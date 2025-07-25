@@ -104,7 +104,7 @@ pub fn draw_rect_on_grid(buf: &mut Buffer, coords: (u16, u16), dimensions: (u16,
     let buf_height = buf.area().height;
 
     // top, bottom and corners
-    for x in coords_x..(coords_x + width + 1) {
+    for x in coords_x..=(coords_x + width) {
         if x >= buf_width {
             break;
         }
@@ -166,7 +166,7 @@ pub fn draw_filled_rect(buf: &mut Buffer, fill_style: Style, rect: &Rect) {
     }
 
     // top and bottom
-    for x in rect.x..(rect.x + rect.width + 1) {
+    for x in rect.x..=(rect.x + rect.width) {
         if x >= buf_width {
             break;
         }

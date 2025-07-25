@@ -29,14 +29,14 @@ fn draw_empty_folder(buf: &mut Buffer, area: Rect) {
     let text_length = empty_folder_line.len();
     let text_style = Style::default();
     let text_start_position =
-        ((area.width - text_length as u16) as f64 / 2.0).ceil() as u16 + area.x;
+        (((area.width - 1) - text_length as u16) as f64 / 2.0).ceil() as u16 + area.x;
     buf.set_string(
         text_start_position,
         (area.height / 2) + area.y - 1,
         empty_folder_line,
         text_style,
     );
-    draw_rect_on_grid(buf, (area.x, area.y), (area.width, area.height));
+    draw_rect_on_grid(buf, (area.x, area.y), (area.width - 1, area.height - 1));
 }
 
 #[derive(Clone)]
@@ -77,8 +77,8 @@ impl<'a> Widget for RectangleGrid<'a> {
         }
         if let Some(coords) = self.small_files_coordinates {
             let (x, y) = coords;
-            let width = (area.x + area.width) - x;
-            let height = (area.y + area.height) - y;
+            let width = (area.x + area.width) - x - 1;
+            let height = (area.y + area.height) - y - 1;
             let small_files_rect = Rect {
                 x,
                 y,
