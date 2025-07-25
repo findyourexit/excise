@@ -149,14 +149,18 @@ pub fn start<B>(
                         if let BackEvent::Key(KeyEvent {
                             code: KeyCode::Char('y'),
                             modifiers: KeyModifiers::NONE,
+                            ..
                         })
                         | BackEvent::Key(KeyEvent {
                             code: KeyCode::Char('q'),
                             modifiers: KeyModifiers::NONE,
+                            ..
                         })
                         | BackEvent::Key(KeyEvent {
+
                             code: KeyCode::Char('c'),
                             modifiers: KeyModifiers::CONTROL,
+                            ..
                         }) = evt
                         {
                             // not ideal, but works in a pinch
@@ -189,7 +193,7 @@ pub fn start<B>(
                 move || {
                     'scanning: for entry in WalkDir::new(&path)
                         .parallelism(if SHOULD_SCAN_HD_FILES_IN_MULTIPLE_THREADS {
-                            RayonDefaultPool
+                            RayonDefaultPool { busy_timeout: std::time::Duration::from_millis(100) }
                         } else {
                             Serial
                         })
