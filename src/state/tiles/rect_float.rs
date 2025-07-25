@@ -1,4 +1,4 @@
-use ::tui::layout::Rect;
+use ratatui::layout::Rect;
 
 #[derive(Clone, Debug)]
 pub struct RectFloat {

@@ -1,7 +1,7 @@
 use ::std::path::PathBuf;
-use ::tui::backend::Backend;
-use ::tui::layout::{Constraint, Direction, Layout, Rect};
-use ::tui::Terminal;
+use ratatui::backend::Backend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::Terminal;
 
 use crate::state::files::FileTree;
 use crate::state::tiles::Board;
@@ -36,7 +36,8 @@ where
         Display { terminal }
     }
     pub fn size(&self) -> Rect {
-        self.terminal.size().expect("could not get terminal size")
+        let size = self.terminal.size().expect("could not get terminal size");
+        Rect::new(0, 0, size.width, size.height)
     }
     pub fn render(
         &mut self,
@@ -47,7 +48,7 @@ where
     ) {
         self.terminal
             .draw(|f| {
-                let full_screen = f.size();
+                let full_screen = f.area();
                 let current_path = file_tree.get_current_path();
                 let current_path_size = file_tree.get_current_folder_size();
                 let current_path_descendants = file_tree.get_current_folder().num_descendants;
@@ -64,7 +65,7 @@ where
                     size: base_path_size,
                     num_descendants: base_path_descendants,
                 };
-                let mut chunks = Layout::default()
+                let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .margin(0)
                     .constraints(
@@ -78,10 +79,10 @@ where
                     .split(full_screen);
 
                 // -1 cos we draw starting at offset 1 in both x and y directions
-
-                chunks[1].width -= 1;
-                chunks[1].height -= 1;
-                board.change_area(&chunks[1]);
+                let mut main_area = chunks[1];
+                main_area.width = main_area.width.saturating_sub(1);
+                main_area.height = main_area.height.saturating_sub(1);
+                board.change_area(&main_area);
                 match ui_mode {
                     UiMode::Loading => {
                         f.render_widget(

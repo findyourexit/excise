@@ -2,7 +2,7 @@ use ::std::fs::Metadata;
 use ::std::path::PathBuf;
 use ::std::sync::mpsc::Receiver;
 
-use ::tui::backend::Backend;
+use ratatui::backend::Backend;
 use crossterm::event::Event as BackEvent;
 
 use crate::input::{

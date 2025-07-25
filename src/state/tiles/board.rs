@@ -1,4 +1,4 @@
-use ::tui::layout::Rect;
+use ratatui::layout::Rect;
 
 use crate::state::files::Folder;
 use crate::state::tiles::files_in_folder::FileType;

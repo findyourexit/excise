@@ -1,6 +1,6 @@
-use ::tui::buffer::Buffer;
-use ::tui::layout::Rect;
-use ::tui::style::{Color, Modifier, Style};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
 
 use ::std::cmp::max;
 
@@ -191,19 +191,28 @@ impl TitleTelescope {
         }
     }
     fn draw_loading_chars(&self, text_length: u16, rect: Rect, buf: &mut Buffer) {
-        let index_in_text = (self.loading_indicator as u16 % (text_length)) as u16;
-        buf.get_mut(rect.x + 1 + index_in_text, rect.y)
-            .set_style(Style::default().add_modifier(Modifier::BOLD));
-        if index_in_text >= text_length - 2 {
-            buf.get_mut(rect.x + 1, rect.y)
-                .set_style(Style::default().add_modifier(Modifier::BOLD));
-            buf.get_mut(rect.x + 2, rect.y)
-                .set_style(Style::default().add_modifier(Modifier::BOLD));
-        } else {
-            buf.get_mut(rect.x + 1 + index_in_text + 1, rect.y)
-                .set_style(Style::default().add_modifier(Modifier::BOLD));
-            buf.get_mut(rect.x + 1 + index_in_text + 2, rect.y)
-                .set_style(Style::default().add_modifier(Modifier::BOLD));
+        let index_in_text = self.loading_indicator as u16 % text_length;
+        let character = match self.loading_indicator % 4 {
+            0 => '|',
+            1 => '/',
+            2 => '-',
+            _ => '\\',
+        };
+        let style = Style::default().add_modifier(Modifier::BOLD);
+
+        buf[(rect.x + 1 + index_in_text, rect.y)]
+            .set_symbol(&character.to_string())
+            .set_style(style);
+        if index_in_text == 0 {
+            buf[(rect.x + 1, rect.y)]
+                .set_style(Style::default().bg(Color::White).fg(Color::Black));
+            buf[(rect.x + 2, rect.y)]
+                .set_style(Style::default().bg(Color::White).fg(Color::Black));
+        } else if index_in_text == text_length - 1 {
+            buf[(rect.x + 1 + index_in_text + 1, rect.y)]
+                .set_style(Style::default().bg(Color::White).fg(Color::Black));
+            buf[(rect.x + 1 + index_in_text + 2, rect.y)]
+                .set_style(Style::default().bg(Color::White).fg(Color::Black));
         }
     }
     fn line_index_len(&self, i: usize) -> usize {

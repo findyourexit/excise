@@ -1,4 +1,4 @@
-use ::tui::buffer::Buffer;
+use ratatui::buffer::Buffer;
 
 pub mod boundaries {
     pub const TOP_RIGHT: &str = "┐";
@@ -110,9 +110,9 @@ fn find_next_symbol(first_symbol: &str, second_symbol: &str) -> Option<&'static 
 }
 
 pub fn draw_next_symbol(buf: &mut Buffer, x: u16, y: u16, symbol: &str) {
-    if let Some(next_symbol) = find_next_symbol(&buf.get(x, y).symbol, symbol) {
-        buf.get_mut(x, y).set_symbol(next_symbol);
+    if let Some(next_symbol) = find_next_symbol(&buf[(x, y)].symbol(), symbol) {
+        buf[(x, y)].set_symbol(next_symbol);
     } else {
-        buf.get_mut(x, y).set_symbol(symbol);
+        buf[(x, y)].set_symbol(symbol);
     }
 }

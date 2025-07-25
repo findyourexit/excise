@@ -1,6 +1,6 @@
-use ::tui::buffer::Buffer;
-use ::tui::layout::Rect;
-use ::tui::style::{Color, Modifier, Style};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
 use ::unicode_width::UnicodeWidthStr;
 
 use crate::state::tiles::{FileType, Tile};
@@ -100,32 +100,66 @@ pub fn draw_rect_on_grid(buf: &mut Buffer, coords: (u16, u16), dimensions: (u16,
         return;
     }
 
+    let buf_width = buf.area().width;
+    let buf_height = buf.area().height;
+
     // top, bottom and corners
     for x in coords_x..(coords_x + width + 1) {
+        if x >= buf_width {
+            break;
+        }
         if x == coords_x {
-            draw_next_symbol(buf, x, coords_y, &boundaries::TOP_LEFT);
-            draw_next_symbol(buf, x, coords_y + height, &boundaries::BOTTOM_LEFT);
+            if coords_y < buf_height {
+                draw_next_symbol(buf, x, coords_y, boundaries::TOP_LEFT);
+            }
+            if coords_y + height < buf_height {
+                draw_next_symbol(buf, x, coords_y + height, boundaries::BOTTOM_LEFT);
+            }
         } else if x == coords_x + width {
-            draw_next_symbol(buf, x, coords_y, &boundaries::TOP_RIGHT);
-            draw_next_symbol(buf, x, coords_y + height, &boundaries::BOTTOM_RIGHT);
+            if coords_y < buf_height {
+                draw_next_symbol(buf, x, coords_y, boundaries::TOP_RIGHT);
+            }
+            if coords_y + height < buf_height {
+                draw_next_symbol(buf, x, coords_y + height, boundaries::BOTTOM_RIGHT);
+            }
         } else {
-            draw_next_symbol(buf, x, coords_y, &boundaries::HORIZONTAL);
-            draw_next_symbol(buf, x, coords_y + height, &boundaries::HORIZONTAL);
+            if coords_y < buf_height {
+                draw_next_symbol(buf, x, coords_y, boundaries::HORIZONTAL);
+            }
+            if coords_y + height < buf_height {
+                draw_next_symbol(buf, x, coords_y + height, boundaries::HORIZONTAL);
+            }
         }
     }
 
     // left and right
     for y in (coords_y + 1)..(coords_y + height) {
-        draw_next_symbol(buf, coords_x, y, &boundaries::VERTICAL);
-        draw_next_symbol(buf, coords_x + width, y, &boundaries::VERTICAL);
+        if y >= buf_height {
+            break;
+        }
+        if coords_x < buf_width {
+            draw_next_symbol(buf, coords_x, y, boundaries::VERTICAL);
+        }
+        if coords_x + width < buf_width {
+            draw_next_symbol(buf, coords_x + width, y, boundaries::VERTICAL);
+        }
     }
 }
 
 pub fn draw_filled_rect(buf: &mut Buffer, fill_style: Style, rect: &Rect) {
+    let buf_width = buf.area().width;
+    let buf_height = buf.area().height;
+
     // fill
     for x in rect.x + 1..(rect.x + rect.width) {
+        if x >= buf_width {
+            break;
+        }
         for y in rect.y + 1..(rect.y + rect.height) {
-            let cell = buf.get_mut(x, y);
+            if y >= buf_height {
+                break;
+            }
+            let cell = &mut buf[(x, y)];
             cell.set_symbol(" ");
             cell.set_style(fill_style);
         }
@@ -133,56 +167,87 @@ pub fn draw_filled_rect(buf: &mut Buffer, fill_style: Style, rect: &Rect) {
 
     // top and bottom
     for x in rect.x..(rect.x + rect.width + 1) {
+        if x >= buf_width {
+            break;
+        }
         if x == rect.x {
-            buf.get_mut(x, rect.y)
-                .set_symbol(&boundaries::TOP_LEFT)
-                .set_style(fill_style);
-            buf.get_mut(x, rect.y + rect.height)
-                .set_symbol(&boundaries::BOTTOM_LEFT)
-                .set_style(fill_style);
+            if rect.y < buf_height {
+                buf[(x, rect.y)]
+                    .set_symbol(boundaries::TOP_LEFT)
+                    .set_style(fill_style);
+            }
+            if rect.y + rect.height < buf_height {
+                buf[(x, rect.y + rect.height)]
+                    .set_symbol(boundaries::BOTTOM_LEFT)
+                    .set_style(fill_style);
+            }
         } else if x == rect.x + rect.width {
-            buf.get_mut(x, rect.y)
-                .set_symbol(&boundaries::TOP_RIGHT)
-                .set_style(fill_style);
-            buf.get_mut(x, rect.y + rect.height)
-                .set_symbol(&boundaries::BOTTOM_RIGHT)
-                .set_style(fill_style);
+            if rect.y < buf_height {
+                buf[(x, rect.y)]
+                    .set_symbol(boundaries::TOP_RIGHT)
+                    .set_style(fill_style);
+            }
+            if rect.y + rect.height < buf_height {
+                buf[(x, rect.y + rect.height)]
+                    .set_symbol(boundaries::BOTTOM_RIGHT)
+                    .set_style(fill_style);
+            }
         } else {
-            buf.get_mut(x, rect.y)
-                .set_symbol(&boundaries::HORIZONTAL)
-                .set_style(fill_style);
-            buf.get_mut(x, rect.y + rect.height)
-                .set_symbol(&boundaries::HORIZONTAL)
-                .set_style(fill_style);
+            if rect.y < buf_height {
+                buf[(x, rect.y)]
+                    .set_symbol(boundaries::HORIZONTAL)
+                    .set_style(fill_style);
+            }
+            if rect.y + rect.height < buf_height {
+                buf[(x, rect.y + rect.height)]
+                    .set_symbol(boundaries::HORIZONTAL)
+                    .set_style(fill_style);
+            }
         }
     }
 
     // left and right
     for y in (rect.y + 1)..(rect.y + rect.height) {
-        buf.get_mut(rect.x, y)
-            .set_symbol(&boundaries::VERTICAL)
-            .set_style(fill_style);
-        buf.get_mut(rect.x + rect.width, y)
-            .set_symbol(&boundaries::VERTICAL)
-            .set_style(fill_style);
+        if y >= buf_height {
+            break;
+        }
+        if rect.x < buf_width {
+            buf[(rect.x, y)]
+                .set_symbol(boundaries::VERTICAL)
+                .set_style(fill_style);
+        }
+        if rect.x + rect.width < buf_width {
+            buf[(rect.x + rect.width, y)]
+                .set_symbol(boundaries::VERTICAL)
+                .set_style(fill_style);
+        }
     }
 }
 
 pub fn draw_tile_text_on_grid(buf: &mut Buffer, tile: &Tile, selected: bool) {
-    let first_line = tile_first_line(&tile);
+    let buf_width = buf.area().width;
+    let buf_height = buf.area().height;
+
+    let first_line = tile_first_line(tile);
     let first_line_length = first_line.width() as u16;
     let first_line_start_position =
         ((tile.width - first_line_length) as f64 / 2.0).ceil() as u16 + tile.x;
-    let second_line = tile_second_line(&tile);
+    let second_line = tile_second_line(tile);
     let second_line_length = second_line.width();
     let second_line_start_position =
         ((tile.width - second_line_length as u16) as f64 / 2.0).ceil() as u16 + tile.x;
-    let (background_style, first_line_style, second_line_style) = tile_style(&tile, selected);
+    let (background_style, first_line_style, second_line_style) = tile_style(tile, selected);
 
     if let Some(background_style) = background_style {
         for x in tile.x + 1..tile.x + tile.width {
+            if x >= buf_width {
+                break;
+            }
             for y in tile.y + 1..tile.y + tile.height {
-                buf.get_mut(x, y)
+                if y >= buf_height {
+                    break;
+                }
+                buf[(x, y)]
                     .set_symbol("█")
                     .set_style(background_style);
                 // we set both the filling symbol and the style

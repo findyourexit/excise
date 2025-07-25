@@ -1,4 +1,4 @@
-use ::tui::layout::Rect;
+use ratatui::layout::Rect;
 
 use crate::state::tiles::{FileMetadata, RectFloat, Tile};
 

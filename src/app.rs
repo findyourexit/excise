@@ -2,7 +2,7 @@ use ::std::fs::{self, Metadata};
 use ::std::mem::ManuallyDrop;
 use ::std::path::PathBuf;
 use ::std::sync::mpsc::{Receiver, SyncSender};
-use ::tui::backend::Backend;
+use ratatui::backend::Backend;
 
 use crate::messages::{handle_instructions, Instruction};
 use crate::state::files::{FileOrFolder, FileTree, Folder};

@@ -1,8 +1,8 @@
 use ::std::path::PathBuf;
-use ::tui::buffer::Buffer;
-use ::tui::layout::Rect;
-use ::tui::style::{Color, Modifier, Style};
-use ::tui::widgets::Widget;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::Widget;
 
 use crate::ui::format::DisplaySize;
 use crate::ui::title::{CellSizeOpt, TitleTelescope};

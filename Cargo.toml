@@ -15,7 +15,7 @@ name = "excise"
 path = "src/main.rs"
 
 [dependencies]
-tui = {version="0.11", default-features = false, features = ['crossterm'] }
+ratatui = {version="0.28", default-features = false, features = ['crossterm'] }
 crossterm = "0.17"
 failure = "0.1"
 jwalk = "0.5"

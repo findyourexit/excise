@@ -1,4 +1,4 @@
-use ::tui::backend::Backend;
+use ratatui::backend::Backend;
 use crossterm::event::Event;
 use crossterm::event::KeyModifiers;
 use crossterm::event::{read, KeyCode, KeyEvent};

@@ -1,9 +1,9 @@
 use ::std::collections::HashMap;
 use ::std::io;
 use ::std::sync::{Arc, Mutex};
-use ::tui::backend::Backend;
-use ::tui::buffer::Cell;
-use ::tui::layout::Rect;
+use ratatui::backend::{Backend, WindowSize};
+use ratatui::buffer::Cell;
+use ratatui::layout::{Position, Size};
 
 #[derive(Hash, Debug, PartialEq)]
 pub enum TerminalEvent {
@@ -87,7 +87,7 @@ impl Backend for TestBackend {
                     Some(cell) => {
                         // this will contain no style information at all
                         // should be good enough for testing
-                        string.push_str(&cell.symbol);
+                        string.push_str(&cell.symbol());
                     }
                     None => {
                         string.push_str(" ");
@@ -100,11 +100,29 @@ impl Backend for TestBackend {
         Ok(())
     }
 
-    fn size(&self) -> io::Result<Rect> {
+    fn size(&self) -> io::Result<Size> {
         let terminal_height = self.terminal_height.lock().unwrap();
         let terminal_width = self.terminal_width.lock().unwrap();
 
-        Ok(Rect::new(0, 0, *terminal_width, *terminal_height))
+        Ok(Size::new(*terminal_width, *terminal_height))
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        Ok(Position::new(0, 0))
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, _position: P) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        let terminal_height = self.terminal_height.lock().unwrap();
+        let terminal_width = self.terminal_width.lock().unwrap();
+
+        Ok(WindowSize {
+            columns_rows: Size::new(*terminal_width, *terminal_height),
+            pixels: Size::new(0, 0),
+        })
     }
 
     fn flush(&mut self) -> io::Result<()> {

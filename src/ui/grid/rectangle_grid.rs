@@ -1,7 +1,7 @@
-use ::tui::buffer::Buffer;
-use ::tui::layout::Rect;
-use ::tui::style::{Color, Style};
-use ::tui::widgets::Widget;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
+use ratatui::widgets::Widget;
 
 use crate::state::tiles::Tile;
 use crate::ui::grid::{draw_rect_on_grid, draw_tile_text_on_grid};
@@ -9,7 +9,7 @@ use crate::ui::grid::{draw_rect_on_grid, draw_tile_text_on_grid};
 fn draw_small_files_rect_on_grid(buf: &mut Buffer, rect: Rect) {
     for x in rect.x + 1..(rect.x + rect.width) {
         for y in rect.y + 1..(rect.y + rect.height) {
-            let buf = buf.get_mut(x, y);
+            let buf = &mut buf[(x, y)];
             buf.set_symbol("x");
             buf.set_style(Style::default().bg(Color::White).fg(Color::Black));
         }
@@ -20,7 +20,7 @@ fn draw_small_files_rect_on_grid(buf: &mut Buffer, rect: Rect) {
 fn draw_empty_folder(buf: &mut Buffer, area: Rect) {
     for x in area.x + 1..area.x + area.width {
         for y in area.y + 1..area.y + area.height {
-            let buf = buf.get_mut(x, y);
+            let buf = &mut buf[(x, y)];
             buf.set_symbol("█");
             buf.set_style(Style::default().bg(Color::White).fg(Color::Black));
         }

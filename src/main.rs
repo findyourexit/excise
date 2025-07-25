@@ -23,11 +23,11 @@ use ::std::thread::park_timeout;
 use ::std::{thread, time};
 use ::structopt::StructOpt;
 
-use ::tui::backend::Backend;
+use ratatui::backend::Backend;
 use crossterm::event::KeyModifiers;
 use crossterm::event::{Event as BackEvent, KeyCode, KeyEvent};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use tui::backend::CrosstermBackend;
+use ratatui::backend::CrosstermBackend;
 
 use app::{App, UiMode};
 use input::TerminalEvents;
