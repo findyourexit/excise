@@ -87,7 +87,7 @@ where
                     UiMode::Exiting { app_loaded: _ } => {
                         handle_keypress_exiting_mode(evt, app);
                     }
-                    UiMode::WarningMessage(_) => {
+                    UiMode::WarningMessage => {
                         handle_keypress_warning_message(evt, app);
                     }
                 }

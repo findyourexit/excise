@@ -274,7 +274,7 @@ where
                         );
                         f.render_widget(ConfirmBox::new(), full_screen);
                     }
-                    UiMode::WarningMessage(_) => {
+                    UiMode::WarningMessage => {
                         f.render_widget(
                             TitleLine::new(
                                 base_path_info,
