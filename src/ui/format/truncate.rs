@@ -1,5 +1,5 @@
 use ::std::iter::FromIterator;
-use ::unicode_width::UnicodeWidthChar;
+use ::unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 fn truncate_iter_to_unicode_width<Input, Collect>(iter: Input, width: usize) -> Collect
 where
@@ -17,7 +17,7 @@ where
 pub fn truncate_middle(row: &str, max_length: u16) -> String {
     if max_length < 6 {
         truncate_iter_to_unicode_width(row.chars(), max_length as usize)
-    } else if row.len() as u16 > max_length {
+    } else if row.width() as u16 > max_length {
         let split_point = (max_length as usize / 2) - 2;
         let first_slice = truncate_iter_to_unicode_width::<_, String>(row.chars(), split_point);
         let second_slice =
@@ -53,8 +53,8 @@ mod tests {
     #[test]
     fn truncate_middle_char_boundary() {
         assert_eq!(
-            truncate_middle("굿걸 - 누가 방송국을 털었나 E06.mp4", 44),
-            "굿걸 - 누가 방송국을[...]국을 털었나 E06.mp4",
+            truncate_middle("굿걸 - 누가 방송국을 털었나 E06.mp4", 30),
+            "굿걸 - 누가 [...]었나 E06.mp4",
         );
     }
 }
