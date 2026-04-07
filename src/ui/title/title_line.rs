@@ -73,15 +73,11 @@ impl<'a> TitleLine<'a> {
     }
 }
 
-impl<'a> Widget for TitleLine<'a> {
+impl Widget for TitleLine<'_> {
+    /// Renders the title line widget
+    #[allow(clippy::too_many_lines)]
     fn render(self, rect: Rect, buf: &mut Buffer) {
-        let base_path = &self
-            .base_path_info
-            .path
-            .clone()
-            .into_os_string()
-            .into_string()
-            .expect("could not convert os string to string");
+        let base_path = &self.base_path_info.path.to_string_lossy().into_owned();
         let current_path = {
             let mut current_path_relative_to_base = PathBuf::new();
             let base_path_len = self.base_path_info.path.iter().count();
