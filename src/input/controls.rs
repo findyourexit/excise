@@ -1,5 +1,6 @@
 use ratatui::backend::Backend;
 use crossterm::event::Event;
+use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use crossterm::event::{read, KeyCode, KeyEvent};
 
@@ -12,7 +13,20 @@ pub struct TerminalEvents;
 impl Iterator for TerminalEvents {
     type Item = Event;
     fn next(&mut self) -> Option<Event> {
-        Some(read().unwrap())
+        loop {
+            let event = read().expect("Failed to read terminal event");
+            // On Windows crossterm reports key press *and* release events (Unix
+            // terminals only report presses). Our key handlers ignore the `kind`
+            // field, so without this filter every keystroke would be handled twice.
+            // Drop releases; forward presses and repeats (so holding a key still
+            // repeats, matching Unix terminal auto-repeat).
+            if let Event::Key(key_event) = &event
+                && key_event.kind == KeyEventKind::Release
+            {
+                continue;
+            }
+            return Some(event);
+        }
     }
 }
 macro_rules! key {
