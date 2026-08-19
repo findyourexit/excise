@@ -5,22 +5,17 @@ use ratatui::widgets::Widget;
 
 use crate::state::FileToDelete;
 use crate::state::tiles::FileType;
-use crate::ui::format::truncate_middle;
+use crate::ui::format::{display_path, truncate_middle};
 use crate::ui::grid::draw_filled_rect;
 
 fn truncated_file_name_line(file_to_delete: &FileToDelete, max_len: u16) -> String {
-    let full_path = file_to_delete
-        .full_path()
-        .into_os_string()
-        .into_string()
-        .expect("could not convert os string to string");
+    let full_path = file_to_delete.full_path();
+    let full_path = display_path(&full_path).into_owned();
     let file_name = file_to_delete
         .path_to_file
         .last()
         .expect("could not find file to delete")
         .to_string_lossy();
-    #[cfg(test)]
-    let full_path = str::replace(&full_path, "\\", "/");
     if max_len > full_path.len() as u16 {
         full_path
     } else {

@@ -36,8 +36,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::{Backend, CrosstermBackend};
 
 use app::{App, UiMode};
-use input::TerminalEvents;
-use messages::{Event, Instruction, handle_events};
+use input::{InputEvent, TerminalEvents};
+use messages::{Event, EventSender, EventTracker, Instruction, handle_events};
 
 #[cfg(not(test))]
 const SHOULD_SHOW_LOADING_ANIMATION: bool = true;
@@ -106,7 +106,7 @@ fn try_main() -> anyhow::Result<()> {
 /// Panics if any thread fails to spawn or join
 pub fn start<B>(
     terminal_backend: B,
-    terminal_events: Box<dyn Iterator<Item = BackEvent> + Send>,
+    terminal_events: Box<dyn Iterator<Item = InputEvent> + Send>,
     path: PathBuf,
     show_apparent_size: bool,
     disable_delete_confirmation: bool,
@@ -120,16 +120,19 @@ pub fn start<B>(
         &mut active_threads,
         channels.instruction_sender.clone(),
         channels.event_receiver,
+        state.event_tracker.clone(),
     );
     spawn_input_handler_thread(
         &mut active_threads,
         channels.instruction_sender.clone(),
         state.running.clone(),
+        state.event_tracker.clone(),
         terminal_events,
     );
     spawn_scanner_thread(
         &mut active_threads,
         channels.instruction_sender.clone(),
+        state.event_tracker.clone(),
         state.loaded.clone(),
         path.clone(),
     );
@@ -159,7 +162,7 @@ pub fn start<B>(
 }
 
 struct AppChannels {
-    event_sender: SyncSender<Event>,
+    event_sender: EventSender,
     event_receiver: Receiver<Event>,
     instruction_sender: SyncSender<Instruction>,
     instruction_receiver: Receiver<Instruction>,
@@ -168,10 +171,11 @@ struct AppChannels {
 struct AppState {
     running: Arc<AtomicBool>,
     loaded: Arc<AtomicBool>,
+    event_tracker: Arc<EventTracker>,
 }
 
 fn setup_channels_and_state() -> (AppChannels, AppState) {
-    let (event_sender, event_receiver): (SyncSender<Event>, Receiver<Event>) =
+    let (raw_event_sender, event_receiver): (SyncSender<Event>, Receiver<Event>) =
         mpsc::sync_channel(1);
     let (instruction_sender, instruction_receiver): (
         SyncSender<Instruction>,
@@ -179,6 +183,9 @@ fn setup_channels_and_state() -> (AppChannels, AppState) {
     ) = mpsc::sync_channel(100);
     let running = Arc::new(AtomicBool::new(true));
     let loaded = Arc::new(AtomicBool::new(false));
+    let event_tracker = Arc::new(EventTracker::default());
+    event_tracker.begin();
+    let event_sender = EventSender::new(raw_event_sender, event_tracker.clone());
 
     let channels = AppChannels {
         event_sender,
@@ -187,7 +194,11 @@ fn setup_channels_and_state() -> (AppChannels, AppState) {
         instruction_receiver,
     };
 
-    let state = AppState { running, loaded };
+    let state = AppState {
+        running,
+        loaded,
+        event_tracker,
+    };
 
     (channels, state)
 }
@@ -196,11 +207,12 @@ fn spawn_event_handler_thread(
     active_threads: &mut Vec<thread::JoinHandle<()>>,
     instruction_sender: SyncSender<Instruction>,
     event_receiver: Receiver<Event>,
+    event_tracker: Arc<EventTracker>,
 ) {
     active_threads.push(
         thread::Builder::new()
             .name("event_executer".to_string())
-            .spawn(|| handle_events(event_receiver, instruction_sender))
+            .spawn(|| handle_events(event_receiver, instruction_sender, event_tracker))
             .expect("Failed to spawn thread"),
     );
 }
@@ -209,13 +221,24 @@ fn spawn_input_handler_thread(
     active_threads: &mut Vec<thread::JoinHandle<()>>,
     instruction_sender: SyncSender<Instruction>,
     running: Arc<AtomicBool>,
-    terminal_events: Box<dyn Iterator<Item = BackEvent> + Send>,
+    event_tracker: Arc<EventTracker>,
+    terminal_events: Box<dyn Iterator<Item = InputEvent> + Send>,
 ) {
     active_threads.push(
         thread::Builder::new()
             .name("stdin_handler".to_string())
             .spawn(move || {
-                for evt in terminal_events {
+                for input in terminal_events {
+                    let evt = match input {
+                        InputEvent::Terminal(evt) => evt,
+                        InputEvent::Barrier => {
+                            if !synchronize_input(&instruction_sender, &event_tracker) {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+
                     if let BackEvent::Resize(_x, _y) = evt {
                         if SHOULD_HANDLE_WIN_CHANGE {
                             let _ = instruction_sender.send(Instruction::ResetUiMode);
@@ -245,12 +268,21 @@ fn spawn_input_handler_thread(
                         ..
                     }) = evt
                     {
-                        let _ = instruction_sender.send(Instruction::Keypress(evt));
-                        park_timeout(time::Duration::from_millis(100));
+                        let (acknowledgment, processed) = mpsc::sync_channel(0);
+                        if instruction_sender
+                            .send(Instruction::Keypress(evt, Some(acknowledgment)))
+                            .is_err()
+                            || processed.recv().is_err()
+                        {
+                            break;
+                        }
                         if !running.load(Ordering::Acquire) {
                             break;
                         }
-                    } else if instruction_sender.send(Instruction::Keypress(evt)).is_err() {
+                    } else if instruction_sender
+                        .send(Instruction::Keypress(evt, None))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -259,9 +291,29 @@ fn spawn_input_handler_thread(
     );
 }
 
+fn synchronize_input(
+    instruction_sender: &SyncSender<Instruction>,
+    event_tracker: &EventTracker,
+) -> bool {
+    if !synchronize_instructions(instruction_sender) {
+        return false;
+    }
+    event_tracker.wait_until_idle();
+    synchronize_instructions(instruction_sender)
+}
+
+fn synchronize_instructions(instruction_sender: &SyncSender<Instruction>) -> bool {
+    let (acknowledgment, processed) = mpsc::sync_channel(0);
+    instruction_sender
+        .send(Instruction::Synchronize(acknowledgment))
+        .is_ok()
+        && processed.recv().is_ok()
+}
+
 fn spawn_scanner_thread(
     active_threads: &mut Vec<thread::JoinHandle<()>>,
     instruction_sender: SyncSender<Instruction>,
+    event_tracker: Arc<EventTracker>,
     loaded: Arc<AtomicBool>,
     path: PathBuf,
 ) {
@@ -299,6 +351,7 @@ fn spawn_scanner_thread(
                 }
                 let _ = instruction_sender.send(Instruction::StartUi);
                 loaded.store(true, Ordering::Release);
+                event_tracker.complete();
             })
             .expect("Failed to spawn thread"),
     );

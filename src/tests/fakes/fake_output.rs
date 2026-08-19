@@ -25,13 +25,13 @@ pub struct TestBackend {
 impl TestBackend {
     pub const fn new(
         log: Arc<Mutex<Vec<TerminalEvent>>>,
-        draw_log: Arc<Mutex<Vec<String>>>,
+        draw_events: Arc<Mutex<Vec<String>>>,
         terminal_width: Arc<Mutex<u16>>,
         terminal_height: Arc<Mutex<u16>>,
     ) -> Self {
         Self {
             events: log,
-            draw_events: draw_log,
+            draw_events,
             terminal_width,
             terminal_height,
         }

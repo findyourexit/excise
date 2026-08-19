@@ -9,12 +9,17 @@ use ratatui::backend::Backend;
 use crate::App;
 use crate::state::FileToDelete;
 
+pub enum InputEvent {
+    Terminal(Event),
+    Barrier,
+}
+
 #[derive(Clone)]
 pub struct TerminalEvents;
 
 impl Iterator for TerminalEvents {
-    type Item = Event;
-    fn next(&mut self) -> Option<Event> {
+    type Item = InputEvent;
+    fn next(&mut self) -> Option<InputEvent> {
         loop {
             let event = read().expect("Failed to read terminal event");
             // On Windows crossterm reports key press *and* release events (Unix
@@ -27,7 +32,7 @@ impl Iterator for TerminalEvents {
             {
                 continue;
             }
-            return Some(event);
+            return Some(InputEvent::Terminal(event));
         }
     }
 }

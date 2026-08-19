@@ -31,8 +31,8 @@ macro_rules! key {
     };
 }
 
-pub fn sleep_and_quit_events(sleep_num: usize, quit_after_confirm: bool) -> TerminalEvents {
-    let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, sleep_num).collect();
+pub fn wait_and_quit_events(barrier_count: usize, quit_after_confirm: bool) -> TerminalEvents {
+    let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, barrier_count).collect();
     events.push(Some(key!(ctrl 'c')));
     if quit_after_confirm {
         events.push(None);

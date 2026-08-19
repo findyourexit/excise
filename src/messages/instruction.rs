@@ -1,6 +1,6 @@
 use ::std::fs::Metadata;
 use ::std::path::PathBuf;
-use ::std::sync::mpsc::Receiver;
+use ::std::sync::mpsc::{Receiver, SyncSender};
 
 use crossterm::event::Event as BackEvent;
 use ratatui::backend::Backend;
@@ -23,7 +23,8 @@ pub enum Instruction {
     RenderAndUpdateBoard,
     Render,
     ResetUiMode,
-    Keypress(BackEvent),
+    Keypress(BackEvent, Option<SyncSender<()>>),
+    Synchronize(SyncSender<()>),
     IncrementFailedToRead,
 }
 
@@ -66,7 +67,7 @@ where
             Instruction::ResetUiMode => {
                 app.reset_ui_mode();
             }
-            Instruction::Keypress(evt) => {
+            Instruction::Keypress(evt, acknowledgment) => {
                 match &app.ui_mode {
                     UiMode::Loading => {
                         handle_keypress_loading_mode(&evt, app);
@@ -91,9 +92,16 @@ where
                         handle_keypress_warning_message(app);
                     }
                 }
-                if !app.is_running {
+                let is_running = app.is_running;
+                if let Some(acknowledgment) = acknowledgment {
+                    let _ = acknowledgment.send(());
+                }
+                if !is_running {
                     break;
                 }
+            }
+            Instruction::Synchronize(acknowledgment) => {
+                let _ = acknowledgment.send(());
             }
             Instruction::IncrementFailedToRead => {
                 app.increment_failed_to_read();

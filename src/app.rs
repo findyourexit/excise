@@ -1,15 +1,15 @@
 use ::std::fs::{self, Metadata};
 use ::std::mem::ManuallyDrop;
 use ::std::path::PathBuf;
-use ::std::sync::mpsc::{Receiver, SyncSender};
+use ::std::sync::mpsc::Receiver;
 use ratatui::backend::Backend;
 
-use crate::Event;
 use crate::messages::{Instruction, handle_instructions};
 use crate::state::files::{FileOrFolder, FileTree, Folder};
 use crate::state::tiles::Board;
 use crate::state::{FileToDelete, UiEffects};
 use crate::ui::Display;
+use crate::{Event, messages::EventSender};
 
 #[derive(Clone)]
 pub enum UiMode {
@@ -32,7 +32,7 @@ where
     board: Board,
     file_tree: ManuallyDrop<FileTree>,
     display: Display<B>,
-    event_sender: SyncSender<Event>,
+    event_sender: EventSender,
     ui_effects: UiEffects,
     delete_confirmation_disabled: bool,
 }
@@ -44,7 +44,7 @@ where
     pub fn new(
         terminal_backend: B,
         path_in_filesystem: PathBuf,
-        event_sender: SyncSender<Event>,
+        event_sender: EventSender,
         show_apparent_size: bool,
         disable_delete_confirmation: bool,
     ) -> Self {

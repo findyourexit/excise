@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
 use crate::state::tiles::{FileType, Tile};
-use crate::ui::format::{DisplaySize, truncate_middle};
+use crate::ui::format::{DisplaySize, display_path, truncate_middle};
 
 fn render_currently_selected(buf: &mut Buffer, currently_selected: &Tile, max_len: u16, y: u16) {
     let file_name = currently_selected.name.to_string_lossy();
@@ -46,7 +46,7 @@ fn render_currently_selected(buf: &mut Buffer, currently_selected: &Tile, max_le
 }
 
 fn render_last_read_path(buf: &mut Buffer, last_read_path: &Path, max_len: u16, y: u16) {
-    let last_read_path = last_read_path.to_string_lossy();
+    let last_read_path = display_path(last_read_path);
     if (last_read_path.chars().count() as u16) < max_len {
         buf.set_string(1, y, last_read_path, Style::default());
     } else {
