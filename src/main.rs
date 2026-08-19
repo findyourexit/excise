@@ -116,6 +116,14 @@ pub fn start<B>(
     let mut active_threads = vec![];
     let (channels, state) = setup_channels_and_state();
 
+    let mut app = App::new(
+        terminal_backend,
+        path.clone(),
+        channels.event_sender,
+        show_apparent_size,
+        disable_delete_confirmation,
+    );
+
     spawn_event_handler_thread(
         &mut active_threads,
         channels.instruction_sender.clone(),
@@ -125,7 +133,6 @@ pub fn start<B>(
     spawn_input_handler_thread(
         &mut active_threads,
         channels.instruction_sender.clone(),
-        state.running.clone(),
         state.event_tracker.clone(),
         terminal_events,
     );
@@ -134,7 +141,7 @@ pub fn start<B>(
         channels.instruction_sender.clone(),
         state.event_tracker.clone(),
         state.loaded.clone(),
-        path.clone(),
+        path,
     );
 
     if SHOULD_SHOW_LOADING_ANIMATION {
@@ -146,13 +153,6 @@ pub fn start<B>(
         );
     }
 
-    let mut app = App::new(
-        terminal_backend,
-        path,
-        channels.event_sender,
-        show_apparent_size,
-        disable_delete_confirmation,
-    );
     app.start(&channels.instruction_receiver);
     state.running.store(false, Ordering::Release);
 
@@ -220,7 +220,6 @@ fn spawn_event_handler_thread(
 fn spawn_input_handler_thread(
     active_threads: &mut Vec<thread::JoinHandle<()>>,
     instruction_sender: SyncSender<Instruction>,
-    running: Arc<AtomicBool>,
     event_tracker: Arc<EventTracker>,
     terminal_events: Box<dyn Iterator<Item = InputEvent> + Send>,
 ) {
@@ -272,11 +271,8 @@ fn spawn_input_handler_thread(
                         if instruction_sender
                             .send(Instruction::Keypress(evt, Some(acknowledgment)))
                             .is_err()
-                            || processed.recv().is_err()
+                            || !matches!(processed.recv(), Ok(true))
                         {
-                            break;
-                        }
-                        if !running.load(Ordering::Acquire) {
                             break;
                         }
                     } else if instruction_sender

@@ -23,7 +23,7 @@ pub enum Instruction {
     RenderAndUpdateBoard,
     Render,
     ResetUiMode,
-    Keypress(BackEvent, Option<SyncSender<()>>),
+    Keypress(BackEvent, Option<SyncSender<bool>>),
     Synchronize(SyncSender<()>),
     IncrementFailedToRead,
 }
@@ -94,7 +94,7 @@ where
                 }
                 let is_running = app.is_running;
                 if let Some(acknowledgment) = acknowledgment {
-                    let _ = acknowledgment.send(());
+                    let _ = acknowledgment.send(is_running);
                 }
                 if !is_running {
                     break;
