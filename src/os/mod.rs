@@ -1,5 +1,5 @@
 #[cfg(target_os = "windows")]
-pub(crate) mod windows;
+pub mod windows;
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) mod unix;
+pub mod unix;

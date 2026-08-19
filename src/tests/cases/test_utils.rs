@@ -1,4 +1,3 @@
-use ::std::iter;
 use ::std::sync::{Arc, Mutex};
 use crossterm::event::KeyModifiers;
 use crossterm::event::{Event, KeyCode, KeyEvent};
@@ -32,14 +31,14 @@ macro_rules! key {
     };
 }
 
-pub fn sleep_and_quit_events(sleep_num: usize, quit_after_confirm: bool) -> Box<TerminalEvents> {
-    let mut events: Vec<Option<Event>> = iter::repeat(None).take(sleep_num).collect();
+pub fn sleep_and_quit_events(sleep_num: usize, quit_after_confirm: bool) -> TerminalEvents {
+    let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, sleep_num).collect();
     events.push(Some(key!(ctrl 'c')));
     if quit_after_confirm {
         events.push(None);
         events.push(Some(key!(char 'y')));
     }
-    Box::new(TerminalEvents::new(events))
+    TerminalEvents::new(events)
 }
 
 type BackendWithStreams = (

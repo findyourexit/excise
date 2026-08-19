@@ -18,7 +18,7 @@ pub struct Tile {
 impl Tile {
     pub fn new(rect: &RectFloat, file_metadata: &FileMetadata) -> Self {
         let rounded = rect.round();
-        Tile {
+        Self {
             x: rounded.x,
             y: rounded.y,
             width: rounded.width,
@@ -30,23 +30,23 @@ impl Tile {
             file_type: file_metadata.file_type,
         }
     }
-    pub fn is_directly_right_of(&self, other: &Tile) -> bool {
+    pub const fn is_directly_right_of(&self, other: &Self) -> bool {
         self.x == other.x + other.width
     }
 
-    pub fn is_directly_left_of(&self, other: &Tile) -> bool {
+    pub const fn is_directly_left_of(&self, other: &Self) -> bool {
         self.x + self.width == other.x
     }
 
-    pub fn is_directly_below(&self, other: &Tile) -> bool {
+    pub const fn is_directly_below(&self, other: &Self) -> bool {
         self.y == other.y + other.height
     }
 
-    pub fn is_directly_above(&self, other: &Tile) -> bool {
+    pub const fn is_directly_above(&self, other: &Self) -> bool {
         self.y + self.height == other.y
     }
 
-    pub fn horizontally_overlaps_with(&self, other: &Tile) -> bool {
+    pub const fn horizontally_overlaps_with(&self, other: &Self) -> bool {
         (self.y >= other.y && self.y <= (other.y + other.height))
             || ((self.y + self.height) <= (other.y + other.height)
                 && (self.y + self.height) > other.y)
@@ -54,18 +54,18 @@ impl Tile {
             || (other.y <= self.y && (other.y + other.height >= (self.y + self.height)))
     }
 
-    pub fn vertically_overlaps_with(&self, other: &Tile) -> bool {
+    pub const fn vertically_overlaps_with(&self, other: &Self) -> bool {
         (self.x >= other.x && self.x <= (other.x + other.width))
             || ((self.x + self.width) <= (other.x + other.width) && (self.x + self.width) > other.x)
             || (self.x <= other.x && (self.x + self.width >= (other.x + other.width)))
             || (other.x <= self.x && (other.x + other.width >= (self.x + self.width)))
     }
 
-    pub fn get_vertical_overlap_with(&self, other: &Tile) -> u16 {
+    pub fn get_vertical_overlap_with(&self, other: &Self) -> u16 {
         std::cmp::min(self.x + self.width, other.x + other.width) - std::cmp::max(self.x, other.x)
     }
 
-    pub fn get_horizontal_overlap_with(&self, other: &Tile) -> u16 {
+    pub fn get_horizontal_overlap_with(&self, other: &Self) -> u16 {
         std::cmp::min(self.y + self.height, other.y + other.height) - std::cmp::max(self.y, other.y)
     }
 }

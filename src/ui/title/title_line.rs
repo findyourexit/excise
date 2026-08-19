@@ -4,9 +4,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
+use crate::ui::FolderInfo;
 use crate::ui::format::DisplaySize;
 use crate::ui::title::{CellSizeOpt, TitleTelescope};
-use crate::ui::FolderInfo;
 
 #[cfg(not(target_os = "windows"))]
 use crate::os::unix::is_user_admin;
@@ -26,7 +26,7 @@ pub struct TitleLine<'a> {
 }
 
 impl<'a> TitleLine<'a> {
-    pub fn new(
+    pub const fn new(
         base_path_info: FolderInfo<'a>,
         current_path_info: FolderInfo<'a>,
         space_freed: u128,
@@ -43,29 +43,29 @@ impl<'a> TitleLine<'a> {
             zoom_level: None,
         }
     }
-    pub fn show_loading(mut self) -> Self {
+    pub const fn show_loading(mut self) -> Self {
         self.show_loading = true;
         self
     }
-    pub fn flash_space(mut self, flash_space: bool) -> Self {
+    pub const fn flash_space(mut self, flash_space: bool) -> Self {
         self.flash_space = flash_space;
         self
     }
-    pub fn path_error(mut self, path_error: bool) -> Self {
+    pub const fn path_error(mut self, path_error: bool) -> Self {
         self.path_error = path_error;
         self
     }
-    pub fn progress_indicator(mut self, progress_indicator: u64) -> Self {
+    pub const fn progress_indicator(mut self, progress_indicator: u64) -> Self {
         self.progress_indicator = progress_indicator;
         self
     }
-    pub fn read_errors(mut self, read_errors: u64) -> Self {
+    pub const fn read_errors(mut self, read_errors: u64) -> Self {
         if read_errors > 0 {
             self.read_errors = Some(read_errors);
         }
         self
     }
-    pub fn zoom_level(mut self, zoom_level: usize) -> Self {
+    pub const fn zoom_level(mut self, zoom_level: usize) -> Self {
         if zoom_level > 0 {
             self.zoom_level = Some(zoom_level);
         }
@@ -90,14 +90,14 @@ impl Widget for TitleLine<'_> {
             // eg. if base_path is "/", we don't want current path to
             // also start with "/" otherwise we'll have "//path_to_my/location"
             // instead of "/path_to_my/location"
-            format!("")
+            String::new()
         } else {
             format!("{}", ::std::path::MAIN_SEPARATOR)
         };
         #[cfg(test)]
         let current_path = str::replace(&current_path, "\\", "/");
         #[cfg(test)]
-        let base_path = str::replace(&base_path, "\\", "/");
+        let base_path = str::replace(base_path, "\\", "/");
         #[cfg(test)]
         let separator = str::replace(&separator, "\\", "/");
         let total_size = DisplaySize(self.base_path_info.size as f64);
@@ -109,70 +109,64 @@ impl Widget for TitleLine<'_> {
         let mut default_style = Style::default().fg(Color::Yellow);
         if !self.show_loading {
             default_style = default_style.add_modifier(Modifier::BOLD);
-        };
+        }
         let mut title_telescope = TitleTelescope::new(default_style);
         if self.show_loading {
             title_telescope.append_to_left_side(vec![
                 CellSizeOpt::new(format!(
-                    "Scanning: {} ({} files)",
-                    total_size, total_descendants
+                    "Scanning: {total_size} ({total_descendants} files)"
                 )),
-                CellSizeOpt::new(format!("Scanning: {}", total_size)),
-                CellSizeOpt::new(format!("{}", total_size)),
+                CellSizeOpt::new(format!("Scanning: {total_size}")),
+                CellSizeOpt::new(format!("{total_size}")),
             ]);
         } else {
             title_telescope.append_to_left_side(vec![
                 CellSizeOpt::new(format!(
-                    "Total: {} ({} files), freed: {}",
-                    total_size, total_descendants, space_freed
+                    "Total: {total_size} ({total_descendants} files), freed: {space_freed}"
                 )),
-                CellSizeOpt::new(format!("Total: {}, freed: {}", total_size, space_freed)),
-                CellSizeOpt::new(format!("Total: {}", total_size)),
-                CellSizeOpt::new(format!("{}", total_size)),
+                CellSizeOpt::new(format!("Total: {total_size}, freed: {space_freed}")),
+                CellSizeOpt::new(format!("Total: {total_size}")),
+                CellSizeOpt::new(format!("{total_size}")),
             ]);
-        };
+        }
         if let Some(read_errors) = self.read_errors {
             title_telescope.append_to_left_side(vec![
-                CellSizeOpt::new(format!(" (failed to read {} files)", read_errors))
+                CellSizeOpt::new(format!(" (failed to read {read_errors} files)"))
                     .style(default_style.fg(Color::Red)),
-                CellSizeOpt::new(format!(" ({} errors)", read_errors))
+                CellSizeOpt::new(format!(" ({read_errors} errors)"))
                     .style(default_style.fg(Color::Red)),
                 CellSizeOpt::new(" (errors)".to_string()).style(default_style.fg(Color::Red)),
             ]);
         }
         if is_user_admin() {
             title_telescope.append_to_left_side(vec![
-                CellSizeOpt::new(format!(" (CAUTION: running as root)"))
+                CellSizeOpt::new(" (CAUTION: running as root)".to_string())
                     .style(default_style.fg(Color::Red)),
-                CellSizeOpt::new(format!(" (running as root)")).style(default_style.fg(Color::Red)),
+                CellSizeOpt::new(" (running as root)".to_string())
+                    .style(default_style.fg(Color::Red)),
                 CellSizeOpt::new(" (root)".to_string()).style(default_style.fg(Color::Red)),
             ]);
         }
-        title_telescope.append_to_right_side(vec![CellSizeOpt::new(base_path.to_string())]);
+        title_telescope.append_to_right_side(vec![CellSizeOpt::new(base_path.clone())]);
         if !current_path.is_empty() {
             title_telescope.append_to_right_side(vec![
                 CellSizeOpt::new(format!(
-                    "{}{} ({}, {} files)",
-                    separator, current_path, current_folder_size, current_folder_descendants
+                    "{separator}{current_path} ({current_folder_size}, {current_folder_descendants} files)"
                 ))
                 .style(default_style.fg(Color::Green)),
                 CellSizeOpt::new(format!(
-                    "{}{} ({})",
-                    separator, current_path, current_folder_size
+                    "{separator}{current_path} ({current_folder_size})"
                 ))
                 .style(default_style.fg(Color::Green)),
-                CellSizeOpt::new(format!("{}{}", separator, current_path))
+                CellSizeOpt::new(format!("{separator}{current_path}"))
                     .style(default_style.fg(Color::Green)),
             ]);
         }
         if let Some(zoom_level) = self.zoom_level {
             title_telescope.append_to_right_side(vec![
-                CellSizeOpt::new(format!(
-                    " (+{} larger file(s), zoom out to show)",
-                    zoom_level
-                ))
-                .style(default_style.fg(Color::Green)),
-                CellSizeOpt::new(format!(" (+{} larger file(s))", zoom_level))
+                CellSizeOpt::new(format!(" (+{zoom_level} larger file(s), zoom out to show)"))
+                    .style(default_style.fg(Color::Green)),
+                CellSizeOpt::new(format!(" (+{zoom_level} larger file(s))"))
                     .style(default_style.fg(Color::Green)),
             ]);
         }

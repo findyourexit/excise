@@ -5,7 +5,7 @@ use ratatui::backend::{Backend, ClearType, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
 
-#[derive(Hash, Debug, PartialEq)]
+#[derive(Hash, Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
     Clear,
     HideCursor,
@@ -23,13 +23,13 @@ pub struct TestBackend {
 }
 
 impl TestBackend {
-    pub fn new(
+    pub const fn new(
         log: Arc<Mutex<Vec<TerminalEvent>>>,
         draw_log: Arc<Mutex<Vec<String>>>,
         terminal_width: Arc<Mutex<u16>>,
         terminal_height: Arc<Mutex<u16>>,
-    ) -> TestBackend {
-        TestBackend {
+    ) -> Self {
+        Self {
             events: log,
             draw_events: draw_log,
             terminal_width,
@@ -56,22 +56,34 @@ impl Backend for TestBackend {
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        self.events.lock().unwrap().push(TerminalEvent::Clear);
+        self.events
+            .lock()
+            .expect("Failed to lock mutex")
+            .push(TerminalEvent::Clear);
         Ok(())
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
-        self.events.lock().unwrap().push(TerminalEvent::HideCursor);
+        self.events
+            .lock()
+            .expect("Failed to lock mutex")
+            .push(TerminalEvent::HideCursor);
         Ok(())
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
-        self.events.lock().unwrap().push(TerminalEvent::ShowCursor);
+        self.events
+            .lock()
+            .expect("Failed to lock mutex")
+            .push(TerminalEvent::ShowCursor);
         Ok(())
     }
 
     fn get_cursor(&mut self) -> io::Result<(u16, u16)> {
-        self.events.lock().unwrap().push(TerminalEvent::GetCursor);
+        self.events
+            .lock()
+            .expect("Failed to lock mutex")
+            .push(TerminalEvent::GetCursor);
         Ok((0, 0))
     }
 
@@ -83,36 +95,42 @@ impl Backend for TestBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        self.events.lock().unwrap().push(TerminalEvent::Draw);
+        self.events
+            .lock()
+            .expect("Failed to lock mutex")
+            .push(TerminalEvent::Draw);
         let mut string = String::with_capacity(content.size_hint().0 * 3);
         let mut coordinates = HashMap::new();
         for (x, y, cell) in content {
             coordinates.insert(Point { x, y }, cell);
         }
-        let terminal_height = self.terminal_height.lock().unwrap();
-        let terminal_width = self.terminal_width.lock().unwrap();
+        let terminal_height = self.terminal_height.lock().expect("Failed to lock mutex");
+        let terminal_width = self.terminal_width.lock().expect("Failed to lock mutex");
         for y in 0..*terminal_height {
             for x in 0..*terminal_width {
                 match coordinates.get(&Point { x, y }) {
                     Some(cell) => {
                         // this will contain no style information at all
                         // should be good enough for testing
-                        string.push_str(&cell.symbol());
+                        string.push_str(cell.symbol());
                     }
                     None => {
-                        string.push_str(" ");
+                        string.push(' ');
                     }
                 }
             }
-            string.push_str("\n");
+            string.push('\n');
         }
-        self.draw_events.lock().unwrap().push(string);
+        self.draw_events
+            .lock()
+            .expect("Failed to lock mutex")
+            .push(string);
         Ok(())
     }
 
     fn size(&self) -> io::Result<Size> {
-        let terminal_height = self.terminal_height.lock().unwrap();
-        let terminal_width = self.terminal_width.lock().unwrap();
+        let terminal_height = self.terminal_height.lock().expect("Failed to lock mutex");
+        let terminal_width = self.terminal_width.lock().expect("Failed to lock mutex");
 
         Ok(Size::new(*terminal_width, *terminal_height))
     }
@@ -126,8 +144,8 @@ impl Backend for TestBackend {
     }
 
     fn window_size(&mut self) -> io::Result<WindowSize> {
-        let terminal_height = self.terminal_height.lock().unwrap();
-        let terminal_width = self.terminal_width.lock().unwrap();
+        let terminal_height = self.terminal_height.lock().expect("Failed to lock mutex");
+        let terminal_width = self.terminal_width.lock().expect("Failed to lock mutex");
 
         Ok(WindowSize {
             columns_rows: Size::new(*terminal_width, *terminal_height),
@@ -136,7 +154,10 @@ impl Backend for TestBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.events.lock().unwrap().push(TerminalEvent::Flush);
+        self.events
+            .lock()
+            .expect("Failed to lock mutex")
+            .push(TerminalEvent::Flush);
         Ok(())
     }
 }

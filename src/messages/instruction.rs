@@ -2,8 +2,8 @@ use ::std::fs::Metadata;
 use ::std::path::PathBuf;
 use ::std::sync::mpsc::Receiver;
 
-use ratatui::backend::Backend;
 use crossterm::event::Event as BackEvent;
+use ratatui::backend::Backend;
 
 use crate::input::{
     handle_keypress_delete_file_mode, handle_keypress_error_message, handle_keypress_exiting_mode,
@@ -27,7 +27,7 @@ pub enum Instruction {
     IncrementFailedToRead,
 }
 
-pub fn handle_instructions<B>(app: &mut App<B>, receiver: Receiver<Instruction>)
+pub fn handle_instructions<B>(app: &mut App<B>, receiver: &Receiver<Instruction>)
 where
     B: Backend,
 {
@@ -69,26 +69,26 @@ where
             Instruction::Keypress(evt) => {
                 match &app.ui_mode {
                     UiMode::Loading => {
-                        handle_keypress_loading_mode(evt, app);
+                        handle_keypress_loading_mode(&evt, app);
                     }
                     UiMode::Normal => {
-                        handle_keypress_normal_mode(evt, app);
+                        handle_keypress_normal_mode(&evt, app);
                     }
                     UiMode::ScreenTooSmall => {
-                        handle_keypress_screen_too_small(evt, app);
+                        handle_keypress_screen_too_small(&evt, app);
                     }
                     UiMode::DeleteFile(file_to_delete) => {
                         let file_to_delete = file_to_delete.clone();
-                        handle_keypress_delete_file_mode(evt, app, file_to_delete);
+                        handle_keypress_delete_file_mode(&evt, app, &file_to_delete);
                     }
                     UiMode::ErrorMessage(_) => {
-                        handle_keypress_error_message(evt, app);
+                        handle_keypress_error_message(&evt, app);
                     }
                     UiMode::Exiting { app_loaded: _ } => {
-                        handle_keypress_exiting_mode(evt, app);
+                        handle_keypress_exiting_mode(&evt, app);
                     }
                     UiMode::WarningMessage => {
-                        handle_keypress_warning_message(evt, app);
+                        handle_keypress_warning_message(app);
                     }
                 }
                 if !app.is_running {

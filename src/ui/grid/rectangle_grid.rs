@@ -29,7 +29,7 @@ fn draw_empty_folder(buf: &mut Buffer, area: Rect) {
     let text_length = empty_folder_line.len();
     let text_style = Style::default();
     let text_start_position =
-        (((area.width - 1) - text_length as u16) as f64 / 2.0).ceil() as u16 + area.x;
+        (f64::from((area.width - 1) - text_length as u16) / 2.0).ceil() as u16 + area.x;
     buf.set_string(
         text_start_position,
         (area.height / 2) + area.y - 1,
@@ -47,7 +47,7 @@ pub struct RectangleGrid<'a> {
 }
 
 impl<'a> RectangleGrid<'a> {
-    pub fn new(
+    pub const fn new(
         rectangles: &'a [Tile],
         small_files_coordinates: Option<(u16, u16)>,
         selected_rect_index: Option<usize>,
@@ -60,7 +60,7 @@ impl<'a> RectangleGrid<'a> {
     }
 }
 
-impl<'a> Widget for RectangleGrid<'a> {
+impl Widget for RectangleGrid<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if self.rectangles.is_empty() {
             draw_empty_folder(buf, area);
@@ -71,7 +71,7 @@ impl<'a> Widget for RectangleGrid<'a> {
                 } else {
                     false
                 };
-                draw_tile_text_on_grid(buf, &tile, selected);
+                draw_tile_text_on_grid(buf, tile, selected);
                 draw_rect_on_grid(buf, (tile.x, tile.y), (tile.width, tile.height));
             }
         }

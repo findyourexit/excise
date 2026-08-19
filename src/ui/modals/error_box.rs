@@ -11,12 +11,12 @@ pub struct ErrorBox<'a> {
 }
 
 impl<'a> ErrorBox<'a> {
-    pub fn new(error_message: &'a str) -> Self {
+    pub const fn new(error_message: &'a str) -> Self {
         Self { error_message }
     }
 }
 
-impl<'a> Widget for ErrorBox<'a> {
+impl Widget for ErrorBox<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let (width, height) = if area.width > 150 {
             (150, 10)
@@ -27,8 +27,8 @@ impl<'a> Widget for ErrorBox<'a> {
         };
 
         // position self in the middle of the rect
-        let x = ((area.x + area.width) / 2) - width / 2;
-        let y = ((area.y + area.height) / 2) - height / 2;
+        let x = u16::midpoint(area.x, area.width) - width / 2;
+        let y = u16::midpoint(area.y, area.height) - height / 2;
 
         let message_rect = Rect {
             x,
@@ -47,12 +47,12 @@ impl<'a> Widget for ErrorBox<'a> {
         // to be the important part
         let error_text = truncate_end(self.error_message, text_max_length);
         let error_text_start_position =
-            ((message_rect.width - error_text.chars().count() as u16) as f64 / 2.0).ceil() as u16
+            (f64::from(message_rect.width - error_text.chars().count() as u16) / 2.0).ceil() as u16
                 + message_rect.x;
 
         let controls_text = ["(Press <ESC> to dismiss)", "(<ESC> to dismiss)"];
 
-        draw_filled_rect(buf, fill_style, &message_rect);
+        draw_filled_rect(buf, fill_style, message_rect);
         buf.set_string(
             error_text_start_position,
             message_rect.y + message_rect.height / 2 - 2,
@@ -60,11 +60,12 @@ impl<'a> Widget for ErrorBox<'a> {
             fill_style,
         );
 
-        for line in controls_text.iter() {
+        for line in &controls_text {
             if text_max_length >= line.chars().count() as u16 {
-                let start_position =
-                    ((message_rect.width - line.chars().count() as u16) as f64 / 2.0).ceil() as u16
-                        + message_rect.x;
+                let start_position = (f64::from(message_rect.width - line.chars().count() as u16)
+                    / 2.0)
+                    .ceil() as u16
+                    + message_rect.x;
                 buf.set_string(
                     start_position,
                     message_rect.y + message_rect.height / 2 + 2,

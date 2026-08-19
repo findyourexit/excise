@@ -1,16 +1,16 @@
 use ::std::path::PathBuf;
+use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::Terminal;
 
+use crate::UiMode;
+use crate::state::UiEffects;
 use crate::state::files::FileTree;
 use crate::state::tiles::Board;
-use crate::state::UiEffects;
 use crate::ui::grid::RectangleGrid;
 use crate::ui::modals::{ConfirmBox, ErrorBox, MessageBox, WarningBox};
 use crate::ui::title::TitleLine;
 use crate::ui::{BottomLine, TermTooSmall};
-use crate::UiMode;
 
 pub struct FolderInfo<'a> {
     pub path: &'a PathBuf,
@@ -33,15 +33,20 @@ where
         let mut terminal = Terminal::new(terminal_backend).expect("failed to create terminal");
         terminal.clear().expect("failed to clear terminal");
         terminal.hide_cursor().expect("failed to hide cursor");
-        Display { terminal }
+        Self { terminal }
     }
     pub fn size(&self) -> Rect {
         let size = self.terminal.size().expect("could not get terminal size");
         Rect::new(0, 0, size.width, size.height)
     }
+    /// Renders the application UI based on the current mode
+    ///
+    /// # Panics
+    /// Panics if the terminal drawing fails
+    #[allow(clippy::too_many_lines)]
     pub fn render(
         &mut self,
-        file_tree: &mut FileTree,
+        file_tree: &FileTree,
         board: &mut Board,
         ui_mode: &UiMode,
         ui_effects: &UiEffects,
@@ -61,7 +66,7 @@ where
                 };
                 let path_in_filesystem = &file_tree.path_in_filesystem;
                 let base_path_info = FolderInfo {
-                    path: &path_in_filesystem,
+                    path: path_in_filesystem,
                     size: base_path_size,
                     num_descendants: base_path_descendants,
                 };
@@ -82,7 +87,7 @@ where
                 let mut main_area = chunks[1];
                 main_area.width = main_area.width.saturating_sub(1);
                 main_area.height = main_area.height.saturating_sub(1);
-                board.change_area(&main_area);
+                board.change_area(main_area);
                 match ui_mode {
                     UiMode::Loading => {
                         f.render_widget(
@@ -148,7 +153,7 @@ where
                         );
                     }
                     UiMode::ScreenTooSmall => {
-                        f.render_widget(TermTooSmall::new(), full_screen);
+                        f.render_widget(TermTooSmall::new(), f.area());
                     }
                     UiMode::DeleteFile(file_to_delete) => {
                         f.render_widget(
@@ -272,7 +277,7 @@ where
                             ),
                             chunks[1],
                         );
-                        f.render_widget(ConfirmBox::new(), full_screen);
+                        f.render_widget(ConfirmBox::new(), f.area());
                     }
                     UiMode::WarningMessage => {
                         f.render_widget(
@@ -307,10 +312,11 @@ where
                         );
                         f.render_widget(WarningBox::new(), full_screen);
                     }
-                };
+                }
             })
             .expect("failed to draw");
     }
+
     pub fn clear(&mut self) {
         self.terminal.clear().expect("failed to clear terminal");
         self.terminal.show_cursor().expect("failed to show cursor");

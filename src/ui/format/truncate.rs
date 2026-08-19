@@ -27,9 +27,9 @@ pub fn truncate_middle(row: &str, max_length: u16) -> String {
                 .collect::<String>();
 
         if max_length % 2 == 0 {
-            format!("{}[...]{}", first_slice, second_slice)
+            format!("{first_slice}[...]{second_slice}")
         } else {
-            format!("{}[..]{}", first_slice, second_slice)
+            format!("{first_slice}[..]{second_slice}")
         }
     } else {
         row.to_string()
@@ -40,7 +40,7 @@ pub fn truncate_end(row: &str, max_len: u16) -> String {
     if row.chars().count() > max_len as usize {
         let mut truncated = String::from(row);
         truncated.truncate(max_len as usize - 3);
-        format!("{}...", truncated)
+        format!("{truncated}...")
     } else {
         row.to_string()
     }

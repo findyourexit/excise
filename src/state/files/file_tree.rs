@@ -2,8 +2,8 @@ use ::std::ffi::{OsStr, OsString};
 use ::std::fs::Metadata;
 use ::std::path::{Path, PathBuf};
 
-use crate::state::files::{FileOrFolder, Folder};
 use crate::state::FileToDelete;
+use crate::state::files::{FileOrFolder, Folder};
 
 pub struct FileTree {
     pub current_folder_names: Vec<OsString>,
@@ -15,8 +15,12 @@ pub struct FileTree {
 }
 
 impl FileTree {
-    pub fn new(base_folder: Folder, path_in_filesystem: PathBuf, show_apparent_size: bool) -> Self {
-        FileTree {
+    pub const fn new(
+        base_folder: Folder,
+        path_in_filesystem: PathBuf,
+        show_apparent_size: bool,
+    ) -> Self {
+        Self {
             base_folder,
             current_folder_names: Vec::new(),
             path_in_filesystem,
@@ -25,10 +29,10 @@ impl FileTree {
             show_apparent_size,
         }
     }
-    pub fn get_total_size(&self) -> u128 {
+    pub const fn get_total_size(&self) -> u128 {
         self.base_folder.size
     }
-    pub fn get_total_descendants(&self) -> u64 {
+    pub const fn get_total_descendants(&self) -> u64 {
         self.base_folder.num_descendants
     }
     pub fn get_current_folder(&self) -> &Folder {
@@ -37,7 +41,7 @@ impl FileTree {
         } else if let Some(FileOrFolder::Folder(current_folder)) =
             self.base_folder.path(self.current_folder_names.clone())
         {
-            &current_folder
+            current_folder
         } else {
             // here we have something in current_folder_names but the last
             // one is somehow not a folder... this is a corrupted state
@@ -50,7 +54,7 @@ impl FileTree {
     pub fn get_current_path(&self) -> PathBuf {
         let mut full_path = PathBuf::from(&self.path_in_filesystem);
         for folder in &self.current_folder_names {
-            full_path.push(&folder)
+            full_path.push(folder);
         }
         full_path
     }
@@ -67,7 +71,7 @@ impl FileTree {
     }
     pub fn delete_file(&mut self, file_to_delete: &FileToDelete) {
         let path_to_delete = &file_to_delete.path_to_file;
-        self.base_folder.delete_path(&path_to_delete);
+        self.base_folder.delete_path(path_to_delete);
     }
     pub fn add_entry(&mut self, entry_metadata: &Metadata, entry_full_path: &Path) {
         let base_path_length = self.path_in_filesystem.components().count();
@@ -76,6 +80,6 @@ impl FileTree {
             relative_path.push(dir);
         }
         self.base_folder
-            .add_entry(entry_metadata, relative_path, self.show_apparent_size);
+            .add_entry(entry_metadata, &relative_path, self.show_apparent_size);
     }
 }

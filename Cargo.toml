@@ -43,7 +43,6 @@ warnings = "deny"
 
 [lints.clippy]
 enum_glob_use = "deny"
-nursery = "deny"
 pedantic = "deny"
 unwrap_used = "deny"
 

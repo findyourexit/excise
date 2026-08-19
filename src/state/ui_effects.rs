@@ -9,7 +9,7 @@ pub struct UiEffects {
 }
 
 impl UiEffects {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             flash_space_freed: false,
             current_path_is_red: false,
@@ -18,7 +18,7 @@ impl UiEffects {
             last_read_path: None,
         }
     }
-    pub fn increment_loading_progress_indicator(&mut self) {
+    pub const fn increment_loading_progress_indicator(&mut self) {
         // increasing and decreasing this number will increase
         // the scanning text animation speed
         self.loading_progress_indicator += 3;

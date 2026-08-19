@@ -11,6 +11,8 @@ pub enum Event {
 
 use std::sync::mpsc::{Receiver, SyncSender};
 
+// Channels must be moved into thread closures since Receiver<T> is !Sync
+#[allow(clippy::needless_pass_by_value)]
 pub fn handle_events(event_receiver: Receiver<Event>, instruction_sender: SyncSender<Instruction>) {
     loop {
         let event = event_receiver

@@ -8,13 +8,13 @@ use crate::ui::grid::draw_filled_rect;
 
 pub struct WarningBox {}
 
-impl<'a> WarningBox {
-    pub fn new() -> Self {
+impl WarningBox {
+    pub const fn new() -> Self {
         Self {}
     }
 }
 
-impl<'a> Widget for WarningBox {
+impl Widget for WarningBox {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let (width, height) = if area.width > 150 {
             (150, 10)
@@ -25,8 +25,8 @@ impl<'a> Widget for WarningBox {
         };
 
         // position self in the middle of the rect
-        let x = ((area.x + area.width) / 2) - width / 2;
-        let y = ((area.y + area.height) / 2) - height / 2;
+        let x = u16::midpoint(area.x, area.width) - width / 2;
+        let y = u16::midpoint(area.y, area.height) - height / 2;
 
         let warning_rect = Rect {
             x,
@@ -50,7 +50,7 @@ impl<'a> Widget for WarningBox {
         // set default value of the warning_text
         // to the longest one from possible_warning_texts array
         let mut warning_text = String::from(possible_warning_texts[0]);
-        for line in possible_warning_texts.iter() {
+        for line in &possible_warning_texts {
             // "+5" here is to make sure confirm message has always some padding
             if warning_rect.width >= (line.chars().count() as u16) + 5 {
                 // here we truncate the end and not the middle because
@@ -58,7 +58,7 @@ impl<'a> Widget for WarningBox {
                 // to be the important part
                 warning_text = truncate_end(line, text_max_length);
                 warning_text_start_position =
-                    ((warning_rect.width - warning_text.len() as u16) as f64 / 2.0).ceil() as u16
+                    (f64::from(warning_rect.width - warning_text.len() as u16) / 2.0).ceil() as u16
                         + warning_rect.x;
                 break;
             }
@@ -66,7 +66,7 @@ impl<'a> Widget for WarningBox {
 
         let controls_text = ["(Press any key to dismiss)", "(any key to dismiss)"];
 
-        draw_filled_rect(buf, fill_style, &warning_rect);
+        draw_filled_rect(buf, fill_style, warning_rect);
         buf.set_string(
             warning_text_start_position,
             warning_rect.y + warning_rect.height / 2 - 2,
@@ -74,11 +74,12 @@ impl<'a> Widget for WarningBox {
             fill_style,
         );
 
-        for line in controls_text.iter() {
+        for line in &controls_text {
             if text_max_length >= line.chars().count() as u16 {
-                let start_position =
-                    ((warning_rect.width - line.chars().count() as u16) as f64 / 2.0).ceil() as u16
-                        + warning_rect.x;
+                let start_position = (f64::from(warning_rect.width - line.chars().count() as u16)
+                    / 2.0)
+                    .ceil() as u16
+                    + warning_rect.x;
                 buf.set_string(
                     start_position,
                     warning_rect.y + warning_rect.height / 2 + 2,

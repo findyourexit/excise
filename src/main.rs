@@ -1,3 +1,11 @@
+#![allow(
+    clippy::unnested_or_patterns,
+    clippy::option_if_let_else,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+
 #[cfg(test)]
 mod tests;
 
@@ -14,23 +22,22 @@ use ::std::env;
 use ::std::io;
 use ::std::path::PathBuf;
 use ::std::process;
+use ::std::sync::Arc;
 use ::std::sync::atomic::{AtomicBool, Ordering};
 use ::std::sync::mpsc;
 use ::std::sync::mpsc::{Receiver, SyncSender};
-use ::std::sync::Arc;
 use ::std::thread::park_timeout;
 use ::std::{thread, time};
 use clap::Parser;
 
-use ratatui::backend::Backend;
 use crossterm::event::KeyModifiers;
 use crossterm::event::{Event as BackEvent, KeyCode, KeyEvent};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 
 use app::{App, UiMode};
 use input::TerminalEvents;
-use messages::{handle_events, Event, Instruction};
+use messages::{Event, Instruction, handle_events};
 
 #[cfg(not(test))]
 const SHOULD_SHOW_LOADING_ANIMATION: bool = true;
@@ -61,43 +68,42 @@ pub struct Opt {
 
 fn main() {
     if let Err(err) = try_main() {
-        println!("Error: {}", err);
+        println!("Error: {err}");
         process::exit(2);
     }
 }
-fn get_stdout() -> io::Result<io::Stdout> {
-    Ok(io::stdout())
+fn get_stdout() -> io::Stdout {
+    io::stdout()
 }
 
 fn try_main() -> anyhow::Result<()> {
     let opts = Opt::parse();
-
-    match get_stdout() {
-        Ok(stdout) => {
-            enable_raw_mode()?;
-            let terminal_backend = CrosstermBackend::new(stdout);
-            let terminal_events = TerminalEvents {};
-            let folder = match opts.folder {
-                Some(folder) => folder,
-                None => env::current_dir()?,
-            };
-            if !folder.as_path().is_dir() {
-                anyhow::bail!("Folder '{}' does not exist", folder.to_string_lossy())
-            }
-            start(
-                terminal_backend,
-                Box::new(terminal_events),
-                folder,
-                opts.apparent_size,
-                opts.disable_delete_confirmation,
-            );
-        }
-        Err(_) => anyhow::bail!("Failed to get stdout: are you trying to pipe 'excise'?"),
+    let stdout = get_stdout();
+    enable_raw_mode()?;
+    let terminal_backend = CrosstermBackend::new(stdout);
+    let terminal_events = TerminalEvents {};
+    let folder = match opts.folder {
+        Some(folder) => folder,
+        None => env::current_dir()?,
+    };
+    if !folder.is_dir() {
+        anyhow::bail!("Folder '{}' does not exist", folder.to_string_lossy());
     }
+    start(
+        terminal_backend,
+        Box::new(terminal_events),
+        folder,
+        opts.apparent_size,
+        opts.disable_delete_confirmation,
+    );
     disable_raw_mode()?;
     Ok(())
 }
 
+/// Starts the application with the provided backend and configuration
+///
+/// # Panics
+/// Panics if any thread fails to spawn or join
 pub fn start<B>(
     terminal_backend: B,
     terminal_events: Box<dyn Iterator<Item = BackEvent> + Send>,
@@ -108,157 +114,212 @@ pub fn start<B>(
     B: Backend + Send + 'static,
 {
     let mut active_threads = vec![];
+    let (channels, state) = setup_channels_and_state();
 
-    let (event_sender, event_receiver): (SyncSender<Event>, Receiver<Event>) =
-        mpsc::sync_channel(1);
-    let (instruction_sender, instruction_receiver): (
-        SyncSender<Instruction>,
-        Receiver<Instruction>,
-    ) = mpsc::sync_channel(100);
-
-    let running = Arc::new(AtomicBool::new(true));
-    let loaded = Arc::new(AtomicBool::new(false));
-
-    active_threads.push(
-        thread::Builder::new()
-            .name("event_executer".to_string())
-            .spawn({
-                let instruction_sender = instruction_sender.clone();
-                || handle_events(event_receiver, instruction_sender)
-            })
-            .unwrap(),
+    spawn_event_handler_thread(
+        &mut active_threads,
+        channels.instruction_sender.clone(),
+        channels.event_receiver,
     );
-
-    active_threads.push(
-        thread::Builder::new()
-            .name("stdin_handler".to_string())
-            .spawn({
-                let instruction_sender = instruction_sender.clone();
-                let running = running.clone();
-                move || {
-                    for evt in terminal_events {
-                        if let BackEvent::Resize(_x, _y) = evt {
-                            if SHOULD_HANDLE_WIN_CHANGE {
-                                let _ = instruction_sender.send(Instruction::ResetUiMode);
-                                let _ = instruction_sender.send(Instruction::Render);
-                            }
-                            continue;
-                        }
-
-                        if let BackEvent::Key(KeyEvent {
-                            code: KeyCode::Char('y'),
-                            modifiers: KeyModifiers::NONE,
-                            ..
-                        })
-                        | BackEvent::Key(KeyEvent {
-                            code: KeyCode::Char('q'),
-                            modifiers: KeyModifiers::NONE,
-                            ..
-                        })
-                        | BackEvent::Key(KeyEvent {
-
-                            code: KeyCode::Char('c'),
-                            modifiers: KeyModifiers::CONTROL,
-                            ..
-                        }) = evt
-                        {
-                            // not ideal, but works in a pinch
-                            let _ = instruction_sender.send(Instruction::Keypress(evt));
-                            park_timeout(time::Duration::from_millis(100));
-                            // if we don't wait, the app won't have time to quit
-                            if !running.load(Ordering::Acquire) {
-                                // sometimes ctrl-c doesn't shut down the app
-                                // (eg. dismissing an error message)
-                                // in order not to be aware of those particularities
-                                // we check "running"
-                                break;
-                            }
-                        } else if instruction_sender.send(Instruction::Keypress(evt)).is_err() {
-                            break;
-                        }
-                    }
-                }
-            })
-            .unwrap(),
+    spawn_input_handler_thread(
+        &mut active_threads,
+        channels.instruction_sender.clone(),
+        state.running.clone(),
+        terminal_events,
     );
-
-    active_threads.push(
-        thread::Builder::new()
-            .name("hd_scanner".to_string())
-            .spawn({
-                let path = path.clone();
-                let instruction_sender = instruction_sender.clone();
-                let loaded = loaded.clone();
-                move || {
-                    'scanning: for entry in WalkDir::new(&path)
-                        .parallelism(if SHOULD_SCAN_HD_FILES_IN_MULTIPLE_THREADS {
-                            RayonDefaultPool { busy_timeout: std::time::Duration::from_millis(100) }
-                        } else {
-                            Serial
-                        })
-                        .skip_hidden(false)
-                        .follow_links(false)
-                        .into_iter()
-                    {
-                        let instruction_sent = match entry {
-                            Ok(entry) => match entry.metadata() {
-                                Ok(file_metadata) => {
-                                    let entry_path = entry.path();
-                                    instruction_sender.send(Instruction::AddEntryToBaseFolder((
-                                        file_metadata,
-                                        entry_path,
-                                    )))
-                                }
-                                Err(_) => {
-                                    instruction_sender.send(Instruction::IncrementFailedToRead)
-                                }
-                            },
-                            Err(_) => instruction_sender.send(Instruction::IncrementFailedToRead),
-                        };
-                        if instruction_sent.is_err() {
-                            // if we fail to send an instruction here, this likely means the program has
-                            // ended and we need to break this loop as well in order not to hang
-                            break 'scanning;
-                        };
-                    }
-                    let _ = instruction_sender.send(Instruction::StartUi);
-                    loaded.store(true, Ordering::Release);
-                }
-            })
-            .unwrap(),
+    spawn_scanner_thread(
+        &mut active_threads,
+        channels.instruction_sender.clone(),
+        state.loaded.clone(),
+        path.clone(),
     );
 
     if SHOULD_SHOW_LOADING_ANIMATION {
-        active_threads.push(
-            thread::Builder::new()
-                .name("loading_loop".to_string())
-                .spawn({
-                    let instruction_sender = instruction_sender.clone();
-                    let running = running.clone();
-                    move || {
-                        while running.load(Ordering::Acquire) && !loaded.load(Ordering::Acquire) {
-                            let _ =
-                                instruction_sender.send(Instruction::ToggleScanningVisualIndicator);
-                            let _ = instruction_sender.send(Instruction::RenderAndUpdateBoard);
-                            park_timeout(time::Duration::from_millis(100));
-                        }
-                    }
-                })
-                .unwrap(),
+        spawn_loading_animation_thread(
+            &mut active_threads,
+            channels.instruction_sender,
+            state.running.clone(),
+            state.loaded.clone(),
         );
     }
 
     let mut app = App::new(
         terminal_backend,
         path,
-        event_sender,
+        channels.event_sender,
         show_apparent_size,
         disable_delete_confirmation,
     );
-    app.start(instruction_receiver);
-    running.store(false, Ordering::Release);
+    app.start(&channels.instruction_receiver);
+    state.running.store(false, Ordering::Release);
 
     for thread_handler in active_threads {
-        thread_handler.join().unwrap();
+        thread_handler.join().expect("Failed to join thread");
     }
+}
+
+struct AppChannels {
+    event_sender: SyncSender<Event>,
+    event_receiver: Receiver<Event>,
+    instruction_sender: SyncSender<Instruction>,
+    instruction_receiver: Receiver<Instruction>,
+}
+
+struct AppState {
+    running: Arc<AtomicBool>,
+    loaded: Arc<AtomicBool>,
+}
+
+fn setup_channels_and_state() -> (AppChannels, AppState) {
+    let (event_sender, event_receiver): (SyncSender<Event>, Receiver<Event>) =
+        mpsc::sync_channel(1);
+    let (instruction_sender, instruction_receiver): (
+        SyncSender<Instruction>,
+        Receiver<Instruction>,
+    ) = mpsc::sync_channel(100);
+    let running = Arc::new(AtomicBool::new(true));
+    let loaded = Arc::new(AtomicBool::new(false));
+
+    let channels = AppChannels {
+        event_sender,
+        event_receiver,
+        instruction_sender,
+        instruction_receiver,
+    };
+
+    let state = AppState { running, loaded };
+
+    (channels, state)
+}
+
+fn spawn_event_handler_thread(
+    active_threads: &mut Vec<thread::JoinHandle<()>>,
+    instruction_sender: SyncSender<Instruction>,
+    event_receiver: Receiver<Event>,
+) {
+    active_threads.push(
+        thread::Builder::new()
+            .name("event_executer".to_string())
+            .spawn(|| handle_events(event_receiver, instruction_sender))
+            .expect("Failed to spawn thread"),
+    );
+}
+
+fn spawn_input_handler_thread(
+    active_threads: &mut Vec<thread::JoinHandle<()>>,
+    instruction_sender: SyncSender<Instruction>,
+    running: Arc<AtomicBool>,
+    terminal_events: Box<dyn Iterator<Item = BackEvent> + Send>,
+) {
+    active_threads.push(
+        thread::Builder::new()
+            .name("stdin_handler".to_string())
+            .spawn(move || {
+                for evt in terminal_events {
+                    if let BackEvent::Resize(_x, _y) = evt {
+                        if SHOULD_HANDLE_WIN_CHANGE {
+                            let _ = instruction_sender.send(Instruction::ResetUiMode);
+                            let _ = instruction_sender.send(Instruction::Render);
+                        }
+                        continue;
+                    }
+
+                    if let BackEvent::Key(KeyEvent {
+                        code: KeyCode::Char('y'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    })
+                    | BackEvent::Key(KeyEvent {
+                        code: KeyCode::Char('q'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    })
+                    | BackEvent::Key(KeyEvent {
+                        code: KeyCode::Char('Q'),
+                        modifiers: KeyModifiers::SHIFT,
+                        ..
+                    })
+                    | BackEvent::Key(KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    }) = evt
+                    {
+                        let _ = instruction_sender.send(Instruction::Keypress(evt));
+                        park_timeout(time::Duration::from_millis(100));
+                        if !running.load(Ordering::Acquire) {
+                            break;
+                        }
+                    } else if instruction_sender.send(Instruction::Keypress(evt)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("Failed to spawn thread"),
+    );
+}
+
+fn spawn_scanner_thread(
+    active_threads: &mut Vec<thread::JoinHandle<()>>,
+    instruction_sender: SyncSender<Instruction>,
+    loaded: Arc<AtomicBool>,
+    path: PathBuf,
+) {
+    active_threads.push(
+        thread::Builder::new()
+            .name("hd_scanner".to_string())
+            .spawn(move || {
+                'scanning: for entry in WalkDir::new(&path)
+                    .parallelism(if SHOULD_SCAN_HD_FILES_IN_MULTIPLE_THREADS {
+                        RayonDefaultPool {
+                            busy_timeout: std::time::Duration::from_millis(100),
+                        }
+                    } else {
+                        Serial
+                    })
+                    .skip_hidden(false)
+                    .follow_links(false)
+                {
+                    let instruction_sent = match entry {
+                        Ok(entry) => match entry.metadata() {
+                            Ok(file_metadata) => {
+                                let entry_path = entry.path();
+                                instruction_sender.send(Instruction::AddEntryToBaseFolder((
+                                    file_metadata,
+                                    entry_path,
+                                )))
+                            }
+                            Err(_) => instruction_sender.send(Instruction::IncrementFailedToRead),
+                        },
+                        Err(_) => instruction_sender.send(Instruction::IncrementFailedToRead),
+                    };
+                    if instruction_sent.is_err() {
+                        break 'scanning;
+                    }
+                }
+                let _ = instruction_sender.send(Instruction::StartUi);
+                loaded.store(true, Ordering::Release);
+            })
+            .expect("Failed to spawn thread"),
+    );
+}
+
+fn spawn_loading_animation_thread(
+    active_threads: &mut Vec<thread::JoinHandle<()>>,
+    instruction_sender: SyncSender<Instruction>,
+    running: Arc<AtomicBool>,
+    loaded: Arc<AtomicBool>,
+) {
+    active_threads.push(
+        thread::Builder::new()
+            .name("loading_loop".to_string())
+            .spawn(move || {
+                while running.load(Ordering::Acquire) && !loaded.load(Ordering::Acquire) {
+                    let _ = instruction_sender.send(Instruction::ToggleScanningVisualIndicator);
+                    let _ = instruction_sender.send(Instruction::RenderAndUpdateBoard);
+                    park_timeout(time::Duration::from_millis(100));
+                }
+            })
+            .expect("Failed to spawn thread"),
+    );
 }

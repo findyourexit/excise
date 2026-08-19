@@ -6,12 +6,12 @@ use ratatui::widgets::Widget;
 pub struct TermTooSmall {}
 
 impl TermTooSmall {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {}
     }
 }
 
-impl<'a> Widget for TermTooSmall {
+impl Widget for TermTooSmall {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let text = [
             "Terminal window is too small ¯\\_(ツ)_/¯",
@@ -20,10 +20,10 @@ impl<'a> Widget for TermTooSmall {
             "¯\\_(ツ)_/¯",
             "!!!",
         ];
-        for line in text.iter() {
+        for line in &text {
             if area.width >= line.chars().count() as u16 {
                 buf.set_string(
-                    ((area.x + area.width) / 2) as u16 - ((line.chars().count() / 2) as u16),
+                    u16::midpoint(area.x, area.width) - ((line.chars().count() / 2) as u16),
                     area.y + area.height / 2,
                     line,
                     Style::default().add_modifier(Modifier::BOLD),

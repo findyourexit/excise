@@ -2,7 +2,7 @@ use ratatui::layout::Rect;
 
 use crate::state::files::Folder;
 use crate::state::tiles::files_in_folder::FileType;
-use crate::state::tiles::{files_in_folder, FileMetadata, Tile, TreeMap};
+use crate::state::tiles::{FileMetadata, Tile, TreeMap, files_in_folder};
 
 pub struct Board {
     pub tiles: Vec<Tile>,
@@ -16,7 +16,7 @@ pub struct Board {
 
 impl Board {
     pub fn new(folder: &Folder) -> Self {
-        Board {
+        Self {
             tiles: vec![],
             unrenderable_tile_coordinates: None,
             files: files_in_folder(folder, 0),
@@ -35,35 +35,34 @@ impl Board {
         self.files = files_in_folder(folder, self.zoom_level);
         self.fill();
     }
-    pub fn change_area(&mut self, area: &Rect) {
-        if self.area != *area {
-            self.area = *area;
+    pub fn change_area(&mut self, area: Rect) {
+        if self.area != area {
+            self.area = area;
             self.fill();
         }
     }
     fn fill(&mut self) {
-        let mut tree_map = TreeMap::new(&self.area);
+        let mut tree_map = TreeMap::new(self.area);
         tree_map.populate_tiles(self.files.iter().collect());
         self.tiles = tree_map.tiles;
         self.unrenderable_tile_coordinates = tree_map.unrenderable_tile_coordinates;
     }
-    pub fn get_selected_index(&self) -> Option<usize> {
+    pub const fn get_selected_index(&self) -> Option<usize> {
         self.selected_index
     }
-    pub fn set_selected_index(&mut self, next_index: &usize) {
-        self.selected_index = Some(*next_index);
+    pub const fn set_selected_index(&mut self, next_index: usize) {
+        self.selected_index = Some(next_index);
     }
-    pub fn has_selected_index(&self) -> bool {
+    pub const fn has_selected_index(&self) -> bool {
         self.selected_index.is_some()
     }
-    pub fn reset_selected_index(&mut self) {
+    pub const fn reset_selected_index(&mut self) {
         self.selected_index = None;
     }
     pub fn currently_selected(&self) -> Option<&Tile> {
-        match &self.selected_index {
-            Some(selected_index) => self.tiles.get(*selected_index),
-            None => None,
-        }
+        self.selected_index
+            .as_ref()
+            .and_then(|selected_index| self.tiles.get(*selected_index))
     }
     pub fn pop_previous_index_and_zoom_level(&mut self) -> Option<(Option<usize>, usize)> {
         self.previous_indices_and_zoom_level.pop()
@@ -78,7 +77,7 @@ impl Board {
             .next();
 
         if let Some(index) = next_index {
-            self.set_selected_index(&index);
+            self.set_selected_index(index);
         }
     }
     pub fn move_selected_right(&mut self) {
@@ -89,18 +88,18 @@ impl Board {
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| {
-                        c.is_directly_right_of(&currently_selected)
-                            && c.horizontally_overlaps_with(&currently_selected)
+                        c.is_directly_right_of(currently_selected)
+                            && c.horizontally_overlaps_with(currently_selected)
                     })
                     // get the index of the tile with the most overlap with currently selected
-                    .max_by_key(|(_, c)| c.get_horizontal_overlap_with(&currently_selected))
+                    .max_by_key(|(_, c)| c.get_horizontal_overlap_with(currently_selected))
                     .map(|(index, _)| index);
                 match next_index {
-                    Some(i) => self.set_selected_index(&i),
+                    Some(i) => self.set_selected_index(i),
                     None => self.reset_selected_index(), // move off the edge of the screen resets selection
                 }
             }
-            None => self.set_selected_index(&0),
+            None => self.set_selected_index(0),
         }
     }
     pub fn move_selected_left(&mut self) {
@@ -111,18 +110,18 @@ impl Board {
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| {
-                        c.is_directly_left_of(&currently_selected)
-                            && c.horizontally_overlaps_with(&currently_selected)
+                        c.is_directly_left_of(currently_selected)
+                            && c.horizontally_overlaps_with(currently_selected)
                     })
                     // get the index of the tile with the most overlap with currently selected
-                    .max_by_key(|(_, c)| c.get_horizontal_overlap_with(&currently_selected))
+                    .max_by_key(|(_, c)| c.get_horizontal_overlap_with(currently_selected))
                     .map(|(index, _)| index);
                 match next_index {
-                    Some(i) => self.set_selected_index(&i),
+                    Some(i) => self.set_selected_index(i),
                     None => self.reset_selected_index(), // move off the edge of the screen resets selection
                 }
             }
-            None => self.set_selected_index(&0),
+            None => self.set_selected_index(0),
         }
     }
     pub fn move_selected_down(&mut self) {
@@ -133,18 +132,18 @@ impl Board {
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| {
-                        c.is_directly_below(&currently_selected)
-                            && c.vertically_overlaps_with(&currently_selected)
+                        c.is_directly_below(currently_selected)
+                            && c.vertically_overlaps_with(currently_selected)
                     })
                     // get the index of the tile with the most overlap with currently selected
-                    .max_by_key(|(_, c)| c.get_vertical_overlap_with(&currently_selected))
+                    .max_by_key(|(_, c)| c.get_vertical_overlap_with(currently_selected))
                     .map(|(index, _)| index);
                 match next_index {
-                    Some(i) => self.set_selected_index(&i),
+                    Some(i) => self.set_selected_index(i),
                     None => self.reset_selected_index(), // move off the edge of the screen resets selection
                 }
             }
-            None => self.set_selected_index(&0),
+            None => self.set_selected_index(0),
         }
     }
     pub fn move_selected_up(&mut self) {
@@ -155,18 +154,18 @@ impl Board {
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| {
-                        c.is_directly_above(&currently_selected)
-                            && c.vertically_overlaps_with(&currently_selected)
+                        c.is_directly_above(currently_selected)
+                            && c.vertically_overlaps_with(currently_selected)
                     })
                     // get the index of the tile with the most overlap with currently selected
-                    .max_by_key(|(_, c)| c.get_vertical_overlap_with(&currently_selected))
+                    .max_by_key(|(_, c)| c.get_vertical_overlap_with(currently_selected))
                     .map(|(index, _)| index);
                 match next_index {
-                    Some(i) => self.set_selected_index(&i),
+                    Some(i) => self.set_selected_index(i),
                     None => self.reset_selected_index(), // move off the edge of the screen resets selection
                 }
             }
-            None => self.set_selected_index(&0),
+            None => self.set_selected_index(0),
         }
     }
     pub fn zoom_in(&mut self, folder: &Folder) {
@@ -188,10 +187,10 @@ impl Board {
         self.files = files_in_folder(folder, self.zoom_level);
         self.fill();
     }
-    pub fn reset_zoom_index(&mut self) {
+    pub const fn reset_zoom_index(&mut self) {
         self.zoom_level = 0;
     }
-    pub fn set_zoom_index(&mut self, index: usize) {
+    pub const fn set_zoom_index(&mut self, index: usize) {
         self.zoom_level = index;
     }
     pub fn record_current_index_and_zoom_level(&mut self) {

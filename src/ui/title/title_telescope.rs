@@ -21,13 +21,13 @@ pub struct CellSizeOpt {
 }
 
 impl CellSizeOpt {
-    pub fn new(content: String) -> Self {
-        CellSizeOpt {
+    pub const fn new(content: String) -> Self {
+        Self {
             content,
             style: None,
         }
     }
-    pub fn style(mut self, style: Style) -> Self {
+    pub const fn style(mut self, style: Style) -> Self {
         self.style = Some(style);
         self
     }
@@ -44,8 +44,8 @@ pub struct TitleTelescope {
 }
 
 impl TitleTelescope {
-    pub fn new(default_style: Style) -> Self {
-        TitleTelescope {
+    pub const fn new(default_style: Style) -> Self {
+        Self {
             default_style,
             left_side: vec![],
             right_side: vec![],
@@ -61,16 +61,16 @@ impl TitleTelescope {
     pub fn append_to_right_side(&mut self, collapsing_cell: CollapsingCell) {
         self.right_side.push(collapsing_cell);
     }
-    pub fn loading(mut self, show_loading: bool, loading_indicator: u64) -> Self {
+    pub const fn loading(mut self, show_loading: bool, loading_indicator: u64) -> Self {
         self.loading = show_loading;
         self.loading_indicator = loading_indicator;
         self
     }
-    pub fn path_error(mut self, should_show_path_error: bool) -> Self {
+    pub const fn path_error(mut self, should_show_path_error: bool) -> Self {
         self.path_error = should_show_path_error;
         self
     }
-    pub fn size_flash(mut self, should_flash_size: bool) -> Self {
+    pub const fn size_flash(mut self, should_flash_size: bool) -> Self {
         self.size_flash = should_flash_size;
         self
     }
@@ -78,12 +78,12 @@ impl TitleTelescope {
         let highest_collapse_count = max(
             self.left_side
                 .iter()
-                .map(|c| c.len())
+                .map(std::vec::Vec::len)
                 .max()
                 .expect("could not get max cell value"),
             self.right_side
                 .iter()
-                .map(|c| c.len())
+                .map(std::vec::Vec::len)
                 .max()
                 .expect("could not get max cell value"),
         );
@@ -99,14 +99,14 @@ impl TitleTelescope {
     }
     fn left_side_candidate(&self, index: usize) -> Vec<&CellSizeOpt> {
         let mut left_side = vec![];
-        for collapsing_cell in self.left_side.iter() {
+        for collapsing_cell in &self.left_side {
             left_side.push(get_index_or_last(collapsing_cell, index));
         }
         left_side
     }
     fn right_side_candidate(&self, index: usize) -> Vec<&CellSizeOpt> {
         let mut right_side = vec![];
-        for collapsing_cell in self.right_side.iter() {
+        for collapsing_cell in &self.right_side {
             right_side.push(get_index_or_last(collapsing_cell, index));
         }
         right_side
@@ -119,7 +119,7 @@ impl TitleTelescope {
         let style_if_path_error = Style::default().bg(Color::Red).fg(Color::White);
         self.condition_style_or_default(self.path_error, style_if_path_error, style)
     }
-    fn condition_style_or_default(
+    const fn condition_style_or_default(
         &self,
         condition: bool,
         condition_style: Style,
@@ -204,10 +204,8 @@ impl TitleTelescope {
             .set_symbol(&character.to_string())
             .set_style(style);
         if index_in_text == 0 {
-            buf[(rect.x + 1, rect.y)]
-                .set_style(Style::default().bg(Color::White).fg(Color::Black));
-            buf[(rect.x + 2, rect.y)]
-                .set_style(Style::default().bg(Color::White).fg(Color::Black));
+            buf[(rect.x + 1, rect.y)].set_style(Style::default().bg(Color::White).fg(Color::Black));
+            buf[(rect.x + 2, rect.y)].set_style(Style::default().bg(Color::White).fg(Color::Black));
         } else if index_in_text == text_length - 1 {
             buf[(rect.x + 1 + index_in_text + 1, rect.y)]
                 .set_style(Style::default().bg(Color::White).fg(Color::Black));

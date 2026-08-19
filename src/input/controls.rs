@@ -1,11 +1,13 @@
-use ratatui::backend::Backend;
+#![allow(clippy::unnested_or_patterns)]
+
 use crossterm::event::Event;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
-use crossterm::event::{read, KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, read};
+use ratatui::backend::Backend;
 
-use crate::state::FileToDelete;
 use crate::App;
+use crate::state::FileToDelete;
 
 #[derive(Clone)]
 pub struct TerminalEvents;
@@ -60,7 +62,7 @@ macro_rules! key {
     };
 }
 
-pub fn handle_keypress_loading_mode<B: Backend>(evt: Event, app: &mut App<B>) {
+pub fn handle_keypress_loading_mode<B: Backend>(evt: &Event, app: &mut App<B>) {
     match evt {
         key!(ctrl 'c') | key!(char 'q') => {
             app.prompt_exit();
@@ -96,10 +98,10 @@ pub fn handle_keypress_loading_mode<B: Backend>(evt: Event, app: &mut App<B>) {
             app.go_up();
         }
         _ => (),
-    };
+    }
 }
 
-pub fn handle_keypress_normal_mode<B: Backend>(evt: Event, app: &mut App<B>) {
+pub fn handle_keypress_normal_mode<B: Backend>(evt: &Event, app: &mut App<B>) {
     match evt {
         key!(ctrl 'c') | key!(char 'q') => {
             app.prompt_exit();
@@ -135,44 +137,44 @@ pub fn handle_keypress_normal_mode<B: Backend>(evt: Event, app: &mut App<B>) {
             app.go_up();
         }
         _ => (),
-    };
+    }
 }
 
 pub fn handle_keypress_delete_file_mode<B: Backend>(
-    evt: Event,
+    evt: &Event,
     app: &mut App<B>,
-    file_to_delete: FileToDelete,
+    file_to_delete: &FileToDelete,
 ) {
     match evt {
         key!(ctrl 'c') | key!(char 'q') | key!(Esc) | key!(char 'n') => {
             app.normal_mode();
         }
         key!(char 'y') => {
-            app.delete_file(&file_to_delete);
+            app.delete_file(file_to_delete);
         }
         _ => (),
-    };
+    }
 }
 
-pub fn handle_keypress_error_message<B: Backend>(evt: Event, app: &mut App<B>) {
+pub fn handle_keypress_error_message<B: Backend>(evt: &Event, app: &mut App<B>) {
     match evt {
         key!(ctrl 'c') | key!(char 'q') | key!(Esc) => {
             app.normal_mode();
         }
         _ => (),
-    };
+    }
 }
 
-pub fn handle_keypress_screen_too_small<B: Backend>(evt: Event, app: &mut App<B>) {
+pub fn handle_keypress_screen_too_small<B: Backend>(evt: &Event, app: &mut App<B>) {
     match evt {
         key!(ctrl 'c') | key!(char 'q') => {
             app.exit();
         }
         _ => (),
-    };
+    }
 }
 
-pub fn handle_keypress_exiting_mode<B: Backend>(evt: Event, app: &mut App<B>) {
+pub fn handle_keypress_exiting_mode<B: Backend>(evt: &Event, app: &mut App<B>) {
     match evt {
         key!(ctrl 'c') | key!(char 'q') | key!(Esc) | key!(char 'n') => {
             app.reset_ui_mode();
@@ -184,13 +186,9 @@ pub fn handle_keypress_exiting_mode<B: Backend>(evt: Event, app: &mut App<B>) {
             app.exit();
         }
         _ => (),
-    };
+    }
 }
 
-pub fn handle_keypress_warning_message<B: Backend>(evt: Event, app: &mut App<B>) {
-    match evt {
-        _ => {
-            app.reset_ui_mode();
-        }
-    }
+pub fn handle_keypress_warning_message<B: Backend>(app: &mut App<B>) {
+    app.reset_ui_mode();
 }

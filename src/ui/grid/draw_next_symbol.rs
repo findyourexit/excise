@@ -14,6 +14,7 @@ pub mod boundaries {
     pub const CROSS: &str = "┼";
 }
 
+#[allow(clippy::match_same_arms)]
 fn combine_symbols(current_symbol: &str, next_symbol: &str) -> Option<&'static str> {
     match (current_symbol, next_symbol) {
         (boundaries::TOP_RIGHT, boundaries::TOP_RIGHT) => Some(boundaries::TOP_RIGHT), // (┐, ┐) => Some(┐)
@@ -110,7 +111,7 @@ fn find_next_symbol(first_symbol: &str, second_symbol: &str) -> Option<&'static 
 }
 
 pub fn draw_next_symbol(buf: &mut Buffer, x: u16, y: u16, symbol: &str) {
-    if let Some(next_symbol) = find_next_symbol(&buf[(x, y)].symbol(), symbol) {
+    if let Some(next_symbol) = find_next_symbol(buf[(x, y)].symbol(), symbol) {
         buf[(x, y)].set_symbol(next_symbol);
     } else {
         buf[(x, y)].set_symbol(symbol);

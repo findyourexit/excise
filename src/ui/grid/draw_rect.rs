@@ -1,32 +1,32 @@
+use ::unicode_width::UnicodeWidthStr;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ::unicode_width::UnicodeWidthStr;
 
 use crate::state::tiles::{FileType, Tile};
-use crate::ui::format::{truncate_middle, DisplaySize, DisplaySizeRounded};
+use crate::ui::format::{DisplaySize, DisplaySizeRounded, truncate_middle};
 use crate::ui::grid::{boundaries, draw_next_symbol};
 
 fn tile_first_line(tile: &Tile) -> String {
-    let max_text_length = if tile.width > 2 { tile.width - 2 } else { 0 };
+    let max_text_length = tile.width.saturating_sub(2);
     let name = &tile.name.to_string_lossy();
     let descendant_count = &tile.descendants;
     let filename_text = match tile.file_type {
-        FileType::File => format!("{}", name),
-        FileType::Folder => format!("{}/", name),
+        FileType::File => format!("{name}"),
+        FileType::Folder => format!("{name}/"),
     };
     match tile.file_type {
         FileType::File => truncate_middle(&filename_text, max_text_length),
         FileType::Folder => {
             let descendant_count = descendant_count.expect("folder should have descendants");
-            let short_descendants_indication = format!("(+{})", descendant_count);
-            let long_descendants_indication = format!("(+{} descendants)", descendant_count);
+            let short_descendants_indication = format!("(+{descendant_count})");
+            let long_descendants_indication = format!("(+{descendant_count} descendants)");
             if filename_text.len() + long_descendants_indication.len() <= max_text_length as usize {
-                format!("{} {}", filename_text, long_descendants_indication)
+                format!("{filename_text} {long_descendants_indication}")
             } else if filename_text.len() + short_descendants_indication.len()
                 <= max_text_length as usize
             {
-                format!("{} {}", filename_text, short_descendants_indication)
+                format!("{filename_text} {short_descendants_indication}")
             } else {
                 truncate_middle(&filename_text, max_text_length)
             }
@@ -35,12 +35,12 @@ fn tile_first_line(tile: &Tile) -> String {
 }
 
 fn tile_second_line(tile: &Tile) -> String {
-    let max_text_length = if tile.width > 2 { tile.width - 2 } else { 0 };
+    let max_text_length = tile.width.saturating_sub(2);
     let percentage = &tile.percentage;
     let display_size = DisplaySize(tile.size as f64);
     let display_size_rounded = DisplaySizeRounded(tile.size as f64);
-    let display_size = format!("{}", display_size);
-    let display_size_rounded = format!("{}", display_size_rounded);
+    let display_size = format!("{display_size}");
+    let display_size_rounded = format!("{display_size_rounded}");
     if max_text_length >= display_size.len() as u16 + 7 {
         // 7 == "(100%)" + 1 space
         format!("{} ({:.0}%)", display_size, percentage * 100.0)
@@ -146,7 +146,7 @@ pub fn draw_rect_on_grid(buf: &mut Buffer, coords: (u16, u16), dimensions: (u16,
     }
 }
 
-pub fn draw_filled_rect(buf: &mut Buffer, fill_style: Style, rect: &Rect) {
+pub fn draw_filled_rect(buf: &mut Buffer, fill_style: Style, rect: Rect) {
     let buf_width = buf.area().width;
     let buf_height = buf.area().height;
 
@@ -231,11 +231,11 @@ pub fn draw_tile_text_on_grid(buf: &mut Buffer, tile: &Tile, selected: bool) {
     let first_line = tile_first_line(tile);
     let first_line_length = first_line.width() as u16;
     let first_line_start_position =
-        ((tile.width - first_line_length) as f64 / 2.0).ceil() as u16 + tile.x;
+        (f64::from(tile.width - first_line_length) / 2.0).ceil() as u16 + tile.x;
     let second_line = tile_second_line(tile);
     let second_line_length = second_line.width();
     let second_line_start_position =
-        ((tile.width - second_line_length as u16) as f64 / 2.0).ceil() as u16 + tile.x;
+        (f64::from(tile.width - second_line_length as u16) / 2.0).ceil() as u16 + tile.x;
     let (background_style, first_line_style, second_line_style) = tile_style(tile, selected);
 
     if let Some(background_style) = background_style {
@@ -247,9 +247,7 @@ pub fn draw_tile_text_on_grid(buf: &mut Buffer, tile: &Tile, selected: bool) {
                 if y >= buf_height {
                     break;
                 }
-                buf[(x, y)]
-                    .set_symbol("█")
-                    .set_style(background_style);
+                buf[(x, y)].set_symbol("█").set_style(background_style);
                 // we set both the filling symbol and the style
                 // because some terminals do not show this symbol on the one side
                 // and our tests need it in order to pass on the other side

@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
 use crate::state::tiles::{FileType, Tile};
-use crate::ui::format::{truncate_middle, DisplaySize};
+use crate::ui::format::{DisplaySize, truncate_middle};
 
 fn render_currently_selected(buf: &mut Buffer, currently_selected: &Tile, max_len: u16, y: u16) {
     let file_name = currently_selected.name.to_string_lossy();
@@ -69,8 +69,10 @@ fn render_controls_legend(buf: &mut Buffer, hide_delete: bool, max_len: u16, y: 
         )
     } else {
         (
-            String::from("<arrows> - move around, <ENTER> - enter folder, <ESC> - parent folder, <BACKSPACE> - delete, <+/-/0> - zoom in/out/reset, <q> - quit"),
-            String::from("←↓↑→/<ENTER>/<ESC>: navigate, <BACKSPACE>: del")
+            String::from(
+                "<arrows> - move around, <ENTER> - enter folder, <ESC> - parent folder, <BACKSPACE> - delete, <+/-/0> - zoom in/out/reset, <q> - quit",
+            ),
+            String::from("←↓↑→/<ENTER>/<ESC>: navigate, <BACKSPACE>: del"),
         )
     };
     let too_small_line = "(...)";
@@ -120,7 +122,7 @@ pub struct BottomLine<'a> {
 }
 
 impl<'a> BottomLine<'a> {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             hide_delete: false,
             hide_small_files_legend: false,
@@ -128,25 +130,25 @@ impl<'a> BottomLine<'a> {
             last_read_path: None,
         }
     }
-    pub fn hide_delete(mut self) -> Self {
+    pub const fn hide_delete(mut self) -> Self {
         self.hide_delete = true;
         self
     }
-    pub fn hide_small_files_legend(mut self, should_hide_small_files_legend: bool) -> Self {
+    pub const fn hide_small_files_legend(mut self, should_hide_small_files_legend: bool) -> Self {
         self.hide_small_files_legend = should_hide_small_files_legend;
         self
     }
-    pub fn currently_selected(mut self, currently_selected: Option<&'a Tile>) -> Self {
+    pub const fn currently_selected(mut self, currently_selected: Option<&'a Tile>) -> Self {
         self.currently_selected = currently_selected;
         self
     }
-    pub fn last_read_path(mut self, last_read_path: Option<&'a PathBuf>) -> Self {
+    pub const fn last_read_path(mut self, last_read_path: Option<&'a PathBuf>) -> Self {
         self.last_read_path = last_read_path;
         self
     }
 }
 
-impl<'a> Widget for BottomLine<'a> {
+impl Widget for BottomLine<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let small_files_legend = "(x = Small files)";
         let small_files_len = if self.hide_small_files_legend {
