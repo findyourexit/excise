@@ -22,37 +22,24 @@ impl FileOrFolder {
 
 #[derive(Debug, Clone)]
 pub struct File {
-    pub name: OsString,
     pub size: u128,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Folder {
-    pub name: OsString,
     pub contents: HashMap<OsString, FileOrFolder>,
     pub size: u128,
     pub num_descendants: u64,
 }
 
 impl From<OsString> for Folder {
-    fn from(name: OsString) -> Self {
-        Folder {
-            name,
-            contents: HashMap::new(),
-            size: 0,
-            num_descendants: 0,
-        }
+    fn from(_name: OsString) -> Self {
+        Self::default()
     }
 }
 impl Folder {
-    pub fn new(path: &PathBuf) -> Self {
-        let base_folder_name = path.iter().last().expect("could not get path base name");
-        Self {
-            name: base_folder_name.to_os_string(),
-            contents: HashMap::new(),
-            size: 0,
-            num_descendants: 0,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn add_entry(
@@ -141,7 +128,7 @@ impl Folder {
             self.size += size;
             self.num_descendants += 1;
             self.contents
-                .insert(name.clone(), FileOrFolder::File(File { name, size }));
+                .insert(name, FileOrFolder::File(File { size }));
         }
     }
     pub fn path(&self, mut folder_names: Vec<OsString>) -> Option<&FileOrFolder> {

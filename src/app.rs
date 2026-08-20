@@ -49,8 +49,8 @@ where
         disable_delete_confirmation: bool,
     ) -> Self {
         let display = Display::new(terminal_backend);
-        let board = Board::new(&Folder::new(&path_in_filesystem));
-        let base_folder = Folder::new(&path_in_filesystem);
+        let board = Board::new(&Folder::new());
+        let base_folder = Folder::new();
         let file_tree = ManuallyDrop::new(FileTree::new(
             base_folder,
             path_in_filesystem,

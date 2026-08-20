@@ -2,7 +2,7 @@ use ::std::ffi::OsString;
 
 use crate::state::files::{FileOrFolder, Folder};
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FileType {
     File,
     Folder,
@@ -49,13 +49,9 @@ pub fn files_in_folder(folder: &Folder, offset: usize) -> Vec<FileMetadata> {
         });
     }
     files.sort_by(|a, b| {
-        if a.percentage == b.percentage {
-            a.name.partial_cmp(&b.name).expect("could not compare name")
-        } else {
-            b.percentage
-                .partial_cmp(&a.percentage)
-                .expect("could not compare percentage")
-        }
+        b.percentage
+            .total_cmp(&a.percentage)
+            .then_with(|| a.name.cmp(&b.name))
     });
     if offset > 0 {
         let removed_items = files.drain(..offset);
