@@ -1,0 +1,42 @@
+---
+source: src/tests/cases/ui.rs
+expression: "&terminal_draw_events_mirror[5]"
+---
+ 8.0K | /tmp/excise_tests/delet[. ]_window_no_confirmation  
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                           file2                            
+                                                            
+                                                            
+                         4.0K (50%)                         
+                                                            
+│                                                          │
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+├──────────────────────────────────────────────────────────┤
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+│                                                          │
+                                                            
+                           file3                            
+                                                            
+                                                            
+                         4.0K (50%)

@@ -1,0 +1,5 @@
+---
+source: src/tests/cases/ui.rs
+expression: "&terminal_draw_events_mirror[8]"
+---
+ Total: 8.0K

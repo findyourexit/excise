@@ -47,7 +47,7 @@ const SHOULD_SCAN_HD_FILES_IN_MULTIPLE_THREADS: bool = true;
 const SHOULD_SCAN_HD_FILES_IN_MULTIPLE_THREADS: bool = false;
 
 #[derive(StructOpt, Debug)]
-#[structopt(name = "diskonaut")]
+#[structopt(name = "excise")]
 pub struct Opt {
     #[structopt(name = "folder", parse(from_os_str))]
     /// The folder to scan
@@ -93,7 +93,7 @@ fn try_main() -> Result<(), failure::Error> {
                 opts.disable_delete_confirmation,
             );
         }
-        Err(_) => failure::bail!("Failed to get stdout: are you trying to pipe 'diskonaut'?"),
+        Err(_) => failure::bail!("Failed to get stdout: are you trying to pipe 'excise'?"),
     }
     disable_raw_mode()?;
     Ok(())

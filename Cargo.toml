@@ -1,13 +1,18 @@
 [package]
-name = "diskonaut"
-description = "Terminal disk space visual navigator"
-version = "0.11.0"
-authors = ["Aram Drevekenin <aram@poor.dev>"]
+name = "excise"
+description = "Surgical terminal storage navigator"
+version = "0.0.0-dev"
+authors = ["Aram Drevekenin <aram@poor.dev>", "Tom Larcher <tom.larcher@gmail.com>"]
 readme = "README.md"
-homepage = "https://github.com/imsnif/diskonaut"
-repository = "https://github.com/imsnif/diskonaut"
+homepage = "https://github.com/findyourexit/excise"
+repository = "https://github.com/findyourexit/excise"
 license = "MIT"
 edition = "2018"
+publish = false
+
+[[bin]]
+name = "excise"
+path = "src/main.rs"
 
 [dependencies]
 tui = {version="0.11", default-features = false, features = ['crossterm'] }

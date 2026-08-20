@@ -33,7 +33,7 @@ macro_rules! key {
         })
     };
 }
-// this means we ask diskonaut to show the actual file size rather than the size taken on disk
+// this means we ask excise to show the actual file size rather than the size taken on disk
 //
 // this is in order to make the tests more possible, so they will show the same result
 // on filesystems with and without compression
@@ -45,7 +45,7 @@ const DELETE_CONFIRMATION_DISABLED: bool = true;
 
 fn create_root_temp_dir(name: &str) -> Result<PathBuf, failure::Error> {
     let mut dir = PathBuf::new();
-    dir.push(String::from("/tmp/diskonaut_tests")); // TODO: fix this for other platforms
+    dir.push(String::from("/tmp/excise_tests")); // TODO: replace with platform-native temporary directories in Phase L1
     dir.push(name.to_string());
 
     remove_dir_all(&dir).ok(); // atomic remove
