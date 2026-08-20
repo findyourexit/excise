@@ -1,3 +1,8 @@
+[workspace]
+members = ["xtask"]
+exclude = ["fuzz"]
+resolver = "3"
+
 [package]
 name = "excise"
 description = "Surgical terminal storage navigator"
@@ -9,12 +14,16 @@ repository = "https://github.com/findyourexit/excise"
 license = "MIT"
 edition = "2024"
 rust-version = "1.88"
-exclude = [".github", "docs/design/recordings", "prototypes", "demo.gif"]
+exclude = [".cargo", ".github", "docs/design/recordings", "prototypes", "demo.gif"]
 publish = false
 
 [[bin]]
 name = "excise"
 path = "src/main.rs"
+
+[[bench]]
+name = "tachyonfx"
+harness = false
 
 [dependencies]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "std"] }
@@ -24,7 +33,6 @@ jwalk = "0.8"
 clap = { version = "4.6", features = ["derive"] }
 filesize = "0.2.0"
 unicode-width = "0.2.2"
-tachyonfx = { version = "0.25.1", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["user"] }
@@ -36,12 +44,17 @@ is_elevated = "0.1.2"
 insta = "1.48.0"
 portable-pty = "0.9.0"
 tempfile = "3.27.0"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+tachyonfx = { version = "0.25.1", default-features = false, features = ["std"] }
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 warnings = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 enum_glob_use = "deny"
 pedantic = "deny"
 unwrap_used = "deny"

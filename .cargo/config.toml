@@ -1,0 +1,2 @@
+[alias]
+verify = "run --locked --package xtask -- verify"

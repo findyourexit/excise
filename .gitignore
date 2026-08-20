@@ -1,5 +1,8 @@
-.cargo/
+.cargo/*
+!.cargo/config.toml
 target/
+fuzz/artifacts/
+fuzz/corpus/
 vendor/
 vendor.tar
 **/*.rs.bk
