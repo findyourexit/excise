@@ -6,3 +6,4 @@ fuzz/corpus/
 vendor/
 vendor.tar
 **/*.rs.bk
+dist/

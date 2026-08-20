@@ -87,6 +87,12 @@ impl TerminalSession {
     /// # Errors
     /// Returns a terminal error if raw mode or alternate-screen entry fails.
     pub fn enter() -> Result<Self, AppError> {
+        Self::enter_with_mouse(false)
+    }
+
+    /// # Errors
+    /// Returns a terminal error if raw mode or alternate-screen entry fails.
+    pub fn enter_with_mouse(mouse_capture: bool) -> Result<Self, AppError> {
         let mut session = Self {
             state: TerminalState::Inactive,
             active: Arc::new(AtomicBool::new(false)),
@@ -99,12 +105,17 @@ impl TerminalSession {
             .transition(TerminalTransition::EnterRaw)
             .map_err(|error| AppError::Invariant(error.to_string()))?;
         session.active.store(true, Ordering::Release);
-        if let Err(error) = execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            DisableLineWrap
-        ) {
+        let enter_result = if mouse_capture {
+            execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                DisableLineWrap
+            )
+        } else {
+            execute!(io::stdout(), EnterAlternateScreen, DisableLineWrap)
+        };
+        if let Err(error) = enter_result {
             let _ = session.restore();
             return Err(AppError::terminal("alternate-screen entry", error));
         }
@@ -148,7 +159,7 @@ impl TerminalSession {
         *self
             .previous_panic_hook
             .lock()
-            .expect("failed to lock panic hook") = Some(previous);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(previous);
         let active = self.active.clone();
         let previous = self.previous_panic_hook.clone();
         panic::set_hook(Box::new(move |info| {
@@ -156,7 +167,11 @@ impl TerminalSession {
                 let _ = restore_commands();
                 let _ = disable_raw_mode();
             }
-            if let Some(previous) = previous.lock().expect("failed to lock panic hook").as_ref() {
+            if let Some(previous) = previous
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
                 previous(info);
             }
         }));
@@ -170,7 +185,7 @@ impl TerminalSession {
         if let Some(previous) = self
             .previous_panic_hook
             .lock()
-            .expect("failed to lock panic hook")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
             panic::set_hook(previous);

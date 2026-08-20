@@ -18,22 +18,23 @@ impl RectFloat {
         }
     }
     pub fn round(&self) -> Rect {
-        let rounded_x = self.x.round();
-        let rounded_y = self.y.round();
-        let mut rect = Rect {
-            x: rounded_x as u16,
-            y: rounded_y as u16,
-            width: ((self.x - rounded_x) + self.width).round() as u16,
-            height: ((self.y - rounded_y) + self.height).round() as u16,
-        };
+        fn coordinate(value: f64) -> u16 {
+            if value.is_finite() {
+                value.round().clamp(0.0, f64::from(u16::MAX)) as u16
+            } else {
+                0
+            }
+        }
 
-        // fix rounding errors
-        if (self.x + self.width).round() as u16 > rect.x + rect.width {
-            rect.width += 1;
+        let x = coordinate(self.x);
+        let y = coordinate(self.y);
+        let right = coordinate(self.x + self.width.max(0.0)).max(x);
+        let bottom = coordinate(self.y + self.height.max(0.0)).max(y);
+        Rect {
+            x,
+            y,
+            width: right.saturating_sub(x),
+            height: bottom.saturating_sub(y),
         }
-        if (self.y + self.height).round() as u16 > rect.y + rect.height {
-            rect.height += 1;
-        }
-        rect
     }
 }

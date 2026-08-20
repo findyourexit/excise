@@ -49,7 +49,7 @@ impl Drop for ChildGuard {
 
 #[test]
 fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> {
-    let (status, output, metrics) = run_pty_interaction(b"y", false)?;
+    let (status, output, metrics) = run_pty_interaction(b"y", None)?;
     if !status.success() {
         bail!("Excise exited unsuccessfully: {status}; captured {output:?}");
     }
@@ -76,7 +76,7 @@ fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> 
 
 #[test]
 fn hard_cancel_restores_terminal_and_uses_exit_130() -> anyhow::Result<()> {
-    let (status, output, _) = run_pty_interaction(b"\x03", false)?;
+    let (status, output, _) = run_pty_interaction(b"\x03", None)?;
     if status.exit_code() != 130 {
         bail!("hard cancel exited with {status}; captured {output:?}");
     }
@@ -85,7 +85,7 @@ fn hard_cancel_restores_terminal_and_uses_exit_130() -> anyhow::Result<()> {
 
 #[test]
 fn panic_restores_terminal_before_diagnostics() -> anyhow::Result<()> {
-    let (status, output, _) = run_pty_interaction(&[], true)?;
+    let (status, output, _) = run_pty_interaction(&[], Some("panic"))?;
     if status.exit_code() != 101 {
         bail!("injected panic exited with {status}; captured {output:?}");
     }
@@ -101,9 +101,30 @@ fn panic_restores_terminal_before_diagnostics() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn typed_runtime_errors_restore_before_diagnostics() -> anyhow::Result<()> {
+    for (kind, expected_exit) in [("input", 74), ("render", 70), ("worker", 70)] {
+        let (status, output, _) = run_pty_interaction(&[], Some(kind))?;
+        if status.exit_code() != expected_exit {
+            bail!("injected {kind} failure exited with {status}; captured {output:?}");
+        }
+        let restored = output
+            .rfind("\u{1b}[?1049l")
+            .context("typed failure never left the alternate screen")?;
+        let diagnostic = output
+            .find("Error:")
+            .context("typed failure diagnostic was not emitted")?;
+        assert!(
+            restored < diagnostic,
+            "{kind} diagnostic preceded restoration"
+        );
+    }
+    Ok(())
+}
 fn run_pty_interaction(
     exit_input: &[u8],
-    panic_after_entry: bool,
+    injected_failure: Option<&str>,
 ) -> anyhow::Result<(ExitStatus, String, Option<PtyMetrics>)> {
     let fixture = tempfile::tempdir().context("failed to create PTY fixture")?;
     std::fs::write(fixture.path().join("smoke-file"), b"excise")
@@ -118,19 +139,7 @@ fn run_pty_interaction(
         })
         .context("failed to open pseudo-terminal")?;
 
-    let binary = if panic_after_entry {
-        std::ffi::OsString::from(env!("CARGO_BIN_EXE_excise"))
-    } else {
-        std::env::var_os("EXCISE_PTY_BINARY")
-            .unwrap_or_else(|| std::ffi::OsString::from(env!("CARGO_BIN_EXE_excise")))
-    };
-    let mut command = CommandBuilder::new(binary);
-    command.arg(fixture.path());
-    command.env("TERM", "xterm-256color");
-
-    if panic_after_entry {
-        command.env("EXCISE_TEST_PANIC_AFTER_TERMINAL_ENTRY", "1");
-    }
+    let command = pty_command(fixture.path(), injected_failure);
     let child = pair
         .slave
         .spawn_command(command)
@@ -155,17 +164,17 @@ fn run_pty_interaction(
 
     let mut measured = None;
     let mut quit_started = None;
-    if !panic_after_entry {
+    if injected_failure.is_none() {
         wait_for_output(&output, b"Folder is empty", STARTUP_TIMEOUT)?;
         let terminal_started = first_output
             .lock()
             .expect("failed to lock PTY timing")
             .expect("terminal emitted no output");
         let first_frame = terminal_started.elapsed();
-        wait_for_output(&output, b"Total:", STARTUP_TIMEOUT)?;
+        wait_for_output(&output, b"COMPLETE", STARTUP_TIMEOUT)?;
         let input_started = Instant::now();
         write_input(&writer, b"q")?;
-        wait_for_output(&output, b"Are you sure you want to quit?", STARTUP_TIMEOUT)?;
+        wait_for_output(&output, b"Quit Excise?", STARTUP_TIMEOUT)?;
         let input_to_frame = input_started.elapsed();
         quit_started = Some(Instant::now());
         write_input(&writer, exit_input)?;
@@ -184,7 +193,7 @@ fn run_pty_interaction(
 
     let bytes = output.0.lock().expect("failed to lock captured PTY output");
     let rendered = String::from_utf8_lossy(&bytes).into_owned();
-    if !panic_after_entry {
+    if injected_failure.is_none() {
         let hidden = rendered
             .rfind("\u{1b}[?25l")
             .context("terminal output never hid the cursor")?;
@@ -213,6 +222,24 @@ fn run_pty_interaction(
             normal_quit,
         });
     Ok((status, rendered, metrics))
+}
+
+fn pty_command(root: &std::path::Path, injected_failure: Option<&str>) -> CommandBuilder {
+    let binary = if injected_failure.is_some() {
+        std::ffi::OsString::from(env!("CARGO_BIN_EXE_excise"))
+    } else {
+        std::env::var_os("EXCISE_PTY_BINARY")
+            .unwrap_or_else(|| std::ffi::OsString::from(env!("CARGO_BIN_EXE_excise")))
+    };
+    let mut command = CommandBuilder::new(binary);
+    command.arg(root);
+    command.env("TERM", "xterm-256color");
+    match injected_failure {
+        Some("panic") => command.env("EXCISE_TEST_PANIC_AFTER_TERMINAL_ENTRY", "1"),
+        Some(kind) => command.env("EXCISE_TEST_ERROR_AFTER_TERMINAL_ENTRY", kind),
+        None => {}
+    }
+    command
 }
 
 fn spawn_terminal_reader(

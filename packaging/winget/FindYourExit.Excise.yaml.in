@@ -1,0 +1,40 @@
+# Split these documents into the version, installer, and locale manifests for submission.
+PackageIdentifier: FindYourExit.Excise
+PackageVersion: '@VERSION@'
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.10.0
+---
+PackageIdentifier: FindYourExit.Excise
+PackageVersion: '@VERSION@'
+InstallerType: zip
+NestedInstallerType: portable
+Commands:
+  - excise
+Installers:
+  - Architecture: x64
+    InstallerUrl: '@X86_64_PC_WINDOWS_MSVC_URL@'
+    InstallerSha256: '@X86_64_PC_WINDOWS_MSVC_SHA256@'
+    NestedInstallerFiles:
+      - RelativeFilePath: excise-x86_64-pc-windows-msvc-v@VERSION@/excise.exe
+        PortableCommandAlias: excise
+  - Architecture: arm64
+    InstallerUrl: '@AARCH64_PC_WINDOWS_MSVC_URL@'
+    InstallerSha256: '@AARCH64_PC_WINDOWS_MSVC_SHA256@'
+    NestedInstallerFiles:
+      - RelativeFilePath: excise-aarch64-pc-windows-msvc-v@VERSION@/excise.exe
+        PortableCommandAlias: excise
+ManifestType: installer
+ManifestVersion: 1.10.0
+---
+PackageIdentifier: FindYourExit.Excise
+PackageVersion: '@VERSION@'
+PackageLocale: en-US
+Publisher: Find Your Exit
+PackageName: Excise
+License: MIT
+LicenseUrl: https://github.com/findyourexit/excise/blob/main/LICENSE
+ShortDescription: Surgical terminal storage navigator
+PackageUrl: https://github.com/findyourexit/excise
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

@@ -11,8 +11,11 @@ cargo-fuzz = true
 [dependencies]
 excise = { path = ".." }
 crossterm = "0.29"
+file-id = "0.2.3"
 libfuzzer-sys = "0.4.13"
+serde_json = "1"
 unicode-width = "0.2.2"
+tempfile = "3.27.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["std"] }
 
 [[bin]]
@@ -53,6 +56,48 @@ bench = false
 [[bin]]
 name = "runtime_events"
 path = "fuzz_targets/runtime_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "treemap"
+path = "fuzz_targets/treemap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "accounting"
+path = "fuzz_targets/accounting.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter"
+path = "fuzz_targets/filter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deletion_state"
+path = "fuzz_targets/deletion_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deletion_plan"
+path = "fuzz_targets/deletion_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "report"
+path = "fuzz_targets/report.rs"
 test = false
 doc = false
 bench = false

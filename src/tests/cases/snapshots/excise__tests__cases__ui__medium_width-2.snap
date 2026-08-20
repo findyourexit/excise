@@ -1,9 +1,14 @@
 ---
 source: src/tests/cases/ui.rs
-expression: "&terminal_draw_events_mirror[1]"
+expression: normalized
 ---
- Total: 20.0K, freed: 0 | /tmp/excise_tests/medium_width    
-┌──────────────────────────────────────────────────────────┐
+ EXCISE  /tmp/excise_tests/medium_width  ◆ COMPLETE         
+ allocated ##.#K   reclaim ##.#K   apparent 20.0K   3 entrie
+────────────────────────────────────────────────────────────
+┌ LIST ────────────────────────────────────────────────────┐
+│   file2                                8.0K   40.0%      │
+│   file3                                8.0K   40.0%      │
+│   file1                                4.0K   20.0%      │
 │                                                          │
 │                                                          │
 │                                                          │
@@ -11,9 +16,6 @@ expression: "&terminal_draw_events_mirror[1]"
 │                                                          │
 │                                                          │
 │                                                          │
-│                          file2                           │
-│                                                          │
-│                        8.0K (40%)                        │
 │                                                          │
 │                                                          │
 │                                                          │
@@ -21,18 +23,14 @@ expression: "&terminal_draw_events_mirror[1]"
 │                                                          │
 │                                                          │
 │                                                          │
-├──────────────────────────────────────────────────────────┤
-│              ┌─────────────────────────────┐             │
-│              │                             │             │
-│              │                             │             │
-│              │        Really quit?         │             │
-│              │                             │             │
-│              │                             │             │
-│              │                             │             │
-│              │                             │             │
-│              │            (y/n)            │             │
-│              │                             │             │
-│              └─────────────────────────────┘             │
+│ ╔ EXIT ════════════════════════════════════════════════╗ │
+│ ║                                                      ║ │
+│ ║                     Quit Excise?                     ║ │
+│ ║              [y] quit    [Esc/q/n] back              ║ │
+│ ║                                                      ║ │
+│ ║                                                      ║ │
+│ ║                                                      ║ │
+│ ╚══════════════════════════════════════════════════════╝ │
 │                                                          │
 │                                                          │
 │                                                          │
@@ -40,15 +38,17 @@ expression: "&terminal_draw_events_mirror[1]"
 │                                                          │
 │                                                          │
 │                                                          │
-├──────────────────────────────────────────────────────────┤
 │                                                          │
 │                                                          │
-│                          file1                           │
 │                                                          │
 │                                                          │
-│                        4.0K (20%)                        │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
 │                                                          │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
-                                                            
- ←↓↑→/<ENTER>/<ESC>: navigate, <BACKSPACE>: del
+ arrows move  Enter open  Backspace delete  ? help          
+Excise · REDUCED MOTION

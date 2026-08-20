@@ -1,7 +1,8 @@
 mod clock;
+mod scanner;
 mod worker;
 
-use std::collections::HashSet;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -10,14 +11,18 @@ use crossterm::event::Event;
 use ratatui::backend::Backend;
 
 pub use clock::{Clock, SystemClock, VirtualClock};
-use worker::{DeletionFailure, WorkerEvent, WorkerPool, prepare_deletion};
+use worker::{WorkerEvent, WorkerPool};
 
 use crate::App;
 use crate::animation::AnimationScheduler;
+use crate::config::{CustomKeyBindings, KeyPreset, SafePreferences, save_safe_preferences};
 use crate::error::{AppError, ExitClass};
 use crate::input::{InputCommand, InputEvent, InputSource, handle_keypress};
-use crate::native_path::{NativeIdentity, safe_display_path};
+use crate::native_path::safe_display_path;
 use crate::outcome::{OperationOutcome, RunSummary};
+use crate::report::{ScanReport, ScanReportState, scan_report_state};
+use crate::state::files::FileTree;
+use crate::theme::ThemeId;
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const IDLE_INPUT_WAIT: Duration = Duration::from_secs(60 * 60);
@@ -32,11 +37,21 @@ pub struct RuntimeSettings {
     pub root: PathBuf,
     pub scan_threads: usize,
     pub event_capacity: usize,
+    pub cross_filesystems: bool,
+    pub exclusions: Vec<String>,
+    pub memory_mib: usize,
     pub apparent_size: bool,
     pub disable_delete_confirmation: bool,
     pub reduced_motion: bool,
     pub monochrome: bool,
     pub animate_loading: bool,
+    pub theme: ThemeId,
+    pub ascii: bool,
+    pub mouse: bool,
+    pub keymap: KeyPreset,
+    pub custom_keys: Option<CustomKeyBindings>,
+    pub config_path: Option<PathBuf>,
+    pub monochrome_locked: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,9 +77,9 @@ where
     animation: AnimationScheduler,
     settings: RuntimeSettings,
     summary: RunSummary,
-    seen_identities: HashSet<NativeIdentity>,
     scan_active: bool,
     scan_cancelled: bool,
+    rescan_active: bool,
     cancelled_while_scanning: bool,
     hard_cancelled: bool,
     deletion_active: bool,
@@ -89,10 +104,19 @@ where
         settings.root.clone(),
         settings.apparent_size,
         settings.disable_delete_confirmation,
+        settings.memory_mib,
+        settings.keymap,
+        settings.custom_keys.clone(),
+        settings.mouse,
     )?;
     let workers = WorkerPool::start(
-        settings.root.clone(),
-        settings.scan_threads,
+        scanner::ScannerOptions {
+            root: settings.root.clone(),
+            threads: settings.scan_threads,
+            cross_filesystems: settings.cross_filesystems,
+            exclusions: settings.exclusions.clone(),
+            internal_paths: app.internal_scan_paths(),
+        },
         settings.event_capacity,
     )?;
     let animation = AnimationScheduler::new(settings.reduced_motion, settings.monochrome, now);
@@ -103,10 +127,10 @@ where
         clock,
         animation,
         settings,
-        seen_identities: HashSet::new(),
         summary: RunSummary::default(),
         scan_active: true,
         scan_cancelled: false,
+        rescan_active: false,
         cancelled_while_scanning: false,
         hard_cancelled: false,
         deletion_active: false,
@@ -122,11 +146,15 @@ where
 {
     fn run(mut self) -> Result<OperationOutcome<RunSummary>, AppError> {
         let loop_result = self.run_loop();
-        let shutdown_result = self
+        let workers = self
             .workers
             .take()
-            .ok_or_else(|| AppError::Invariant("worker pool already stopped".to_string()))?
-            .shutdown();
+            .ok_or_else(|| AppError::Invariant("worker pool already stopped".to_string()))?;
+        let shutdown_result = if self.hard_cancelled {
+            workers.hard_shutdown()
+        } else {
+            workers.shutdown()
+        };
         let finish_result = self.app.finish();
 
         let outcome = loop_result?;
@@ -139,6 +167,9 @@ where
         self.render()?;
         while self.app.is_running {
             let mut did_work = self.process_input_batch()?;
+            if !self.app.is_running && self.scan_active {
+                self.cancelled_while_scanning = true;
+            }
             did_work |= self.process_worker_batch()?;
             did_work |= self.process_deadlines();
             self.update_animation_frame();
@@ -162,6 +193,11 @@ where
         }
 
         let summary = self.summary.clone();
+        let deletion_incomplete = summary
+            .deletion_changed_entries
+            .saturating_add(summary.deletion_missing_entries)
+            .saturating_add(summary.deletion_failed_entries)
+            .saturating_add(summary.deletion_unattempted_entries);
         if self.hard_cancelled {
             Ok(OperationOutcome::Cancelled {
                 value: Some(summary),
@@ -172,7 +208,13 @@ where
                 value: Some(summary),
                 precise: true,
             })
-        } else if summary.unreadable_entries > 0 {
+        } else if deletion_incomplete > 0 {
+            Ok(OperationOutcome::Partial {
+                completed_entries: summary.deleted_entries,
+                failed_entries: deletion_incomplete,
+                value: summary,
+            })
+        } else if self.app.scan_is_uncertain(&summary) {
             Ok(OperationOutcome::Uncertain {
                 unreadable_entries: summary.unreadable_entries,
                 value: summary,
@@ -206,6 +248,7 @@ where
             InputEvent::Terminal(Event::Resize(_, _)) => {
                 self.app.reset_ui_mode();
                 self.app.mark_dirty();
+                self.animation.schedule_navigation();
                 Ok(false)
             }
             InputEvent::Terminal(event) => {
@@ -216,11 +259,13 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_input_command(&mut self, command: InputCommand) -> Result<(), AppError> {
         let now = self.clock.now();
         match command {
             InputCommand::Navigation if self.app.ui_mode.allows_motion() => {
                 self.animation.schedule_navigation();
+                self.animation.schedule_focus();
                 self.app.mark_dirty();
             }
             InputCommand::None | InputCommand::Navigation => {}
@@ -228,19 +273,131 @@ where
                 self.app.set_path_to_red();
                 self.schedule(now, TimedAction::ResetPathColor, TRANSIENT_STATUS_DURATION);
             }
-            InputCommand::Delete(target) => {
+            InputCommand::StartRescan(target) => {
+                if self.scan_active || self.deletion_active {
+                    return Ok(());
+                }
+                self.app.begin_rescan(target.clone())?;
+                self.reset_scan_summary();
+                self.workers()?.request_rescan(scanner::ScannerOptions {
+                    root: target,
+                    threads: self.settings.scan_threads,
+                    cross_filesystems: self.settings.cross_filesystems,
+                    exclusions: self.settings.exclusions.clone(),
+                    internal_paths: self.app.internal_scan_paths(),
+                })?;
+                self.scan_active = true;
+                self.rescan_active = true;
+                self.next_loading_frame = now.saturating_add(LOADING_FRAME_INTERVAL);
+                self.animation.schedule_aggregation();
+            }
+            InputCommand::CancelRescan => {
+                if self.rescan_active {
+                    self.workers()?.cancel_rescan();
+                }
+            }
+            InputCommand::PlanDeletion(target) => {
                 if self.deletion_active {
                     return Ok(());
                 }
-                match prepare_deletion(target) {
-                    Ok(request) => {
-                        self.app.begin_deletion(&request.target);
-                        self.workers()?.request_deletion(request)?;
-                        self.deletion_active = true;
-                    }
-                    Err(error) => self.app.show_error(deletion_error_message(&error)),
+                let reduced_guardrails = self.app.reduced_deletion_guardrails();
+                let maximum_bytes = self.app.maximum_deletion_plan_bytes();
+                self.workers()?
+                    .request_deletion_plan(target, reduced_guardrails, maximum_bytes)?;
+                self.deletion_active = true;
+            }
+            InputCommand::ExportScan => {
+                let result = next_export_path("scan-report").and_then(|path| {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .map_err(|error| error.to_string())?;
+                    self.app
+                        .write_scan_report(&self.summary, &mut file)
+                        .map_err(|error| error.to_string())?;
+                    Ok(path)
+                });
+                match result {
+                    Ok(path) => self.app.show_notice(format!(
+                        "Scan report exported to {}",
+                        safe_display_path(&path).text
+                    )),
+                    Err(error) => self.app.show_error(format!("Scan export failed: {error}")),
                 }
             }
+            InputCommand::ExportDeletionHistory => {
+                let result = next_export_path("deletion-history").and_then(|path| {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .map_err(|error| error.to_string())?;
+                    self.app
+                        .write_deletion_history(&mut file)
+                        .map_err(|error| error.to_string())?;
+                    Ok(path)
+                });
+                match result {
+                    Ok(path) => {
+                        self.app.clear_deletion_history();
+                        self.app.show_notice(format!(
+                            "Deletion history exported to {}",
+                            safe_display_path(&path).text
+                        ));
+                    }
+                    Err(error) => {
+                        self.app
+                            .show_error(format!("Deletion history export failed: {error}"));
+                    }
+                }
+            }
+            InputCommand::CycleTheme => {
+                self.settings.theme = self.settings.theme.next();
+                self.settings.monochrome =
+                    self.settings.monochrome_locked || self.settings.theme == ThemeId::Monochrome;
+                self.animation
+                    .set_accessibility(self.settings.reduced_motion, self.settings.monochrome);
+                self.app.preferences_changed();
+            }
+            InputCommand::SavePreferencesAndExit => {
+                let result = self.settings.config_path.as_ref().map_or_else(
+                    || {
+                        Err(AppError::Config(
+                            "no writable config path is available".to_string(),
+                        ))
+                    },
+                    |path| {
+                        save_safe_preferences(
+                            path,
+                            SafePreferences {
+                                theme: self.settings.theme,
+                                ascii: self.settings.ascii,
+                                mouse: self.settings.mouse,
+                                keymap: self.settings.keymap,
+                                custom_keys: self.settings.custom_keys.clone(),
+                                reduced_motion: self.settings.reduced_motion,
+                            },
+                        )
+                    },
+                );
+                match result {
+                    Ok(()) => {
+                        self.app.preferences_saved();
+                        self.app.exit();
+                    }
+                    Err(error) => self.app.show_error(error.to_string()),
+                }
+            }
+            InputCommand::DiscardPreferencesAndExit => self.app.exit(),
+            InputCommand::ExecuteDeletion(plan) => {
+                if self.deletion_active {
+                    return Ok(());
+                }
+                self.workers()?.execute_deletion(plan)?;
+                self.deletion_active = true;
+            }
+            InputCommand::SoftCancelDeletion => self.workers()?.soft_cancel_deletion(),
             InputCommand::HardCancel => self.hard_cancelled = true,
         }
         if !self.app.ui_mode.allows_motion() {
@@ -264,51 +421,136 @@ where
                     break;
                 }
             };
-            self.handle_worker_event(event);
+            self.handle_worker_event(event)?;
             processed = true;
         }
         Ok(processed)
     }
 
-    fn handle_worker_event(&mut self, event: WorkerEvent) {
+    #[allow(clippy::too_many_lines)]
+    fn handle_worker_event(&mut self, event: WorkerEvent) -> Result<(), AppError> {
         match event {
-            WorkerEvent::ScanEntry {
-                metadata,
-                path,
-                identity,
-            } => {
-                self.summary.scanned_entries += 1;
-                if self.seen_identities.insert(identity) {
-                    self.summary.identified_entries += 1;
+            WorkerEvent::ScanBatch { entries } => {
+                self.summary.scanned_entries += entries.len() as u64;
+                for entry in entries {
+                    self.app.add_entry_to_base_folder(
+                        &entry.metadata,
+                        entry.path,
+                        entry.identity,
+                    )?;
                 }
-                self.app.add_entry_to_base_folder(&metadata, path);
+                self.summary.identified_entries =
+                    u64::try_from(self.app.identity_count()).unwrap_or(u64::MAX);
             }
-            WorkerEvent::ScanSkippedLink { path } => {
-                self.summary.unreadable_entries += 1;
-                self.summary.last_unreadable_path = Some(safe_display_path(&path).text);
-                self.summary.last_worker_error = Some("symbolic link skipped".to_string());
-                self.app.increment_failed_to_read();
+            WorkerEvent::ScanDirectoryComplete { path } => {
+                self.app.complete_directory(&path)?;
+            }
+            WorkerEvent::ScanUnscanned { path, reason } => {
+                self.summary.unscanned_entries += 1;
+                self.summary.last_unscanned_path = Some(safe_display_path(&path).text);
+                self.summary.last_unscanned_reason = Some(format!("{reason:?}"));
+                match &reason {
+                    crate::model::UnscannedReason::Excluded(_) => {
+                        self.summary.excluded_entries += 1;
+                    }
+                    crate::model::UnscannedReason::FilesystemBoundary => {
+                        self.summary.filesystem_boundaries += 1;
+                    }
+                    crate::model::UnscannedReason::SymbolicLink => {
+                        self.summary.link_entries += 1;
+                    }
+                    crate::model::UnscannedReason::Metadata(message) => {
+                        self.summary.unreadable_entries += 1;
+                        self.summary.last_unreadable_path =
+                            self.summary.last_unscanned_path.clone();
+                        self.summary.last_worker_error = Some(message.clone());
+                        self.app.increment_failed_to_read();
+                    }
+                    crate::model::UnscannedReason::MemoryAggregation => {}
+                }
+                self.app.record_unscanned(&path, reason)?;
             }
             WorkerEvent::ScanFailed { path, message } => {
+                self.summary.unscanned_entries += 1;
+                self.summary.last_unscanned_path =
+                    path.as_deref().map(|path| safe_display_path(path).text);
+                self.summary.last_unscanned_reason = Some(message.clone());
                 self.summary.unreadable_entries += 1;
                 self.summary.last_unreadable_path =
                     path.as_deref().map(|path| safe_display_path(path).text);
-                self.summary.last_worker_error = Some(message);
+                self.summary.last_worker_error = Some(message.clone());
+                if let Some(path) = path {
+                    self.app.record_unscanned(
+                        &path,
+                        crate::model::UnscannedReason::Metadata(message),
+                    )?;
+                }
                 self.app.increment_failed_to_read();
+                self.animation.schedule_error();
             }
             WorkerEvent::ScanFinished { cancelled } => {
                 self.scan_active = false;
-                self.scan_cancelled = cancelled;
-                if !cancelled {
-                    self.app.start_ui();
-                    self.animation.schedule_state_change();
+                if self.rescan_active {
+                    self.rescan_active = false;
+                    if cancelled {
+                        self.summary.unreadable_entries =
+                            self.summary.unreadable_entries.saturating_add(1);
+                        self.summary.last_worker_error =
+                            Some("focused rescan cancelled".to_string());
+                        self.app.cancel_rescan()?;
+                    } else {
+                        self.app.finish_rescan()?;
+                    }
+                    let (used, limit, spilled) = self.app.model_stats();
+                    self.summary.model_bytes = used;
+                    self.summary.model_limit_bytes = limit;
+                    self.summary.identity_spilled = spilled;
+                    self.animation.schedule_completion();
+                } else {
+                    self.scan_cancelled = cancelled;
+                    if !cancelled {
+                        self.app.finalize_scan()?;
+                        let (used, limit, spilled) = self.app.model_stats();
+                        self.summary.model_bytes = used;
+                        self.summary.model_limit_bytes = limit;
+                        self.summary.identity_spilled = spilled;
+                        self.app.start_ui();
+                        self.animation.schedule_completion();
+                    }
                 }
             }
-            WorkerEvent::DeletionFinished { request, result } => {
+            WorkerEvent::DeletionPlanned {
+                target_node_id,
+                result,
+            } => {
                 self.deletion_active = false;
-                let error = result.as_ref().err().map(deletion_error_message);
-                if self.app.complete_deletion(&request.target, error) {
-                    self.summary.deleted_entries += 1;
+                if result.is_err() {
+                    self.animation.schedule_error();
+                }
+                self.app.deletion_plan_ready(target_node_id, result);
+            }
+            WorkerEvent::DeletionFinished { report } => {
+                self.deletion_active = false;
+                let deleted = report.deleted_entries();
+                self.summary.deleted_entries = self.summary.deleted_entries.saturating_add(deleted);
+                self.summary.deletion_changed_entries = self
+                    .summary
+                    .deletion_changed_entries
+                    .saturating_add(report.changed_entries());
+                self.summary.deletion_missing_entries = self
+                    .summary
+                    .deletion_missing_entries
+                    .saturating_add(report.missing_entries());
+                self.summary.deletion_failed_entries = self
+                    .summary
+                    .deletion_failed_entries
+                    .saturating_add(report.failed_entries());
+                self.summary.deletion_unattempted_entries = self
+                    .summary
+                    .deletion_unattempted_entries
+                    .saturating_add(report.unattempted_entries());
+                self.animation.schedule_deletion_result();
+                if self.app.complete_deletion(report) && deleted > 0 {
                     self.app.flash_space_freed();
                     self.schedule(
                         self.clock.now(),
@@ -318,6 +560,7 @@ where
                 }
             }
         }
+        Ok(())
     }
 
     fn process_deadlines(&mut self) -> bool {
@@ -356,9 +599,33 @@ where
         }
     }
 
+    fn reset_scan_summary(&mut self) {
+        self.summary.scanned_entries = 0;
+        self.summary.identified_entries = 0;
+        self.summary.unreadable_entries = 0;
+        self.summary.unscanned_entries = 0;
+        self.summary.excluded_entries = 0;
+        self.summary.filesystem_boundaries = 0;
+        self.summary.link_entries = 0;
+        self.summary.model_bytes = 0;
+        self.summary.model_limit_bytes = 0;
+        self.summary.identity_spilled = false;
+        self.summary.last_unreadable_path = None;
+        self.summary.last_unscanned_path = None;
+        self.summary.last_unscanned_reason = None;
+        self.summary.last_worker_error = None;
+    }
+
     fn render(&mut self) -> Result<bool, AppError> {
-        self.app
-            .render_if_dirty(&mut self.animation, self.clock.now())
+        self.app.render_if_dirty(
+            &mut self.animation,
+            self.clock.now(),
+            self.settings.theme.attribution().name,
+            crate::theme::Theme::for_id(self.settings.theme),
+            self.settings.ascii,
+            self.settings.monochrome,
+            self.settings.reduced_motion,
+        )
     }
 
     fn schedule(&mut self, now: Duration, action: TimedAction, delay: Duration) {
@@ -393,7 +660,7 @@ where
         while self.scan_active || self.deletion_active {
             match self.workers()?.events().recv_timeout(WORKER_POLL_INTERVAL) {
                 Ok(event) => {
-                    self.handle_worker_event(event);
+                    self.handle_worker_event(event)?;
                     self.process_worker_batch()?;
                     self.render()?;
                 }
@@ -429,17 +696,145 @@ where
             .ok_or_else(|| AppError::Invariant("worker pool unavailable".to_string()))
     }
 }
-
-fn deletion_error_message(error: &DeletionFailure) -> String {
-    match error {
-        DeletionFailure::IdentityChanged => {
-            "Deletion refused because the selected path changed identity".to_string()
+/// Runs the production scanner and bounded model without acquiring a terminal.
+///
+/// # Errors
+/// Returns a scanner, model, or worker error after all owned workers stop.
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanReport>, AppError> {
+    let mut tree = FileTree::new(
+        settings.root.clone(),
+        settings.apparent_size,
+        settings.memory_mib,
+    )
+    .map_err(|error| AppError::Model(error.to_string()))?;
+    let workers = WorkerPool::start(
+        scanner::ScannerOptions {
+            root: settings.root.clone(),
+            threads: settings.scan_threads,
+            cross_filesystems: settings.cross_filesystems,
+            exclusions: settings.exclusions.clone(),
+            internal_paths: tree.internal_scan_paths(),
+        },
+        settings.event_capacity,
+    )?;
+    let mut summary = RunSummary::default();
+    let scan_result = (|| -> Result<bool, AppError> {
+        loop {
+            let event = workers
+                .events()
+                .recv()
+                .map_err(|_| AppError::Worker("scanner event channel disconnected".to_string()))?;
+            match event {
+                WorkerEvent::ScanBatch { entries } => {
+                    summary.scanned_entries =
+                        summary.scanned_entries.saturating_add(entries.len() as u64);
+                    for entry in entries {
+                        tree.add_entry(&entry.metadata, &entry.path, entry.identity)
+                            .map_err(|error| AppError::Model(error.to_string()))?;
+                    }
+                    summary.identified_entries =
+                        u64::try_from(tree.identity_count()).unwrap_or(u64::MAX);
+                }
+                WorkerEvent::ScanDirectoryComplete { path } => tree
+                    .complete_directory(&path)
+                    .map_err(|error| AppError::Model(error.to_string()))?,
+                WorkerEvent::ScanUnscanned { path, reason } => {
+                    summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
+                    summary.last_unscanned_path = Some(safe_display_path(&path).text);
+                    summary.last_unscanned_reason = Some(format!("{reason:?}"));
+                    match &reason {
+                        crate::model::UnscannedReason::Excluded(_) => {
+                            summary.excluded_entries = summary.excluded_entries.saturating_add(1);
+                        }
+                        crate::model::UnscannedReason::FilesystemBoundary => {
+                            summary.filesystem_boundaries =
+                                summary.filesystem_boundaries.saturating_add(1);
+                        }
+                        crate::model::UnscannedReason::SymbolicLink => {
+                            summary.link_entries = summary.link_entries.saturating_add(1);
+                        }
+                        crate::model::UnscannedReason::Metadata(message) => {
+                            summary.unreadable_entries =
+                                summary.unreadable_entries.saturating_add(1);
+                            summary
+                                .last_unreadable_path
+                                .clone_from(&summary.last_unscanned_path);
+                            summary.last_worker_error = Some(message.clone());
+                            tree.failed_to_read = tree.failed_to_read.saturating_add(1);
+                        }
+                        crate::model::UnscannedReason::MemoryAggregation => {}
+                    }
+                    tree.record_unscanned(&path, reason)
+                        .map_err(|error| AppError::Model(error.to_string()))?;
+                }
+                WorkerEvent::ScanFailed { path, message } => {
+                    summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
+                    summary.unreadable_entries = summary.unreadable_entries.saturating_add(1);
+                    summary.last_unscanned_path =
+                        path.as_deref().map(|path| safe_display_path(path).text);
+                    summary
+                        .last_unreadable_path
+                        .clone_from(&summary.last_unscanned_path);
+                    summary.last_unscanned_reason = Some(message.clone());
+                    summary.last_worker_error = Some(message.clone());
+                    if let Some(path) = path {
+                        tree.record_unscanned(
+                            &path,
+                            crate::model::UnscannedReason::Metadata(message),
+                        )
+                        .map_err(|error| AppError::Model(error.to_string()))?;
+                    }
+                    tree.failed_to_read = tree.failed_to_read.saturating_add(1);
+                }
+                WorkerEvent::ScanFinished { cancelled } => return Ok(cancelled),
+                WorkerEvent::DeletionPlanned { .. } | WorkerEvent::DeletionFinished { .. } => {}
+            }
         }
-        DeletionFailure::SymbolicLink => {
-            "Deletion refused because the selected path is a symbolic link".to_string()
-        }
-        DeletionFailure::Io(message) => message.clone(),
+    })();
+    let shutdown_result = workers.shutdown();
+    let cancelled = scan_result?;
+    shutdown_result?;
+    if !cancelled {
+        tree.finalize()
+            .map_err(|error| AppError::Model(error.to_string()))?;
     }
+    let (used, limit, spilled) = tree.model_stats();
+    summary.model_bytes = used;
+    summary.model_limit_bytes = limit;
+    summary.identity_spilled = spilled;
+    let state = scan_report_state(&tree, &summary, cancelled);
+    let uncertain = state == ScanReportState::Uncertain;
+    let report = ScanReport::from_completed_tree(tree, summary.clone(), state);
+    if cancelled {
+        Ok(OperationOutcome::Cancelled {
+            value: Some(report),
+            precise: true,
+        })
+    } else if uncertain {
+        Ok(OperationOutcome::Uncertain {
+            unreadable_entries: summary.unreadable_entries,
+            value: report,
+        })
+    } else {
+        Ok(OperationOutcome::Exact(report))
+    }
+}
+
+fn next_export_path(kind: &str) -> Result<PathBuf, String> {
+    let directory = std::env::current_dir().map_err(|error| error.to_string())?;
+    for suffix in 0..1_000_u16 {
+        let name = if suffix == 0 {
+            format!("excise-{kind}.json")
+        } else {
+            format!("excise-{kind}-{suffix}.json")
+        };
+        let path = directory.join(name);
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(format!("no free export filename for {kind}"))
 }
 
 #[must_use]

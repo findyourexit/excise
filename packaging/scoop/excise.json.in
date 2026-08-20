@@ -1,0 +1,34 @@
+{
+  "version": "@VERSION@",
+  "description": "Surgical terminal storage navigator",
+  "homepage": "https://github.com/findyourexit/excise",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "@X86_64_PC_WINDOWS_MSVC_URL@",
+      "hash": "@X86_64_PC_WINDOWS_MSVC_SHA256@",
+      "extract_dir": "excise-x86_64-pc-windows-msvc-v@VERSION@"
+    },
+    "arm64": {
+      "url": "@AARCH64_PC_WINDOWS_MSVC_URL@",
+      "hash": "@AARCH64_PC_WINDOWS_MSVC_SHA256@",
+      "extract_dir": "excise-aarch64-pc-windows-msvc-v@VERSION@"
+    }
+  },
+  "bin": "excise.exe",
+  "checkver": {
+    "github": "https://github.com/findyourexit/excise"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/findyourexit/excise/releases/download/v$version/excise-x86_64-pc-windows-msvc-v$version.zip",
+        "extract_dir": "excise-x86_64-pc-windows-msvc-v$version"
+      },
+      "arm64": {
+        "url": "https://github.com/findyourexit/excise/releases/download/v$version/excise-aarch64-pc-windows-msvc-v$version.zip",
+        "extract_dir": "excise-aarch64-pc-windows-msvc-v$version"
+      }
+    }
+  }
+}

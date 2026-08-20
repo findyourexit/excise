@@ -1,93 +1,59 @@
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::Widget;
+use ratatui::text::Line;
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget};
 
-use crate::ui::format::truncate_middle;
-use crate::ui::grid::draw_filled_rect;
-
-fn render_confirm_prompt(buf: &mut Buffer, confirm_rect: Rect) {
-    let text_style = Style::default()
-        .bg(Color::Black)
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-
-    let possible_confirm_texts = [
-        "Are you sure you want to quit?",
-        "Sure you want to quit?",
-        "Really quit?",
-        "Quit?",
-    ];
-    // set default value of the confirm_text
-    // to the longest one from possible_confirm_text array
-    let mut confirm_text = String::from(possible_confirm_texts[0]);
-    let mut confirm_text_start_position: u16 = 0;
-    let text_max_length = confirm_rect.width - 4;
-    for line in &possible_confirm_texts {
-        // "+10" here is to make sure confirm message has always some padding
-        if confirm_rect.width >= (line.chars().count() as u16) + 10 {
-            confirm_text = truncate_middle(line, text_max_length);
-            confirm_text_start_position =
-                (f64::from(confirm_rect.width - confirm_text.len() as u16) / 2.0).ceil() as u16
-                    + confirm_rect.x;
-            break;
-        }
-    }
-
-    let y_n_line = "(y/n)";
-    let y_n_line_start_position = (f64::from(confirm_rect.width - y_n_line.len() as u16) / 2.0)
-        .ceil() as u16
-        + confirm_rect.x;
-
-    buf.set_string(
-        confirm_text_start_position,
-        confirm_rect.y + confirm_rect.height / 2 - 2,
-        confirm_text,
-        text_style,
-    );
-    buf.set_string(
-        y_n_line_start_position,
-        confirm_rect.y + confirm_rect.height / 2 + 3,
-        y_n_line,
-        text_style,
-    );
+pub struct ConfirmBox {
+    save_preferences: bool,
 }
 
-pub struct ConfirmBox {}
-
 impl ConfirmBox {
-    pub const fn new() -> Self {
-        Self {}
+    pub const fn new(save_preferences: bool) -> Self {
+        Self { save_preferences }
     }
 }
 
 impl Widget for ConfirmBox {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let (width, height) = if area.width > 150 {
-            (150, 10)
-        } else if area.width >= 50 {
-            (area.width / 2, 10)
-        } else {
-            unreachable!("app should not be rendered if window is so small")
-        };
-
-        // position self in the middle of the self
-        let x = u16::midpoint(area.x, area.width) - width / 2;
-        let y = u16::midpoint(area.y, area.height) - height / 2;
-
-        let confirm_rect = Rect {
-            x,
-            y,
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let width = area.width.saturating_sub(4).clamp(30, 64).min(area.width);
+        let height = if self.save_preferences { 10 } else { 8 }.min(area.height);
+        let rect = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
             width,
             height,
-        };
-        let fill_style = Style::default()
-            .bg(Color::Black)
+        );
+        Clear.render(rect, buffer);
+        let style = Style::default()
             .fg(Color::White)
+            .bg(Color::Black)
             .add_modifier(Modifier::BOLD);
-
-        draw_filled_rect(buf, fill_style, confirm_rect);
-
-        render_confirm_prompt(buf, confirm_rect);
+        let lines = if self.save_preferences {
+            vec![
+                Line::from(""),
+                Line::from("Safe UI preferences changed this session."),
+                Line::from("[s] save preferences and quit"),
+                Line::from("[d] discard changes and quit"),
+                Line::from("[Esc/q/n] back"),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from("Quit Excise?"),
+                Line::from("[y] quit    [Esc/q/n] back"),
+            ]
+        };
+        Paragraph::new(lines)
+            .style(style)
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(style)
+                    .title(" EXIT "),
+            )
+            .render(rect, buffer);
     }
 }

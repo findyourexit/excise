@@ -1,4 +1,5 @@
 use crate::error::ExitClass;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationOutcome<T> {
@@ -40,12 +41,25 @@ impl<T> OperationOutcome<T> {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunSummary {
     pub scanned_entries: u64,
     pub identified_entries: u64,
     pub unreadable_entries: u64,
+    pub unscanned_entries: u64,
+    pub excluded_entries: u64,
+    pub filesystem_boundaries: u64,
+    pub link_entries: u64,
     pub deleted_entries: u64,
+    pub deletion_changed_entries: u64,
+    pub deletion_missing_entries: u64,
+    pub deletion_failed_entries: u64,
+    pub deletion_unattempted_entries: u64,
+    pub model_bytes: usize,
+    pub model_limit_bytes: usize,
+    pub identity_spilled: bool,
     pub last_unreadable_path: Option<String>,
+    pub last_unscanned_path: Option<String>,
+    pub last_unscanned_reason: Option<String>,
     pub last_worker_error: Option<String>,
 }

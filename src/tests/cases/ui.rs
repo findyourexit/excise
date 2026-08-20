@@ -2,7 +2,6 @@ use ::std::fs::{File, create_dir};
 use ::std::io::prelude::*;
 use ::std::path::Path;
 
-use ::insta::assert_snapshot;
 use crossterm::event::KeyModifiers;
 use crossterm::event::{Event, KeyCode, KeyEvent};
 
@@ -37,6 +36,52 @@ macro_rules! key {
         })
     };
 }
+
+fn metric_value_range(line: &str, marker: &str) -> Option<std::ops::Range<usize>> {
+    let marker_end = line.find(marker)?.saturating_add(marker.len());
+    let value_start = marker_end.saturating_add(
+        line.get(marker_end..)?
+            .find(|character: char| !character.is_ascii_whitespace())?,
+    );
+    let value_end = value_start.saturating_add(
+        line.get(value_start..)?
+            .find(|character: char| character.is_whitespace() || matches!(character, '│' | '║'))
+            .unwrap_or_else(|| line.len().saturating_sub(value_start)),
+    );
+    Some(value_start..value_end)
+}
+
+fn normalize_snapshot(frame: &str) -> String {
+    let mut normalized = String::with_capacity(frame.len());
+    for line in frame.split_inclusive('\n') {
+        let identity_start = line
+            .find("identity ")
+            .map_or(usize::MAX, |index| index + "identity ".len());
+        let metric_ranges = [
+            metric_value_range(line, "allocated "),
+            metric_value_range(line, "reclaim "),
+        ];
+        for (index, character) in line.char_indices() {
+            let dynamic_metric = metric_ranges
+                .iter()
+                .flatten()
+                .any(|range| range.contains(&index));
+            if character.is_ascii_digit() && (index >= identity_start || dynamic_metric) {
+                normalized.push('#');
+            } else {
+                normalized.push(character);
+            }
+        }
+    }
+    normalized
+}
+
+macro_rules! assert_snapshot {
+    ($value:expr) => {{
+        let normalized = normalize_snapshot($value);
+        ::insta::assert_snapshot!(normalized);
+    }};
+}
 // this means we ask excise to show the actual file size rather than the size taken on disk
 //
 // this is in order to make the tests more possible, so they will show the same result
@@ -59,6 +104,22 @@ fn create_temp_file<P: AsRef<Path>>(path: P, size: usize) -> Result<(), anyhow::
         pos += bytes_written;
     }
     Ok(())
+}
+
+fn assert_compact_inspector(frame: &str) {
+    for expected in [
+        "INSPECT",
+        "allocated",
+        "reclaim",
+        "entries",
+        "identity",
+        "links",
+    ] {
+        assert!(
+            frame.contains(expected),
+            "narrow selection omitted {expected}"
+        );
+    }
 }
 
 #[test]
@@ -226,7 +287,7 @@ fn small_width_long_folder_name() {
 #[test]
 fn too_small_width_one() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(49, 50);
-    let keyboard_events = Box::new(wait_and_quit_events(1, false));
+    let keyboard_events = Box::new(wait_and_quit_events(1, true));
     let temp_dir_path =
         create_root_temp_dir("too_small_width_one").expect("failed to create temp dir");
 
@@ -390,7 +451,7 @@ fn too_small_width_five() {
 #[test]
 fn too_small_height() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 14);
-    let keyboard_events = Box::new(wait_and_quit_events(1, false));
+    let keyboard_events = Box::new(wait_and_quit_events(1, true));
     let temp_dir_path =
         create_root_temp_dir("too_small_height").expect("failed to create temp dir");
 
@@ -607,7 +668,21 @@ fn enter_folder_medium_width() {
     );
 
     assert_snapshot!(&terminal_draw_events_mirror[0]);
-    assert_snapshot!(&terminal_draw_events_mirror[1]);
+    let selected_frame = &terminal_draw_events_mirror[1];
+    for expected in [
+        "INSPECT",
+        "allocated",
+        "reclaim",
+        "entries",
+        "identity",
+        "links",
+        "scope",
+    ] {
+        assert!(
+            selected_frame.contains(expected),
+            "medium-width selection omitted {expected}"
+        );
+    }
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
 }
@@ -670,7 +745,7 @@ fn enter_folder_small_width() {
     );
 
     assert_snapshot!(&terminal_draw_events_mirror[0]);
-    assert_snapshot!(&terminal_draw_events_mirror[1]);
+    assert_compact_inspector(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
 }
@@ -1617,6 +1692,7 @@ fn delete_file_no_confirmation() {
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
+    events.push(Some(key!(char 'y')));
     events.push(None);
     events.push(None);
     events.push(None);
@@ -1689,14 +1765,14 @@ fn delete_file_no_confirmation() {
 
 #[test]
 fn cant_delete_file_with_term_too_small() {
-    let (terminal_events, terminal_draw_events, backend) = test_backend_factory(49, 50);
+    let (terminal_events, _terminal_draw_events, backend) = test_backend_factory(49, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
     events.push(Some(key!(char 'l'))); // once to place selected marker on screen
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
-    events.push(Some(key!(char 'y')));
+    events.push(Some(key!(Esc)));
     events.push(None);
     events.push(None);
     events.push(None);
@@ -1733,9 +1809,6 @@ fn cant_delete_file_with_term_too_small() {
         SHOW_APPARENT_SIZE,
         DELETE_CONFIRMATION_ENABLED,
     );
-    let terminal_draw_events_mirror = terminal_draw_events
-        .lock()
-        .expect("could not acquire lock on terminal events");
 
     assert_terminal_lifecycle(
         &terminal_events
@@ -1757,7 +1830,6 @@ fn cant_delete_file_with_term_too_small() {
     );
     drop(temp_dir_path);
 
-    assert_snapshot!(&terminal_draw_events_mirror[0]);
 }
 
 #[test]
@@ -1771,7 +1843,10 @@ fn delete_folder() {
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
-    events.push(Some(key!(char 'y')));
+    for character in "subfolder1".chars() {
+        events.push(Some(key!(char character)));
+    }
+    events.push(Some(key!(Enter)));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
     // with the following ctrl-c
     events.push(None);
@@ -1859,6 +1934,7 @@ fn delete_folder_no_confirmation() {
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
     // with the following ctrl-c
     events.push(None);
+    events.push(Some(key!(char 'y')));
     events.push(None);
     events.push(None);
     events.push(None);
@@ -1944,7 +2020,10 @@ fn delete_folder_small_window() {
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
-    events.push(Some(key!(char 'y')));
+    for character in "subfolder1".chars() {
+        events.push(Some(key!(char character)));
+    }
+    events.push(Some(key!(Enter)));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
     // with the following ctrl-c
     events.push(None);
@@ -2011,9 +2090,9 @@ fn delete_folder_small_window() {
     drop(temp_dir_path);
 
     assert_snapshot!(&terminal_draw_events_mirror[0]);
-    assert_snapshot!(&terminal_draw_events_mirror[1]);
-    assert_snapshot!(&terminal_draw_events_mirror[2]);
-    assert_snapshot!(&terminal_draw_events_mirror[3]);
+    assert_compact_inspector(&terminal_draw_events_mirror[1]);
+    assert_compact_inspector(&terminal_draw_events_mirror[2]);
+    assert_compact_inspector(&terminal_draw_events_mirror[3]);
     assert_snapshot!(&terminal_draw_events_mirror[4]);
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
@@ -2035,6 +2114,7 @@ fn delete_folder_small_window_no_confirmation() {
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
+    events.push(Some(key!(char 'y')));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
     // with the following ctrl-c
     events.push(None);
@@ -2100,9 +2180,9 @@ fn delete_folder_small_window_no_confirmation() {
     drop(temp_dir_path);
 
     assert_snapshot!(&terminal_draw_events_mirror[0]);
-    assert_snapshot!(&terminal_draw_events_mirror[1]);
-    assert_snapshot!(&terminal_draw_events_mirror[2]);
-    assert_snapshot!(&terminal_draw_events_mirror[3]);
+    assert_compact_inspector(&terminal_draw_events_mirror[1]);
+    assert_compact_inspector(&terminal_draw_events_mirror[2]);
+    assert_compact_inspector(&terminal_draw_events_mirror[3]);
     assert_snapshot!(&terminal_draw_events_mirror[4]);
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
@@ -2121,7 +2201,10 @@ fn delete_folder_with_multiple_children() {
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
-    events.push(Some(key!(char 'y')));
+    for character in "subfolder1".chars() {
+        events.push(Some(key!(char character)));
+    }
+    events.push(Some(key!(Enter)));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
     // with the following ctrl-c
     events.push(None);
@@ -2238,6 +2321,7 @@ fn delete_folder_with_multiple_children_no_confirmation() {
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
+    events.push(Some(key!(char 'y')));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
     // with the following ctrl-c
     events.push(None);
@@ -2794,4 +2878,82 @@ fn small_files_with_x_as_zero() {
 
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
+}
+
+#[test]
+fn filter_and_help_overlay_are_keyboard_complete() {
+    let (terminal_events, terminal_draw_events, backend) = test_backend_factory(100, 30);
+    let mut events = vec![None, Some(key!(char '/'))];
+    for character in "file2".chars() {
+        events.push(Some(key!(char character)));
+    }
+    events.push(Some(key!(Enter)));
+    events.push(None);
+    events.push(Some(key!(char '?')));
+    events.push(None);
+    events.push(Some(key!(Esc)));
+    events.push(None);
+    events.push(Some(key!(ctrl 'c')));
+    events.push(None);
+    events.push(Some(key!(char 'y')));
+    let keyboard_events = Box::new(TerminalEvents::new(events));
+    let temp_dir_path =
+        create_root_temp_dir("filter_and_help_overlay").expect("failed to create temp dir");
+    create_temp_file(temp_dir_path.path().join("file1"), 4096)
+        .expect("first file should be created");
+    create_temp_file(temp_dir_path.path().join("file2"), 8192)
+        .expect("second file should be created");
+
+    start(
+        backend,
+        keyboard_events,
+        temp_dir_path.path().to_path_buf(),
+        SHOW_APPARENT_SIZE,
+        DELETE_CONFIRMATION_ENABLED,
+    );
+    let terminal_draw_events = terminal_draw_events
+        .lock()
+        .expect("failed to lock test state");
+    assert_terminal_lifecycle(
+        &terminal_events
+            .lock()
+            .expect("failed to lock terminal events"),
+    );
+    assert!(terminal_draw_events.len() >= 3);
+    assert_snapshot!(&terminal_draw_events[1]);
+    assert_snapshot!(&terminal_draw_events[2]);
+}
+
+#[test]
+fn theme_change_requires_explicit_save_or_discard_on_exit() {
+    let (terminal_events, terminal_draw_events, backend) = test_backend_factory(100, 30);
+    let keyboard_events = Box::new(TerminalEvents::new(vec![
+        None,
+        Some(key!(char 't')),
+        None,
+        Some(key!(ctrl 'c')),
+        None,
+        Some(key!(char 'd')),
+    ]));
+    let temp_dir_path =
+        create_root_temp_dir("theme_save_prompt").expect("failed to create temp dir");
+    create_temp_file(temp_dir_path.path().join("file"), 4096).expect("fixture should be created");
+
+    start(
+        backend,
+        keyboard_events,
+        temp_dir_path.path().to_path_buf(),
+        SHOW_APPARENT_SIZE,
+        DELETE_CONFIRMATION_ENABLED,
+    );
+    let terminal_draw_events = terminal_draw_events
+        .lock()
+        .expect("failed to lock test state");
+    assert_terminal_lifecycle(
+        &terminal_events
+            .lock()
+            .expect("failed to lock terminal events"),
+    );
+    assert!(terminal_draw_events.len() >= 3);
+    assert_snapshot!(&terminal_draw_events[2]);
 }

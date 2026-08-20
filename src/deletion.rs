@@ -1,0 +1,1666 @@
+use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io;
+use std::mem::size_of;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::UNIX_EPOCH;
+
+use cap_primitives::ambient_authority;
+use cap_primitives::fs::{self as cap_fs, FollowSymlinks};
+use file_id::FileId;
+use serde::{Deserialize, Serialize};
+use sysinfo::Disks;
+use thiserror::Error;
+
+use crate::model::NodeId;
+use crate::model::NodeKind;
+use crate::native_path::{NativeIdentity, safe_display_os_str};
+use crate::state::FileToDelete;
+
+pub const DEFAULT_PLAN_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+#[must_use]
+pub const fn deletion_supported() -> bool {
+    cfg!(any(target_os = "linux", target_vendor = "apple", windows))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlannedKind {
+    Directory,
+    File,
+    Link,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedSnapshot {
+    pub identity: NativeIdentity,
+    pub kind: PlannedKind,
+    pub apparent_bytes: u128,
+    pub allocated_bytes: Option<u128>,
+    pub modified_nanos: Option<u128>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewedEntry {
+    pub relative_path: PathBuf,
+    pub snapshot: PlannedSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedEntry {
+    pub relative_path: PathBuf,
+    pub snapshot: PlannedSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfirmationChallenge {
+    ConfirmFile,
+    TypeName(String),
+    TypePhrase(String),
+    ReducedGuard,
+}
+
+impl ConfirmationChallenge {
+    #[must_use]
+    pub fn expected_input(&self) -> &str {
+        match self {
+            Self::ConfirmFile | Self::ReducedGuard => "y",
+            Self::TypeName(name) | Self::TypePhrase(name) => name,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeletionPlan {
+    pub target: FileToDelete,
+    pub root_relative_path: PathBuf,
+    pub entries: Vec<PlannedEntry>,
+    pub challenge: ConfirmationChallenge,
+    pub apparent_bytes: u128,
+    pub estimated_bytes: usize,
+}
+
+impl DeletionPlan {
+    #[must_use]
+    pub fn planned_entries(&self) -> u64 {
+        u64::try_from(self.entries.len()).unwrap_or(u64::MAX)
+    }
+
+    #[must_use]
+    pub fn root_snapshot(&self) -> Option<&PlannedSnapshot> {
+        self.entries
+            .iter()
+            .find(|entry| entry.relative_path == self.root_relative_path)
+            .map(|entry| &entry.snapshot)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeletionEntryOutcome {
+    Deleted,
+    Changed(String),
+    Missing,
+    Failed(String),
+    Unattempted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeletionEntryResult {
+    pub entry: PlannedEntry,
+    pub outcome: DeletionEntryOutcome,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeletionReport {
+    pub target_node_id: NodeId,
+    pub root_relative_path: PathBuf,
+    pub scan_root: PathBuf,
+    pub entries: Vec<DeletionEntryResult>,
+    pub soft_cancelled: bool,
+    pub precise: bool,
+    pub estimated_bytes: usize,
+}
+
+impl DeletionReport {
+    #[must_use]
+    pub fn deleted_entries(&self) -> u64 {
+        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Deleted))
+    }
+
+    #[must_use]
+    pub fn changed_entries(&self) -> u64 {
+        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Changed(_)))
+    }
+
+    #[must_use]
+    pub fn missing_entries(&self) -> u64 {
+        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Missing))
+    }
+
+    #[must_use]
+    pub fn failed_entries(&self) -> u64 {
+        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Failed(_)))
+    }
+
+    #[must_use]
+    pub fn unattempted_entries(&self) -> u64 {
+        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Unattempted))
+    }
+
+    #[must_use]
+    pub fn deleted_apparent_bytes(&self) -> u128 {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.outcome, DeletionEntryOutcome::Deleted))
+            .fold(0_u128, |total, entry| {
+                total.saturating_add(entry.entry.snapshot.apparent_bytes)
+            })
+    }
+
+    fn count(&self, predicate: impl Fn(&DeletionEntryOutcome) -> bool) -> u64 {
+        u64::try_from(
+            self.entries
+                .iter()
+                .filter(|entry| predicate(&entry.outcome))
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum DeletionPlanError {
+    #[error("aggregate and synthetic nodes cannot be deleted")]
+    Synthetic,
+    #[error("scan roots and filesystem roots cannot be deleted")]
+    Root,
+    #[error("deletion target is not a safe relative path")]
+    InvalidRelativePath,
+    #[error("deletion target changed while its plan was built")]
+    Changed,
+    #[error("deletion planning was cancelled")]
+    Cancelled,
+    #[error("deletion plan exceeds its {limit} byte memory limit")]
+    MemoryLimit { limit: usize },
+    #[error("deletion planning failed for {path}: {message}")]
+    Io {
+        path: String,
+        message: String,
+        kind: io::ErrorKind,
+    },
+}
+
+/// Builds and revalidates an identity-bound deletion plan.
+///
+/// # Errors
+/// Returns a planning error when the target is ineligible, changed, unreadable, cancelled, or
+/// exceeds the bounded plan memory limit.
+pub fn build_plan(
+    scan_root: &Path,
+    target: FileToDelete,
+    reduced_guardrails: bool,
+) -> Result<DeletionPlan, DeletionPlanError> {
+    build_plan_cancellable(
+        scan_root,
+        target,
+        reduced_guardrails,
+        &AtomicBool::new(false),
+        DEFAULT_PLAN_LIMIT_BYTES,
+    )
+}
+
+/// Builds an identity-bound deletion plan with explicit cancellation and memory limits.
+///
+/// # Errors
+/// Returns a planning error when the target is ineligible, changed, unreadable, cancelled, or
+/// exceeds `maximum_bytes`.
+#[allow(clippy::too_many_lines)]
+pub fn build_plan_cancellable(
+    scan_root: &Path,
+    mut target: FileToDelete,
+    reduced_guardrails: bool,
+    cancelled: &AtomicBool,
+    maximum_bytes: usize,
+) -> Result<DeletionPlan, DeletionPlanError> {
+    if target.synthetic {
+        return Err(DeletionPlanError::Synthetic);
+    }
+    let relative = relative_target(&target)?;
+    let full_path = target.full_path();
+    if target.expected_snapshot.kind == NodeKind::Directory
+        && is_mount_root(&full_path).map_err(|error| plan_io(&full_path, error))?
+    {
+        return Err(DeletionPlanError::Root);
+    }
+    let root = open_root(scan_root)?;
+    let (snapshot, directory_handle) = inspect_relative(&root, &relative)?;
+    validate_model_snapshot(&target, &snapshot)?;
+    let challenge = challenge_for(&target, &snapshot, reduced_guardrails);
+    let mut entries = Vec::new();
+    let mut estimated_bytes = 0;
+
+    if let Some(handle) = directory_handle {
+        push_planned_entry(
+            &mut entries,
+            PlannedEntry {
+                relative_path: relative.clone(),
+                snapshot,
+            },
+            &mut estimated_bytes,
+            maximum_bytes,
+        )?;
+        let mut pending = VecDeque::from([0_usize]);
+        let mut root_handle = Some(handle);
+        while let Some(index) = pending.pop_front() {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(DeletionPlanError::Cancelled);
+            }
+            let relative_path = entries[index].relative_path.clone();
+            let expected = entries[index].snapshot.clone();
+            let handle = if index == 0 {
+                root_handle
+                    .take()
+                    .ok_or(DeletionPlanError::InvalidRelativePath)?
+            } else {
+                let (actual, handle) = inspect_relative(&root, &relative_path)?;
+                if actual != expected {
+                    return Err(DeletionPlanError::Changed);
+                }
+                handle.ok_or(DeletionPlanError::Changed)?
+            };
+            let read_dir =
+                cap_fs::read_base_dir(&handle).map_err(|error| plan_io(&relative_path, error))?;
+            for child in read_dir {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(DeletionPlanError::Cancelled);
+                }
+                let child = child.map_err(|error| plan_io(&relative_path, error))?;
+                let name = child.file_name();
+                validate_component(&name)?;
+                let child_relative = relative_path.join(&name);
+                let (child_snapshot, child_directory) =
+                    inspect_child(&handle, &name, &child_relative)?;
+                let directory = child_directory.is_some();
+                drop(child_directory);
+                let child_index = entries.len();
+                push_planned_entry(
+                    &mut entries,
+                    PlannedEntry {
+                        relative_path: child_relative,
+                        snapshot: child_snapshot,
+                    },
+                    &mut estimated_bytes,
+                    maximum_bytes,
+                )?;
+                if directory {
+                    pending.push_back(child_index);
+                }
+            }
+        }
+        entries.sort_by(|left, right| {
+            right
+                .relative_path
+                .components()
+                .count()
+                .cmp(&left.relative_path.components().count())
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+    } else {
+        push_planned_entry(
+            &mut entries,
+            PlannedEntry {
+                relative_path: relative.clone(),
+                snapshot,
+            },
+            &mut estimated_bytes,
+            maximum_bytes,
+        )?;
+    }
+    target
+        .reviewed_entries
+        .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    if entries.len() != target.reviewed_entries.len()
+        || entries.iter().any(|entry| {
+            target
+                .reviewed_entries
+                .binary_search_by(|reviewed| reviewed.relative_path.cmp(&entry.relative_path))
+                .ok()
+                .and_then(|index| target.reviewed_entries.get(index))
+                .is_none_or(|reviewed| reviewed.snapshot != entry.snapshot)
+        })
+    {
+        return Err(DeletionPlanError::Changed);
+    }
+    estimated_bytes = estimated_bytes.saturating_mul(2);
+
+    let apparent_bytes = entries.iter().fold(0_u128, |total, entry| {
+        total.saturating_add(entry.snapshot.apparent_bytes)
+    });
+    let plan = DeletionPlan {
+        target,
+        root_relative_path: relative,
+        entries,
+        challenge,
+        apparent_bytes,
+        estimated_bytes,
+    };
+    revalidate_plan_cancellable(scan_root, &plan, cancelled)?;
+    Ok(plan)
+}
+
+/// Revalidates every planned identity against the live filesystem.
+///
+/// # Errors
+/// Returns an error if any entry changed, disappeared, became unreadable, or escaped the scan root.
+pub fn revalidate_plan(scan_root: &Path, plan: &DeletionPlan) -> Result<(), DeletionPlanError> {
+    revalidate_plan_cancellable(scan_root, plan, &AtomicBool::new(false))
+}
+
+fn revalidate_plan_cancellable(
+    scan_root: &Path,
+    plan: &DeletionPlan,
+    cancelled: &AtomicBool,
+) -> Result<(), DeletionPlanError> {
+    let root = open_root(scan_root)?;
+    for entry in &plan.entries {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(DeletionPlanError::Cancelled);
+        }
+        let (actual, _) = inspect_relative(&root, &entry.relative_path)?;
+        if actual != entry.snapshot {
+            return Err(DeletionPlanError::Changed);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub fn execute_plan(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    soft_cancelled: &AtomicBool,
+    hard_cancelled: &AtomicBool,
+) -> DeletionReport {
+    execute_plan_unix(scan_root, plan, soft_cancelled, hard_cancelled)
+}
+
+#[cfg(windows)]
+pub fn execute_plan(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    soft_cancelled: &AtomicBool,
+    hard_cancelled: &AtomicBool,
+) -> DeletionReport {
+    execute_plan_windows(scan_root, plan, soft_cancelled, hard_cancelled)
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
+pub fn execute_plan(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    _soft_cancelled: &AtomicBool,
+    _hard_cancelled: &AtomicBool,
+) -> DeletionReport {
+    failed_report(
+        scan_root,
+        plan,
+        "permanent deletion is unavailable on this target",
+    )
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn execute_plan_unix(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    soft_cancelled: &AtomicBool,
+    hard_cancelled: &AtomicBool,
+) -> DeletionReport {
+    execute_plan_unix_with_hook(scan_root, plan, soft_cancelled, hard_cancelled, || {})
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn execute_plan_unix_with_hook<F>(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    soft_cancelled: &AtomicBool,
+    hard_cancelled: &AtomicBool,
+    mut after_isolation: F,
+) -> DeletionReport
+where
+    F: FnMut(),
+{
+    let root = match open_root(scan_root) {
+        Ok(root) => root,
+        Err(error) => return failed_report(scan_root, plan, &error.to_string()),
+    };
+    let estimated_bytes = plan.estimated_bytes;
+    let target_node_id = plan.target.node_id;
+    let root_relative_path = plan.root_relative_path.clone();
+    let mut results = Vec::with_capacity(plan.entries.len());
+    let mut stopped = false;
+    for entry in plan.entries {
+        if stopped
+            || soft_cancelled.load(Ordering::Acquire)
+            || hard_cancelled.load(Ordering::Acquire)
+        {
+            stopped = true;
+            results.push(DeletionEntryResult {
+                entry,
+                outcome: DeletionEntryOutcome::Unattempted,
+            });
+            continue;
+        }
+        let outcome = execute_unix_entry(&root, &entry, &mut after_isolation);
+        results.push(DeletionEntryResult { entry, outcome });
+    }
+    DeletionReport {
+        target_node_id,
+        root_relative_path,
+        scan_root: scan_root.to_path_buf(),
+        entries: results,
+        soft_cancelled: soft_cancelled.load(Ordering::Acquire),
+        precise: !hard_cancelled.load(Ordering::Acquire),
+        estimated_bytes,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[allow(clippy::too_many_lines)]
+fn execute_unix_entry<F>(
+    root: &File,
+    entry: &PlannedEntry,
+    after_isolation: &mut F,
+) -> DeletionEntryOutcome
+where
+    F: FnMut(),
+{
+    let (parent, original_name) = match open_parent(root, &entry.relative_path) {
+        Ok(value) => value,
+        Err(DeletionPlanError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => return DeletionEntryOutcome::Missing,
+        Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
+    };
+    let (detached_name, placeholder) = match create_placeholder(&parent) {
+        Ok(value) => value,
+        Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
+    };
+    if let Err(error) = exchange_names(&parent, &original_name, &detached_name) {
+        let cleanup = remove_verified_placeholder(&parent, &detached_name, &placeholder);
+        return DeletionEntryOutcome::Failed(cleanup.map_or_else(
+            |cleanup_error| format!("{error}; placeholder cleanup failed: {cleanup_error}"),
+            |()| error.to_string(),
+        ));
+    }
+    after_isolation();
+
+    let actual = match inspect_child(&parent, &detached_name, &entry.relative_path) {
+        Ok((snapshot, handle)) => {
+            drop(handle);
+            snapshot
+        }
+        Err(DeletionPlanError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => {
+            return match finalize_placeholder(&parent, &original_name, &detached_name, &placeholder)
+            {
+                Ok(()) => DeletionEntryOutcome::Missing,
+                Err(error) => DeletionEntryOutcome::Failed(format!(
+                    "isolated entry disappeared; namespace cleanup failed: {error}"
+                )),
+            };
+        }
+        Err(error) => {
+            let restore = restore_detached(&parent, &original_name, &detached_name, &placeholder);
+            return DeletionEntryOutcome::Failed(restore.map_or_else(
+                |restore_error| format!("{error}; namespace recovery failed: {restore_error}"),
+                |()| error.to_string(),
+            ));
+        }
+    };
+    if !matches_for_execution(&entry.snapshot, &actual) {
+        return match restore_detached(&parent, &original_name, &detached_name, &placeholder) {
+            Ok(()) => DeletionEntryOutcome::Changed(
+                "identity, type, size, allocation, or modification changed".to_string(),
+            ),
+            Err(error) => DeletionEntryOutcome::Failed(format!(
+                "entry changed; namespace recovery failed: {error}"
+            )),
+        };
+    }
+
+    let removal = match entry.snapshot.kind {
+        PlannedKind::Directory => cap_fs::remove_dir(&parent, Path::new(&detached_name)),
+        PlannedKind::File | PlannedKind::Link => {
+            cap_fs::remove_file(&parent, Path::new(&detached_name))
+        }
+    };
+    match removal {
+        Ok(()) => finalize_placeholder(&parent, &original_name, &detached_name, &placeholder)
+            .map_or_else(
+                |error| {
+                    DeletionEntryOutcome::Failed(format!(
+                        "target deleted; namespace cleanup failed: {error}"
+                    ))
+                },
+                |()| DeletionEntryOutcome::Deleted,
+            ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            finalize_placeholder(&parent, &original_name, &detached_name, &placeholder).map_or_else(
+                |cleanup_error| {
+                    DeletionEntryOutcome::Failed(format!(
+                        "target disappeared; namespace cleanup failed: {cleanup_error}"
+                    ))
+                },
+                |()| DeletionEntryOutcome::Missing,
+            )
+        }
+        Err(error) => {
+            let restore = restore_detached(&parent, &original_name, &detached_name, &placeholder);
+            if error.kind() == io::ErrorKind::DirectoryNotEmpty {
+                restore.map_or_else(
+                    |restore_error| {
+                        DeletionEntryOutcome::Failed(format!(
+                            "directory changed; namespace recovery failed: {restore_error}"
+                        ))
+                    },
+                    |()| {
+                        DeletionEntryOutcome::Changed(
+                            "directory contains a new or changed entry".to_string(),
+                        )
+                    },
+                )
+            } else {
+                DeletionEntryOutcome::Failed(restore.map_or_else(
+                    |restore_error| format!("{error}; namespace recovery failed: {restore_error}"),
+                    |()| error.to_string(),
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn execute_plan_windows(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    soft_cancelled: &AtomicBool,
+    hard_cancelled: &AtomicBool,
+) -> DeletionReport {
+    let root = match open_root(scan_root) {
+        Ok(root) => root,
+        Err(error) => return failed_report(scan_root, plan, &error.to_string()),
+    };
+    let estimated_bytes = plan.estimated_bytes;
+    let target_node_id = plan.target.node_id;
+    let root_relative_path = plan.root_relative_path.clone();
+    let mut results = Vec::with_capacity(plan.entries.len());
+    let mut stopped = false;
+    for entry in plan.entries {
+        if stopped
+            || soft_cancelled.load(Ordering::Acquire)
+            || hard_cancelled.load(Ordering::Acquire)
+        {
+            stopped = true;
+            results.push(DeletionEntryResult {
+                entry,
+                outcome: DeletionEntryOutcome::Unattempted,
+            });
+            continue;
+        }
+        let outcome = execute_windows_entry(&root, &entry);
+        results.push(DeletionEntryResult { entry, outcome });
+    }
+    DeletionReport {
+        target_node_id,
+        root_relative_path,
+        scan_root: scan_root.to_path_buf(),
+        entries: results,
+        soft_cancelled: soft_cancelled.load(Ordering::Acquire),
+        precise: !hard_cancelled.load(Ordering::Acquire),
+        estimated_bytes,
+    }
+}
+
+#[cfg(windows)]
+fn execute_windows_entry(root: &File, entry: &PlannedEntry) -> DeletionEntryOutcome {
+    use cap_primitives::fs::{_WindowsByHandle as _, OpenOptionsExt as _};
+
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let (parent, name) = match open_parent(root, &entry.relative_path) {
+        Ok(value) => value,
+        Err(DeletionPlanError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => return DeletionEntryOutcome::Missing,
+        Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
+    };
+    let mut options = cap_fs::OpenOptions::new();
+    options
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        ._cap_fs_ext_follow(FollowSymlinks::No);
+    let handle = match cap_fs::open(&parent, Path::new(&name), &options) {
+        Ok(handle) => handle,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return DeletionEntryOutcome::Missing;
+        }
+        Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
+    };
+    let metadata = match cap_fs::Metadata::from_file(&handle) {
+        Ok(metadata) => metadata,
+        Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
+    };
+    let kind = if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        PlannedKind::Link
+    } else if metadata.is_dir() {
+        PlannedKind::Directory
+    } else {
+        PlannedKind::File
+    };
+    let actual = match snapshot_from_open_file(&handle, kind) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
+    };
+    if !matches_for_execution(&entry.snapshot, &actual) {
+        return DeletionEntryOutcome::Changed(
+            "identity, type, size, allocation, or modification changed".to_string(),
+        );
+    }
+    match crate::windows_delete::remove_open_handle(&handle) {
+        Ok(()) => DeletionEntryOutcome::Deleted,
+        Err(error) if error.raw_os_error() == Some(145) => {
+            DeletionEntryOutcome::Changed("directory contains a new or changed entry".to_string())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DeletionEntryOutcome::Missing,
+        Err(error) => DeletionEntryOutcome::Failed(error.to_string()),
+    }
+}
+
+fn failed_report(scan_root: &Path, plan: DeletionPlan, message: &str) -> DeletionReport {
+    DeletionReport {
+        target_node_id: plan.target.node_id,
+        root_relative_path: plan.root_relative_path,
+        scan_root: scan_root.to_path_buf(),
+        entries: plan
+            .entries
+            .into_iter()
+            .map(|entry| DeletionEntryResult {
+                entry,
+                outcome: DeletionEntryOutcome::Failed(message.to_string()),
+            })
+            .collect(),
+        soft_cancelled: false,
+        precise: true,
+        estimated_bytes: plan.estimated_bytes,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn create_placeholder(parent: &File) -> io::Result<(OsString, PlannedSnapshot)> {
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_PLACEHOLDER: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..128 {
+        let sequence = NEXT_PLACEHOLDER.fetch_add(1, Ordering::Relaxed);
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
+        let token = random
+            .iter()
+            .fold(String::with_capacity(32), |mut token, byte| {
+                use std::fmt::Write as _;
+
+                let _ = write!(token, "{byte:02x}");
+                token
+            });
+        let name = OsString::from(format!(
+            ".excise-delete-{token}-{:x}-{sequence:x}",
+            std::process::id()
+        ));
+        let mut options = cap_fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match cap_fs::open(parent, Path::new(&name), &options) {
+            Ok(file) => {
+                let metadata = file.metadata()?;
+                return snapshot_from_std_metadata(&metadata, PlannedKind::File)
+                    .map(|snapshot| (name, snapshot));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve an isolated deletion name",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn exchange_names(parent: &File, left: &OsStr, right: &OsStr) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        parent,
+        Path::new(left),
+        parent,
+        Path::new(right),
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn remove_verified_placeholder(
+    parent: &File,
+    name: &OsStr,
+    expected: &PlannedSnapshot,
+) -> io::Result<()> {
+    let (actual, handle) = inspect_child(parent, name, Path::new(name))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    drop(handle);
+    if actual != *expected {
+        return Err(io::Error::other(
+            "isolated deletion placeholder identity changed",
+        ));
+    }
+    cap_fs::remove_file(parent, Path::new(name))
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn restore_detached(
+    parent: &File,
+    original: &OsStr,
+    detached: &OsStr,
+    placeholder: &PlannedSnapshot,
+) -> io::Result<()> {
+    let (actual, handle) = inspect_child(parent, original, Path::new(original))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    drop(handle);
+    if actual != *placeholder {
+        return Err(io::Error::other(
+            "original name no longer contains the deletion placeholder",
+        ));
+    }
+    exchange_names(parent, original, detached)?;
+    remove_verified_placeholder(parent, detached, placeholder)
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn finalize_placeholder(
+    parent: &File,
+    original: &OsStr,
+    detached: &OsStr,
+    placeholder: &PlannedSnapshot,
+) -> io::Result<()> {
+    let (actual, handle) = inspect_child(parent, original, Path::new(original))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    drop(handle);
+    if actual != *placeholder {
+        return Err(io::Error::other(
+            "original name no longer contains the deletion placeholder",
+        ));
+    }
+    rustix::fs::renameat_with(
+        parent,
+        Path::new(original),
+        parent,
+        Path::new(detached),
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)?;
+    remove_verified_placeholder(parent, detached, placeholder)
+}
+
+fn inspect_relative(
+    root: &File,
+    relative: &Path,
+) -> Result<(PlannedSnapshot, Option<File>), DeletionPlanError> {
+    let (parent, name) = open_parent(root, relative)?;
+    inspect_child(&parent, &name, relative)
+}
+
+fn inspect_child(
+    parent: &File,
+    name: &OsStr,
+    display_path: &Path,
+) -> Result<(PlannedSnapshot, Option<File>), DeletionPlanError> {
+    let metadata = cap_fs::stat(parent, Path::new(name), FollowSymlinks::No)
+        .map_err(|error| plan_io(display_path, error))?;
+    if metadata.is_dir() && !metadata.is_symlink() {
+        let handle = cap_fs::open_dir_nofollow(parent, Path::new(name))
+            .map_err(|error| plan_io(display_path, error))?;
+        let snapshot = snapshot_from_open_file(&handle, PlannedKind::Directory)
+            .map_err(|error| plan_io(display_path, error))?;
+        Ok((snapshot, Some(handle)))
+    } else {
+        let kind = if metadata.is_symlink() {
+            PlannedKind::Link
+        } else {
+            PlannedKind::File
+        };
+        let snapshot = snapshot_from_cap_metadata(parent, name, &metadata, kind)
+            .map_err(|error| plan_io(display_path, error))?;
+        Ok((snapshot, None))
+    }
+}
+
+fn open_root(path: &Path) -> Result<File, DeletionPlanError> {
+    cap_fs::open_ambient_dir(path, ambient_authority()).map_err(|error| plan_io(path, error))
+}
+
+fn validate_model_snapshot(
+    target: &FileToDelete,
+    actual: &PlannedSnapshot,
+) -> Result<(), DeletionPlanError> {
+    let expected_kind = match target.expected_snapshot.kind {
+        NodeKind::Directory => PlannedKind::Directory,
+        NodeKind::File => PlannedKind::File,
+        NodeKind::Link => PlannedKind::Link,
+        NodeKind::Root | NodeKind::Synthetic(_) => return Err(DeletionPlanError::Synthetic),
+    };
+    if expected_kind != actual.kind
+        || target.expected_snapshot.apparent_bytes != actual.apparent_bytes
+        || target.expected_snapshot.modified_nanos != actual.modified_nanos
+        || target
+            .expected_snapshot
+            .identity
+            .as_ref()
+            .is_some_and(|identity| identity != &actual.identity)
+    {
+        return Err(DeletionPlanError::Changed);
+    }
+    Ok(())
+}
+
+fn open_parent(root: &File, relative: &Path) -> Result<(File, OsString), DeletionPlanError> {
+    let components = validated_components(relative)?;
+    let Some((name, parents)) = components.split_last() else {
+        return Err(DeletionPlanError::Root);
+    };
+    let mut parent = root.try_clone().map_err(|error| plan_io(relative, error))?;
+    for component in parents {
+        parent = cap_fs::open_dir_nofollow(&parent, Path::new(component))
+            .map_err(|error| plan_io(relative, error))?;
+    }
+    Ok((parent, name.clone()))
+}
+
+fn is_mount_root(path: &Path) -> io::Result<bool> {
+    let canonical = std::fs::canonicalize(path)?;
+    if canonical.parent().is_none_or(|parent| parent == canonical) {
+        return Ok(true);
+    }
+    let disks = Disks::new_with_refreshed_list();
+    Ok(disks.list().iter().any(|disk| {
+        std::fs::canonicalize(disk.mount_point()).is_ok_and(|mount| mount == canonical)
+    }))
+}
+
+fn relative_target(target: &FileToDelete) -> Result<PathBuf, DeletionPlanError> {
+    let relative = target.path_to_file.iter().collect::<PathBuf>();
+    validated_components(&relative)?;
+    if relative.as_os_str().is_empty() {
+        Err(DeletionPlanError::Root)
+    } else {
+        Ok(relative)
+    }
+}
+
+fn validated_components(path: &Path) -> Result<Vec<OsString>, DeletionPlanError> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(component) => components.push(component.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(DeletionPlanError::InvalidRelativePath);
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(DeletionPlanError::Root);
+    }
+    Ok(components)
+}
+
+fn validate_component(name: &OsStr) -> Result<(), DeletionPlanError> {
+    if name.is_empty() || name == OsStr::new(".") || name == OsStr::new("..") {
+        Err(DeletionPlanError::InvalidRelativePath)
+    } else {
+        Ok(())
+    }
+}
+
+fn challenge_for(
+    target: &FileToDelete,
+    snapshot: &PlannedSnapshot,
+    reduced_guardrails: bool,
+) -> ConfirmationChallenge {
+    if reduced_guardrails {
+        return ConfirmationChallenge::ReducedGuard;
+    }
+    if snapshot.kind != PlannedKind::Directory {
+        return ConfirmationChallenge::ConfirmFile;
+    }
+    let name = target.path_to_file.last().map_or_else(
+        || safe_display_os_str(OsStr::new("")),
+        |name| safe_display_os_str(name),
+    );
+    if name.deceptive {
+        ConfirmationChallenge::TypePhrase(format!(
+            "DELETE {}",
+            challenge_code(&snapshot.identity.file_id)
+        ))
+    } else {
+        ConfirmationChallenge::TypeName(name.text)
+    }
+}
+
+fn challenge_code(file_id: &FileId) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let bytes = serde_json::to_vec(file_id).unwrap_or_default();
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (0..4)
+        .map(|shift| ALPHABET[((hash >> (shift * 5)) & 31) as usize] as char)
+        .collect()
+}
+
+fn matches_for_execution(expected: &PlannedSnapshot, actual: &PlannedSnapshot) -> bool {
+    same_object(&expected.identity, &actual.identity)
+        && expected.kind == actual.kind
+        && (expected.kind == PlannedKind::Directory
+            || (expected.apparent_bytes == actual.apparent_bytes
+                && expected.allocated_bytes == actual.allocated_bytes
+                && expected.modified_nanos == actual.modified_nanos))
+}
+
+fn same_object(expected: &NativeIdentity, actual: &NativeIdentity) -> bool {
+    expected.file_id == actual.file_id && expected.reparse_point == actual.reparse_point
+}
+
+#[cfg(unix)]
+fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn snapshot_from_std_metadata(
+    metadata: &std::fs::Metadata,
+    kind: PlannedKind,
+) -> io::Result<PlannedSnapshot> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Ok(PlannedSnapshot {
+        identity: NativeIdentity {
+            file_id: FileId::new_inode(metadata.dev(), metadata.ino()),
+            link_count: Some(metadata.nlink()),
+            reparse_point: metadata.file_type().is_symlink(),
+        },
+        kind,
+        apparent_bytes: if kind == PlannedKind::Directory {
+            0
+        } else {
+            u128::from(metadata.len())
+        },
+        allocated_bytes: (kind == PlannedKind::File)
+            .then(|| u128::from(metadata.blocks()).saturating_mul(512)),
+        modified_nanos: modified_nanos(metadata),
+    })
+}
+
+#[cfg(windows)]
+fn snapshot_from_open_file(handle: &File, kind: PlannedKind) -> io::Result<PlannedSnapshot> {
+    use cap_primitives::fs::_WindowsByHandle as _;
+
+    let metadata = cap_fs::Metadata::from_file(handle)?;
+    let volume = metadata
+        .volume_serial_number()
+        .ok_or_else(|| io::Error::other("file handle did not expose a volume serial number"))?;
+    let index = metadata
+        .file_index()
+        .ok_or_else(|| io::Error::other("file handle did not expose a file index"))?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.into_std().duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    Ok(PlannedSnapshot {
+        identity: NativeIdentity {
+            file_id: FileId::new_low_res(volume, index),
+            link_count: metadata.number_of_links().map(u64::from),
+            reparse_point: metadata.file_attributes() & 0x0000_0400 != 0,
+        },
+        kind,
+        apparent_bytes: if kind == PlannedKind::Directory {
+            0
+        } else {
+            u128::from(metadata.len())
+        },
+        allocated_bytes: None,
+        modified_nanos,
+    })
+}
+
+#[cfg(not(windows))]
+fn snapshot_from_open_file(handle: &File, kind: PlannedKind) -> io::Result<PlannedSnapshot> {
+    snapshot_from_std_metadata(&handle.metadata()?, kind)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn snapshot_from_std_metadata(
+    _metadata: &std::fs::Metadata,
+    _kind: PlannedKind,
+) -> io::Result<PlannedSnapshot> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "permanent deletion is unavailable on this target",
+    ))
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn snapshot_from_cap_metadata(
+    _parent: &File,
+    _name: &OsStr,
+    metadata: &cap_fs::Metadata,
+    kind: PlannedKind,
+) -> io::Result<PlannedSnapshot> {
+    use cap_primitives::fs::MetadataExt as _;
+
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.into_std().duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    Ok(PlannedSnapshot {
+        identity: NativeIdentity {
+            file_id: FileId::new_inode(metadata.dev(), metadata.ino()),
+            link_count: Some(metadata.nlink()),
+            reparse_point: metadata.is_symlink(),
+        },
+        kind,
+        apparent_bytes: u128::from(metadata.len()),
+
+        allocated_bytes: (kind == PlannedKind::File)
+            .then(|| u128::from(metadata.blocks()).saturating_mul(512)),
+        modified_nanos,
+    })
+}
+
+#[cfg(windows)]
+fn snapshot_from_cap_metadata(
+    parent: &File,
+    name: &OsStr,
+    _metadata: &cap_fs::Metadata,
+    kind: PlannedKind,
+) -> io::Result<PlannedSnapshot> {
+    use cap_primitives::fs::OpenOptionsExt as _;
+
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let mut options = cap_fs::OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        ._cap_fs_ext_follow(FollowSymlinks::No);
+    let handle = cap_fs::open(parent, Path::new(name), &options)?;
+    snapshot_from_open_file(&handle, kind)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn snapshot_from_cap_metadata(
+    _parent: &File,
+    _name: &OsStr,
+    _metadata: &cap_fs::Metadata,
+    _kind: PlannedKind,
+) -> io::Result<PlannedSnapshot> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "permanent deletion is unavailable on this target",
+    ))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn plan_io(path: &Path, error: io::Error) -> DeletionPlanError {
+    DeletionPlanError::Io {
+        path: path.to_string_lossy().into_owned(),
+        message: error.to_string(),
+        kind: error.kind(),
+    }
+}
+fn push_planned_entry(
+    entries: &mut Vec<PlannedEntry>,
+    entry: PlannedEntry,
+    estimated_bytes: &mut usize,
+    maximum_bytes: usize,
+) -> Result<(), DeletionPlanError> {
+    let required = size_of::<PlannedEntry>()
+        .saturating_add(
+            entry
+                .relative_path
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                .saturating_mul(2),
+        )
+        .saturating_add(128);
+    let next = estimated_bytes.saturating_add(required);
+    if next > maximum_bytes {
+        return Err(DeletionPlanError::MemoryLimit {
+            limit: maximum_bytes,
+        });
+    }
+    *estimated_bytes = next;
+    entries.push(entry);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::sync::atomic::AtomicBool;
+
+    use super::*;
+    use crate::state::tiles::FileType;
+
+    fn reviewed_snapshot(path: &Path, metadata: &std::fs::Metadata) -> PlannedSnapshot {
+        let kind = if metadata.is_dir() {
+            PlannedKind::Directory
+        } else if metadata.file_type().is_symlink() {
+            PlannedKind::Link
+        } else {
+            PlannedKind::File
+        };
+        PlannedSnapshot {
+            identity: crate::native_path::identity_for(path, metadata)
+                .expect("fixture identity lookup should succeed")
+                .expect("fixture identity should be readable"),
+            kind,
+            apparent_bytes: if kind == PlannedKind::Directory {
+                0
+            } else {
+                u128::from(metadata.len())
+            },
+            allocated_bytes: (kind == PlannedKind::File && !cfg!(windows))
+                .then(|| {
+                    crate::os::physical_size(path, metadata)
+                        .ok()
+                        .map(u128::from)
+                })
+                .flatten(),
+            modified_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+        }
+    }
+
+    fn reviewed_entries(root: &Path, target: &Path) -> Vec<ReviewedEntry> {
+        let mut entries = Vec::new();
+        let mut stack = vec![target.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let metadata =
+                std::fs::symlink_metadata(&path).expect("fixture metadata should be readable");
+            let snapshot = reviewed_snapshot(&path, &metadata);
+            if snapshot.kind == PlannedKind::Directory {
+                for child in std::fs::read_dir(&path).expect("fixture directory should be readable")
+                {
+                    stack.push(child.expect("fixture entry should be readable").path());
+                }
+            }
+            entries.push(ReviewedEntry {
+                relative_path: path
+                    .strip_prefix(root)
+                    .expect("fixture should be below root")
+                    .to_path_buf(),
+                snapshot,
+            });
+        }
+        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        entries
+    }
+
+    fn target(root: &Path, name: OsString, file_type: FileType) -> FileToDelete {
+        let path = root.join(&name);
+        let reviewed_entries = reviewed_entries(root, &path);
+        let snapshot = reviewed_entries
+            .iter()
+            .find(|entry| entry.relative_path == Path::new(&name))
+            .expect("target should be reviewed")
+            .snapshot
+            .clone();
+        let kind = match snapshot.kind {
+            PlannedKind::Directory => NodeKind::Directory,
+            PlannedKind::File => NodeKind::File,
+            PlannedKind::Link => NodeKind::Link,
+        };
+        FileToDelete {
+            node_id: NodeId(1),
+            synthetic: false,
+            path_in_filesystem: root.to_path_buf(),
+            path_to_file: vec![name],
+            file_type,
+            num_descendants: (kind == NodeKind::Directory).then(|| {
+                u64::try_from(reviewed_entries.len().saturating_sub(1)).unwrap_or(u64::MAX)
+            }),
+            size: 0,
+            expected_snapshot: crate::model::EntrySnapshot {
+                identity: Some(snapshot.identity.clone()),
+                kind,
+                apparent_bytes: snapshot.apparent_bytes,
+                allocated_bytes: snapshot.allocated_bytes,
+                modified_nanos: snapshot.modified_nanos,
+            },
+            reviewed_entries,
+        }
+    }
+
+    #[test]
+    fn unchanged_file_plan_deletes_exact_identity() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.challenge, ConfirmationChallenge::ConfirmFile);
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert!(report.precise);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn replaced_file_is_skipped() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"original").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+        std::fs::rename(&path, root.path().join("original"))
+            .expect("original identity should remain allocated");
+        std::fs::write(&path, b"replacement").expect("replacement should be written");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.changed_entries(), 1);
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_after_isolation_is_never_deleted() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"reviewed").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+        let displaced_placeholder = root.path().join("displaced-placeholder");
+
+        let report = execute_plan_unix_with_hook(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            || {
+                std::fs::rename(&path, &displaced_placeholder)
+                    .expect("placeholder should be displaced");
+                std::fs::write(&path, b"replacement")
+                    .expect("replacement should occupy the original name");
+            },
+        );
+
+        assert_eq!(
+            std::fs::read(&path).expect("replacement should survive"),
+            b"replacement"
+        );
+        assert_eq!(report.failed_entries(), 1);
+        assert!(report.precise);
+    }
+
+    #[test]
+    fn new_directory_child_is_never_swept() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let planned_child = directory.join("planned");
+        std::fs::write(&planned_child, b"planned").expect("planned child should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::Folder),
+            false,
+        )
+        .expect("directory plan should build");
+        let new_child = directory.join("new");
+        std::fs::write(&new_child, b"new").expect("new child should be written");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert_eq!(report.changed_entries(), 1);
+        assert!(!planned_child.exists());
+        assert!(new_child.exists());
+        assert!(directory.exists());
+    }
+
+    #[test]
+    fn soft_cancel_leaves_every_entry_unattempted() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(true),
+            &AtomicBool::new(false),
+        );
+
+        assert!(report.soft_cancelled);
+        assert_eq!(report.unattempted_entries(), 1);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn changed_scan_snapshot_is_rejected_before_consent() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"original").expect("target should be written");
+        let reviewed = target(root.path(), OsString::from("target"), FileType::File);
+        std::fs::write(&path, b"changed content").expect("target should change");
+
+        assert!(matches!(
+            build_plan(root.path(), reviewed, false),
+            Err(DeletionPlanError::Changed)
+        ));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn stale_reviewed_subtree_is_rejected_before_consent() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let reviewed_child = directory.join("reviewed");
+        std::fs::write(&reviewed_child, b"reviewed").expect("reviewed child should be written");
+        let reviewed = target(root.path(), OsString::from("target"), FileType::Folder);
+        let stale_child = directory.join("not-reviewed");
+        std::fs::write(&stale_child, b"late").expect("late child should be written");
+
+        assert!(matches!(
+            build_plan(root.path(), reviewed, false),
+            Err(DeletionPlanError::Changed)
+        ));
+        assert!(reviewed_child.exists());
+        assert!(stale_child.exists());
+    }
+
+    #[test]
+    fn file_to_directory_replacement_is_skipped() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"original").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+        std::fs::rename(&path, root.path().join("original"))
+            .expect("original identity should remain allocated");
+        std::fs::create_dir(&path).expect("replacement directory should be created");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(report.changed_entries(), 1);
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn changed_entry_does_not_block_safe_sibling() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let changed = directory.join("changed");
+        let safe = directory.join("safe");
+        std::fs::write(&changed, b"original").expect("changed fixture should be written");
+        std::fs::write(&safe, b"safe").expect("safe fixture should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::Folder),
+            false,
+        )
+        .expect("directory plan should build");
+        std::fs::rename(&changed, directory.join("original"))
+            .expect("original identity should remain allocated");
+        std::fs::write(&changed, b"replacement").expect("replacement should be written");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert!(report.deleted_entries() >= 1);
+        assert!(report.changed_entries() >= 1);
+        assert!(!safe.exists());
+        assert!(changed.exists());
+    }
+
+    #[test]
+    fn hard_cancel_marks_report_imprecise() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(true),
+        );
+        assert!(!report.precise);
+        assert_eq!(report.unattempted_entries(), 1);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn deletion_plan_respects_memory_limit() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        let target = target(root.path(), OsString::from("target"), FileType::File);
+
+        assert!(matches!(
+            build_plan_cancellable(root.path(), target, false, &AtomicBool::new(false), 1,),
+            Err(DeletionPlanError::MemoryLimit { limit: 1 })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_plan_does_not_retain_one_handle_per_level() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let target_path = root.path().join("target");
+        std::fs::create_dir(&target_path).expect("target directory should be created");
+        let mut deepest = target_path;
+        for _ in 0..300 {
+            deepest.push("d");
+            std::fs::create_dir(&deepest).expect("deep directory should be created");
+        }
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::Folder),
+            false,
+        )
+        .expect("deep plan should stay within the process file descriptor limit");
+
+        assert_eq!(plan.planned_entries(), 301);
+    }
+
+    #[test]
+    fn safe_directory_and_reduced_guardrails_use_distinct_challenges() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::create_dir(&path).expect("target directory should be created");
+        let reviewed = target(root.path(), OsString::from("target"), FileType::Folder);
+        let guarded =
+            build_plan(root.path(), reviewed.clone(), false).expect("guarded plan should build");
+        let reduced = build_plan(root.path(), reviewed, true).expect("reduced plan should build");
+
+        assert_eq!(
+            guarded.challenge,
+            ConfirmationChallenge::TypeName("target".to_string())
+        );
+        assert_eq!(reduced.challenge, ConfirmationChallenge::ReducedGuard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_a_link_never_deletes_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let outside = tempfile::tempdir().expect("outside root should exist");
+        let outside_file = outside.path().join("outside");
+        std::fs::write(&outside_file, b"outside").expect("outside target should be written");
+        let link = root.path().join("link");
+        symlink(&outside_file, &link).expect("link should be created");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("link"), FileType::File),
+            false,
+        )
+        .expect("link plan should build without following it");
+        assert_eq!(
+            plan.root_snapshot().map(|snapshot| snapshot.kind),
+            Some(PlannedKind::Link)
+        );
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert!(!link.exists());
+        assert!(outside_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_root_is_rejected_but_a_link_to_it_is_plannable() {
+        use std::os::unix::fs::symlink;
+
+        assert!(is_mount_root(Path::new("/")).expect("root mount should be inspectable"));
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let link = root.path().join("root-link");
+        symlink("/", &link).expect("root link should be created");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("root-link"), FileType::File),
+            false,
+        )
+        .expect("a link to a mount root should not follow its target");
+        assert_eq!(
+            plan.root_snapshot().map(|snapshot| snapshot.kind),
+            Some(PlannedKind::Link)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_directory_name_uses_generated_challenge() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let name = OsString::from_vec(b"bad\x1bname".to_vec());
+        std::fs::create_dir(root.path().join(&name)).expect("hostile directory should be created");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), name, FileType::Folder),
+            false,
+        )
+        .expect("hostile directory plan should build");
+
+        assert!(matches!(
+            plan.challenge,
+            ConfirmationChallenge::TypePhrase(_)
+        ));
+    }
+}

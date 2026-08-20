@@ -1,93 +1,42 @@
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::Widget;
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 
-use crate::ui::format::truncate_end;
-use crate::ui::grid::draw_filled_rect;
-
-pub struct WarningBox {}
+pub struct WarningBox;
 
 impl WarningBox {
     pub const fn new() -> Self {
-        Self {}
+        Self
     }
 }
 
 impl Widget for WarningBox {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let (width, height) = if area.width > 150 {
-            (150, 10)
-        } else if area.width >= 50 {
-            (area.width / 2, 10)
-        } else {
-            unreachable!("app should not be rendered if window is so small")
-        };
-
-        // position self in the middle of the rect
-        let x = u16::midpoint(area.x, area.width) - width / 2;
-        let y = u16::midpoint(area.y, area.height) - height / 2;
-
-        let warning_rect = Rect {
-            x,
-            y,
-            width,
-            height,
-        };
-        let fill_style = Style::default()
-            .bg(Color::Black)
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
-        let text_max_length = warning_rect.width - 4;
-        let mut warning_text_start_position: u16 = 0;
-
-        let possible_warning_texts = [
-            "Sorry, deletion is only allowed once the scanning has completed",
-            "Deletion is not allowed while scanning",
-            "Can't delete while scanning",
-            "Can't delete now",
-        ];
-        // set default value of the warning_text
-        // to the longest one from possible_warning_texts array
-        let mut warning_text = String::from(possible_warning_texts[0]);
-        for line in &possible_warning_texts {
-            // "+5" here is to make sure confirm message has always some padding
-            if warning_rect.width >= (line.chars().count() as u16) + 5 {
-                // here we truncate the end and not the middle because
-                // when dealing with warning messages, the beginning tends
-                // to be the important part
-                warning_text = truncate_end(line, text_max_length);
-                warning_text_start_position =
-                    (f64::from(warning_rect.width - warning_text.len() as u16) / 2.0).ceil() as u16
-                        + warning_rect.x;
-                break;
-            }
-        }
-
-        let controls_text = ["(Press any key to dismiss)", "(any key to dismiss)"];
-
-        draw_filled_rect(buf, fill_style, warning_rect);
-        buf.set_string(
-            warning_text_start_position,
-            warning_rect.y + warning_rect.height / 2 - 2,
-            warning_text,
-            fill_style,
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let width = area.width.saturating_sub(2).clamp(30, 72).min(area.width);
+        let height = area.height.saturating_sub(2).clamp(7, 9).min(area.height);
+        let rect = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width.min(area.width),
+            height.min(area.height),
         );
-
-        for line in &controls_text {
-            if text_max_length >= line.chars().count() as u16 {
-                let start_position = (f64::from(warning_rect.width - line.chars().count() as u16)
-                    / 2.0)
-                    .ceil() as u16
-                    + warning_rect.x;
-                buf.set_string(
-                    start_position,
-                    warning_rect.y + warning_rect.height / 2 + 2,
-                    line,
-                    fill_style,
-                );
-                break;
-            }
-        }
+        Clear.render(rect, buffer);
+        let style = Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        Paragraph::new("Deletion is locked until scanning or focused rescanning completes.\n\n[Any key] dismiss")
+            .style(style)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(style)
+                    .title(" WARNING "),
+            )
+            .render(rect, buffer);
     }
 }

@@ -14,7 +14,16 @@ fuzz_target!(|data: &[u8]| {
             apparent_size: false,
             scan_threads: None,
             event_buffer: None,
+            cross_filesystems: false,
+            exclusions: Vec::new(),
+            memory_mib: None,
             reduced_motion: false,
+            theme: None,
+            ascii: false,
+            mouse: false,
+            keymap: None,
+            format: None,
+            output: None,
             disable_delete_confirmation: false,
         };
         let _ = RuntimeConfig::from_layers(

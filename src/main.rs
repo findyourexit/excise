@@ -1,20 +1,24 @@
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
 use std::process;
 
 use clap::Parser;
 use clap::error::ErrorKind;
 use ratatui::backend::CrosstermBackend;
 
-use excise::config::{Cli, RuntimeConfig};
+use excise::config::{Cli, OutputFormat, RuntimeConfig, default_config_path};
 use excise::error::{AppError, ExitClass};
 use excise::native_path::ResolvedRoot;
-use excise::runtime::{RuntimeSettings, SystemClock, run};
+use excise::report::{ReportError, ScanReport};
+use excise::runtime::{RuntimeSettings, SystemClock, run, scan_headless};
 use excise::{TerminalEvents, TerminalSession, validate_terminal};
 
 fn main() {
     process::exit(run_main());
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_main() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -44,11 +48,49 @@ fn run_main() -> i32 {
         Ok(root) => root,
         Err(error) => return report_error(&error),
     };
+    let output_format = config.format;
+    let output_path = config.output.clone();
+    let preference_path = config.config_path.clone().or_else(default_config_path);
+    let monochrome_locked = config.monochrome && config.theme != excise::theme::ThemeId::Monochrome;
+    let settings = RuntimeSettings {
+        root: root.resolved.as_path().to_path_buf(),
+        scan_threads: config.scan_threads,
+        event_capacity: config.event_buffer,
+        cross_filesystems: config.cross_filesystems,
+        exclusions: config.exclusions,
+        memory_mib: config.memory_mib,
+        apparent_size: config.apparent_size,
+        disable_delete_confirmation: config.disable_delete_confirmation,
+        reduced_motion: config.reduced_motion,
+        monochrome: config.monochrome,
+        animate_loading: true,
+        theme: config.theme,
+        ascii: config.ascii,
+        mouse: config.mouse,
+        keymap: config.keymap,
+        custom_keys: config.custom_keys,
+        config_path: preference_path,
+        monochrome_locked,
+    };
+    if output_format != OutputFormat::Tui {
+        let outcome = match scan_headless(settings) {
+            Ok(outcome) => outcome,
+            Err(error) => return report_error(&error),
+        };
+        let Some(report) = outcome.value() else {
+            eprintln!("Error: headless scan returned no report");
+            return ExitClass::Runtime.code();
+        };
+        if let Err(error) = write_scan_report(report, output_format, output_path.as_deref()) {
+            return report_error(&error);
+        }
+        return outcome.exit_class().code();
+    }
     if let Err(error) = validate_terminal() {
         return report_error(&error);
     }
 
-    let mut session = match TerminalSession::enter() {
+    let mut session = match TerminalSession::enter_with_mouse(settings.mouse) {
         Ok(session) => session,
         Err(error) => return report_error(&error),
     };
@@ -57,16 +99,16 @@ fn run_main() -> i32 {
         std::env::var_os("EXCISE_TEST_PANIC_AFTER_TERMINAL_ENTRY").is_none(),
         "injected panic after terminal entry"
     );
-    let settings = RuntimeSettings {
-        root: root.resolved.as_path().to_path_buf(),
-        scan_threads: config.scan_threads,
-        event_capacity: config.event_buffer,
-        apparent_size: config.apparent_size,
-        disable_delete_confirmation: config.disable_delete_confirmation,
-        reduced_motion: config.reduced_motion,
-        monochrome: config.monochrome,
-        animate_loading: true,
-    };
+    #[cfg(debug_assertions)]
+    if let Some(error) = injected_runtime_error() {
+        let restore_result = session.restore();
+        drop(session);
+        if let Err(restore_error) = restore_result {
+            eprintln!("Error: {error}");
+            return report_error(&restore_error);
+        }
+        return report_error(&error);
+    }
     let backend = CrosstermBackend::new(io::stdout());
     let run_result = run(
         backend,
@@ -88,7 +130,57 @@ fn run_main() -> i32 {
     }
 }
 
+fn write_scan_report(
+    report: &ScanReport,
+    format: OutputFormat,
+    output: Option<&Path>,
+) -> Result<(), AppError> {
+    if let Some(path) = output {
+        let mut file = File::create(path)
+            .map_err(|error| AppError::io("could not create report output", error))?;
+        write_scan_report_to(report, format, &mut file)
+    } else {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        write_scan_report_to(report, format, &mut output)
+    }
+}
+
+fn write_scan_report_to(
+    report: &ScanReport,
+    format: OutputFormat,
+    writer: &mut impl Write,
+) -> Result<(), AppError> {
+    let result = match format {
+        OutputFormat::Json => report.write_json(writer),
+        OutputFormat::Table => report.write_table(writer),
+        OutputFormat::Tui => {
+            return Err(AppError::Invariant(
+                "TUI format reached headless report writer".to_string(),
+            ));
+        }
+    };
+    result.map_err(|error| match error {
+        ReportError::Io(error) => AppError::io("could not write report", error),
+        ReportError::Serialization(error) => {
+            AppError::Invariant(format!("could not serialize report: {error}"))
+        }
+        ReportError::Invariant(message) => AppError::Invariant(message),
+    })
+}
+
 fn report_error(error: &AppError) -> i32 {
     eprintln!("Error: {error}");
     error.exit_class().code()
+}
+
+#[cfg(debug_assertions)]
+fn injected_runtime_error() -> Option<AppError> {
+    let kind = std::env::var_os("EXCISE_TEST_ERROR_AFTER_TERMINAL_ENTRY")?;
+    Some(match kind.to_string_lossy().as_ref() {
+        "input" => AppError::io("injected input failure", io::Error::other("input failed")),
+        "render" => AppError::terminal("draw", "injected render failure"),
+        "worker" => AppError::Worker("injected worker failure".to_string()),
+        other => AppError::Invariant(format!("unknown injected failure {other}")),
+    })
 }

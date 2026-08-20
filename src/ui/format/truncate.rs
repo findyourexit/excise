@@ -36,19 +36,6 @@ pub fn truncate_middle(row: &str, max_length: u16) -> String {
     }
 }
 
-pub fn truncate_end(row: &str, max_len: u16) -> String {
-    let max_len = max_len as usize;
-    if row.width() <= max_len {
-        return row.to_string();
-    }
-    if max_len <= 3 {
-        return ".".repeat(max_len);
-    }
-
-    let content = truncate_iter_to_unicode_width::<_, String>(row.chars(), max_len - 3);
-    format!("{content}...")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,13 +46,5 @@ mod tests {
             truncate_middle("굿걸 - 누가 방송국을 털었나 E06.mp4", 30),
             "굿걸 - 누가 [...]었나 E06.mp4",
         );
-    }
-
-    #[test]
-    fn truncate_end_respects_zero_and_unicode_widths() {
-        assert_eq!(truncate_end("abc", 0), "");
-        assert_eq!(truncate_end("abcdef", 4), "a...");
-        assert_eq!(truncate_end("굿걸", 3), "...");
-        assert_eq!(truncate_end("굿걸", 4), "굿걸");
     }
 }

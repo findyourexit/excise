@@ -1,4 +1,4 @@
-use std::fs::{self, Metadata};
+use std::fs::Metadata;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,36 +6,32 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
-use jwalk::Parallelism::{RayonNewPool, Serial};
-use jwalk::WalkDir;
 
+use crate::deletion::{DeletionPlan, DeletionReport, build_plan_cancellable, execute_plan};
 use crate::error::AppError;
-use crate::native_path::{NativeIdentity, identity_for, safe_display_path};
+use crate::native_path::NativeIdentity;
 use crate::state::FileToDelete;
+
+use super::scanner::{self, ScannerOptions};
 
 const CHANNEL_RETRY: Duration = Duration::from_millis(25);
 
-#[derive(Clone)]
-pub struct DeletionRequest {
-    pub target: FileToDelete,
-    pub expected_identity: NativeIdentity,
+pub struct ScannedEntry {
+    pub metadata: Metadata,
+    pub path: PathBuf,
+    pub identity: NativeIdentity,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DeletionFailure {
-    IdentityChanged,
-    SymbolicLink,
-    Io(String),
-}
-
-pub enum WorkerEvent {
-    ScanEntry {
-        metadata: Metadata,
-        path: PathBuf,
-        identity: NativeIdentity,
+pub(super) enum WorkerEvent {
+    ScanBatch {
+        entries: Vec<ScannedEntry>,
     },
-    ScanSkippedLink {
+    ScanDirectoryComplete {
         path: PathBuf,
+    },
+    ScanUnscanned {
+        path: PathBuf,
+        reason: crate::model::UnscannedReason,
     },
     ScanFailed {
         path: Option<PathBuf>,
@@ -44,51 +40,81 @@ pub enum WorkerEvent {
     ScanFinished {
         cancelled: bool,
     },
+    DeletionPlanned {
+        target_node_id: crate::model::NodeId,
+        result: Result<Box<DeletionPlan>, String>,
+    },
     DeletionFinished {
-        request: DeletionRequest,
-        result: Result<(), DeletionFailure>,
+        report: DeletionReport,
     },
 }
 
 enum WorkerCommand {
-    Delete(DeletionRequest),
+    PlanDeletion {
+        maximum_bytes: usize,
+        target: FileToDelete,
+        reduced_guardrails: bool,
+    },
+    Rescan(ScannerOptions),
+    ExecuteDeletion(DeletionPlan),
 }
 
 pub struct WorkerPool {
     events: Receiver<WorkerEvent>,
     commands: Sender<WorkerCommand>,
     cancelled: Arc<AtomicBool>,
-    handles: Vec<thread::JoinHandle<()>>,
+    deletion_soft_cancelled: Arc<AtomicBool>,
+    rescan_cancelled: Arc<AtomicBool>,
+    scanner_handle: thread::JoinHandle<()>,
+    deletion_handle: thread::JoinHandle<()>,
 }
 
 impl WorkerPool {
-    pub fn start(
-        root: PathBuf,
-        scan_threads: usize,
-        event_capacity: usize,
-    ) -> Result<Self, AppError> {
+    pub fn start(scanner_options: ScannerOptions, event_capacity: usize) -> Result<Self, AppError> {
         let (event_sender, events) = bounded(event_capacity);
         let (commands, command_receiver) = bounded(1);
         let cancelled = Arc::new(AtomicBool::new(false));
+        let rescan_cancelled = Arc::new(AtomicBool::new(false));
+        let deletion_soft_cancelled = Arc::new(AtomicBool::new(false));
+        let scan_root = scanner_options.root.clone();
 
-        let scanner_cancelled = cancelled.clone();
-        let scanner_events = event_sender.clone();
-        let scanner = thread::Builder::new()
-            .name("excise-scanner".to_string())
-            .spawn(move || scan(&root, scan_threads, &scanner_events, &scanner_cancelled))
+        let scanner = scanner::spawn(scanner_options, event_sender.clone(), cancelled.clone())
             .map_err(|error| AppError::io("could not spawn scanner worker", error))?;
 
-        let deletion_cancelled = cancelled.clone();
-        let deletion = thread::Builder::new()
+        let worker_cancelled = cancelled.clone();
+        let worker_rescan_cancelled = rescan_cancelled.clone();
+        let worker_soft_cancelled = deletion_soft_cancelled.clone();
+        let deletion = match thread::Builder::new()
             .name("excise-deletion".to_string())
-            .spawn(move || deletion_worker(&command_receiver, &event_sender, &deletion_cancelled))
-            .map_err(|error| AppError::io("could not spawn deletion worker", error))?;
+            .spawn(move || {
+                deletion_worker(
+                    &scan_root,
+                    &command_receiver,
+                    &event_sender,
+                    &worker_soft_cancelled,
+                    &worker_rescan_cancelled,
+                    &worker_cancelled,
+                );
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                cancelled.store(true, Ordering::Release);
+                drop(events);
+                scanner
+                    .join()
+                    .map_err(|_| AppError::Worker("scanner thread panicked".to_string()))?;
+                return Err(AppError::io("could not spawn deletion worker", error));
+            }
+        };
 
         Ok(Self {
             events,
             commands,
             cancelled,
-            handles: vec![scanner, deletion],
+            deletion_soft_cancelled,
+            rescan_cancelled,
+            scanner_handle: scanner,
+            deletion_handle: deletion,
         })
     }
 
@@ -97,111 +123,78 @@ impl WorkerPool {
         &self.events
     }
 
-    pub fn request_deletion(&self, request: DeletionRequest) -> Result<(), AppError> {
+    pub fn request_deletion_plan(
+        &self,
+        target: FileToDelete,
+        reduced_guardrails: bool,
+        maximum_bytes: usize,
+    ) -> Result<(), AppError> {
+        self.deletion_soft_cancelled.store(false, Ordering::Release);
         self.commands
-            .send(WorkerCommand::Delete(request))
+            .send(WorkerCommand::PlanDeletion {
+                target,
+                maximum_bytes,
+                reduced_guardrails,
+            })
             .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
     }
 
+    pub fn execute_deletion(&self, plan: DeletionPlan) -> Result<(), AppError> {
+        self.deletion_soft_cancelled.store(false, Ordering::Release);
+        self.commands
+            .send(WorkerCommand::ExecuteDeletion(plan))
+            .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
+    }
+
+    pub fn soft_cancel_deletion(&self) {
+        self.deletion_soft_cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn request_rescan(&self, options: ScannerOptions) -> Result<(), AppError> {
+        self.rescan_cancelled.store(false, Ordering::Release);
+        self.commands
+            .send(WorkerCommand::Rescan(options))
+            .map_err(|_| AppError::Worker("rescan worker disconnected".to_string()))
+    }
+
+    pub fn cancel_rescan(&self) {
+        self.rescan_cancelled.store(true, Ordering::Release);
+    }
+
     pub fn shutdown(self) -> Result<(), AppError> {
+        self.stop(false)
+    }
+
+    pub fn hard_shutdown(self) -> Result<(), AppError> {
+        self.stop(true)
+    }
+
+    fn stop(self, detach_deletion: bool) -> Result<(), AppError> {
         self.cancelled.store(true, Ordering::Release);
+        self.deletion_soft_cancelled.store(true, Ordering::Release);
+        self.rescan_cancelled.store(true, Ordering::Release);
         drop(self.events);
         drop(self.commands);
-        for handle in self.handles {
-            handle
-                .join()
-                .map_err(|_| AppError::Worker("worker thread panicked".to_string()))?;
+        if detach_deletion {
+            drop(self.scanner_handle);
+            drop(self.deletion_handle);
+            return Ok(());
         }
-        Ok(())
+        self.scanner_handle
+            .join()
+            .map_err(|_| AppError::Worker("scanner thread panicked".to_string()))?;
+        self.deletion_handle
+            .join()
+            .map_err(|_| AppError::Worker("deletion thread panicked".to_string()))
     }
-}
-
-pub fn prepare_deletion(target: FileToDelete) -> Result<DeletionRequest, DeletionFailure> {
-    let path = target.full_path();
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
-        DeletionFailure::Io(format!("{}: {error}", safe_display_path(&path).text))
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(DeletionFailure::SymbolicLink);
-    }
-    let expected_identity = identity_for(&path, &metadata)
-        .map_err(|error| DeletionFailure::Io(error.to_string()))?
-        .ok_or(DeletionFailure::SymbolicLink)?;
-    Ok(DeletionRequest {
-        target,
-        expected_identity,
-    })
-}
-
-fn scan(
-    root: &std::path::Path,
-    scan_threads: usize,
-    sender: &Sender<WorkerEvent>,
-    cancelled: &AtomicBool,
-) {
-    let parallelism = if scan_threads == 1 {
-        Serial
-    } else {
-        RayonNewPool(scan_threads)
-    };
-    for entry in WalkDir::new(root)
-        .parallelism(parallelism)
-        .skip_hidden(false)
-        .follow_links(false)
-    {
-        if cancelled.load(Ordering::Acquire) {
-            let _ = send_event(
-                sender,
-                WorkerEvent::ScanFinished { cancelled: true },
-                cancelled,
-            );
-            return;
-        }
-
-        let event = match entry {
-            Ok(entry) => {
-                let path = entry.path();
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        WorkerEvent::ScanSkippedLink { path }
-                    }
-                    Ok(metadata) => match identity_for(&path, &metadata) {
-                        Ok(Some(identity)) => WorkerEvent::ScanEntry {
-                            metadata,
-                            path,
-                            identity,
-                        },
-                        Ok(None) => WorkerEvent::ScanSkippedLink { path },
-                        Err(error) => WorkerEvent::ScanFailed {
-                            path: Some(path),
-                            message: error.to_string(),
-                        },
-                    },
-                    Err(error) => WorkerEvent::ScanFailed {
-                        path: Some(path),
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Err(error) => WorkerEvent::ScanFailed {
-                path: error.path().map(PathBuf::from),
-                message: error.to_string(),
-            },
-        };
-        if !send_event(sender, event, cancelled) {
-            return;
-        }
-    }
-    let _ = send_event(
-        sender,
-        WorkerEvent::ScanFinished { cancelled: false },
-        cancelled,
-    );
 }
 
 fn deletion_worker(
+    scan_root: &std::path::Path,
     commands: &Receiver<WorkerCommand>,
     sender: &Sender<WorkerEvent>,
+    soft_cancelled: &AtomicBool,
+    rescan_cancelled: &Arc<AtomicBool>,
     cancelled: &AtomicBool,
 ) {
     loop {
@@ -213,42 +206,42 @@ fn deletion_worker(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        let WorkerCommand::Delete(request) = command;
-        let result = execute_deletion(&request);
-        if !send_event(
-            sender,
-            WorkerEvent::DeletionFinished { request, result },
-            cancelled,
-        ) {
+        let event = match command {
+            WorkerCommand::PlanDeletion {
+                target,
+                reduced_guardrails,
+                maximum_bytes,
+            } => {
+                let target_node_id = target.node_id;
+                let result = build_plan_cancellable(
+                    scan_root,
+                    target,
+                    reduced_guardrails,
+                    cancelled,
+                    maximum_bytes,
+                )
+                .map(Box::new)
+                .map_err(|error| error.to_string());
+                WorkerEvent::DeletionPlanned {
+                    target_node_id,
+                    result,
+                }
+            }
+            WorkerCommand::Rescan(options) => {
+                scanner::run(options, sender, rescan_cancelled.as_ref());
+                continue;
+            }
+            WorkerCommand::ExecuteDeletion(plan) => WorkerEvent::DeletionFinished {
+                report: execute_plan(scan_root, plan, soft_cancelled, cancelled),
+            },
+        };
+        if !send_event(sender, event, cancelled) {
             return;
         }
     }
 }
 
-fn execute_deletion(request: &DeletionRequest) -> Result<(), DeletionFailure> {
-    let path = request.target.full_path();
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
-        DeletionFailure::Io(format!("{}: {error}", safe_display_path(&path).text))
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(DeletionFailure::SymbolicLink);
-    }
-    let actual = identity_for(&path, &metadata)
-        .map_err(|error| DeletionFailure::Io(error.to_string()))?
-        .ok_or(DeletionFailure::SymbolicLink)?;
-    if actual != request.expected_identity {
-        return Err(DeletionFailure::IdentityChanged);
-    }
-
-    if metadata.is_dir() {
-        fs::remove_dir_all(&path)
-    } else {
-        fs::remove_file(&path)
-    }
-    .map_err(|error| DeletionFailure::Io(error.to_string()))
-}
-
-fn send_event(
+pub(super) fn send_event(
     sender: &Sender<WorkerEvent>,
     mut event: WorkerEvent,
     cancelled: &AtomicBool,
@@ -272,7 +265,19 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
+    use crate::model::UnscannedReason;
+
     use super::*;
+
+    fn options(root: &std::path::Path, threads: usize) -> ScannerOptions {
+        ScannerOptions {
+            root: root.to_path_buf(),
+            threads,
+            cross_filesystems: false,
+            exclusions: Vec::new(),
+            internal_paths: Vec::new(),
+        }
+    }
 
     #[test]
     fn bounded_scanner_delivers_every_file() {
@@ -282,8 +287,7 @@ mod tests {
                 .expect("fixture file should be written");
         }
 
-        let workers =
-            WorkerPool::start(root.path().to_path_buf(), 2, 1).expect("workers should start");
+        let workers = WorkerPool::start(options(root.path(), 2), 1).expect("workers should start");
         let mut names = HashSet::new();
         loop {
             match workers
@@ -291,20 +295,140 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("scanner should produce completion")
             {
-                WorkerEvent::ScanEntry { path, .. } => {
-                    if let Some(name) = path.file_name().and_then(|name| name.to_str())
-                        && name.starts_with("file-")
-                    {
-                        names.insert(name.to_string());
+                WorkerEvent::ScanBatch { entries } => {
+                    for entry in entries {
+                        if let Some(name) = entry.path.file_name().and_then(|name| name.to_str())
+                            && name.starts_with("file-")
+                        {
+                            names.insert(name.to_string());
+                        }
                     }
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
-                WorkerEvent::ScanSkippedLink { .. } | WorkerEvent::DeletionFinished { .. } => {}
+                WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
         assert_eq!(names.len(), 100);
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[test]
+    fn focused_rescan_reuses_bounded_worker_channel() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let file = root.path().join("file");
+        std::fs::write(&file, b"x").expect("fixture should be written");
+        let scanner_options = options(root.path(), 1);
+        let workers = WorkerPool::start(scanner_options.clone(), 1).expect("workers should start");
+
+        for pass in 0..2 {
+            if pass == 1 {
+                workers
+                    .request_rescan(scanner_options.clone())
+                    .expect("focused rescan should start");
+            }
+            let mut saw_file = false;
+            loop {
+                match workers
+                    .events()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("scan pass should complete")
+                {
+                    WorkerEvent::ScanBatch { entries } => {
+                        saw_file |= entries.iter().any(|entry| entry.path == file);
+                    }
+                    WorkerEvent::ScanFinished { cancelled: false } => break,
+                    WorkerEvent::ScanFinished { cancelled: true } => {
+                        panic!("scan pass was cancelled")
+                    }
+                    WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                    WorkerEvent::ScanDirectoryComplete { .. }
+                    | WorkerEvent::ScanUnscanned { .. }
+                    | WorkerEvent::DeletionPlanned { .. }
+                    | WorkerEvent::DeletionFinished { .. } => {}
+                }
+            }
+            assert!(saw_file);
+        }
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[test]
+    fn deep_wide_scan_completes_with_bounded_queue() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let mut deepest = root.path().to_path_buf();
+        for depth in 0..300 {
+            for sibling in 0..9 {
+                std::fs::create_dir(deepest.join(format!("s{depth}-{sibling}")))
+                    .expect("sibling directory should be created");
+            }
+            deepest.push("d");
+            std::fs::create_dir(&deepest).expect("deep directory should be created");
+        }
+        let marker = deepest.join("marker");
+        std::fs::write(&marker, b"x").expect("deep marker should be written");
+        let workers = WorkerPool::start(options(root.path(), 1), 1).expect("workers should start");
+        let mut found = false;
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("deep scan should complete")
+            {
+                WorkerEvent::ScanBatch { entries } => {
+                    found |= entries.iter().any(|entry| entry.path == marker);
+                }
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
+                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        assert!(found);
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[test]
+    fn bounded_directory_queue_delivers_wide_tree() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        for index in 0..64 {
+            let directory = root.path().join(format!("directory-{index}"));
+            std::fs::create_dir(&directory).expect("fixture directory should be created");
+            std::fs::write(directory.join("file"), b"x").expect("fixture file should be written");
+        }
+
+        let workers = WorkerPool::start(options(root.path(), 1), 1).expect("workers should start");
+        let mut files = HashSet::new();
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("wide scan should complete")
+            {
+                WorkerEvent::ScanBatch { entries } => {
+                    for entry in entries {
+                        if entry.path.file_name().is_some_and(|name| name == "file") {
+                            files.insert(entry.path);
+                        }
+                    }
+                }
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
+                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        assert_eq!(files.len(), 64);
         workers.shutdown().expect("workers should stop");
     }
 
@@ -315,9 +439,95 @@ mod tests {
             std::fs::write(root.path().join(format!("file-{index}")), b"x")
                 .expect("fixture file should be written");
         }
-        let workers =
-            WorkerPool::start(root.path().to_path_buf(), 2, 1).expect("workers should start");
+        let workers = WorkerPool::start(options(root.path(), 2), 1).expect("workers should start");
         workers.shutdown().expect("shutdown should unblock senders");
+    }
+
+    #[test]
+    fn scanner_prunes_configured_exclusions() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let ignored = root.path().join("ignored");
+        std::fs::create_dir(&ignored).expect("ignored directory should be created");
+        let secret = ignored.join("secret");
+        std::fs::write(&secret, b"x").expect("ignored file should be written");
+        let mut scanner_options = options(root.path(), 1);
+        scanner_options.exclusions = vec!["ignored/".to_string()];
+
+        let workers = WorkerPool::start(scanner_options, 16).expect("workers should start");
+        let mut excluded_directory = false;
+        let mut traversed_secret = false;
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("excluded scan should complete")
+            {
+                WorkerEvent::ScanUnscanned { path, reason } => {
+                    excluded_directory |= path == ignored
+                        && reason == UnscannedReason::Excluded("ignored/".to_string());
+                }
+                WorkerEvent::ScanBatch { entries } => {
+                    traversed_secret |= entries.iter().any(|entry| entry.path == secret);
+                }
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
+                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        assert!(excluded_directory);
+        assert!(!traversed_secret);
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[test]
+    fn scanner_skips_only_explicit_internal_paths() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let user_session = root.path().join(".excise-session-user-data");
+        let active_spill = root.path().join(".excise-session-active");
+        std::fs::create_dir(&user_session).expect("user-owned session-like directory should exist");
+        std::fs::create_dir(&active_spill).expect("active spill directory should exist");
+        let user_file = user_session.join("user-file");
+        let spill_file = active_spill.join("spill-file");
+        std::fs::write(&user_file, b"user data").expect("user fixture should be written");
+        std::fs::write(&spill_file, b"spill data").expect("spill fixture should be written");
+
+        let mut scanner_options = options(root.path(), 1);
+        scanner_options.internal_paths = vec![active_spill.clone()];
+        let workers = WorkerPool::start(scanner_options, 16).expect("workers should start");
+        let mut saw_spill_directory = false;
+        let mut saw_user_directory = false;
+        let mut saw_user_file = false;
+        let mut saw_spill_file = false;
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("scanner should complete")
+            {
+                WorkerEvent::ScanBatch { entries } => {
+                    saw_user_directory |= entries.iter().any(|entry| entry.path == user_session);
+                    saw_user_file |= entries.iter().any(|entry| entry.path == user_file);
+                    saw_spill_file |= entries.iter().any(|entry| entry.path == spill_file);
+                    saw_spill_directory |= entries.iter().any(|entry| entry.path == active_spill);
+                }
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
+                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+
+        assert!(!saw_spill_directory);
+        assert!(saw_user_directory);
+        assert!(saw_user_file);
+        assert!(!saw_spill_file);
+        workers.shutdown().expect("workers should stop");
     }
 
     #[cfg(unix)]
@@ -332,8 +542,7 @@ mod tests {
         let link = root.path().join("linked");
         symlink(outside.path(), &link).expect("directory link should be created");
 
-        let workers =
-            WorkerPool::start(root.path().to_path_buf(), 1, 16).expect("workers should start");
+        let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
         let mut skipped_link = false;
         let mut traversed_secret = false;
         loop {
@@ -342,18 +551,49 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("scanner should produce completion")
             {
-                WorkerEvent::ScanSkippedLink { path } => skipped_link |= path == link,
-                WorkerEvent::ScanEntry { path, .. } => {
-                    traversed_secret |= path.file_name().is_some_and(|name| name == "secret");
+                WorkerEvent::ScanUnscanned { path, .. } => skipped_link |= path == link,
+                WorkerEvent::ScanBatch { entries } => {
+                    traversed_secret |= entries
+                        .iter()
+                        .any(|entry| entry.path.file_name().is_some_and(|name| name == "secret"));
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
-                WorkerEvent::DeletionFinished { .. } => {}
+                WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
         assert!(skipped_link);
         assert!(!traversed_secret);
         workers.shutdown().expect("workers should stop");
+    }
+    #[test]
+    fn hard_shutdown_does_not_join_blocked_workers() {
+        let (_event_sender, events) = bounded::<WorkerEvent>(1);
+        let (commands, command_receiver) = bounded::<WorkerCommand>(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let deletion_soft_cancelled = Arc::new(AtomicBool::new(false));
+        let rescan_cancelled = Arc::new(AtomicBool::new(false));
+        let scanner_handle = thread::spawn(|| {});
+        let deletion_handle = thread::spawn(|| thread::sleep(Duration::from_secs(2)));
+        drop(command_receiver);
+        let pool = WorkerPool {
+            events,
+            commands,
+            cancelled: cancelled.clone(),
+            deletion_soft_cancelled,
+            rescan_cancelled,
+            scanner_handle,
+            deletion_handle,
+        };
+
+        let started = std::time::Instant::now();
+        pool.hard_shutdown()
+            .expect("hard shutdown should detach blocked workers");
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(cancelled.load(Ordering::Acquire));
     }
 }

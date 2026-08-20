@@ -43,6 +43,8 @@ pub enum AppError {
     },
     #[error("worker failure: {0}")]
     Worker(String),
+    #[error("model failure: {0}")]
+    Model(String),
     #[error("internal invariant failed: {0}")]
     Invariant(String),
 }
@@ -70,9 +72,11 @@ impl AppError {
             Self::Cli(_) => ExitClass::Usage,
             Self::Config(_) => ExitClass::Config,
             Self::Io { .. } => ExitClass::Io,
-            Self::Tty(_) | Self::Terminal { .. } | Self::Worker(_) | Self::Invariant(_) => {
-                ExitClass::Runtime
-            }
+            Self::Tty(_)
+            | Self::Terminal { .. }
+            | Self::Worker(_)
+            | Self::Model(_)
+            | Self::Invariant(_) => ExitClass::Runtime,
         }
     }
 }

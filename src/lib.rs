@@ -9,21 +9,33 @@
 pub mod animation;
 mod app;
 pub mod config;
+pub mod deletion;
 pub mod error;
+pub mod filter;
 pub mod input;
+pub mod model;
 pub mod native_path;
 mod os;
 pub mod outcome;
+pub mod report;
 pub mod runtime;
 mod state;
 pub mod terminal;
+pub mod theme;
 mod ui;
+#[cfg(windows)]
+mod windows_delete;
 
 pub(crate) use app::{App, UiMode};
 pub use input::TerminalEvents;
+pub use state::FileToDelete;
 pub use terminal::{
     TerminalSession, TerminalState, TerminalTransition, TerminalTransitionError, validate_terminal,
 };
+
+pub mod geometry {
+    pub use crate::state::tiles::{FileMetadata, FileType, Tile, TreeMap};
+}
 
 #[cfg(test)]
 mod tests;
@@ -42,11 +54,21 @@ pub(crate) fn start<B>(
         root: path,
         scan_threads: 1,
         event_capacity: 256,
+        cross_filesystems: false,
+        exclusions: Vec::new(),
+        memory_mib: crate::model::DEFAULT_PROCESS_MIB,
         apparent_size: show_apparent_size,
         disable_delete_confirmation,
         reduced_motion: true,
         monochrome: true,
         animate_loading: false,
+        theme: crate::theme::ThemeId::ExciseDark,
+        ascii: false,
+        mouse: false,
+        keymap: crate::config::KeyPreset::Vim,
+        custom_keys: None,
+        config_path: None,
+        monochrome_locked: true,
     };
     runtime::run(
         terminal_backend,

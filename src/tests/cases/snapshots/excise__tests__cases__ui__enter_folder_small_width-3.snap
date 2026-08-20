@@ -1,9 +1,12 @@
 ---
 source: src/tests/cases/ui.rs
-expression: "&terminal_draw_events_mirror[2]"
+expression: normalized
 ---
- 16.0K | /tmp/excis[..]mall_width/subfolder_[...]a_long_name
-┌──────────────────────────────────────────────────────────┐
+ EXCISE  /tmp/excise_t[...]e_a_long_name  ◆ COMPLETE        
+ allocated ##.#K   reclaim ##.#K   apparent 16.0K   4 entrie
+────────────────────────────────────────────────────────────
+┌ LIST ────────────────────────────────────────────────────┐
+│   file1                                8.0K  100.0%      │
 │                                                          │
 │                                                          │
 │                                                          │
@@ -20,17 +23,14 @@ expression: "&terminal_draw_events_mirror[2]"
 │                                                          │
 │                                                          │
 │                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                          file1                           │
-│                                                          │
-│                       8.0K (100%)                        │
-│                                                          │
-│                                                          │
-│                                                          │
+│ ╔ EXIT ════════════════════════════════════════════════╗ │
+│ ║                                                      ║ │
+│ ║                     Quit Excise?                     ║ │
+│ ║              [y] quit    [Esc/q/n] back              ║ │
+│ ║                                                      ║ │
+│ ║                                                      ║ │
+│ ║                                                      ║ │
+│ ╚══════════════════════════════════════════════════════╝ │
 │                                                          │
 │                                                          │
 │                                                          │
@@ -50,5 +50,5 @@ expression: "&terminal_draw_events_mirror[2]"
 │                                                          │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
-                                                            
- ←↓↑→/<ENTER>/<ESC>: navigate, <BACKSPACE>: del
+ arrows move  Enter open  Backspace delete  ? help          
+Excise · REDUCED MOTION

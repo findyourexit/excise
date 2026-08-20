@@ -5,7 +5,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crate::error::AppError;
 use crate::input::{InputEvent, InputSource};
 use crate::outcome::OperationOutcome;
-use crate::runtime::{RuntimeSettings, VirtualClock, run};
+use crate::runtime::{RuntimeSettings, VirtualClock, run, scan_headless};
 use crate::tests::cases::test_utils::test_backend_factory;
 use crate::tests::fakes::{BackendOperation, TerminalEvent, TerminalEvents};
 
@@ -14,11 +14,21 @@ fn settings(root: &std::path::Path) -> RuntimeSettings {
         root: root.to_path_buf(),
         scan_threads: 1,
         event_capacity: 16,
+        cross_filesystems: false,
+        exclusions: Vec::new(),
+        memory_mib: crate::model::DEFAULT_PROCESS_MIB,
         apparent_size: true,
         disable_delete_confirmation: false,
         reduced_motion: true,
         monochrome: true,
         animate_loading: false,
+        theme: crate::theme::ThemeId::ExciseDark,
+        ascii: false,
+        mouse: false,
+        keymap: crate::config::KeyPreset::Vim,
+        custom_keys: None,
+        config_path: None,
+        monochrome_locked: true,
     }
 }
 
@@ -133,15 +143,15 @@ fn graceful_quit_during_scan_is_precise_cancellation() {
         Box::new(VirtualClock::new()),
     )
     .expect("graceful cancellation should restore cleanly");
-    assert!(matches!(
-        outcome,
-        OperationOutcome::Cancelled { precise: true, .. }
-    ));
+    assert!(
+        matches!(outcome, OperationOutcome::Cancelled { precise: true, .. }),
+        "unexpected outcome: {outcome:?}"
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn skipped_link_produces_uncertain_outcome() {
+fn skipped_link_is_an_explicit_scoped_boundary() {
     use std::os::unix::fs::symlink;
 
     let root = tempfile::tempdir().expect("runtime root should exist");
@@ -160,12 +170,60 @@ fn skipped_link_produces_uncertain_outcome() {
         settings(root.path()),
         Box::new(VirtualClock::new()),
     )
-    .expect("uncertain scan should exit cleanly");
-    assert!(matches!(
-        outcome,
-        OperationOutcome::Uncertain {
-            unreadable_entries: 1,
-            ..
-        }
-    ));
+    .expect("scoped scan should exit cleanly");
+    let OperationOutcome::Exact(summary) = outcome else {
+        panic!("expected exact scoped outcome, got {outcome:?}");
+    };
+    assert_eq!(summary.unscanned_entries, 1);
+    assert_eq!(summary.link_entries, 1);
+    assert_eq!(summary.unreadable_entries, 0);
+}
+
+#[test]
+fn headless_scan_streams_a_round_trippable_bounded_report() {
+    let root = tempfile::tempdir().expect("headless root should exist");
+    std::fs::write(root.path().join("zeta"), b"a").expect("first fixture should be written");
+    std::fs::write(root.path().join("alpha"), b"bc").expect("second fixture should be written");
+
+    let outcome = scan_headless(settings(root.path())).expect("headless scan should succeed");
+    let OperationOutcome::Exact(report) = outcome else {
+        panic!("expected exact headless report");
+    };
+    assert_eq!(report.summary().scanned_entries, 2);
+    let mut encoded = Vec::new();
+    report
+        .write_json(&mut encoded)
+        .expect("streamed report should serialize");
+    let decoded: crate::report::ScanReportDocument =
+        serde_json::from_slice(&encoded).expect("streamed report should deserialize");
+    assert_eq!(decoded.document_kind, "scan-report");
+    assert_eq!(decoded.entries.len(), 3);
+    let paths = decoded
+        .entries
+        .iter()
+        .map(|entry| entry.display_path.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        paths.windows(2).all(|pair| pair[0] <= pair[1]),
+        "streamed report paths must be deterministic and lexical: {paths:?}"
+    );
+}
+
+#[test]
+fn model_uncertainty_never_returns_an_exact_headless_exit() {
+    let root = tempfile::tempdir().expect("headless root should exist");
+    std::fs::write(root.path().join("excluded"), b"x").expect("excluded fixture should be written");
+    let mut settings = settings(root.path());
+    settings.exclusions = vec!["excluded".to_string()];
+
+    let outcome = scan_headless(settings).expect("headless scan should complete");
+    let OperationOutcome::Uncertain {
+        unreadable_entries,
+        value: report,
+    } = outcome
+    else {
+        panic!("uncertain model must not return an exact outcome");
+    };
+    assert_eq!(unreadable_entries, 0);
+    assert_eq!(report.state(), crate::report::ScanReportState::Uncertain);
 }

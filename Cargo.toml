@@ -17,6 +17,16 @@ rust-version = "1.88"
 exclude = [".cargo", ".github", "docs/design/recordings", "prototypes", "demo.gif"]
 publish = false
 
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.tar.gz"
+bin-dir = "{ name }-{ target }-v{ version }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install", "compile"]
+
+[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.zip"
+pkg-fmt = "zip"
 [[bin]]
 name = "excise"
 path = "src/main.rs"
@@ -25,11 +35,15 @@ path = "src/main.rs"
 name = "tachyonfx"
 harness = false
 
+[[bench]]
+name = "core"
+harness = false
 [dependencies]
+
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "std"] }
 crossterm = "0.29"
 anyhow = "1"
-jwalk = "0.8"
+cap-primitives = "4.0.2"
 clap = { version = "4.6", features = ["derive"] }
 filesize = "0.2.0"
 unicode-width = "0.2.2"
@@ -37,29 +51,37 @@ base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 crossbeam-channel = "0.5.16"
 directories = "6.0.0"
 file-id = { version = "0.2.3", features = ["serde"] }
+globset = "0.4.20"
+getrandom = "0.3.4"
+ignore = "0.4.33"
+redb = "2.6.3"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tachyonfx = { version = "0.25.1", default-features = false, features = ["std"] }
 thiserror = "2.0.20"
 toml = "1.1.4"
+sysinfo = { version = "0.35.2", default-features = false, features = ["disk", "system"] }
+tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["user"] }
+nix = { version = "0.31.3", features = ["user", "signal"] }
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 is_elevated = "0.1.2"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [dev-dependencies]
 insta = "1.48.0"
 portable-pty = "0.9.0"
-tempfile = "3.27.0"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
-serde_json = "1.0.151"
+jsonschema = { version = "0.49.9", default-features = false }
 
 [lints]
 workspace = true
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 warnings = "deny"
 
 [workspace.lints.clippy]

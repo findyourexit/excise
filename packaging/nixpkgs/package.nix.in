@@ -1,0 +1,35 @@
+{ lib, rustPlatform, installShellFiles, fetchFromGitHub }:
+
+rustPlatform.buildRustPackage rec {
+  pname = "excise";
+  version = "@VERSION@";
+
+  src = fetchFromGitHub {
+    owner = "findyourexit";
+    repo = "excise";
+    rev = "v${version}";
+    hash = "@SOURCE_NAR_HASH@";
+  };
+
+  cargoHash = "@CARGO_VENDOR_HASH@";
+  nativeBuildInputs = [ installShellFiles ];
+
+  postInstall = ''
+    installManPage generated/man/excise.1
+    installShellCompletion \
+      --bash generated/completions/excise.bash \
+      --zsh generated/completions/_excise \
+      --fish generated/completions/excise.fish
+    install -d $out/share/excise/schemas
+    cp docs/schemas/*.json $out/share/excise/schemas/
+  '';
+
+  meta = {
+    description = "Surgical terminal storage navigator";
+    homepage = "https://github.com/findyourexit/excise";
+    license = lib.licenses.mit;
+    maintainers = [ ];
+    mainProgram = "excise";
+    platforms = lib.platforms.unix;
+  };
+}

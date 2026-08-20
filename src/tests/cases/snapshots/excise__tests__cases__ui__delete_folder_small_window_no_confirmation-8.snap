@@ -2,8 +2,12 @@
 source: src/tests/cases/ui.rs
 expression: "&terminal_draw_events_mirror[7]"
 ---
- 8.0K | /tmp/excise_tests/delet[..]_window_no_confirmation  
-┌──────────────────────────────────────────────────────────┐
+ EXCISE  /tmp/excise_t[...]_confirmation  ◆ COMPLETE        
+ allocated 8.0K   reclaim 8.0K   apparent 8.0K   2 entries  
+────────────────────────────────────────────────────────────
+┌ LIST ────────────────────────────────────────────────────┐
+│   file2                                4.0K   50.0%      │
+│   file3                                4.0K   50.0%      │
 │                                                          │
 │                                                          │
 │                                                          │
@@ -13,33 +17,29 @@ expression: "&terminal_draw_events_mirror[7]"
 │                                                          │
 │                                                          │
 │                                                          │
-│                          file2                           │
 │                                                          │
 │                                                          │
-│                        4.0K (50%)                        │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│              ┌─────────────────────────────┐             │
-│              │                             │             │
-│              │                             │             │
-│              │        Really quit?         │             │
-├──────────────│                             │─────────────┤
-│              │                             │             │
-│              │                             │             │
-│              │                             │             │
-│              │            (y/n)            │             │
-│              │                             │             │
-│              └─────────────────────────────┘             │
+│ ╔ ! DELETION RESULT · PRECISE ═════════════════════════╗ │
+│ ║                                                      ║ │
+│ ║deleted       2                                       ║ │
+│ ║changed       0                                       ║ │
+│ ║missing       0                                       ║ │
+│ ║failed        0                                       ║ │
+│ ║unattempted   0                                       ║ │
+│ ║                                                      ║ │
+│ ║Result is precise. [Enter/Esc] close                  ║ │
+│ ║                                                      ║ │
+│ ║                                                      ║ │
+│ ║                                                      ║ │
+│ ║                                                      ║ │
+│ ║                                                      ║ │
+│ ╚══════════════════════════════════════════════════════╝ │
 │                                                          │
 │                                                          │
 │                                                          │
-│                          file3                           │
 │                                                          │
 │                                                          │
-│                        4.0K (50%)                        │
+│                                                          │
 │                                                          │
 │                                                          │
 │                                                          │
@@ -50,5 +50,5 @@ expression: "&terminal_draw_events_mirror[7]"
 │                                                          │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
-                                                            
- ←↓↑→/<ENTER>/<ESC>: navigate, <BACKSPACE>: del
+ / filter  arrows/Vim move  Enter open/rescan  Backspace del
+Excise · ! REDUCED DELETE GUARD · REDUCED MOTION

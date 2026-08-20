@@ -1,0 +1,27 @@
+# typed: strict
+# frozen_string_literal: true
+
+# Excise source formula submission template.
+class Excise < Formula
+  desc "Surgical terminal storage navigator"
+  homepage "https://github.com/findyourexit/excise"
+  url "https://github.com/findyourexit/excise/archive/refs/tags/v@VERSION@.tar.gz"
+  sha256 "@SOURCE_TARBALL_SHA256@"
+  license "MIT"
+
+  depends_on "rust" => :build
+
+  def install
+    system "cargo", "install", *std_cargo_args(path: ".")
+    man1.install "generated/man/excise.1"
+    bash_completion.install "generated/completions/excise.bash" => "excise"
+    zsh_completion.install "generated/completions/_excise"
+    fish_completion.install "generated/completions/excise.fish"
+    pkgshare.install "docs/schemas"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/excise --version")
+    assert_match "scan-report", shell_output("#{bin}/excise --format json #{testpath}")
+  end
+end

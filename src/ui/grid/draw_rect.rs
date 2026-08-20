@@ -1,10 +1,10 @@
 use ::unicode_width::UnicodeWidthStr;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
 use crate::native_path::safe_display_os_str;
 use crate::state::tiles::{FileType, Tile};
+use crate::theme::Theme;
 use crate::ui::format::{DisplaySize, DisplaySizeRounded, truncate_middle};
 use crate::ui::grid::{boundaries, draw_next_symbol};
 
@@ -15,9 +15,10 @@ fn tile_first_line(tile: &Tile) -> String {
     let filename_text = match tile.file_type {
         FileType::File => name,
         FileType::Folder => format!("{name}/"),
+        FileType::Synthetic => format!("[{name}]"),
     };
     match tile.file_type {
-        FileType::File => truncate_middle(&filename_text, max_text_length),
+        FileType::File | FileType::Synthetic => truncate_middle(&filename_text, max_text_length),
         FileType::Folder => {
             let descendant_count = descendant_count.expect("folder should have descendants");
             let short_descendants_indication = format!("(+{descendant_count})");
@@ -40,14 +41,25 @@ fn tile_second_line(tile: &Tile) -> String {
     let percentage = &tile.percentage;
     let display_size = DisplaySize(tile.size as f64);
     let display_size_rounded = DisplaySizeRounded(tile.size as f64);
-    let display_size = format!("{display_size}");
-    let display_size_rounded = format!("{display_size_rounded}");
-    if max_text_length >= display_size.len() as u16 + 7 {
+    let prefix = if tile.uncertain { "≥" } else { "" };
+    let display_size = if tile.uncertain && tile.size == 0 {
+        "?".to_string()
+    } else {
+        format!("{prefix}{display_size}")
+    };
+    let display_size_rounded = if tile.uncertain && tile.size == 0 {
+        "?".to_string()
+    } else {
+        format!("{prefix}{display_size_rounded}")
+    };
+    let display_size_len = display_size.chars().count() as u16;
+    let display_size_rounded_len = display_size_rounded.chars().count() as u16;
+    if max_text_length >= display_size_len + 7 {
         // 7 == "(100%)" + 1 space
         format!("{} ({:.0}%)", display_size, percentage * 100.0)
-    } else if max_text_length > display_size.len() as u16 {
+    } else if max_text_length > display_size_len {
         display_size
-    } else if max_text_length > display_size_rounded.len() as u16 {
+    } else if max_text_length > display_size_rounded_len {
         display_size_rounded
     } else if max_text_length > 6 {
         // 6 == "(100%)"
@@ -60,37 +72,55 @@ fn tile_second_line(tile: &Tile) -> String {
     }
 }
 
-pub fn tile_style(tile: &Tile, selected: bool) -> (Option<Style>, Style, Style) {
-    let (background_style, first_line_style, second_line_style) = match (selected, &tile.file_type)
-    {
-        (true, FileType::File) => (
-            Some(Style::default().fg(Color::Gray).bg(Color::Gray)),
-            Style::default()
-                .fg(Color::Magenta)
-                .bg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(Color::Magenta)
-                .bg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        (false, FileType::File) => (None, Style::default(), Style::default()),
-        (true, FileType::Folder) => (
-            Some(Style::default().fg(Color::Blue).bg(Color::Blue)),
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Black).bg(Color::Blue),
-        ),
-        (false, FileType::Folder) => (
-            None,
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-            Style::default(),
-        ),
+pub fn tile_style(tile: &Tile, selected: bool, theme: Theme) -> (Option<Style>, Style, Style) {
+    let selected_modifier = if theme.surface_selection == theme.text_inverse {
+        Modifier::BOLD | Modifier::REVERSED
+    } else {
+        Modifier::BOLD
     };
+    let (background_style, mut first_line_style, mut second_line_style) = if selected {
+        (
+            Some(
+                Style::default()
+                    .fg(theme.surface_selection)
+                    .bg(theme.surface_selection),
+            ),
+            Style::default()
+                .fg(theme.text_inverse)
+                .bg(theme.surface_selection)
+                .add_modifier(selected_modifier),
+            Style::default()
+                .fg(theme.text_inverse)
+                .bg(theme.surface_selection)
+                .add_modifier(selected_modifier),
+        )
+    } else {
+        match tile.file_type {
+            FileType::File => (
+                None,
+                Style::default().fg(theme.text_primary),
+                Style::default().fg(theme.text_primary),
+            ),
+            FileType::Folder => (
+                None,
+                Style::default()
+                    .fg(theme.focus)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.text_primary),
+            ),
+            FileType::Synthetic => (
+                None,
+                Style::default()
+                    .fg(theme.state_aggregated)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.text_primary),
+            ),
+        }
+    };
+    if tile.uncertain {
+        first_line_style = first_line_style.add_modifier(Modifier::DIM);
+        second_line_style = second_line_style.add_modifier(Modifier::DIM);
+    }
     (background_style, first_line_style, second_line_style)
 }
 
@@ -147,85 +177,7 @@ pub fn draw_rect_on_grid(buf: &mut Buffer, coords: (u16, u16), dimensions: (u16,
     }
 }
 
-pub fn draw_filled_rect(buf: &mut Buffer, fill_style: Style, rect: Rect) {
-    let buf_width = buf.area().width;
-    let buf_height = buf.area().height;
-
-    // fill
-    for x in rect.x + 1..(rect.x + rect.width) {
-        if x >= buf_width {
-            break;
-        }
-        for y in rect.y + 1..(rect.y + rect.height) {
-            if y >= buf_height {
-                break;
-            }
-            let cell = &mut buf[(x, y)];
-            cell.set_symbol(" ");
-            cell.set_style(fill_style);
-        }
-    }
-
-    // top and bottom
-    for x in rect.x..=(rect.x + rect.width) {
-        if x >= buf_width {
-            break;
-        }
-        if x == rect.x {
-            if rect.y < buf_height {
-                buf[(x, rect.y)]
-                    .set_symbol(boundaries::TOP_LEFT)
-                    .set_style(fill_style);
-            }
-            if rect.y + rect.height < buf_height {
-                buf[(x, rect.y + rect.height)]
-                    .set_symbol(boundaries::BOTTOM_LEFT)
-                    .set_style(fill_style);
-            }
-        } else if x == rect.x + rect.width {
-            if rect.y < buf_height {
-                buf[(x, rect.y)]
-                    .set_symbol(boundaries::TOP_RIGHT)
-                    .set_style(fill_style);
-            }
-            if rect.y + rect.height < buf_height {
-                buf[(x, rect.y + rect.height)]
-                    .set_symbol(boundaries::BOTTOM_RIGHT)
-                    .set_style(fill_style);
-            }
-        } else {
-            if rect.y < buf_height {
-                buf[(x, rect.y)]
-                    .set_symbol(boundaries::HORIZONTAL)
-                    .set_style(fill_style);
-            }
-            if rect.y + rect.height < buf_height {
-                buf[(x, rect.y + rect.height)]
-                    .set_symbol(boundaries::HORIZONTAL)
-                    .set_style(fill_style);
-            }
-        }
-    }
-
-    // left and right
-    for y in (rect.y + 1)..(rect.y + rect.height) {
-        if y >= buf_height {
-            break;
-        }
-        if rect.x < buf_width {
-            buf[(rect.x, y)]
-                .set_symbol(boundaries::VERTICAL)
-                .set_style(fill_style);
-        }
-        if rect.x + rect.width < buf_width {
-            buf[(rect.x + rect.width, y)]
-                .set_symbol(boundaries::VERTICAL)
-                .set_style(fill_style);
-        }
-    }
-}
-
-pub fn draw_tile_text_on_grid(buf: &mut Buffer, tile: &Tile, selected: bool) {
+pub fn draw_tile_text_on_grid(buf: &mut Buffer, tile: &Tile, selected: bool, theme: Theme) {
     let buf_width = buf.area().width;
     let buf_height = buf.area().height;
 
@@ -237,7 +189,7 @@ pub fn draw_tile_text_on_grid(buf: &mut Buffer, tile: &Tile, selected: bool) {
     let second_line_length = second_line.width();
     let second_line_start_position =
         (f64::from(tile.width - second_line_length as u16) / 2.0).ceil() as u16 + tile.x;
-    let (background_style, first_line_style, second_line_style) = tile_style(tile, selected);
+    let (background_style, first_line_style, second_line_style) = tile_style(tile, selected, theme);
 
     if let Some(background_style) = background_style {
         for x in tile.x + 1..tile.x + tile.width {
@@ -285,19 +237,6 @@ pub fn draw_tile_text_on_grid(buf: &mut Buffer, tile: &Tile, selected: bool) {
             second_line,
             second_line_style,
         );
-    } else if tile.height > 4 {
-        buf.set_string(
-            first_line_start_position,
-            tile.y + 1,
-            first_line,
-            first_line_style,
-        );
-        buf.set_string(
-            second_line_start_position,
-            tile.y + 2,
-            second_line,
-            second_line_style,
-        );
     } else if tile.height == 4 {
         buf.set_string(
             first_line_start_position,
@@ -331,5 +270,55 @@ pub fn draw_tile_text_on_grid(buf: &mut Buffer, tile: &Tile, selected: bool) {
             first_line,
             first_line_style,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use crate::model::NodeId;
+    use crate::theme::ThemeId;
+
+    use super::*;
+
+    fn tile(file_type: FileType) -> Tile {
+        Tile {
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 5,
+            node_id: NodeId(1),
+            name: OsString::from("entry"),
+            size: 1,
+            apparent_size: 1,
+            descendants: None,
+            percentage: 1.0,
+            file_type,
+            synthetic_kind: None,
+            uncertain: false,
+        }
+    }
+
+    #[test]
+    fn selected_labels_use_semantic_inverse_roles_in_every_theme() {
+        for id in ThemeId::ALL {
+            let theme = Theme::for_id(id);
+            for file_type in [FileType::File, FileType::Folder, FileType::Synthetic] {
+                let (background, first, second) = tile_style(&tile(file_type), true, theme);
+                let background = background.expect("selected tile should paint its background");
+                assert_eq!(background.bg, Some(theme.surface_selection), "{id:?}");
+                assert_eq!(first.bg, Some(theme.surface_selection), "{id:?}");
+                assert_eq!(second.bg, Some(theme.surface_selection), "{id:?}");
+                assert_eq!(first.fg, Some(theme.text_inverse), "{id:?}");
+                assert_eq!(second.fg, Some(theme.text_inverse), "{id:?}");
+                assert!(first.add_modifier.contains(Modifier::BOLD), "{id:?}");
+                if id == ThemeId::Monochrome {
+                    assert!(first.add_modifier.contains(Modifier::REVERSED), "{id:?}");
+                } else {
+                    assert_ne!(theme.text_inverse, theme.surface_selection, "{id:?}");
+                }
+            }
+        }
     }
 }

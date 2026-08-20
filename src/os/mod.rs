@@ -7,3 +7,9 @@ pub mod windows;
 
 #[cfg(not(target_os = "windows"))]
 pub mod unix;
+
+#[cfg(target_os = "windows")]
+pub(crate) use windows::is_user_admin;
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) use unix::is_user_admin;

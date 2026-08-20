@@ -1,0 +1,125 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH excise 1  "excise 0.0.0-dev" 
+.SH NAME
+excise
+.SH SYNOPSIS
+\fBexcise\fR [\fB\-\-config\fR] [\fB\-a\fR|\fB\-\-apparent\-size\fR] [\fB\-\-scan\-threads\fR] [\fB\-\-event\-buffer\fR] [\fB\-\-cross\-filesystems\fR] [\fB\-\-exclude\fR] [\fB\-\-memory\-mib\fR] [\fB\-\-reduced\-motion\fR] [\fB\-\-theme\fR] [\fB\-\-ascii\fR] [\fB\-\-mouse\fR] [\fB\-\-keymap\fR] [\fB\-\-format\fR] [\fB\-\-output\fR] [\fB\-d\fR|\fB\-\-disable\-delete\-confirmation\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIfolder\fR] 
+.SH DESCRIPTION
+.SH OPTIONS
+.TP
+\fB\-\-config\fR \fI<FILE>\fR
+Read configuration from FILE
+.TP
+\fB\-a\fR, \fB\-\-apparent\-size\fR
+Show apparent file sizes instead of allocated bytes
+.TP
+\fB\-\-scan\-threads\fR \fI<COUNT>\fR
+Scanner worker count (1\-32)
+.TP
+\fB\-\-event\-buffer\fR \fI<COUNT>\fR
+Bounded worker\-event capacity (16\-4096)
+.TP
+\fB\-\-cross\-filesystems\fR
+Permit traversal across filesystem boundaries
+.TP
+\fB\-\-exclude\fR \fI<PATTERN>\fR
+Ordered gitignore\-style exclusion pattern
+.TP
+\fB\-\-memory\-mib\fR \fI<MIB>\fR
+Whole\-process memory envelope in MiB
+.TP
+\fB\-\-reduced\-motion\fR
+Disable nonessential motion
+.TP
+\fB\-\-theme\fR \fI<THEME>\fR
+Built\-in semantic color theme
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+excise\-dark
+.IP \(bu 2
+excise\-light
+.IP \(bu 2
+high\-contrast
+.IP \(bu 2
+monochrome
+.IP \(bu 2
+dracula
+.IP \(bu 2
+tokyo\-night
+.IP \(bu 2
+catppuccin\-mocha
+.IP \(bu 2
+catppuccin\-latte
+.IP \(bu 2
+gruvbox\-dark
+.IP \(bu 2
+gruvbox\-light
+.IP \(bu 2
+nord
+.IP \(bu 2
+solarized\-dark
+.IP \(bu 2
+solarized\-light
+.IP \(bu 2
+one\-dark
+.IP \(bu 2
+monokai
+.RE
+.TP
+\fB\-\-ascii\fR
+Use ASCII\-only symbols and borders
+.TP
+\fB\-\-mouse\fR
+Enable mouse capture and selection
+.TP
+\fB\-\-keymap\fR \fI<PRESET>\fR
+Keyboard preset; arrows and safety keys always work
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+vim
+.IP \(bu 2
+custom
+.IP \(bu 2
+emacs
+.RE
+.TP
+\fB\-\-format\fR \fI<FORMAT>\fR
+Output mode; table and JSON never acquire a terminal
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+tui
+.IP \(bu 2
+table
+.IP \(bu 2
+json
+.RE
+.TP
+\fB\-\-output\fR \fI<FILE>\fR
+Write a noninteractive report to FILE instead of stdout
+.TP
+\fB\-d\fR, \fB\-\-disable\-delete\-confirmation\fR
+Do not ask for confirmation before deleting
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
+[\fIfolder\fR]
+Folder to scan
+.SH VERSION
+v0.0.0\-dev

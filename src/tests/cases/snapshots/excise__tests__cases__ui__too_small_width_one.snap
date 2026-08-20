@@ -1,55 +1,54 @@
 ---
 source: src/tests/cases/ui.rs
-expression: "&terminal_draw_events_mirror[0]"
+expression: normalized
 ---
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-     Terminal window is too small ¯\_(ツ )_/¯     
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-                                                 
-
+ EXCISE  /tmp/ex[..]dth_one  ◆ COMPLETE          
+ allocated ##.#K   reclaim ##.#K   apparent 20.0K
+─────────────────────────────────────────────────
+┌ LIST ─────────────────────────────────────────┐
+│   file2                     8.0K   40.0%      │
+│   file3                     8.0K   40.0%      │
+│   file1                     4.0K   20.0%      │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+│                                               │
+└───────────────────────────────────────────────┘
+ arrows move  Enter open  / filter  ? help       
+Excise · REDUCED MOTION

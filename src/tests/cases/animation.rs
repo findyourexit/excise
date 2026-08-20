@@ -23,6 +23,18 @@ fn keyed_effects_coalesce_and_finish_under_virtual_time() {
 }
 
 #[test]
+fn large_surfaces_use_a_lower_animation_frame_rate() {
+    let area = Rect::new(0, 0, 200, 100);
+    let mut buffer = Buffer::empty(area);
+    let mut scheduler = AnimationScheduler::new(false, false, Duration::ZERO);
+    scheduler.schedule_navigation();
+
+    scheduler.process(Duration::ZERO, &mut buffer, area);
+
+    assert_eq!(scheduler.next_frame_at(), Some(Duration::from_millis(66)));
+}
+
+#[test]
 fn reduced_motion_and_monochrome_are_idle_silent() {
     let mut reduced = AnimationScheduler::new(true, false, Duration::ZERO);
     reduced.schedule_navigation();

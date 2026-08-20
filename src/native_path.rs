@@ -134,22 +134,64 @@ impl ResolvedRoot {
 /// # Errors
 /// Returns an I/O error when the platform identity provider cannot inspect the path.
 pub fn identity_for(path: &Path, metadata: &Metadata) -> io::Result<Option<NativeIdentity>> {
-    if metadata.file_type().is_symlink() {
-        return Ok(None);
-    }
-
-    let file_id = file_id::get_file_id(path)?;
     #[cfg(unix)]
-    let link_count = {
+    let (file_id, link_count, reparse_point) = {
         use std::os::unix::fs::MetadataExt as _;
-        Some(metadata.nlink())
+
+        let _ = path;
+        (
+            file_id::FileId::new_inode(metadata.dev(), metadata.ino()),
+            Some(metadata.nlink()),
+            is_reparse_point(metadata),
+        )
     };
-    #[cfg(not(unix))]
-    let link_count = None;
+    #[cfg(windows)]
+    let (file_id, link_count, reparse_point) = {
+        let _ = metadata;
+        use cap_primitives::fs::{_WindowsByHandle as _, OpenOptionsExt as _};
+
+        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let mut options = cap_primitives::fs::OpenOptions::new();
+        options
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+        let handle =
+            cap_primitives::fs::open_ambient(path, &options, cap_primitives::ambient_authority())?;
+        let metadata = cap_primitives::fs::Metadata::from_file(&handle)?;
+        let volume = metadata
+            .volume_serial_number()
+            .ok_or_else(|| io::Error::other("file handle did not expose a volume serial number"))?;
+        let index = metadata
+            .file_index()
+            .ok_or_else(|| io::Error::other("file handle did not expose a file index"))?;
+        (
+            file_id::FileId::new_low_res(volume, index),
+            metadata.number_of_links().map(u64::from),
+            metadata.file_attributes() & 0x0000_0400 != 0,
+        )
+    };
+    #[cfg(not(any(unix, windows)))]
+    let (file_id, link_count, reparse_point) = {
+        if metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+        (
+            file_id::get_file_id(path)?,
+            None,
+            is_reparse_point(metadata),
+        )
+    };
     Ok(Some(NativeIdentity {
         file_id,
         link_count,
-        reparse_point: is_reparse_point(metadata),
+        reparse_point,
     }))
 }
 
@@ -331,15 +373,7 @@ fn decode_path(encoded: &EncodedNativePath) -> Result<PathBuf, PathCodecError> {
     }
 }
 
-#[cfg(windows)]
-fn is_reparse_point(metadata: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
 #[cfg(not(windows))]
-const fn is_reparse_point(_metadata: &Metadata) -> bool {
-    false
+fn is_reparse_point(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
