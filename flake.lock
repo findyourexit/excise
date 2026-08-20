@@ -2,7 +2,7 @@
   "nodes": {
     "nixpkgs": {
       "locked": {
-        "narHash": "sha256-8/gLyNG0ri0FYsjmf2TaHRxBxXzY7Sxfi2PCjVPy9XM=",
+        "narHash": "sha256-gwrPcFf/rDjHPaVflbDZ040ZDmBTRj/7+s8ZmE2SaIM=",
         "rev": "b18a4b905f8d028dc4476412e6d6891728695379",
         "revCount": 1012336,
         "type": "tarball",

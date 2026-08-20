@@ -1,0 +1,43 @@
+name: Hosted benchmark
+
+on:
+  pull_request:
+    paths:
+      - "benches/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tachyonfx:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned MSRV
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup override set 1.88.0
+      - name: Run statistical render benchmark
+        run: cargo bench --bench tachyonfx --locked -- --noplot
+      - name: Run statistical core benchmark
+        run: cargo bench --bench core --locked -- --noplot
+      - name: Preserve Criterion measurements
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: tachyonfx-criterion
+          path: target/criterion
+          if-no-files-found: error
+          retention-days: 1

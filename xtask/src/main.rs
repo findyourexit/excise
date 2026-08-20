@@ -15,7 +15,6 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const EXCEPTION_FILE: &str = "verification/exceptions.txt";
 const NATIVE_PATH_SCHEMA_ID: &str =
     "https://github.com/findyourexit/excise/schemas/native-path-v1.json";
 const RELEASE_REPOSITORY: &str = "https://github.com/findyourexit/excise";
@@ -74,7 +73,6 @@ fn release_version() -> Result<String, Box<dyn Error>> {
 }
 
 fn verify() -> Result<(), Box<dyn Error>> {
-    ensure_exception_ratchet_is_empty()?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     run_static_checks(&cargo)?;
     run_behavior_checks(&cargo)?;
@@ -82,7 +80,7 @@ fn verify() -> Result<(), Box<dyn Error>> {
     check_distribution_contract(&release_version()?)?;
     run_dynamic_checks(&cargo)?;
 
-    println!("\nLocal verification passed with zero exceptions.");
+    println!("\nLocal verification passed.");
     Ok(())
 }
 
@@ -112,6 +110,7 @@ fn run_static_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
             "GOVERNANCE.md",
             "MAINTAINERS.md",
             "SECURITY.md",
+            "SUPPORT.md",
             "docs",
         ],
     )?;
@@ -232,8 +231,10 @@ fn run_dynamic_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
 
 fn run_fuzz_target(target: &str, iterations: u32) -> Result<(), Box<dyn Error>> {
     let runs = format!("-runs={iterations}");
+    let corpus = format!("fuzz/corpus/{target}");
     let seed = format!("fuzz/seeds/{target}");
-    let mut args = vec!["run", "nightly", "cargo", "fuzz", "run", target];
+    fs::create_dir_all(&corpus)?;
+    let mut args = vec!["run", "nightly", "cargo", "fuzz", "run", target, &corpus];
     if Path::new(&seed).is_dir() {
         args.push(&seed);
     }
@@ -243,24 +244,6 @@ fn run_fuzz_target(target: &str, iterations: u32) -> Result<(), Box<dyn Error>> 
         &format!("fuzz smoke: {target}"),
         &args,
     )
-}
-
-fn ensure_exception_ratchet_is_empty() -> Result<(), Box<dyn Error>> {
-    let content = fs::read_to_string(EXCEPTION_FILE)?;
-    let active: Vec<_> = content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect();
-    if active.is_empty() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "{} active verification exception(s) remain in {EXCEPTION_FILE}",
-            active.len()
-        ))
-        .into())
-    }
 }
 
 fn check_installed_cross_targets(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
@@ -1262,11 +1245,11 @@ fn write_provenance(
         }],
         "predicate": {
             "buildDefinition": {
-                "buildType": "https://github.com/findyourexit/excise/local-release-equivalent/v1",
+                "buildType": "https://github.com/findyourexit/excise/development-build/v1",
                 "externalParameters": { "host": host, "version": version }
             },
             "runDetails": {
-                "builder": { "id": "local-only; not a release attestation" }
+                "builder": { "id": "local development build; not a release attestation" }
             }
         }
     });

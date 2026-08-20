@@ -73,6 +73,8 @@ impl FilterPattern {
     pub fn matches_path(&self, path: &Path, base: &Path) -> bool {
         let relative = path.strip_prefix(base).unwrap_or(path);
         let displayed = safe_display_path(relative).text;
+        #[cfg(windows)]
+        let displayed = displayed.replace("\\\\", "/");
         self.matcher.as_ref().map_or_else(
             || {
                 displayed == self.raw
@@ -105,8 +107,11 @@ mod tests {
     #[test]
     fn glob_filter_respects_path_separators() {
         let filter = FilterPattern::new("build/*.o").expect("glob should compile");
-        assert!(filter.matches_path(Path::new("root/build/main.o"), Path::new("root")));
-        assert!(!filter.matches_path(Path::new("root/build/deep/main.o"), Path::new("root")));
+        let root = Path::new("root");
+        let file = root.join("build").join("main.o");
+        let deep_file = root.join("build").join("deep").join("main.o");
+        assert!(filter.matches_path(&file, root));
+        assert!(!filter.matches_path(&deep_file, root));
     }
 
     #[cfg(unix)]

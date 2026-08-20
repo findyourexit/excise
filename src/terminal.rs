@@ -80,6 +80,7 @@ pub fn validate_terminal() -> Result<(), AppError> {
 pub struct TerminalSession {
     state: TerminalState,
     active: Arc<AtomicBool>,
+    mouse_capture: bool,
     previous_panic_hook: Arc<Mutex<Option<PanicHook>>>,
 }
 
@@ -96,6 +97,7 @@ impl TerminalSession {
         let mut session = Self {
             state: TerminalState::Inactive,
             active: Arc::new(AtomicBool::new(false)),
+            mouse_capture,
             previous_panic_hook: Arc::new(Mutex::new(None)),
         };
 
@@ -136,7 +138,8 @@ impl TerminalSession {
 
         let was_active = self.active.swap(false, Ordering::AcqRel);
         let terminal_result = if was_active && self.state.has_alternate_screen() {
-            restore_commands().map_err(|error| AppError::terminal("restoration", error))
+            restore_commands(self.mouse_capture)
+                .map_err(|error| AppError::terminal("restoration", error))
         } else {
             Ok(())
         };
@@ -162,9 +165,10 @@ impl TerminalSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(previous);
         let active = self.active.clone();
         let previous = self.previous_panic_hook.clone();
+        let mouse_capture = self.mouse_capture;
         panic::set_hook(Box::new(move |info| {
             if active.swap(false, Ordering::AcqRel) {
-                let _ = restore_commands();
+                let _ = restore_commands(mouse_capture);
                 let _ = disable_raw_mode();
             }
             if let Some(previous) = previous
@@ -199,13 +203,23 @@ impl Drop for TerminalSession {
     }
 }
 
-fn restore_commands() -> io::Result<()> {
-    execute!(
-        io::stdout(),
-        ResetColor,
-        Show,
-        DisableMouseCapture,
-        EnableLineWrap,
-        LeaveAlternateScreen
-    )
+fn restore_commands(mouse_capture: bool) -> io::Result<()> {
+    if mouse_capture {
+        execute!(
+            io::stdout(),
+            ResetColor,
+            Show,
+            DisableMouseCapture,
+            EnableLineWrap,
+            LeaveAlternateScreen
+        )
+    } else {
+        execute!(
+            io::stdout(),
+            ResetColor,
+            Show,
+            EnableLineWrap,
+            LeaveAlternateScreen
+        )
+    }
 }

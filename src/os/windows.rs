@@ -12,12 +12,12 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
-    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-    GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl,
-    InitializeSecurityDescriptor, IsValidAcl, IsValidSid, OBJECT_INHERIT_ACE,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+    GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
+    IsValidAcl, IsValidSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+    TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
@@ -34,11 +34,17 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-const PRIVATE_ACE_FLAGS: u8 = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+const PRIVATE_ACE_FLAGS: u8 = 0;
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const STILL_ACTIVE: u32 = 259;
 
+#[cfg(test)]
+pub(crate) fn is_user_admin() -> bool {
+    false
+}
+
+#[cfg(not(test))]
 pub(crate) fn is_user_admin() -> bool {
     is_elevated::is_elevated()
 }
@@ -261,6 +267,10 @@ fn set_private_security(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "One held-handle security check must preserve its verification order as one invariant."
+)]
 fn verify_private_handle(handle: HANDLE, directory: bool, user: &CurrentUserSid) -> io::Result<()> {
     let mut file_information = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the held handle is valid and `file_information` is an aligned
@@ -358,8 +368,12 @@ fn verify_private_handle(handle: HANDLE, directory: bool, user: &CurrentUserSid)
     // SAFETY: a valid ACL guarantees a readable ACE header at this pointer.
     let header = unsafe { &*ace.cast::<ACE_HEADER>() };
     if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags != PRIVATE_ACE_FLAGS {
-        return Err(private_path_error(
-            "private path DACL has unexpected ACE flags or type",
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "private path DACL has unexpected ACE type {} or flags {}; expected type {} and flags {}",
+                header.AceType, header.AceFlags, ACCESS_ALLOWED_ACE_TYPE, PRIVATE_ACE_FLAGS,
+            ),
         ));
     }
     if usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>() {
@@ -454,7 +468,7 @@ impl CurrentUserSid {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 token_user.User.Sid.cast::<u8>(),
-                sid.as_mut_ptr(),
+                sid.as_mut_ptr().cast(),
                 sid.len(),
             );
         }
@@ -473,15 +487,15 @@ struct PrivateSecurity {
 
 impl PrivateSecurity {
     fn new(user: &CurrentUserSid) -> io::Result<Self> {
-        let ace_len = size_of::<ACCESS_ALLOWED_ACE>()
+        let access_entry_bytes = size_of::<ACCESS_ALLOWED_ACE>()
             .saturating_sub(size_of::<u32>())
             .saturating_add(user.0.len());
-        let acl_len = size_of::<ACL>().saturating_add(ace_len);
-        let mut acl = AlignedBytes::zeroed(acl_len);
+        let acl_allocation_bytes = size_of::<ACL>().saturating_add(access_entry_bytes);
+        let mut acl = AlignedBytes::zeroed(acl_allocation_bytes);
         let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
         let mut descriptor = SECURITY_DESCRIPTOR::default();
-        let acl_size =
-            u32::try_from(acl_len).map_err(|_| private_path_error("private DACL was too large"))?;
+        let acl_size = u32::try_from(acl_allocation_bytes)
+            .map_err(|_| private_path_error("private DACL was too large"))?;
 
         // SAFETY: `acl` is an aligned allocation large enough for the ACL and
         // one access-allowed ACE carrying the validated current-user SID.
@@ -554,12 +568,12 @@ impl AlignedBytes {
         }
     }
 
-    fn as_ptr(&self) -> *const u8 {
-        self.words.as_ptr().cast()
+    fn as_ptr(&self) -> *const usize {
+        self.words.as_ptr()
     }
 
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.words.as_mut_ptr().cast()
+    fn as_mut_ptr(&mut self) -> *mut usize {
+        self.words.as_mut_ptr()
     }
 
     const fn len(&self) -> usize {

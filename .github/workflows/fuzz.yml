@@ -1,0 +1,51 @@
+name: Fuzz smoke
+
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2026-08-18 --profile minimal
+          cargo +nightly-2026-08-18 install cargo-fuzz --version 0.13.2 --locked
+      - name: Run bounded fuzz smoke targets
+        run: |
+          mkdir -p fuzz/corpus/{treemap,accounting,filter,deletion_state,deletion_plan,report}
+          cargo +nightly-2026-08-18 fuzz run truncate -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-08-18 fuzz run config -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-08-18 fuzz run native_path -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-08-18 fuzz run terminal_state -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-08-18 fuzz run tachyonfx -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-08-18 fuzz run runtime_events -- -max_total_time=30 -max_len=256
+          cargo +nightly-2026-08-18 fuzz run treemap fuzz/corpus/treemap fuzz/seeds/treemap -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-08-18 fuzz run accounting fuzz/corpus/accounting fuzz/seeds/accounting -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-08-18 fuzz run filter fuzz/corpus/filter fuzz/seeds/filter -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-08-18 fuzz run deletion_state fuzz/corpus/deletion_state fuzz/seeds/deletion_state -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-08-18 fuzz run deletion_plan fuzz/corpus/deletion_plan fuzz/seeds/deletion_plan -- -max_total_time=60 -max_len=256
+          cargo +nightly-2026-08-18 fuzz run report fuzz/corpus/report fuzz/seeds/report -- -max_total_time=60 -max_len=16384
+
+      - name: Preserve crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 1

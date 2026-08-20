@@ -280,6 +280,9 @@ impl Exclusions {
     }
 
     fn reason(&self, path: &Path, is_dir: bool) -> Option<String> {
+        if self.is_internal(path) {
+            return Some("Excise session state".to_string());
+        }
         if !self
             .matcher
             .matched_path_or_any_parents(path, is_dir)

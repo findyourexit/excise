@@ -1,0 +1,124 @@
+name: Release candidate artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      attest:
+        description: Generate GitHub build attestations for the dry-run artifacts
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, shell: bash }
+          - { os: ubuntu-24.04, target: aarch64-unknown-linux-gnu, shell: bash }
+          - { os: macos-14, target: aarch64-apple-darwin, shell: bash }
+          - { os: macos-14, target: x86_64-apple-darwin, shell: bash }
+          - { os: windows-2025, target: x86_64-pc-windows-msvc, shell: pwsh }
+          - { os: windows-2025, target: aarch64-pc-windows-msvc, shell: pwsh }
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build locked release binary
+        uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --locked --release --package excise
+          toolchain: 1.88.0
+          strip: true
+          use-rust-cache: false
+      - name: Validate distribution template contracts
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: cargo run --locked --package xtask -- check-distribution
+      - name: Assemble Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          root="excise-${TARGET}-v${version}"
+          mkdir -p "stage/${root}/generated" "stage/${root}/schemas"
+          cp "target/${TARGET}/release/excise" "stage/${root}/excise"
+          cp LICENSE README.md "stage/${root}/"
+          cp -R generated/. "stage/${root}/generated/"
+          cp docs/schemas/*.json "stage/${root}/schemas/"
+          tar -C stage -czf "${root}.tar.gz" "${root}"
+          mkdir upload
+          mv "${root}.tar.gz" upload/
+      - name: Assemble Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]*)"').Matches[0].Groups[1].Value
+          $root = "excise-$env:TARGET-v$version"
+          New-Item -ItemType Directory -Force "stage/$root/generated", "stage/$root/schemas", upload | Out-Null
+          Copy-Item "target/$env:TARGET/release/excise.exe" "stage/$root/excise.exe"
+          Copy-Item LICENSE, README.md "stage/$root/"
+          Copy-Item -Recurse generated/* "stage/$root/generated/"
+          Copy-Item docs/schemas/*.json "stage/$root/schemas/"
+          Compress-Archive -Path "stage/$root" -DestinationPath "upload/$root.zip"
+      - name: Upload immutable target archive
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: excise-${{ matrix.target }}
+          path: upload/*
+          if-no-files-found: error
+          retention-days: 1
+
+  supply-chain:
+    name: Checksums, SBOM, and optional provenance
+    needs: archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download target archives
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: excise-*
+          path: release
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum ./excise-* > checksums.sha256
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: release
+          format: spdx-json
+          output-file: release/excise.spdx.json
+          upload-artifact: false
+      - name: Attest dry-run artifacts
+        if: inputs.attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: release/*
+      - name: Upload release candidate bundle
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: excise-release-candidate
+          path: release
+          if-no-files-found: error
+          retention-days: 1

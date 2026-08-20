@@ -604,9 +604,9 @@ fn reclaim_stale_session(path: &Path, now: SystemTime) -> Result<bool, ModelErro
 
 #[cfg(windows)]
 fn reclaim_stale_session(path: &Path, now: SystemTime) -> Result<bool, ModelError> {
-    let mut handle = match crate::os::windows::open_verified_private_directory_for_cleanup(path) {
-        Ok(handle) => handle,
-        Err(_) => return Ok(false),
+    let Ok(mut handle) = crate::os::windows::open_verified_private_directory_for_cleanup(path)
+    else {
+        return Ok(false);
     };
     if !is_stale_session(path, now) {
         return Ok(false);
@@ -722,7 +722,7 @@ fn remove_verified_session_held(
     let database = directory.join(IDENTITY_DATABASE_FILE);
     match fs::symlink_metadata(&database) {
         Ok(_) => {
-            crate::os::windows::delete_verified_private_file(&database).map_err(identity_error)?
+            crate::os::windows::delete_verified_private_file(&database).map_err(identity_error)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(identity_error(error)),
@@ -930,11 +930,6 @@ fn verify_unix_private_path(
         ));
     }
     Ok(())
-}
-
-#[cfg(all(windows, test))]
-fn restrict_private_directory(path: &Path) -> Result<(), ModelError> {
-    crate::os::windows::restrict_private_path(path, true).map_err(identity_error)
 }
 
 #[cfg(windows)]

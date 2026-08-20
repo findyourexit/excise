@@ -4,6 +4,7 @@ use ::std::path::Path;
 
 use crossterm::event::KeyModifiers;
 use crossterm::event::{Event, KeyCode, KeyEvent};
+use unicode_width::UnicodeWidthStr as _;
 
 use crate::start;
 use crate::tests::cases::test_utils::*;
@@ -51,25 +52,83 @@ fn metric_value_range(line: &str, marker: &str) -> Option<std::ops::Range<usize>
     Some(value_start..value_end)
 }
 
+fn normalize_identity_cell(line: &str) -> String {
+    let Some((start, marker)) = ["identity  ", "identity "].into_iter().find_map(|marker| {
+        let start = line.find(marker)?;
+        let value_start = start + marker.len();
+        let value = line.get(value_start..)?;
+        (value.starts_with("Inod") || value.starts_with("LowR") || value.starts_with("HighR"))
+            .then_some((start, marker))
+    }) else {
+        return line.to_string();
+    };
+    let Some(relative_end) = line[start..].find(['│', '║']) else {
+        return line.to_string();
+    };
+    let end = start + relative_end;
+    let cell = &line[start..end];
+    let cell_width = cell.width();
+
+    let canonical = if marker == "identity " {
+        let full = "identity Inode { device_id: ########, inode_number: ######## }";
+        let truncated = "identity Inode { device_id: ########, inode_number: …";
+        let target_width: usize = if cell_width < full.width() { 54 } else { 76 };
+        let value = if target_width == 54 { truncated } else { full };
+        let mut canonical = value.to_string();
+        canonical.extend(std::iter::repeat_n(
+            ' ',
+            target_width.saturating_sub(canonical.width()),
+        ));
+        canonical
+    } else {
+        "identity  Inod[...]ber: ######## }".to_string()
+    };
+    let mut normalized = String::with_capacity(line.len());
+    normalized.push_str(&line[..start]);
+    normalized.push_str(&canonical);
+    normalized.push_str(&line[end..]);
+    normalized
+}
+
 fn normalize_snapshot(frame: &str) -> String {
     let mut normalized = String::with_capacity(frame.len());
-    for line in frame.split_inclusive('\n') {
+    for raw_line in frame.split_inclusive('\n') {
+        let line = normalize_identity_cell(raw_line);
         let identity_start = line
             .find("identity ")
             .map_or(usize::MAX, |index| index + "identity ".len());
+        let links_start = line
+            .find("links ")
+            .map_or(usize::MAX, |index| index + "links ".len());
         let metric_ranges = [
-            metric_value_range(line, "allocated "),
-            metric_value_range(line, "reclaim "),
+            metric_value_range(&line, "allocated "),
+            metric_value_range(&line, "reclaim "),
         ];
+        let mut in_identity_or_links_number = false;
         for (index, character) in line.char_indices() {
             let dynamic_metric = metric_ranges
                 .iter()
                 .flatten()
                 .any(|range| range.contains(&index));
-            if character.is_ascii_digit() && (index >= identity_start || dynamic_metric) {
-                normalized.push('#');
+            let in_identity = index >= identity_start;
+            let in_links = index >= links_start;
+            if character.is_ascii_digit() && in_identity {
+                if !in_identity_or_links_number {
+                    normalized.push_str("########");
+                    in_identity_or_links_number = true;
+                }
+            } else if character.is_ascii_digit() && in_links {
+                if !in_identity_or_links_number {
+                    normalized.push('#');
+                    in_identity_or_links_number = true;
+                }
             } else {
-                normalized.push(character);
+                in_identity_or_links_number = false;
+                if character.is_ascii_digit() && dynamic_metric {
+                    normalized.push('#');
+                } else {
+                    normalized.push(character);
+                }
             }
         }
     }

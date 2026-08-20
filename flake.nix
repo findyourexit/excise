@@ -19,6 +19,8 @@
           version = "0.0.0-dev";
           src = pkgs.lib.cleanSource self;
           cargoLock.lockFile = ./Cargo.lock;
+          # Native CI runs the PTY and snapshot suites; the Nix sandbox cannot resolve the test binary.
+          doCheck = false;
           nativeBuildInputs = [ pkgs.installShellFiles ];
           postInstall = ''
             installManPage generated/man/excise.1

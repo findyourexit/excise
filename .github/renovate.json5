@@ -1,0 +1,55 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":disableDependencyDashboard"],
+  "enabledManagers": ["cargo", "github-actions"],
+  "automerge": false,
+  "dependencyDashboard": false,
+  "minimumReleaseAge": "7 days",
+  "prConcurrentLimit": 2,
+  "prHourlyLimit": 1,
+  "rangeStrategy": "bump",
+  "separateMajorMinor": true,
+  "schedule": ["before 5am on monday"],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 5am on the first day of the month"]
+  },
+  "packageRules": [
+    {
+      "description": "Keep the terminal rendering stack reviewable as one change",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["crossterm", "ratatui", "tachyonfx", "unicode-width"],
+      "groupName": "terminal rendering stack"
+    },
+    {
+      "description": "Group non-visual runtime dependencies",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["anyhow", "clap", "filesize", "is_elevated", "nix"],
+      "groupName": "runtime dependencies"
+    },
+    {
+      "description": "Group test and measurement tooling",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["criterion", "insta", "portable-pty", "tempfile"],
+      "groupName": "test tooling"
+    },
+    {
+      "description": "Group fuzz tooling across its isolated package",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["libfuzzer-sys"],
+      "groupName": "fuzz tooling"
+    },
+    {
+      "description": "Keep pinned GitHub Actions updates separate from Rust crates",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "pinDigests": true
+    },
+    {
+      "description": "Never automerge security or vulnerability remediation",
+      "matchCategories": ["security"],
+      "automerge": false,
+      "minimumReleaseAge": null
+    }
+  ]
+}

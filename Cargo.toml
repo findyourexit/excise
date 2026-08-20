@@ -6,6 +6,9 @@ resolver = "3"
 [package]
 name = "excise"
 description = "Surgical terminal storage navigator"
+keywords = ["disk-usage", "filesystem", "terminal", "tui"]
+categories = ["command-line-utilities", "filesystem"]
+
 version = "0.0.0-dev"
 authors = ["Aram Drevekenin <aram@poor.dev>", "Tom Larcher <tom.larcher@gmail.com>"]
 readme = "README.md"
@@ -14,7 +17,7 @@ repository = "https://github.com/findyourexit/excise"
 license = "MIT"
 edition = "2024"
 rust-version = "1.88"
-exclude = [".cargo", ".github", "docs/design/recordings", "prototypes", "demo.gif"]
+exclude = [".cargo", ".github", ".gitmessage"]
 publish = false
 
 

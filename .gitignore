@@ -1,3 +1,8 @@
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
 .cargo/*
 !.cargo/config.toml
 target/
@@ -7,3 +12,11 @@ vendor/
 vendor.tar
 **/*.rs.bk
 dist/
+/excise-scan-report*.json
+/excise-deletion-history*.json
+
+# Documentation media is published externally, not stored in Git.
+/demo.*
+/docs/**/assets/
+/docs/**/recordings/
+/docs/**/*.cast

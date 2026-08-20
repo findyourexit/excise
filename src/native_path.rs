@@ -147,7 +147,6 @@ pub fn identity_for(path: &Path, metadata: &Metadata) -> io::Result<Option<Nativ
     };
     #[cfg(windows)]
     let (file_id, link_count, reparse_point) = {
-        let _ = metadata;
         use cap_primitives::fs::{_WindowsByHandle as _, OpenOptionsExt as _};
 
         const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
@@ -156,6 +155,7 @@ pub fn identity_for(path: &Path, metadata: &Metadata) -> io::Result<Option<Nativ
         const FILE_SHARE_DELETE: u32 = 0x0000_0004;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let _ = metadata;
         let mut options = cap_primitives::fs::OpenOptions::new();
         options
             .access_mode(FILE_READ_ATTRIBUTES)
