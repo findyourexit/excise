@@ -289,7 +289,12 @@ fn run_with_env(
     value: &OsStr,
 ) -> Result<(), Box<dyn Error>> {
     println!("\n==> {label}");
-    let status = Command::new(program).args(args).env(key, value).status()?;
+    let mut command = Command::new(program);
+    command.args(args).env(key, value);
+    if !cfg!(windows) {
+        command.env("EXCISE_PTY_BUDGETS", "1");
+    }
+    let status = command.status()?;
     if status.success() {
         Ok(())
     } else {

@@ -19,8 +19,12 @@
           version = "0.0.0-dev";
           src = pkgs.lib.cleanSource self;
           cargoLock.lockFile = ./Cargo.lock;
-          # Native CI runs the PTY and snapshot suites; the Nix sandbox cannot resolve the test binary.
-          doCheck = false;
+          preCheck = ''
+            cargo build --target ${pkgs.stdenv.hostPlatform.rust.rustcTargetSpec} --bin excise --locked --offline
+            export EXCISE_PTY_DEBUG_BINARY="$PWD/target/${pkgs.stdenv.hostPlatform.rust.rustcTargetSpec}/debug/excise"
+            cargo build --release --target ${pkgs.stdenv.hostPlatform.rust.rustcTargetSpec} --bin excise --locked --offline
+            export EXCISE_PTY_BINARY="$PWD/target/${pkgs.stdenv.hostPlatform.rust.rustcTargetSpec}/release/excise"
+          '';
           nativeBuildInputs = [ pkgs.installShellFiles ];
           postInstall = ''
             installManPage generated/man/excise.1
