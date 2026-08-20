@@ -1,0 +1,72 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities or unsafe deletion paths here. Use the private security-reporting link in the issue chooser.
+  - type: input
+    id: version
+    attributes:
+      label: Excise version or commit
+      placeholder: "v1.0.0 or 0123456789abcdef"
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      description: Terminal application and shell, if relevant.
+      placeholder: "Windows Terminal 1.x with PowerShell 7"
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use synthetic paths and fixtures; remove sensitive filesystem information.
+      placeholder: |
+        1. Create ...
+        2. Run `excise ...`
+        3. Press ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant context
+      description: Filesystem type, links, mounts, permissions, terminal dimensions, configuration, logs, or report excerpts.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: I removed sensitive real paths and personal data.
+          required: true
+        - label: This report does not disclose an unpatched vulnerability or unsafe deletion path.
+          required: true

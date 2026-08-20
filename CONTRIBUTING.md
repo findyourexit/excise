@@ -1,39 +1,67 @@
-# How to contribute to Diskonaut
-You can contribute to `diskonaut` in several ways, all of which would be very much appreciated.
-Following are a few guidelines that might help you find your way around.
+# Contributing to Excise
 
-Please note that Diskonaut has a Code of Conduct (you can find it in the root of the repository).
-It is there so that we can have a safe and pleasant environment that encourages acceptance, participation and kindness.
+Thank you for improving Excise. Contributions are welcome across Rust code, tests, documentation, packaging, accessibility, and platform support.
 
-## Have you found a bug?
-If Diskonaut is not working for you, or you found something that is not behaving as it should, it would be great if you could let us know about it.
-To do this, please open an issue in the repository and provide as much relevant information as possible. Ideally, also a way to reproduce this bug.
-If you would like to try and fix this bug yourself, please open a pull request (for more information, see the section of this document regarding code contributions).
+## Before opening work
 
-## Do you have an idea for a new feature?
-`diskonaut` can always be improved, and one of the best ways to improve it is by having its users suggest new features and different ways it can behave.
-If you'd like to make such a suggestion, please open an issue detailing it. In this issue others would be able to comment on the suggestion.
-Finally, you or someone else would be able to implement this suggestion if it is decided to do so.
+- Search existing issues and pull requests first.
+- Use the issue chooser for reproducible defects and feature proposals.
+- Use [GitHub Discussions](https://github.com/findyourexit/excise/discussions) for usage questions and early ideas.
+- Report security vulnerabilities and unintended-deletion risks privately according to [SECURITY.md](SECURITY.md).
 
-## Would you like to make a code contribution?
-Code contributions to `diskonaut` are very welcome and encouraged. If you're unsure what to work on, a good place to start is the "Help Wanted" or "Good First Issue" tags in the issues of this repository.
+For a substantial change, open an issue before implementation so scope and public behavior can be agreed without wasting work.
 
-Following is some information you might find useful regarding the particularities of contributing to `diskonaut`:
+## Development setup
 
-### Testing
-Diskonaut uses automated integration tests to make sure everything is working as it should.
-If you're adding new functionality, you might want to add new tests or adjust the existing ones.
+Excise uses Rust 1.88 and the 2024 edition. The pinned toolchain is declared in `rust-toolchain.toml`.
 
-These tests work by creating textual "snapshots" of how the UI looks in certain situations. One test can have several snapshots.
+```console
+cargo check --workspace --all-targets --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
 
-An example test would be:
-1. Create a temporary folder with a few files and subfolders.
-2. Run diskonaut on that folder and take a snapshot of its UI. Make sure that snapshot is identical to the snapshot stored in this repository for that test.
-3. Enter one of the subfolders, take another snapshot and make sure it is identical to the second stored snapshot for that test.
+`cargo verify` runs the complete local verification suite, including formatting, workflow and dependency-policy validation, link checks, cross-target checks, tests, package checks, Cargo Deny, bounded fuzzing, benchmarks, and generated-file verification. See [docs/development.md](docs/development.md) for prerequisites and focused commands.
 
-To store and compare the snapshots, we use [`insta`](https://docs.rs/insta/0.8.1/insta/)
+## Engineering expectations
 
-For an improved experience, you can install `cargo-insta` on your computer, which will allow you to review new snapshots - approving or rejecting them. Please see the insta documentation for more details.
+- Correctness and data safety come before features.
+- Workspace lints deny `unsafe` by default. The audited Windows FFI boundary in `src/os/windows.rs` is the sole explicit exception; keep unsafe code confined there and document every block's safety conditions.
+- Runtime behavior remains local: do not add telemetry or network access.
+- Destructive-path changes must preserve identity checks, no-follow behavior, consent, revalidation, and partial-failure reporting.
+- Accounting changes must distinguish apparent, allocated, shared, and reclaimable bytes.
+- UI changes must remain usable with keyboard-only input, reduced motion, monochrome output, ASCII output, and narrow terminals.
+- Add tests for new observable behavior and plausible regressions; avoid tests coupled only to implementation details.
+- Update user-facing documentation and generated artifacts when their contracts change.
 
-### Code formatting
-`diskonaut` uses [rustfmt](https://github.com/rust-lang/rustfmt) for code formatting. In most (all?) cases, if you have it installed on your computer, you can run `cargo fmt` in the project folder, and it will auto fix your code.
+## Pull requests
+
+Keep pull requests focused and reviewable. Include:
+
+1. the user-visible problem;
+2. the chosen behavior and important tradeoffs;
+3. safety, compatibility, and accessibility impact;
+4. exact verification commands and results; and
+5. screenshots only when textual or snapshot evidence cannot describe a terminal-layout change.
+
+Snapshot changes are product changes. Review them deliberately and explain meaningful differences.
+
+## Developer Certificate of Origin
+
+Every new commit must include a `Signed-off-by` trailer certifying the [Developer Certificate of Origin 1.1](https://developercertificate.org/):
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+Use `git commit -s`. Excise does not require a CLA or copyright assignment. Historical commits retain their original authorship; do not rewrite another contributor's identity to add a sign-off they did not provide.
+
+To enable the repository's Conventional Commit template in this clone:
+
+```console
+git config --local commit.template .gitmessage
+```
+
+## Conduct
+
+Participation is governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).

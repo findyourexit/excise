@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a user-facing improvement
+title: "feature: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user need without assuming a particular implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the observable behavior and how users would discover or control it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: impact
+    attributes:
+      label: Safety, compatibility, and accessibility impact
+      description: Address deletion safety, storage semantics, platform behavior, keyboard use, narrow terminals, monochrome output, and reduced motion where relevant.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: I am willing to help test or implement this proposal.
+          required: false

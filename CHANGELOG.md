@@ -1,12 +1,30 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable Excise changes are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
+Excise preserves the historical Diskonaut changelog below. Diskonaut versions and tags are not Excise releases.
 
 ## [Unreleased]
 
 ### Added
+
+* Added bounded, iterative scanning with explicit exclusions, filesystem boundaries, uncertainty, cancellation, and secure identity spill.
+* Added identity-unique allocated-byte accounting, hard-link deduplication, reclaimable bounds, and explicit `Shared` and `Other` nodes.
+* Added identity-planned, no-follow permanent deletion with independent enumeration, per-entry revalidation, hostile-name challenges, partial reports, and soft or hard cancellation.
+* Added versioned TOML configuration, environment and CLI layering, fifteen built-in themes, reduced motion, ASCII output, mouse support, and Vim, Emacs, or custom movement.
+* Added noninteractive table and JSON reports, lossless native-path encoding, published JSON Schemas, generated man pages, and shell completions.
+* Added Linux, macOS, Windows, Nix, packaging, PTY, snapshot, fuzz, benchmark, dependency-policy, SBOM, checksum, and provenance verification.
+
+### Changed
+
+* Reintroduced the project as Excise, an independent successor that retains Diskonaut's commit history and contributor attribution.
+* Replaced the legacy actor model with one synchronous owner loop and bounded scanner and deletion worker protocols.
+* Rebuilt the terminal interface around Ratatui with responsive treemap and list layouts, semantic status states, and guarded destructive interactions.
+
+## Diskonaut history
+
+### Unreleased upstream changes
+
 * Only show "Small Files" legend when there are small files on screen (https://github.com/imsnif/diskonaut/pull/75) - [@pjsier](https://github.com/pjsier)
 
 ## [0.11.0] - 2020-09-23

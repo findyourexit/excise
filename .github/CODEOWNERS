@@ -1,0 +1,11 @@
+* @findyourexit
+
+/src/deletion.rs @findyourexit
+/src/model/ @findyourexit
+/src/native_path.rs @findyourexit
+/src/report.rs @findyourexit
+/src/runtime/ @findyourexit
+/src/terminal.rs @findyourexit
+/docs/schemas/ @findyourexit
+/.github/ @findyourexit
+/SECURITY.md @findyourexit

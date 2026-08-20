@@ -1,0 +1,40 @@
+# <type>(<scope>): <subject>
+#
+# <body>
+#
+# <footer>
+
+# --- COMMIT END ---
+# Type can be:
+#  build    (changes that affect the build system or external dependencies)
+#  chore    (routine maintenance that does not change production behavior)
+#  ci       (changes to CI configuration files and scripts)
+#  docs     (changes to documentation)
+#  feat     (new user-facing feature)
+#  fix      (fix addressing a user bug)
+#  perf     (performance-related change)
+#  refactor (refactoring production code)
+#  revert   (reversion in code)
+#  style    (formatting changes - no production code logic changes)
+#  test     (adding or refactoring tests - no production code changes)
+#
+# Scope is optional and is intended for specifying a granular context appropriate for the changes.
+#
+# Common scopes used for this project:
+# admin, deps, docs, harden, release, runtime, scanner, ui
+#
+# Subject should use imperative mood and say what you did.
+# The body should go into detail about changes made.
+# The footer should contain any related or resolved GitHub issue keys.
+#
+# For a full example:
+#   feat(lang): add Gibberish language support
+#
+#   Added support for Gibberish language including:
+#   - New language files
+#   - Translation updates
+#   - Unit tests for language switching
+#
+#   Refs:
+#   - #1234
+#   - #1235

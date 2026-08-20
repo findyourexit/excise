@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security or unintended-deletion report
+    url: https://github.com/findyourexit/excise/security/advisories/new
+    about: Report vulnerabilities and unsafe deletion paths privately.
+  - name: Questions and support
+    url: https://github.com/findyourexit/excise/discussions
+    about: Ask installation, configuration, and usage questions.
