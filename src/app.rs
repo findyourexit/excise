@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs::Metadata;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +26,14 @@ use crate::theme::Theme;
 use crate::ui::Display;
 const MIB: usize = 1024 * 1024;
 const MINIMUM_PLAN_BYTES: usize = 4 * 1024;
+fn emit_pty_test_marker(label: &str) {
+    if std::env::var_os("EXCISE_PTY_TEST_MARKERS").is_none() {
+        return;
+    }
+    let mut stdout = io::stdout();
+    let _ = writeln!(stdout, "\n__EXCISE_PTY_{label}__");
+    let _ = stdout.flush();
+}
 
 pub enum UiMode {
     Loading,
@@ -231,6 +239,7 @@ where
         self.ui_mode = UiMode::Normal;
         self.loaded = true;
         self.render_and_update_board();
+        emit_pty_test_marker("SCAN_COMPLETE");
     }
     pub fn add_entry_to_base_folder(
         &mut self,
@@ -300,6 +309,7 @@ where
         self.ui_mode = UiMode::Exiting {
             save_preferences: self.preferences_dirty,
         };
+        emit_pty_test_marker("QUIT_PROMPT");
         self.mark_dirty();
     }
 

@@ -49,16 +49,12 @@ impl Drop for ChildGuard {
 
 #[test]
 fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> {
-    if std::env::consts::OS == "windows" {
-        // Hosted Windows ConPTY does not reliably deliver completion markers.
-        return Ok(());
-    }
     let (status, output, metrics) = run_pty_interaction(b"y", None)?;
     if !status.success() {
         bail!("Excise exited unsuccessfully: {status}; captured {output:?}");
     }
     let metrics = metrics.context("normal run did not record PTY metrics")?;
-    if std::env::var_os("EXCISE_PTY_BINARY").is_some() {
+    if std::env::var_os("EXCISE_PTY_BUDGETS").is_some() {
         assert!(
             metrics.first_frame <= FIRST_FRAME_BUDGET,
             "first frame took {:?}; captured {output:?}",
@@ -80,10 +76,6 @@ fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> 
 
 #[test]
 fn hard_cancel_restores_terminal_and_uses_exit_130() -> anyhow::Result<()> {
-    if std::env::consts::OS == "windows" {
-        // Hosted Windows ConPTY does not reliably deliver completion markers.
-        return Ok(());
-    }
     let (status, output, _) = run_pty_interaction(b"\x03", None)?;
     if status.exit_code() != 130 {
         bail!("hard cancel exited with {status}; captured {output:?}");
@@ -130,6 +122,34 @@ fn typed_runtime_errors_restore_before_diagnostics() -> anyhow::Result<()> {
     }
     Ok(())
 }
+fn windows_conpty() -> bool {
+    std::env::consts::OS == "windows"
+}
+
+fn scan_ready_marker() -> &'static [u8] {
+    if windows_conpty() {
+        b"__EXCISE_PTY_SCAN_COMPLETE__"
+    } else {
+        b"COMPLETE"
+    }
+}
+
+fn initial_ready_marker() -> &'static [u8] {
+    if windows_conpty() {
+        scan_ready_marker()
+    } else {
+        b"Folder is empty"
+    }
+}
+
+fn quit_ready_marker() -> &'static [u8] {
+    if windows_conpty() {
+        b"__EXCISE_PTY_QUIT_PROMPT__"
+    } else {
+        b"Quit Excise?"
+    }
+}
+
 fn run_pty_interaction(
     exit_input: &[u8],
     injected_failure: Option<&str>,
@@ -173,16 +193,17 @@ fn run_pty_interaction(
     let mut measured = None;
     let mut quit_started = None;
     if injected_failure.is_none() {
-        wait_for_output(&output, b"Folder is empty", STARTUP_TIMEOUT)?;
+        let scan_marker = scan_ready_marker();
+        wait_for_output(&output, initial_ready_marker(), STARTUP_TIMEOUT)?;
         let terminal_started = first_output
             .lock()
             .expect("failed to lock PTY timing")
             .expect("terminal emitted no output");
         let first_frame = terminal_started.elapsed();
-        wait_for_output(&output, b"COMPLETE", STARTUP_TIMEOUT)?;
+        wait_for_output(&output, scan_marker, STARTUP_TIMEOUT)?;
         let input_started = Instant::now();
         write_input(&writer, b"q")?;
-        wait_for_output(&output, b"Quit Excise?", STARTUP_TIMEOUT)?;
+        wait_for_output(&output, quit_ready_marker(), STARTUP_TIMEOUT)?;
         let input_to_frame = input_started.elapsed();
         quit_started = Some(Instant::now());
         write_input(&writer, exit_input)?;
@@ -237,14 +258,21 @@ fn run_pty_interaction(
 
 fn pty_command(root: &std::path::Path, injected_failure: Option<&str>) -> CommandBuilder {
     let binary = if injected_failure.is_some() {
-        std::ffi::OsString::from(env!("CARGO_BIN_EXE_excise"))
+        std::env::var_os("EXCISE_PTY_DEBUG_BINARY")
+            .filter(|path| std::path::Path::new(path).is_file())
+            .unwrap_or_else(|| std::ffi::OsString::from(env!("CARGO_BIN_EXE_excise")))
     } else {
         std::env::var_os("EXCISE_PTY_BINARY")
+            .filter(|path| std::path::Path::new(path).is_file())
             .unwrap_or_else(|| std::ffi::OsString::from(env!("CARGO_BIN_EXE_excise")))
     };
     let mut command = CommandBuilder::new(binary);
     command.arg(root);
+    command.cwd(root);
     command.env("TERM", "xterm-256color");
+    if std::env::consts::OS == "windows" {
+        command.env("EXCISE_PTY_TEST_MARKERS", "1");
+    }
     match injected_failure {
         Some("panic") => command.env("EXCISE_TEST_PANIC_AFTER_TERMINAL_ENTRY", "1"),
         Some(kind) => command.env("EXCISE_TEST_ERROR_AFTER_TERMINAL_ENTRY", kind),
