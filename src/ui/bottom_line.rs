@@ -4,11 +4,12 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
+use crate::native_path::safe_display_os_str;
 use crate::state::tiles::{FileType, Tile};
 use crate::ui::format::{DisplaySize, display_path, truncate_middle};
 
 fn render_currently_selected(buf: &mut Buffer, currently_selected: &Tile, max_len: u16, y: u16) {
-    let file_name = currently_selected.name.to_string_lossy();
+    let file_name = safe_display_os_str(&currently_selected.name).text;
     let size = DisplaySize(currently_selected.size as f64);
     let descendants = currently_selected.descendants;
     let (style, lines) = match currently_selected.file_type {

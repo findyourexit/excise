@@ -1,12 +1,15 @@
 #![allow(clippy::unnested_or_patterns)]
 
+use std::time::Duration;
+
 use crossterm::event::Event;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
-use crossterm::event::{KeyCode, KeyEvent, read};
+use crossterm::event::{KeyCode, KeyEvent, poll, read};
 use ratatui::backend::Backend;
 
 use crate::App;
+use crate::error::AppError;
 use crate::state::FileToDelete;
 
 pub enum InputEvent {
@@ -14,28 +17,45 @@ pub enum InputEvent {
     Barrier,
 }
 
+pub trait InputSource {
+    /// # Errors
+    /// Returns an input I/O error when terminal readiness cannot be queried.
+    fn poll(&mut self, timeout: Duration) -> Result<bool, AppError>;
+    /// # Errors
+    /// Returns an input I/O error when the next terminal event cannot be read.
+    fn read(&mut self) -> Result<InputEvent, AppError>;
+}
+
 #[derive(Clone)]
 pub struct TerminalEvents;
 
-impl Iterator for TerminalEvents {
-    type Item = InputEvent;
-    fn next(&mut self) -> Option<InputEvent> {
+impl InputSource for TerminalEvents {
+    fn poll(&mut self, timeout: Duration) -> Result<bool, AppError> {
+        poll(timeout).map_err(|error| AppError::io("could not poll terminal input", error))
+    }
+
+    fn read(&mut self) -> Result<InputEvent, AppError> {
         loop {
-            let event = read().expect("Failed to read terminal event");
-            // On Windows crossterm reports key press *and* release events (Unix
-            // terminals only report presses). Our key handlers ignore the `kind`
-            // field, so without this filter every keystroke would be handled twice.
-            // Drop releases; forward presses and repeats (so holding a key still
-            // repeats, matching Unix terminal auto-repeat).
+            let event =
+                read().map_err(|error| AppError::io("could not read terminal input", error))?;
             if let Event::Key(key_event) = &event
                 && key_event.kind == KeyEventKind::Release
             {
                 continue;
             }
-            return Some(InputEvent::Terminal(event));
+            return Ok(InputEvent::Terminal(event));
         }
     }
 }
+
+pub(crate) enum InputCommand {
+    None,
+    Navigation,
+    PathError,
+    Delete(FileToDelete),
+    HardCancel,
+}
+
 macro_rules! key {
     (char $x:expr) => {
         Event::Key(KeyEvent {
@@ -67,133 +87,133 @@ macro_rules! key {
     };
 }
 
-pub fn handle_keypress_loading_mode<B: Backend>(evt: &Event, app: &mut App<B>) {
+pub(crate) fn handle_keypress<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+    match &app.ui_mode {
+        crate::UiMode::Loading => handle_keypress_loading_mode(evt, app),
+        crate::UiMode::Normal => handle_keypress_normal_mode(evt, app),
+        crate::UiMode::ScreenTooSmall => handle_keypress_screen_too_small(evt, app),
+        crate::UiMode::DeleteFile(file_to_delete) => {
+            let file_to_delete = file_to_delete.clone();
+            handle_keypress_delete_file_mode(evt, app, file_to_delete)
+        }
+        crate::UiMode::ErrorMessage(_) => handle_keypress_error_message(evt, app),
+        crate::UiMode::Exiting { app_loaded: _ } => handle_keypress_exiting_mode(evt, app),
+        crate::UiMode::WarningMessage => {
+            app.reset_ui_mode();
+            InputCommand::None
+        }
+    }
+}
+
+fn handle_keypress_loading_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+    handle_navigation(evt, app, true)
+}
+
+fn handle_keypress_normal_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+    if matches!(evt, key!(Backspace)) {
+        return app
+            .prompt_file_deletion()
+            .map_or(InputCommand::None, InputCommand::Delete);
+    }
+    handle_navigation(evt, app, false)
+}
+
+fn handle_navigation<B: Backend>(evt: &Event, app: &mut App<B>, loading: bool) -> InputCommand {
     match evt {
         key!(ctrl 'c') | key!(char 'q') => {
             app.prompt_exit();
+            InputCommand::None
         }
         key!(char 'l') | key!(Right) | key!(ctrl 'f') => {
             app.move_selected_right();
+            InputCommand::Navigation
         }
         key!(char 'h') | key!(Left) | key!(ctrl 'b') => {
             app.move_selected_left();
+            InputCommand::Navigation
         }
         key!(char 'j') | key!(Down) | key!(ctrl 'n') => {
             app.move_selected_down();
+            InputCommand::Navigation
         }
         key!(char 'k') | key!(Up) | key!(ctrl 'p') => {
             app.move_selected_up();
+            InputCommand::Navigation
         }
         key!(char '+') | key!(shift '+') => {
             app.zoom_in();
+            InputCommand::Navigation
         }
         key!(char '-') => {
             app.zoom_out();
+            InputCommand::Navigation
         }
         key!(char '0') => {
             app.reset_zoom();
+            InputCommand::Navigation
         }
         key!(char '\n') | key!(Enter) => {
             app.handle_enter();
+            InputCommand::Navigation
         }
-        key!(Backspace) => {
+        key!(Backspace) if loading => {
             app.show_warning_modal();
+            InputCommand::None
         }
         key!(Esc) => {
-            app.go_up();
+            if app.go_up() {
+                InputCommand::Navigation
+            } else {
+                InputCommand::PathError
+            }
         }
-        _ => (),
+        _ => InputCommand::None,
     }
 }
 
-pub fn handle_keypress_normal_mode<B: Backend>(evt: &Event, app: &mut App<B>) {
-    match evt {
-        key!(ctrl 'c') | key!(char 'q') => {
-            app.prompt_exit();
-        }
-        key!(Backspace) => {
-            app.prompt_file_deletion();
-        }
-        key!(char 'l') | key!(Right) | key!(ctrl 'f') => {
-            app.move_selected_right();
-        }
-        key!(char 'h') | key!(Left) | key!(ctrl 'b') => {
-            app.move_selected_left();
-        }
-        key!(char 'j') | key!(Down) | key!(ctrl 'n') => {
-            app.move_selected_down();
-        }
-        key!(char 'k') | key!(Up) | key!(ctrl 'p') => {
-            app.move_selected_up();
-        }
-        key!(char '+') | key!(shift '+') => {
-            app.zoom_in();
-        }
-        key!(char '-') => {
-            app.zoom_out();
-        }
-        key!(char '0') => {
-            app.reset_zoom();
-        }
-        key!(char '\n') | key!(Enter) => {
-            app.handle_enter();
-        }
-        key!(Esc) => {
-            app.go_up();
-        }
-        _ => (),
-    }
-}
-
-pub fn handle_keypress_delete_file_mode<B: Backend>(
+fn handle_keypress_delete_file_mode<B: Backend>(
     evt: &Event,
     app: &mut App<B>,
-    file_to_delete: &FileToDelete,
-) {
+    file_to_delete: FileToDelete,
+) -> InputCommand {
     match evt {
         key!(ctrl 'c') | key!(char 'q') | key!(Esc) | key!(char 'n') => {
             app.normal_mode();
+            InputCommand::None
         }
-        key!(char 'y') => {
-            app.delete_file(file_to_delete);
-        }
-        _ => (),
+        key!(char 'y') => InputCommand::Delete(file_to_delete),
+        _ => InputCommand::None,
     }
 }
 
-pub fn handle_keypress_error_message<B: Backend>(evt: &Event, app: &mut App<B>) {
-    match evt {
-        key!(ctrl 'c') | key!(char 'q') | key!(Esc) => {
-            app.normal_mode();
-        }
-        _ => (),
+fn handle_keypress_error_message<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+    if matches!(evt, key!(ctrl 'c') | key!(char 'q') | key!(Esc)) {
+        app.normal_mode();
     }
+    InputCommand::None
 }
 
-pub fn handle_keypress_screen_too_small<B: Backend>(evt: &Event, app: &mut App<B>) {
+fn handle_keypress_screen_too_small<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+    if matches!(evt, key!(ctrl 'c') | key!(char 'q')) {
+        app.exit();
+    }
+    InputCommand::None
+}
+
+fn handle_keypress_exiting_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
     match evt {
-        key!(ctrl 'c') | key!(char 'q') => {
+        key!(ctrl 'c') => {
             app.exit();
+            InputCommand::HardCancel
         }
-        _ => (),
-    }
-}
-
-pub fn handle_keypress_exiting_mode<B: Backend>(evt: &Event, app: &mut App<B>) {
-    match evt {
-        key!(ctrl 'c') | key!(char 'q') | key!(Esc) | key!(char 'n') => {
+        key!(char 'q') | key!(Esc) | key!(char 'n') => {
             app.reset_ui_mode();
-            // we have to manually call render here to make sure ui gets updated
-            // because reset_ui_mode does not call it itself
-            app.render();
+            InputCommand::None
         }
         key!(char 'y') => {
             app.exit();
+            InputCommand::None
         }
-        _ => (),
+        _ => InputCommand::None,
     }
-}
-
-pub fn handle_keypress_warning_message<B: Backend>(app: &mut App<B>) {
-    app.reset_ui_mode();
 }

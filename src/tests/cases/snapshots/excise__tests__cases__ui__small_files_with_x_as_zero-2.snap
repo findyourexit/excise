@@ -2,54 +2,53 @@
 source: src/tests/cases/ui.rs
 expression: "&terminal_draw_events_mirror[1]"
 ---
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-             ┌────────────────────────┐           
-             │                        │           
-             │                        │           
-             │      Really quit?      │           
-             │                        │           
-             │                        │           
-             │                        │           
-             │                        │           
-             │         (y/n)          │           
-             │                        │           
-             └────────────────────────┘           
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-                                                  
-
+ 2.4M | /tmp/excise_tests/[..]les_with_x_as_zero  
+┌────────────────────────────────────────────────┐
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                     file1                      │
+│                                                │
+│                                                │
+│                   1.0M (42%)                   │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+├────────────┌────────────────────────┐──────────┤
+│            │                        │          │
+│            │                        │          │
+│            │      Really quit?      │          │
+│            │                        │          │
+│            │                        │          │
+│            │                        │          │
+│            │                        │          │
+│            │         (y/n)          │          │
+│            │                        │          │
+│            └────────────────────────┘          │
+│                   1.0M (42%)                   │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+├────────────────────────────────────────────────┤
+│xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx│
+│xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx│
+│xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx│
+│xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx│
+│xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx│
+│xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx│
+└────────────────────────────────────────────────┘
+                                (x = Small files) 
+ ←↓↑→/<ENTER>/<ESC>: navigate, <BACKSPACE>: del

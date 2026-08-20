@@ -1,9 +1,13 @@
+use std::time::Duration;
+
 use ::std::path::PathBuf;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::UiMode;
+use crate::animation::AnimationScheduler;
+use crate::error::AppError;
 use crate::state::UiEffects;
 use crate::state::files::FileTree;
 use crate::state::tiles::Board;
@@ -29,20 +33,33 @@ impl<B> Display<B>
 where
     B: Backend,
 {
-    pub fn new(terminal_backend: B) -> Self {
-        let mut terminal = Terminal::new(terminal_backend).expect("failed to create terminal");
-        terminal.clear().expect("failed to clear terminal");
-        terminal.hide_cursor().expect("failed to hide cursor");
-        Self { terminal }
+    /// # Errors
+    /// Returns a terminal error if initialization, clearing, or cursor setup fails.
+    pub fn new(terminal_backend: B) -> Result<Self, AppError> {
+        let mut terminal = Terminal::new(terminal_backend)
+            .map_err(|error| AppError::terminal("initialization", error))?;
+        terminal
+            .backend_mut()
+            .clear()
+            .map_err(|error| AppError::terminal("clear", error))?;
+        terminal
+            .hide_cursor()
+            .map_err(|error| AppError::terminal("cursor hide", error))?;
+        Ok(Self { terminal })
     }
-    pub fn size(&self) -> Rect {
-        let size = self.terminal.size().expect("could not get terminal size");
-        Rect::new(0, 0, size.width, size.height)
+    /// # Errors
+    /// Returns a terminal error if the terminal size cannot be read.
+    pub fn size(&self) -> Result<Rect, AppError> {
+        let size = self
+            .terminal
+            .size()
+            .map_err(|error| AppError::terminal("size query", error))?;
+        Ok(Rect::new(0, 0, size.width, size.height))
     }
     /// Renders the application UI based on the current mode
     ///
-    /// # Panics
-    /// Panics if the terminal drawing fails
+    /// # Errors
+    /// Returns a terminal error if drawing fails.
     #[allow(clippy::too_many_lines)]
     pub fn render(
         &mut self,
@@ -50,7 +67,9 @@ where
         board: &mut Board,
         ui_mode: &UiMode,
         ui_effects: &UiEffects,
-    ) {
+        animation: &mut AnimationScheduler,
+        now: Duration,
+    ) -> Result<(), AppError> {
         self.terminal
             .draw(|f| {
                 let full_screen = f.area();
@@ -313,12 +332,21 @@ where
                         f.render_widget(WarningBox::new(), full_screen);
                     }
                 }
+                animation.process(now, f.buffer_mut(), full_screen);
             })
-            .expect("failed to draw");
+            .map_err(|error| AppError::terminal("draw", error))?;
+        Ok(())
     }
 
-    pub fn clear(&mut self) {
-        self.terminal.clear().expect("failed to clear terminal");
-        self.terminal.show_cursor().expect("failed to show cursor");
+    /// # Errors
+    /// Returns a terminal error if clearing or cursor restoration fails.
+    pub fn clear(&mut self) -> Result<(), AppError> {
+        self.terminal
+            .backend_mut()
+            .clear()
+            .map_err(|error| AppError::terminal("clear", error))?;
+        self.terminal
+            .show_cursor()
+            .map_err(|error| AppError::terminal("cursor show", error))
     }
 }

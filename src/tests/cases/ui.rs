@@ -8,7 +8,6 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 
 use crate::start;
 use crate::tests::cases::test_utils::*;
-use crate::tests::fakes::TerminalEvent::*;
 use crate::tests::fakes::TerminalEvents;
 use crate::tests::fixtures::TestDirectory;
 
@@ -92,17 +91,13 @@ fn two_large_files_one_small_file() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -136,17 +131,13 @@ fn medium_width() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -180,17 +171,13 @@ fn small_width() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -225,17 +212,13 @@ fn small_width_long_folder_name() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -270,17 +253,13 @@ fn too_small_width_one() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 1);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
 }
 
@@ -314,17 +293,13 @@ fn too_small_width_two() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 1);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
 }
 
@@ -346,17 +321,13 @@ fn too_small_width_three() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 1);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
 }
 
@@ -378,17 +349,13 @@ fn too_small_width_four() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 1);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
 }
 
@@ -410,17 +377,13 @@ fn too_small_width_five() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 1);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
 }
 
@@ -442,17 +405,13 @@ fn too_small_height() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 1);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
 }
 
@@ -518,17 +477,12 @@ fn eleven_files() {
         .lock()
         .expect("failed to lock test state");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -583,18 +537,12 @@ fn enter_folder() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 4);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -652,19 +600,12 @@ fn enter_folder_medium_width() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 4);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -722,18 +663,12 @@ fn enter_folder_small_width() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 4);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -778,17 +713,12 @@ fn small_files() {
         .lock()
         .expect("failed to lock test state");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -850,19 +780,12 @@ fn zoom_into_small_files() {
         .lock()
         .expect("failed to lock test state");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 9);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -952,18 +875,12 @@ fn cannot_move_into_small_files() {
         .lock()
         .expect("failed to lock test state");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 5);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1015,18 +932,12 @@ fn minimum_tile_sides() {
         .lock()
         .expect("failed to lock test state");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -1083,18 +994,12 @@ fn move_down_and_enter_folder() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 5);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1149,19 +1054,12 @@ fn noop_when_entering_file() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 4);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1222,19 +1120,12 @@ fn move_up_and_enter_folder() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear,
-        ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 6);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1295,18 +1186,12 @@ fn move_right_and_enter_folder() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 5);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1368,19 +1253,12 @@ fn move_left_and_enter_folder() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear,
-        ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 6);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1437,19 +1315,12 @@ fn enter_largest_folder_with_no_selected_tile() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Clear, ShowCursor,
-    ];
-
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 3);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1498,18 +1369,12 @@ fn clear_selection_when_moving_off_screen_edges() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 5);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1572,19 +1437,12 @@ fn esc_to_go_up() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear,
-        ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 6);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1653,19 +1511,12 @@ fn noop_when_pressing_esc_at_base_folder() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 9);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1674,7 +1525,6 @@ fn noop_when_pressing_esc_at_base_folder() {
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
     assert_snapshot!(&terminal_draw_events_mirror[7]);
-    assert_snapshot!(&terminal_draw_events_mirror[8]);
 }
 
 #[test]
@@ -1726,16 +1576,10 @@ fn delete_file() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(
         std::fs::metadata(&file_2_path).is_err(),
@@ -1755,7 +1599,6 @@ fn delete_file() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 8);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1813,16 +1656,10 @@ fn delete_file_no_confirmation() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(
         std::fs::metadata(&file_2_path).is_err(),
@@ -1842,14 +1679,12 @@ fn delete_file_no_confirmation() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 7);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
     assert_snapshot!(&terminal_draw_events_mirror[4]);
     assert_snapshot!(&terminal_draw_events_mirror[5]);
-    assert_snapshot!(&terminal_draw_events_mirror[6]);
 }
 
 #[test]
@@ -1902,14 +1737,10 @@ fn cant_delete_file_with_term_too_small() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(std::fs::metadata(&file_2_path).is_ok(), "file not deleted");
     assert!(
@@ -1926,7 +1757,6 @@ fn cant_delete_file_with_term_too_small() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 1);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
 }
 
@@ -1983,16 +1813,10 @@ fn delete_folder() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(
         std::fs::metadata(&subfolder_1_path).is_err(),
@@ -2012,7 +1836,6 @@ fn delete_folder() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 9);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -2021,7 +1844,6 @@ fn delete_folder() {
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
     assert_snapshot!(&terminal_draw_events_mirror[7]);
-    assert_snapshot!(&terminal_draw_events_mirror[8]);
 }
 
 #[test]
@@ -2076,16 +1898,10 @@ fn delete_folder_no_confirmation() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(
         std::fs::metadata(&subfolder_1_path).is_err(),
@@ -2105,7 +1921,6 @@ fn delete_folder_no_confirmation() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 8);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -2113,7 +1928,6 @@ fn delete_folder_no_confirmation() {
     assert_snapshot!(&terminal_draw_events_mirror[4]);
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
-    assert_snapshot!(&terminal_draw_events_mirror[7]);
 }
 
 #[test]
@@ -2173,17 +1987,10 @@ fn delete_folder_small_window() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(
         std::fs::metadata(&file_2_path).is_ok(),
@@ -2203,7 +2010,6 @@ fn delete_folder_small_window() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 10);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -2213,7 +2019,6 @@ fn delete_folder_small_window() {
     assert_snapshot!(&terminal_draw_events_mirror[6]);
     assert_snapshot!(&terminal_draw_events_mirror[7]);
     assert_snapshot!(&terminal_draw_events_mirror[8]);
-    assert_snapshot!(&terminal_draw_events_mirror[9]);
 }
 
 #[test]
@@ -2271,16 +2076,10 @@ fn delete_folder_small_window_no_confirmation() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(
         std::fs::metadata(&file_2_path).is_ok(),
@@ -2300,7 +2099,6 @@ fn delete_folder_small_window_no_confirmation() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 9);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -2309,7 +2107,6 @@ fn delete_folder_small_window_no_confirmation() {
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
     assert_snapshot!(&terminal_draw_events_mirror[7]);
-    assert_snapshot!(&terminal_draw_events_mirror[8]);
 }
 
 #[test]
@@ -2384,17 +2181,10 @@ fn delete_folder_with_multiple_children() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(
         std::fs::metadata(&subfolder_1_path).is_err(),
@@ -2426,7 +2216,6 @@ fn delete_folder_with_multiple_children() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 9);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -2435,7 +2224,6 @@ fn delete_folder_with_multiple_children() {
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
     assert_snapshot!(&terminal_draw_events_mirror[7]);
-    assert_snapshot!(&terminal_draw_events_mirror[8]);
 }
 
 #[test]
@@ -2509,16 +2297,10 @@ fn delete_folder_with_multiple_children_no_confirmation() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(
         std::fs::metadata(&subfolder_1_path).is_err(),
@@ -2550,7 +2332,6 @@ fn delete_folder_with_multiple_children_no_confirmation() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 8);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -2558,7 +2339,6 @@ fn delete_folder_with_multiple_children_no_confirmation() {
     assert_snapshot!(&terminal_draw_events_mirror[4]);
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
-    assert_snapshot!(&terminal_draw_events_mirror[7]);
 }
 
 #[test]
@@ -2604,14 +2384,10 @@ fn pressing_delete_with_no_selected_tile() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(std::fs::metadata(&file_2_path).is_ok(), "file not deleted");
     assert!(
@@ -2628,7 +2404,6 @@ fn pressing_delete_with_no_selected_tile() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -2680,15 +2455,10 @@ fn delete_file_press_n() {
         .lock()
         .expect("could not acquire lock on terminal events");
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
     assert!(std::fs::metadata(&file_2_path).is_ok(), "file not deleted");
     assert!(
@@ -2705,7 +2475,6 @@ fn delete_file_press_n() {
     );
     drop(temp_dir_path);
 
-    assert_eq!(terminal_draw_events_mirror.len(), 5);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -2743,17 +2512,13 @@ fn files_with_size_zero() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -2775,17 +2540,13 @@ fn empty_folder() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -2856,20 +2617,12 @@ fn permission_denied_when_deleting() {
         .expect("failed to restore test path permissions");
     drop(temp_dir_path);
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 9);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -2945,20 +2698,12 @@ fn permission_denied_when_deleting_no_confirmation() {
         .expect("failed to restore test path permissions");
     drop(temp_dir_path);
 
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor,
-        Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Draw,
-        HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-
-    assert_eq!(
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("could not acquire lock on terminal_events")[..],
-        &expected_terminal_events[..]
+            .expect("could not acquire lock on terminal_events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 8);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -2997,17 +2742,13 @@ fn small_files_with_y_as_zero() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }
@@ -3044,17 +2785,13 @@ fn small_files_with_x_as_zero() {
     let terminal_draw_events_mirror = terminal_draw_events
         .lock()
         .expect("failed to lock test state");
-    let expected_terminal_events = [
-        Clear, HideCursor, Draw, HideCursor, Flush, Draw, HideCursor, Flush, Clear, ShowCursor,
-    ];
-    assert_eq!(
+
+    assert_terminal_lifecycle(
         &terminal_events
             .lock()
-            .expect("failed to lock test terminal events")[..],
-        &expected_terminal_events[..]
+            .expect("failed to lock test terminal events"),
     );
 
-    assert_eq!(terminal_draw_events_mirror.len(), 2);
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
 }

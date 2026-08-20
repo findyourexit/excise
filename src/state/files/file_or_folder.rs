@@ -3,7 +3,7 @@ use ::std::ffi::OsString;
 use ::std::fs::Metadata;
 use ::std::path::{Path, PathBuf};
 
-use ::filesize::PathExt;
+use crate::os::physical_size;
 
 #[derive(Debug, Clone)]
 pub enum FileOrFolder {
@@ -46,6 +46,7 @@ impl Folder {
         &mut self,
         entry_metadata: &Metadata,
         relative_path: &Path,
+        entry_full_path: &Path,
         show_apparent_size: bool,
     ) {
         // apparent_size (named after the flag of the same name in 'du')
@@ -57,8 +58,7 @@ impl Folder {
             let size = if show_apparent_size {
                 u128::from(entry_metadata.len())
             } else {
-                relative_path
-                    .size_on_disk_fast(entry_metadata)
+                physical_size(entry_full_path, entry_metadata)
                     .unwrap_or(entry_metadata.len())
                     .into()
             };

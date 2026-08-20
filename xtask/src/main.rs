@@ -46,6 +46,20 @@ fn run_static_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     run(
+        OsStr::new("lychee"),
+        "documentation links",
+        &[
+            "--offline",
+            "--no-progress",
+            "README.md",
+            "CONTRIBUTING.md",
+            "GOVERNANCE.md",
+            "MAINTAINERS.md",
+            "SECURITY.md",
+            "docs",
+        ],
+    )?;
+    run(
         cargo,
         "compile",
         &["check", "--workspace", "--all-targets", "--locked"],
@@ -70,12 +84,24 @@ fn run_behavior_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
     run(
         cargo,
         "unit and snapshot tests",
-        &["test", "--workspace", "--bins", "--locked"],
+        &["test", "--workspace", "--lib", "--bins", "--locked"],
     )?;
     run(
         cargo,
-        "pseudo-terminal smoke",
+        "release PTY binary",
+        &["build", "--release", "--package", "excise", "--locked"],
+    )?;
+    let pty_binary = fs::canonicalize(if cfg!(windows) {
+        "target/release/excise.exe"
+    } else {
+        "target/release/excise"
+    })?;
+    run_with_env(
+        cargo,
+        "pseudo-terminal smoke and budgets",
         &["test", "--test", "pty_smoke", "--locked"],
+        "EXCISE_PTY_BINARY",
+        pty_binary.as_os_str(),
     )?;
     run(
         cargo,
@@ -92,21 +118,12 @@ fn run_behavior_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_dynamic_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
-    run(
-        OsStr::new("rustup"),
-        "fuzz smoke",
-        &[
-            "run",
-            "nightly",
-            "cargo",
-            "fuzz",
-            "run",
-            "truncate",
-            "--",
-            "-runs=512",
-            "-max_len=4096",
-        ],
-    )?;
+    run_fuzz_target("truncate", 512)?;
+    run_fuzz_target("config", 512)?;
+    run_fuzz_target("native_path", 512)?;
+    run_fuzz_target("terminal_state", 512)?;
+    run_fuzz_target("tachyonfx", 512)?;
+    run_fuzz_target("runtime_events", 64)?;
     run(
         cargo,
         "TachyonFX render benchmark",
@@ -131,6 +148,25 @@ fn run_dynamic_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
         &["build", "--release", "--package", "excise", "--locked"],
     )?;
     report_release_binary_size()
+}
+
+fn run_fuzz_target(target: &str, iterations: u32) -> Result<(), Box<dyn Error>> {
+    let runs = format!("-runs={iterations}");
+    run(
+        OsStr::new("rustup"),
+        &format!("fuzz smoke: {target}"),
+        &[
+            "run",
+            "nightly",
+            "cargo",
+            "fuzz",
+            "run",
+            target,
+            "--",
+            &runs,
+            "-max_len=4096",
+        ],
+    )
 }
 
 fn ensure_exception_ratchet_is_empty() -> Result<(), Box<dyn Error>> {
@@ -179,6 +215,22 @@ fn check_installed_cross_targets(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
 fn run(program: &OsStr, label: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
     println!("\n==> {label}");
     let status = Command::new(program).args(args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{label} exited with {status}")).into())
+    }
+}
+
+fn run_with_env(
+    program: &OsStr,
+    label: &str,
+    args: &[&str],
+    key: &str,
+    value: &OsStr,
+) -> Result<(), Box<dyn Error>> {
+    println!("\n==> {label}");
+    let status = Command::new(program).args(args).env(key, value).status()?;
     if status.success() {
         Ok(())
     } else {

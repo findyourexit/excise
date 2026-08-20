@@ -18,7 +18,9 @@ allow = [
   "Zlib",
 ]
 confidence-threshold = 0.8
-exceptions = []
+exceptions = [
+  { allow = ["MPL-2.0"], crate = "option-ext@0.2.0" },
+]
 
 [licenses.private]
 ignore = false

@@ -2,51 +2,53 @@
 source: src/tests/cases/ui.rs
 expression: "&terminal_draw_events_mirror[2]"
 ---
-                                                                             2                                                                                                                
-                                                                                                                                     ─                                                ┬       
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                         file1                                                                                        │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                     392.0K (96%)                                                                                     │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx 
-                                                                                                                                                                                      │xxxxxx│
-                                                                                                                                                                                      │       
-                                                                                                                                     ─                                                ┴
+ Total: 2.3M (5 files), freed: 0 | /tmp/excise_tests/zoom_into_small_files (+2 larger file(s), zoom out to show)                                                                              
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬──────┐
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                        file1                                                                                        │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                    392.0K (96%)                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+│                                                                                                                                                                                     │xxxxxx│
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴──────┘
+                                                                                                                                                                            (x = Small files) 
+ <arrows> - move around, <ENTER> - enter folder, <ESC> - parent folder, <BACKSPACE> - delete, <+/-/0> - zoom in/out/reset, <q> - quit

@@ -58,3 +58,22 @@ pub fn test_backend_factory(w: u16, h: u16) -> BackendWithStreams {
     );
     (terminal_events, terminal_draw_events, backend)
 }
+
+pub fn assert_terminal_lifecycle(events: &[TerminalEvent]) {
+    use TerminalEvent::{Clear, Draw, Flush, HideCursor, ShowCursor};
+
+    assert!(
+        events.len() >= 7,
+        "terminal lifecycle was incomplete: {events:?}"
+    );
+    assert_eq!(&events[..2], &[Clear, HideCursor]);
+    assert_eq!(&events[events.len() - 2..], &[Clear, ShowCursor]);
+    let frames = &events[2..events.len() - 2];
+    assert_eq!(frames.len() % 3, 0, "incomplete draw frame: {frames:?}");
+    assert!(
+        frames
+            .chunks_exact(3)
+            .all(|frame| frame == [Draw, HideCursor, Flush]),
+        "unexpected terminal frame sequence: {frames:?}"
+    );
+}

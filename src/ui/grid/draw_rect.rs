@@ -3,16 +3,17 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::native_path::safe_display_os_str;
 use crate::state::tiles::{FileType, Tile};
 use crate::ui::format::{DisplaySize, DisplaySizeRounded, truncate_middle};
 use crate::ui::grid::{boundaries, draw_next_symbol};
 
 fn tile_first_line(tile: &Tile) -> String {
     let max_text_length = tile.width.saturating_sub(2);
-    let name = &tile.name.to_string_lossy();
+    let name = safe_display_os_str(&tile.name).text;
     let descendant_count = &tile.descendants;
     let filename_text = match tile.file_type {
-        FileType::File => format!("{name}"),
+        FileType::File => name,
         FileType::Folder => format!("{name}/"),
     };
     match tile.file_type {

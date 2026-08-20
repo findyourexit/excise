@@ -9,12 +9,50 @@ rust-version = "1.88"
 cargo-fuzz = true
 
 [dependencies]
+excise = { path = ".." }
+crossterm = "0.29"
 libfuzzer-sys = "0.4.13"
 unicode-width = "0.2.2"
+ratatui = { version = "0.30.2", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "truncate"
 path = "fuzz_targets/truncate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tachyonfx"
+path = "fuzz_targets/tachyonfx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_path"
+path = "fuzz_targets/native_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terminal_state"
+path = "fuzz_targets/terminal_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "runtime_events"
+path = "fuzz_targets/runtime_events.rs"
 test = false
 doc = false
 bench = false
