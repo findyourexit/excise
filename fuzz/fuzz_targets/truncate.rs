@@ -17,6 +17,4 @@ fuzz_target!(|data: &[u8]| {
     let middle = truncate::truncate_middle(&input, max_width);
     assert!(middle.width() <= usize::from(max_width));
 
-    let end = truncate::truncate_end(&input, max_width);
-    assert!(end.width() <= usize::from(max_width));
 });

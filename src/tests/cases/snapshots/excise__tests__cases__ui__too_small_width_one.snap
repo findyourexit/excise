@@ -2,7 +2,7 @@
 source: src/tests/cases/ui.rs
 expression: normalized
 ---
- EXCISE  /tmp/ex[..]dth_one  ◆ COMPLETE          
+ EXCISE  /tmp/ex[..]idth_one  ◆ COMPLETE         
  allocated ##.#K   reclaim ##.#K   apparent 20.0K
 ─────────────────────────────────────────────────
 ┌ LIST ─────────────────────────────────────────┐

@@ -2,7 +2,7 @@
 source: src/tests/cases/ui.rs
 expression: normalized
 ---
- EXCISE  /tmp/exc[...]der_name  ◆ COMPLETE        
+ EXCISE  /tmp/ex[...]der_name  ◆ COMPLETE         
  allocated ##.#K   reclaim ##.#K   apparent 20.0K 
 ──────────────────────────────────────────────────
 ┌ LIST ──────────────────────────────────────────┐

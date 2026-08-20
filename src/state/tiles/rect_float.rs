@@ -20,7 +20,7 @@ impl RectFloat {
     pub fn round(&self) -> Rect {
         fn coordinate(value: f64) -> u16 {
             if value.is_finite() {
-                value.round().clamp(0.0, f64::from(u16::MAX)) as u16
+                (value + 1.0e-9).round().clamp(0.0, f64::from(u16::MAX)) as u16
             } else {
                 0
             }

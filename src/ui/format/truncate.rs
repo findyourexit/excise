@@ -18,19 +18,18 @@ pub fn truncate_middle(row: &str, max_length: u16) -> String {
     if max_length < 6 {
         truncate_iter_to_unicode_width(row.chars(), max_length as usize)
     } else if row.width() as u16 > max_length {
-        let split_point = (max_length as usize / 2) - 2;
-        let first_slice = truncate_iter_to_unicode_width::<_, String>(row.chars(), split_point);
+        let marker = if max_length % 2 == 0 { "[...]" } else { "[..]" };
+        let remaining = usize::from(max_length).saturating_sub(marker.width());
+        let first_width = remaining / 2;
+        let second_width = remaining.saturating_sub(first_width);
+        let first_slice = truncate_iter_to_unicode_width::<_, String>(row.chars(), first_width);
         let second_slice =
-            truncate_iter_to_unicode_width::<_, Vec<_>>(row.chars().rev(), split_point)
+            truncate_iter_to_unicode_width::<_, Vec<_>>(row.chars().rev(), second_width)
                 .into_iter()
                 .rev()
                 .collect::<String>();
 
-        if max_length % 2 == 0 {
-            format!("{first_slice}[...]{second_slice}")
-        } else {
-            format!("{first_slice}[..]{second_slice}")
-        }
+        format!("{first_slice}{marker}{second_slice}")
     } else {
         row.to_string()
     }
@@ -46,5 +45,11 @@ mod tests {
             truncate_middle("굿걸 - 누가 방송국을 털었나 E06.mp4", 30),
             "굿걸 - 누가 [...]었나 E06.mp4",
         );
+    }
+
+    #[test]
+    fn truncate_middle_respects_even_marker_budget() {
+        let truncated = truncate_middle("abcdefg", 6);
+        assert_eq!(truncated.width(), 6);
     }
 }

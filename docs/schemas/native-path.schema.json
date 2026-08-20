@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/schemas/native-path-v1.json",
+  "title": "Excise native path v1",
+  "description": "Platform-native path bytes encoded by EncodedNativePath.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["encoding", "data"],
+      "additionalProperties": false,
+      "properties": {
+        "encoding": { "const": "unix-bytes" },
+        "data": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["encoding", "data"],
+      "additionalProperties": false,
+      "properties": {
+        "encoding": { "const": "windows-utf16-le" },
+        "data": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["encoding", "data"],
+      "additionalProperties": false,
+      "properties": {
+        "encoding": { "const": "utf8" },
+        "data": { "type": "string" }
+      }
+    }
+  ]
+}

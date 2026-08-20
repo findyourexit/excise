@@ -282,6 +282,42 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_fractional_boundaries_round_without_overlap() {
+        let weights = [
+            192_u8, 128, 194, 128, 194, 128, 194, 128, 66, 128, 194, 128, 0, 0, 0, 0, 0, 0, 50, 0,
+            0, 226, 128, 226, 128, 194, 128, 194, 128, 194, 128, 72, 194,
+        ];
+        let total = weights.iter().map(|weight| u32::from(*weight)).sum::<u32>();
+        let files = weights
+            .iter()
+            .enumerate()
+            .map(|(index, weight)| FileMetadata {
+                node_id: NodeId(u32::try_from(index).expect("test node ID should fit")),
+                name: OsString::from(format!("entry-{index}")),
+                size: u128::from(*weight),
+                apparent_size: u128::from(*weight),
+                descendants: None,
+                percentage: f64::from(*weight) / f64::from(total),
+                file_type: FileType::File,
+                synthetic_kind: None,
+                uncertain: false,
+            })
+            .collect::<Vec<_>>();
+        let mut treemap = TreeMap::new(Rect::new(0, 0, 195, 128));
+        treemap.populate_tiles(&files);
+
+        for (index, tile) in treemap.tiles.iter().enumerate() {
+            for other in &treemap.tiles[index + 1..] {
+                let overlaps = tile.x < other.x.saturating_add(other.width)
+                    && other.x < tile.x.saturating_add(tile.width)
+                    && tile.y < other.y.saturating_add(other.height)
+                    && other.y < tile.y.saturating_add(tile.height);
+                assert!(!overlaps, "tiles overlap: {tile:?} and {other:?}");
+            }
+        }
+    }
+
+    #[test]
     fn zero_size_entries_become_viewport_only_small_entries() {
         let mut files = files(2);
         for file in &mut files {

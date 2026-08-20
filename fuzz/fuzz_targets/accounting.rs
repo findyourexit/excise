@@ -5,7 +5,9 @@ use file_id::FileId;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let mut store = IdentityStore::new(64 * 1024);
+    let Ok(mut store) = IdentityStore::new(64 * 1024) else {
+        return;
+    };
     let mut total = ByteBounds::default();
     for (index, chunk) in data.get(1..).unwrap_or_default().chunks(3).take(64).enumerate() {
         let lower = u128::from(chunk.first().copied().unwrap_or_default());

@@ -47,7 +47,7 @@ fuzz_target!(|data: &[u8]| {
                 && other.x < tile.x.saturating_add(tile.width)
                 && tile.y < other.y.saturating_add(other.height)
                 && other.y < tile.y.saturating_add(tile.height);
-            assert!(!overlaps);
+            assert!(!overlaps, "tiles overlap: {tile:?} and {other:?}");
         }
     }
 });

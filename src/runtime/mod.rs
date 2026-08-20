@@ -441,9 +441,11 @@ where
                 }
                 self.summary.identified_entries =
                     u64::try_from(self.app.identity_count()).unwrap_or(u64::MAX);
+                self.animation.schedule_scan_progress();
             }
             WorkerEvent::ScanDirectoryComplete { path } => {
                 self.app.complete_directory(&path)?;
+                self.animation.schedule_state_change();
             }
             WorkerEvent::ScanUnscanned { path, reason } => {
                 self.summary.unscanned_entries += 1;

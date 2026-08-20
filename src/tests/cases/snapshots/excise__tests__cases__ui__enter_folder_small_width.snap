@@ -2,11 +2,11 @@
 source: src/tests/cases/ui.rs
 expression: normalized
 ---
- EXCISE  /tmp/excise_t[...]r_small_width  ◆ COMPLETE        
+ EXCISE  /tmp/excise_[...]r_small_width  ◆ COMPLETE         
  allocated ##.#K   reclaim ##.#K   apparent 16.0K   4 entrie
 ────────────────────────────────────────────────────────────
 ┌ LIST ────────────────────────────────────────────────────┐
-│ ▸ subfolder_wit[...]e_a_long_name       8.0K   50.0%     │
+│ ▸ subfolder_wi[...]e_a_long_name       8.0K   50.0%      │
 │   file2                                4.0K   25.0%      │
 │   file3                                4.0K   25.0%      │
 │                                                          │

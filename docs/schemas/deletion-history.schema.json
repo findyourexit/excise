@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/schemas/deletion-history-v1.json",
+  "title": "Excise deletion-history v1",
+  "type": "object",
+  "required": ["document_kind", "schema_version", "operations"],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "deletion-history" },
+    "schema_version": { "const": 1 },
+    "operations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/operation" }
+    }
+  },
+  "$defs": {
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "file_id": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["inode"],
+          "additionalProperties": false,
+          "properties": {
+            "inode": {
+              "type": "object",
+              "required": ["device", "inode"],
+              "additionalProperties": false,
+              "properties": {
+                "device": { "$ref": "#/$defs/unsigned" },
+                "inode": { "$ref": "#/$defs/unsigned" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["lowres"],
+          "additionalProperties": false,
+          "properties": {
+            "lowres": {
+              "type": "object",
+              "required": ["volume", "index"],
+              "additionalProperties": false,
+              "properties": {
+                "volume": { "$ref": "#/$defs/unsigned" },
+                "index": { "$ref": "#/$defs/unsigned" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["highres"],
+          "additionalProperties": false,
+          "properties": {
+            "highres": {
+              "type": "object",
+              "required": ["volume", "file"],
+              "additionalProperties": false,
+              "properties": {
+                "volume": { "$ref": "#/$defs/unsigned" },
+                "file": { "$ref": "#/$defs/unsigned" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "native_identity": {
+      "type": "object",
+      "required": ["file_id", "link_count", "reparse_point"],
+      "additionalProperties": false,
+      "properties": {
+        "file_id": { "$ref": "#/$defs/file_id" },
+        "link_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "reparse_point": { "type": "boolean" }
+      }
+    },
+    "planned_kind": {
+      "enum": ["directory", "file", "link"]
+    },
+    "outcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "enum": ["deleted", "missing", "unattempted"] }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["status", "detail"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "enum": ["changed", "failed"] },
+            "detail": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "entry": {
+      "type": "object",
+      "required": [
+        "path",
+        "display_path",
+        "identity",
+        "kind",
+        "apparent_bytes",
+        "allocated_bytes",
+        "modified_nanos",
+        "outcome"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "$ref": "https://github.com/findyourexit/excise/schemas/native-path-v1.json" },
+        "display_path": { "type": "string" },
+        "identity": { "$ref": "#/$defs/native_identity" },
+        "kind": { "$ref": "#/$defs/planned_kind" },
+        "apparent_bytes": { "$ref": "#/$defs/unsigned" },
+        "allocated_bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "modified_nanos": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "outcome": { "$ref": "#/$defs/outcome" }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "required": ["root", "display_root", "precise", "soft_cancelled", "entries"],
+      "additionalProperties": false,
+      "properties": {
+        "root": { "$ref": "https://github.com/findyourexit/excise/schemas/native-path-v1.json" },
+        "display_root": { "type": "string" },
+        "precise": { "type": "boolean" },
+        "soft_cancelled": { "type": "boolean" },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/entry" }
+        }
+      }
+    }
+  }
+}

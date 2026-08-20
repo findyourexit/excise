@@ -1829,7 +1829,6 @@ fn cant_delete_file_with_term_too_small() {
         "second different file was untouched"
     );
     drop(temp_dir_path);
-
 }
 
 #[test]

@@ -11,10 +11,10 @@ expression: normalized
 ││                                                                                                                         │                             ││allocated #.#K                    │
 ││                                                                                                                         │                             ││reclaim   #.#K                    │
 ││                                                                                                                         │                             ││apparent 8.0K · entries 1         │
-││                                                                                                                         │                             ││identity  Inode[...]ber: ######## │
-││                                                                                                                         │                             ││}                                 │
-││                                                                                                                         │                             ││links     3 · s[...]              │
-││                                                                                                                         │                             ││materialized                      │
+││                                                                                                                         │                             ││identity  Inod[...]ber: ######## }│
+││                                                                                                                         │                             ││links     3 · [...]   materialized│
+││                                                                                                                         │                             ││                                  │
+││                                                                                                                         │                             ││                                  │
 ││                                                                                                                         │                             ││                                  │
 ││                                                          file2                                                          │                             ││                                  │
 ││                                                                                                                         │                             ││                                  │

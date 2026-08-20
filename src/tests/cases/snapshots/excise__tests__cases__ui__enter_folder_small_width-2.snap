@@ -2,7 +2,7 @@
 source: src/tests/cases/ui.rs
 expression: normalized
 ---
- EXCISE  /tmp/excise_t[...]e_a_long_name  ◆ COMPLETE        
+ EXCISE  /tmp/excise_[...]e_a_long_name  ◆ COMPLETE         
  allocated ##.#K   reclaim ##.#K   apparent 16.0K   4 entrie
 ────────────────────────────────────────────────────────────
 ┌ LIST ────────────────────────────────────────────────────┐

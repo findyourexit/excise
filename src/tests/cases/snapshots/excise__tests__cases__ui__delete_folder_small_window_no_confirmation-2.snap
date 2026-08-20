@@ -2,7 +2,7 @@
 source: src/tests/cases/ui.rs
 expression: normalized
 ---
- EXCISE  /tmp/excise_t[...]_confirmation  ◆ COMPLETE        
+ EXCISE  /tmp/excise_[...]_confirmation  ◆ COMPLETE         
  allocated ##.#K   reclaim ##.#K   apparent 12.0K   4 entrie
 ────────────────────────────────────────────────────────────
 ┌ LIST ────────────────────────────────────────────────────┐
