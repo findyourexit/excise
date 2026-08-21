@@ -850,8 +850,11 @@ fn model_error(error: ModelError) -> AppError {
 mod tests {
     use ratatui::backend::TestBackend;
 
+    #[cfg(unix)]
     use crate::deletion::{PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan};
+    #[cfg(unix)]
     use crate::native_path::identity_for;
+    #[cfg(unix)]
     use crate::state::tiles::FileType;
 
     use super::*;

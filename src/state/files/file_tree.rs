@@ -532,13 +532,18 @@ fn record_unscanned_to(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsStr;
+    #[cfg(unix)]
+    use std::ffi::OsString;
     use std::fs;
 
+    #[cfg(unix)]
     use crate::deletion::{build_plan, execute_plan};
     use crate::model::{ByteBounds, NodeKind, SyntheticKind};
     use crate::native_path::identity_for;
+    #[cfg(unix)]
     use crate::state::FileToDelete;
+    #[cfg(unix)]
     use crate::state::tiles::FileType;
 
     use super::*;
