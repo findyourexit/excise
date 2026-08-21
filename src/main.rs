@@ -9,7 +9,9 @@ use ratatui::backend::CrosstermBackend;
 
 use excise::config::{Cli, OutputFormat, RuntimeConfig, default_config_path};
 use excise::error::{AppError, ExitClass};
-use excise::native_path::ResolvedRoot;
+#[cfg(debug_assertions)]
+use excise::native_path::safe_display_os_str_text;
+use excise::native_path::{ResolvedRoot, safe_display_text};
 use excise::report::{ReportError, ScanReport};
 use excise::runtime::{RuntimeSettings, SystemClock, run, scan_headless};
 use excise::{TerminalEvents, TerminalSession, validate_terminal};
@@ -35,7 +37,7 @@ fn run_main() -> i32 {
             };
         }
         Err(error) => {
-            eprintln!("{error}");
+            eprintln!("{}", safe_error_text(error));
             return ExitClass::Usage.code();
         }
     };
@@ -104,7 +106,7 @@ fn run_main() -> i32 {
         let restore_result = session.restore();
         drop(session);
         if let Err(restore_error) = restore_result {
-            eprintln!("Error: {error}");
+            eprintln!("Error: {}", safe_error_text(&error));
             return report_error(&restore_error);
         }
         return report_error(&error);
@@ -123,8 +125,11 @@ fn run_main() -> i32 {
         (Ok(outcome), Ok(())) => outcome.exit_class().code(),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => report_error(&error),
         (Err(run_error), Err(restore_error)) => {
-            eprintln!("Error: {run_error}");
-            eprintln!("Error while restoring terminal: {restore_error}");
+            eprintln!("Error: {}", safe_error_text(run_error));
+            eprintln!(
+                "Error while restoring terminal: {}",
+                safe_error_text(restore_error)
+            );
             ExitClass::Runtime.code()
         }
     }
@@ -170,17 +175,63 @@ fn write_scan_report_to(
 }
 
 fn report_error(error: &AppError) -> i32 {
-    eprintln!("Error: {error}");
+    eprintln!("Error: {}", safe_error_text(error));
     error.exit_class().code()
 }
 
 #[cfg(debug_assertions)]
 fn injected_runtime_error() -> Option<AppError> {
     let kind = std::env::var_os("EXCISE_TEST_ERROR_AFTER_TERMINAL_ENTRY")?;
-    Some(match kind.to_string_lossy().as_ref() {
-        "input" => AppError::io("injected input failure", io::Error::other("input failed")),
-        "render" => AppError::terminal("draw", "injected render failure"),
-        "worker" => AppError::Worker("injected worker failure".to_string()),
-        other => AppError::Invariant(format!("unknown injected failure {other}")),
+    Some(match kind.to_str() {
+        Some("input") => AppError::io("injected input failure", io::Error::other("input failed")),
+        Some("render") => AppError::terminal("draw", "injected render failure"),
+        Some("worker") => AppError::Worker("injected worker failure".to_string()),
+        _ => AppError::Invariant(format!(
+            "unknown injected failure {}",
+            safe_display_os_str_text(&kind)
+        )),
     })
+}
+
+fn safe_error_text(error: impl std::fmt::Display) -> String {
+    let error = error.to_string();
+    safe_display_text(&error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_error_text_escapes_controls_and_preserves_marker() {
+        let rendered = safe_error_text(AppError::Config("bad\n\u{202e}name\u{1b}[31m".to_string()));
+        assert!(rendered.starts_with("[deceptive]"));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{202e}"));
+        assert!(rendered.contains("\\x1b"));
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn report_error_keeps_missing_hostile_root_path_safe_once() {
+        let parent = tempfile::tempdir().expect("root-error parent should exist");
+        let path = parent.path().join("missing-\u{202e}root");
+        let error = ResolvedRoot::resolve(path).expect_err("missing root should fail to resolve");
+
+        let raw = error.to_string();
+        let rendered = safe_error_text(&error);
+        assert!(raw.contains("[deceptive]"));
+        assert!(raw.contains("missing-\\u{202e}root"));
+        assert_eq!(rendered, raw);
+        assert_eq!(
+            rendered
+                .matches(excise::native_path::DECEPTIVE_DISPLAY_MARKER)
+                .count(),
+            1,
+        );
+        assert_eq!(rendered.matches("\\u{202e}").count(), 1);
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.contains('\u{202e}'));
+    }
 }

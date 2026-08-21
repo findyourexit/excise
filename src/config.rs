@@ -10,7 +10,13 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
+use crate::native_path::{safe_display_path_text, safe_display_text};
 use crate::theme::ThemeId;
+
+fn config_error(message: impl std::fmt::Display) -> AppError {
+    let message = message.to_string();
+    AppError::Config(safe_display_text(&message))
+}
 
 pub const CONFIG_VERSION: u16 = 1;
 const DEFAULT_EVENT_BUFFER: usize = 256;
@@ -100,7 +106,7 @@ impl CustomKeyBindings {
         ];
         for (direction, key) in bindings {
             if let Some(action) = normal_mode_action_for_custom_key(key) {
-                return Err(AppError::Config(format!(
+                return Err(config_error(format!(
                     "custom movement key {direction} ({key:?}) conflicts with the normal-mode {action} command; choose another key"
                 )));
             }
@@ -110,7 +116,7 @@ impl CustomKeyBindings {
                 } else {
                     "is not an unmodified printable ASCII key"
                 };
-                return Err(AppError::Config(format!(
+                return Err(config_error(format!(
                     "custom movement key {direction} ({key:?}) {reason}; choose an unmodified printable ASCII key"
                 )));
             }
@@ -120,7 +126,7 @@ impl CustomKeyBindings {
                 .iter()
                 .find(|(_, existing_key)| existing_key == key)
             {
-                return Err(AppError::Config(format!(
+                return Err(config_error(format!(
                     "custom movement keys {other_direction} and {direction} both use {key:?}; use four distinct keys"
                 )));
             }
@@ -508,7 +514,7 @@ pub fn save_safe_preferences(path: &Path, preferences: SafePreferences) -> Resul
     config.runtime.reduced_motion = Some(preferences.reduced_motion);
     config.runtime.custom_keys = preferences.custom_keys;
     let serialized = toml::to_string_pretty(&config)
-        .map_err(|error| AppError::Config(format!("could not serialize config: {error}")))?;
+        .map_err(|error| config_error(format!("could not serialize config: {error}")))?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|error| AppError::io("could not create config directory", error))?;
@@ -527,7 +533,7 @@ pub fn save_safe_preferences(path: &Path, preferences: SafePreferences) -> Resul
 /// # Errors
 /// Returns an invalid-configuration error for malformed or unknown TOML fields.
 pub fn parse_file_config(input: &str) -> Result<FileConfig, AppError> {
-    toml::from_str(input).map_err(|error| AppError::Config(error.to_string()))
+    toml::from_str(input).map_err(|error| config_error(error.to_string()))
 }
 
 #[must_use]
@@ -540,20 +546,20 @@ pub(crate) fn compile_exclusions(root: &Path, patterns: &[String]) -> Result<Git
     let mut builder = GitignoreBuilder::new(root);
     for pattern in patterns {
         builder.add_line(None, pattern).map_err(|error| {
-            AppError::Config(format!("invalid scanner exclusion {pattern:?}: {error}"))
+            config_error(format!("invalid scanner exclusion {pattern:?}: {error}"))
         })?;
     }
     builder
         .build()
-        .map_err(|error| AppError::Config(format!("invalid scanner exclusions: {error}")))
+        .map_err(|error| config_error(format!("invalid scanner exclusions: {error}")))
 }
 
 fn load_file(path: &Path) -> Result<FileConfig, AppError> {
     fs::read_to_string(path)
         .map_err(|error| {
-            AppError::Config(format!(
+            config_error(format!(
                 "could not read {}: {error}",
-                path.to_string_lossy()
+                safe_display_path_text(path)
             ))
         })
         .and_then(|input| parse_file_config(&input))
@@ -573,7 +579,7 @@ where
         .filter(|value| !value.is_empty())
         .map(|value| {
             T::from_str(&value.to_string_lossy(), true)
-                .map_err(|error| AppError::Config(format!("{name}: {error}")))
+                .map_err(|error| config_error(format!("{name}: {error}")))
         })
         .transpose()
 }
@@ -614,5 +620,35 @@ fn validate_range(
         Err(AppError::Config(format!(
             "{name} must be between {minimum} and {maximum}; got {value}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_errors_escape_terminal_controls() {
+        let error = config_error("bad\n\u{202e}name\u{1b}[31m");
+        let message = error.to_string();
+        assert!(message.starts_with("invalid configuration: [deceptive]"));
+        assert!(message.contains("\\n"));
+        assert!(message.contains("\\u{202e}"));
+        assert!(message.contains("\\x1b"));
+        assert!(!message.chars().any(char::is_control));
+        assert!(!message.contains('\u{202e}'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_configuration_path_keeps_invalid_bytes_reversible() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(OsString::from_vec(b"missing-\xff/config.toml".to_vec()));
+        let error = load_file(&path).expect_err("missing configuration should fail");
+        let message = error.to_string();
+        assert!(message.contains("[deceptive]"));
+        assert!(message.contains("missing-\\xff/config.toml"));
     }
 }
