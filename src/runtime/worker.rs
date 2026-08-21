@@ -71,6 +71,7 @@ pub struct WorkerPool {
     events: Receiver<WorkerEvent>,
     commands: Sender<WorkerCommand>,
     cancelled: Arc<AtomicBool>,
+    deletion_plan_cancelled: Arc<AtomicBool>,
     deletion_soft_cancelled: Arc<AtomicBool>,
     rescan_cancelled: Arc<AtomicBool>,
     scanner_handle: thread::JoinHandle<()>,
@@ -82,6 +83,7 @@ impl WorkerPool {
         let (event_sender, events) = bounded(event_capacity);
         let (commands, command_receiver) = bounded(1);
         let cancelled = Arc::new(AtomicBool::new(false));
+        let deletion_plan_cancelled = Arc::new(AtomicBool::new(false));
         let rescan_cancelled = Arc::new(AtomicBool::new(false));
         let deletion_soft_cancelled = Arc::new(AtomicBool::new(false));
         let scan_root = scanner_options.root.clone();
@@ -91,6 +93,7 @@ impl WorkerPool {
             .map_err(|error| AppError::io("could not spawn scanner worker", error))?;
 
         let worker_cancelled = cancelled.clone();
+        let worker_plan_cancelled = deletion_plan_cancelled.clone();
         let worker_rescan_cancelled = rescan_cancelled.clone();
         let worker_soft_cancelled = deletion_soft_cancelled.clone();
         let deletion = match thread::Builder::new()
@@ -101,6 +104,7 @@ impl WorkerPool {
                     scan_root_identity.as_ref(),
                     &command_receiver,
                     &event_sender,
+                    &worker_plan_cancelled,
                     &worker_soft_cancelled,
                     &worker_rescan_cancelled,
                     &worker_cancelled,
@@ -121,6 +125,7 @@ impl WorkerPool {
             events,
             commands,
             cancelled,
+            deletion_plan_cancelled,
             deletion_soft_cancelled,
             rescan_cancelled,
             scanner_handle: scanner,
@@ -139,7 +144,7 @@ impl WorkerPool {
         reduced_guardrails: bool,
         maximum_bytes: usize,
     ) -> Result<(), AppError> {
-        self.deletion_soft_cancelled.store(false, Ordering::Release);
+        self.deletion_plan_cancelled.store(false, Ordering::Release);
         self.commands
             .send(WorkerCommand::PlanDeletion {
                 target,
@@ -164,6 +169,9 @@ impl WorkerPool {
 
     pub fn soft_cancel_deletion(&self) {
         self.deletion_soft_cancelled.store(true, Ordering::Release);
+    }
+    pub fn cancel_deletion_plan(&self) {
+        self.deletion_plan_cancelled.store(true, Ordering::Release);
     }
     pub fn resume_deletion(&self) {
         self.deletion_soft_cancelled.store(false, Ordering::Release);
@@ -190,6 +198,7 @@ impl WorkerPool {
 
     fn stop(self, detach_deletion: bool) -> Result<(), AppError> {
         self.cancelled.store(true, Ordering::Release);
+        self.deletion_plan_cancelled.store(true, Ordering::Release);
         self.deletion_soft_cancelled.store(true, Ordering::Release);
         self.rescan_cancelled.store(true, Ordering::Release);
         drop(self.events);
@@ -207,12 +216,16 @@ impl WorkerPool {
             .map_err(|_| AppError::Worker("deletion thread panicked".to_string()))
     }
 }
-
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The worker receives each independent bounded command, cancellation, and filesystem capability explicitly."
+)]
 fn deletion_worker(
     scan_root: &std::path::Path,
     scan_root_identity: Option<&NativeIdentity>,
     commands: &Receiver<WorkerCommand>,
     sender: &Sender<WorkerEvent>,
+    plan_cancelled: &AtomicBool,
     soft_cancelled: &AtomicBool,
     rescan_cancelled: &Arc<AtomicBool>,
     cancelled: &AtomicBool,
@@ -239,7 +252,7 @@ fn deletion_worker(
                         identity.clone(),
                         target,
                         reduced_guardrails,
-                        cancelled,
+                        plan_cancelled,
                         maximum_bytes,
                     )
                 } else {
@@ -247,7 +260,7 @@ fn deletion_worker(
                         scan_root,
                         target,
                         reduced_guardrails,
-                        cancelled,
+                        plan_cancelled,
                         maximum_bytes,
                     )
                 }
@@ -809,6 +822,79 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn scanner_stops_before_following_a_replaced_root() {
+        use crate::native_path::identity_for;
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().expect("scan parent should exist");
+        let scan_root = parent.path().join("scan-root");
+        let original = parent.path().join("original-root");
+        let outside = parent.path().join("outside-root");
+        std::fs::create_dir(&scan_root).expect("scan root should be created");
+        std::fs::create_dir(&outside).expect("replacement root should be created");
+        for index in 0..256 {
+            std::fs::write(scan_root.join(format!("original-{index}")), b"original")
+                .expect("original fixture should be written");
+        }
+        std::fs::write(outside.join("replacement"), b"replacement")
+            .expect("replacement fixture should be written");
+        let metadata = std::fs::symlink_metadata(&scan_root).expect("root metadata should exist");
+        let identity = identity_for(&scan_root, &metadata)
+            .expect("root identity should be readable")
+            .expect("root should not be a symbolic link");
+
+        let mut scanner_options = options(&scan_root, 1);
+        scanner_options.root_identity = Some(identity);
+        let workers = WorkerPool::start(scanner_options, 1).expect("workers should start");
+        let mut replaced = false;
+        let mut saw_root_change = false;
+        let mut saw_replacement = false;
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("scanner should produce completion")
+            {
+                WorkerEvent::ScanBatch { entries } => {
+                    saw_replacement |= entries
+                        .iter()
+                        .any(|entry| entry.path == outside.join("replacement"));
+                    if !replaced {
+                        std::fs::rename(&scan_root, &original)
+                            .expect("original root should be displaced");
+                        symlink(&outside, &scan_root)
+                            .expect("replacement symlink should be created");
+                        replaced = true;
+                    }
+                }
+                WorkerEvent::ScanFailed { message, .. } => {
+                    saw_root_change |= message.contains("during traversal");
+                }
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => {
+                    panic!("root replacement should be uncertain, not cancellation")
+                }
+                WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        assert!(replaced, "test must replace root after the first batch");
+        assert!(
+            saw_root_change,
+            "root replacement should emit an explicit failure"
+        );
+        assert!(
+            !saw_replacement,
+            "scanner must not follow the replacement root"
+        );
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn final_plan_revalidation_runs_in_cancellable_worker() {
         use std::os::unix::fs::MetadataExt as _;
         use std::time::UNIX_EPOCH;
@@ -917,6 +1003,7 @@ mod tests {
             events,
             commands,
             cancelled: cancelled.clone(),
+            deletion_plan_cancelled: Arc::new(AtomicBool::new(false)),
             deletion_soft_cancelled,
             rescan_cancelled,
             scanner_handle,

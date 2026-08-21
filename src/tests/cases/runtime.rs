@@ -232,6 +232,137 @@ fn soft_cancel_wins_when_revalidation_event_follows_input() {
 }
 
 #[cfg(unix)]
+struct ReplanInput {
+    events: Vec<Option<Event>>,
+    target: std::path::PathBuf,
+    changed: bool,
+}
+
+#[cfg(unix)]
+impl ReplanInput {
+    fn new(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
+        let mut events = events;
+        events.reverse();
+        Self {
+            events,
+            target,
+            changed: false,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl InputSource for ReplanInput {
+    fn poll(&mut self, _timeout: Duration) -> Result<bool, AppError> {
+        Ok(!self.events.is_empty())
+    }
+
+    fn read(&mut self) -> Result<InputEvent, AppError> {
+        let event = self
+            .events
+            .pop()
+            .ok_or_else(|| AppError::Invariant("fake input exhausted after poll".to_string()))?;
+        if !self.changed
+            && matches!(
+                &event,
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Char('y'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }))
+            )
+        {
+            std::fs::write(&self.target, b"changed-after-plan")
+                .expect("post-plan replacement should be written");
+            self.changed = true;
+        }
+        Ok(event.map_or(InputEvent::Barrier, InputEvent::Terminal))
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn changed_plan_rescans_before_reprompting_and_does_not_reuse_stale_review() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::new(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("stale plan should be rebuilt after the focused rescan");
+    assert!(
+        matches!(outcome, OperationOutcome::Exact(_)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(!target.exists(), "freshly planned target should be deleted");
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_directory_change_is_rescanned_before_reprompting() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    let mutation = target.join("new-child");
+    std::fs::create_dir(&target).expect("deletion directory should be created");
+    std::fs::write(target.join("old-child"), b"old")
+        .expect("initial directory child should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::new(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        mutation,
+    );
+    let mut settings = settings(root.path());
+    settings.disable_delete_confirmation = true;
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings,
+        Box::new(VirtualClock::new()),
+    )
+    .expect("persistent directory change should trigger a focused rescan");
+    assert!(
+        matches!(outcome, OperationOutcome::Exact(_)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(
+        !target.exists(),
+        "freshly planned directory should be deleted; outcome: {outcome:?}"
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn skipped_link_is_an_explicit_scoped_boundary() {
     use std::os::unix::fs::symlink;

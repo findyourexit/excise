@@ -57,6 +57,7 @@ pub(crate) enum InputCommand {
     StartRescan(PathBuf),
     CancelRescan,
     PlanDeletion(FileToDelete),
+    CancelDeletionPlan,
     RevalidateDeletion(DeletionPlan),
     ExportScan,
     ExportDeletionHistory,
@@ -310,7 +311,7 @@ fn handle_keypress_planning_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> I
     match evt {
         key!(Esc) => {
             app.normal_mode();
-            InputCommand::None
+            InputCommand::CancelDeletionPlan
         }
         key!(ctrl 'c') => {
             app.exit();
@@ -505,5 +506,35 @@ mod tests {
         let command = handle_keypress(&key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut app);
         assert!(matches!(command, InputCommand::HardCancel));
         assert!(!app.is_running);
+    }
+
+    #[test]
+    fn planning_escape_cancels_pending_plan() {
+        use crate::model::{EntrySnapshot, NodeId, NodeKind};
+        use crate::state::FileToDelete;
+        use crate::state::tiles::FileType;
+
+        let (root, mut app) = app();
+        app.ui_mode = UiMode::PlanningDeletion(Box::new(FileToDelete {
+            node_id: NodeId(1),
+            synthetic: false,
+            path_in_filesystem: root.path().to_path_buf(),
+            path_to_file: vec!["target".into()],
+            file_type: FileType::File,
+            num_descendants: None,
+            size: 0,
+            expected_snapshot: EntrySnapshot {
+                identity: None,
+                kind: NodeKind::File,
+                apparent_bytes: 0,
+                allocated_bytes: None,
+                modified_nanos: None,
+            },
+            reviewed_entries: Vec::new(),
+        }));
+
+        let command = handle_keypress(&key(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+        assert!(matches!(command, InputCommand::CancelDeletionPlan));
+        assert!(matches!(app.ui_mode, UiMode::Normal));
     }
 }

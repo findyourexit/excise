@@ -185,13 +185,20 @@ impl TaskQueue {
         ))
     }
 
-    fn take(&self, cancelled: &AtomicBool) -> io::Result<Option<DirectoryTask>> {
+    fn take(
+        &self,
+        cancelled: &AtomicBool,
+        root_invalid: &AtomicBool,
+    ) -> io::Result<Option<DirectoryTask>> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
-            if cancelled.load(Ordering::Acquire) || state.pending == 0 {
+            if cancelled.load(Ordering::Acquire)
+                || root_invalid.load(Ordering::Acquire)
+                || state.pending == 0
+            {
                 return Ok(None);
             }
             if let Some(task) = state.tasks.pop_front() {
@@ -425,13 +432,17 @@ pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancell
         }
         exclusions.internal_paths.push(task_spill_path);
     }
+    let root_invalid = AtomicBool::new(false);
     thread::scope(|scope| {
         for index in 0..threads {
             let worker_queue = &queue;
             let worker_sender = sender;
             let worker_cancelled = cancelled;
+            let worker_root_invalid = &root_invalid;
             let worker_exclusions = &exclusions;
             let worker_root_filesystem = root_filesystem.as_ref();
+            let worker_root = &root;
+            let worker_root_identity = root_identity.as_ref();
             if let Err(error) = thread::Builder::new()
                 .name(format!("excise-scan-{index}"))
                 .spawn_scoped(scope, move || {
@@ -439,6 +450,9 @@ pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancell
                         worker_queue,
                         worker_sender,
                         worker_cancelled,
+                        worker_root_invalid,
+                        worker_root,
+                        worker_root_identity,
                         worker_exclusions,
                         worker_root_filesystem,
                         cross_filesystems,
@@ -473,17 +487,23 @@ struct ScanFrame {
     batch: Vec<ScannedEntry>,
     directories: Vec<DirectoryTask>,
 }
-
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The worker receives its bounded queue, cancellation state, root identity, and scan policy explicitly."
+)]
 fn scan_worker(
     queue: &TaskQueue,
     sender: &Sender<WorkerEvent>,
     cancelled: &AtomicBool,
+    root_invalid: &AtomicBool,
+    root: &Path,
+    root_identity: Option<&NativeIdentity>,
     exclusions: &Exclusions,
     root_filesystem: Option<&FilesystemKey>,
     cross_filesystems: bool,
 ) {
     loop {
-        let task = match queue.take(cancelled) {
+        let task = match queue.take(cancelled, root_invalid) {
             Ok(Some(task)) => task,
             Ok(None) => return,
             Err(error) => {
@@ -505,13 +525,18 @@ fn scan_worker(
             queue,
             sender,
             cancelled,
+            root_invalid,
+            root,
+            root_identity,
             exclusions,
             root_filesystem,
             cross_filesystems,
         );
         queue.complete();
         if !completed {
-            cancelled.store(true, Ordering::Release);
+            if !root_invalid.load(Ordering::Acquire) {
+                cancelled.store(true, Ordering::Release);
+            }
             queue.cancel();
             return;
         }
@@ -524,11 +549,17 @@ fn scan_directory(
     queue: &TaskQueue,
     sender: &Sender<WorkerEvent>,
     cancelled: &AtomicBool,
+    root_invalid: &AtomicBool,
+    root: &Path,
+    root_identity: Option<&NativeIdentity>,
     exclusions: &Exclusions,
     root_filesystem: Option<&FilesystemKey>,
     cross_filesystems: bool,
 ) -> bool {
-    if cancelled.load(Ordering::Acquire) {
+    if cancelled.load(Ordering::Acquire) || root_invalid.load(Ordering::Acquire) {
+        return false;
+    }
+    if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
         return false;
     }
     let mut frame = match open_frame(task) {
@@ -545,8 +576,13 @@ fn scan_directory(
             return true;
         }
     };
+    if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
+        return false;
+    }
     loop {
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.load(Ordering::Acquire)
+            || !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid)
+        {
             return false;
         }
         if frame.batch.len() == BATCH_SIZE && !flush_frame(&mut frame, queue, sender, cancelled) {
@@ -554,6 +590,15 @@ fn scan_directory(
         }
         match frame.entries.next() {
             Some(Ok(entry)) => {
+                if !validate_root_for_traversal(
+                    root,
+                    root_identity,
+                    sender,
+                    cancelled,
+                    root_invalid,
+                ) {
+                    return false;
+                }
                 process_entry(
                     &mut frame,
                     &entry,
@@ -577,7 +622,13 @@ fn scan_directory(
             None => break,
         }
     }
+    if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
+        return false;
+    }
     if !frame.batch.is_empty() && !flush_frame(&mut frame, queue, sender, cancelled) {
+        return false;
+    }
+    if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
         return false;
     }
     send_event(
@@ -587,6 +638,40 @@ fn scan_directory(
         },
         cancelled,
     )
+}
+
+fn validate_root_for_traversal(
+    root: &Path,
+    root_identity: Option<&NativeIdentity>,
+    sender: &Sender<WorkerEvent>,
+    cancelled: &AtomicBool,
+    root_invalid: &AtomicBool,
+) -> bool {
+    if root_invalid.load(Ordering::Acquire) {
+        return false;
+    }
+    let Err(message) = validate_scan_root(root, root_identity) else {
+        return true;
+    };
+    let message = if message == "scan root identity changed before scanning" {
+        "scan root identity changed during traversal".to_string()
+    } else {
+        format!("scan root became invalid during traversal: {message}")
+    };
+    if root_invalid
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFailed {
+                path: Some(root.to_path_buf()),
+                message,
+            },
+            cancelled,
+        );
+    }
+    false
 }
 
 fn open_frame(task: DirectoryTask) -> Result<ScanFrame, (DirectoryTask, std::io::Error)> {
@@ -615,7 +700,7 @@ fn process_entry(
     if exclusions.is_internal(&path) {
         return;
     }
-    let metadata = match fs::symlink_metadata(&path) {
+    let metadata = match entry.metadata() {
         Ok(metadata) => metadata,
         Err(error) => {
             let _ = send_event(

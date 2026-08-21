@@ -498,10 +498,23 @@ impl Arena {
 
     pub fn complete_directory(&mut self, path: &Path) -> Result<(), ModelError> {
         if let Some(id) = self.find_path(path) {
+            let metadata = fs::symlink_metadata(path).ok();
+            let identity = metadata
+                .as_ref()
+                .and_then(|metadata| identity_for(path, metadata).ok().flatten());
+            let modified_nanos = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos());
             if let Some(node) = self.node_mut(id)
                 && node.state == NodeState::Scanning
             {
                 node.state = NodeState::Complete;
+                node.snapshot.modified_nanos = modified_nanos;
+                if let Some(identity) = identity {
+                    node.snapshot.identity = Some(identity);
+                }
             }
             return Ok(());
         }
@@ -836,6 +849,8 @@ impl Arena {
         let staged_state = staged_root.state;
         let staged_reason = staged_root.unscanned_reason.clone();
         let staged_children = staged_root.children.clone();
+        let staged_modified_nanos = staged_root.snapshot.modified_nanos;
+        let staged_identity = staged_root.snapshot.identity.clone();
 
         let mut removed = Vec::new();
         for child in self.children(target).to_vec() {
@@ -908,6 +923,10 @@ impl Arena {
         target_node.metrics = NodeMetrics::default();
         target_node.snapshot.kind = replacement_kind;
         target_node.unscanned_reason = staged_reason;
+        target_node.snapshot.modified_nanos = staged_modified_nanos;
+        if let Some(identity) = staged_identity {
+            target_node.snapshot.identity = Some(identity);
+        }
 
         self.budget = planned_budget;
         self.identities = identities;

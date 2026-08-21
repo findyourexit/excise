@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
@@ -129,6 +130,66 @@ impl FileTree {
     pub fn identity_for_path(&self, path: &Path) -> Option<NativeIdentity> {
         let id = self.arena.path_ids(path)?.last().copied()?;
         self.arena.node(id)?.snapshot.identity.clone()
+    }
+    pub fn deletion_target_for_path(
+        &self,
+        path: &Path,
+    ) -> Result<crate::state::FileToDelete, ModelError> {
+        let ids = self
+            .arena
+            .path_ids(path)
+            .ok_or_else(|| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
+        let node_id = *ids
+            .last()
+            .ok_or_else(|| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
+        if ids.iter().any(|id| {
+            self.arena
+                .node(*id)
+                .is_none_or(|node| node.state != NodeState::Complete)
+        }) {
+            return Err(ModelError::Invariant(
+                "deletion requires a fully materialized path".to_string(),
+            ));
+        }
+        let node = self
+            .arena
+            .node(node_id)
+            .ok_or_else(|| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
+        if node.kind.is_synthetic() {
+            return Err(ModelError::Invariant(
+                "deletion requires a fully materialized subtree".to_string(),
+            ));
+        }
+        let relative = path
+            .strip_prefix(&self.path_in_filesystem)
+            .map_err(|_| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
+        let (file_type, num_descendants) = match node.kind {
+            NodeKind::Directory => (
+                crate::state::tiles::FileType::Folder,
+                Some(node.metrics.descendants),
+            ),
+            NodeKind::File | NodeKind::Link => (crate::state::tiles::FileType::File, None),
+            NodeKind::Root | NodeKind::Synthetic(_) => {
+                return Err(ModelError::Invariant(
+                    "scan roots and synthetic nodes cannot be deleted".to_string(),
+                ));
+            }
+        };
+        Ok(crate::state::FileToDelete {
+            node_id,
+            synthetic: false,
+            path_in_filesystem: self.path_in_filesystem.clone(),
+            path_to_file: relative.iter().map(OsStr::to_os_string).collect(),
+            file_type,
+            num_descendants,
+            size: if self.show_apparent_size {
+                node.metrics.apparent_bytes
+            } else {
+                node.metrics.allocated_bytes.lower
+            },
+            expected_snapshot: node.snapshot.clone(),
+            reviewed_entries: Vec::new(),
+        })
     }
 
     pub fn reviewed_subtree(

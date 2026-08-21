@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -614,21 +614,54 @@ where
             self.mark_dirty();
         }
     }
-    pub fn deletion_revalidation_failed(
+    pub fn begin_deletion_replan(
         &mut self,
         target_node_id: crate::model::NodeId,
         plan: DeletionPlan,
-    ) {
+    ) -> Result<Option<PathBuf>, AppError> {
         if plan.target.node_id != target_node_id {
             self.show_error("Deletion validation returned an unexpected target");
-            return;
+            return Ok(None);
         }
-        let target = plan.target;
-        let display = target.display_copy();
+        let mut target = plan.target;
+        let target_path = target.full_path();
+        let rescan_target = if target.expected_snapshot.kind == crate::model::NodeKind::Directory {
+            target_path.clone()
+        } else {
+            target_path
+                .parent()
+                .map_or_else(|| target.path_in_filesystem.clone(), Path::to_path_buf)
+        };
+        target.reviewed_entries.clear();
+        self.begin_rescan(rescan_target.clone())?;
         self.deletion_replan = Some(target);
         self.ui_effects.deletion_in_progress = false;
-        self.ui_mode = UiMode::PlanningDeletion(Box::new(display));
+        Ok(Some(rescan_target))
+    }
+
+    pub fn rebuild_deletion_replan(&mut self) -> Option<FileToDelete> {
+        let stale = self.take_deletion_replan()?;
+        let path = stale.full_path();
+        let mut target = match self.file_tree.deletion_target_for_path(&path) {
+            Ok(target) => target,
+            Err(error) => {
+                self.show_error(format!("Deletion rescan could not refresh target: {error}"));
+                return None;
+            }
+        };
+        target.reviewed_entries = match self
+            .file_tree
+            .reviewed_subtree(target.node_id, self.maximum_deletion_plan_bytes())
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.show_error(format!("Deletion rescan could not review target: {error}"));
+                return None;
+            }
+        };
+        self.ui_mode = UiMode::PlanningDeletion(Box::new(target.display_copy()));
         self.mark_dirty();
+        Some(target)
     }
 
     pub fn resume_deletion(&mut self, stopping: bool) {
@@ -772,6 +805,7 @@ where
 
     pub fn cancel_rescan(&mut self) -> Result<(), AppError> {
         self.file_tree.cancel_rescan().map_err(model_error)?;
+        self.deletion_replan = None;
         self.ui_mode = UiMode::Normal;
         self.render_and_update_board();
         Ok(())
@@ -785,7 +819,6 @@ where
         self.ui_mode = UiMode::FilterInput { input, error: None };
         self.mark_dirty();
     }
-
     pub fn push_filter_character(&mut self, character: char) {
         if character.is_control() {
             return;

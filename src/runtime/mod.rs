@@ -311,6 +311,7 @@ where
                     .request_deletion_plan(target, reduced_guardrails, maximum_bytes)?;
                 self.deletion_active = true;
             }
+            InputCommand::CancelDeletionPlan => self.workers()?.cancel_deletion_plan(),
             InputCommand::RevalidateDeletion(plan) => {
                 if self.deletion_active {
                     return Ok(());
@@ -507,13 +508,19 @@ where
                 if self.rescan_active {
                     self.rescan_active = false;
                     if cancelled {
-                        self.summary.unreadable_entries =
-                            self.summary.unreadable_entries.saturating_add(1);
-                        self.summary.last_worker_error =
-                            Some("focused rescan cancelled".to_string());
                         self.app.cancel_rescan()?;
                     } else {
                         self.app.finish_rescan()?;
+                        if let Some(target) = self.app.rebuild_deletion_replan() {
+                            let reduced_guardrails = self.app.reduced_deletion_guardrails();
+                            let maximum_bytes = self.app.maximum_deletion_plan_bytes();
+                            self.workers()?.request_deletion_plan(
+                                target,
+                                reduced_guardrails,
+                                maximum_bytes,
+                            )?;
+                            self.deletion_active = true;
+                        }
                     }
                     let (used, limit, spilled) = self.app.model_stats();
                     self.summary.model_bytes = used;
@@ -556,19 +563,34 @@ where
                     Err((_plan, error)) if error == "deletion planning was cancelled" => {
                         self.app.normal_mode();
                     }
-                    Err((plan, _error)) => {
+                    Err((plan, error))
+                        if error == "deletion target changed while its plan was built" =>
+                    {
                         self.animation.schedule_error();
-                        self.app.deletion_revalidation_failed(target_node_id, *plan);
-                        if let Some(target) = self.app.take_deletion_replan() {
-                            let reduced_guardrails = self.app.reduced_deletion_guardrails();
-                            let maximum_bytes = self.app.maximum_deletion_plan_bytes();
-                            self.workers()?.request_deletion_plan(
-                                target,
-                                reduced_guardrails,
-                                maximum_bytes,
-                            )?;
-                            self.deletion_active = true;
-                        }
+                        let Some(target) = self.app.begin_deletion_replan(target_node_id, *plan)?
+                        else {
+                            return Ok(());
+                        };
+                        let root_identity = self.app.identity_for_path(&target);
+                        self.reset_scan_summary();
+                        self.workers()?.request_rescan(scanner::ScannerOptions {
+                            root: target,
+                            root_identity,
+                            threads: self.settings.scan_threads,
+                            cross_filesystems: self.settings.cross_filesystems,
+                            exclusions: self.settings.exclusions.clone(),
+                            internal_paths: self.app.internal_scan_paths(),
+                        })?;
+                        self.scan_active = true;
+                        self.rescan_active = true;
+                        self.next_loading_frame =
+                            self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
+                        self.animation.schedule_aggregation();
+                    }
+                    Err((_plan, error)) => {
+                        self.animation.schedule_error();
+                        self.app
+                            .show_error(format!("Deletion validation failed: {error}"));
                     }
                 }
             }
