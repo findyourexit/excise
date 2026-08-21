@@ -9,7 +9,7 @@ Excise is a surgical terminal storage navigator. It combines a responsive treema
 Excise is an independent successor to [Diskonaut](https://github.com/imsnif/diskonaut). The repository preserves Diskonaut's history and release tags while giving the project a new product, architecture, and maintenance life.
 
 > [!WARNING]
-> Excise is pre-release software. Permanent deletion has no trash or undo. Use development builds only on disposable data until a stable release is published.
+> Excise permanently deletes selected filesystem entries. There is no trash or undo. Use it only on data you can safely remove.
 
 ## Why Excise
 
@@ -22,7 +22,7 @@ Excise is an independent successor to [Diskonaut](https://github.com/imsnif/disk
 
 ## Build from source
 
-A stable release is not available yet. Build the current source with Rust 1.88 or newer:
+Build the current stable source with Rust 1.88 or newer:
 
 ```console
 git clone https://github.com/findyourexit/excise.git

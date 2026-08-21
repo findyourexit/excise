@@ -4,7 +4,12 @@ Excise performs permanent filesystem deletion, so data-loss defects are treated 
 
 ## Supported versions
 
-Excise has not published a stable release. The `main` branch is reviewed as pre-release software and must not be trusted with irreplaceable data. A support table will be added with the first stable release.
+Excise supports the latest stable release, currently `0.1.0`. The `main` branch is development software and must not be trusted with irreplaceable data.
+
+| Version | Status |
+|---|---|
+| `0.1.x` | Supported stable line |
+| `main` | Development only |
 
 ## Report privately
 
