@@ -323,9 +323,15 @@ fn generated_artifacts() -> Result<Vec<GeneratedArtifact>, Box<dyn Error>> {
     let mut artifacts = Vec::new();
     let mut man = Vec::new();
     clap_mangen::Man::new(Cli::command()).render(&mut man)?;
+    let mut man = String::from_utf8(man)?
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    man.push('\n');
     artifacts.push(GeneratedArtifact {
         path: PathBuf::from("generated/man/excise.1"),
-        bytes: man,
+        bytes: man.into_bytes(),
     });
     for (shell, name) in [
         (Shell::Bash, "excise.bash"),
