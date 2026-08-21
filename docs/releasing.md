@@ -1,6 +1,6 @@
 # Release process
 
-Excise has not published a stable release. This runbook defines the evidence and artifact shape expected before publication; it does not authorize a release by itself.
+This runbook defines the evidence and artifact shape expected for publication. It does not authorize a release by itself.
 
 ## Release commit
 

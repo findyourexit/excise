@@ -1,6 +1,6 @@
 # Getting started
 
-Excise is pre-release software. Build it from source and begin with a disposable directory. Permanent deletion does not use a trash folder and cannot be undone.
+Excise permanently deletes selected filesystem entries. There is no trash or undo. Begin with a disposable directory.
 
 ## Requirements
 

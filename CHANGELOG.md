@@ -8,7 +8,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 _No unreleased changes._
 
-## [0.1.0-rc.1] - 2026-08-21
+## [0.1.0] - 2026-08-21
 
 ### Added
 
