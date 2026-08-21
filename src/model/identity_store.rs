@@ -116,8 +116,12 @@ impl SessionDirectory {
                 }) {
                     Ok(marker) => marker,
                     Err(error) => {
-                        let _ = remove_verified_session_held(&path, &mut handle);
-                        return Err(error);
+                        return match remove_verified_session_held(&path, &mut handle) {
+                            Ok(()) => Err(error),
+                            Err(cleanup_error) => Err(ModelError::Identity(format!(
+                                "{error}; private spill-session cleanup also failed: {cleanup_error}"
+                            ))),
+                        };
                     }
                 };
                 return Ok(Self {
@@ -147,7 +151,10 @@ impl SessionDirectory {
 impl Drop for SessionDirectory {
     fn drop(&mut self) {
         self.handle.close();
-        let _ = remove_verified_session(&self.path);
+        if let Err(_error) = remove_verified_session(&self.path) {
+            // Drop cannot report errors. The path remains private and is left
+            // for a later bounded startup cleanup attempt.
+        }
     }
 }
 
@@ -557,7 +564,10 @@ fn identity_error(error: impl std::fmt::Display) -> ModelError {
 fn cleanup_stale_sessions_once() {
     static STARTUP_SESSION_CLEANUP: OnceLock<()> = OnceLock::new();
     STARTUP_SESSION_CLEANUP.get_or_init(|| {
-        let _ = cleanup_stale_sessions();
+        if let Err(_error) = cleanup_stale_sessions() {
+            // Startup cleanup is best effort. A parent-enumeration failure
+            // must not prevent creating a new private spill session.
+        }
     });
 }
 
@@ -581,8 +591,13 @@ fn cleanup_stale_sessions_in(parent: &Path, now: SystemTime) -> Result<usize, Mo
             continue;
         }
         let path = entry.path();
-        if matches!(reclaim_stale_session(&path, now), Ok(true)) {
-            removed = removed.saturating_add(1);
+        match reclaim_stale_session(&path, now) {
+            Ok(true) => removed = removed.saturating_add(1),
+            Ok(false) => {}
+            Err(_error) => {
+                // Failed ownership/type/liveness checks are conservative:
+                // leave this candidate untouched and continue the bounded scan.
+            }
         }
     }
     Ok(removed)
@@ -595,7 +610,10 @@ fn is_session_directory_name(name: &std::ffi::OsStr) -> bool {
 
 #[cfg(not(windows))]
 fn reclaim_stale_session(path: &Path, now: SystemTime) -> Result<bool, ModelError> {
-    if !is_verified_stale_session(path, now) {
+    // This private-path check is the ownership proof on platforms without a
+    // held cleanup handle; failure means this candidate is left untouched.
+    verify_private_directory(path)?;
+    if !is_stale_session(path, now)? {
         return Ok(false);
     }
     remove_verified_session(path)?;
@@ -604,48 +622,33 @@ fn reclaim_stale_session(path: &Path, now: SystemTime) -> Result<bool, ModelErro
 
 #[cfg(windows)]
 fn reclaim_stale_session(path: &Path, now: SystemTime) -> Result<bool, ModelError> {
-    let Ok(mut handle) = crate::os::windows::open_verified_private_directory_for_cleanup(path)
-    else {
-        return Ok(false);
-    };
-    if !is_stale_session(path, now) {
+    // The held handle proves ownership and prevents namespace replacement
+    // through the classification and deletion sequence.
+    let mut handle = crate::os::windows::open_verified_private_directory_for_cleanup(path)
+        .map_err(identity_error)?;
+    if !is_stale_session(path, now)? {
         return Ok(false);
     }
     remove_verified_session_held(path, &mut handle)?;
     Ok(true)
 }
 
-#[cfg(not(windows))]
-fn is_verified_stale_session(path: &Path, now: SystemTime) -> bool {
-    verify_private_directory(path).is_ok() && is_stale_session(path, now)
-}
-
-fn is_stale_session(path: &Path, now: SystemTime) -> bool {
-    if session_contents_are_safe(path).is_err() {
-        return false;
-    }
-    let Ok(marker) = read_session_marker(path) else {
-        return false;
-    };
-    let Ok(now_seconds) = seconds_since_epoch(now) else {
-        return false;
-    };
+fn is_stale_session(path: &Path, now: SystemTime) -> Result<bool, ModelError> {
+    session_contents_are_safe(path)?;
+    let marker = read_session_marker(path)?;
+    let now_seconds = seconds_since_epoch(now)?;
     if now_seconds.saturating_sub(marker.started_at) < STALE_SESSION_AGE.as_secs() {
-        return false;
+        return Ok(false);
     }
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
+    let metadata = fs::symlink_metadata(path).map_err(identity_error)?;
+    let modified = metadata.modified().map_err(identity_error)?;
     if now
         .duration_since(modified)
         .map_or(true, |age| age < STALE_SESSION_AGE)
     {
-        return false;
+        return Ok(false);
     }
-    !session_process_is_active(marker.pid)
+    Ok(!session_process_is_active(marker.pid))
 }
 
 fn session_contents_are_safe(directory: &Path) -> Result<(), ModelError> {
@@ -1155,6 +1158,27 @@ mod tests {
             .checked_add(STALE_SESSION_AGE + std::time::Duration::from_secs(1))
             .expect("test clock should advance");
         (created, cleanup)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_rejects_unverifiable_session_directory() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().expect("cleanup parent should exist");
+        let target = parent.path().join("outside-target");
+        std::fs::create_dir(&target).expect("link target should be created");
+        let candidate = parent.path().join(".excise-session-link");
+        symlink(&target, &candidate).expect("session lookalike link should be created");
+
+        let (_, cleanup) = expired_time();
+        assert!(reclaim_stale_session(&candidate, cleanup).is_err());
+        assert!(
+            std::fs::symlink_metadata(&candidate)
+                .expect("candidate should remain")
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[cfg(unix)]
