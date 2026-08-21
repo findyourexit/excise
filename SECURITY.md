@@ -13,7 +13,7 @@ Excise supports the latest stable release, currently `0.1.0`. The `main` branch 
 
 ## Report privately
 
-Use GitHub's **Security** tab and **Report a vulnerability** to disclose:
+Use GitHub's **Security** tab and **Report a vulnerability** as the primary private-reporting channel:
 
 - unintended, over-broad, or incorrectly authorized deletion;
 - path, link, junction, mount, or file-identity confusion;
@@ -24,7 +24,7 @@ Use GitHub's **Security** tab and **Report a vulnerability** to disclose:
 - dependency or release-integrity vulnerabilities; and
 - other confidentiality, integrity, or availability defects.
 
-If private vulnerability reporting is unavailable, contact the lead maintainer through the methods listed on the [findyourexit GitHub profile](https://github.com/findyourexit). Do not open a public issue for an unpatched vulnerability or unintended-deletion path.
+If private vulnerability reporting is unavailable, use the monitored fallback by emailing the lead maintainer at `tom.larcher@gmail.com`, the public maintainer contact listed in `Cargo.toml`. Do not open a public issue for an unpatched vulnerability or unintended-deletion path.
 
 ## What to include
 
