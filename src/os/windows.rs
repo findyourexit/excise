@@ -171,18 +171,6 @@ pub(crate) fn is_process_active(pid: u32) -> bool {
     process_query_is_active(query_succeeded, exit_code)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{STILL_ACTIVE, process_query_is_active};
-
-    #[test]
-    fn process_query_failure_is_treated_as_active() {
-        assert!(process_query_is_active(false, 0));
-        assert!(process_query_is_active(true, STILL_ACTIVE));
-        assert!(!process_query_is_active(true, 0));
-    }
-}
-
 fn open_private_path(path: &Path, directory: bool, access: u32) -> io::Result<OwnedHandle> {
     let wide_path = wide_path(path);
     let flags = FILE_FLAG_OPEN_REPARSE_POINT
@@ -642,4 +630,16 @@ fn private_path_error(message: &str) -> io::Error {
 
 fn win32_error(code: u32) -> io::Error {
     io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(i32::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STILL_ACTIVE, process_query_is_active};
+
+    #[test]
+    fn process_query_failure_is_treated_as_active() {
+        assert!(process_query_is_active(false, 0));
+        assert!(process_query_is_active(true, STILL_ACTIVE));
+        assert!(!process_query_is_active(true, 0));
+    }
 }
