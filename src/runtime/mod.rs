@@ -18,7 +18,7 @@ use crate::animation::AnimationScheduler;
 use crate::config::{CustomKeyBindings, KeyPreset, SafePreferences, save_safe_preferences};
 use crate::error::{AppError, ExitClass};
 use crate::input::{InputCommand, InputEvent, InputSource, handle_keypress};
-use crate::native_path::safe_display_path;
+use crate::native_path::{NativeIdentity, safe_display_path};
 use crate::outcome::{OperationOutcome, RunSummary};
 use crate::report::{ScanReport, ScanReportState, scan_report_state};
 use crate::state::files::FileTree;
@@ -35,6 +35,7 @@ const MAX_WORKER_BATCH: usize = 128;
 #[allow(clippy::struct_excessive_bools)]
 pub struct RuntimeSettings {
     pub root: PathBuf,
+    pub root_identity: NativeIdentity,
     pub scan_threads: usize,
     pub event_capacity: usize,
     pub cross_filesystems: bool,
@@ -99,9 +100,10 @@ where
     B: Backend,
 {
     let now = clock.now();
-    let app = App::new(
+    let app = App::new_with_root_identity(
         terminal_backend,
         settings.root.clone(),
+        settings.root_identity.clone(),
         settings.apparent_size,
         settings.disable_delete_confirmation,
         settings.memory_mib,
@@ -112,6 +114,7 @@ where
     let workers = WorkerPool::start(
         scanner::ScannerOptions {
             root: settings.root.clone(),
+            root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
             cross_filesystems: settings.cross_filesystems,
             exclusions: settings.exclusions.clone(),
@@ -277,10 +280,12 @@ where
                 if self.scan_active || self.deletion_active {
                     return Ok(());
                 }
+                let root_identity = self.app.identity_for_path(&target);
                 self.app.begin_rescan(target.clone())?;
                 self.reset_scan_summary();
                 self.workers()?.request_rescan(scanner::ScannerOptions {
                     root: target,
+                    root_identity,
                     threads: self.settings.scan_threads,
                     cross_filesystems: self.settings.cross_filesystems,
                     exclusions: self.settings.exclusions.clone(),
@@ -704,8 +709,9 @@ where
 /// Returns a scanner, model, or worker error after all owned workers stop.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanReport>, AppError> {
-    let mut tree = FileTree::new(
+    let mut tree = FileTree::new_with_root_identity(
         settings.root.clone(),
+        settings.root_identity.clone(),
         settings.apparent_size,
         settings.memory_mib,
     )
@@ -713,6 +719,7 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
     let workers = WorkerPool::start(
         scanner::ScannerOptions {
             root: settings.root.clone(),
+            root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
             cross_filesystems: settings.cross_filesystems,
             exclusions: settings.exclusions.clone(),

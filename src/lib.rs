@@ -50,8 +50,13 @@ pub(crate) fn start<B>(
 ) where
     B: ratatui::backend::Backend,
 {
+    let metadata = std::fs::symlink_metadata(&path).expect("test root metadata should exist");
+    let root_identity = crate::native_path::identity_for(&path, &metadata)
+        .expect("test root identity should be readable")
+        .expect("test root should not be a symbolic link");
     let settings = runtime::RuntimeSettings {
         root: path,
+        root_identity,
         scan_threads: 1,
         event_capacity: 256,
         cross_filesystems: false,

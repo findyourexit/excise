@@ -15,7 +15,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use super::worker::{ScannedEntry, WorkerEvent, send_event};
 use crate::model::UnscannedReason;
-use crate::native_path::{EncodedNativePath, NativePath, identity_for};
+use crate::native_path::{EncodedNativePath, NativeIdentity, NativePath, identity_for};
 
 const BATCH_SIZE: usize = 128;
 const TASK_QUEUE_PER_WORKER: usize = 8;
@@ -29,6 +29,7 @@ type TaskSpillFile = File;
 #[derive(Clone, Debug)]
 pub struct ScannerOptions {
     pub root: PathBuf,
+    pub root_identity: Option<NativeIdentity>,
     pub threads: usize,
     pub cross_filesystems: bool,
     pub exclusions: Vec<String>,
@@ -319,11 +320,28 @@ pub fn spawn(
 pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancelled: &AtomicBool) {
     let ScannerOptions {
         root,
+        root_identity,
         threads,
         cross_filesystems,
         exclusions: exclusion_patterns,
         internal_paths,
     } = options;
+    if let Err(message) = validate_scan_root(&root, root_identity.as_ref()) {
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFailed {
+                path: Some(root.clone()),
+                message,
+            },
+            cancelled,
+        );
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFinished { cancelled: false },
+            cancelled,
+        );
+        return;
+    }
     let mut exclusions = match Exclusions::new(&root, exclusion_patterns, internal_paths) {
         Ok(exclusions) => exclusions,
         Err(message) => {
@@ -707,6 +725,30 @@ fn flush_frame(
         }
     }
     true
+}
+
+fn validate_scan_root(path: &Path, expected: Option<&NativeIdentity>) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "could not inspect scan root {}: {error}",
+            path.to_string_lossy()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("scan root was replaced by a symbolic link or non-directory".to_string());
+    }
+    let actual = identity_for(path, &metadata)
+        .map_err(|error| format!("could not identify scan root: {error}"))?
+        .ok_or_else(|| "scan root identity is unavailable".to_string())?;
+    if actual.reparse_point {
+        return Err("scan root was replaced by a reparse point".to_string());
+    }
+    if expected.is_some_and(|expected| {
+        actual.file_id != expected.file_id || actual.reparse_point != expected.reparse_point
+    }) {
+        return Err("scan root identity changed before scanning".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

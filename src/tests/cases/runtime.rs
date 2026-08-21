@@ -10,8 +10,13 @@ use crate::tests::cases::test_utils::test_backend_factory;
 use crate::tests::fakes::{BackendOperation, TerminalEvent, TerminalEvents};
 
 fn settings(root: &std::path::Path) -> RuntimeSettings {
+    let metadata = std::fs::symlink_metadata(root).expect("runtime root metadata should exist");
+    let root_identity = crate::native_path::identity_for(root, &metadata)
+        .expect("runtime root identity should be readable")
+        .expect("runtime root should not be a symbolic link");
     RuntimeSettings {
         root: root.to_path_buf(),
+        root_identity,
         scan_threads: 1,
         event_capacity: 16,
         cross_filesystems: false,

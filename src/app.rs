@@ -9,7 +9,10 @@ use ratatui::backend::Backend;
 
 use crate::animation::AnimationScheduler;
 use crate::config::{CustomKeyBindings, KeyPreset};
-use crate::deletion::{ConfirmationChallenge, DeletionPlan, DeletionReport, deletion_supported};
+use crate::deletion::{
+    ConfirmationChallenge, DeletionPlan, DeletionReport, current_scan_root_identity,
+    deletion_supported, revalidate_plan,
+};
 use crate::error::AppError;
 use crate::filter::FilterPattern;
 use crate::model::{ModelError, NodeState, SyntheticKind, UnscannedReason};
@@ -93,6 +96,7 @@ where
     deletion_history: Vec<Arc<DeletionReport>>,
     deletion_history_bytes: usize,
     deletion_history_limit: usize,
+    deletion_replan: Option<FileToDelete>,
     preferences_dirty: bool,
     keymap: KeyPreset,
     custom_keys: Option<CustomKeyBindings>,
@@ -104,7 +108,7 @@ impl<B> App<B>
 where
     B: Backend,
 {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn new(
         terminal_backend: B,
         path_in_filesystem: PathBuf,
@@ -115,11 +119,66 @@ where
         custom_keys: Option<CustomKeyBindings>,
         mouse_enabled: bool,
     ) -> Result<Self, AppError> {
+        let root_identity = current_scan_root_identity(&path_in_filesystem)
+            .map_err(|error| AppError::Model(error.to_string()))?;
+        Self::new_with_root_identity(
+            terminal_backend,
+            path_in_filesystem,
+            root_identity,
+            show_apparent_size,
+            disable_delete_confirmation,
+            process_memory_mib,
+            keymap,
+            custom_keys,
+            mouse_enabled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_root_identity(
+        terminal_backend: B,
+        path_in_filesystem: PathBuf,
+        root_identity: NativeIdentity,
+        show_apparent_size: bool,
+        disable_delete_confirmation: bool,
+        process_memory_mib: usize,
+        keymap: KeyPreset,
+        custom_keys: Option<CustomKeyBindings>,
+        mouse_enabled: bool,
+    ) -> Result<Self, AppError> {
         let display = Display::new(terminal_backend)?;
         let board = Board::new();
-        let file_tree = FileTree::new(path_in_filesystem, show_apparent_size, process_memory_mib)
-            .map_err(model_error)?;
-        Ok(Self {
+        let file_tree = FileTree::new_with_root_identity(
+            path_in_filesystem,
+            root_identity,
+            show_apparent_size,
+            process_memory_mib,
+        )
+        .map_err(model_error)?;
+        Ok(Self::from_parts(
+            display,
+            board,
+            file_tree,
+            disable_delete_confirmation,
+            keymap,
+            custom_keys,
+            mouse_enabled,
+            process_memory_mib,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        display: Display<B>,
+        board: Board,
+        file_tree: FileTree,
+        disable_delete_confirmation: bool,
+        keymap: KeyPreset,
+        custom_keys: Option<CustomKeyBindings>,
+        mouse_enabled: bool,
+        process_memory_mib: usize,
+    ) -> Self {
+        Self {
             is_running: true,
             loaded: false,
             board,
@@ -136,7 +195,8 @@ where
             deletion_history_bytes: 0,
             deletion_history_limit: process_memory_mib.saturating_mul(MIB) / 8,
             deletion_history: Vec::new(),
-        })
+            deletion_replan: None,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -280,6 +340,10 @@ where
     #[must_use]
     pub fn internal_scan_paths(&self) -> Vec<PathBuf> {
         self.file_tree.internal_scan_paths()
+    }
+    #[must_use]
+    pub fn identity_for_path(&self, path: &std::path::Path) -> Option<NativeIdentity> {
+        self.file_tree.identity_for_path(path)
     }
 
     #[must_use]
@@ -445,6 +509,7 @@ where
                 return None;
             }
         };
+        self.deletion_replan = None;
         self.ui_mode = UiMode::PlanningDeletion(Box::new(file_to_delete.display_copy()));
         self.mark_dirty();
         Some(file_to_delete)
@@ -503,14 +568,12 @@ where
             }
         }
     }
-
     pub fn pop_confirmation_character(&mut self) {
         if let UiMode::DeleteConfirm { input, .. } = &mut self.ui_mode {
             input.pop();
             self.mark_dirty();
         }
     }
-
     pub fn take_confirmed_deletion_plan(&mut self) -> Option<DeletionPlan> {
         let confirmed = matches!(
             &self.ui_mode,
@@ -527,6 +590,14 @@ where
         else {
             return None;
         };
+        if revalidate_plan(&plan.target.path_in_filesystem, &plan).is_err() {
+            let target = plan.target;
+            let display = target.display_copy();
+            self.deletion_replan = Some(target);
+            self.ui_mode = UiMode::PlanningDeletion(Box::new(display));
+            self.mark_dirty();
+            return None;
+        }
         let planned_entries = plan.planned_entries();
         self.ui_mode = UiMode::Deleting {
             planned_entries,
@@ -535,6 +606,10 @@ where
         self.ui_effects.deletion_in_progress = true;
         self.mark_dirty();
         Some(*plan)
+    }
+
+    pub fn take_deletion_replan(&mut self) -> Option<FileToDelete> {
+        self.deletion_replan.take()
     }
 
     pub fn prompt_deletion_cancel(&mut self) {
@@ -655,6 +730,7 @@ where
     }
 
     pub fn normal_mode(&mut self) {
+        self.deletion_replan = None;
         self.ui_mode = UiMode::Normal;
         self.render_and_update_board();
     }
@@ -774,6 +850,10 @@ fn model_error(error: ModelError) -> AppError {
 mod tests {
     use ratatui::backend::TestBackend;
 
+    use crate::deletion::{PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan};
+    use crate::native_path::identity_for;
+    use crate::state::tiles::FileType;
+
     use super::*;
 
     fn report(estimated_bytes: usize) -> DeletionReport {
@@ -815,5 +895,71 @@ mod tests {
         app.clear_deletion_history();
         assert!(app.deletion_history.is_empty());
         assert_eq!(app.remaining_deletion_history_bytes(), limit);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn stale_confirmation_is_discarded_and_replanned() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::time::UNIX_EPOCH;
+
+        let root = tempfile::tempdir().expect("app root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"original").expect("target should be written");
+        let metadata = std::fs::symlink_metadata(&path).expect("target metadata should exist");
+        let identity = identity_for(&path, &metadata)
+            .expect("target identity should be readable")
+            .expect("target should not be a symbolic link");
+        let snapshot = PlannedSnapshot {
+            identity: identity.clone(),
+            kind: PlannedKind::File,
+            apparent_bytes: u128::from(metadata.len()),
+            allocated_bytes: Some(u128::from(metadata.blocks()).saturating_mul(512)),
+            modified_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+        };
+        let target = FileToDelete {
+            node_id: crate::model::NodeId(1),
+            synthetic: false,
+            path_in_filesystem: root.path().to_path_buf(),
+            path_to_file: vec![std::ffi::OsString::from("target")],
+            file_type: FileType::File,
+            num_descendants: None,
+            size: snapshot.apparent_bytes,
+            expected_snapshot: crate::model::EntrySnapshot {
+                identity: Some(identity),
+                kind: crate::model::NodeKind::File,
+                apparent_bytes: snapshot.apparent_bytes,
+                allocated_bytes: snapshot.allocated_bytes,
+                modified_nanos: snapshot.modified_nanos,
+            },
+            reviewed_entries: vec![ReviewedEntry {
+                relative_path: PathBuf::from("target"),
+                snapshot,
+            }],
+        };
+        let plan = build_plan(root.path(), target, false).expect("deletion plan should build");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.ui_mode = UiMode::DeleteConfirm {
+            input: plan.challenge.expected_input().to_string(),
+            plan: Some(Box::new(plan)),
+        };
+        std::fs::write(&path, b"replacement").expect("target should change");
+
+        assert!(app.take_confirmed_deletion_plan().is_none());
+        assert!(matches!(app.ui_mode, UiMode::PlanningDeletion(_)));
+        assert!(app.take_deletion_replan().is_some());
     }
 }

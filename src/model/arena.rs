@@ -83,6 +83,11 @@ impl Arena {
     pub const fn root(&self) -> NodeId {
         self.root
     }
+    pub(crate) fn set_root_identity(&mut self, identity: NativeIdentity) {
+        if let Some(root) = self.node_mut(self.root) {
+            root.snapshot.identity = Some(identity);
+        }
+    }
 
     #[must_use]
     pub const fn memory_used(&self) -> usize {
@@ -259,7 +264,7 @@ impl Arena {
                 apparent,
                 allocated,
                 &identity,
-                Some(parent),
+                Some(other),
                 Some(other),
             )?;
             self.accumulate_other(parent, other, metrics);
@@ -276,7 +281,7 @@ impl Arena {
                 apparent,
                 allocated,
                 &identity,
-                Some(parent),
+                Some(other),
                 Some(other),
             )?;
             self.accumulate_other(parent, other, metrics);
@@ -638,7 +643,7 @@ impl Arena {
     pub fn remove_subtree(&mut self, root: NodeId) {
         let mut removed = Vec::new();
         self.collect_subtree_ids(root, &mut removed);
-        self.remove_nodes(removed);
+        self.remove_nodes_with_accounting(removed);
     }
 
     fn collect_subtree_ids(&self, root: NodeId, removed: &mut Vec<NodeId>) {
@@ -649,6 +654,49 @@ impl Arena {
                 removed.push(id);
             }
         }
+    }
+
+    pub fn remove_paths(&mut self, paths: &[PathBuf]) -> usize {
+        let mut removed = Vec::new();
+        for path in paths {
+            if let Some(id) = self.find_path(path)
+                && id != self.root
+            {
+                self.collect_subtree_ids(id, &mut removed);
+            }
+        }
+        self.remove_nodes_with_accounting(removed)
+    }
+
+    fn remove_nodes_with_accounting(&mut self, mut removed: Vec<NodeId>) -> usize {
+        removed.sort_unstable();
+        removed.dedup();
+        if removed.is_empty() {
+            return 0;
+        }
+        let shared = self
+            .nodes
+            .iter()
+            .filter_map(Option::as_deref)
+            .filter(|node| {
+                node.kind == NodeKind::Synthetic(SyntheticKind::Shared)
+                    && removed.binary_search(&node.id).is_err()
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        let identities = self
+            .rebuild_identities_without(&removed)
+            .expect("deletion identity reconciliation should remain readable");
+        let mut removal_order = removed.clone();
+        removal_order.sort_by_key(|id| self.depth(*id));
+        self.remove_nodes(removal_order);
+        self.remove_nodes(shared);
+        self.identities = identities;
+        self.prepare_identity_metrics();
+        let identity_scratch = IdentityStore::new(self.identities.memory_limit())
+            .expect("deletion identity scratch should remain available");
+        self.rebuild_identity_metrics(identity_scratch);
+        removed.len()
     }
 
     fn remove_nodes(&mut self, removed: Vec<NodeId>) {
@@ -691,7 +739,9 @@ impl Arena {
         if id == self.root {
             return false;
         }
-        self.remove_subtree(id);
+        let mut removed = Vec::new();
+        self.collect_subtree_ids(id, &mut removed);
+        self.remove_nodes_with_accounting(removed);
         true
     }
 
@@ -909,6 +959,20 @@ impl Arena {
         let mut rebuilt = IdentityStore::new(identity_limit)?;
         self.identities.visit_records(|file_id, record| {
             if let Some(record) = remove_replaced_participants(record, target, removed) {
+                merge_identity_record(&mut rebuilt, &file_id, record)?;
+            }
+            Ok(())
+        })?;
+        Ok(rebuilt)
+    }
+    fn rebuild_identities_without(
+        &mut self,
+        removed: &[NodeId],
+    ) -> Result<IdentityStore, ModelError> {
+        let identity_limit = self.identities.memory_limit().min(self.budget.headroom());
+        let mut rebuilt = IdentityStore::new(identity_limit)?;
+        self.identities.visit_records(|file_id, record| {
+            if let Some(record) = remove_deleted_participants(record, removed) {
                 merge_identity_record(&mut rebuilt, &file_id, record)?;
             }
             Ok(())
@@ -1569,6 +1633,30 @@ fn remove_replaced_participants(
     }
     Some(record)
 }
+fn remove_deleted_participants(
+    mut record: IdentityRecord,
+    removed: &[NodeId],
+) -> Option<IdentityRecord> {
+    let removed_links = record
+        .nodes
+        .iter()
+        .filter(|id| removed.binary_search(id).is_ok())
+        .count();
+    record.nodes.retain(|id| removed.binary_search(id).is_err());
+    record.observed_links = record
+        .observed_links
+        .saturating_sub(u64::try_from(removed_links).unwrap_or(u64::MAX));
+    if record.nodes.is_empty() {
+        return None;
+    }
+    if record
+        .allocation_node
+        .is_some_and(|id| removed.binary_search(&id).is_ok())
+    {
+        record.allocation_node = record.nodes.first().copied();
+    }
+    Some(record)
+}
 
 fn remap_staged_record(
     record: &mut IdentityRecord,
@@ -2120,6 +2208,55 @@ mod tests {
                 .descendants,
             2
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_materialized_hard_link_rehomes_allocation_to_other() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"payload").expect("fixture should be written");
+        fs::hard_link(&first, &second).expect("hard link should be created");
+
+        let mut arena = test_arena(root.path());
+        arena.max_children_per_directory = 1;
+        let first_id = add_path(&mut arena, &first).expect("first link should be retained");
+        assert!(add_path(&mut arena, &second).is_none());
+        arena.finalize().expect("hard links should finalize");
+        let shared_allocation = arena
+            .children(arena.root())
+            .iter()
+            .filter_map(|id| arena.node(*id))
+            .find(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Shared))
+            .expect("shared allocation should be represented")
+            .metrics
+            .allocated_bytes;
+
+        assert!(arena.remove_path(&first));
+
+        let other = arena
+            .children(arena.root())
+            .iter()
+            .filter_map(|id| arena.node(*id))
+            .find(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Other))
+            .expect("remaining hard link should stay in Other");
+        assert_eq!(other.metrics.allocated_bytes, shared_allocation);
+        assert_eq!(other.metrics.reclaimable_bytes.lower, 0);
+        assert!(arena.children(arena.root()).iter().all(|id| {
+            arena
+                .node(*id)
+                .is_none_or(|node| node.kind != NodeKind::Synthetic(SyntheticKind::Shared))
+        }));
+        assert_eq!(
+            arena
+                .node(arena.root())
+                .expect("root should exist")
+                .metrics
+                .allocated_bytes,
+            shared_allocation
+        );
+        assert!(arena.node(first_id).is_none());
     }
 
     #[test]

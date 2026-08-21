@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
 
-use crate::deletion::{DeletionPlan, DeletionReport, build_plan_cancellable, execute_plan};
+use crate::deletion::{
+    DeletionPlan, DeletionReport, build_plan_cancellable,
+    build_plan_cancellable_with_root_identity, execute_plan,
+};
 use crate::error::AppError;
 use crate::native_path::NativeIdentity;
 use crate::state::FileToDelete;
@@ -77,6 +80,7 @@ impl WorkerPool {
         let rescan_cancelled = Arc::new(AtomicBool::new(false));
         let deletion_soft_cancelled = Arc::new(AtomicBool::new(false));
         let scan_root = scanner_options.root.clone();
+        let scan_root_identity = scanner_options.root_identity.clone();
 
         let scanner = scanner::spawn(scanner_options, event_sender.clone(), cancelled.clone())
             .map_err(|error| AppError::io("could not spawn scanner worker", error))?;
@@ -89,6 +93,7 @@ impl WorkerPool {
             .spawn(move || {
                 deletion_worker(
                     &scan_root,
+                    scan_root_identity.as_ref(),
                     &command_receiver,
                     &event_sender,
                     &worker_soft_cancelled,
@@ -191,6 +196,7 @@ impl WorkerPool {
 
 fn deletion_worker(
     scan_root: &std::path::Path,
+    scan_root_identity: Option<&NativeIdentity>,
     commands: &Receiver<WorkerCommand>,
     sender: &Sender<WorkerEvent>,
     soft_cancelled: &AtomicBool,
@@ -213,13 +219,24 @@ fn deletion_worker(
                 maximum_bytes,
             } => {
                 let target_node_id = target.node_id;
-                let result = build_plan_cancellable(
-                    scan_root,
-                    target,
-                    reduced_guardrails,
-                    cancelled,
-                    maximum_bytes,
-                )
+                let result = if let Some(identity) = scan_root_identity {
+                    build_plan_cancellable_with_root_identity(
+                        scan_root,
+                        identity.clone(),
+                        target,
+                        reduced_guardrails,
+                        cancelled,
+                        maximum_bytes,
+                    )
+                } else {
+                    build_plan_cancellable(
+                        scan_root,
+                        target,
+                        reduced_guardrails,
+                        cancelled,
+                        maximum_bytes,
+                    )
+                }
                 .map(Box::new)
                 .map_err(|error| error.to_string());
                 WorkerEvent::DeletionPlanned {
@@ -272,6 +289,7 @@ mod tests {
     fn options(root: &std::path::Path, threads: usize) -> ScannerOptions {
         ScannerOptions {
             root: root.to_path_buf(),
+            root_identity: None,
             threads,
             cross_filesystems: false,
             exclusions: Vec::new(),
@@ -569,6 +587,57 @@ mod tests {
         assert!(!traversed_secret);
         workers.shutdown().expect("workers should stop");
     }
+    #[cfg(unix)]
+    #[test]
+    fn scanner_rejects_replaced_root_before_traversal() {
+        use crate::native_path::identity_for;
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().expect("scan parent should exist");
+        let scan_root = parent.path().join("scan-root");
+        let original = parent.path().join("original-root");
+        let outside = parent.path().join("outside-root");
+        std::fs::create_dir(&scan_root).expect("scan root should be created");
+        std::fs::write(scan_root.join("original"), b"original")
+            .expect("original fixture should be written");
+        let metadata = std::fs::symlink_metadata(&scan_root).expect("root metadata should exist");
+        let identity = identity_for(&scan_root, &metadata)
+            .expect("root identity should be readable")
+            .expect("root should not be a symbolic link");
+        std::fs::rename(&scan_root, &original).expect("original root should be displaced");
+        std::fs::create_dir(&outside).expect("replacement root should be created");
+        std::fs::write(outside.join("replacement"), b"replacement")
+            .expect("replacement fixture should be written");
+        symlink(&outside, &scan_root).expect("replacement symlink should be created");
+
+        let mut scanner_options = options(&scan_root, 1);
+        scanner_options.root_identity = Some(identity);
+        let workers = WorkerPool::start(scanner_options, 16).expect("workers should start");
+        let mut failed = false;
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("scanner should produce completion")
+            {
+                WorkerEvent::ScanFailed { message, .. } => {
+                    failed = message.contains("replaced") || message.contains("changed");
+                }
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => {
+                    panic!("replaced root should be rejected, not cancelled")
+                }
+                WorkerEvent::ScanBatch { .. }
+                | WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        assert!(failed);
+        workers.shutdown().expect("workers should stop");
+    }
+
     #[test]
     fn hard_shutdown_does_not_join_blocked_workers() {
         let (_event_sender, events) = bounded::<WorkerEvent>(1);
