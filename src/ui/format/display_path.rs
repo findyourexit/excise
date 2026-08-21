@@ -3,8 +3,7 @@ use std::path::Path;
 
 use crate::native_path::{SafeDisplayPath, safe_display_os_str, safe_display_path};
 
-/// Prefix shown whenever a path or message contains deceptive native text.
-pub const DECEPTIVE_DISPLAY_MARKER: &str = "[deceptive]";
+pub use crate::native_path::DECEPTIVE_DISPLAY_MARKER;
 
 #[cfg(test)]
 #[must_use]
@@ -37,10 +36,12 @@ pub fn display_text_info(value: &str) -> SafeDisplayPath {
 #[must_use]
 pub fn display_text(value: &str) -> String {
     let displayed = display_text_info(value);
-    if value.contains(DECEPTIVE_DISPLAY_MARKER) && !displayed.deceptive {
+    if displayed.deceptive {
+        format!("{DECEPTIVE_DISPLAY_MARKER} {}", displayed.text)
+    } else if value.contains(DECEPTIVE_DISPLAY_MARKER) {
         value.to_string()
     } else {
-        marked(displayed)
+        displayed.text
     }
 }
 
@@ -62,15 +63,7 @@ pub fn display_os_str_middle(value: &OsStr, width: u16) -> String {
     truncate_marked(&displayed, width, crate::ui::format::truncate_middle)
 }
 
-fn marked(displayed: SafeDisplayPath) -> String {
-    if displayed.deceptive {
-        format!("{DECEPTIVE_DISPLAY_MARKER} {}", displayed.text)
-    } else {
-        displayed.text
-    }
-}
-
-fn truncate_marked(
+pub(crate) fn truncate_marked(
     displayed: &SafeDisplayPath,
     width: u16,
     truncate: fn(&str, u16) -> String,

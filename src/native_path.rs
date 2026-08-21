@@ -59,6 +59,39 @@ pub struct SafeDisplayPath {
     pub deceptive: bool,
 }
 
+/// Prefix shown whenever a display value contains deceptive native text.
+pub const DECEPTIVE_DISPLAY_MARKER: &str = "[deceptive]";
+
+fn marked(displayed: SafeDisplayPath) -> String {
+    if displayed.deceptive {
+        format!("{DECEPTIVE_DISPLAY_MARKER} {}", displayed.text)
+    } else {
+        displayed.text
+    }
+}
+
+#[must_use]
+pub fn safe_display_path_text(path: &Path) -> String {
+    marked(safe_display_path(path))
+}
+
+#[must_use]
+pub fn safe_display_os_str_text(value: &OsStr) -> String {
+    marked(safe_display_os_str(value))
+}
+
+#[must_use]
+pub fn safe_display_text(value: &str) -> String {
+    let displayed = safe_display_os_str(OsStr::new(value));
+    if displayed.deceptive {
+        marked(displayed)
+    } else if value.contains(DECEPTIVE_DISPLAY_MARKER) {
+        value.to_string()
+    } else {
+        displayed.text
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "encoding", content = "data", rename_all = "kebab-case")]
 pub enum EncodedNativePath {

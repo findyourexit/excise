@@ -11,13 +11,14 @@ use crate::deletion::{
     DeletionPlan, DeletionPlanError, DeletionReport, build_plan_cancellable, execute_plan,
 };
 use crate::error::AppError;
-use crate::native_path::{NativeIdentity, SafeDisplayPath, safe_display_os_str, safe_display_path};
+#[cfg(test)]
+use crate::native_path::DECEPTIVE_DISPLAY_MARKER;
+use crate::native_path::{NativeIdentity, safe_display_path_text, safe_display_text};
 use crate::state::FileToDelete;
 
 use super::scanner::{self, ScannerOptions};
 
 const CHANNEL_RETRY: Duration = Duration::from_millis(25);
-const DECEPTIVE_DISPLAY_MARKER: &str = "[deceptive]";
 
 pub struct ScannedEntry {
     pub metadata: Metadata,
@@ -245,29 +246,11 @@ fn deletion_worker(
     }
 }
 fn safe_worker_path(path: &Path) -> String {
-    let displayed = safe_display_path(path);
-    if displayed.deceptive {
-        marked(displayed)
-    } else {
-        path.to_string_lossy().into_owned()
-    }
+    safe_display_path_text(path)
 }
 
 fn safe_worker_text(value: &str) -> String {
-    let displayed = safe_display_os_str(std::ffi::OsStr::new(value));
-    if displayed.deceptive {
-        marked(displayed)
-    } else {
-        value.to_string()
-    }
-}
-
-fn marked(displayed: SafeDisplayPath) -> String {
-    if displayed.deceptive {
-        format!("{DECEPTIVE_DISPLAY_MARKER} {}", displayed.text)
-    } else {
-        displayed.text
-    }
+    safe_display_text(value)
 }
 
 fn format_deletion_error(
@@ -316,6 +299,13 @@ fn sanitize_worker_event(event: WorkerEvent) -> WorkerEvent {
                 }
                 reason => reason,
             },
+        },
+        WorkerEvent::DeletionPlanned {
+            target_node_id,
+            result,
+        } => WorkerEvent::DeletionPlanned {
+            target_node_id,
+            result: result.map_err(|message| safe_worker_text(&message)),
         },
         event => event,
     }
@@ -748,6 +738,32 @@ mod tests {
         assert!(message.starts_with(DECEPTIVE_DISPLAY_MARKER));
         assert!(message.contains("\\t"));
         assert!(message.contains("\\u{202e}"));
+        assert!(!message.chars().any(char::is_control));
+        assert!(!message.contains('\u{202e}'));
+    }
+    #[test]
+    fn deletion_plan_errors_are_sanitized_at_worker_boundary() {
+        let (sender, events) = bounded(1);
+        let cancelled = AtomicBool::new(false);
+        assert!(send_event(
+            &sender,
+            WorkerEvent::DeletionPlanned {
+                target_node_id: crate::model::NodeId(1),
+                result: Err("permission denied\n\u{202e}name\u{1b}[31m".to_string()),
+            },
+            &cancelled,
+        ));
+        let WorkerEvent::DeletionPlanned { result, .. } = events
+            .recv()
+            .expect("sanitized deletion error should be delivered")
+        else {
+            panic!("expected a deletion plan event");
+        };
+        let message = result.expect_err("injected deletion error should remain an error");
+        assert!(message.starts_with(DECEPTIVE_DISPLAY_MARKER));
+        assert!(message.contains("\\n"));
+        assert!(message.contains("\\u{202e}"));
+        assert!(message.contains("\\x1b"));
         assert!(!message.chars().any(char::is_control));
         assert!(!message.contains('\u{202e}'));
     }
