@@ -219,6 +219,27 @@ impl IdentityStore {
     pub fn spill_path(&self) -> Option<&Path> {
         self.is_spilled().then(|| self.session.path())
     }
+    #[cfg(all(test, windows))]
+    pub(crate) fn corrupt_spill_record_for_test(
+        &mut self,
+        file_id: &FileId,
+    ) -> Result<(), ModelError> {
+        self.flush_pending()?;
+        let Storage::Disk { database, .. } = &mut self.storage else {
+            return Err(ModelError::Invariant(
+                "identity store did not spill".to_string(),
+            ));
+        };
+        let key = serde_json::to_vec(file_id).map_err(identity_error)?;
+        let transaction = database.begin_write().map_err(identity_error)?;
+        {
+            let mut table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+            table
+                .insert(key.as_slice(), b"corrupt")
+                .map_err(identity_error)?;
+        }
+        transaction.commit().map_err(identity_error)
+    }
 
     #[must_use]
     pub fn internal_scan_paths(&self) -> Vec<PathBuf> {

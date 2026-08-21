@@ -2829,21 +2829,29 @@ mod tests {
         arena.finalize().expect("model should finalize");
 
         let mut corrupt = IdentityStore::new(1).expect("spill store should initialize");
+        let file_id = FileId::new_inode(17, 1);
         corrupt
             .observe(
-                &FileId::new_inode(17, 1),
+                &file_id,
                 Some(1),
                 ByteBounds::exact(4096),
                 Some(NodeId(1)),
                 Some(NodeId(1)),
             )
             .expect("identity should spill");
-        let spill_path = corrupt
-            .spill_path()
-            .expect("spilled store should expose its path")
-            .to_path_buf();
-        std::fs::write(spill_path.join("identities.redb"), b"corrupt")
-            .expect("spill database should be corruptible");
+        #[cfg(windows)]
+        corrupt
+            .corrupt_spill_record_for_test(&file_id)
+            .expect("spill record should be corruptible through the database");
+        #[cfg(not(windows))]
+        {
+            let spill_path = corrupt
+                .spill_path()
+                .expect("spilled store should expose its path")
+                .to_path_buf();
+            std::fs::write(spill_path.join("identities.redb"), b"corrupt")
+                .expect("spill database should be corruptible");
+        }
         arena.identities = corrupt;
 
         let error = arena
