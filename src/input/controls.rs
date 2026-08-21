@@ -64,6 +64,7 @@ pub(crate) enum InputCommand {
     SavePreferencesAndExit,
     DiscardPreferencesAndExit,
     SoftCancelDeletion,
+    ResumeDeletion,
     HardCancel,
 }
 
@@ -380,18 +381,12 @@ fn handle_keypress_deleting_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> I
 
 fn handle_keypress_deletion_cancel_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
     match evt {
-        key!(char 's') => {
-            app.resume_deletion(true);
-            InputCommand::SoftCancelDeletion
-        }
+        key!(char 's') => InputCommand::SoftCancelDeletion,
         key!(ctrl 'c') | key!(char 'h') => {
             app.exit();
             InputCommand::HardCancel
         }
-        key!(Esc) | key!(char 'b') => {
-            app.resume_deletion(false);
-            InputCommand::None
-        }
+        key!(Esc) | key!(char 'b') => InputCommand::ResumeDeletion,
         _ => InputCommand::None,
     }
 }
@@ -449,5 +444,66 @@ fn handle_keypress_exiting_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> In
             InputCommand::None
         }
         _ => InputCommand::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+
+    use crate::UiMode;
+    use crate::config::KeyPreset;
+
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn app() -> (tempfile::TempDir, App<TestBackend>) {
+        let root = tempfile::tempdir().expect("input root should exist");
+        let app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        (root, app)
+    }
+
+    #[test]
+    fn deletion_cancel_keys_defer_state_changes_to_runtime() {
+        let (_root, mut app) = app();
+        app.ui_mode = UiMode::DeletionCancel { planned_entries: 1 };
+
+        let command = handle_keypress(&key(KeyCode::Char('s'), KeyModifiers::NONE), &mut app);
+        assert!(matches!(command, InputCommand::SoftCancelDeletion));
+        assert!(matches!(
+            &app.ui_mode,
+            UiMode::DeletionCancel { planned_entries: 1 }
+        ));
+
+        let command = handle_keypress(&key(KeyCode::Char('b'), KeyModifiers::NONE), &mut app);
+        assert!(matches!(command, InputCommand::ResumeDeletion));
+        assert!(matches!(
+            &app.ui_mode,
+            UiMode::DeletionCancel { planned_entries: 1 }
+        ));
+    }
+
+    #[test]
+    fn deletion_cancel_hard_key_still_exits() {
+        let (_root, mut app) = app();
+        app.ui_mode = UiMode::DeletionCancel { planned_entries: 1 };
+
+        let command = handle_keypress(&key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut app);
+        assert!(matches!(command, InputCommand::HardCancel));
+        assert!(!app.is_running);
     }
 }

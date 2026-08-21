@@ -155,6 +155,83 @@ fn graceful_quit_during_scan_is_precise_cancellation() {
 }
 
 #[cfg(unix)]
+struct DelayedSoftCancelInput {
+    events: Vec<Option<Event>>,
+}
+
+#[cfg(unix)]
+impl DelayedSoftCancelInput {
+    fn new(mut events: Vec<Option<Event>>) -> Self {
+        events.reverse();
+        Self { events }
+    }
+}
+
+#[cfg(unix)]
+impl InputSource for DelayedSoftCancelInput {
+    fn poll(&mut self, _timeout: Duration) -> Result<bool, AppError> {
+        Ok(!self.events.is_empty())
+    }
+
+    fn read(&mut self) -> Result<InputEvent, AppError> {
+        let event = self
+            .events
+            .pop()
+            .ok_or_else(|| AppError::Invariant("fake input exhausted after poll".to_string()))?;
+        if matches!(
+            &event,
+            Some(Event::Key(KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }))
+        ) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(event.map_or(InputEvent::Barrier, InputEvent::Terminal))
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn soft_cancel_wins_when_revalidation_event_follows_input() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = DelayedSoftCancelInput::new(vec![
+        None,
+        Some(key(KeyCode::Down, KeyModifiers::NONE)),
+        Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Some(key(KeyCode::Char('s'), KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+    ]);
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("soft cancellation should restore cleanly");
+    let OperationOutcome::Partial {
+        completed_entries,
+        failed_entries,
+        ..
+    } = outcome
+    else {
+        panic!("expected a partial cancellation result, got {outcome:?}");
+    };
+    assert_eq!(completed_entries, 0);
+    assert_eq!(failed_entries, 1);
+    assert!(target.exists(), "soft-cancelled target must remain");
+}
+
+#[cfg(unix)]
 #[test]
 fn skipped_link_is_an_explicit_scoped_boundary() {
     use std::os::unix::fs::symlink;

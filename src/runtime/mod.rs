@@ -402,7 +402,14 @@ where
                 }
             }
             InputCommand::DiscardPreferencesAndExit => self.app.exit(),
-            InputCommand::SoftCancelDeletion => self.workers()?.soft_cancel_deletion(),
+            InputCommand::SoftCancelDeletion => {
+                self.workers()?.soft_cancel_deletion();
+                self.app.resume_deletion(true);
+            }
+            InputCommand::ResumeDeletion => {
+                self.workers()?.resume_deletion();
+                self.app.resume_deletion(false);
+            }
             InputCommand::HardCancel => self.hard_cancelled = true,
         }
         if !self.app.ui_mode.allows_motion() {

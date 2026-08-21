@@ -150,7 +150,6 @@ impl WorkerPool {
     }
 
     pub fn execute_deletion(&self, plan: DeletionPlan) -> Result<(), AppError> {
-        self.deletion_soft_cancelled.store(false, Ordering::Release);
         self.commands
             .send(WorkerCommand::ExecuteDeletion(plan))
             .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
@@ -165,6 +164,9 @@ impl WorkerPool {
 
     pub fn soft_cancel_deletion(&self) {
         self.deletion_soft_cancelled.store(true, Ordering::Release);
+    }
+    pub fn resume_deletion(&self) {
+        self.deletion_soft_cancelled.store(false, Ordering::Release);
     }
 
     pub fn request_rescan(&self, options: ScannerOptions) -> Result<(), AppError> {
@@ -318,6 +320,142 @@ mod tests {
             exclusions: Vec::new(),
             internal_paths: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    fn single_file_plan(root: &std::path::Path) -> (std::path::PathBuf, DeletionPlan) {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::time::UNIX_EPOCH;
+
+        use crate::deletion::{PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan};
+        use crate::native_path::identity_for;
+        use crate::state::tiles::FileType;
+
+        let path = root.join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        let metadata = std::fs::symlink_metadata(&path).expect("target metadata should exist");
+        let identity = identity_for(&path, &metadata)
+            .expect("target identity should be readable")
+            .expect("target identity should be available");
+        let snapshot = PlannedSnapshot {
+            identity: identity.clone(),
+            kind: PlannedKind::File,
+            apparent_bytes: u128::from(metadata.len()),
+            allocated_bytes: Some(u128::from(metadata.blocks()).saturating_mul(512)),
+            modified_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+        };
+        let target = FileToDelete {
+            node_id: crate::model::NodeId(1),
+            synthetic: false,
+            path_in_filesystem: root.to_path_buf(),
+            path_to_file: vec![std::ffi::OsString::from("target")],
+            file_type: FileType::File,
+            num_descendants: None,
+            size: snapshot.apparent_bytes,
+            expected_snapshot: crate::model::EntrySnapshot {
+                identity: Some(identity),
+                kind: crate::model::NodeKind::File,
+                apparent_bytes: snapshot.apparent_bytes,
+                allocated_bytes: snapshot.allocated_bytes,
+                modified_nanos: snapshot.modified_nanos,
+            },
+            reviewed_entries: vec![ReviewedEntry {
+                relative_path: std::path::PathBuf::from("target"),
+                snapshot: snapshot.clone(),
+            }],
+        };
+        let plan = build_plan(root, target, false).expect("deletion plan should build");
+        (path, plan)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn soft_cancel_wins_over_queued_revalidation_success() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let (path, plan) = single_file_plan(root.path());
+        let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
+        workers
+            .revalidate_deletion(plan)
+            .expect("revalidation should be queued");
+
+        let plan = loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker should report revalidation")
+            {
+                WorkerEvent::DeletionRevalidated {
+                    result: Ok(plan), ..
+                } => break *plan,
+                WorkerEvent::DeletionRevalidated { result: Err(_), .. } => {
+                    panic!("revalidation should succeed")
+                }
+                _ => {}
+            }
+        };
+
+        workers.soft_cancel_deletion();
+        workers
+            .execute_deletion(plan)
+            .expect("execution should be queued after cancellation");
+        let report = loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker should report deletion")
+            {
+                WorkerEvent::DeletionFinished { report } => break report,
+                WorkerEvent::ScanBatch { .. }
+                | WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::ScanFailed { .. }
+                | WorkerEvent::ScanFinished { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. } => {}
+            }
+        };
+        assert!(report.soft_cancelled);
+        assert_eq!(report.unattempted_entries(), 1);
+        assert!(path.exists());
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_deletion_clears_soft_cancel_before_execution() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let (path, plan) = single_file_plan(root.path());
+        let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
+        workers.soft_cancel_deletion();
+        workers.resume_deletion();
+        workers
+            .execute_deletion(plan)
+            .expect("execution should be queued after resuming");
+
+        let report = loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker should report deletion")
+            {
+                WorkerEvent::DeletionFinished { report } => break report,
+                WorkerEvent::ScanBatch { .. }
+                | WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::ScanFailed { .. }
+                | WorkerEvent::ScanFinished { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. } => {}
+            }
+        };
+        assert!(!report.soft_cancelled);
+        assert_eq!(report.deleted_entries(), 1);
+        assert!(!path.exists());
+        workers.shutdown().expect("workers should stop");
     }
 
     #[test]
