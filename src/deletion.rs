@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::model::NodeId;
 use crate::model::NodeKind;
-use crate::native_path::{NativeIdentity, safe_display_os_str};
+use crate::native_path::{NativeIdentity, identity_for, safe_display_os_str};
 use crate::state::FileToDelete;
 
 pub const DEFAULT_PLAN_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -77,6 +77,7 @@ impl ConfirmationChallenge {
 pub struct DeletionPlan {
     pub target: FileToDelete,
     pub root_relative_path: PathBuf,
+    pub scan_root_identity: NativeIdentity,
     pub entries: Vec<PlannedEntry>,
     pub challenge: ConfirmationChallenge,
     pub apparent_bytes: u128,
@@ -159,6 +160,38 @@ impl DeletionReport {
                 total.saturating_add(entry.entry.snapshot.apparent_bytes)
             })
     }
+    #[must_use]
+    pub fn deleted_allocated_bytes(&self) -> u128 {
+        let mut allocations = HashMap::<FileId, (u64, Option<u64>, Option<u128>)>::new();
+        for result in &self.entries {
+            if !matches!(result.outcome, DeletionEntryOutcome::Deleted) {
+                continue;
+            }
+            let snapshot = &result.entry.snapshot;
+            let allocation = allocations.entry(snapshot.identity.file_id).or_insert((
+                0,
+                snapshot.identity.link_count,
+                snapshot.allocated_bytes,
+            ));
+            allocation.0 = allocation.0.saturating_add(1);
+            allocation.1 = match (allocation.1, snapshot.identity.link_count) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                _ => None,
+            };
+            allocation.2 = match (allocation.2, snapshot.allocated_bytes) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, None) | (None, left) => left,
+            };
+        }
+        allocations
+            .values()
+            .filter_map(|(deleted, links, allocated)| {
+                links
+                    .filter(|links| *links > 0 && *deleted >= *links)
+                    .and(*allocated)
+            })
+            .fold(0_u128, u128::saturating_add)
+    }
 
     fn count(&self, predicate: impl Fn(&DeletionEntryOutcome) -> bool) -> u64 {
         u64::try_from(
@@ -171,7 +204,7 @@ impl DeletionReport {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum DeletionPlanError {
     #[error("aggregate and synthetic nodes cannot be deleted")]
     Synthetic,
@@ -181,6 +214,8 @@ pub enum DeletionPlanError {
     InvalidRelativePath,
     #[error("deletion target changed while its plan was built")]
     Changed,
+    #[error("planned deletion entry is missing: {0:?}")]
+    Missing(PathBuf),
     #[error("deletion planning was cancelled")]
     Cancelled,
     #[error("deletion plan exceeds its {limit} byte memory limit")]
@@ -193,6 +228,35 @@ pub enum DeletionPlanError {
     },
 }
 
+impl DeletionPlanError {
+    #[must_use]
+    pub(crate) const fn is_changed(&self) -> bool {
+        matches!(self, Self::Changed)
+    }
+
+    #[must_use]
+    pub(crate) const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    #[must_use]
+    pub(crate) const fn is_missing(&self) -> bool {
+        matches!(
+            self,
+            Self::Missing(_)
+                | Self::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn is_missing_target(&self, plan: &DeletionPlan) -> bool {
+        matches!(self, Self::Missing(path) if path == &plan.root_relative_path)
+    }
+}
+
 /// Builds and revalidates an identity-bound deletion plan.
 ///
 /// # Errors
@@ -203,8 +267,10 @@ pub fn build_plan(
     target: FileToDelete,
     reduced_guardrails: bool,
 ) -> Result<DeletionPlan, DeletionPlanError> {
-    build_plan_cancellable(
+    let scan_root_identity = current_scan_root_identity(scan_root)?;
+    build_plan_cancellable_with_root_identity(
         scan_root,
+        scan_root_identity,
         target,
         reduced_guardrails,
         &AtomicBool::new(false),
@@ -217,9 +283,28 @@ pub fn build_plan(
 /// # Errors
 /// Returns a planning error when the target is ineligible, changed, unreadable, cancelled, or
 /// exceeds `maximum_bytes`.
-#[allow(clippy::too_many_lines)]
 pub fn build_plan_cancellable(
     scan_root: &Path,
+    target: FileToDelete,
+    reduced_guardrails: bool,
+    cancelled: &AtomicBool,
+    maximum_bytes: usize,
+) -> Result<DeletionPlan, DeletionPlanError> {
+    let scan_root_identity = current_scan_root_identity(scan_root)?;
+    build_plan_cancellable_with_root_identity(
+        scan_root,
+        scan_root_identity,
+        target,
+        reduced_guardrails,
+        cancelled,
+        maximum_bytes,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn build_plan_cancellable_with_root_identity(
+    scan_root: &Path,
+    scan_root_identity: NativeIdentity,
     mut target: FileToDelete,
     reduced_guardrails: bool,
     cancelled: &AtomicBool,
@@ -235,7 +320,7 @@ pub fn build_plan_cancellable(
     {
         return Err(DeletionPlanError::Root);
     }
-    let root = open_root(scan_root)?;
+    let root = open_root(scan_root, &scan_root_identity)?;
     let (snapshot, directory_handle) = inspect_relative(&root, &relative)?;
     validate_model_snapshot(&target, &snapshot)?;
     let challenge = challenge_for(&target, &snapshot, reduced_guardrails);
@@ -342,6 +427,7 @@ pub fn build_plan_cancellable(
     let plan = DeletionPlan {
         target,
         root_relative_path: relative,
+        scan_root_identity,
         entries,
         challenge,
         apparent_bytes,
@@ -359,17 +445,23 @@ pub fn revalidate_plan(scan_root: &Path, plan: &DeletionPlan) -> Result<(), Dele
     revalidate_plan_cancellable(scan_root, plan, &AtomicBool::new(false))
 }
 
-fn revalidate_plan_cancellable(
+pub(crate) fn revalidate_plan_cancellable(
     scan_root: &Path,
     plan: &DeletionPlan,
     cancelled: &AtomicBool,
 ) -> Result<(), DeletionPlanError> {
-    let root = open_root(scan_root)?;
+    let root = open_root(scan_root, &plan.scan_root_identity)?;
     for entry in &plan.entries {
         if cancelled.load(Ordering::Acquire) {
             return Err(DeletionPlanError::Cancelled);
         }
-        let (actual, _) = inspect_relative(&root, &entry.relative_path)?;
+        let (actual, _) = match inspect_relative(&root, &entry.relative_path) {
+            Err(DeletionPlanError::Io {
+                kind: io::ErrorKind::NotFound,
+                ..
+            }) => return Err(DeletionPlanError::Missing(entry.relative_path.clone())),
+            result => result?,
+        };
         if actual != entry.snapshot {
             return Err(DeletionPlanError::Changed);
         }
@@ -432,16 +524,18 @@ fn execute_plan_unix_with_hook<F>(
 where
     F: FnMut(),
 {
-    let root = match open_root(scan_root) {
+    let root = match open_root(scan_root, &plan.scan_root_identity) {
         Ok(root) => root,
         Err(error) => return failed_report(scan_root, plan, &error.to_string()),
     };
     let estimated_bytes = plan.estimated_bytes;
     let target_node_id = plan.target.node_id;
     let root_relative_path = plan.root_relative_path.clone();
+    let planned_link_counts = planned_link_counts(&plan.entries);
+    let mut deleted_link_counts = HashMap::new();
     let mut results = Vec::with_capacity(plan.entries.len());
     let mut stopped = false;
-    for entry in plan.entries {
+    for mut entry in plan.entries {
         if stopped
             || soft_cancelled.load(Ordering::Acquire)
             || hard_cancelled.load(Ordering::Acquire)
@@ -453,7 +547,15 @@ where
             });
             continue;
         }
-        let outcome = execute_unix_entry(&root, &entry, &mut after_isolation);
+        let outcome = execute_unix_entry(&root, &mut entry, &mut after_isolation);
+        if matches!(&outcome, DeletionEntryOutcome::Deleted) {
+            note_deleted_link(&mut entry, &planned_link_counts, &deleted_link_counts);
+            let file_id = entry.snapshot.identity.file_id;
+            deleted_link_counts
+                .entry(file_id)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+        }
         results.push(DeletionEntryResult { entry, outcome });
     }
     DeletionReport {
@@ -471,7 +573,7 @@ where
 #[allow(clippy::too_many_lines)]
 fn execute_unix_entry<F>(
     root: &File,
-    entry: &PlannedEntry,
+    entry: &mut PlannedEntry,
     after_isolation: &mut F,
 ) -> DeletionEntryOutcome
 where
@@ -501,6 +603,7 @@ where
     let actual = match inspect_child(&parent, &detached_name, &entry.relative_path) {
         Ok((snapshot, handle)) => {
             drop(handle);
+            entry.snapshot.identity.link_count = snapshot.identity.link_count;
             snapshot
         }
         Err(DeletionPlanError::Io {
@@ -592,16 +695,18 @@ fn execute_plan_windows(
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
 ) -> DeletionReport {
-    let root = match open_root(scan_root) {
+    let root = match open_root(scan_root, &plan.scan_root_identity) {
         Ok(root) => root,
         Err(error) => return failed_report(scan_root, plan, &error.to_string()),
     };
     let estimated_bytes = plan.estimated_bytes;
     let target_node_id = plan.target.node_id;
     let root_relative_path = plan.root_relative_path.clone();
+    let planned_link_counts = planned_link_counts(&plan.entries);
+    let mut deleted_link_counts = HashMap::new();
     let mut results = Vec::with_capacity(plan.entries.len());
     let mut stopped = false;
-    for entry in plan.entries {
+    for mut entry in plan.entries {
         if stopped
             || soft_cancelled.load(Ordering::Acquire)
             || hard_cancelled.load(Ordering::Acquire)
@@ -613,7 +718,15 @@ fn execute_plan_windows(
             });
             continue;
         }
-        let outcome = execute_windows_entry(&root, &entry);
+        let outcome = execute_windows_entry(&root, &mut entry);
+        if matches!(&outcome, DeletionEntryOutcome::Deleted) {
+            note_deleted_link(&mut entry, &planned_link_counts, &deleted_link_counts);
+            let file_id = entry.snapshot.identity.file_id;
+            deleted_link_counts
+                .entry(file_id)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+        }
         results.push(DeletionEntryResult { entry, outcome });
     }
     DeletionReport {
@@ -628,7 +741,7 @@ fn execute_plan_windows(
 }
 
 #[cfg(windows)]
-fn execute_windows_entry(root: &File, entry: &PlannedEntry) -> DeletionEntryOutcome {
+fn execute_windows_entry(root: &File, entry: &mut PlannedEntry) -> DeletionEntryOutcome {
     use cap_primitives::fs::{_WindowsByHandle as _, OpenOptionsExt as _};
 
     const DELETE: u32 = 0x0001_0000;
@@ -677,6 +790,7 @@ fn execute_windows_entry(root: &File, entry: &PlannedEntry) -> DeletionEntryOutc
         Ok(snapshot) => snapshot,
         Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
     };
+    entry.snapshot.identity.link_count = actual.identity.link_count;
     if !matches_for_execution(&entry.snapshot, &actual) {
         return DeletionEntryOutcome::Changed(
             "identity, type, size, allocation, or modification changed".to_string(),
@@ -857,8 +971,41 @@ fn inspect_child(
     }
 }
 
-fn open_root(path: &Path) -> Result<File, DeletionPlanError> {
-    cap_fs::open_ambient_dir(path, ambient_authority()).map_err(|error| plan_io(path, error))
+pub(crate) fn current_scan_root_identity(path: &Path) -> Result<NativeIdentity, DeletionPlanError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| plan_io(path, error))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(DeletionPlanError::Changed);
+    }
+    let identity = identity_for(path, &metadata)
+        .map_err(|error| plan_io(path, error))?
+        .ok_or(DeletionPlanError::Changed)?;
+    if identity.reparse_point {
+        return Err(DeletionPlanError::Changed);
+    }
+    Ok(identity)
+}
+
+pub(crate) fn validate_scan_root_identity(
+    path: &Path,
+    expected: &NativeIdentity,
+) -> Result<(), DeletionPlanError> {
+    if !same_object(expected, &current_scan_root_identity(path)?) {
+        return Err(DeletionPlanError::Changed);
+    }
+    Ok(())
+}
+
+fn open_root(path: &Path, expected: &NativeIdentity) -> Result<File, DeletionPlanError> {
+    validate_scan_root_identity(path, expected)?;
+    let root = cap_fs::open_ambient_dir(path, ambient_authority())
+        .map_err(|error| plan_io(path, error))?;
+    let handle_snapshot = snapshot_from_open_file(&root, PlannedKind::Directory)
+        .map_err(|error| plan_io(path, error))?;
+    if !same_object(expected, &handle_snapshot.identity) {
+        return Err(DeletionPlanError::Changed);
+    }
+    validate_scan_root_identity(path, expected)?;
+    Ok(root)
 }
 
 fn validate_model_snapshot(
@@ -949,23 +1096,23 @@ fn challenge_for(
     snapshot: &PlannedSnapshot,
     reduced_guardrails: bool,
 ) -> ConfirmationChallenge {
-    if reduced_guardrails {
-        return ConfirmationChallenge::ReducedGuard;
-    }
-    if snapshot.kind != PlannedKind::Directory {
-        return ConfirmationChallenge::ConfirmFile;
-    }
     let name = target.path_to_file.last().map_or_else(
         || safe_display_os_str(OsStr::new("")),
         |name| safe_display_os_str(name),
     );
     if name.deceptive {
-        ConfirmationChallenge::TypePhrase(format!(
+        return ConfirmationChallenge::TypePhrase(format!(
             "DELETE {}",
             challenge_code(&snapshot.identity.file_id)
-        ))
-    } else {
+        ));
+    }
+    if reduced_guardrails {
+        return ConfirmationChallenge::ReducedGuard;
+    }
+    if snapshot.kind == PlannedKind::Directory {
         ConfirmationChallenge::TypeName(name.text)
+    } else {
+        ConfirmationChallenge::ConfirmFile
     }
 }
 
@@ -993,6 +1140,45 @@ fn matches_for_execution(expected: &PlannedSnapshot, actual: &PlannedSnapshot) -
 
 fn same_object(expected: &NativeIdentity, actual: &NativeIdentity) -> bool {
     expected.file_id == actual.file_id && expected.reparse_point == actual.reparse_point
+}
+
+fn planned_link_counts(entries: &[PlannedEntry]) -> HashMap<FileId, u64> {
+    let mut counts: HashMap<FileId, u64> = HashMap::new();
+    for entry in entries {
+        if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link)
+            && entry.snapshot.identity.link_count.is_some()
+        {
+            counts
+                .entry(entry.snapshot.identity.file_id)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+        }
+    }
+    counts
+}
+
+fn note_deleted_link(
+    entry: &mut PlannedEntry,
+    planned: &HashMap<FileId, u64>,
+    deleted: &HashMap<FileId, u64>,
+) {
+    if !matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link) {
+        return;
+    }
+    let Some(actual) = entry.snapshot.identity.link_count else {
+        return;
+    };
+    let Some(planned) = planned.get(&entry.snapshot.identity.file_id).copied() else {
+        entry.snapshot.identity.link_count = None;
+        return;
+    };
+    let already_deleted = deleted
+        .get(&entry.snapshot.identity.file_id)
+        .copied()
+        .unwrap_or(0);
+    if actual > planned.saturating_sub(already_deleted) {
+        entry.snapshot.identity.link_count = None;
+    }
 }
 
 #[cfg(unix)]
@@ -1024,7 +1210,7 @@ fn snapshot_from_std_metadata(
         } else {
             u128::from(metadata.len())
         },
-        allocated_bytes: (kind == PlannedKind::File)
+        allocated_bytes: matches!(kind, PlannedKind::File | PlannedKind::Link)
             .then(|| u128::from(metadata.blocks()).saturating_mul(512)),
         modified_nanos: modified_nanos(metadata),
     })
@@ -1058,7 +1244,10 @@ fn snapshot_from_open_file(handle: &File, kind: PlannedKind) -> io::Result<Plann
         } else {
             u128::from(metadata.len())
         },
-        allocated_bytes: None,
+        allocated_bytes: (kind != PlannedKind::Directory)
+            .then(|| crate::os::physical_size_from_handle(handle))
+            .transpose()?
+            .map(u128::from),
         modified_nanos,
     })
 }
@@ -1103,7 +1292,7 @@ fn snapshot_from_cap_metadata(
         kind,
         apparent_bytes: u128::from(metadata.len()),
 
-        allocated_bytes: (kind == PlannedKind::File)
+        allocated_bytes: matches!(kind, PlannedKind::File | PlannedKind::Link)
             .then(|| u128::from(metadata.blocks()).saturating_mul(512)),
         modified_nanos,
     })
@@ -1191,24 +1380,25 @@ mod tests {
     use crate::state::tiles::FileType;
 
     fn reviewed_snapshot(path: &Path, metadata: &std::fs::Metadata) -> PlannedSnapshot {
-        let kind = if metadata.is_dir() {
-            PlannedKind::Directory
-        } else if metadata.file_type().is_symlink() {
+        let identity = crate::native_path::identity_for(path, metadata)
+            .expect("fixture identity lookup should succeed")
+            .expect("fixture identity should be readable");
+        let kind = if metadata.file_type().is_symlink() || identity.reparse_point {
             PlannedKind::Link
+        } else if metadata.is_dir() {
+            PlannedKind::Directory
         } else {
             PlannedKind::File
         };
         PlannedSnapshot {
-            identity: crate::native_path::identity_for(path, metadata)
-                .expect("fixture identity lookup should succeed")
-                .expect("fixture identity should be readable"),
+            identity,
             kind,
             apparent_bytes: if kind == PlannedKind::Directory {
                 0
             } else {
                 u128::from(metadata.len())
             },
-            allocated_bytes: (kind == PlannedKind::File && !cfg!(windows))
+            allocated_bytes: matches!(kind, PlannedKind::File | PlannedKind::Link)
                 .then(|| {
                     crate::os::physical_size(path, metadata)
                         .ok()
@@ -1654,6 +1844,10 @@ mod tests {
             plan.root_snapshot().map(|snapshot| snapshot.kind),
             Some(PlannedKind::Link)
         );
+        let link_allocation = plan
+            .root_snapshot()
+            .and_then(|snapshot| snapshot.allocated_bytes)
+            .expect("link-object allocation should be known");
 
         let report = execute_plan(
             root.path(),
@@ -1663,6 +1857,7 @@ mod tests {
         );
 
         assert_eq!(report.deleted_entries(), 1);
+        assert_eq!(report.deleted_allocated_bytes(), link_allocation);
         assert!(!link.exists());
         assert!(outside_file.exists());
     }
@@ -1730,6 +1925,10 @@ mod tests {
             plan.root_snapshot().map(|snapshot| snapshot.kind),
             Some(PlannedKind::Link)
         );
+        let junction_allocation = plan
+            .root_snapshot()
+            .and_then(|snapshot| snapshot.allocated_bytes)
+            .expect("reparse-object allocation should be known");
 
         let report = execute_plan(
             root.path(),
@@ -1739,6 +1938,7 @@ mod tests {
         );
 
         assert_eq!(report.deleted_entries(), 1);
+        assert_eq!(report.deleted_allocated_bytes(), junction_allocation);
         assert!(!junction.exists());
         assert!(outside_file.exists());
     }
@@ -1797,5 +1997,169 @@ mod tests {
             plan.challenge,
             ConfirmationChallenge::TypePhrase(_)
         ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn hostile_file_name_uses_generated_challenge() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let name = OsString::from_vec(b"bad\x1bfile".to_vec());
+        std::fs::write(root.path().join(&name), b"payload")
+            .expect("hostile file should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), name, FileType::File),
+            false,
+        )
+        .expect("hostile file plan should build");
+
+        assert!(matches!(
+            plan.challenge,
+            ConfirmationChallenge::TypePhrase(ref phrase) if phrase.starts_with("DELETE ")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_scan_root_is_rejected_before_execution() {
+        let parent = tempfile::tempdir().expect("deletion parent should exist");
+        let scan_root = parent.path().join("scan-root");
+        let original = parent.path().join("original-root");
+        std::fs::create_dir(&scan_root).expect("scan root should be created");
+        std::fs::write(scan_root.join("target"), b"original").expect("target should be written");
+        let plan = build_plan(
+            &scan_root,
+            target(&scan_root, OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+
+        std::fs::rename(&scan_root, &original).expect("original root should be displaced");
+        std::fs::create_dir(&scan_root).expect("replacement root should be created");
+        std::fs::write(scan_root.join("target"), b"replacement")
+            .expect("replacement target should be written");
+
+        let report = execute_plan(
+            &scan_root,
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.failed_entries(), 1);
+        assert!(scan_root.join("target").exists());
+        assert!(original.join("target").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allocated_bytes_are_reported_only_after_last_hard_link_deletion() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::write(&first, b"payload").expect("hard-link source should be written");
+        std::fs::hard_link(&first, &second).expect("hard link should be created");
+
+        let first_plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("first"), FileType::File),
+            false,
+        )
+        .expect("first hard-link plan should build");
+        let first_allocated = first_plan
+            .root_snapshot()
+            .and_then(|snapshot| snapshot.allocated_bytes)
+            .expect("first allocation should be known");
+        let first_report = execute_plan(
+            root.path(),
+            first_plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(first_report.deleted_allocated_bytes(), 0);
+        assert!(second.exists());
+
+        let second_report = execute_plan(
+            root.path(),
+            build_plan(
+                root.path(),
+                target(root.path(), OsString::from("second"), FileType::File),
+                false,
+            )
+            .expect("last hard-link plan should build"),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(second_report.deleted_allocated_bytes(), first_allocated);
+        assert!(!second.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn external_hard_link_created_after_planning_is_not_reported_as_freed() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let outside = tempfile::tempdir().expect("external root should exist");
+        let external = outside.path().join("external");
+        let first = root.path().join("first");
+        std::fs::write(&first, b"payload").expect("hard-link source should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("first"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+        std::fs::hard_link(&first, &external).expect("external hard link should be created");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert_eq!(report.deleted_allocated_bytes(), 0);
+        assert_eq!(
+            external
+                .metadata()
+                .expect("external link should remain")
+                .len(),
+            7
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planned_hard_links_still_report_allocation_after_both_delete() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let first = directory.join("first");
+        let second = directory.join("second");
+        std::fs::write(&first, b"payload").expect("hard-link source should be written");
+        std::fs::hard_link(&first, &second).expect("hard link should be created");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::Folder),
+            false,
+        )
+        .expect("directory plan should build");
+        let allocated = plan
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == Path::new("target/first"))
+            .and_then(|entry| entry.snapshot.allocated_bytes)
+            .expect("allocation should be known");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), 3);
+        assert_eq!(report.deleted_allocated_bytes(), allocated);
+        assert!(!directory.exists());
     }
 }
