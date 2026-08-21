@@ -1688,6 +1688,61 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn deleting_a_junction_never_deletes_its_target() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let outside = tempfile::tempdir().expect("outside root should exist");
+        let outside_file = outside.path().join("outside");
+        std::fs::write(&outside_file, b"outside").expect("outside target should be written");
+        let junction = root.path().join("junction");
+        let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "''"));
+        let command = format!(
+            "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path {} -Target {} | Out-Null",
+            quote(&junction),
+            quote(outside.path())
+        );
+        let output = std::process::Command::new("pwsh")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &command,
+            ])
+            .output()
+            .expect("junction command should start");
+        assert!(
+            output.status.success(),
+            "junction command failed with {}: stdout={:?} stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("junction"), FileType::Folder),
+            false,
+        )
+        .expect("junction plan should build without following its target");
+        assert_eq!(
+            plan.root_snapshot().map(|snapshot| snapshot.kind),
+            Some(PlannedKind::Link)
+        );
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert!(!junction.exists());
+        assert!(outside_file.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn hostile_directory_name_uses_generated_challenge() {
