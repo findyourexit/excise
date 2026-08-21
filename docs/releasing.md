@@ -30,7 +30,7 @@ The manually dispatched `Release candidate artifacts` workflow builds immutable 
 - x86_64 and Apple Silicon macOS; and
 - x86_64 and AArch64 Windows.
 
-It then produces SHA-256 checksums, an SPDX JSON SBOM, and optional GitHub build provenance. Artifacts are short-lived validation inputs until an explicitly reviewed publishing workflow is introduced.
+It then produces SHA-256 checksums, an SPDX JSON dependency SBOM from the exact source checkout, and optional GitHub build provenance. The SBOM describes the locked Cargo package inventory. The checksum manifest and archive contents describe the released files. Artifacts are short-lived validation inputs until an explicitly reviewed publishing workflow is introduced.
 
 ## Publication requirements
 

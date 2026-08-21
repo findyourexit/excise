@@ -118,6 +118,19 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Check out source for dependency SBOM
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          persist-credentials: false
+      - name: Prepare Cargo dependency source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sbom-source/xtask
+          cp source/Cargo.toml source/Cargo.lock sbom-source/
+          cp source/xtask/Cargo.toml sbom-source/xtask/
       - name: Download target archives
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v8
         with:
@@ -131,10 +144,18 @@ jobs:
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
-          path: release
+          path: sbom-source
           format: spdx-json
           output-file: release/excise.spdx.json
           upload-artifact: false
+      - name: Validate dependency SBOM coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sbom=release/excise.spdx.json
+          test "$(jq '.packages | length' "$sbom")" -gt 1
+          jq -e '.packages[] | select(.name == "excise")' "$sbom" >/dev/null
+          jq -e '.packages[] | select(.name == "serde")' "$sbom" >/dev/null
       - name: Attest dry-run artifacts
         if: inputs.attest
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
