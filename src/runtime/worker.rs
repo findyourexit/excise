@@ -1,5 +1,5 @@
 use std::fs::Metadata;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -7,14 +7,17 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
 
-use crate::deletion::{DeletionPlan, DeletionReport, build_plan_cancellable, execute_plan};
+use crate::deletion::{
+    DeletionPlan, DeletionPlanError, DeletionReport, build_plan_cancellable, execute_plan,
+};
 use crate::error::AppError;
-use crate::native_path::NativeIdentity;
+use crate::native_path::{NativeIdentity, SafeDisplayPath, safe_display_os_str, safe_display_path};
 use crate::state::FileToDelete;
 
 use super::scanner::{self, ScannerOptions};
 
 const CHANNEL_RETRY: Duration = Duration::from_millis(25);
+const DECEPTIVE_DISPLAY_MARKER: &str = "[deceptive]";
 
 pub struct ScannedEntry {
     pub metadata: Metadata,
@@ -213,6 +216,7 @@ fn deletion_worker(
                 maximum_bytes,
             } => {
                 let target_node_id = target.node_id;
+                let target_relative = target.path_to_file.iter().collect::<PathBuf>();
                 let result = build_plan_cancellable(
                     scan_root,
                     target,
@@ -221,7 +225,7 @@ fn deletion_worker(
                     maximum_bytes,
                 )
                 .map(Box::new)
-                .map_err(|error| error.to_string());
+                .map_err(|error| format_deletion_error(error, scan_root, &target_relative));
                 WorkerEvent::DeletionPlanned {
                     target_node_id,
                     result,
@@ -240,12 +244,89 @@ fn deletion_worker(
         }
     }
 }
+fn safe_worker_path(path: &Path) -> String {
+    let displayed = safe_display_path(path);
+    if displayed.deceptive {
+        marked(displayed)
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+fn safe_worker_text(value: &str) -> String {
+    let displayed = safe_display_os_str(std::ffi::OsStr::new(value));
+    if displayed.deceptive {
+        marked(displayed)
+    } else {
+        value.to_string()
+    }
+}
+
+fn marked(displayed: SafeDisplayPath) -> String {
+    if displayed.deceptive {
+        format!("{DECEPTIVE_DISPLAY_MARKER} {}", displayed.text)
+    } else {
+        displayed.text
+    }
+}
+
+fn format_deletion_error(
+    error: DeletionPlanError,
+    scan_root: &Path,
+    target_relative: &Path,
+) -> String {
+    match error {
+        DeletionPlanError::Io {
+            path,
+            message,
+            kind: _,
+        } => {
+            let target_lossy = target_relative.to_string_lossy();
+            let root_lossy = scan_root.to_string_lossy();
+            let path = if path == target_lossy {
+                safe_worker_path(target_relative)
+            } else if path == root_lossy {
+                safe_worker_path(scan_root)
+            } else {
+                safe_worker_text(&path)
+            };
+            format!(
+                "deletion planning failed for {path}: {}",
+                safe_worker_text(&message)
+            )
+        }
+        error => safe_worker_text(&error.to_string()),
+    }
+}
+
+fn sanitize_worker_event(event: WorkerEvent) -> WorkerEvent {
+    match event {
+        WorkerEvent::ScanFailed { path, message } => WorkerEvent::ScanFailed {
+            path,
+            message: safe_worker_text(&message),
+        },
+        WorkerEvent::ScanUnscanned { path, reason } => WorkerEvent::ScanUnscanned {
+            path,
+            reason: match reason {
+                crate::model::UnscannedReason::Excluded(pattern) => {
+                    crate::model::UnscannedReason::Excluded(safe_worker_text(&pattern))
+                }
+                crate::model::UnscannedReason::Metadata(message) => {
+                    crate::model::UnscannedReason::Metadata(safe_worker_text(&message))
+                }
+                reason => reason,
+            },
+        },
+        event => event,
+    }
+}
 
 pub(super) fn send_event(
     sender: &Sender<WorkerEvent>,
     mut event: WorkerEvent,
     cancelled: &AtomicBool,
 ) -> bool {
+    event = sanitize_worker_event(event);
     loop {
         match sender.send_timeout(event, CHANNEL_RETRY) {
             Ok(()) => return true,
@@ -595,5 +676,79 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn worker_error_messages_escape_controls_and_bidi_overrides() {
+        let (sender, events) = bounded(1);
+        let cancelled = AtomicBool::new(false);
+        assert!(send_event(
+            &sender,
+            WorkerEvent::ScanFailed {
+                path: Some(PathBuf::from("/scan/hostile")),
+                message: "permission denied\n\u{202e}name\u{1b}[31m".to_string(),
+            },
+            &cancelled,
+        ));
+        let WorkerEvent::ScanFailed { message, .. } = events
+            .recv()
+            .expect("sanitized worker error should be delivered")
+        else {
+            panic!("expected a scan failure event");
+        };
+        assert!(message.starts_with(DECEPTIVE_DISPLAY_MARKER));
+        assert!(message.contains("\\n"));
+        assert!(message.contains("\\u{202e}"));
+        assert!(message.contains("\\x1b"));
+        assert!(!message.chars().any(char::is_control));
+        assert!(!message.contains('\u{202e}'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_errors_preserve_invalid_target_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let relative = PathBuf::from(OsString::from_vec(b"bad\xffname".to_vec()));
+        let error = DeletionPlanError::Io {
+            path: relative.to_string_lossy().into_owned(),
+            message: "permission denied".to_string(),
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+        let rendered = format_deletion_error(error, Path::new("/scan"), &relative);
+        assert!(rendered.contains(DECEPTIVE_DISPLAY_MARKER));
+        assert!(rendered.contains("bad\\xffname"));
+        assert!(!rendered.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn worker_unscanned_error_reasons_escape_controls() {
+        let (sender, events) = bounded(1);
+        let cancelled = AtomicBool::new(false);
+        assert!(send_event(
+            &sender,
+            WorkerEvent::ScanUnscanned {
+                path: PathBuf::from("/scan/hostile"),
+                reason: crate::model::UnscannedReason::Metadata(
+                    "metadata failed\t\u{202e}name".to_string(),
+                ),
+            },
+            &cancelled,
+        ));
+        let WorkerEvent::ScanUnscanned { reason, .. } = events
+            .recv()
+            .expect("sanitized unscanned event should be delivered")
+        else {
+            panic!("expected an unscanned event");
+        };
+        let crate::model::UnscannedReason::Metadata(message) = reason else {
+            panic!("expected metadata reason");
+        };
+        assert!(message.starts_with(DECEPTIVE_DISPLAY_MARKER));
+        assert!(message.contains("\\t"));
+        assert!(message.contains("\\u{202e}"));
+        assert!(!message.chars().any(char::is_control));
+        assert!(!message.contains('\u{202e}'));
     }
 }

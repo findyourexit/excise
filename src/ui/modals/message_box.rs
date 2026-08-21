@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wra
 
 use crate::deletion::{ConfirmationChallenge, DeletionPlan, DeletionReport, PlannedKind};
 use crate::state::FileToDelete;
-use crate::ui::format::{DisplaySize, display_path};
+use crate::ui::format::{DisplaySize, display_path_end, display_text};
 
 #[derive(Clone, Copy)]
 pub enum DeletionView<'a> {
@@ -129,7 +129,7 @@ fn lines(view: DeletionView<'_>, width: u16) -> Vec<Line<'static>> {
     match view {
         DeletionView::Planning(target) => vec![
             Line::from(""),
-            Line::from(truncate(&display_path(&target.full_path()), width)),
+            Line::from(display_path_end(&target.full_path(), width)),
             Line::from(""),
             Line::from("Enumerating a no-follow identity snapshot."),
             Line::from("Deletion is disabled until the plan is complete."),
@@ -151,7 +151,7 @@ fn lines(view: DeletionView<'_>, width: u16) -> Vec<Line<'static>> {
             );
             let mut content = vec![
                 Line::from(""),
-                Line::from(truncate(&display_path(&plan.target.full_path()), width)),
+                Line::from(display_path_end(&plan.target.full_path(), width)),
                 Line::from(truncate(&identity, width)),
                 Line::from(format!(
                     "{} planned entries · {} logical",
@@ -171,12 +171,12 @@ fn lines(view: DeletionView<'_>, width: u16) -> Vec<Line<'static>> {
                 }
                 ConfirmationChallenge::TypeName(expected) => {
                     content.push(Line::from(format!("Type exact name: {expected}")));
-                    content.push(Line::from(format!("> {input}_")));
+                    content.push(Line::from(format!("> {}_", display_text(input))));
                     content.push(Line::from("[Enter] arm when exact"));
                 }
                 ConfirmationChallenge::TypePhrase(expected) => {
                     content.push(Line::from(format!("Type: {expected}")));
-                    content.push(Line::from(format!("> {input}_")));
+                    content.push(Line::from(format!("> {}_", display_text(input))));
                     content.push(Line::from("[Enter] arm when exact"));
                 }
             }
