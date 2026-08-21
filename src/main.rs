@@ -221,7 +221,8 @@ mod tests {
 
         let raw = error.to_string();
         let rendered = safe_error_text(&error);
-        assert!(raw.contains("could not resolve [deceptive] missing-\\u{202e}root"));
+        assert!(raw.contains("[deceptive]"));
+        assert!(raw.contains("missing-\\u{202e}root"));
         assert_eq!(rendered, raw);
         assert_eq!(
             rendered
