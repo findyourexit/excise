@@ -1308,6 +1308,27 @@ mod tests {
         assert!(report.precise);
         assert!(!path.exists());
     }
+    #[test]
+    fn synthetic_and_scan_root_targets_are_rejected() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+
+        let mut synthetic = target(root.path(), OsString::from("target"), FileType::File);
+        synthetic.synthetic = true;
+        assert!(matches!(
+            build_plan(root.path(), synthetic, false),
+            Err(DeletionPlanError::Synthetic)
+        ));
+
+        let mut scan_root = target(root.path(), OsString::from("target"), FileType::File);
+        scan_root.path_to_file.clear();
+        assert!(matches!(
+            build_plan(root.path(), scan_root, false),
+            Err(DeletionPlanError::Root)
+        ));
+        assert!(path.exists());
+    }
 
     #[test]
     fn replaced_file_is_skipped() {
@@ -1481,6 +1502,30 @@ mod tests {
         );
         assert_eq!(report.changed_entries(), 1);
         assert!(path.is_dir());
+    }
+    #[test]
+    fn directory_to_file_replacement_is_skipped() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::create_dir(&path).expect("target directory should be created");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::Folder),
+            false,
+        )
+        .expect("directory plan should build");
+        std::fs::rename(&path, root.path().join("original"))
+            .expect("original directory identity should remain allocated");
+        std::fs::write(&path, b"replacement").expect("replacement file should be written");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(report.changed_entries(), 1);
+        assert!(path.is_file());
     }
 
     #[test]
