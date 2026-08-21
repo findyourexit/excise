@@ -133,7 +133,10 @@ impl ResolvedRoot {
         let requested = NativePath::new(path);
         let resolved_path = fs::canonicalize(requested.as_path()).map_err(|error| {
             AppError::io(
-                format!("could not resolve {}", requested.safe_display().text),
+                format!(
+                    "could not resolve {}",
+                    safe_display_path_text(requested.as_path())
+                ),
                 error,
             )
         })?;
@@ -141,7 +144,7 @@ impl ResolvedRoot {
             AppError::io(
                 format!(
                     "could not inspect {}",
-                    safe_display_path(&resolved_path).text
+                    safe_display_path_text(&resolved_path)
                 ),
                 error,
             )
@@ -149,7 +152,7 @@ impl ResolvedRoot {
         if !metadata.is_dir() {
             return Err(AppError::Cli(format!(
                 "scan root is not a directory: {}",
-                requested.safe_display().text
+                safe_display_path_text(requested.as_path())
             )));
         }
         let identity = identity_for(&resolved_path, &metadata)

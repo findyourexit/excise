@@ -212,4 +212,25 @@ mod tests {
         assert!(!rendered.chars().any(char::is_control));
         assert!(!rendered.contains('\u{202e}'));
     }
+
+    #[test]
+    fn report_error_keeps_missing_hostile_root_path_safe_once() {
+        let parent = tempfile::tempdir().expect("root-error parent should exist");
+        let path = parent.path().join("missing-\u{202e}root");
+        let error = ResolvedRoot::resolve(path).expect_err("missing root should fail to resolve");
+
+        let raw = error.to_string();
+        let rendered = safe_error_text(&error);
+        assert!(raw.contains("could not resolve [deceptive] missing-\\u{202e}root"));
+        assert_eq!(rendered, raw);
+        assert_eq!(
+            rendered
+                .matches(excise::native_path::DECEPTIVE_DISPLAY_MARKER)
+                .count(),
+            1,
+        );
+        assert_eq!(rendered.matches("\\u{202e}").count(), 1);
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.contains('\u{202e}'));
+    }
 }
