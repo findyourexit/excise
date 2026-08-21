@@ -6,6 +6,10 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+_No unreleased changes._
+
+## [0.1.0-rc.1] - 2026-08-21
+
 ### Added
 
 * Added bounded, iterative scanning with explicit exclusions, filesystem boundaries, uncertainty, cancellation, and secure identity spill.
