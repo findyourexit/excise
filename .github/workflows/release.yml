@@ -1,18 +1,45 @@
 name: Release candidate artifacts
-
 on:
   workflow_dispatch:
     inputs:
-      attest:
-        description: Generate GitHub build attestations for the dry-run artifacts
-        type: boolean
-        default: false
-
+      version:
+        description: Expected Cargo.toml package version from protected main
+        required: true
+        type: string
 permissions:
   contents: read
-
 jobs:
+  release-gate:
+    name: Verify protected main source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - name: Check out protected source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify dispatch identity and manifest version
+        id: identity
+        shell: bash
+        env:
+          EXPECTED_REF: refs/heads/main
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = "$EXPECTED_REF"
+          test "$GITHUB_REF_PROTECTED" = true
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          test -n "$manifest_version"
+          test "$manifest_version" = "$EXPECTED_VERSION"
+          printf 'version=%s\n' "$manifest_version" >> "$GITHUB_OUTPUT"
   archive:
+    needs: release-gate
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -30,7 +57,22 @@ jobs:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Verify checked-out source
+        shell: bash
+        env:
+          EXPECTED_REF: refs/heads/main
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ needs.release-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "$EXPECTED_REF"
+          test "$GITHUB_REF_PROTECTED" = true
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          test -n "$manifest_version"
+          test "$manifest_version" = "$EXPECTED_VERSION"
       - name: Install Linux cross linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update --yes && sudo apt-get install --yes gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
@@ -74,9 +116,11 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          EXPECTED_VERSION: ${{ needs.release-gate.outputs.version }}
         run: |
           set -euo pipefail
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          test "$version" = "$EXPECTED_VERSION"
           root="excise-${TARGET}-v${version}"
           mkdir -p "stage/${root}/generated" "stage/${root}/schemas"
           cp "target/${TARGET}/release/excise" "stage/${root}/excise"
@@ -91,8 +135,10 @@ jobs:
         shell: pwsh
         env:
           TARGET: ${{ matrix.target }}
+          EXPECTED_VERSION: ${{ needs.release-gate.outputs.version }}
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]*)"').Matches[0].Groups[1].Value
+          if ($version -ne $env:EXPECTED_VERSION) { throw "Manifest version does not match release gate" }
           $root = "excise-$env:TARGET-v$version"
           New-Item -ItemType Directory -Force "stage/$root/generated", "stage/$root/schemas", upload | Out-Null
           Copy-Item "target/$env:TARGET/release/excise.exe" "stage/$root/excise.exe"
@@ -107,10 +153,9 @@ jobs:
           path: upload/*
           if-no-files-found: error
           retention-days: 1
-
   supply-chain:
-    name: Checksums, SBOM, and optional provenance
-    needs: archive
+    name: Checksums, SBOM, and provenance
+    needs: [archive, release-gate]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -124,6 +169,20 @@ jobs:
           ref: ${{ github.sha }}
           path: source
           persist-credentials: false
+      - name: Verify checked-out source
+        shell: bash
+        env:
+          EXPECTED_REF: refs/heads/main
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ needs.release-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "$EXPECTED_REF"
+          test "$GITHUB_REF_PROTECTED" = true
+          test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' source/Cargo.toml | sed -n '1p')"
+          test -n "$manifest_version"
+          test "$manifest_version" = "$EXPECTED_VERSION"
       - name: Prepare Cargo dependency source
         shell: bash
         run: |
@@ -156,8 +215,7 @@ jobs:
           test "$(jq '.packages | length' "$sbom")" -gt 1
           jq -e '.packages[] | select(.name == "excise")' "$sbom" >/dev/null
           jq -e '.packages[] | select(.name == "serde")' "$sbom" >/dev/null
-      - name: Attest dry-run artifacts
-        if: inputs.attest
+      - name: Attest release candidate artifacts
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: release/*
