@@ -311,6 +311,13 @@ where
                     .request_deletion_plan(target, reduced_guardrails, maximum_bytes)?;
                 self.deletion_active = true;
             }
+            InputCommand::RevalidateDeletion(plan) => {
+                if self.deletion_active {
+                    return Ok(());
+                }
+                self.workers()?.revalidate_deletion(plan)?;
+                self.deletion_active = true;
+            }
             InputCommand::ExportScan => {
                 let result = next_export_path("scan-report").and_then(|path| {
                     let mut file = OpenOptions::new()
@@ -395,13 +402,6 @@ where
                 }
             }
             InputCommand::DiscardPreferencesAndExit => self.app.exit(),
-            InputCommand::ExecuteDeletion(plan) => {
-                if self.deletion_active {
-                    return Ok(());
-                }
-                self.workers()?.execute_deletion(plan)?;
-                self.deletion_active = true;
-            }
             InputCommand::SoftCancelDeletion => self.workers()?.soft_cancel_deletion(),
             InputCommand::HardCancel => self.hard_cancelled = true,
         }
@@ -536,6 +536,35 @@ where
                 }
                 self.app.deletion_plan_ready(target_node_id, result);
             }
+            WorkerEvent::DeletionRevalidated {
+                target_node_id,
+                result,
+            } => {
+                self.deletion_active = false;
+                match result {
+                    Ok(plan) => {
+                        self.workers()?.execute_deletion(*plan)?;
+                        self.deletion_active = true;
+                    }
+                    Err((_plan, error)) if error == "deletion planning was cancelled" => {
+                        self.app.normal_mode();
+                    }
+                    Err((plan, _error)) => {
+                        self.animation.schedule_error();
+                        self.app.deletion_revalidation_failed(target_node_id, *plan);
+                        if let Some(target) = self.app.take_deletion_replan() {
+                            let reduced_guardrails = self.app.reduced_deletion_guardrails();
+                            let maximum_bytes = self.app.maximum_deletion_plan_bytes();
+                            self.workers()?.request_deletion_plan(
+                                target,
+                                reduced_guardrails,
+                                maximum_bytes,
+                            )?;
+                            self.deletion_active = true;
+                        }
+                    }
+                }
+            }
             WorkerEvent::DeletionFinished { report } => {
                 self.deletion_active = false;
                 let deleted = report.deleted_entries();
@@ -556,14 +585,23 @@ where
                     .summary
                     .deletion_unattempted_entries
                     .saturating_add(report.unattempted_entries());
-                self.animation.schedule_deletion_result();
-                if self.app.complete_deletion(report) && deleted > 0 {
-                    self.app.flash_space_freed();
-                    self.schedule(
-                        self.clock.now(),
-                        TimedAction::UnflashSpace,
-                        TRANSIENT_STATUS_DURATION,
-                    );
+                match self.app.try_complete_deletion(report) {
+                    Ok(true) => {
+                        self.animation.schedule_deletion_result();
+                        self.app.flash_space_freed();
+                        self.schedule(
+                            self.clock.now(),
+                            TimedAction::UnflashSpace,
+                            TRANSIENT_STATUS_DURATION,
+                        );
+                    }
+                    Ok(false) => self.animation.schedule_deletion_result(),
+                    Err(error) => {
+                        self.summary.unreadable_entries =
+                            self.summary.unreadable_entries.saturating_add(1);
+                        self.summary.last_worker_error = Some(error.to_string());
+                        self.animation.schedule_error();
+                    }
                 }
             }
         }
@@ -797,7 +835,9 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                     tree.failed_to_read = tree.failed_to_read.saturating_add(1);
                 }
                 WorkerEvent::ScanFinished { cancelled } => return Ok(cancelled),
-                WorkerEvent::DeletionPlanned { .. } | WorkerEvent::DeletionFinished { .. } => {}
+                WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
     })();

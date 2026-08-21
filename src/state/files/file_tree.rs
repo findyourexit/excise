@@ -232,7 +232,12 @@ impl FileTree {
         }
     }
 
+    #[allow(dead_code)]
     pub fn apply_deletion_report(&mut self, report: &DeletionReport) {
+        let _ = self.try_apply_deletion_report(report);
+    }
+
+    pub fn try_apply_deletion_report(&mut self, report: &DeletionReport) -> Result<(), ModelError> {
         let removed_paths = report
             .entries
             .iter()
@@ -244,7 +249,7 @@ impl FileTree {
             })
             .map(|result| self.path_in_filesystem.join(&result.entry.relative_path))
             .collect::<Vec<_>>();
-        self.arena.remove_paths(&removed_paths);
+        self.arena.try_remove_paths(&removed_paths)?;
         if report.changed_entries() > 0
             || report.failed_entries() > 0
             || report.unattempted_entries() > 0
@@ -261,6 +266,7 @@ impl FileTree {
             report.deleted_allocated_bytes()
         };
         self.space_freed = self.space_freed.saturating_add(freed);
+        Ok(())
     }
 
     #[allow(clippy::needless_pass_by_value)]

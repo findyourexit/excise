@@ -57,7 +57,7 @@ pub(crate) enum InputCommand {
     StartRescan(PathBuf),
     CancelRescan,
     PlanDeletion(FileToDelete),
-    ExecuteDeletion(DeletionPlan),
+    RevalidateDeletion(DeletionPlan),
     ExportScan,
     ExportDeletionHistory,
     CycleTheme,
@@ -344,13 +344,9 @@ fn handle_keypress_delete_confirm_mode<B: Backend>(evt: &Event, app: &mut App<B>
             app.pop_confirmation_character();
             InputCommand::None
         }
-        key!(Enter) => app.take_confirmed_deletion_plan().map_or_else(
-            || {
-                app.take_deletion_replan()
-                    .map_or(InputCommand::None, InputCommand::PlanDeletion)
-            },
-            InputCommand::ExecuteDeletion,
-        ),
+        key!(Enter) => app
+            .take_confirmed_deletion_plan()
+            .map_or(InputCommand::None, InputCommand::RevalidateDeletion),
         Event::Key(KeyEvent {
             code: KeyCode::Char(character),
             modifiers,
@@ -358,13 +354,8 @@ fn handle_keypress_delete_confirm_mode<B: Backend>(evt: &Event, app: &mut App<B>
         }) if modifiers.is_empty() || *modifiers == KeyModifiers::SHIFT => {
             app.push_confirmation_character(*character);
             if app.confirmation_is_single_key() {
-                app.take_confirmed_deletion_plan().map_or_else(
-                    || {
-                        app.take_deletion_replan()
-                            .map_or(InputCommand::None, InputCommand::PlanDeletion)
-                    },
-                    InputCommand::ExecuteDeletion,
-                )
+                app.take_confirmed_deletion_plan()
+                    .map_or(InputCommand::None, InputCommand::RevalidateDeletion)
             } else {
                 InputCommand::None
             }

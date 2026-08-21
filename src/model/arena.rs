@@ -641,9 +641,13 @@ impl Arena {
     }
 
     pub fn remove_subtree(&mut self, root: NodeId) {
+        let _ = self.try_remove_subtree(root);
+    }
+
+    pub fn try_remove_subtree(&mut self, root: NodeId) -> Result<(), ModelError> {
         let mut removed = Vec::new();
         self.collect_subtree_ids(root, &mut removed);
-        self.remove_nodes_with_accounting(removed);
+        self.remove_nodes_with_accounting(removed).map(|_| ())
     }
 
     fn collect_subtree_ids(&self, root: NodeId, removed: &mut Vec<NodeId>) {
@@ -657,6 +661,10 @@ impl Arena {
     }
 
     pub fn remove_paths(&mut self, paths: &[PathBuf]) -> usize {
+        self.try_remove_paths(paths).unwrap_or(0)
+    }
+
+    pub fn try_remove_paths(&mut self, paths: &[PathBuf]) -> Result<usize, ModelError> {
         let mut removed = Vec::new();
         for path in paths {
             if let Some(id) = self.find_path(path)
@@ -668,11 +676,14 @@ impl Arena {
         self.remove_nodes_with_accounting(removed)
     }
 
-    fn remove_nodes_with_accounting(&mut self, mut removed: Vec<NodeId>) -> usize {
+    fn remove_nodes_with_accounting(
+        &mut self,
+        mut removed: Vec<NodeId>,
+    ) -> Result<usize, ModelError> {
         removed.sort_unstable();
         removed.dedup();
         if removed.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let shared = self
             .nodes
@@ -684,19 +695,16 @@ impl Arena {
             })
             .map(|node| node.id)
             .collect::<Vec<_>>();
-        let identities = self
-            .rebuild_identities_without(&removed)
-            .expect("deletion identity reconciliation should remain readable");
+        let identities = self.rebuild_identities_without(&removed)?;
+        let identity_scratch = IdentityStore::new(self.identities.memory_limit())?;
         let mut removal_order = removed.clone();
         removal_order.sort_by_key(|id| self.depth(*id));
         self.remove_nodes(removal_order);
         self.remove_nodes(shared);
         self.identities = identities;
         self.prepare_identity_metrics();
-        let identity_scratch = IdentityStore::new(self.identities.memory_limit())
-            .expect("deletion identity scratch should remain available");
-        self.rebuild_identity_metrics(identity_scratch);
-        removed.len()
+        self.rebuild_identity_metrics(identity_scratch)?;
+        Ok(removed.len())
     }
 
     fn remove_nodes(&mut self, removed: Vec<NodeId>) {
@@ -733,16 +741,19 @@ impl Arena {
     }
 
     pub fn remove_path(&mut self, path: &Path) -> bool {
+        self.try_remove_path(path).unwrap_or(false)
+    }
+
+    pub fn try_remove_path(&mut self, path: &Path) -> Result<bool, ModelError> {
         let Some(id) = self.find_path(path) else {
-            return false;
+            return Ok(false);
         };
         if id == self.root {
-            return false;
+            return Ok(false);
         }
         let mut removed = Vec::new();
         self.collect_subtree_ids(id, &mut removed);
-        self.remove_nodes_with_accounting(removed);
-        true
+        self.remove_nodes_with_accounting(removed).map(|_| true)
     }
 
     pub fn mark_path_uncertain(&mut self, path: &Path, reason: UnscannedReason) -> bool {
@@ -868,7 +879,7 @@ impl Arena {
         self.budget = planned_budget;
         self.identities = identities;
         self.prepare_identity_metrics();
-        self.rebuild_identity_metrics(identity_scratch);
+        self.rebuild_identity_metrics(identity_scratch)?;
         Ok(())
     }
 
@@ -992,9 +1003,22 @@ impl Arena {
                     node.metrics =
                         leaf_metrics(node.snapshot.apparent_bytes, ByteBounds::exact(0), links);
                 }
+                NodeKind::Link
+                    if node.state == NodeState::Complete && node.unscanned_reason.is_none() =>
+                {
+                    let links = node
+                        .snapshot
+                        .identity
+                        .as_ref()
+                        .and_then(|identity| identity.link_count);
+                    node.metrics =
+                        leaf_metrics(node.snapshot.apparent_bytes, ByteBounds::exact(0), links);
+                }
                 NodeKind::Synthetic(SyntheticKind::Other | SyntheticKind::Aggregate) => {
-                    node.metrics.allocated_bytes = ByteBounds::exact(0);
-                    node.metrics.reclaimable_bytes = ByteBounds::exact(0);
+                    node.metrics.allocated_bytes =
+                        reset_rebuild_bounds(node.metrics.allocated_bytes);
+                    node.metrics.reclaimable_bytes =
+                        reset_rebuild_bounds(node.metrics.reclaimable_bytes);
                 }
                 NodeKind::File
                 | NodeKind::Root
@@ -1004,7 +1028,8 @@ impl Arena {
             }
         }
     }
-    fn rebuild_identity_metrics(&mut self, replacement: IdentityStore) {
+
+    fn rebuild_identity_metrics(&mut self, replacement: IdentityStore) -> Result<(), ModelError> {
         let mut identities = std::mem::replace(&mut self.identities, replacement);
         let duplicate_bytes = self
             .duplicate_identities
@@ -1012,19 +1037,18 @@ impl Arena {
             .saturating_mul(DUPLICATE_ID_OVERHEAD);
         self.budget.release(duplicate_bytes);
         self.duplicate_identities.clear();
-        identities
-            .visit_records(|file_id, record| {
-                self.restore_identity_allocation(&record);
-                if record.observed_links > 1 {
-                    self.track_duplicate(file_id);
-                }
-                Ok(())
-            })
-            .expect("preflighted identity records should remain readable");
+        let result = identities.visit_records(|file_id, record| {
+            self.restore_identity_allocation(&record);
+            if record.observed_links > 1 {
+                self.track_duplicate(file_id);
+            }
+            Ok(())
+        });
         self.identities = identities;
+        result?;
         self.rebuild_metrics();
-        self.finalize()
-            .expect("preflighted identity finalization should remain valid");
+        self.finalize()?;
+        Ok(())
     }
 
     fn restore_identity_allocation(&mut self, record: &IdentityRecord) {
@@ -1732,6 +1756,14 @@ fn retention_rank(metrics: NodeMetrics) -> (bool, u128) {
         metrics.allocated_bytes.upper.is_none(),
         metrics.allocated_bytes.lower,
     )
+}
+
+fn reset_rebuild_bounds(bounds: ByteBounds) -> ByteBounds {
+    if bounds.upper.is_none() {
+        ByteBounds::unknown()
+    } else {
+        ByteBounds::exact(0)
+    }
 }
 
 fn estimate_node(name: &OsStr) -> usize {
@@ -2630,5 +2662,194 @@ mod tests {
         assert_eq!(after, before);
         assert_eq!(live.path_for(old_id), Some(old));
         assert_eq!(live.memory_used(), memory_before);
+    }
+    #[test]
+    fn deletion_rebuild_preserves_unknown_other_bounds() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let unknown = root.path().join("unknown");
+        let removable = root.path().join("removable");
+        fs::write(&removable, b"remove").expect("removable fixture should be written");
+        let mut arena = test_arena(root.path());
+        arena.max_children_per_directory = 0;
+        arena
+            .record_unscanned(&unknown, UnscannedReason::Metadata("denied".to_string()))
+            .expect("unknown Other entry should be represented");
+        arena.max_children_per_directory = DEFAULT_MAX_CHILDREN;
+        let removable_id = add_path(&mut arena, &removable).expect("removable should be retained");
+        arena
+            .complete_directory(root.path())
+            .expect("root should complete");
+        arena.finalize().expect("model should finalize");
+        let other_id = arena
+            .children(arena.root())
+            .iter()
+            .copied()
+            .find(|id| {
+                arena
+                    .node(*id)
+                    .is_some_and(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Other))
+            })
+            .expect("Other entry should remain");
+        assert_eq!(
+            arena
+                .node(other_id)
+                .expect("Other entry should exist")
+                .metrics
+                .allocated_bytes,
+            ByteBounds::unknown()
+        );
+        assert!(
+            arena
+                .try_remove_path(&removable)
+                .expect("deletion rebuild should succeed")
+        );
+        assert!(arena.node(removable_id).is_none());
+        let other = arena.node(other_id).expect("Other entry should survive");
+        assert_eq!(other.metrics.allocated_bytes.upper, None);
+        assert_eq!(other.metrics.reclaimable_bytes.upper, None);
+    }
+
+    #[test]
+    fn deletion_rebuild_preserves_unknown_aggregate_bounds() {
+        let root = tempfile::tempdir().expect("aggregate root should exist");
+        let aggregate_path = root.path().join("aggregate");
+        let aggregate_unknown = aggregate_path.join("unknown");
+        let removable = root.path().join("removable");
+        fs::create_dir(&aggregate_path).expect("aggregate directory should be created");
+        fs::write(&removable, b"remove").expect("removable fixture should be written");
+        let mut arena = test_arena(root.path());
+        arena
+            .record_unscanned(
+                &aggregate_unknown,
+                UnscannedReason::Metadata("denied".to_string()),
+            )
+            .expect("unknown aggregate entry should be represented");
+        let removable_id = add_path(&mut arena, &removable).expect("removable should be retained");
+        arena
+            .complete_directory(&aggregate_path)
+            .expect("aggregate directory should complete");
+        arena
+            .complete_directory(root.path())
+            .expect("aggregate root should complete");
+        arena.finalize().expect("aggregate model should finalize");
+        assert!(
+            arena
+                .aggregate_cold_subtree(&HashSet::from([arena.root()]))
+                .expect("aggregate conversion should succeed")
+        );
+        let aggregate_id = arena
+            .children(arena.root())
+            .iter()
+            .copied()
+            .find(|id| {
+                arena
+                    .node(*id)
+                    .is_some_and(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Aggregate))
+            })
+            .expect("Aggregate entry should remain");
+        assert_eq!(
+            arena
+                .node(aggregate_id)
+                .expect("Aggregate entry should exist")
+                .metrics
+                .allocated_bytes
+                .upper,
+            None
+        );
+        assert!(
+            arena
+                .try_remove_path(&removable)
+                .expect("aggregate deletion rebuild should succeed")
+        );
+        assert!(arena.node(removable_id).is_none());
+        let aggregate = arena
+            .node(aggregate_id)
+            .expect("Aggregate entry should survive");
+        assert_eq!(aggregate.metrics.allocated_bytes.upper, None);
+        assert_eq!(aggregate.metrics.reclaimable_bytes.upper, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_rebuild_does_not_double_count_surviving_reparse_objects() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("model root should exist");
+        let target = root.path().join("target");
+        let link = root.path().join("link");
+        let removable = root.path().join("removable");
+        fs::write(&target, b"target").expect("link target should be written");
+        symlink(&target, &link).expect("symlink should be created");
+        fs::write(&removable, b"remove").expect("removable fixture should be written");
+        let mut arena = test_arena(root.path());
+        let link_metadata = fs::symlink_metadata(&link).expect("link metadata should exist");
+        let link_identity = identity_for(&link, &link_metadata)
+            .expect("link identity should be readable")
+            .expect("link identity should be available");
+        let link_id = arena
+            .add_entry(&link, &link_metadata, link_identity)
+            .expect("link should be added")
+            .expect("link should be retained");
+        let removable_id = add_path(&mut arena, &removable).expect("removable should be added");
+        arena
+            .complete_directory(root.path())
+            .expect("root should complete");
+        arena.finalize().expect("model should finalize");
+        let before = arena
+            .node(link_id)
+            .expect("link should exist")
+            .metrics
+            .allocated_bytes;
+
+        assert!(
+            arena
+                .try_remove_path(&removable)
+                .expect("deletion rebuild should succeed")
+        );
+        assert!(arena.node(removable_id).is_none());
+        assert_eq!(
+            arena
+                .node(link_id)
+                .expect("surviving link should exist")
+                .metrics
+                .allocated_bytes,
+            before
+        );
+    }
+    #[test]
+    fn corrupt_identity_spill_returns_error_without_panicking() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let path = root.path().join("target");
+        fs::write(&path, b"payload").expect("target fixture should be written");
+        let mut arena = test_arena(root.path());
+        let target_id = add_path(&mut arena, &path).expect("target should be retained");
+        arena
+            .complete_directory(root.path())
+            .expect("root should complete");
+        arena.finalize().expect("model should finalize");
+
+        let mut corrupt = IdentityStore::new(1).expect("spill store should initialize");
+        corrupt
+            .observe(
+                &FileId::new_inode(17, 1),
+                Some(1),
+                ByteBounds::exact(4096),
+                Some(NodeId(1)),
+                Some(NodeId(1)),
+            )
+            .expect("identity should spill");
+        let spill_path = corrupt
+            .spill_path()
+            .expect("spilled store should expose its path")
+            .to_path_buf();
+        std::fs::write(spill_path.join("identities.redb"), b"corrupt")
+            .expect("spill database should be corruptible");
+        arena.identities = corrupt;
+
+        let error = arena
+            .try_remove_path(&path)
+            .expect_err("corrupt identity spill should be reported");
+        assert!(error.to_string().contains("identity"));
+        assert!(arena.node(target_id).is_some());
     }
 }

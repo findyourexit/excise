@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bo
 
 use crate::deletion::{
     DeletionPlan, DeletionReport, build_plan_cancellable,
-    build_plan_cancellable_with_root_identity, execute_plan,
+    build_plan_cancellable_with_root_identity, execute_plan, revalidate_plan_cancellable,
 };
 use crate::error::AppError;
 use crate::native_path::NativeIdentity;
@@ -47,6 +47,10 @@ pub(super) enum WorkerEvent {
         target_node_id: crate::model::NodeId,
         result: Result<Box<DeletionPlan>, String>,
     },
+    DeletionRevalidated {
+        target_node_id: crate::model::NodeId,
+        result: Result<Box<DeletionPlan>, (Box<DeletionPlan>, String)>,
+    },
     DeletionFinished {
         report: DeletionReport,
     },
@@ -58,6 +62,7 @@ enum WorkerCommand {
         target: FileToDelete,
         reduced_guardrails: bool,
     },
+    RevalidateDeletion(DeletionPlan),
     Rescan(ScannerOptions),
     ExecuteDeletion(DeletionPlan),
 }
@@ -148,6 +153,13 @@ impl WorkerPool {
         self.deletion_soft_cancelled.store(false, Ordering::Release);
         self.commands
             .send(WorkerCommand::ExecuteDeletion(plan))
+            .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
+    }
+
+    pub fn revalidate_deletion(&self, plan: DeletionPlan) -> Result<(), AppError> {
+        self.deletion_soft_cancelled.store(false, Ordering::Release);
+        self.commands
+            .send(WorkerCommand::RevalidateDeletion(plan))
             .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
     }
 
@@ -244,6 +256,17 @@ fn deletion_worker(
                     result,
                 }
             }
+            WorkerCommand::RevalidateDeletion(plan) => {
+                let target_node_id = plan.target.node_id;
+                let result = match revalidate_plan_cancellable(scan_root, &plan, soft_cancelled) {
+                    Ok(()) => Ok(Box::new(plan)),
+                    Err(error) => Err((Box::new(plan), error.to_string())),
+                };
+                WorkerEvent::DeletionRevalidated {
+                    target_node_id,
+                    result,
+                }
+            }
             WorkerCommand::Rescan(options) => {
                 scanner::run(options, sender, rescan_cancelled.as_ref());
                 continue;
@@ -328,6 +351,7 @@ mod tests {
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -367,6 +391,7 @@ mod tests {
                     WorkerEvent::ScanDirectoryComplete { .. }
                     | WorkerEvent::ScanUnscanned { .. }
                     | WorkerEvent::DeletionPlanned { .. }
+                    | WorkerEvent::DeletionRevalidated { .. }
                     | WorkerEvent::DeletionFinished { .. } => {}
                 }
             }
@@ -406,6 +431,7 @@ mod tests {
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -443,6 +469,7 @@ mod tests {
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -492,6 +519,7 @@ mod tests {
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -537,6 +565,7 @@ mod tests {
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -580,6 +609,7 @@ mod tests {
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -631,6 +661,7 @@ mod tests {
                 | WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -638,6 +669,102 @@ mod tests {
         workers.shutdown().expect("workers should stop");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn final_plan_revalidation_runs_in_cancellable_worker() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::time::UNIX_EPOCH;
+
+        use crate::deletion::{
+            ConfirmationChallenge, DeletionPlan, PlannedEntry, PlannedKind, PlannedSnapshot,
+            ReviewedEntry, current_scan_root_identity,
+        };
+        use crate::native_path::identity_for;
+        use crate::state::FileToDelete;
+        use crate::state::tiles::FileType;
+
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"original").expect("target should be written");
+        let metadata = std::fs::symlink_metadata(&path).expect("target metadata should exist");
+        let identity = identity_for(&path, &metadata)
+            .expect("target identity should be readable")
+            .expect("target identity should be available");
+        let snapshot = PlannedSnapshot {
+            identity: identity.clone(),
+            kind: PlannedKind::File,
+            apparent_bytes: u128::from(metadata.len()),
+            allocated_bytes: Some(u128::from(metadata.blocks()).saturating_mul(512)),
+            modified_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+        };
+        let target = FileToDelete {
+            node_id: crate::model::NodeId(1),
+            synthetic: false,
+            path_in_filesystem: root.path().to_path_buf(),
+            path_to_file: vec![std::ffi::OsString::from("target")],
+            file_type: FileType::File,
+            num_descendants: None,
+            size: snapshot.apparent_bytes,
+            expected_snapshot: crate::model::EntrySnapshot {
+                identity: Some(identity),
+                kind: crate::model::NodeKind::File,
+                apparent_bytes: snapshot.apparent_bytes,
+                allocated_bytes: snapshot.allocated_bytes,
+                modified_nanos: snapshot.modified_nanos,
+            },
+            reviewed_entries: vec![ReviewedEntry {
+                relative_path: std::path::PathBuf::from("target"),
+                snapshot: snapshot.clone(),
+            }],
+        };
+        let root_identity =
+            current_scan_root_identity(root.path()).expect("scan root identity should be readable");
+        let plan = DeletionPlan {
+            target,
+            root_relative_path: std::path::PathBuf::from("target"),
+            scan_root_identity: root_identity.clone(),
+            entries: vec![PlannedEntry {
+                relative_path: std::path::PathBuf::from("target"),
+                snapshot,
+            }],
+            challenge: ConfirmationChallenge::ConfirmFile,
+            apparent_bytes: 8,
+            estimated_bytes: 1,
+        };
+        let mut scanner_options = options(root.path(), 1);
+        scanner_options.root_identity = Some(root_identity);
+        let workers = WorkerPool::start(scanner_options, 16).expect("workers should start");
+        std::fs::write(&path, b"replacement-after-confirmation")
+            .expect("replacement should be written");
+        workers
+            .revalidate_deletion(plan)
+            .expect("revalidation should be queued");
+
+        let result = loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker should report revalidation")
+            {
+                WorkerEvent::DeletionRevalidated { result, .. } => break result,
+                WorkerEvent::ScanBatch { .. }
+                | WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::ScanFailed { .. }
+                | WorkerEvent::ScanFinished { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        };
+        let (returned, error) = result.expect_err("changed confirmation should be rejected");
+        assert_eq!(returned.entries.len(), 1);
+        assert!(error.contains("changed"));
+        workers.shutdown().expect("workers should stop");
+    }
     #[test]
     fn hard_shutdown_does_not_join_blocked_workers() {
         let (_event_sender, events) = bounded::<WorkerEvent>(1);

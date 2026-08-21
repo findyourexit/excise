@@ -11,7 +11,7 @@ use crate::animation::AnimationScheduler;
 use crate::config::{CustomKeyBindings, KeyPreset};
 use crate::deletion::{
     ConfirmationChallenge, DeletionPlan, DeletionReport, current_scan_root_identity,
-    deletion_supported, revalidate_plan,
+    deletion_supported,
 };
 use crate::error::AppError;
 use crate::filter::FilterPattern;
@@ -590,14 +590,6 @@ where
         else {
             return None;
         };
-        if revalidate_plan(&plan.target.path_in_filesystem, &plan).is_err() {
-            let target = plan.target;
-            let display = target.display_copy();
-            self.deletion_replan = Some(target);
-            self.ui_mode = UiMode::PlanningDeletion(Box::new(display));
-            self.mark_dirty();
-            return None;
-        }
         let planned_entries = plan.planned_entries();
         self.ui_mode = UiMode::Deleting {
             planned_entries,
@@ -622,6 +614,22 @@ where
             self.mark_dirty();
         }
     }
+    pub fn deletion_revalidation_failed(
+        &mut self,
+        target_node_id: crate::model::NodeId,
+        plan: DeletionPlan,
+    ) {
+        if plan.target.node_id != target_node_id {
+            self.show_error("Deletion validation returned an unexpected target");
+            return;
+        }
+        let target = plan.target;
+        let display = target.display_copy();
+        self.deletion_replan = Some(target);
+        self.ui_effects.deletion_in_progress = false;
+        self.ui_mode = UiMode::PlanningDeletion(Box::new(display));
+        self.mark_dirty();
+    }
 
     pub fn resume_deletion(&mut self, stopping: bool) {
         if let UiMode::DeletionCancel { planned_entries } = self.ui_mode {
@@ -633,10 +641,19 @@ where
         }
     }
 
+    #[allow(dead_code)]
     pub fn complete_deletion(&mut self, report: DeletionReport) -> bool {
+        self.try_complete_deletion(report).unwrap_or(false)
+    }
+
+    pub fn try_complete_deletion(&mut self, report: DeletionReport) -> Result<bool, AppError> {
         self.ui_effects.deletion_in_progress = false;
         let deleted = report.deleted_entries() > 0;
-        self.file_tree.apply_deletion_report(&report);
+        if let Err(error) = self.file_tree.try_apply_deletion_report(&report) {
+            self.ui_mode = UiMode::ErrorMessage(format!("Deletion accounting failed: {error}"));
+            self.mark_dirty();
+            return Err(model_error(error));
+        }
         let report = Arc::new(report);
         if report.estimated_bytes <= self.remaining_deletion_history_bytes() {
             self.deletion_history_bytes = self
@@ -647,7 +664,7 @@ where
         self.ui_mode = UiMode::DeletionResult { report };
         self.board.reset_selected_index();
         self.render_and_update_board();
-        deleted
+        Ok(deleted)
     }
 
     #[must_use]
@@ -731,6 +748,7 @@ where
 
     pub fn normal_mode(&mut self) {
         self.deletion_replan = None;
+        self.ui_effects.deletion_in_progress = false;
         self.ui_mode = UiMode::Normal;
         self.render_and_update_board();
     }
@@ -901,7 +919,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn stale_confirmation_is_discarded_and_replanned() {
+    fn confirmed_plan_is_deferred_to_worker_revalidation() {
         use std::os::unix::fs::MetadataExt as _;
         use std::time::UNIX_EPOCH;
 
@@ -961,8 +979,11 @@ mod tests {
         };
         std::fs::write(&path, b"replacement").expect("target should change");
 
-        assert!(app.take_confirmed_deletion_plan().is_none());
-        assert!(matches!(app.ui_mode, UiMode::PlanningDeletion(_)));
-        assert!(app.take_deletion_replan().is_some());
+        let confirmed = app
+            .take_confirmed_deletion_plan()
+            .expect("confirmed plan should be handed to the worker");
+        assert_eq!(confirmed.entries.len(), 1);
+        assert!(matches!(app.ui_mode, UiMode::Deleting { .. }));
+        assert!(app.take_deletion_replan().is_none());
     }
 }
