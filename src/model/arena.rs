@@ -219,19 +219,19 @@ impl Arena {
             .last()
             .ok_or_else(|| ModelError::InvalidPath("entry had no filename".to_string()))?;
 
-        let kind = if metadata.is_dir() {
-            NodeKind::Directory
-        } else if metadata.file_type().is_symlink() {
+        let kind = if metadata.file_type().is_symlink() || identity.reparse_point {
             NodeKind::Link
+        } else if metadata.is_dir() {
+            NodeKind::Directory
         } else {
             NodeKind::File
         };
-        let apparent = if metadata.is_dir() {
+        let apparent = if kind == NodeKind::Directory {
             0
         } else {
             u128::from(metadata.len())
         };
-        let allocated = if metadata.is_dir() {
+        let allocated = if kind == NodeKind::Directory {
             ByteBounds::exact(0)
         } else {
             physical_size(path, metadata)
@@ -247,7 +247,7 @@ impl Arena {
             identity: Some(identity.clone()),
             kind,
             apparent_bytes: apparent,
-            allocated_bytes: if kind == NodeKind::File && !cfg!(windows) {
+            allocated_bytes: if matches!(kind, NodeKind::File | NodeKind::Link) {
                 allocated.upper
             } else {
                 None
@@ -410,23 +410,31 @@ impl Arena {
             }
         }
         let metadata = fs::symlink_metadata(path).ok();
-        let kind = if metadata.as_ref().is_some_and(Metadata::is_dir) {
-            NodeKind::Directory
-        } else if metadata
+        let metadata_identity = metadata
+            .as_ref()
+            .and_then(|metadata| identity_for(path, metadata).ok().flatten());
+        let is_link = metadata
             .as_ref()
             .is_some_and(|metadata| metadata.file_type().is_symlink())
-        {
+            || metadata_identity
+                .as_ref()
+                .is_some_and(|identity| identity.reparse_point)
+            || matches!(reason, UnscannedReason::SymbolicLink);
+        let kind = if is_link {
             NodeKind::Link
+        } else if metadata.as_ref().is_some_and(Metadata::is_dir) {
+            NodeKind::Directory
         } else {
             NodeKind::File
         };
         let apparent = metadata
             .as_ref()
+            .filter(|_| kind != NodeKind::Directory)
             .map_or(0, |metadata| u128::from(metadata.len()));
         let allocated = metadata
             .as_ref()
             .map_or_else(ByteBounds::unknown, |metadata| {
-                if metadata.is_dir() {
+                if kind == NodeKind::Directory {
                     ByteBounds::exact(0)
                 } else {
                     physical_size(path, metadata)
@@ -435,11 +443,11 @@ impl Arena {
                 }
             });
 
-        let metrics = if scoped_zero {
-            NodeMetrics::default()
-        } else {
-            leaf_metrics(apparent, allocated, None)
-        };
+        let declared_links = metadata_identity
+            .as_ref()
+            .filter(|identity| identity.reparse_point)
+            .and_then(|identity| identity.link_count);
+        let metrics = unscanned_metrics(apparent, allocated, kind, &reason, declared_links);
         let at_child_limit = self.retained_child_count(parent) >= self.max_children_per_directory;
         let replacement = if !aggregate_at_parent && at_child_limit {
             self.smallest_retained_child(parent)
@@ -469,12 +477,10 @@ impl Arena {
             kind,
             unscanned_state(&reason),
             EntrySnapshot {
-                identity: metadata
-                    .as_ref()
-                    .and_then(|metadata| identity_for(path, metadata).ok().flatten()),
+                identity: metadata_identity,
                 kind,
                 apparent_bytes: apparent,
-                allocated_bytes: if kind == NodeKind::File && !cfg!(windows) {
+                allocated_bytes: if matches!(kind, NodeKind::File | NodeKind::Link) {
                     allocated.upper
                 } else {
                     None
@@ -705,6 +711,14 @@ impl Arena {
     }
 
     pub fn try_remove_paths(&mut self, paths: &[PathBuf]) -> Result<usize, ModelError> {
+        self.try_remove_paths_with_link_counts(paths, &HashMap::new())
+    }
+
+    pub(crate) fn try_remove_paths_with_link_counts(
+        &mut self,
+        paths: &[PathBuf],
+        link_counts: &HashMap<FileId, Option<u64>>,
+    ) -> Result<usize, ModelError> {
         let mut removed = Vec::new();
         for path in paths {
             if let Some(id) = self.find_path(path)
@@ -713,12 +727,17 @@ impl Arena {
                 self.collect_subtree_ids(id, &mut removed);
             }
         }
-        self.remove_nodes_with_accounting(removed)
+        self.remove_nodes_with_accounting_and_link_counts(removed, link_counts)
     }
 
-    fn remove_nodes_with_accounting(
+    fn remove_nodes_with_accounting(&mut self, removed: Vec<NodeId>) -> Result<usize, ModelError> {
+        self.remove_nodes_with_accounting_and_link_counts(removed, &HashMap::new())
+    }
+
+    fn remove_nodes_with_accounting_and_link_counts(
         &mut self,
         mut removed: Vec<NodeId>,
+        link_counts: &HashMap<FileId, Option<u64>>,
     ) -> Result<usize, ModelError> {
         removed.sort_unstable();
         removed.dedup();
@@ -735,13 +754,14 @@ impl Arena {
             })
             .map(|node| node.id)
             .collect::<Vec<_>>();
-        let identities = self.rebuild_identities_without(&removed)?;
+        let identities = self.rebuild_identities_without(&removed, link_counts)?;
         let identity_scratch = IdentityStore::new(self.identities.memory_limit())?;
         let mut removal_order = removed.clone();
         removal_order.sort_by_key(|id| self.depth(*id));
         self.remove_nodes(removal_order);
         self.remove_nodes(shared);
         self.identities = identities;
+        self.refresh_surviving_link_counts(link_counts)?;
         self.prepare_identity_metrics();
         self.rebuild_identity_metrics(identity_scratch)?;
         Ok(removed.len())
@@ -1054,16 +1074,70 @@ impl Arena {
     fn rebuild_identities_without(
         &mut self,
         removed: &[NodeId],
+        link_counts: &HashMap<FileId, Option<u64>>,
     ) -> Result<IdentityStore, ModelError> {
         let identity_limit = self.identities.memory_limit().min(self.budget.headroom());
         let mut rebuilt = IdentityStore::new(identity_limit)?;
         self.identities.visit_records(|file_id, record| {
-            if let Some(record) = remove_deleted_participants(record, removed) {
+            if let Some(mut record) = remove_deleted_participants(record, removed) {
+                if let Some(link_count) = link_counts.get(&file_id) {
+                    record.declared_links = *link_count;
+                }
                 merge_identity_record(&mut rebuilt, &file_id, record)?;
             }
             Ok(())
         })?;
         Ok(rebuilt)
+    }
+
+    fn refresh_surviving_link_counts(
+        &mut self,
+        link_counts: &HashMap<FileId, Option<u64>>,
+    ) -> Result<(), ModelError> {
+        if link_counts.is_empty() {
+            return Ok(());
+        }
+        let candidates = self
+            .nodes
+            .iter()
+            .filter_map(Option::as_deref)
+            .filter_map(|node| {
+                node.snapshot
+                    .identity
+                    .as_ref()
+                    .map(|identity| (node.id, identity.file_id))
+            })
+            .filter(|(_, file_id)| link_counts.contains_key(file_id))
+            .collect::<Vec<_>>();
+        let mut refreshed = HashMap::new();
+        for (id, file_id) in candidates {
+            let link_count = if let Some(link_count) = refreshed.get(&file_id) {
+                *link_count
+            } else {
+                let link_count = self
+                    .path_for(id)
+                    .and_then(|path| {
+                        fs::symlink_metadata(&path)
+                            .ok()
+                            .map(|metadata| (path, metadata))
+                    })
+                    .and_then(|(path, metadata)| identity_for(&path, &metadata).ok().flatten())
+                    .filter(|identity| identity.file_id == file_id)
+                    .and_then(|identity| identity.link_count);
+                refreshed.insert(file_id, link_count);
+                link_count
+            };
+            if let Some(node) = self.node_mut(id)
+                && let Some(identity) = node.snapshot.identity.as_mut()
+            {
+                identity.link_count = link_count;
+            }
+        }
+        for (file_id, link_count) in refreshed {
+            self.identities
+                .refresh_declared_links(&file_id, link_count)?;
+        }
+        Ok(())
     }
 
     fn prepare_identity_metrics(&mut self) {
@@ -1092,13 +1166,18 @@ impl Arena {
                         leaf_metrics(node.snapshot.apparent_bytes, ByteBounds::exact(0), links);
                 }
                 NodeKind::Synthetic(SyntheticKind::Other | SyntheticKind::Aggregate) => {
+                    let previous = node.metrics;
                     let untracked = self
                         .untracked_metrics
                         .get(&node.id)
                         .copied()
                         .unwrap_or_default();
-                    node.metrics.allocated_bytes = untracked.allocated_bytes;
-                    node.metrics.reclaimable_bytes = untracked.reclaimable_bytes;
+                    node.metrics.allocated_bytes =
+                        preserve_unknown_upper(untracked.allocated_bytes, previous.allocated_bytes);
+                    node.metrics.reclaimable_bytes = preserve_unknown_upper(
+                        untracked.reclaimable_bytes,
+                        previous.reclaimable_bytes,
+                    );
                 }
                 NodeKind::File
                 | NodeKind::Root
@@ -1468,7 +1547,18 @@ impl Arena {
                     total.allocated_bytes.add(node.metrics.allocated_bytes);
                     total.reclaimable_bytes.add(node.metrics.reclaimable_bytes);
                 }
-                _ => stack.extend(node.children.iter().copied()),
+                _ => {
+                    if node.state == NodeState::Uncertain
+                        && node
+                            .unscanned_reason
+                            .as_ref()
+                            .is_some_and(|reason| matches!(reason, UnscannedReason::Metadata(_)))
+                    {
+                        total.allocated_bytes.add(ByteBounds::unknown());
+                        total.reclaimable_bytes.add(ByteBounds::unknown());
+                    }
+                    stack.extend(node.children.iter().copied());
+                }
             }
         }
         total
@@ -1923,6 +2013,35 @@ fn has_zero_scoped_metrics(reason: &UnscannedReason) -> bool {
         reason,
         UnscannedReason::FilesystemBoundary | UnscannedReason::Excluded(_)
     )
+}
+
+fn unscanned_metrics(
+    apparent: u128,
+    allocated: ByteBounds,
+    kind: NodeKind,
+    reason: &UnscannedReason,
+    declared_links: Option<u64>,
+) -> NodeMetrics {
+    if has_zero_scoped_metrics(reason) {
+        return NodeMetrics::default();
+    }
+    let mut metrics = leaf_metrics(apparent, allocated, declared_links);
+    if kind.is_directory() && matches!(reason, UnscannedReason::Metadata(_)) {
+        metrics.allocated_bytes.upper = None;
+        metrics.reclaimable_bytes.upper = None;
+    }
+    metrics
+}
+
+fn preserve_unknown_upper(rebuilt: ByteBounds, previous: ByteBounds) -> ByteBounds {
+    ByteBounds {
+        lower: rebuilt.lower,
+        upper: if rebuilt.upper.is_none() || previous.upper.is_none() {
+            None
+        } else {
+            rebuilt.upper
+        },
+    }
 }
 
 fn retention_rank(metrics: NodeMetrics) -> (bool, u128) {
@@ -2474,6 +2593,56 @@ mod tests {
         assert_eq!(node.metrics.allocated_bytes, ByteBounds::unknown());
         assert_eq!(node.metrics.reclaimable_bytes, ByteBounds::unknown());
     }
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_link_tracks_object_allocation_and_reclaimability() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("link root should exist");
+        let target = root.path().join("target");
+        let link = root.path().join("link");
+        fs::write(&target, b"target").expect("link target should be written");
+        symlink(&target, &link).expect("symbolic link should be created");
+
+        let mut arena = test_arena(root.path());
+        arena
+            .record_unscanned(&link, UnscannedReason::SymbolicLink)
+            .expect("symbolic link should be represented");
+        let id = arena
+            .find_child(arena.root(), OsStr::new("link"))
+            .expect("symbolic link should remain visible");
+        let node = arena.node(id).expect("symbolic link node should exist");
+        assert!(node.snapshot.allocated_bytes.is_some());
+        assert_eq!(node.metrics.reclaimable_bytes, node.metrics.allocated_bytes);
+    }
+    #[test]
+    fn unreadable_directory_without_prior_node_stays_unknown_after_rebuild() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let directory = root.path().join("unreadable-directory");
+        fs::create_dir(&directory).expect("directory fixture should be created");
+        let mut arena = test_arena(root.path());
+        arena
+            .record_unscanned(&directory, UnscannedReason::Metadata("denied".to_string()))
+            .expect("unreadable directory should be represented");
+        let id = arena
+            .find_child(arena.root(), OsStr::new("unreadable-directory"))
+            .expect("unreadable directory should exist");
+        assert_eq!(
+            arena
+                .node(id)
+                .expect("unreadable directory should remain")
+                .metrics
+                .allocated_bytes
+                .upper,
+            None
+        );
+        arena.rebuild();
+        let node = arena
+            .node(id)
+            .expect("unreadable directory should survive rebuild");
+        assert_eq!(node.metrics.allocated_bytes.upper, None);
+        assert_eq!(node.metrics.reclaimable_bytes.upper, None);
+    }
     #[test]
     fn excluded_and_boundary_entries_are_visible_without_scoped_bytes() {
         let root = tempfile::tempdir().expect("model root should exist");
@@ -3008,6 +3177,121 @@ mod tests {
         let root_metrics = arena.node(arena.root()).expect("root should exist").metrics;
         assert_eq!(root_metrics.allocated_bytes, before.allocated_bytes);
         assert_eq!(root_metrics.reclaimable_bytes, before.reclaimable_bytes);
+    }
+    #[test]
+    fn aggregate_rebuild_preserves_unknown_non_leaf_bounds() {
+        let root = tempfile::tempdir().expect("aggregate root should exist");
+        let aggregate_path = root.path().join("aggregate");
+        let unknown_directory = aggregate_path.join("unknown-directory");
+        let known = unknown_directory.join("known");
+        let removable = root.path().join("removable");
+        fs::create_dir(&aggregate_path).expect("aggregate directory should be created");
+        fs::create_dir(&unknown_directory).expect("unknown directory should be created");
+        fs::write(&known, b"known").expect("known fixture should be written");
+        fs::write(&removable, b"remove").expect("removable fixture should be written");
+
+        let mut arena = test_arena(root.path());
+        add_path(&mut arena, &aggregate_path).expect("aggregate path should be retained");
+        add_path(&mut arena, &unknown_directory).expect("unknown directory should be retained");
+        add_path(&mut arena, &known).expect("known child should be retained");
+        arena
+            .record_unscanned(
+                &unknown_directory,
+                UnscannedReason::Metadata("denied".to_string()),
+            )
+            .expect("unknown directory should be marked uncertain");
+        let removable_id = add_path(&mut arena, &removable).expect("removable should be retained");
+        for path in [&unknown_directory, &aggregate_path, root.path()] {
+            arena
+                .complete_directory(path)
+                .expect("fixture directory should complete");
+        }
+        arena.finalize().expect("model should finalize");
+        assert!(
+            arena
+                .aggregate_cold_subtree(&HashSet::from([arena.root()]))
+                .expect("aggregate conversion should succeed")
+        );
+        let aggregate_id = arena
+            .children(arena.root())
+            .iter()
+            .copied()
+            .find(|id| {
+                arena
+                    .node(*id)
+                    .is_some_and(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Aggregate))
+            })
+            .expect("Aggregate node should remain");
+        assert_eq!(
+            arena
+                .node(aggregate_id)
+                .expect("Aggregate node should exist")
+                .metrics
+                .allocated_bytes
+                .upper,
+            None
+        );
+
+        assert!(arena.remove_path(&removable));
+        assert!(arena.node(removable_id).is_none());
+        let aggregate = arena
+            .node(aggregate_id)
+            .expect("Aggregate node should survive rebuild");
+        assert_eq!(aggregate.metrics.allocated_bytes.upper, None);
+        assert_eq!(aggregate.metrics.reclaimable_bytes.upper, None);
+    }
+
+    #[test]
+    fn other_rebuild_preserves_unknown_non_leaf_bounds() {
+        let root = tempfile::tempdir().expect("Other root should exist");
+        let unknown_directory = root.path().join("unknown-directory");
+        let known = unknown_directory.join("known");
+        let removable = root.path().join("removable");
+        fs::create_dir(&unknown_directory).expect("unknown directory should be created");
+        fs::write(&known, b"known").expect("known fixture should be written");
+        fs::write(&removable, b"remove").expect("removable fixture should be written");
+
+        let mut arena = test_arena(root.path());
+        arena.max_children_per_directory = 0;
+        arena
+            .record_unscanned(
+                &unknown_directory,
+                UnscannedReason::Metadata("denied".to_string()),
+            )
+            .expect("unknown directory should be retained in Other");
+        let other_id = arena
+            .children(arena.root())
+            .iter()
+            .copied()
+            .find(|id| {
+                arena
+                    .node(*id)
+                    .is_some_and(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Other))
+            })
+            .expect("Other node should exist");
+        assert_eq!(
+            arena
+                .node(other_id)
+                .expect("Other node should remain")
+                .metrics
+                .allocated_bytes
+                .upper,
+            None
+        );
+        arena.max_children_per_directory = DEFAULT_MAX_CHILDREN;
+        let removable_id = add_path(&mut arena, &removable).expect("removable should be retained");
+        arena
+            .complete_directory(root.path())
+            .expect("root should complete");
+        arena.finalize().expect("model should finalize");
+
+        assert!(arena.remove_path(&removable));
+        assert!(arena.node(removable_id).is_none());
+        let other = arena
+            .node(other_id)
+            .expect("Other node should survive rebuild");
+        assert_eq!(other.metrics.allocated_bytes.upper, None);
+        assert_eq!(other.metrics.reclaimable_bytes.upper, None);
     }
 
     #[cfg(windows)]

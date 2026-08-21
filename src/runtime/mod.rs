@@ -560,37 +560,32 @@ where
                         self.workers()?.execute_deletion(*plan)?;
                         self.deletion_active = true;
                     }
-                    Err((_plan, error)) if error == "deletion planning was cancelled" => {
-                        self.app.normal_mode();
-                    }
-                    Err((plan, error))
-                        if error == "deletion target changed while its plan was built" =>
-                    {
-                        self.animation.schedule_error();
-                        let Some(target) = self.app.begin_deletion_replan(target_node_id, *plan)?
-                        else {
-                            return Ok(());
-                        };
-                        let root_identity = self.app.identity_for_path(&target);
-                        self.reset_scan_summary();
-                        self.workers()?.request_rescan(scanner::ScannerOptions {
-                            root: target,
-                            root_identity,
-                            threads: self.settings.scan_threads,
-                            cross_filesystems: self.settings.cross_filesystems,
-                            exclusions: self.settings.exclusions.clone(),
-                            internal_paths: self.app.internal_scan_paths(),
-                        })?;
-                        self.scan_active = true;
-                        self.rescan_active = true;
-                        self.next_loading_frame =
-                            self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
-                        self.animation.schedule_aggregation();
-                    }
-                    Err((_plan, error)) => {
-                        self.animation.schedule_error();
-                        self.app
-                            .show_error(format!("Deletion validation failed: {error}"));
+                    Err((plan, error)) => {
+                        if error == "deletion planning was cancelled" {
+                            self.app.normal_mode();
+                        } else {
+                            self.animation.schedule_error();
+                            let Some(target) =
+                                self.app.begin_deletion_replan(target_node_id, *plan)?
+                            else {
+                                return Ok(());
+                            };
+                            let root_identity = self.app.identity_for_path(&target);
+                            self.reset_scan_summary();
+                            self.workers()?.request_rescan(scanner::ScannerOptions {
+                                root: target,
+                                root_identity,
+                                threads: self.settings.scan_threads,
+                                cross_filesystems: self.settings.cross_filesystems,
+                                exclusions: self.settings.exclusions.clone(),
+                                internal_paths: self.app.internal_scan_paths(),
+                            })?;
+                            self.scan_active = true;
+                            self.rescan_active = true;
+                            self.next_loading_frame =
+                                self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
+                            self.animation.schedule_aggregation();
+                        }
                     }
                 }
             }

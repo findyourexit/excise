@@ -231,14 +231,15 @@ fn soft_cancel_wins_when_revalidation_event_follows_input() {
     assert!(target.exists(), "soft-cancelled target must remain");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct ReplanInput {
     events: Vec<Option<Event>>,
     target: std::path::PathBuf,
     changed: bool,
+    remove_on_confirm: bool,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl ReplanInput {
     fn new(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
         let mut events = events;
@@ -247,11 +248,17 @@ impl ReplanInput {
             events,
             target,
             changed: false,
+            remove_on_confirm: false,
         }
+    }
+    fn missing(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
+        let mut input = Self::new(events, target);
+        input.remove_on_confirm = true;
+        input
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl InputSource for ReplanInput {
     fn poll(&mut self, _timeout: Duration) -> Result<bool, AppError> {
         Ok(!self.events.is_empty())
@@ -272,8 +279,12 @@ impl InputSource for ReplanInput {
                 }))
             )
         {
-            std::fs::write(&self.target, b"changed-after-plan")
-                .expect("post-plan replacement should be written");
+            if self.remove_on_confirm {
+                std::fs::remove_file(&self.target).expect("post-plan target should be removed");
+            } else {
+                std::fs::write(&self.target, b"changed-after-plan")
+                    .expect("post-plan replacement should be written");
+            }
             self.changed = true;
         }
         Ok(event.map_or(InputEvent::Barrier, InputEvent::Terminal))
@@ -315,6 +326,41 @@ fn changed_plan_rescans_before_reprompting_and_does_not_reuse_stale_review() {
         "unexpected outcome: {outcome:?}"
     );
     assert!(!target.exists(), "freshly planned target should be deleted");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn missing_final_validation_replans_without_terminal_io() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::missing(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("missing final validation should trigger a rescan, not terminal I/O");
+    assert!(
+        matches!(outcome, OperationOutcome::Exact(_)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(!target.exists(), "missing target should remain absent");
 }
 
 #[cfg(unix)]

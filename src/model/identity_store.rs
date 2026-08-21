@@ -324,6 +324,17 @@ impl IdentityStore {
         self.insert_by_key(&key, record, existing.is_none())?;
         Ok(existing)
     }
+    pub(crate) fn refresh_declared_links(
+        &mut self,
+        file_id: &FileId,
+        declared_links: Option<u64>,
+    ) -> Result<(), ModelError> {
+        let Some(mut record) = self.get(file_id)? else {
+            return Ok(());
+        };
+        record.declared_links = declared_links;
+        self.upsert_record(file_id, &record).map(|_| ())
+    }
 
     /// Repoints only one identity's participants using a caller-sorted removal set.
     ///

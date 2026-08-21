@@ -39,6 +39,7 @@ pub struct ScannerOptions {
 #[derive(Clone)]
 struct DirectoryTask {
     path: PathBuf,
+    identity: Option<NativeIdentity>,
 }
 
 struct TaskQueue {
@@ -86,7 +87,7 @@ impl TaskSpill {
 
     fn push(&mut self, task: DirectoryTask) -> io::Result<()> {
         let encoded = NativePath::new(task.path).encode();
-        let payload = serde_json::to_vec(&encoded).map_err(io::Error::other)?;
+        let payload = serde_json::to_vec(&(encoded, task.identity)).map_err(io::Error::other)?;
         if payload.len() > MAX_SPILLED_TASK_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -139,7 +140,7 @@ impl TaskSpill {
         }
         let mut payload = vec![0_u8; payload_len];
         self.file.read_exact(&mut payload)?;
-        let encoded: EncodedNativePath =
+        let (encoded, identity): (EncodedNativePath, Option<NativeIdentity>) =
             serde_json::from_slice(&payload).map_err(io::Error::other)?;
         let path = NativePath::decode(&encoded)
             .map_err(io::Error::other)?
@@ -164,7 +165,7 @@ impl TaskSpill {
             #[cfg(not(windows))]
             let _ = self.file.set_len(0);
         }
-        Ok(Some(DirectoryTask { path }))
+        Ok(Some(DirectoryTask { path, identity }))
     }
 }
 
@@ -174,7 +175,10 @@ impl TaskQueue {
         Ok((
             Self {
                 state: Mutex::new(QueueState {
-                    tasks: VecDeque::from([DirectoryTask { path: root }]),
+                    tasks: VecDeque::from([DirectoryTask {
+                        path: root,
+                        identity: None,
+                    }]),
                     spill,
                     pending: 1,
                 }),
@@ -564,15 +568,30 @@ fn scan_directory(
     }
     let mut frame = match open_frame(task) {
         Ok(frame) => frame,
-        Err((task, error)) => {
-            let _ = send_event(
-                sender,
-                WorkerEvent::ScanFailed {
-                    path: Some(task.path),
-                    message: error.to_string(),
-                },
-                cancelled,
-            );
+        Err(error) => {
+            let (task, error) = *error;
+            match error {
+                DirectoryTaskError::Replaced(message) => {
+                    let _ = send_event(
+                        sender,
+                        WorkerEvent::ScanUnscanned {
+                            path: task.path,
+                            reason: UnscannedReason::Metadata(message),
+                        },
+                        cancelled,
+                    );
+                }
+                DirectoryTaskError::Io(error) => {
+                    let _ = send_event(
+                        sender,
+                        WorkerEvent::ScanFailed {
+                            path: Some(task.path),
+                            message: error.to_string(),
+                        },
+                        cancelled,
+                    );
+                }
+            }
             return true;
         }
     };
@@ -674,16 +693,60 @@ fn validate_root_for_traversal(
     false
 }
 
-fn open_frame(task: DirectoryTask) -> Result<ScanFrame, (DirectoryTask, std::io::Error)> {
-    match fs::read_dir(&task.path) {
-        Ok(entries) => Ok(ScanFrame {
-            task,
-            entries,
-            batch: Vec::with_capacity(BATCH_SIZE),
-            directories: Vec::with_capacity(BATCH_SIZE),
-        }),
-        Err(error) => Err((task, error)),
+enum DirectoryTaskError {
+    Replaced(String),
+    Io(io::Error),
+}
+
+fn open_frame(task: DirectoryTask) -> Result<ScanFrame, Box<(DirectoryTask, DirectoryTaskError)>> {
+    if let Some(expected) = task.identity.as_ref() {
+        let metadata = match fs::symlink_metadata(&task.path) {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(Box::new((task, DirectoryTaskError::Io(error)))),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Box::new((
+                task,
+                DirectoryTaskError::Replaced(
+                    "scanner directory task was replaced by a symbolic link or non-directory"
+                        .to_string(),
+                ),
+            )));
+        }
+        let actual = match identity_for(&task.path, &metadata) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                return Err(Box::new((
+                    task,
+                    DirectoryTaskError::Replaced(
+                        "scanner directory task identity is unavailable".to_string(),
+                    ),
+                )));
+            }
+            Err(error) => return Err(Box::new((task, DirectoryTaskError::Io(error)))),
+        };
+        if actual.file_id != expected.file_id
+            || actual.reparse_point != expected.reparse_point
+            || actual.reparse_point
+        {
+            return Err(Box::new((
+                task,
+                DirectoryTaskError::Replaced(
+                    "scanner directory task identity changed before traversal".to_string(),
+                ),
+            )));
+        }
     }
+    let entries = match fs::read_dir(&task.path) {
+        Ok(entries) => entries,
+        Err(error) => return Err(Box::new((task, DirectoryTaskError::Io(error)))),
+    };
+    Ok(ScanFrame {
+        task,
+        entries,
+        batch: Vec::with_capacity(BATCH_SIZE),
+        directories: Vec::with_capacity(BATCH_SIZE),
+    })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -755,7 +818,21 @@ fn process_entry(
     }
     match identity_for(&path, &metadata) {
         Ok(Some(identity)) => {
-            let directory = is_dir.then(|| DirectoryTask { path: path.clone() });
+            if identity.reparse_point {
+                let _ = send_event(
+                    sender,
+                    WorkerEvent::ScanUnscanned {
+                        path,
+                        reason: UnscannedReason::SymbolicLink,
+                    },
+                    cancelled,
+                );
+                return;
+            }
+            let directory = is_dir.then(|| DirectoryTask {
+                path: path.clone(),
+                identity: Some(identity.clone()),
+            });
             frame.batch.push(ScannedEntry {
                 metadata,
                 path,
@@ -867,6 +944,7 @@ mod tests {
             queue
                 .schedule(DirectoryTask {
                     path: PathBuf::from(format!("/scan-root/entry-{index}")),
+                    identity: None,
                 })
                 .expect("scanner task should spill when the resident queue is full");
         }

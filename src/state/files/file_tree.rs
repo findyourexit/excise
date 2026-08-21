@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use crate::model::{
 };
 use crate::native_path::NativeIdentity;
 use crate::state::tiles::{FileMetadata, files_in_folder};
+use file_id::FileId;
 
 struct RescanStage {
     target_id: NodeId,
@@ -299,6 +300,32 @@ impl FileTree {
     }
 
     pub fn try_apply_deletion_report(&mut self, report: &DeletionReport) -> Result<(), ModelError> {
+        let mut deleted_link_counts: HashMap<FileId, Option<u64>> = HashMap::new();
+        for result in &report.entries {
+            if !matches!(result.outcome, DeletionEntryOutcome::Deleted)
+                || !matches!(
+                    result.entry.snapshot.kind,
+                    PlannedKind::File | PlannedKind::Link
+                )
+            {
+                continue;
+            }
+            let file_id = result.entry.snapshot.identity.file_id;
+            let post_delete = result
+                .entry
+                .snapshot
+                .identity
+                .link_count
+                .map(|count| count.saturating_sub(1));
+            deleted_link_counts
+                .entry(file_id)
+                .and_modify(|current| {
+                    if current.is_some() {
+                        *current = post_delete;
+                    }
+                })
+                .or_insert(post_delete);
+        }
         let removed_paths = report
             .entries
             .iter()
@@ -310,7 +337,8 @@ impl FileTree {
             })
             .map(|result| self.path_in_filesystem.join(&result.entry.relative_path))
             .collect::<Vec<_>>();
-        self.arena.try_remove_paths(&removed_paths)?;
+        self.arena
+            .try_remove_paths_with_link_counts(&removed_paths, &deleted_link_counts)?;
         if report.changed_entries() > 0
             || report.failed_entries() > 0
             || report.unattempted_entries() > 0
@@ -600,19 +628,19 @@ fn record_unscanned_to(
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::ffi::OsString;
     use std::fs;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use crate::deletion::{build_plan, execute_plan};
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use crate::model::ByteBounds;
     use crate::model::{NodeKind, SyntheticKind};
     use crate::native_path::identity_for;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use crate::state::FileToDelete;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use crate::state::tiles::FileType;
 
     use super::*;
@@ -1009,7 +1037,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn partial_hard_link_deletion_rebuilds_identity_metrics() {
         let root = tempfile::tempdir().expect("deletion root should exist");
@@ -1063,6 +1091,15 @@ mod tests {
             .allocated_bytes
             .map_or(ByteBounds::unknown(), ByteBounds::exact);
         assert_eq!(second_node.metrics.allocated_bytes, allocated);
+        assert_eq!(
+            second_node
+                .snapshot
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.link_count),
+            Some(1)
+        );
+        assert_eq!(second_node.metrics.reclaimable_bytes, allocated);
         assert!(
             tree.nodes()
                 .all(|node| { node.kind != NodeKind::Synthetic(SyntheticKind::Shared) })

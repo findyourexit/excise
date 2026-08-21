@@ -1173,7 +1173,7 @@ fn snapshot_from_std_metadata(
         } else {
             u128::from(metadata.len())
         },
-        allocated_bytes: (kind == PlannedKind::File)
+        allocated_bytes: matches!(kind, PlannedKind::File | PlannedKind::Link)
             .then(|| u128::from(metadata.blocks()).saturating_mul(512)),
         modified_nanos: modified_nanos(metadata),
     })
@@ -1207,7 +1207,10 @@ fn snapshot_from_open_file(handle: &File, kind: PlannedKind) -> io::Result<Plann
         } else {
             u128::from(metadata.len())
         },
-        allocated_bytes: None,
+        allocated_bytes: (kind != PlannedKind::Directory)
+            .then(|| crate::os::physical_size_from_handle(handle))
+            .transpose()?
+            .map(u128::from),
         modified_nanos,
     })
 }
@@ -1252,7 +1255,7 @@ fn snapshot_from_cap_metadata(
         kind,
         apparent_bytes: u128::from(metadata.len()),
 
-        allocated_bytes: (kind == PlannedKind::File)
+        allocated_bytes: matches!(kind, PlannedKind::File | PlannedKind::Link)
             .then(|| u128::from(metadata.blocks()).saturating_mul(512)),
         modified_nanos,
     })
@@ -1340,24 +1343,25 @@ mod tests {
     use crate::state::tiles::FileType;
 
     fn reviewed_snapshot(path: &Path, metadata: &std::fs::Metadata) -> PlannedSnapshot {
-        let kind = if metadata.is_dir() {
-            PlannedKind::Directory
-        } else if metadata.file_type().is_symlink() {
+        let identity = crate::native_path::identity_for(path, metadata)
+            .expect("fixture identity lookup should succeed")
+            .expect("fixture identity should be readable");
+        let kind = if metadata.file_type().is_symlink() || identity.reparse_point {
             PlannedKind::Link
+        } else if metadata.is_dir() {
+            PlannedKind::Directory
         } else {
             PlannedKind::File
         };
         PlannedSnapshot {
-            identity: crate::native_path::identity_for(path, metadata)
-                .expect("fixture identity lookup should succeed")
-                .expect("fixture identity should be readable"),
+            identity,
             kind,
             apparent_bytes: if kind == PlannedKind::Directory {
                 0
             } else {
                 u128::from(metadata.len())
             },
-            allocated_bytes: (kind == PlannedKind::File && !cfg!(windows))
+            allocated_bytes: matches!(kind, PlannedKind::File | PlannedKind::Link)
                 .then(|| {
                     crate::os::physical_size(path, metadata)
                         .ok()
@@ -1803,6 +1807,10 @@ mod tests {
             plan.root_snapshot().map(|snapshot| snapshot.kind),
             Some(PlannedKind::Link)
         );
+        let link_allocation = plan
+            .root_snapshot()
+            .and_then(|snapshot| snapshot.allocated_bytes)
+            .expect("link-object allocation should be known");
 
         let report = execute_plan(
             root.path(),
@@ -1812,6 +1820,7 @@ mod tests {
         );
 
         assert_eq!(report.deleted_entries(), 1);
+        assert_eq!(report.deleted_allocated_bytes(), link_allocation);
         assert!(!link.exists());
         assert!(outside_file.exists());
     }
@@ -1879,6 +1888,10 @@ mod tests {
             plan.root_snapshot().map(|snapshot| snapshot.kind),
             Some(PlannedKind::Link)
         );
+        let junction_allocation = plan
+            .root_snapshot()
+            .and_then(|snapshot| snapshot.allocated_bytes)
+            .expect("reparse-object allocation should be known");
 
         let report = execute_plan(
             root.path(),
@@ -1888,6 +1901,7 @@ mod tests {
         );
 
         assert_eq!(report.deleted_entries(), 1);
+        assert_eq!(report.deleted_allocated_bytes(), junction_allocation);
         assert!(!junction.exists());
         assert!(outside_file.exists());
     }
