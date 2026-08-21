@@ -147,6 +147,10 @@ pub(crate) fn delete_verified_private_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+const fn process_query_is_active(query_succeeded: bool, exit_code: u32) -> bool {
+    !query_succeeded || exit_code == STILL_ACTIVE
+}
+
 /// Returns `true` unless Windows can positively establish that the process has
 /// exited. Cleanup callers treat uncertainty as an active session.
 pub(crate) fn is_process_active(pid: u32) -> bool {
@@ -163,7 +167,20 @@ pub(crate) fn is_process_active(pid: u32) -> bool {
     let _process = OwnedHandle(process);
     let mut exit_code = 0_u32;
     // SAFETY: the owned process handle and the output value remain live here.
-    unsafe { GetExitCodeProcess(process, &raw mut exit_code) != 0 && exit_code == STILL_ACTIVE }
+    let query_succeeded = unsafe { GetExitCodeProcess(process, &raw mut exit_code) } != 0;
+    process_query_is_active(query_succeeded, exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STILL_ACTIVE, process_query_is_active};
+
+    #[test]
+    fn process_query_failure_is_treated_as_active() {
+        assert!(process_query_is_active(false, 0));
+        assert!(process_query_is_active(true, STILL_ACTIVE));
+        assert!(!process_query_is_active(true, 0));
+    }
 }
 
 fn open_private_path(path: &Path, directory: bool, access: u32) -> io::Result<OwnedHandle> {
