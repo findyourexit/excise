@@ -13,7 +13,20 @@ rustup target add \
   x86_64-pc-windows-msvc
 ```
 
-A host may not be able to install every target. Native behavior is exercised by GitHub Actions on Linux, macOS, and Windows.
+A host may not be able to install every target. The published target set has separate native-behavior and release-artifact evidence.
+
+## Target evidence
+
+| Target | Support classification | Published evidence |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu` (x86_64 Linux) | Native behavioral target | Native verification plus hosted release build/archive |
+| `aarch64-apple-darwin` (AArch64 macOS) | Native behavioral target | Native verification plus hosted release build/archive |
+| `x86_64-pc-windows-msvc` (x86_64 Windows) | Native behavioral target | Native verification plus hosted release build/archive |
+| `x86_64-apple-darwin` (x86_64 macOS) | Release target; compile/archive only | Hosted release build/archive job |
+| `aarch64-unknown-linux-gnu` (AArch64 Linux) | Release target; compile/archive only | Hosted release build/archive job |
+| `aarch64-pc-windows-msvc` (AArch64 Windows) | Release target; compile/archive only | Hosted release build/archive job |
+
+Only the native behavioral rows carry published runtime-behavior evidence. Compile-only targets must not be treated as fully behaviorally validated: a successful hosted build or archive demonstrates release compilation and packaging, not native runtime compatibility.
 
 ## Fast feedback
 
