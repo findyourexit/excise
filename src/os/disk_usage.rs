@@ -12,7 +12,7 @@ pub(crate) fn physical_size(path: &Path, metadata: &Metadata) -> io::Result<u64>
     {
         let _ = metadata;
         let handle = open_nofollow(path)?;
-        return physical_size_from_handle(&handle);
+        physical_size_from_handle(&handle)
     }
     #[cfg(not(windows))]
     path.size_on_disk_fast(metadata)

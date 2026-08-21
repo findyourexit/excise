@@ -570,31 +570,14 @@ fn scan_directory(
         Ok(frame) => frame,
         Err(error) => {
             let (task, error) = *error;
-            match error {
-                DirectoryTaskError::Replaced(message) => {
-                    let _ = send_event(
-                        sender,
-                        WorkerEvent::ScanUnscanned {
-                            path: task.path,
-                            reason: UnscannedReason::Metadata(message),
-                        },
-                        cancelled,
-                    );
-                }
-                DirectoryTaskError::Io(error) => {
-                    let _ = send_event(
-                        sender,
-                        WorkerEvent::ScanFailed {
-                            path: Some(task.path),
-                            message: error.to_string(),
-                        },
-                        cancelled,
-                    );
-                }
-            }
+            report_directory_task_error(task.path, error, sender, cancelled);
             return true;
         }
     };
+    if let Err(error) = validate_directory_task(&frame.task) {
+        report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
+        return true;
+    }
     if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
         return false;
     }
@@ -604,8 +587,14 @@ fn scan_directory(
         {
             return false;
         }
-        if frame.batch.len() == BATCH_SIZE && !flush_frame(&mut frame, queue, sender, cancelled) {
-            return false;
+        if frame.batch.len() == BATCH_SIZE {
+            if !flush_frame(&mut frame, queue, sender, cancelled) {
+                return false;
+            }
+            if let Err(error) = validate_directory_task(&frame.task) {
+                report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
+                return true;
+            }
         }
         match frame.entries.next() {
             Some(Ok(entry)) => {
@@ -644,11 +633,23 @@ fn scan_directory(
     if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
         return false;
     }
+    if let Err(error) = validate_directory_task(&frame.task) {
+        report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
+        return true;
+    }
     if !frame.batch.is_empty() && !flush_frame(&mut frame, queue, sender, cancelled) {
         return false;
     }
+    if let Err(error) = validate_directory_task(&frame.task) {
+        report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
+        return true;
+    }
     if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
         return false;
+    }
+    if let Err(error) = validate_directory_task(&frame.task) {
+        report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
+        return true;
     }
     send_event(
         sender,
@@ -698,44 +699,67 @@ enum DirectoryTaskError {
     Io(io::Error),
 }
 
+fn validate_directory_task(task: &DirectoryTask) -> Result<(), DirectoryTaskError> {
+    let Some(expected) = task.identity.as_ref() else {
+        return Ok(());
+    };
+    let metadata = fs::symlink_metadata(&task.path).map_err(DirectoryTaskError::Io)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(DirectoryTaskError::Replaced(
+            "scanner directory task was replaced by a symbolic link or non-directory".to_string(),
+        ));
+    }
+    let actual = identity_for(&task.path, &metadata)
+        .map_err(DirectoryTaskError::Io)?
+        .ok_or_else(|| {
+            DirectoryTaskError::Replaced(
+                "scanner directory task identity is unavailable".to_string(),
+            )
+        })?;
+    if actual.file_id != expected.file_id
+        || actual.reparse_point != expected.reparse_point
+        || actual.reparse_point
+    {
+        return Err(DirectoryTaskError::Replaced(
+            "scanner directory task identity changed before traversal".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn report_directory_task_error(
+    path: PathBuf,
+    error: DirectoryTaskError,
+    sender: &Sender<WorkerEvent>,
+    cancelled: &AtomicBool,
+) {
+    match error {
+        DirectoryTaskError::Replaced(message) => {
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanUnscanned {
+                    path,
+                    reason: UnscannedReason::Metadata(message),
+                },
+                cancelled,
+            );
+        }
+        DirectoryTaskError::Io(error) => {
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanFailed {
+                    path: Some(path),
+                    message: error.to_string(),
+                },
+                cancelled,
+            );
+        }
+    }
+}
+
 fn open_frame(task: DirectoryTask) -> Result<ScanFrame, Box<(DirectoryTask, DirectoryTaskError)>> {
-    if let Some(expected) = task.identity.as_ref() {
-        let metadata = match fs::symlink_metadata(&task.path) {
-            Ok(metadata) => metadata,
-            Err(error) => return Err(Box::new((task, DirectoryTaskError::Io(error)))),
-        };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(Box::new((
-                task,
-                DirectoryTaskError::Replaced(
-                    "scanner directory task was replaced by a symbolic link or non-directory"
-                        .to_string(),
-                ),
-            )));
-        }
-        let actual = match identity_for(&task.path, &metadata) {
-            Ok(Some(identity)) => identity,
-            Ok(None) => {
-                return Err(Box::new((
-                    task,
-                    DirectoryTaskError::Replaced(
-                        "scanner directory task identity is unavailable".to_string(),
-                    ),
-                )));
-            }
-            Err(error) => return Err(Box::new((task, DirectoryTaskError::Io(error)))),
-        };
-        if actual.file_id != expected.file_id
-            || actual.reparse_point != expected.reparse_point
-            || actual.reparse_point
-        {
-            return Err(Box::new((
-                task,
-                DirectoryTaskError::Replaced(
-                    "scanner directory task identity changed before traversal".to_string(),
-                ),
-            )));
-        }
+    if let Err(error) = validate_directory_task(&task) {
+        return Err(Box::new((task, error)));
     }
     let entries = match fs::read_dir(&task.path) {
         Ok(entries) => entries,
@@ -955,6 +979,100 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(state.tasks.len(), 1);
         assert_eq!(state.spill.pending, BATCH_SIZE);
+    }
+    #[cfg(any(unix, windows))]
+    fn replace_directory_with_link(path: &Path, displaced: &Path, target: &Path) {
+        fs::rename(path, displaced).expect("original directory should be displaced");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, path).expect("replacement symlink should be created");
+        #[cfg(windows)]
+        {
+            let quote =
+                |value: &Path| format!("'{}'", value.display().to_string().replace('\'', "''"));
+            let command = format!(
+                "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path {} -Target {} | Out-Null",
+                quote(path),
+                quote(target)
+            );
+            let output = std::process::Command::new("pwsh")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &command,
+                ])
+                .output()
+                .expect("junction command should start");
+            assert!(
+                output.status.success(),
+                "junction command failed with {}: stdout={:?} stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn scanner_marks_replaced_descendant_link_uncertain() {
+        use crossbeam_channel::bounded;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let outside = tempfile::tempdir().expect("outside root should exist");
+        fs::write(outside.path().join("secret"), b"outside")
+            .expect("outside fixture should be written");
+        let descendant = root.path().join("descendant");
+        let displaced = root.path().join("displaced-descendant");
+        fs::create_dir(&descendant).expect("descendant should be created");
+        fs::write(descendant.join("original"), b"inside")
+            .expect("descendant fixture should be written");
+        let metadata = fs::symlink_metadata(&descendant).expect("descendant metadata should exist");
+        let identity = identity_for(&descendant, &metadata)
+            .expect("descendant identity should be readable")
+            .expect("descendant identity should be available");
+        replace_directory_with_link(&descendant, &displaced, outside.path());
+
+        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1)
+            .expect("scanner task queue should be available");
+        let (sender, events) = bounded(4);
+        let cancelled = AtomicBool::new(false);
+        let root_invalid = AtomicBool::new(false);
+        let exclusions = Exclusions::new(root.path(), Vec::new(), Vec::new())
+            .expect("scanner exclusions should compile");
+        assert!(scan_directory(
+            DirectoryTask {
+                path: descendant.clone(),
+                identity: Some(identity),
+            },
+            &queue,
+            &sender,
+            &cancelled,
+            &root_invalid,
+            root.path(),
+            None,
+            &exclusions,
+            None,
+            true,
+        ));
+
+        match events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replaced descendant should be reported")
+        {
+            WorkerEvent::ScanUnscanned { path, reason } => {
+                assert_eq!(path, descendant);
+                assert!(matches!(reason, UnscannedReason::Metadata(_)));
+            }
+            _ => panic!("replaced descendant should not be traversed"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "replacement must not be traversed"
+        );
     }
 }
 

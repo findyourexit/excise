@@ -334,44 +334,6 @@ mod tests {
             internal_paths: Vec::new(),
         }
     }
-    #[cfg(any(unix, windows))]
-    fn replace_directory_with_link(
-        path: &std::path::Path,
-        displaced: &std::path::Path,
-        target: &std::path::Path,
-    ) {
-        std::fs::rename(path, displaced).expect("original directory should be displaced");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(target, path).expect("replacement symlink should be created");
-        #[cfg(windows)]
-        {
-            let quote = |value: &std::path::Path| {
-                format!("'{}'", value.display().to_string().replace('\'', "''"))
-            };
-            let command = format!(
-                "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path {} -Target {} | Out-Null",
-                quote(path),
-                quote(target)
-            );
-            let output = std::process::Command::new("pwsh")
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &command,
-                ])
-                .output()
-                .expect("junction command should start");
-            assert!(
-                output.status.success(),
-                "junction command failed with {}: stdout={:?} stderr={:?}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
 
     #[cfg(unix)]
     fn single_file_plan(root: &std::path::Path) -> (std::path::PathBuf, DeletionPlan) {
@@ -804,76 +766,6 @@ mod tests {
         }
         assert!(skipped_link);
         assert!(!traversed_secret);
-        workers.shutdown().expect("workers should stop");
-    }
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn scanner_marks_replaced_descendant_link_uncertain() {
-        let root = tempfile::tempdir().expect("scan root should exist");
-        let outside = tempfile::tempdir().expect("outside root should exist");
-        std::fs::write(outside.path().join("secret"), b"outside")
-            .expect("outside fixture should be written");
-        let descendant = root.path().join("descendant");
-        let displaced = root.path().join("displaced-descendant");
-        std::fs::create_dir(&descendant).expect("descendant should be created");
-        std::fs::write(descendant.join("original"), b"inside")
-            .expect("descendant fixture should be written");
-        for index in 0..256 {
-            std::fs::write(root.path().join(format!("filler-{index}")), b"filler")
-                .expect("root filler should be written");
-        }
-
-        let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
-        let mut replaced = false;
-        let mut uncertain = false;
-        let mut saw_unscanned = false;
-        let mut unscanned_path = None;
-        let mut queued_directory = false;
-        let mut traversed_outside = false;
-        loop {
-            match workers
-                .events()
-                .recv_timeout(Duration::from_secs(5))
-                .expect("scanner should produce completion")
-            {
-                WorkerEvent::ScanBatch { entries } => {
-                    queued_directory |= entries
-                        .iter()
-                        .any(|entry| entry.path == descendant && entry.metadata.is_dir());
-                    traversed_outside |= entries
-                        .iter()
-                        .any(|entry| entry.path == outside.path().join("secret"));
-                    if !replaced && entries.iter().any(|entry| entry.path == descendant) {
-                        replace_directory_with_link(&descendant, &displaced, outside.path());
-                        replaced = true;
-                    }
-                }
-                WorkerEvent::ScanUnscanned { path, reason } => {
-                    saw_unscanned = true;
-                    unscanned_path = Some((path.clone(), reason.clone()));
-                    uncertain |=
-                        path == descendant && matches!(reason, UnscannedReason::Metadata(_));
-                }
-                WorkerEvent::ScanFinished { cancelled: false } => break,
-                WorkerEvent::ScanFinished { cancelled: true } => {
-                    panic!("descendant replacement should be uncertain, not cancelled")
-                }
-                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
-                WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
-                | WorkerEvent::DeletionFinished { .. } => {}
-            }
-        }
-        assert!(replaced, "test must replace the queued descendant");
-        assert!(
-            uncertain,
-            "replaced descendant must be retained as uncertain; replaced={replaced} queued_directory={queued_directory} saw_unscanned={saw_unscanned} unscanned={unscanned_path:?} traversed_outside={traversed_outside}"
-        );
-        assert!(
-            !traversed_outside,
-            "scanner must not follow the replacement link"
-        );
         workers.shutdown().expect("workers should stop");
     }
 
