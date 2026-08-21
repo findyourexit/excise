@@ -16,7 +16,7 @@
 ## Contribute and maintain
 
 - [Development guide](development.md)
-- [Release process](releasing.md)
+- [Release and distribution policy](releasing.md)
 - [Project lineage](lineage.md)
 
 ## Published schemas

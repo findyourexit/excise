@@ -2,6 +2,12 @@
 
 This runbook defines the evidence and artifact shape expected for publication. It does not authorize a release by itself.
 
+## Current distribution policy
+
+Distribution is archive-only: the package manifest remains `publish = false`, and no package-manager or other publication channel is enabled. The `cargo-binstall` metadata and Scoop/Winget templates are validation inputs for the distribution contract, not enabled channels; passing their checks does not publish or authorize package-manager artifacts.
+
+Any future distribution channel requires reviewed immutable metadata and release evidence tying that metadata to the exact protected commit and immutable release assets. Until that review is complete, keep `publish = false` and use only the archive candidate described below.
+
 ## Release commit
 
 A release pull request must:
@@ -24,13 +30,13 @@ cargo dist-local
 
 ## Hosted candidate
 
-The manually dispatched `Release candidate artifacts` workflow builds immutable archives for:
+The manually dispatched `Release candidate artifacts` workflow builds six immutable target archives for:
 
 - x86_64 and AArch64 Linux;
 - x86_64 and Apple Silicon macOS; and
 - x86_64 and AArch64 Windows.
 
-It then produces SHA-256 checksums, an SPDX JSON dependency SBOM from the exact source checkout, and optional GitHub build provenance. The SBOM describes the locked Cargo package inventory. The checksum manifest and archive contents describe the released files. Artifacts are short-lived validation inputs until an explicitly reviewed publishing workflow is introduced.
+It then produces SHA-256 checksums, an SPDX JSON dependency SBOM from the exact source checkout, and optional GitHub build provenance when `attest` is enabled. The candidate set is six immutable target archives plus checksums, SBOM, and provenance evidence when requested. The SBOM describes the locked Cargo package inventory. The checksum manifest and archive contents describe the released files. Candidate artifacts are retained for one day as short-lived validation inputs; they are not published or durable distribution assets.
 
 ## Publication requirements
 
@@ -40,7 +46,8 @@ Before a stable release, maintainers must verify:
 - the tag, manifest, changelog, archive names, checksums, SBOM, and provenance agree;
 - release notes call out deletion, accounting, schema, configuration, platform, and compatibility changes;
 - security advisories and yanked dependencies are clear;
-- install metadata points only to immutable release assets; and
+- install metadata points only to immutable release assets;
+- any future distribution channel has reviewed immutable metadata and release evidence before enablement; and
 - rollback consists of stopping distribution and publishing a corrective version, never moving an existing tag.
 
 ## Historical tags
