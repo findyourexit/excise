@@ -524,13 +524,15 @@ impl Serialize for DeletionOutcomeRecordRef<'_> {
             DeletionEntryOutcome::Changed(message) => {
                 let mut outcome = serializer.serialize_map(Some(2))?;
                 outcome.serialize_entry("status", "changed")?;
-                outcome.serialize_entry("detail", message)?;
+                let detail = safe_display_text(message);
+                outcome.serialize_entry("detail", &detail)?;
                 outcome
             }
             DeletionEntryOutcome::Failed(message) => {
                 let mut outcome = serializer.serialize_map(Some(2))?;
                 outcome.serialize_entry("status", "failed")?;
-                outcome.serialize_entry("detail", message)?;
+                let detail = safe_display_text(message);
+                outcome.serialize_entry("detail", &detail)?;
                 outcome
             }
         };
@@ -967,5 +969,77 @@ mod tests {
                         && !path.contains('\u{1b}')
                 })
         );
+    }
+
+    #[test]
+    fn deletion_outcome_details_are_marked_and_escaped() {
+        use crate::deletion::{DeletionEntryResult, PlannedEntry, PlannedSnapshot};
+
+        let hostile = format!("{DECEPTIVE_DISPLAY_MARKER} changed\n\u{202e}\u{1b}[31m");
+        let report = Arc::new(DeletionReport {
+            target_node_id: NodeId(0),
+            root_relative_path: PathBuf::from("target"),
+            scan_root: PathBuf::from("/scan"),
+            entries: vec![
+                DeletionEntryResult {
+                    entry: PlannedEntry {
+                        relative_path: PathBuf::from("changed"),
+                        snapshot: PlannedSnapshot {
+                            identity: identity(),
+                            kind: PlannedKind::File,
+                            apparent_bytes: 3,
+                            allocated_bytes: Some(4096),
+                            modified_nanos: Some(1),
+                        },
+                    },
+                    outcome: DeletionEntryOutcome::Changed(hostile.clone()),
+                },
+                DeletionEntryResult {
+                    entry: PlannedEntry {
+                        relative_path: PathBuf::from("failed"),
+                        snapshot: PlannedSnapshot {
+                            identity: identity(),
+                            kind: PlannedKind::File,
+                            apparent_bytes: 3,
+                            allocated_bytes: Some(4096),
+                            modified_nanos: Some(1),
+                        },
+                    },
+                    outcome: DeletionEntryOutcome::Failed(hostile),
+                },
+            ],
+            soft_cancelled: false,
+            precise: true,
+            estimated_bytes: 0,
+        });
+
+        let mut encoded = Vec::new();
+        write_deletion_history_json(&[report], &mut encoded)
+            .expect("hostile deletion outcomes should serialize");
+        assert!(!encoded.contains(&0x1b));
+        assert!(
+            !encoded
+                .windows(3)
+                .any(|window| window == [0xe2, 0x80, 0xae])
+        );
+
+        let history: Value =
+            serde_json::from_slice(&encoded).expect("deletion history should parse");
+        let entries = history["operations"][0]["entries"]
+            .as_array()
+            .expect("deletion history entries should be an array");
+        for (entry, status) in entries.iter().zip(["changed", "failed"]) {
+            assert_eq!(entry["outcome"]["status"], status);
+            let detail = entry["outcome"]["detail"]
+                .as_str()
+                .expect("outcome detail should be a string");
+            assert!(detail.starts_with(DECEPTIVE_DISPLAY_MARKER));
+            assert_eq!(detail.matches(DECEPTIVE_DISPLAY_MARKER).count(), 2);
+            assert!(detail.contains("\\n"));
+            assert!(detail.contains("\\u{202e}"));
+            assert!(detail.contains("\\x1b"));
+            assert!(!detail.chars().any(char::is_control));
+            assert!(!detail.contains('\u{202e}'));
+        }
     }
 }
