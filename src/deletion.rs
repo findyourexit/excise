@@ -1743,6 +1743,41 @@ mod tests {
         assert!(outside_file.exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn sharing_failure_is_reported_without_deleting_target() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .expect("sharing blocker should open");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.failed_entries(), 1);
+        assert!(path.exists());
+        drop(blocker);
+    }
+
     #[cfg(unix)]
     #[test]
     fn hostile_directory_name_uses_generated_challenge() {
