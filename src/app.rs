@@ -73,6 +73,11 @@ pub enum UiMode {
     WarningMessage,
 }
 
+pub(crate) enum DeletionReplanResult {
+    Ready(Box<FileToDelete>),
+    Missing,
+}
+
 impl UiMode {
     #[must_use]
     pub const fn allows_motion(&self) -> bool {
@@ -614,7 +619,8 @@ where
             self.mark_dirty();
         }
     }
-    pub fn begin_deletion_replan(
+
+    pub(crate) fn begin_deletion_replan(
         &mut self,
         target_node_id: crate::model::NodeId,
         plan: DeletionPlan,
@@ -623,7 +629,26 @@ where
             self.show_error("Deletion validation returned an unexpected target");
             return Ok(None);
         }
-        let mut target = plan.target;
+        self.begin_deletion_replan_target(plan.target)
+    }
+
+    pub(crate) fn begin_pending_deletion_replan(
+        &mut self,
+        target_node_id: crate::model::NodeId,
+    ) -> Result<Option<PathBuf>, AppError> {
+        let target = match &self.ui_mode {
+            UiMode::PlanningDeletion(target) if target.node_id == target_node_id => {
+                (**target).clone()
+            }
+            _ => return Ok(None),
+        };
+        self.begin_deletion_replan_target(target)
+    }
+
+    fn begin_deletion_replan_target(
+        &mut self,
+        mut target: FileToDelete,
+    ) -> Result<Option<PathBuf>, AppError> {
         let target_path = target.full_path();
         let rescan_target = if target.expected_snapshot.kind == crate::model::NodeKind::Directory {
             target_path.clone()
@@ -639,11 +664,14 @@ where
         Ok(Some(rescan_target))
     }
 
-    pub fn rebuild_deletion_replan(&mut self) -> Option<FileToDelete> {
+    pub(crate) fn rebuild_deletion_replan(&mut self) -> Option<DeletionReplanResult> {
         let stale = self.take_deletion_replan()?;
         let path = stale.full_path();
         let mut target = match self.file_tree.deletion_target_for_path(&path) {
             Ok(target) => target,
+            Err(crate::model::ModelError::InvalidPath(_)) => {
+                return Some(DeletionReplanResult::Missing);
+            }
             Err(error) => {
                 self.show_error(format!("Deletion rescan could not refresh target: {error}"));
                 return None;
@@ -661,7 +689,13 @@ where
         };
         self.ui_mode = UiMode::PlanningDeletion(Box::new(target.display_copy()));
         self.mark_dirty();
-        Some(target)
+        Some(DeletionReplanResult::Ready(Box::new(target)))
+    }
+
+    pub(crate) fn complete_missing_deletion(&mut self) {
+        self.ui_effects.deletion_in_progress = false;
+        self.ui_mode = UiMode::Normal;
+        self.render_and_update_board();
     }
 
     pub fn resume_deletion(&mut self, stopping: bool) {

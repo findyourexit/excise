@@ -231,12 +231,15 @@ fn soft_cancel_wins_when_revalidation_event_follows_input() {
     assert!(target.exists(), "soft-cancelled target must remain");
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[cfg(any(unix, windows))]
 struct ReplanInput {
     events: Vec<Option<Event>>,
     target: std::path::PathBuf,
     changed: bool,
     remove_on_confirm: bool,
+    change_on_plan: bool,
+    remove_on_plan: bool,
 }
 
 #[cfg(any(unix, windows))]
@@ -249,11 +252,25 @@ impl ReplanInput {
             target,
             changed: false,
             remove_on_confirm: false,
+            change_on_plan: false,
+            remove_on_plan: false,
         }
     }
     fn missing(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
         let mut input = Self::new(events, target);
         input.remove_on_confirm = true;
+        input
+    }
+    fn planning_change(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
+        let mut input = Self::new(events, target);
+        input.change_on_plan = true;
+        input
+    }
+
+    fn planning_missing(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
+        let mut input = Self::new(events, target);
+        input.change_on_plan = true;
+        input.remove_on_plan = true;
         input
     }
 }
@@ -269,17 +286,22 @@ impl InputSource for ReplanInput {
             .events
             .pop()
             .ok_or_else(|| AppError::Invariant("fake input exhausted after poll".to_string()))?;
+        let trigger = if self.change_on_plan {
+            KeyCode::Backspace
+        } else {
+            KeyCode::Char('y')
+        };
         if !self.changed
             && matches!(
                 &event,
                 Some(Event::Key(KeyEvent {
-                    code: KeyCode::Char('y'),
+                    code,
                     modifiers: KeyModifiers::NONE,
                     ..
-                }))
+                })) if *code == trigger
             )
         {
-            if self.remove_on_confirm {
+            if self.remove_on_confirm || self.remove_on_plan {
                 std::fs::remove_file(&self.target).expect("post-plan target should be removed");
             } else {
                 std::fs::write(&self.target, b"changed-after-plan")
@@ -330,12 +352,12 @@ fn changed_plan_rescans_before_reprompting_and_does_not_reuse_stale_review() {
 
 #[cfg(any(unix, windows))]
 #[test]
-fn missing_final_validation_replans_without_terminal_io() {
+fn changed_plan_during_planning_rescans_before_reprompting() {
     let root = tempfile::tempdir().expect("runtime root should exist");
     let target = root.path().join("target");
     std::fs::write(&target, b"payload").expect("deletion target should be written");
     let (_, _, backend) = test_backend_factory(80, 24);
-    let input = ReplanInput::missing(
+    let input = ReplanInput::planning_change(
         vec![
             None,
             Some(key(KeyCode::Down, KeyModifiers::NONE)),
@@ -355,11 +377,93 @@ fn missing_final_validation_replans_without_terminal_io() {
         settings(root.path()),
         Box::new(VirtualClock::new()),
     )
-    .expect("missing final validation should trigger a rescan, not terminal I/O");
+    .expect("planning drift should trigger a focused rescan");
     assert!(
         matches!(outcome, OperationOutcome::Exact(_)),
         "unexpected outcome: {outcome:?}"
     );
+    assert!(!target.exists(), "freshly planned target should be deleted");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn missing_plan_target_reports_partial_summary() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::planning_missing(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("missing planning target should produce a partial summary");
+    let OperationOutcome::Partial {
+        completed_entries,
+        failed_entries,
+        value: summary,
+    } = outcome
+    else {
+        panic!("missing planning target must not return exact: {outcome:?}");
+    };
+    assert_eq!(completed_entries, 0);
+    assert_eq!(failed_entries, 1);
+    assert_eq!(summary.deletion_missing_entries, 1);
+    assert!(!target.exists(), "missing target should remain absent");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn missing_final_validation_reports_partial_summary() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::missing(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("missing final validation should produce a partial summary");
+    let OperationOutcome::Partial {
+        completed_entries,
+        failed_entries,
+        value: summary,
+    } = outcome
+    else {
+        panic!("missing final validation must not return exact: {outcome:?}");
+    };
+    assert_eq!(completed_entries, 0);
+    assert_eq!(failed_entries, 1);
+    assert_eq!(summary.deletion_missing_entries, 1);
     assert!(!target.exists(), "missing target should remain absent");
 }
 

@@ -1,15 +1,15 @@
 use std::collections::VecDeque;
 #[cfg(windows)]
 use std::ffi::OsString;
-use std::fs;
-#[cfg(not(windows))]
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+use cap_primitives::ambient_authority;
+use cap_primitives::fs::{self as cap_fs, FollowSymlinks};
 use crossbeam_channel::Sender;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
@@ -487,7 +487,8 @@ pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancell
 
 struct ScanFrame {
     task: DirectoryTask,
-    entries: fs::ReadDir,
+    _directory: File,
+    entries: cap_fs::ReadDir,
     batch: Vec<ScannedEntry>,
     directories: Vec<DirectoryTask>,
 }
@@ -724,9 +725,49 @@ fn validate_directory_task(task: &DirectoryTask) -> Result<(), DirectoryTaskErro
             "scanner directory task identity changed before traversal".to_string(),
         ));
     }
+    #[cfg(test)]
+    maybe_replace_after_validation(&task.path);
     Ok(())
 }
 
+#[cfg(all(test, unix))]
+static VALIDATION_REPLACEMENT: std::sync::OnceLock<Mutex<Option<(PathBuf, PathBuf, PathBuf)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn maybe_replace_after_validation(path: &Path) {
+    #[cfg(unix)]
+    {
+        let replacement = VALIDATION_REPLACEMENT.get_or_init(|| Mutex::new(None));
+        let Some((expected_path, displaced_path, target_path)) = replacement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        if expected_path != path {
+            let mut pending = replacement
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *pending = Some((expected_path, displaced_path, target_path));
+            return;
+        }
+        fs::rename(path, displaced_path).expect("original directory should be displaced");
+        std::os::unix::fs::symlink(target_path, path)
+            .expect("replacement symlink should be created");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+#[cfg(all(test, unix))]
+fn replace_after_next_validation(path: PathBuf, displaced: PathBuf, target: PathBuf) {
+    *VALIDATION_REPLACEMENT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, displaced, target));
+}
 fn report_directory_task_error(
     path: PathBuf,
     error: DirectoryTaskError,
@@ -757,37 +798,182 @@ fn report_directory_task_error(
     }
 }
 
-fn open_frame(task: DirectoryTask) -> Result<ScanFrame, Box<(DirectoryTask, DirectoryTaskError)>> {
-    if let Err(error) = validate_directory_task(&task) {
-        return Err(Box::new((task, error)));
+fn open_scan_directory(path: &Path) -> io::Result<File> {
+    let mut options = cap_fs::OpenOptions::new();
+    options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_primitives::fs::OpenOptionsExt as _;
+        let flags = rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW;
+        options.custom_flags(i32::try_from(flags.bits()).unwrap_or(i32::MAX));
     }
-    let entries = match fs::read_dir(&task.path) {
+    #[cfg(windows)]
+    {
+        use cap_primitives::fs::OpenOptionsExt as _;
+        const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    cap_fs::open_ambient(path, &options, ambient_authority())
+}
+
+fn classify_directory_open_error(path: &Path, error: io::Error) -> DirectoryTaskError {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            DirectoryTaskError::Replaced(
+                "scanner directory task was replaced by a symbolic link or non-directory"
+                    .to_string(),
+            )
+        }
+        _ => DirectoryTaskError::Io(error),
+    }
+}
+
+fn same_identity(left: &NativeIdentity, right: &NativeIdentity) -> bool {
+    left.file_id == right.file_id && left.reparse_point == right.reparse_point
+}
+
+fn open_frame(task: DirectoryTask) -> Result<ScanFrame, Box<(DirectoryTask, DirectoryTaskError)>> {
+    let directory = match open_scan_directory(&task.path) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return Err(Box::new((
+                task.clone(),
+                classify_directory_open_error(&task.path, error),
+            )));
+        }
+    };
+    let metadata = match directory.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Err(Box::new((task, DirectoryTaskError::Io(error)))),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Box::new((
+            task,
+            DirectoryTaskError::Replaced(
+                "scanner directory task was replaced by a symbolic link or non-directory"
+                    .to_string(),
+            ),
+        )));
+    }
+    let actual = match identity_for(&task.path, &metadata) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            return Err(Box::new((
+                task,
+                DirectoryTaskError::Replaced(
+                    "scanner directory task identity is unavailable".to_string(),
+                ),
+            )));
+        }
+        Err(error) => return Err(Box::new((task, DirectoryTaskError::Io(error)))),
+    };
+    if actual.reparse_point
+        || task
+            .identity
+            .as_ref()
+            .is_some_and(|expected| !same_identity(expected, &actual))
+    {
+        return Err(Box::new((
+            task,
+            DirectoryTaskError::Replaced(
+                "scanner directory task identity changed before traversal".to_string(),
+            ),
+        )));
+    }
+    let entries = match cap_fs::read_base_dir(&directory) {
         Ok(entries) => entries,
         Err(error) => return Err(Box::new((task, DirectoryTaskError::Io(error)))),
     };
     Ok(ScanFrame {
         task,
+        _directory: directory,
         entries,
         batch: Vec::with_capacity(BATCH_SIZE),
         directories: Vec::with_capacity(BATCH_SIZE),
     })
 }
 
+fn entry_metadata(entry: &cap_fs::DirEntry) -> io::Result<cap_fs::Metadata> {
+    #[cfg(windows)]
+    {
+        use cap_primitives::fs::_WindowsDirEntryExt as _;
+        entry.full_metadata()
+    }
+    #[cfg(not(windows))]
+    {
+        entry.metadata()
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn identity_from_entry_metadata(metadata: &cap_fs::Metadata) -> io::Result<Option<NativeIdentity>> {
+    #[cfg(unix)]
+    {
+        use cap_primitives::fs::MetadataExt as _;
+        Ok(Some(NativeIdentity {
+            file_id: file_id::FileId::new_inode(metadata.dev(), metadata.ino()),
+            link_count: Some(metadata.nlink()),
+            reparse_point: metadata.is_symlink(),
+        }))
+    }
+    #[cfg(windows)]
+    {
+        use cap_primitives::fs::_WindowsByHandle as _;
+        let volume = metadata.volume_serial_number().ok_or_else(|| {
+            io::Error::other("directory entry did not expose a volume serial number")
+        })?;
+        let index = metadata
+            .file_index()
+            .ok_or_else(|| io::Error::other("directory entry did not expose a file index"))?;
+        Ok(Some(NativeIdentity {
+            file_id: file_id::FileId::new_low_res(volume, index),
+            link_count: metadata.number_of_links().map(u64::from),
+            reparse_point: metadata.file_attributes() & 0x0000_0400 != 0,
+        }))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Ok(None)
+    }
+}
+
+fn report_symbolic_link(path: PathBuf, sender: &Sender<WorkerEvent>, cancelled: &AtomicBool) {
+    let _ = send_event(
+        sender,
+        WorkerEvent::ScanUnscanned {
+            path,
+            reason: UnscannedReason::SymbolicLink,
+        },
+        cancelled,
+    );
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn process_entry(
     frame: &mut ScanFrame,
-    entry: &fs::DirEntry,
+    entry: &cap_fs::DirEntry,
     sender: &Sender<WorkerEvent>,
     cancelled: &AtomicBool,
     exclusions: &Exclusions,
     root_filesystem: Option<&FilesystemKey>,
     cross_filesystems: bool,
 ) {
-    let path = entry.path();
+    let name = entry.file_name();
+    let path = frame.task.path.join(&name);
     if exclusions.is_internal(&path) {
         return;
     }
-    let metadata = match entry.metadata() {
+    let entry_metadata = match entry_metadata(entry) {
         Ok(metadata) => metadata,
         Err(error) => {
             let _ = send_event(
@@ -801,6 +987,71 @@ fn process_entry(
             return;
         }
     };
+    let entry_identity = match identity_from_entry_metadata(&entry_metadata) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanFailed {
+                    path: Some(path),
+                    message: error.to_string(),
+                },
+                cancelled,
+            );
+            return;
+        }
+    };
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanFailed {
+                    path: Some(path),
+                    message: error.to_string(),
+                },
+                cancelled,
+            );
+            return;
+        }
+    };
+    let identity = match identity_for(&path, &metadata) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return,
+        Err(error) => {
+            let message = format!(
+                "{}: {error}",
+                path.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_string_lossy()
+            );
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanFailed {
+                    path: Some(path),
+                    message,
+                },
+                cancelled,
+            );
+            return;
+        }
+    };
+    if entry_identity
+        .as_ref()
+        .is_some_and(|expected| !same_identity(expected, &identity))
+    {
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanUnscanned {
+                path,
+                reason: UnscannedReason::Metadata(
+                    "scanner entry identity changed before metadata collection".to_string(),
+                ),
+            },
+            cancelled,
+        );
+        return;
+    }
     let is_dir = metadata.is_dir();
     if let Some(pattern) = exclusions.reason(&path, is_dir) {
         let _ = send_event(
@@ -813,15 +1064,8 @@ fn process_entry(
         );
         return;
     }
-    if metadata.file_type().is_symlink() {
-        let _ = send_event(
-            sender,
-            WorkerEvent::ScanUnscanned {
-                path,
-                reason: UnscannedReason::SymbolicLink,
-            },
-            cancelled,
-        );
+    if metadata.file_type().is_symlink() || identity.reparse_point {
+        report_symbolic_link(path, sender, cancelled);
         return;
     }
     if is_dir && !cross_filesystems {
@@ -840,49 +1084,17 @@ fn process_entry(
             return;
         }
     }
-    match identity_for(&path, &metadata) {
-        Ok(Some(identity)) => {
-            if identity.reparse_point {
-                let _ = send_event(
-                    sender,
-                    WorkerEvent::ScanUnscanned {
-                        path,
-                        reason: UnscannedReason::SymbolicLink,
-                    },
-                    cancelled,
-                );
-                return;
-            }
-            let directory = is_dir.then(|| DirectoryTask {
-                path: path.clone(),
-                identity: Some(identity.clone()),
-            });
-            frame.batch.push(ScannedEntry {
-                metadata,
-                path,
-                identity,
-            });
-            if let Some(directory) = directory {
-                frame.directories.push(directory);
-            }
-        }
-        Ok(None) => {}
-        Err(error) => {
-            let message = format!(
-                "{}: {error}",
-                path.parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_string_lossy()
-            );
-            let _ = send_event(
-                sender,
-                WorkerEvent::ScanFailed {
-                    path: Some(path),
-                    message,
-                },
-                cancelled,
-            );
-        }
+    let directory = is_dir.then(|| DirectoryTask {
+        path: path.clone(),
+        identity: Some(entry_identity.unwrap_or_else(|| identity.clone())),
+    });
+    frame.batch.push(ScannedEntry {
+        metadata,
+        path,
+        identity,
+    });
+    if let Some(directory) = directory {
+        frame.directories.push(directory);
     }
 }
 
@@ -1072,6 +1284,87 @@ mod tests {
         assert!(
             events.try_recv().is_err(),
             "replacement must not be traversed"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn scanner_does_not_follow_replacement_after_identity_validation() {
+        use crossbeam_channel::bounded;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let outside = tempfile::tempdir().expect("outside root should exist");
+        let outside_secret = outside.path().join("secret");
+        fs::write(&outside_secret, b"outside").expect("outside fixture should be written");
+        let descendant = root.path().join("descendant");
+        let displaced = root.path().join("displaced-descendant");
+        fs::create_dir(&descendant).expect("descendant should be created");
+        fs::write(descendant.join("original"), b"inside")
+            .expect("descendant fixture should be written");
+        let metadata = fs::symlink_metadata(&descendant).expect("descendant metadata should exist");
+        let identity = identity_for(&descendant, &metadata)
+            .expect("descendant identity should be readable")
+            .expect("descendant identity should be available");
+        replace_after_next_validation(descendant.clone(), displaced, outside.path().to_path_buf());
+
+        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1)
+            .expect("scanner task queue should be available");
+        let (sender, events) = bounded(8);
+        let cancelled = AtomicBool::new(false);
+        let root_invalid = AtomicBool::new(false);
+        let exclusions = Exclusions::new(root.path(), Vec::new(), Vec::new())
+            .expect("scanner exclusions should compile");
+        assert!(scan_directory(
+            DirectoryTask {
+                path: descendant.clone(),
+                identity: Some(identity),
+            },
+            &queue,
+            &sender,
+            &cancelled,
+            &root_invalid,
+            root.path(),
+            None,
+            &exclusions,
+            None,
+            true,
+        ));
+
+        let mut saw_replacement = false;
+        while let Ok(event) = events.recv_timeout(Duration::from_secs(1)) {
+            match event {
+                WorkerEvent::ScanUnscanned { path, reason } => {
+                    assert_eq!(path, descendant);
+                    assert!(matches!(reason, UnscannedReason::Metadata(_)));
+                    saw_replacement = true;
+                    break;
+                }
+                WorkerEvent::ScanBatch { entries } => {
+                    assert!(
+                        !entries
+                            .iter()
+                            .any(|entry| entry.path == descendant.join("secret")),
+                        "scanner must not enumerate the replacement target"
+                    );
+                }
+                WorkerEvent::ScanDirectoryComplete { .. } => {
+                    panic!("replaced directory must not be reported complete")
+                }
+                WorkerEvent::ScanFailed { .. }
+                | WorkerEvent::ScanFinished { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        assert!(
+            saw_replacement,
+            "replacement should be reported as unscanned"
+        );
+        assert!(
+            outside_secret.exists(),
+            "outside target should remain untouched"
         );
     }
 }

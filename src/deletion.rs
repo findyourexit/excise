@@ -204,7 +204,7 @@ impl DeletionReport {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum DeletionPlanError {
     #[error("aggregate and synthetic nodes cannot be deleted")]
     Synthetic,
@@ -214,6 +214,8 @@ pub enum DeletionPlanError {
     InvalidRelativePath,
     #[error("deletion target changed while its plan was built")]
     Changed,
+    #[error("planned deletion entry is missing: {0:?}")]
+    Missing(PathBuf),
     #[error("deletion planning was cancelled")]
     Cancelled,
     #[error("deletion plan exceeds its {limit} byte memory limit")]
@@ -224,6 +226,35 @@ pub enum DeletionPlanError {
         message: String,
         kind: io::ErrorKind,
     },
+}
+
+impl DeletionPlanError {
+    #[must_use]
+    pub(crate) const fn is_changed(&self) -> bool {
+        matches!(self, Self::Changed)
+    }
+
+    #[must_use]
+    pub(crate) const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    #[must_use]
+    pub(crate) const fn is_missing(&self) -> bool {
+        matches!(
+            self,
+            Self::Missing(_)
+                | Self::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn is_missing_target(&self, plan: &DeletionPlan) -> bool {
+        matches!(self, Self::Missing(path) if path == &plan.root_relative_path)
+    }
 }
 
 /// Builds and revalidates an identity-bound deletion plan.
@@ -424,7 +455,13 @@ pub(crate) fn revalidate_plan_cancellable(
         if cancelled.load(Ordering::Acquire) {
             return Err(DeletionPlanError::Cancelled);
         }
-        let (actual, _) = inspect_relative(&root, &entry.relative_path)?;
+        let (actual, _) = match inspect_relative(&root, &entry.relative_path) {
+            Err(DeletionPlanError::Io {
+                kind: io::ErrorKind::NotFound,
+                ..
+            }) => return Err(DeletionPlanError::Missing(entry.relative_path.clone())),
+            result => result?,
+        };
         if actual != entry.snapshot {
             return Err(DeletionPlanError::Changed);
         }

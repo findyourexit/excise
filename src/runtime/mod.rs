@@ -511,15 +511,23 @@ where
                         self.app.cancel_rescan()?;
                     } else {
                         self.app.finish_rescan()?;
-                        if let Some(target) = self.app.rebuild_deletion_replan() {
-                            let reduced_guardrails = self.app.reduced_deletion_guardrails();
-                            let maximum_bytes = self.app.maximum_deletion_plan_bytes();
-                            self.workers()?.request_deletion_plan(
-                                target,
-                                reduced_guardrails,
-                                maximum_bytes,
-                            )?;
-                            self.deletion_active = true;
+                        match self.app.rebuild_deletion_replan() {
+                            Some(crate::app::DeletionReplanResult::Ready(target)) => {
+                                let reduced_guardrails = self.app.reduced_deletion_guardrails();
+                                let maximum_bytes = self.app.maximum_deletion_plan_bytes();
+                                self.workers()?.request_deletion_plan(
+                                    *target,
+                                    reduced_guardrails,
+                                    maximum_bytes,
+                                )?;
+                                self.deletion_active = true;
+                            }
+                            Some(crate::app::DeletionReplanResult::Missing) => {
+                                self.summary.deletion_missing_entries =
+                                    self.summary.deletion_missing_entries.saturating_add(1);
+                                self.app.complete_missing_deletion();
+                            }
+                            None => {}
                         }
                     }
                     let (used, limit, spilled) = self.app.model_stats();
@@ -545,10 +553,26 @@ where
                 result,
             } => {
                 self.deletion_active = false;
-                if result.is_err() {
-                    self.animation.schedule_error();
+                match result {
+                    Ok(plan) => self.app.deletion_plan_ready(target_node_id, Ok(plan)),
+                    Err(error) if error.is_changed() => {
+                        if let Some(target) =
+                            self.app.begin_pending_deletion_replan(target_node_id)?
+                        {
+                            self.start_deletion_rescan(target)?;
+                        }
+                    }
+                    Err(error) if error.is_missing() => {
+                        self.summary.deletion_missing_entries =
+                            self.summary.deletion_missing_entries.saturating_add(1);
+                        self.app.complete_missing_deletion();
+                    }
+                    Err(error) => {
+                        self.animation.schedule_error();
+                        self.app
+                            .deletion_plan_ready(target_node_id, Err(error.to_string()));
+                    }
                 }
-                self.app.deletion_plan_ready(target_node_id, result);
             }
             WorkerEvent::DeletionRevalidated {
                 target_node_id,
@@ -560,32 +584,20 @@ where
                         self.workers()?.execute_deletion(*plan)?;
                         self.deletion_active = true;
                     }
-                    Err((plan, error)) => {
-                        if error == "deletion planning was cancelled" {
-                            self.app.normal_mode();
-                        } else {
-                            self.animation.schedule_error();
-                            let Some(target) =
-                                self.app.begin_deletion_replan(target_node_id, *plan)?
-                            else {
-                                return Ok(());
-                            };
-                            let root_identity = self.app.identity_for_path(&target);
-                            self.reset_scan_summary();
-                            self.workers()?.request_rescan(scanner::ScannerOptions {
-                                root: target,
-                                root_identity,
-                                threads: self.settings.scan_threads,
-                                cross_filesystems: self.settings.cross_filesystems,
-                                exclusions: self.settings.exclusions.clone(),
-                                internal_paths: self.app.internal_scan_paths(),
-                            })?;
-                            self.scan_active = true;
-                            self.rescan_active = true;
-                            self.next_loading_frame =
-                                self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
-                            self.animation.schedule_aggregation();
-                        }
+                    Err((_plan, error)) if error.is_cancelled() => {
+                        self.app.normal_mode();
+                    }
+                    Err((plan, error)) if error.is_missing_target(&plan) => {
+                        self.summary.deletion_missing_entries =
+                            self.summary.deletion_missing_entries.saturating_add(1);
+                        self.app.complete_missing_deletion();
+                    }
+                    Err((plan, _error)) => {
+                        let Some(target) = self.app.begin_deletion_replan(target_node_id, *plan)?
+                        else {
+                            return Ok(());
+                        };
+                        self.start_deletion_rescan(target)?;
                     }
                 }
             }
@@ -629,6 +641,24 @@ where
                 }
             }
         }
+        Ok(())
+    }
+
+    fn start_deletion_rescan(&mut self, target: PathBuf) -> Result<(), AppError> {
+        let root_identity = self.app.identity_for_path(&target);
+        self.reset_scan_summary();
+        self.workers()?.request_rescan(scanner::ScannerOptions {
+            root: target,
+            root_identity,
+            threads: self.settings.scan_threads,
+            cross_filesystems: self.settings.cross_filesystems,
+            exclusions: self.settings.exclusions.clone(),
+            internal_paths: self.app.internal_scan_paths(),
+        })?;
+        self.scan_active = true;
+        self.rescan_active = true;
+        self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
+        self.animation.schedule_aggregation();
         Ok(())
     }
 

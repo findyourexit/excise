@@ -8,7 +8,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
 
 use crate::deletion::{
-    DeletionPlan, DeletionReport, build_plan_cancellable,
+    DeletionPlan, DeletionPlanError, DeletionReport, build_plan_cancellable,
     build_plan_cancellable_with_root_identity, execute_plan, revalidate_plan_cancellable,
 };
 use crate::error::AppError;
@@ -45,11 +45,11 @@ pub(super) enum WorkerEvent {
     },
     DeletionPlanned {
         target_node_id: crate::model::NodeId,
-        result: Result<Box<DeletionPlan>, String>,
+        result: Result<Box<DeletionPlan>, DeletionPlanError>,
     },
     DeletionRevalidated {
         target_node_id: crate::model::NodeId,
-        result: Result<Box<DeletionPlan>, (Box<DeletionPlan>, String)>,
+        result: Result<Box<DeletionPlan>, (Box<DeletionPlan>, DeletionPlanError)>,
     },
     DeletionFinished {
         report: DeletionReport,
@@ -264,8 +264,7 @@ fn deletion_worker(
                         maximum_bytes,
                     )
                 }
-                .map(Box::new)
-                .map_err(|error| error.to_string());
+                .map(Box::new);
                 WorkerEvent::DeletionPlanned {
                     target_node_id,
                     result,
@@ -275,7 +274,7 @@ fn deletion_worker(
                 let target_node_id = plan.target.node_id;
                 let result = match revalidate_plan_cancellable(scan_root, &plan, soft_cancelled) {
                     Ok(()) => Ok(Box::new(plan)),
-                    Err(error) => Err((Box::new(plan), error.to_string())),
+                    Err(error) => Err((Box::new(plan), error)),
                 };
                 WorkerEvent::DeletionRevalidated {
                     target_node_id,
@@ -987,7 +986,7 @@ mod tests {
         };
         let (returned, error) = result.expect_err("changed confirmation should be rejected");
         assert_eq!(returned.entries.len(), 1);
-        assert!(error.contains("changed"));
+        assert!(error.is_changed());
         workers.shutdown().expect("workers should stop");
     }
     #[test]
