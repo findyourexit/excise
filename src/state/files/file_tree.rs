@@ -539,7 +539,9 @@ mod tests {
 
     #[cfg(unix)]
     use crate::deletion::{build_plan, execute_plan};
-    use crate::model::{ByteBounds, NodeKind, SyntheticKind};
+    #[cfg(unix)]
+    use crate::model::ByteBounds;
+    use crate::model::{NodeKind, SyntheticKind};
     use crate::native_path::identity_for;
     #[cfg(unix)]
     use crate::state::FileToDelete;
