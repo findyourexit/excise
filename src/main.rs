@@ -9,7 +9,9 @@ use ratatui::backend::CrosstermBackend;
 
 use excise::config::{Cli, OutputFormat, RuntimeConfig, default_config_path};
 use excise::error::{AppError, ExitClass};
-use excise::native_path::{ResolvedRoot, safe_display_os_str_text, safe_display_text};
+#[cfg(debug_assertions)]
+use excise::native_path::safe_display_os_str_text;
+use excise::native_path::{ResolvedRoot, safe_display_text};
 use excise::report::{ReportError, ScanReport};
 use excise::runtime::{RuntimeSettings, SystemClock, run, scan_headless};
 use excise::{TerminalEvents, TerminalSession, validate_terminal};

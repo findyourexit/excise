@@ -867,16 +867,19 @@ mod tests {
         let parent = tempfile::tempdir().expect("report parent should exist");
         let root = parent.path().join("scan-\u{202e}-root");
         std::fs::create_dir(&root).expect("report root should be created");
-        let path = root.join("entry-\u{1b}[31m");
-        std::fs::write(&path, b"payload").expect("report entry should be written");
-        let metadata = std::fs::symlink_metadata(&path).expect("report metadata should exist");
-        let identity = crate::native_path::identity_for(&path, &metadata)
+        // Keep the hostile path synthetic: Windows rejects ESC in filesystem names.
+        let fixture_path = root.join("entry-fixture");
+        std::fs::write(&fixture_path, b"payload").expect("report entry should be written");
+        let metadata =
+            std::fs::symlink_metadata(&fixture_path).expect("report metadata should exist");
+        let entry_identity = crate::native_path::identity_for(&fixture_path, &metadata)
             .expect("report identity should be readable")
             .expect("report entry should not be a link");
+        let hostile_path = root.join("entry-\u{1b}[31m");
         let mut tree = FileTree::new(root.clone(), false, crate::model::DEFAULT_PROCESS_MIB)
             .expect("report model should be created");
-        tree.add_entry(&metadata, &path, identity.clone())
-            .expect("report entry should be added");
+        tree.add_entry(&metadata, &hostile_path, entry_identity.clone())
+            .expect("hostile report entry should be added");
         tree.complete_directory(&root)
             .expect("report root should complete");
         tree.finalize().expect("report model should finalize");
@@ -922,13 +925,13 @@ mod tests {
 
         let report = Arc::new(DeletionReport {
             target_node_id: NodeId(1),
-            root_relative_path: PathBuf::from("entry-\u{202e}"),
+            root_relative_path: PathBuf::from("entry-\u{1b}[31m"),
             scan_root: root,
             entries: vec![DeletionEntryResult {
                 entry: PlannedEntry {
-                    relative_path: PathBuf::from("entry-\u{202e}"),
+                    relative_path: PathBuf::from("entry-\u{1b}[31m"),
                     snapshot: PlannedSnapshot {
-                        identity,
+                        identity: entry_identity,
                         kind: PlannedKind::File,
                         apparent_bytes: 1,
                         allocated_bytes: Some(1),
@@ -949,12 +952,20 @@ mod tests {
         assert!(
             history["operations"][0]["display_root"]
                 .as_str()
-                .is_some_and(|path| path.contains(DECEPTIVE_DISPLAY_MARKER))
+                .is_some_and(|path| {
+                    path.contains(DECEPTIVE_DISPLAY_MARKER)
+                        && path.contains("\\x1b")
+                        && !path.contains('\u{1b}')
+                })
         );
         assert!(
             history["operations"][0]["entries"][0]["display_path"]
                 .as_str()
-                .is_some_and(|path| path.contains(DECEPTIVE_DISPLAY_MARKER))
+                .is_some_and(|path| {
+                    path.contains(DECEPTIVE_DISPLAY_MARKER)
+                        && path.contains("\\x1b")
+                        && !path.contains('\u{1b}')
+                })
         );
     }
 }
