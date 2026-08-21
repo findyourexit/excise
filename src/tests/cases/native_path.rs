@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use crate::native_path::safe_display_os_str;
 use crate::native_path::{NativePath, ResolvedRoot, identity_for, safe_display_path};
 
 #[test]
@@ -37,6 +39,25 @@ fn unix_codec_preserves_non_utf8_bytes() {
         original
     );
     assert!(original.safe_display().deceptive);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_codec_and_display_preserve_unpaired_utf16() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let original = OsString::from_wide(&[u16::from(b'a'), 0xd800, u16::from(b'b')]);
+    let displayed = safe_display_os_str(&original);
+    assert!(displayed.deceptive);
+    assert!(displayed.text.contains("\\u{d800}"));
+
+    let path = NativePath::new(std::path::PathBuf::from(original));
+    let encoded = path.encode();
+    assert_eq!(
+        NativePath::decode(&encoded).expect("path should decode"),
+        path
+    );
 }
 
 #[test]
