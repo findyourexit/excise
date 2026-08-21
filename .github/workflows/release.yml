@@ -20,26 +20,51 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, shell: bash }
-          - { os: ubuntu-24.04, target: aarch64-unknown-linux-gnu, shell: bash }
-          - { os: macos-14, target: aarch64-apple-darwin, shell: bash }
-          - { os: macos-14, target: x86_64-apple-darwin, shell: bash }
-          - { os: windows-2025, target: x86_64-pc-windows-msvc, shell: pwsh }
-          - { os: windows-2025, target: aarch64-pc-windows-msvc, shell: pwsh }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04, target: aarch64-unknown-linux-gnu }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          - { os: windows-2025, target: x86_64-pc-windows-msvc }
+          - { os: windows-2025, target: aarch64-pc-windows-msvc }
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Install Linux cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update --yes && sudo apt-get install --yes gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Install pinned Rust target
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup target add "$TARGET" --toolchain 1.88.0
+          rustup override set 1.88.0
       - name: Build locked release binary
-        uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
-        with:
-          command: build
-          target: ${{ matrix.target }}
-          args: --locked --release --package excise
-          toolchain: 1.88.0
-          strip: true
-          use-rust-cache: false
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+          fi
+          cargo build --target "$TARGET" --locked --release --package excise
+      - name: Strip Unix release binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+            aarch64-linux-gnu-strip "target/$TARGET/release/excise"
+          else
+            strip "target/$TARGET/release/excise"
+          fi
       - name: Validate distribution template contracts
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
@@ -76,7 +101,7 @@ jobs:
           Copy-Item docs/schemas/*.json "stage/$root/schemas/"
           Compress-Archive -Path "stage/$root" -DestinationPath "upload/$root.zip"
       - name: Upload immutable target archive
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v7
         with:
           name: excise-${{ matrix.target }}
           path: upload/*
@@ -94,7 +119,7 @@ jobs:
       attestations: write
     steps:
       - name: Download target archives
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v8
         with:
           pattern: excise-*
           path: release
@@ -116,7 +141,7 @@ jobs:
         with:
           subject-path: release/*
       - name: Upload release candidate bundle
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v7
         with:
           name: excise-release-candidate
           path: release
