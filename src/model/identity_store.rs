@@ -235,7 +235,7 @@ impl IdentityStore {
         {
             let mut table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
             table
-                .insert(key.as_slice(), b"corrupt")
+                .insert(key.as_slice(), &b"corrupt"[..])
                 .map_err(identity_error)?;
         }
         transaction.commit().map_err(identity_error)
