@@ -1,16 +1,16 @@
 # Release process
 
-This runbook defines the planned `0.1.1` early-testing release contract and the evidence required before publication. It is a procedure, not authorization; nothing in this document means that `0.1.1` has already been published.
+This runbook records the published `0.1.1` early-testing release contract and the evidence required for publication and future corrective releases. It is a procedure, not authorization.
 
 ## The 0.1.1 contract
 
-The planned `0.1.1` release is for early testing. It is the first release contract that permits publishing the `excise` crate, while the public library API and destructive behavior remain provisional until the project declares a stable line. Test only with disposable data; do not treat this release as suitable for irreplaceable files.
+The published `0.1.1` release is for early testing. Its public library API and destructive behavior remain provisional until the project declares a stable line. Test only with disposable data; do not treat this release as suitable for irreplaceable files.
 
 The release commit and candidate must agree on all of the following:
 
 - `Cargo.toml`, `Cargo.lock`, the CLI version, and the changelog identify `0.1.1`;
 - the crate is publishable (the release metadata must not set `publish = false`);
-- the annotated `v0.1.1` tag, when created, points to the exact protected `main` commit that passed verification;
+- the annotated `v0.1.1` tag points to the exact protected `main` commit that passed verification;
 - six target archives, their SHA-256 manifest, the SPDX JSON SBOM, and GitHub build attestations describe that same commit and version;
 - the first-party Homebrew tap formula refers only to those immutable GitHub release assets; and
 - the tagged Nix flake and cargo-binstall metadata resolve the same immutable `0.1.1` release.
@@ -145,14 +145,16 @@ The candidate contains six immutable target archives, `checksums.sha256`, and `e
 Confirm that every archive contains its target binary, `LICENSE`, `generated/man/excise.1`, and `schemas/scan-report.schema.json`; the SBOM and provenance files are candidate-bundle evidence and are not silently substituted for an archive. The workflow retains candidate artifacts for one day. Retention is a validation convenience, not publication or durable distribution.
 ## Promotion order and publication semantics
 
-After local and hosted evidence has been reviewed and approved, create the annotated `v0.1.1` tag on the verified protected commit with the reviewed candidate run ID in its message, then push it:
+The approved `0.1.1` publication used:
 
-```console
-git tag -a v0.1.1 "$source_sha" -m "candidate-run-id: $run_id"
-git push origin v0.1.1
-```
+- source commit: `59eb0d17295eaef99305521651107c28dce27613`;
+- candidate workflow run: [32733774029](https://github.com/findyourexit/excise/actions/runs/32733774029);
+- annotated tag: `v0.1.1`, carrying `candidate-run-id: 32733774029`;
+- publication recovery run: [32742153533](https://github.com/findyourexit/excise/actions/runs/32742153533).
 
-The push-triggered workflow reads that immutable tag annotation, requires the exact candidate run to be successful for the tagged source SHA, verifies its checksums, archive contents, SBOM, and attestations, and promotes those exact candidate bytes without rebuilding:
+The tag was never moved. The recovery workflow verified and promoted the exact candidate bytes without rebuilding them.
+
+The publication semantics are:
 
 1. The `release` job creates the GitHub release from the promoted candidate bundle. It reuses an existing published release only after the exact tag object, complete asset set, and every asset checksum match; published mismatches and unexpected drafts are refused, while a matching non-prerelease draft may be repaired with the reverified candidate assets.
 2. The `publish-crate` job publishes the crate once after the release job succeeds. Do not run `cargo publish` manually; the job accepts an existing version only after matching its registry checksum and non-yanked state, and otherwise fails before retrying.

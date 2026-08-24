@@ -18,7 +18,7 @@ Excise is an independent successor to [Diskonaut](https://github.com/imsnif/disk
 > Excise permanently deletes selected filesystem entries. There is no trash or undo. Use it only on data you can safely remove.
 
 > [!IMPORTANT]
-> The planned Excise **0.1.1** release is for early testing. Start with a disposable directory, keep the default confirmation enabled, and read the [deletion contract](docs/safety/deletion.md) before selecting anything you might need.
+The published Excise **0.1.1** release is for early testing. Start with a disposable directory, keep the default confirmation enabled, and read the [deletion contract](docs/safety/deletion.md) before selecting anything you might need.
 
 ## Why Excise
 
@@ -31,14 +31,14 @@ Excise is an independent successor to [Diskonaut](https://github.com/imsnif/disk
 
 ## Quick Start
 
-All release-channel commands below target the planned **0.1.1** early-testing release. Do not run them until the [release process](docs/releasing.md) announces publication; before then, use the protected `main` source build below.
+All release-channel commands below target the published **0.1.1** early-testing release. Before using them, read the [release process](docs/releasing.md) and follow the disposable-fixture guidance.
 
 ### Install it
 
 <details>
 <summary><strong>Homebrew (macOS)</strong></summary>
 
-After the `0.1.1` release is promoted, the first-party Homebrew tap will carry the formula:
+The first-party Homebrew tap carries the formula:
 
 ```console
 brew tap findyourexit/tap
@@ -51,7 +51,7 @@ excise --version  # excise 0.1.1
 <details>
 <summary><strong>crates.io</strong></summary>
 
-After the crate is published, install the `0.1.1` package with the locked dependency graph:
+The `0.1.1` package is published on crates.io; install it with the locked dependency graph:
 
 ```console
 cargo install excise --version 0.1.1 --locked
@@ -63,7 +63,7 @@ excise --version  # excise 0.1.1
 <details>
 <summary><strong>GitHub Release</strong></summary>
 
-After the GitHub release is created, download the archive for your platform from the [0.1.1 GitHub Release](https://github.com/findyourexit/excise/releases/tag/v0.1.1). For example, Apple silicon macOS:
+Download the archive for your platform from the [published 0.1.1 GitHub Release](https://github.com/findyourexit/excise/releases/tag/v0.1.1). For example, Apple silicon macOS:
 The provenance check requires the GitHub CLI (`gh`) and a GitHub API-authenticated session.
 
 ```console
@@ -98,7 +98,7 @@ The release provides archives for AArch64 and x86_64 macOS, AArch64 and x86_64 L
 <details>
 <summary><strong>Build from source</strong></summary>
 
-Before `v0.1.1` is published, build the current protected `main` source:
+To build the current protected `main` source:
 
 ```console
 git clone --branch main --depth 1 https://github.com/findyourexit/excise.git
@@ -107,14 +107,14 @@ cargo install --path . --locked
 excise --version
 ```
 
-After publication, replace `main` with `v0.1.1` to reproduce the exact release commit.
+To reproduce the exact published release commit, replace `main` with `v0.1.1` in the clone command.
 
 </details>
 
 <details>
 <summary><strong>Nix</strong></summary>
 
-After the `v0.1.1` release is announced, run or install the flake from that tag without updating its lock file:
+Run or install the published `v0.1.1` flake without updating its lock file:
 
 ```console
 nix run github:findyourexit/excise/v0.1.1 -- --format table /path/to/inspect
