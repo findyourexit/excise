@@ -18,7 +18,7 @@ use crate::animation::AnimationScheduler;
 use crate::config::{CustomKeyBindings, KeyPreset, SafePreferences, save_safe_preferences};
 use crate::error::{AppError, ExitClass};
 use crate::input::{InputCommand, InputEvent, InputSource, handle_keypress};
-use crate::native_path::safe_display_path;
+use crate::native_path::{NativeIdentity, safe_display_path};
 use crate::outcome::{OperationOutcome, RunSummary};
 use crate::report::{ScanReport, ScanReportState, scan_report_state};
 use crate::state::files::FileTree;
@@ -35,6 +35,7 @@ const MAX_WORKER_BATCH: usize = 128;
 #[allow(clippy::struct_excessive_bools)]
 pub struct RuntimeSettings {
     pub root: PathBuf,
+    pub root_identity: NativeIdentity,
     pub scan_threads: usize,
     pub event_capacity: usize,
     pub cross_filesystems: bool,
@@ -99,9 +100,10 @@ where
     B: Backend,
 {
     let now = clock.now();
-    let app = App::new(
+    let app = App::new_with_root_identity(
         terminal_backend,
         settings.root.clone(),
+        settings.root_identity.clone(),
         settings.apparent_size,
         settings.disable_delete_confirmation,
         settings.memory_mib,
@@ -112,6 +114,7 @@ where
     let workers = WorkerPool::start(
         scanner::ScannerOptions {
             root: settings.root.clone(),
+            root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
             cross_filesystems: settings.cross_filesystems,
             exclusions: settings.exclusions.clone(),
@@ -277,10 +280,12 @@ where
                 if self.scan_active || self.deletion_active {
                     return Ok(());
                 }
+                let root_identity = self.app.identity_for_path(&target);
                 self.app.begin_rescan(target.clone())?;
                 self.reset_scan_summary();
                 self.workers()?.request_rescan(scanner::ScannerOptions {
                     root: target,
+                    root_identity,
                     threads: self.settings.scan_threads,
                     cross_filesystems: self.settings.cross_filesystems,
                     exclusions: self.settings.exclusions.clone(),
@@ -297,13 +302,21 @@ where
                 }
             }
             InputCommand::PlanDeletion(target) => {
-                if self.deletion_active {
+                if self.scan_active || self.deletion_active {
                     return Ok(());
                 }
                 let reduced_guardrails = self.app.reduced_deletion_guardrails();
                 let maximum_bytes = self.app.maximum_deletion_plan_bytes();
                 self.workers()?
                     .request_deletion_plan(target, reduced_guardrails, maximum_bytes)?;
+                self.deletion_active = true;
+            }
+            InputCommand::CancelDeletionPlan => self.workers()?.cancel_deletion_plan(),
+            InputCommand::RevalidateDeletion(plan) => {
+                if self.deletion_active {
+                    return Ok(());
+                }
+                self.workers()?.revalidate_deletion(plan)?;
                 self.deletion_active = true;
             }
             InputCommand::ExportScan => {
@@ -390,14 +403,14 @@ where
                 }
             }
             InputCommand::DiscardPreferencesAndExit => self.app.exit(),
-            InputCommand::ExecuteDeletion(plan) => {
-                if self.deletion_active {
-                    return Ok(());
-                }
-                self.workers()?.execute_deletion(plan)?;
-                self.deletion_active = true;
+            InputCommand::SoftCancelDeletion => {
+                self.workers()?.soft_cancel_deletion();
+                self.app.resume_deletion(true);
             }
-            InputCommand::SoftCancelDeletion => self.workers()?.soft_cancel_deletion(),
+            InputCommand::ResumeDeletion => {
+                self.workers()?.resume_deletion();
+                self.app.resume_deletion(false);
+            }
             InputCommand::HardCancel => self.hard_cancelled = true,
         }
         if !self.app.ui_mode.allows_motion() {
@@ -443,8 +456,8 @@ where
                     u64::try_from(self.app.identity_count()).unwrap_or(u64::MAX);
                 self.animation.schedule_scan_progress();
             }
-            WorkerEvent::ScanDirectoryComplete { path } => {
-                self.app.complete_directory(&path)?;
+            WorkerEvent::ScanDirectoryComplete { path, identity } => {
+                self.app.complete_directory(&path, identity.as_ref())?;
                 self.animation.schedule_state_change();
             }
             WorkerEvent::ScanUnscanned { path, reason } => {
@@ -461,7 +474,8 @@ where
                     crate::model::UnscannedReason::SymbolicLink => {
                         self.summary.link_entries += 1;
                     }
-                    crate::model::UnscannedReason::Metadata(message) => {
+                    crate::model::UnscannedReason::Metadata(message)
+                    | crate::model::UnscannedReason::Replacement(message) => {
                         self.summary.unreadable_entries += 1;
                         self.summary.last_unreadable_path =
                             self.summary.last_unscanned_path.clone();
@@ -495,13 +509,27 @@ where
                 if self.rescan_active {
                     self.rescan_active = false;
                     if cancelled {
-                        self.summary.unreadable_entries =
-                            self.summary.unreadable_entries.saturating_add(1);
-                        self.summary.last_worker_error =
-                            Some("focused rescan cancelled".to_string());
                         self.app.cancel_rescan()?;
                     } else {
                         self.app.finish_rescan()?;
+                        match self.app.rebuild_deletion_replan() {
+                            Some(crate::app::DeletionReplanResult::Ready(target)) => {
+                                let reduced_guardrails = self.app.reduced_deletion_guardrails();
+                                let maximum_bytes = self.app.maximum_deletion_plan_bytes();
+                                self.workers()?.request_deletion_plan(
+                                    *target,
+                                    reduced_guardrails,
+                                    maximum_bytes,
+                                )?;
+                                self.deletion_active = true;
+                            }
+                            Some(crate::app::DeletionReplanResult::Missing) => {
+                                self.summary.deletion_missing_entries =
+                                    self.summary.deletion_missing_entries.saturating_add(1);
+                                self.app.complete_missing_deletion();
+                            }
+                            None => {}
+                        }
                     }
                     let (used, limit, spilled) = self.app.model_stats();
                     self.summary.model_bytes = used;
@@ -526,10 +554,53 @@ where
                 result,
             } => {
                 self.deletion_active = false;
-                if result.is_err() {
-                    self.animation.schedule_error();
+                match result {
+                    Ok(plan) => self.app.deletion_plan_ready(target_node_id, Ok(plan)),
+                    Err(error) if error.is_stale() => {
+                        if let Some(target) =
+                            self.app.begin_pending_deletion_replan(target_node_id)?
+                        {
+                            self.start_deletion_rescan(target)?;
+                        }
+                    }
+                    Err(error) if error.is_missing() => {
+                        self.summary.deletion_missing_entries =
+                            self.summary.deletion_missing_entries.saturating_add(1);
+                        self.app.complete_missing_deletion();
+                    }
+                    Err(error) => {
+                        self.animation.schedule_error();
+                        self.app
+                            .deletion_plan_ready(target_node_id, Err(error.to_string()));
+                    }
                 }
-                self.app.deletion_plan_ready(target_node_id, result);
+            }
+            WorkerEvent::DeletionRevalidated {
+                target_node_id,
+                result,
+            } => {
+                self.deletion_active = false;
+                match result {
+                    Ok(plan) => {
+                        self.workers()?.execute_deletion(*plan)?;
+                        self.deletion_active = true;
+                    }
+                    Err((_plan, error)) if error.is_cancelled() => {
+                        self.app.normal_mode();
+                    }
+                    Err((plan, error)) if error.is_missing_target(&plan) => {
+                        self.summary.deletion_missing_entries =
+                            self.summary.deletion_missing_entries.saturating_add(1);
+                        self.app.complete_missing_deletion();
+                    }
+                    Err((plan, _error)) => {
+                        let Some(target) = self.app.begin_deletion_replan(target_node_id, *plan)?
+                        else {
+                            return Ok(());
+                        };
+                        self.start_deletion_rescan(target)?;
+                    }
+                }
             }
             WorkerEvent::DeletionFinished { report } => {
                 self.deletion_active = false;
@@ -551,17 +622,44 @@ where
                     .summary
                     .deletion_unattempted_entries
                     .saturating_add(report.unattempted_entries());
-                self.animation.schedule_deletion_result();
-                if self.app.complete_deletion(report) && deleted > 0 {
-                    self.app.flash_space_freed();
-                    self.schedule(
-                        self.clock.now(),
-                        TimedAction::UnflashSpace,
-                        TRANSIENT_STATUS_DURATION,
-                    );
+                match self.app.try_complete_deletion(report) {
+                    Ok(true) => {
+                        self.animation.schedule_deletion_result();
+                        self.app.flash_space_freed();
+                        self.schedule(
+                            self.clock.now(),
+                            TimedAction::UnflashSpace,
+                            TRANSIENT_STATUS_DURATION,
+                        );
+                    }
+                    Ok(false) => self.animation.schedule_deletion_result(),
+                    Err(error) => {
+                        self.summary.unreadable_entries =
+                            self.summary.unreadable_entries.saturating_add(1);
+                        self.summary.last_worker_error = Some(error.to_string());
+                        self.animation.schedule_error();
+                    }
                 }
             }
         }
+        Ok(())
+    }
+
+    fn start_deletion_rescan(&mut self, target: PathBuf) -> Result<(), AppError> {
+        let root_identity = self.app.identity_for_path(&target);
+        self.reset_scan_summary();
+        self.workers()?.request_rescan(scanner::ScannerOptions {
+            root: target,
+            root_identity,
+            threads: self.settings.scan_threads,
+            cross_filesystems: self.settings.cross_filesystems,
+            exclusions: self.settings.exclusions.clone(),
+            internal_paths: self.app.internal_scan_paths(),
+        })?;
+        self.scan_active = true;
+        self.rescan_active = true;
+        self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
+        self.animation.schedule_aggregation();
         Ok(())
     }
 
@@ -704,8 +802,9 @@ where
 /// Returns a scanner, model, or worker error after all owned workers stop.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanReport>, AppError> {
-    let mut tree = FileTree::new(
+    let mut tree = FileTree::new_with_root_identity(
         settings.root.clone(),
+        settings.root_identity.clone(),
         settings.apparent_size,
         settings.memory_mib,
     )
@@ -713,6 +812,7 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
     let workers = WorkerPool::start(
         scanner::ScannerOptions {
             root: settings.root.clone(),
+            root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
             cross_filesystems: settings.cross_filesystems,
             exclusions: settings.exclusions.clone(),
@@ -738,8 +838,8 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                     summary.identified_entries =
                         u64::try_from(tree.identity_count()).unwrap_or(u64::MAX);
                 }
-                WorkerEvent::ScanDirectoryComplete { path } => tree
-                    .complete_directory(&path)
+                WorkerEvent::ScanDirectoryComplete { path, identity } => tree
+                    .complete_directory(&path, identity.as_ref())
                     .map_err(|error| AppError::Model(error.to_string()))?,
                 WorkerEvent::ScanUnscanned { path, reason } => {
                     summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
@@ -756,7 +856,8 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                         crate::model::UnscannedReason::SymbolicLink => {
                             summary.link_entries = summary.link_entries.saturating_add(1);
                         }
-                        crate::model::UnscannedReason::Metadata(message) => {
+                        crate::model::UnscannedReason::Metadata(message)
+                        | crate::model::UnscannedReason::Replacement(message) => {
                             summary.unreadable_entries =
                                 summary.unreadable_entries.saturating_add(1);
                             summary
@@ -790,7 +891,9 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                     tree.failed_to_read = tree.failed_to_read.saturating_add(1);
                 }
                 WorkerEvent::ScanFinished { cancelled } => return Ok(cancelled),
-                WorkerEvent::DeletionPlanned { .. } | WorkerEvent::DeletionFinished { .. } => {}
+                WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
     })();
