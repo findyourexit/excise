@@ -805,6 +805,9 @@ fn validate_directory_task(
 #[cfg(all(test, unix))]
 static VALIDATION_REPLACEMENT: std::sync::OnceLock<Mutex<Option<(PathBuf, PathBuf, PathBuf)>>> =
     std::sync::OnceLock::new();
+#[cfg(all(test, unix))]
+static BATCH_REPLACEMENT: std::sync::OnceLock<Mutex<Option<(PathBuf, PathBuf, PathBuf)>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 fn maybe_replace_after_validation(path: &Path) {
@@ -833,9 +836,41 @@ fn maybe_replace_after_validation(path: &Path) {
     let _ = path;
 }
 
+#[cfg(test)]
+fn maybe_replace_after_batch(path: &Path) {
+    #[cfg(unix)]
+    {
+        let replacement = BATCH_REPLACEMENT.get_or_init(|| Mutex::new(None));
+        let mut pending = replacement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((expected_path, displaced_path, target_path)) = pending.take() else {
+            return;
+        };
+        if expected_path != path {
+            *pending = Some((expected_path, displaced_path, target_path));
+            return;
+        }
+        drop(pending);
+        fs::rename(path, displaced_path).expect("original directory should be displaced");
+        std::os::unix::fs::symlink(target_path, path)
+            .expect("replacement symlink should be created");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[cfg(all(test, unix))]
 fn replace_after_next_validation(path: PathBuf, displaced: PathBuf, target: PathBuf) {
     *VALIDATION_REPLACEMENT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, displaced, target));
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn replace_after_next_batch(path: PathBuf, displaced: PathBuf, target: PathBuf) {
+    *BATCH_REPLACEMENT
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, displaced, target));
@@ -1249,6 +1284,9 @@ fn flush_frame(
         frame.directories.clear();
         return false;
     }
+    // Let replacement-race fixtures mutate only after the batch is observable.
+    #[cfg(test)]
+    maybe_replace_after_batch(&frame.task.path);
     for task in std::mem::take(&mut frame.directories) {
         if let Err(error) = queue.schedule(task) {
             failed.store(true, Ordering::Release);
