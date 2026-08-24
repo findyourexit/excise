@@ -5,7 +5,6 @@
 class Excise < Formula
   desc "Surgical terminal storage navigator"
   homepage "https://github.com/findyourexit/excise"
-  version "@VERSION@"
   license "MIT"
   on_macos do
     if Hardware::CPU.arm?
