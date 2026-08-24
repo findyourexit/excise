@@ -9,7 +9,9 @@ use crate::deletion::{DeletionEntryOutcome, DeletionReport, PlannedKind};
 #[cfg(test)]
 use crate::model::NodeId;
 use crate::model::{ByteBounds, NodeKind, NodeState};
-use crate::native_path::{EncodedNativePath, NativeIdentity, NativePath, safe_display_path};
+use crate::native_path::{
+    EncodedNativePath, NativeIdentity, NativePath, safe_display_path_text, safe_display_text,
+};
 use crate::outcome::RunSummary;
 use crate::state::files::FileTree;
 
@@ -213,7 +215,7 @@ impl Serialize for StreamingScanReport<'_> {
     {
         let mut document = serializer.serialize_map(Some(8))?;
         let root = NativePath::new(self.root).encode();
-        let display_root = safe_display_path(self.root).text;
+        let display_root = safe_display_path_text(self.root);
         document.serialize_entry("document_kind", "scan-report")?;
         document.serialize_entry("schema_version", &REPORT_SCHEMA_VERSION)?;
         document.serialize_entry("root", &root)?;
@@ -272,12 +274,12 @@ impl Serialize for ScanReportEntryRef<'_> {
     {
         let mut entry = serializer.serialize_map(Some(10))?;
         let path = NativePath::new(&self.path).encode();
-        let display_path = safe_display_path(&self.path).text;
+        let display_path = safe_display_path_text(&self.path);
         let unscanned_reason = self
             .node
             .unscanned_reason
             .as_ref()
-            .map(|reason| format!("{reason:?}"));
+            .map(|reason| safe_display_text(&format!("{reason:?}")));
         entry.serialize_entry("path", &path)?;
         entry.serialize_entry("display_path", &display_path)?;
         entry.serialize_entry("kind", &self.node.kind)?;
@@ -309,7 +311,7 @@ fn write_scan_table_entries(tree: &FileTree, writer: &mut impl Write) -> Result<
             display_bounds(node.metrics.reclaimable_bytes),
             node.metrics.apparent_bytes,
             node.kind,
-            safe_display_path(&path).text,
+            safe_display_path_text(&path),
         )?;
         stack.extend(node.children.iter().rev().copied());
     }
@@ -431,7 +433,7 @@ impl Serialize for DeletionHistoryOperationRef<'_> {
         let root = self.report.scan_root.join(&self.report.root_relative_path);
         let mut operation = serializer.serialize_map(Some(5))?;
         operation.serialize_entry("root", &NativePath::new(&root).encode())?;
-        operation.serialize_entry("display_root", &safe_display_path(&root).text)?;
+        operation.serialize_entry("display_root", &safe_display_path_text(&root))?;
         operation.serialize_entry("precise", &self.report.precise)?;
         operation.serialize_entry("soft_cancelled", &self.report.soft_cancelled)?;
         operation.serialize_entry(
@@ -478,7 +480,7 @@ impl Serialize for DeletionHistoryEntryRef<'_> {
         let snapshot = &self.result.entry.snapshot;
         let mut entry = serializer.serialize_map(Some(8))?;
         entry.serialize_entry("path", &NativePath::new(&path).encode())?;
-        entry.serialize_entry("display_path", &safe_display_path(&path).text)?;
+        entry.serialize_entry("display_path", &safe_display_path_text(&path))?;
         entry.serialize_entry("identity", &snapshot.identity)?;
         entry.serialize_entry("kind", &snapshot.kind)?;
         entry.serialize_entry("apparent_bytes", &snapshot.apparent_bytes)?;
@@ -522,13 +524,15 @@ impl Serialize for DeletionOutcomeRecordRef<'_> {
             DeletionEntryOutcome::Changed(message) => {
                 let mut outcome = serializer.serialize_map(Some(2))?;
                 outcome.serialize_entry("status", "changed")?;
-                outcome.serialize_entry("detail", message)?;
+                let detail = safe_display_text(message);
+                outcome.serialize_entry("detail", &detail)?;
                 outcome
             }
             DeletionEntryOutcome::Failed(message) => {
                 let mut outcome = serializer.serialize_map(Some(2))?;
                 outcome.serialize_entry("status", "failed")?;
-                outcome.serialize_entry("detail", message)?;
+                let detail = safe_display_text(message);
+                outcome.serialize_entry("detail", &detail)?;
                 outcome
             }
         };
@@ -558,6 +562,7 @@ fn display_bounds(bounds: ByteBounds) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_path::DECEPTIVE_DISPLAY_MARKER;
 
     use file_id::FileId;
     use serde_json::{Value, json};
@@ -856,5 +861,185 @@ mod tests {
             ScanReportState::Uncertain,
             "unknown model bounds must not depend on transport counters"
         );
+    }
+    #[test]
+    fn hostile_paths_in_exports_are_marked_and_escaped() {
+        use crate::deletion::{DeletionEntryResult, PlannedEntry, PlannedSnapshot};
+
+        let parent = tempfile::tempdir().expect("report parent should exist");
+        let root = parent.path().join("scan-\u{202e}-root");
+        std::fs::create_dir(&root).expect("report root should be created");
+        // Keep the hostile path synthetic: Windows rejects ESC in filesystem names.
+        let fixture_path = root.join("entry-fixture");
+        std::fs::write(&fixture_path, b"payload").expect("report entry should be written");
+        let metadata =
+            std::fs::symlink_metadata(&fixture_path).expect("report metadata should exist");
+        let entry_identity = crate::native_path::identity_for(&fixture_path, &metadata)
+            .expect("report identity should be readable")
+            .expect("report entry should not be a link");
+        let hostile_path = root.join("entry-\u{1b}[31m");
+        let mut tree = FileTree::new(root.clone(), false, crate::model::DEFAULT_PROCESS_MIB)
+            .expect("report model should be created");
+        tree.add_entry(&metadata, &hostile_path, entry_identity.clone())
+            .expect("hostile report entry should be added");
+        tree.complete_directory(&root, None)
+            .expect("report root should complete");
+        tree.finalize().expect("report model should finalize");
+
+        let summary = RunSummary::default();
+        let mut encoded = Vec::new();
+        write_scan_report_json(
+            &root,
+            &tree,
+            &summary,
+            scan_report_state(&tree, &summary, false),
+            &mut encoded,
+        )
+        .expect("hostile scan report should serialize");
+        let document: Value = serde_json::from_slice(&encoded).expect("scan report should parse");
+        let display_root = document["display_root"]
+            .as_str()
+            .expect("scan display root should be a string");
+        assert!(display_root.contains(DECEPTIVE_DISPLAY_MARKER));
+        assert!(display_root.contains("\\u{202e}"));
+        let entry = document["entries"]
+            .as_array()
+            .and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry["display_path"]
+                        .as_str()
+                        .is_some_and(|path| path.contains("entry-"))
+                })
+            })
+            .expect("hostile scan entry should be reported");
+        let display_path = entry["display_path"]
+            .as_str()
+            .expect("scan display path should be a string");
+        assert!(display_path.contains(DECEPTIVE_DISPLAY_MARKER));
+        assert!(display_path.contains("\\x1b"));
+        assert!(!display_path.contains('\u{1b}'));
+
+        let mut table = Vec::new();
+        write_scan_report_table(&tree, &mut table).expect("hostile scan table should serialize");
+        let table = String::from_utf8(table).expect("scan table should be UTF-8");
+        assert!(table.contains(DECEPTIVE_DISPLAY_MARKER));
+        assert!(table.contains("\\x1b"));
+
+        let report = Arc::new(DeletionReport {
+            target_node_id: NodeId(1),
+            root_relative_path: PathBuf::from("entry-\u{1b}[31m"),
+            scan_root: root,
+            entries: vec![DeletionEntryResult {
+                entry: PlannedEntry {
+                    relative_path: PathBuf::from("entry-\u{1b}[31m"),
+                    snapshot: PlannedSnapshot {
+                        identity: entry_identity,
+                        kind: PlannedKind::File,
+                        apparent_bytes: 1,
+                        allocated_bytes: Some(1),
+                        modified_nanos: Some(1),
+                    },
+                },
+                outcome: DeletionEntryOutcome::Deleted,
+            }],
+            soft_cancelled: false,
+            precise: true,
+            estimated_bytes: 0,
+        });
+        let mut history = Vec::new();
+        write_deletion_history_json(&[report], &mut history)
+            .expect("hostile deletion history should serialize");
+        let history: Value =
+            serde_json::from_slice(&history).expect("deletion history should parse");
+        assert!(
+            history["operations"][0]["display_root"]
+                .as_str()
+                .is_some_and(|path| {
+                    path.contains(DECEPTIVE_DISPLAY_MARKER)
+                        && path.contains("\\x1b")
+                        && !path.contains('\u{1b}')
+                })
+        );
+        assert!(
+            history["operations"][0]["entries"][0]["display_path"]
+                .as_str()
+                .is_some_and(|path| {
+                    path.contains(DECEPTIVE_DISPLAY_MARKER)
+                        && path.contains("\\x1b")
+                        && !path.contains('\u{1b}')
+                })
+        );
+    }
+
+    #[test]
+    fn deletion_outcome_details_are_marked_and_escaped() {
+        use crate::deletion::{DeletionEntryResult, PlannedEntry, PlannedSnapshot};
+
+        let hostile = format!("{DECEPTIVE_DISPLAY_MARKER} changed\n\u{202e}\u{1b}[31m");
+        let report = Arc::new(DeletionReport {
+            target_node_id: NodeId(0),
+            root_relative_path: PathBuf::from("target"),
+            scan_root: PathBuf::from("/scan"),
+            entries: vec![
+                DeletionEntryResult {
+                    entry: PlannedEntry {
+                        relative_path: PathBuf::from("changed"),
+                        snapshot: PlannedSnapshot {
+                            identity: identity(),
+                            kind: PlannedKind::File,
+                            apparent_bytes: 3,
+                            allocated_bytes: Some(4096),
+                            modified_nanos: Some(1),
+                        },
+                    },
+                    outcome: DeletionEntryOutcome::Changed(hostile.clone()),
+                },
+                DeletionEntryResult {
+                    entry: PlannedEntry {
+                        relative_path: PathBuf::from("failed"),
+                        snapshot: PlannedSnapshot {
+                            identity: identity(),
+                            kind: PlannedKind::File,
+                            apparent_bytes: 3,
+                            allocated_bytes: Some(4096),
+                            modified_nanos: Some(1),
+                        },
+                    },
+                    outcome: DeletionEntryOutcome::Failed(hostile),
+                },
+            ],
+            soft_cancelled: false,
+            precise: true,
+            estimated_bytes: 0,
+        });
+
+        let mut encoded = Vec::new();
+        write_deletion_history_json(&[report], &mut encoded)
+            .expect("hostile deletion outcomes should serialize");
+        assert!(!encoded.contains(&0x1b));
+        assert!(
+            !encoded
+                .windows(3)
+                .any(|window| window == [0xe2, 0x80, 0xae])
+        );
+
+        let history: Value =
+            serde_json::from_slice(&encoded).expect("deletion history should parse");
+        let entries = history["operations"][0]["entries"]
+            .as_array()
+            .expect("deletion history entries should be an array");
+        for (entry, status) in entries.iter().zip(["changed", "failed"]) {
+            assert_eq!(entry["outcome"]["status"], status);
+            let detail = entry["outcome"]["detail"]
+                .as_str()
+                .expect("outcome detail should be a string");
+            assert!(detail.starts_with(DECEPTIVE_DISPLAY_MARKER));
+            assert_eq!(detail.matches(DECEPTIVE_DISPLAY_MARKER).count(), 2);
+            assert!(detail.contains("\\n"));
+            assert!(detail.contains("\\u{202e}"));
+            assert!(detail.contains("\\x1b"));
+            assert!(!detail.chars().any(char::is_control));
+            assert!(!detail.contains('\u{202e}'));
+        }
     }
 }

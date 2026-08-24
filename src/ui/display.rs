@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use ratatui::Terminal;
@@ -7,20 +8,24 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
+use unicode_width::UnicodeWidthStr as _;
 
 use crate::UiMode;
 use crate::animation::AnimationScheduler;
 use crate::config::KeyPreset;
 use crate::error::AppError;
-use crate::model::{ByteBounds, NodeKind, NodeState, SyntheticKind};
-use crate::native_path::safe_display_os_str;
+use crate::model::{ByteBounds, NodeKind, NodeState, SyntheticKind, UnscannedReason};
+use crate::native_path::SafeDisplayPath;
 use crate::os::is_user_admin;
 use crate::state::UiEffects;
 use crate::state::files::FileTree;
 use crate::state::tiles::{Board, FileType};
 use crate::theme::Theme;
 use crate::ui::TermTooSmall;
-use crate::ui::format::{DisplaySize, display_path, truncate_middle};
+use crate::ui::format::{
+    DECEPTIVE_DISPLAY_MARKER, DisplaySize, display_os_str_middle, display_path_info,
+    display_path_middle, display_text, display_text_info, truncate_marked, truncate_middle,
+};
 use crate::ui::grid::RectangleGrid;
 use crate::ui::modals::{ConfirmBox, ErrorBox, HelpBox, MessageBox, NoticeBox, WarningBox};
 
@@ -363,10 +368,7 @@ fn render_instrument_header(
     let current = file_tree.current_node();
     let total = file_tree.total_node();
     let (marker, state, state_color) = view_state(ui_mode, current.state, ascii, theme);
-    let path = truncate_middle(
-        &display_path(&file_tree.get_current_path()),
-        area.width.saturating_sub(30),
-    );
+    let path = display_path_middle(&file_tree.get_current_path(), area.width.saturating_sub(30));
     let title = Line::from(vec![
         Span::styled(
             " EXCISE ",
@@ -484,9 +486,8 @@ fn render_list(buffer: &mut Buffer, area: Rect, board: &Board, theme: Theme, asc
             (FileType::File, _) if tile.uncertain => "?",
             _ => " ",
         };
-        let name = safe_display_os_str(&tile.name).text;
         let name_width = area.width.saturating_sub(28);
-        let name = truncate_middle(&name, name_width);
+        let name = display_os_str_middle(&tile.name, name_width);
         let size = if tile.uncertain && tile.size == 0 {
             "unknown".to_string()
         } else if tile.uncertain {
@@ -583,9 +584,28 @@ fn render_inspector(
         },
     );
     let reason = node.unscanned_reason.as_ref().map_or_else(
-        || "scope     materialized".to_string(),
-        |reason| format!("scope     {reason:?}"),
+        || display_text_info("scope     materialized"),
+        |reason| {
+            let mut displayed = display_text_info(&format!("scope     {reason:?}"));
+            let deceptive = match reason {
+                UnscannedReason::Excluded(value)
+                | UnscannedReason::Metadata(value)
+                | UnscannedReason::Replacement(value) => {
+                    let displayed = display_text_info(value);
+                    displayed.deceptive || value.contains(DECEPTIVE_DISPLAY_MARKER)
+                }
+                UnscannedReason::SymbolicLink
+                | UnscannedReason::FilesystemBoundary
+                | UnscannedReason::MemoryAggregation => false,
+            };
+            displayed.deceptive |= deceptive;
+            displayed
+        },
     );
+    let reason_detail = SafeDisplayPath {
+        text: format!("{link_detail} · {}", reason.text),
+        deceptive: reason.deceptive,
+    };
     let action = if node.kind.is_synthetic() {
         "Enter focused rescan · deletion unavailable"
     } else if node.state == NodeState::Complete {
@@ -593,9 +613,8 @@ fn render_inspector(
     } else {
         "Incomplete scope · deletion unavailable"
     };
-    let name = safe_display_os_str(&node.name).text;
     let name_line = Line::styled(
-        truncate_middle(&name, inner.width),
+        display_os_str_middle(&node.name, inner.width),
         Style::default()
             .fg(theme.text_primary)
             .add_modifier(Modifier::BOLD),
@@ -632,9 +651,10 @@ fn render_inspector(
                 node.metrics.descendants
             )),
             Line::from(truncate_middle(&identity, inner.width)),
-            Line::from(truncate_middle(
-                &format!("{link_detail} · {reason}"),
+            Line::from(truncate_marked(
+                &reason_detail,
                 inner.width,
+                truncate_middle,
             )),
         ]
     } else if inner.height < 12 {
@@ -652,9 +672,10 @@ fn render_inspector(
                 node.metrics.descendants
             )),
             Line::from(truncate_middle(&identity, inner.width)),
-            Line::from(truncate_middle(
-                &format!("{link_detail} · {reason}"),
+            Line::from(truncate_marked(
+                &reason_detail,
                 inner.width,
+                truncate_middle,
             )),
             Line::styled(action, Style::default().fg(theme.text_muted)),
         ]
@@ -678,7 +699,7 @@ fn render_inspector(
             Line::from(format!("entries   {}", node.metrics.descendants)),
             Line::from(truncate_middle(&identity, inner.width)),
             Line::from(link_detail),
-            Line::from(truncate_middle(&reason, inner.width)),
+            Line::from(truncate_marked(&reason, inner.width, truncate_middle)),
             Line::from(""),
             Line::styled(action, Style::default().fg(theme.text_muted)),
         ]
@@ -744,16 +765,18 @@ fn render_status(
     };
     let transient_status = match ui_mode {
         UiMode::FilterInput { input, error } => Some(error.as_ref().map_or_else(
-            || format!("/ {input}_  [Enter] apply  [Esc] cancel"),
-            |error| format!("/ {input}_  ERROR: {error}"),
+            || format!("/ {}_  [Enter] apply  [Esc] cancel", display_text(input)),
+            |error| format!("/ {}_  ERROR: {}", display_text(input), display_text(error)),
         )),
-        UiMode::Rescanning { target } => Some(format!(
-            "~ RESCANNING {} · deletion locked · [Esc] cancel",
-            display_path(target)
+        UiMode::Rescanning { target } => Some(status_with_path(
+            "~ RESCANNING ",
+            target,
+            " · deletion locked · [Esc] cancel",
+            area.width,
         )),
         UiMode::Loading => Some(ui_effects.last_read_path.as_ref().map_or_else(
             || "~ SCANNING · deletion locked".to_string(),
-            |path| format!("~ SCANNING {}", display_path(path)),
+            |path| status_with_path("~ SCANNING ", path, "", area.width),
         )),
         _ if file_tree.failed_to_read > 0 => {
             Some(format!("? {} unreadable entries", file_tree.failed_to_read))
@@ -785,6 +808,32 @@ fn render_status(
     .alignment(Alignment::Left)
     .render(area, buffer);
 }
+fn status_with_path(prefix: &str, path: &Path, suffix: &str, width: u16) -> String {
+    let displayed = display_path_info(path);
+    let marker = if displayed.deceptive {
+        if width == 0 {
+            ""
+        } else if usize::from(width) <= DECEPTIVE_DISPLAY_MARKER.width() {
+            "!"
+        } else {
+            DECEPTIVE_DISPLAY_MARKER
+        }
+    } else {
+        ""
+    };
+    let separator = if marker.is_empty() { "" } else { " " };
+    let reserved = marker
+        .width()
+        .saturating_add(separator.width())
+        .saturating_add(prefix.width())
+        .saturating_add(suffix.width());
+    let path_width = usize::from(width).saturating_sub(reserved);
+    let path = truncate_middle(
+        &displayed.text,
+        u16::try_from(path_width).unwrap_or(u16::MAX),
+    );
+    format!("{marker}{separator}{prefix}{path}{suffix}")
+}
 
 fn safety_label(reduced_guardrails: bool, elevated: bool, width: u16) -> Option<&'static str> {
     match (reduced_guardrails, elevated) {
@@ -802,10 +851,22 @@ fn status_with_safety(
     elevated: bool,
     width: u16,
 ) -> String {
-    match safety_label(reduced_guardrails, elevated, width) {
-        Some(label) => format!("{label} · {status}"),
-        None => status,
+    let Some(label) = safety_label(reduced_guardrails, elevated, width) else {
+        return status;
+    };
+    if let Some(status) = status
+        .strip_prefix(DECEPTIVE_DISPLAY_MARKER)
+        .and_then(|status| status.strip_prefix(' '))
+    {
+        return format!("{DECEPTIVE_DISPLAY_MARKER} {label} · {status}");
     }
+    if let Some(status) = status.strip_prefix("! ~ RESCANNING ") {
+        return format!("! {label} · ~ RESCANNING {status}");
+    }
+    if let Some(status) = status.strip_prefix("! ~ SCANNING ") {
+        return format!("! {label} · ~ SCANNING {status}");
+    }
+    format!("{label} · {status}")
 }
 
 fn baseline_status(flags: &[&str], reduced_guardrails: bool, elevated: bool, width: u16) -> String {
@@ -975,6 +1036,109 @@ mod tests {
     }
 
     #[test]
+    fn deceptive_inspector_reason_marker_stays_visible_when_narrow() {
+        let root = tempfile::tempdir().expect("inspector root should exist");
+        let path = root.path().join("selected-entry");
+        fs::write(&path, b"selected contents").expect("fixture should be written");
+        let metadata = fs::symlink_metadata(&path).expect("fixture metadata should exist");
+        let identity = identity_for(&path, &metadata)
+            .expect("fixture identity should be readable")
+            .expect("fixture should not be a link");
+        let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
+            .expect("file tree should be created");
+        tree.add_entry(&metadata, &path, identity)
+            .expect("fixture should be added")
+            .expect("fixture should remain materialized");
+        tree.record_unscanned(
+            &path,
+            UnscannedReason::Metadata("metadata failed\t\u{202e}name\u{1b}[31m".to_string()),
+        )
+        .expect("hostile reason should be recorded");
+        tree.complete_directory(root.path(), None)
+            .expect("fixture root should complete");
+        tree.finalize().expect("fixture tree should finalize");
+
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 78, 10));
+        board.change_files(tree.files_in_current_folder(0));
+        board.set_selected_index(0);
+
+        for (width, height) in [(4, 64), (12, 40), (24, 24), (52, 10), (80, 10), (80, 14)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = Buffer::empty(area);
+            render_inspector(
+                &mut buffer,
+                area,
+                &tree,
+                &board,
+                Theme::for_id(ThemeId::ExciseDark),
+                false,
+            );
+            let rendered = buffer.content.iter().fold(String::new(), |mut text, cell| {
+                text.push_str(cell.symbol());
+                text
+            });
+            assert!(!rendered.chars().any(char::is_control));
+            assert!(!rendered.contains('\u{202e}'));
+            assert!(
+                rendered.contains(DECEPTIVE_DISPLAY_MARKER) || rendered.contains('!'),
+                "deception marker lost at inspector size {width}x{height}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn premarked_inspector_reason_marker_stays_visible_when_narrow() {
+        let root = tempfile::tempdir().expect("inspector root should exist");
+        let path = root.path().join("selected-entry");
+        fs::write(&path, b"selected contents").expect("fixture should be written");
+        let metadata = fs::symlink_metadata(&path).expect("fixture metadata should exist");
+        let identity = identity_for(&path, &metadata)
+            .expect("fixture identity should be readable")
+            .expect("fixture should not be a link");
+        let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
+            .expect("file tree should be created");
+        tree.add_entry(&metadata, &path, identity)
+            .expect("fixture should be added")
+            .expect("fixture should remain materialized");
+        tree.record_unscanned(
+            &path,
+            UnscannedReason::Metadata(format!("{DECEPTIVE_DISPLAY_MARKER} metadata failed")),
+        )
+        .expect("premarked reason should be recorded");
+        tree.complete_directory(root.path(), None)
+            .expect("fixture root should complete");
+        tree.finalize().expect("fixture tree should finalize");
+
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 78, 10));
+        board.change_files(tree.files_in_current_folder(0));
+        board.set_selected_index(0);
+
+        for (width, height) in [(4, 64), (12, 40), (24, 24), (52, 10), (80, 10), (80, 14)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = Buffer::empty(area);
+            render_inspector(
+                &mut buffer,
+                area,
+                &tree,
+                &board,
+                Theme::for_id(ThemeId::ExciseDark),
+                false,
+            );
+            let rendered = buffer.content.iter().fold(String::new(), |mut text, cell| {
+                text.push_str(cell.symbol());
+                text
+            });
+            assert!(!rendered.chars().any(char::is_control));
+            assert!(
+                rendered.contains(DECEPTIVE_DISPLAY_MARKER) || rendered.contains('!'),
+                "premarked deception marker lost at inspector size {width}x{height}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
     fn safety_labels_survive_every_transient_status() {
         for status in [
             "~ SCANNING · deletion locked",
@@ -1004,5 +1168,25 @@ mod tests {
             32,
         );
         assert!(baseline.starts_with("! ELEVATED · ! REDUCED GUARD"));
+    }
+
+    #[test]
+    fn deceptive_status_marker_stays_visible_when_narrow() {
+        let path = Path::new("status-\u{202e}hostile");
+        for width in [1, 5, 10, 11, 12, 24] {
+            let rendered = status_with_path("~ RESCANNING ", path, "", width);
+            assert!(!rendered.chars().any(char::is_control));
+            assert!(!rendered.contains('\u{202e}'));
+            assert!(
+                rendered.starts_with('!') || rendered.starts_with(DECEPTIVE_DISPLAY_MARKER),
+                "deception marker lost at width {width}: {rendered:?}"
+            );
+        }
+        let marked = status_with_path("~ RESCANNING ", path, "", 80);
+        let marked_with_safety = status_with_safety(marked, true, true, 80);
+        assert!(marked_with_safety.starts_with(DECEPTIVE_DISPLAY_MARKER));
+        let compact = status_with_path("~ RESCANNING ", path, "", 5);
+        let compact_with_safety = status_with_safety(compact, true, true, 5);
+        assert!(compact_with_safety.starts_with('!'));
     }
 }

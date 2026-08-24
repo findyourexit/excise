@@ -3,7 +3,7 @@ mod scanner;
 mod worker;
 
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossbeam_channel::{RecvTimeoutError, TryRecvError};
@@ -18,7 +18,9 @@ use crate::animation::AnimationScheduler;
 use crate::config::{CustomKeyBindings, KeyPreset, SafePreferences, save_safe_preferences};
 use crate::error::{AppError, ExitClass};
 use crate::input::{InputCommand, InputEvent, InputSource, handle_keypress};
-use crate::native_path::{NativeIdentity, safe_display_path};
+use crate::native_path::{
+    DECEPTIVE_DISPLAY_MARKER, NativeIdentity, safe_display_path_text, safe_display_text,
+};
 use crate::outcome::{OperationOutcome, RunSummary};
 use crate::report::{ScanReport, ScanReportState, scan_report_state};
 use crate::state::files::FileTree;
@@ -332,10 +334,9 @@ where
                     Ok(path)
                 });
                 match result {
-                    Ok(path) => self.app.show_notice(format!(
-                        "Scan report exported to {}",
-                        safe_display_path(&path).text
-                    )),
+                    Ok(path) => self
+                        .app
+                        .show_notice(export_notice("Scan report exported to", &path)),
                     Err(error) => self.app.show_error(format!("Scan export failed: {error}")),
                 }
             }
@@ -354,10 +355,8 @@ where
                 match result {
                     Ok(path) => {
                         self.app.clear_deletion_history();
-                        self.app.show_notice(format!(
-                            "Deletion history exported to {}",
-                            safe_display_path(&path).text
-                        ));
+                        self.app
+                            .show_notice(export_notice("Deletion history exported to", &path));
                     }
                     Err(error) => {
                         self.app
@@ -462,8 +461,8 @@ where
             }
             WorkerEvent::ScanUnscanned { path, reason } => {
                 self.summary.unscanned_entries += 1;
-                self.summary.last_unscanned_path = Some(safe_display_path(&path).text);
-                self.summary.last_unscanned_reason = Some(format!("{reason:?}"));
+                self.summary.last_unscanned_path = Some(safe_display_path_text(&path));
+                self.summary.last_unscanned_reason = Some(display_reason(&reason));
                 match &reason {
                     crate::model::UnscannedReason::Excluded(_) => {
                         self.summary.excluded_entries += 1;
@@ -479,7 +478,7 @@ where
                         self.summary.unreadable_entries += 1;
                         self.summary.last_unreadable_path =
                             self.summary.last_unscanned_path.clone();
-                        self.summary.last_worker_error = Some(message.clone());
+                        self.summary.last_worker_error = Some(safe_display_text(message));
                         self.app.increment_failed_to_read();
                     }
                     crate::model::UnscannedReason::MemoryAggregation => {}
@@ -487,13 +486,12 @@ where
                 self.app.record_unscanned(&path, reason)?;
             }
             WorkerEvent::ScanFailed { path, message } => {
+                let message = safe_display_text(&message);
                 self.summary.unscanned_entries += 1;
-                self.summary.last_unscanned_path =
-                    path.as_deref().map(|path| safe_display_path(path).text);
-                self.summary.last_unscanned_reason = Some(message.clone());
                 self.summary.unreadable_entries += 1;
-                self.summary.last_unreadable_path =
-                    path.as_deref().map(|path| safe_display_path(path).text);
+                self.summary.last_unscanned_path = path.as_deref().map(safe_display_path_text);
+                self.summary.last_unreadable_path = self.summary.last_unscanned_path.clone();
+                self.summary.last_unscanned_reason = Some(message.clone());
                 self.summary.last_worker_error = Some(message.clone());
                 if let Some(path) = path {
                     self.app.record_unscanned(
@@ -796,6 +794,29 @@ where
             .ok_or_else(|| AppError::Invariant("worker pool unavailable".to_string()))
     }
 }
+fn export_notice(prefix: &str, path: &Path) -> String {
+    format!("{prefix} {}", safe_display_path_text(path))
+}
+
+fn display_reason(reason: &crate::model::UnscannedReason) -> String {
+    let deceptive = match reason {
+        crate::model::UnscannedReason::Excluded(value)
+        | crate::model::UnscannedReason::Metadata(value)
+        | crate::model::UnscannedReason::Replacement(value) => {
+            safe_display_text(value).starts_with(DECEPTIVE_DISPLAY_MARKER)
+        }
+        crate::model::UnscannedReason::SymbolicLink
+        | crate::model::UnscannedReason::FilesystemBoundary
+        | crate::model::UnscannedReason::MemoryAggregation => false,
+    };
+    let rendered = safe_display_text(&format!("{reason:?}"));
+    if deceptive && !rendered.contains(DECEPTIVE_DISPLAY_MARKER) {
+        format!("{DECEPTIVE_DISPLAY_MARKER} {rendered}")
+    } else {
+        rendered
+    }
+}
+
 /// Runs the production scanner and bounded model without acquiring a terminal.
 ///
 /// # Errors
@@ -843,8 +864,8 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                     .map_err(|error| AppError::Model(error.to_string()))?,
                 WorkerEvent::ScanUnscanned { path, reason } => {
                     summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
-                    summary.last_unscanned_path = Some(safe_display_path(&path).text);
-                    summary.last_unscanned_reason = Some(format!("{reason:?}"));
+                    summary.last_unscanned_path = Some(safe_display_path_text(&path));
+                    summary.last_unscanned_reason = Some(display_reason(&reason));
                     match &reason {
                         crate::model::UnscannedReason::Excluded(_) => {
                             summary.excluded_entries = summary.excluded_entries.saturating_add(1);
@@ -863,7 +884,7 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                             summary
                                 .last_unreadable_path
                                 .clone_from(&summary.last_unscanned_path);
-                            summary.last_worker_error = Some(message.clone());
+                            summary.last_worker_error = Some(safe_display_text(message));
                             tree.failed_to_read = tree.failed_to_read.saturating_add(1);
                         }
                         crate::model::UnscannedReason::MemoryAggregation => {}
@@ -872,10 +893,10 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                         .map_err(|error| AppError::Model(error.to_string()))?;
                 }
                 WorkerEvent::ScanFailed { path, message } => {
+                    let message = safe_display_text(&message);
                     summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
                     summary.unreadable_entries = summary.unreadable_entries.saturating_add(1);
-                    summary.last_unscanned_path =
-                        path.as_deref().map(|path| safe_display_path(path).text);
+                    summary.last_unscanned_path = path.as_deref().map(safe_display_path_text);
                     summary
                         .last_unreadable_path
                         .clone_from(&summary.last_unscanned_path);
@@ -945,4 +966,44 @@ fn next_export_path(kind: &str) -> Result<PathBuf, String> {
 #[must_use]
 pub const fn outcome_exit_class(outcome: &OperationOutcome<RunSummary>) -> ExitClass {
     outcome.exit_class()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_notice_preserves_deceptive_path_marker() {
+        let path = Path::new("report-\u{202e}name\u{1b}[31m.json");
+        let rendered = export_notice("Scan report exported to", path);
+        assert!(rendered.starts_with("Scan report exported to [deceptive]"));
+        assert!(rendered.contains("\\u{202e}"));
+        assert!(rendered.contains("\\x1b"));
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.contains('\u{202e}'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_notice_preserves_invalid_native_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(OsString::from_vec(b"report-\xff.json".to_vec()));
+        let rendered = export_notice("Deletion history exported to", &path);
+        assert!(rendered.contains("[deceptive]"));
+        assert!(rendered.contains("report-\\xff.json"));
+    }
+
+    #[test]
+    fn runtime_unscanned_reasons_are_safe_display_text() {
+        let reason =
+            crate::model::UnscannedReason::Metadata("metadata failed\t\u{202e}name".to_string());
+        let rendered = display_reason(&reason);
+        assert!(rendered.contains("[deceptive]"));
+        assert!(rendered.contains("\\t"));
+        assert!(rendered.contains("\\u{202e}"));
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.contains('\u{202e}'));
+    }
 }
