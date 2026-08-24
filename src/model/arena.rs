@@ -8,7 +8,7 @@ use std::time::UNIX_EPOCH;
 
 use file_id::FileId;
 
-use super::identity_store::{IdentityRecord, IdentityStore};
+use super::identity_store::{IdentityRecord, IdentityStore, merge_declared_links};
 use super::{
     ByteBounds, EntrySnapshot, MemoryBudget, ModelError, Node, NodeId, NodeKind, NodeMetrics,
     NodeState, SyntheticKind, UnscannedReason,
@@ -1302,19 +1302,46 @@ impl Arena {
         if kind.is_directory() {
             return Ok(NodeMetrics::default());
         }
-        let (is_new, _) = self.identities.observe(
+        let (is_new, record) = self.identities.observe(
             &identity.file_id,
             identity.link_count,
             allocated,
             node,
             allocation_node,
         )?;
+        if !is_new && record.declared_links.is_none() {
+            self.mark_identity_reclaimable_unknown(&record);
+        }
         Ok(if is_new {
             leaf_metrics(apparent, allocated, identity.link_count)
         } else {
             self.track_duplicate(identity.file_id);
             leaf_metrics(apparent, ByteBounds::exact(0), identity.link_count)
         })
+    }
+    fn mark_identity_reclaimable_unknown(&mut self, record: &IdentityRecord) {
+        let Some(allocation_node) = record.allocation_node else {
+            return;
+        };
+        let changed = self.node_mut(allocation_node).is_some_and(|node| {
+            let next = if node.kind.is_synthetic() {
+                ByteBounds::unknown()
+            } else {
+                ByteBounds {
+                    lower: 0,
+                    upper: record.allocated_bytes.upper,
+                }
+            };
+            if node.metrics.reclaimable_bytes == next {
+                false
+            } else {
+                node.metrics.reclaimable_bytes = next;
+                true
+            }
+        });
+        if changed {
+            self.rebuild_metrics();
+        }
     }
 
     fn retained_child_count(&self, parent: NodeId) -> usize {
@@ -1993,11 +2020,8 @@ fn merge_identity_record(
         existing.observed_links = existing
             .observed_links
             .saturating_add(record.observed_links);
-        existing.declared_links = match (existing.declared_links, record.declared_links) {
-            (Some(left), Some(right)) => Some(left.max(right)),
-            (left @ Some(_), None) | (None, left @ Some(_)) => left,
-            (None, None) => None,
-        };
+        existing.declared_links =
+            merge_declared_links(existing.declared_links, record.declared_links);
         existing.allocated_bytes =
             conservative_bounds(existing.allocated_bytes, record.allocated_bytes);
         if existing.allocation_node.is_none() {
@@ -2453,6 +2477,47 @@ mod tests {
         assert_eq!(other.metrics.descendants, 2);
     }
 
+    #[test]
+    fn conflicting_hard_link_counts_never_claim_reclaimable_bytes() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"payload").expect("fixture should be written");
+        fs::hard_link(&first, &second).expect("hard link should be created");
+        let first_metadata = fs::symlink_metadata(&first).expect("first metadata should exist");
+        let identity = identity_for(&first, &first_metadata)
+            .expect("fixture identity lookup should succeed")
+            .expect("fixture identity should exist");
+        let first_identity = NativeIdentity {
+            link_count: Some(1),
+            ..identity.clone()
+        };
+        let second_identity = NativeIdentity {
+            link_count: Some(2),
+            ..identity
+        };
+
+        let mut arena = test_arena(root.path());
+        let first_id = arena
+            .add_entry(&first, &first_metadata, first_identity)
+            .expect("first link should be retained")
+            .expect("first link should have a node");
+        let second_metadata = fs::symlink_metadata(&second).expect("second metadata should exist");
+        arena
+            .add_entry(&second, &second_metadata, second_identity)
+            .expect("second link should be retained")
+            .expect("second link should have a node");
+        arena.finalize().expect("conflicting links should finalize");
+
+        assert_eq!(
+            arena
+                .node(first_id)
+                .expect("first link node should remain")
+                .metrics
+                .reclaimable_bytes,
+            ByteBounds::exact(0)
+        );
+    }
     #[test]
     fn hard_links_move_allocated_bytes_to_shared() {
         let root = tempfile::tempdir().expect("model root should exist");
