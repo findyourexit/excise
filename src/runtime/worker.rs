@@ -895,7 +895,6 @@ mod tests {
     #[test]
     fn scanner_stops_before_following_a_replaced_root() {
         use crate::native_path::identity_for;
-        use std::os::unix::fs::symlink;
 
         let parent = tempfile::tempdir().expect("scan parent should exist");
         let scan_root = parent.path().join("scan-root");
@@ -913,11 +912,12 @@ mod tests {
         let identity = identity_for(&scan_root, &metadata)
             .expect("root identity should be readable")
             .expect("root should not be a symbolic link");
+        scanner::replace_after_next_batch(scan_root.clone(), original, outside.clone());
 
         let mut scanner_options = options(&scan_root, 1);
         scanner_options.root_identity = Some(identity);
         let workers = WorkerPool::start(scanner_options, 1).expect("workers should start");
-        let mut replaced = false;
+        let mut saw_batch = false;
         let mut saw_root_change = false;
         let mut saw_replacement = false;
         loop {
@@ -927,16 +927,10 @@ mod tests {
                 .expect("scanner should produce completion")
             {
                 WorkerEvent::ScanBatch { entries } => {
+                    saw_batch = true;
                     saw_replacement |= entries
                         .iter()
                         .any(|entry| entry.path == outside.join("replacement"));
-                    if !replaced {
-                        std::fs::rename(&scan_root, &original)
-                            .expect("original root should be displaced");
-                        symlink(&outside, &scan_root)
-                            .expect("replacement symlink should be created");
-                        replaced = true;
-                    }
                 }
                 WorkerEvent::ScanFailed { message, .. } => {
                     saw_root_change |= message.contains("during traversal");
@@ -952,7 +946,10 @@ mod tests {
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
-        assert!(replaced, "test must replace root after the first batch");
+        assert!(
+            saw_batch,
+            "test must emit a batch before replacing the root"
+        );
         assert!(
             saw_root_change,
             "root replacement should emit an explicit failure"
