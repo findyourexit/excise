@@ -45,6 +45,13 @@ pub struct IdentityStore {
     estimated_bytes: usize,
 }
 
+/// Keeps a declared link count exact only while every observation agrees.
+pub(crate) fn merge_declared_links(current: Option<u64>, observed: Option<u64>) -> Option<u64> {
+    match (current, observed) {
+        (Some(current), Some(observed)) if current == observed => Some(current),
+        _ => None,
+    }
+}
 enum Storage {
     Memory(HashMap<Vec<u8>, IdentityRecord>),
     Disk {
@@ -192,7 +199,7 @@ impl IdentityStore {
             nodes: Vec::new(),
         });
         record.observed_links = record.observed_links.saturating_add(1);
-        record.declared_links = record.declared_links.or(declared_links);
+        record.declared_links = merge_declared_links(record.declared_links, declared_links);
         if let Some(node) = node {
             record.nodes.push(node);
         }
@@ -1064,6 +1071,28 @@ mod tests {
             path
         };
         assert!(!spill_path.exists());
+    }
+    #[test]
+    fn conflicting_declared_link_counts_are_unknown() {
+        let file_id = FileId::new_inode(2, 2);
+        let mut store = IdentityStore::new(usize::MAX).expect("private session should initialize");
+        for declared_links in [Some(1), Some(2), Some(2)] {
+            store
+                .observe(
+                    &file_id,
+                    declared_links,
+                    ByteBounds::exact(4096),
+                    None,
+                    None,
+                )
+                .expect("identity observation should succeed");
+        }
+
+        let record = store
+            .get(&file_id)
+            .expect("identity lookup should succeed")
+            .expect("identity should remain");
+        assert_eq!(record.declared_links, None);
     }
     #[test]
     fn spilled_store_retains_many_exact_records() {
