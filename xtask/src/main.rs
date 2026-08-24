@@ -20,12 +20,43 @@ const NATIVE_PATH_SCHEMA_ID: &str =
 const RELEASE_REPOSITORY: &str = "https://github.com/findyourexit/excise";
 const SCOOP_TEMPLATE: &str = "packaging/scoop/excise.json.in";
 const WINGET_TEMPLATE: &str = "packaging/winget/FindYourExit.Excise.yaml.in";
-const UNIX_RELEASE_TARGETS: [&str; 4] = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
+const HOMEBREW_TEMPLATE: &str = "packaging/homebrew/Formula/excise.rb.in";
+
+#[derive(Clone, Copy)]
+struct UnixReleaseAsset {
+    target: &'static str,
+    url_placeholder: &'static str,
+    hash_placeholder: &'static str,
+    hash_env: &'static str,
+}
+
+const UNIX_RELEASE_ASSETS: [UnixReleaseAsset; 4] = [
+    UnixReleaseAsset {
+        target: "x86_64-unknown-linux-gnu",
+        url_placeholder: "@X86_64_UNKNOWN_LINUX_GNU_URL@",
+        hash_placeholder: "@X86_64_UNKNOWN_LINUX_GNU_SHA256@",
+        hash_env: "EXCISE_SHA256_X86_64_UNKNOWN_LINUX_GNU",
+    },
+    UnixReleaseAsset {
+        target: "aarch64-unknown-linux-gnu",
+        url_placeholder: "@AARCH64_UNKNOWN_LINUX_GNU_URL@",
+        hash_placeholder: "@AARCH64_UNKNOWN_LINUX_GNU_SHA256@",
+        hash_env: "EXCISE_SHA256_AARCH64_UNKNOWN_LINUX_GNU",
+    },
+    UnixReleaseAsset {
+        target: "x86_64-apple-darwin",
+        url_placeholder: "@X86_64_APPLE_DARWIN_URL@",
+        hash_placeholder: "@X86_64_APPLE_DARWIN_SHA256@",
+        hash_env: "EXCISE_SHA256_X86_64_APPLE_DARWIN",
+    },
+    UnixReleaseAsset {
+        target: "aarch64-apple-darwin",
+        url_placeholder: "@AARCH64_APPLE_DARWIN_URL@",
+        hash_placeholder: "@AARCH64_APPLE_DARWIN_SHA256@",
+        hash_env: "EXCISE_SHA256_AARCH64_APPLE_DARWIN",
+    },
 ];
+
 const WINDOWS_RELEASE_ASSETS: [WindowsReleaseAsset; 2] = [
     WindowsReleaseAsset {
         target: "x86_64-pc-windows-msvc",
@@ -56,9 +87,10 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
         Some("generate") => write_generated(),
         Some("check-generated") => check_generated(),
         Some("check-distribution") => check_distribution_contract(&release_version()?),
+        Some("render-homebrew") => render_homebrew_formula(),
         Some("dist-local") => build_local_dist(),
         _ => Err(io::Error::other(
-            "usage: cargo xtask <verify|generate|check-generated|check-distribution|dist-local>",
+            "usage: cargo xtask <verify|generate|check-generated|check-distribution|render-homebrew|dist-local>",
         )
         .into()),
     }
@@ -533,12 +565,7 @@ fn build_local_dist() -> Result<(), Box<dyn Error>> {
     )?;
     let formula_dir = dist.join("homebrew");
     fs::create_dir_all(&formula_dir)?;
-    write_local_homebrew_formula(
-        &formula_dir.join("excise.rb"),
-        &archive_path,
-        &archive_hash,
-        &version,
-    )?;
+    write_local_homebrew_formula(&formula_dir.join("excise.rb"), &archive_path, &archive_hash)?;
     verify_archive(&archive_path, &archive_name, binary_name)?;
     println!("local release archive: {}", archive_path.display());
     Ok(())
@@ -562,7 +589,6 @@ fn write_local_homebrew_formula(
     path: &Path,
     archive: &Path,
     hash: &str,
-    version: &str,
 ) -> Result<(), Box<dyn Error>> {
     let archive = fs::canonicalize(archive)?;
     let formula = format!(
@@ -574,7 +600,6 @@ class Excise < Formula
   desc "Surgical terminal storage navigator"
   homepage "https://github.com/findyourexit/excise"
   url "file://{url}"
-  version "{version}"
   sha256 "{hash}"
   license "MIT"
 
@@ -692,6 +717,59 @@ fn distribution_template_values(version: &str) -> BTreeMap<String, String> {
     values
 }
 
+fn homebrew_template_values(
+    version: &str,
+    hashes: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let mut values = BTreeMap::new();
+    for asset in UNIX_RELEASE_ASSETS {
+        let hash = hashes.get(asset.target).ok_or_else(|| {
+            io::Error::other(format!("Homebrew SHA256 was absent for {}", asset.target))
+        })?;
+        values.insert(
+            asset.url_placeholder.to_owned(),
+            release_asset_url(asset.target, version, "tar.gz"),
+        );
+        values.insert(asset.hash_placeholder.to_owned(), hash.clone());
+    }
+    Ok(values)
+}
+
+fn fixture_homebrew_hashes() -> BTreeMap<String, String> {
+    UNIX_RELEASE_ASSETS
+        .into_iter()
+        .map(|asset| (asset.target.to_owned(), fixture_sha256(asset.target)))
+        .collect()
+}
+
+fn check_homebrew_template(version: &str) -> Result<(), Box<dyn Error>> {
+    let hashes = fixture_homebrew_hashes();
+    let values = homebrew_template_values(version, &hashes)?;
+    let rendered = render_distribution_template(Path::new(HOMEBREW_TEMPLATE), &values)?;
+    validate_homebrew_formula(&rendered, version, &hashes)
+}
+
+fn render_homebrew_formula() -> Result<(), Box<dyn Error>> {
+    let version = required_env("EXCISE_RELEASE_VERSION")?;
+    let output = PathBuf::from(required_env("EXCISE_HOMEBREW_FORMULA")?);
+    let mut hashes = BTreeMap::new();
+    for asset in UNIX_RELEASE_ASSETS {
+        hashes.insert(asset.target.to_owned(), required_env(asset.hash_env)?);
+    }
+    let values = homebrew_template_values(&version, &hashes)?;
+    let rendered = render_distribution_template(Path::new(HOMEBREW_TEMPLATE), &values)?;
+    validate_homebrew_formula(&rendered, &version, &hashes)?;
+    fs::write(&output, rendered)?;
+    println!("rendered Homebrew formula: {}", output.display());
+    Ok(())
+}
+
+fn required_env(name: &str) -> Result<String, Box<dyn Error>> {
+    env::var(name).map_err(|_| {
+        io::Error::other(format!("required environment variable {name} was absent")).into()
+    })
+}
+
 fn render_distribution_template(
     path: &Path,
     values: &BTreeMap<String, String>,
@@ -728,6 +806,73 @@ fn check_distribution_contract(version: &str) -> Result<(), Box<dyn Error>> {
     validate_scoop_manifest(&scoop, version)?;
     let winget = render_distribution_template(Path::new(WINGET_TEMPLATE), &values)?;
     validate_winget_manifest(&winget, version)?;
+    check_homebrew_template(version)?;
+    Ok(())
+}
+
+fn validate_homebrew_formula(
+    rendered: &str,
+    version: &str,
+    hashes: &BTreeMap<String, String>,
+) -> Result<(), Box<dyn Error>> {
+    for required in [
+        "class Excise < Formula",
+        "homepage \"https://github.com/findyourexit/excise\"",
+        "on_macos do",
+        "on_linux do",
+        "Hardware::CPU.arm?",
+        "def install",
+        "bin.install \"excise\"",
+        "test do",
+    ] {
+        require(
+            rendered.contains(required),
+            format!("Homebrew formula omitted required declaration {required}"),
+        )?;
+    }
+    require(
+        !rendered
+            .lines()
+            .any(|line| line.trim_start().starts_with("version \"")),
+        "Homebrew formula must derive the release version from its URL",
+    )?;
+    require(
+        rendered
+            .lines()
+            .filter(|line| line.trim_start().starts_with("url \""))
+            .count()
+            == UNIX_RELEASE_ASSETS.len(),
+        "Homebrew formula must declare one URL per Unix release target",
+    )?;
+    require(
+        rendered
+            .lines()
+            .filter(|line| line.trim_start().starts_with("sha256 \""))
+            .count()
+            == UNIX_RELEASE_ASSETS.len(),
+        "Homebrew formula must declare one SHA256 per Unix release target",
+    )?;
+    for asset in UNIX_RELEASE_ASSETS {
+        let hash = hashes.get(asset.target).ok_or_else(|| {
+            io::Error::other(format!("Homebrew SHA256 was absent for {}", asset.target))
+        })?;
+        require(
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            format!(
+                "Homebrew SHA256 is not a hexadecimal digest for {}",
+                asset.target
+            ),
+        )?;
+        let expected_url = release_asset_url(asset.target, version, "tar.gz");
+        let expected_pair = format!("url \"{expected_url}\"\n      sha256 \"{hash}\"");
+        require(
+            rendered.matches(&expected_pair).count() == 1,
+            format!(
+                "Homebrew formula does not pair the URL and SHA256 for {}",
+                asset.target
+            ),
+        )?;
+    }
     Ok(())
 }
 
@@ -796,16 +941,22 @@ fn validate_binstall_metadata(manifest: &str, version: &str) -> Result<(), Box<d
         package_format == "tgz",
         "cargo-binstall must extract Unix .tar.gz assets as tgz",
     )?;
-    for target in UNIX_RELEASE_TARGETS {
+    for asset in UNIX_RELEASE_ASSETS {
         require(
-            render_binstall_template(&package_url, target, version, "")?
-                == release_asset_url(target, version, "tar.gz"),
-            format!("cargo-binstall Unix URL does not resolve for {target}"),
+            render_binstall_template(&package_url, asset.target, version, "")?
+                == release_asset_url(asset.target, version, "tar.gz"),
+            format!(
+                "cargo-binstall Unix URL does not resolve for {}",
+                asset.target
+            ),
         )?;
         require(
-            render_binstall_template(&bin_dir, target, version, "")?
-                == format!("{}/excise", release_asset_root(target, version)),
-            format!("cargo-binstall Unix binary path does not resolve for {target}"),
+            render_binstall_template(&bin_dir, asset.target, version, "")?
+                == format!("{}/excise", release_asset_root(asset.target, version)),
+            format!(
+                "cargo-binstall Unix binary path does not resolve for {}",
+                asset.target
+            ),
         )?;
     }
     require(
@@ -1329,6 +1480,25 @@ mod tests {
         ));
         if let Err(error) = validate_winget_manifest(&winget, TEST_VERSION) {
             panic!("Winget template failed semantic validation: {error}");
+        }
+    }
+
+    #[test]
+    fn homebrew_template_resolves_to_unix_release_assets() {
+        let hashes = fixture_homebrew_hashes();
+        let values = match homebrew_template_values(TEST_VERSION, &hashes) {
+            Ok(values) => values,
+            Err(error) => panic!("Homebrew values did not build: {error}"),
+        };
+        let formula = match render_template(
+            include_str!("../../packaging/homebrew/Formula/excise.rb.in"),
+            &values,
+        ) {
+            Ok(formula) => formula,
+            Err(error) => panic!("Homebrew template did not render: {error}"),
+        };
+        if let Err(error) = validate_homebrew_formula(&formula, TEST_VERSION, &hashes) {
+            panic!("Homebrew template failed semantic validation: {error}");
         }
     }
 
