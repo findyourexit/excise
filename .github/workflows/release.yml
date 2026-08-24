@@ -1,4 +1,6 @@
 name: Release candidate artifacts
+run-name: Excise release candidate ${{ inputs.dispatch_id || github.ref_name }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -6,43 +8,169 @@ on:
         description: Expected Cargo.toml package version from protected main
         required: true
         type: string
+      source_sha:
+        description: Expected reviewed commit SHA on protected main
+        required: true
+        type: string
+      dispatch_id:
+        description: Unique identifier for this candidate dispatch
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
+
 jobs:
   release-gate:
-    name: Verify protected main source
+    name: Verify release source identity
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    environment:
+      name: release-validation
+    permissions:
+      actions: read
+      contents: read
     outputs:
-      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.release_identity.outputs.tag }}
+      version: ${{ github.event_name == 'workflow_dispatch' && steps.candidate_identity.outputs.version || steps.release_identity.outputs.version }}
+      candidate_run_id: ${{ steps.candidate_run.outputs.run_id }}
+      tag_object_sha: ${{ steps.candidate_run.outputs.tag_object_sha }}
+      source_sha: ${{ github.event_name == 'workflow_dispatch' && steps.candidate_identity.outputs.source_sha || steps.release_identity.outputs.source_sha }}
     steps:
-      - name: Check out protected source
+      - name: Check out exact source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify dispatch identity and manifest version
-        id: identity
+        if: github.event_name == 'workflow_dispatch'
+        id: candidate_identity
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           EXPECTED_REF: refs/heads/main
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ inputs.source_sha }}
           EXPECTED_VERSION: ${{ inputs.version }}
+          EXPECTED_DISPATCH_ID: ${{ inputs.dispatch_id }}
         run: |
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_REF" = "$EXPECTED_REF"
           test "$GITHUB_REF_PROTECTED" = true
+          if [[ ! "$EXPECTED_DISPATCH_ID" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "dispatch_id must be a 32-character lowercase hexadecimal value" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          main_relation="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${EXPECTED_SHA}...main" --jq '.status')"
+          case "$main_relation" in
+            ahead|identical) ;;
+            *) echo "source SHA is not reachable from protected main" >&2; exit 1 ;;
+          esac
+          manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
           test -n "$manifest_version"
           test "$manifest_version" = "$EXPECTED_VERSION"
           printf 'version=%s\n' "$manifest_version" >> "$GITHUB_OUTPUT"
+          printf 'source_sha=%s\n' "$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+      - name: Verify release tag and manifest version
+        if: github.event_name == 'push'
+        id: release_identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF_TYPE" = tag
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tags must be stable semantic versions (vMAJOR.MINOR.PATCH)" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release source SHA must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          expected_ref="refs/tags/$tag"
+          test "$GITHUB_REF" = "$expected_ref"
+          test "$(git rev-parse "${expected_ref}^{commit}")" = "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          main_relation="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${EXPECTED_SHA}...main" --jq '.status')"
+          case "$main_relation" in
+            ahead|identical) ;;
+            *) echo "release source SHA is not reachable from protected main" >&2; exit 1 ;;
+          esac
+          manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          test -n "$manifest_version"
+          test "$manifest_version" = "$version"
+          {
+            printf 'tag=%s\n' "$tag"
+            printf 'version=%s\n' "$version"
+            printf 'source_sha=%s\n' "$EXPECTED_SHA"
+          } >> "$GITHUB_OUTPUT"
+      - name: Find approved candidate run
+        if: github.event_name == 'push'
+        id: candidate_run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_TAG: ${{ steps.release_identity.outputs.tag }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${EXPECTED_TAG}")"
+          object_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          if [[ "$object_type" != "tag" ]]; then
+            echo "release tag must be annotated and carry a candidate run ID" >&2
+            exit 1
+          fi
+          tag_object_sha="$(jq -r '.object.sha' <<<"$tag_ref")"
+          tag_message="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" --jq '.message')"
+          candidate_run_id="$(printf '%s\n' "$tag_message" | sed -n 's/^candidate-run-id: \([0-9][0-9]*\)$/\1/p')"
+          if [[ ! "$candidate_run_id" =~ ^[0-9]+$ ]]; then
+            echo "annotated release tag omitted a unique candidate-run-id" >&2
+            exit 1
+          fi
+          candidate_run="$(
+            gh run view "$candidate_run_id" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json databaseId,headSha,headBranch,event,conclusion,workflowName
+          )"
+          jq -e \
+            --arg expected_id "$candidate_run_id" \
+            --arg expected_sha "$EXPECTED_SHA" '
+              (.databaseId | tostring) == $expected_id and
+              .headSha == $expected_sha and
+              .headBranch == "main" and
+              .event == "workflow_dispatch" and
+              .conclusion == "success" and
+              .workflowName == "Release candidate artifacts"
+            ' <<<"$candidate_run" >/dev/null
+          printf 'run_id=%s\n' "$candidate_run_id" >> "$GITHUB_OUTPUT"
+          printf 'tag_object_sha=%s\n' "$tag_object_sha" >> "$GITHUB_OUTPUT"
   archive:
+    if: github.event_name == 'workflow_dispatch'
     needs: release-gate
-    name: ${{ matrix.target }}
+    name: Build ${{ matrix.target }} archive
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -54,23 +182,24 @@ jobs:
           - { os: windows-2025, target: x86_64-pc-windows-msvc }
           - { os: windows-2025, target: aarch64-pc-windows-msvc }
     steps:
-      - name: Check out source
+      - name: Check out exact source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.release-gate.outputs.source_sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - name: Verify checked-out source
+      - name: Verify checked-out candidate source
         shell: bash
         env:
-          EXPECTED_REF: refs/heads/main
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ needs.release-gate.outputs.source_sha }}
           EXPECTED_VERSION: ${{ needs.release-gate.outputs.version }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = "$EXPECTED_REF"
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
           test "$GITHUB_REF_PROTECTED" = true
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
           test -n "$manifest_version"
           test "$manifest_version" = "$EXPECTED_VERSION"
       - name: Install Linux cross linker
@@ -81,7 +210,8 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
           rustup target add "$TARGET" --toolchain 1.88.0
           rustup override set 1.88.0
       - name: Build locked release binary
@@ -102,6 +232,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
+          set -euo pipefail
           if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
             aarch64-linux-gnu-strip "target/$TARGET/release/excise"
           else
@@ -119,17 +250,15 @@ jobs:
           EXPECTED_VERSION: ${{ needs.release-gate.outputs.version }}
         run: |
           set -euo pipefail
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
           test "$version" = "$EXPECTED_VERSION"
           root="excise-${TARGET}-v${version}"
-          mkdir -p "stage/${root}/generated" "stage/${root}/schemas"
+          mkdir -p "stage/${root}/generated" "stage/${root}/schemas" upload
           cp "target/${TARGET}/release/excise" "stage/${root}/excise"
           cp LICENSE README.md "stage/${root}/"
           cp -R generated/. "stage/${root}/generated/"
           cp docs/schemas/*.json "stage/${root}/schemas/"
-          tar -C stage -czf "${root}.tar.gz" "${root}"
-          mkdir upload
-          mv "${root}.tar.gz" upload/
+          tar -C stage -czf "upload/${root}.tar.gz" "$root"
       - name: Assemble Windows archive
         if: runner.os == 'Windows'
         shell: pwsh
@@ -146,14 +275,18 @@ jobs:
           Copy-Item -Recurse generated/* "stage/$root/generated/"
           Copy-Item docs/schemas/*.json "stage/$root/schemas/"
           Compress-Archive -Path "stage/$root" -DestinationPath "upload/$root.zip"
-      - name: Upload immutable target archive
+      - name: Upload immutable candidate target archive
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v7
         with:
           name: excise-${{ matrix.target }}
           path: upload/*
           if-no-files-found: error
           retention-days: 1
+
+
   supply-chain:
+    if: github.event_name == 'workflow_dispatch'
     name: Checksums, SBOM, and provenance
     needs: [archive, release-gate]
     runs-on: ubuntu-24.04
@@ -163,24 +296,25 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - name: Check out source for dependency SBOM
+      - name: Check out exact source for dependency SBOM
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.release-gate.outputs.source_sha }}
+          fetch-depth: 0
           path: source
           persist-credentials: false
-      - name: Verify checked-out source
+      - name: Verify checked-out candidate source
         shell: bash
         env:
-          EXPECTED_REF: refs/heads/main
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ needs.release-gate.outputs.source_sha }}
           EXPECTED_VERSION: ${{ needs.release-gate.outputs.version }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = "$EXPECTED_REF"
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
           test "$GITHUB_REF_PROTECTED" = true
           test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
-          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' source/Cargo.toml | sed -n '1p')"
+          manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' source/Cargo.toml | sed -n '1p')"
           test -n "$manifest_version"
           test "$manifest_version" = "$EXPECTED_VERSION"
       - name: Prepare Cargo dependency source
@@ -197,8 +331,22 @@ jobs:
           path: release
           merge-multiple: true
       - name: Generate checksums
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
         run: |
+          set -euo pipefail
           cd release
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            test -f "excise-${target}-v${VERSION}.tar.gz"
+          done
+          for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            test -f "excise-${target}-v${VERSION}.zip"
+          done
           sha256sum ./excise-* > checksums.sha256
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -209,12 +357,17 @@ jobs:
           upload-artifact: false
       - name: Validate dependency SBOM coverage
         shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.release-gate.outputs.version }}
         run: |
           set -euo pipefail
           sbom=release/excise.spdx.json
           test "$(jq '.packages | length' "$sbom")" -gt 1
-          jq -e '.packages[] | select(.name == "excise")' "$sbom" >/dev/null
           jq -e '.packages[] | select(.name == "serde")' "$sbom" >/dev/null
+          jq -e --arg version "$EXPECTED_VERSION" '
+            ([.packages[] | select(.name == "excise")] | length == 1) and
+            ([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)
+          ' "$sbom" >/dev/null
       - name: Attest release candidate artifacts
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
@@ -226,3 +379,622 @@ jobs:
           path: release
           if-no-files-found: error
           retention-days: 1
+
+  promote-candidate:
+    if: github.event_name == 'push'
+    name: Promote reviewed candidate bundle
+    needs: release-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    steps:
+      - name: Download reviewed candidate bundle
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v8
+        with:
+          name: excise-release-candidate
+          path: release
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.release-gate.outputs.candidate_run_id }}
+      - name: Verify reviewed candidate bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ needs.release-gate.outputs.source_sha }}
+          EXPECTED_VERSION: ${{ needs.release-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd release
+          archives=(
+            "excise-x86_64-unknown-linux-gnu-v${EXPECTED_VERSION}.tar.gz"
+            "excise-aarch64-unknown-linux-gnu-v${EXPECTED_VERSION}.tar.gz"
+            "excise-x86_64-apple-darwin-v${EXPECTED_VERSION}.tar.gz"
+            "excise-aarch64-apple-darwin-v${EXPECTED_VERSION}.tar.gz"
+            "excise-x86_64-pc-windows-msvc-v${EXPECTED_VERSION}.zip"
+            "excise-aarch64-pc-windows-msvc-v${EXPECTED_VERSION}.zip"
+          )
+          for archive in "${archives[@]}"; do
+            test -s "$archive"
+          done
+          test -s checksums.sha256
+          test -s excise.spdx.json
+          sha256sum --check checksums.sha256
+          jq -e '.packages | length > 1' excise.spdx.json >/dev/null
+          jq -e '.packages[] | select(.name == "serde")' excise.spdx.json >/dev/null
+          jq -e --arg version "$EXPECTED_VERSION" '
+            ([.packages[] | select(.name == "excise")] | length == 1) and
+            ([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)
+          ' excise.spdx.json >/dev/null
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            archive="excise-${target}-v${EXPECTED_VERSION}.tar.gz"
+            root="excise-${target}-v${EXPECTED_VERSION}"
+            tar -tzf "$archive" | grep -Fqx "$root/excise"
+            tar -tzf "$archive" | grep -Fqx "$root/LICENSE"
+            tar -tzf "$archive" | grep -Fqx "$root/generated/man/excise.1"
+            tar -tzf "$archive" | grep -Fqx "$root/schemas/scan-report.schema.json"
+          done
+          for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            archive="excise-${target}-v${EXPECTED_VERSION}.zip"
+            root="excise-${target}-v${EXPECTED_VERSION}"
+            unzip -t "$archive" >/dev/null
+            unzip -Z1 "$archive" | grep -Fqx "$root/excise.exe"
+            unzip -Z1 "$archive" | grep -Fqx "$root/LICENSE"
+            unzip -Z1 "$archive" | grep -Fqx "$root/generated/man/excise.1"
+            unzip -Z1 "$archive" | grep -Fqx "$root/schemas/scan-report.schema.json"
+          done
+          for subject in "${archives[@]}" checksums.sha256 excise.spdx.json; do
+            gh attestation verify "$subject" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$EXPECTED_SHA" \
+              --source-ref refs/heads/main
+          done
+      - name: Upload approved release bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v7
+        with:
+          name: excise-release-bundle
+          path: release
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Create GitHub Release
+    if: github.event_name == 'push'
+    needs: [release-gate, promote-candidate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download approved release bundle
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v8
+        with:
+          name: excise-release-bundle
+          path: release
+      - name: Verify release bundle checksums
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd release
+          test -s checksums.sha256
+          test -s excise.spdx.json
+          sha256sum --check checksums.sha256
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            archive="excise-${target}-v${VERSION}.tar.gz"
+            test -f "$archive"
+          done
+          for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            archive="excise-${target}-v${VERSION}.zip"
+            test -f "$archive"
+          done
+      - name: Verify tag target has not moved
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-gate.outputs.tag }}
+          SOURCE_SHA: ${{ needs.release-gate.outputs.source_sha }}
+          EXPECTED_TAG_OBJECT_SHA: ${{ needs.release-gate.outputs.tag_object_sha }}
+        run: |
+          set -euo pipefail
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}")"
+          object_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          test "$object_type" = tag
+          object_sha="$(jq -r '.object.sha' <<<"$tag_ref")"
+          test "$object_sha" = "$EXPECTED_TAG_OBJECT_SHA"
+          object_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.sha')"
+          test "$object_sha" = "$SOURCE_SHA"
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-gate.outputs.tag }}
+          VERSION: ${{ needs.release-gate.outputs.version }}
+          SOURCE_SHA: ${{ needs.release-gate.outputs.source_sha }}
+          EXPECTED_TAG_OBJECT_SHA: ${{ needs.release-gate.outputs.tag_object_sha }}
+        run: |
+          set -euo pipefail
+          expected_assets=(
+            checksums.sha256
+            excise.spdx.json
+            "excise-x86_64-unknown-linux-gnu-v${VERSION}.tar.gz"
+            "excise-aarch64-unknown-linux-gnu-v${VERSION}.tar.gz"
+            "excise-x86_64-apple-darwin-v${VERSION}.tar.gz"
+            "excise-aarch64-apple-darwin-v${VERSION}.tar.gz"
+            "excise-x86_64-pc-windows-msvc-v${VERSION}.zip"
+            "excise-aarch64-pc-windows-msvc-v${VERSION}.zip"
+          )
+          verify_tag_identity() {
+            local tag_ref object_type object_sha
+            if ! tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}")"; then
+              return 1
+            fi
+            if ! object_type="$(jq -r '.object.type' <<<"$tag_ref")"; then
+              return 1
+            fi
+            if [[ "$object_type" != tag ]]; then
+              return 1
+            fi
+            if ! object_sha="$(jq -r '.object.sha' <<<"$tag_ref")"; then
+              return 1
+            fi
+            if [[ "$object_sha" != "$EXPECTED_TAG_OBJECT_SHA" ]]; then
+              return 1
+            fi
+            if ! object_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.sha')"; then
+              return 1
+            fi
+            [[ "$object_sha" == "$SOURCE_SHA" ]]
+          }
+          verify_release_asset_names() {
+            local release_json actual_assets expected_assets_text
+            if ! release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets)"; then
+              return 1
+            fi
+            if ! actual_assets="$(jq -r '.assets[].name' <<<"$release_json" | sort)"; then
+              return 1
+            fi
+            expected_assets_text="$(printf '%s\n' "${expected_assets[@]}" | sort)"
+            [[ "$actual_assets" == "$expected_assets_text" ]]
+          }
+          verify_existing_release() {
+            local existing_release_dir existing_release_json existing_assets expected_assets_text asset
+            local existing_hash expected_hash
+            if ! existing_release_dir="$(mktemp -d)"; then
+              return 1
+            fi
+            if ! existing_release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets)"; then
+              rm -rf -- "$existing_release_dir"
+              return 1
+            fi
+            if ! existing_assets="$(jq -r '.assets[].name' <<<"$existing_release_json" | sort)"; then
+              rm -rf -- "$existing_release_dir"
+              return 1
+            fi
+            expected_assets_text="$(printf '%s\n' "${expected_assets[@]}" | sort)"
+            if [[ "$existing_assets" != "$expected_assets_text" ]]; then
+              rm -rf -- "$existing_release_dir"
+              return 1
+            fi
+            if ! gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$existing_release_dir"; then
+              rm -rf -- "$existing_release_dir"
+              return 1
+            fi
+            for asset in "${expected_assets[@]}"; do
+              if [[ ! -s "$existing_release_dir/$asset" || ! -s "release/$asset" ]]; then
+                rm -rf -- "$existing_release_dir"
+                return 1
+              fi
+              if ! existing_hash="$(sha256sum "$existing_release_dir/$asset" | cut -d' ' -f1)"; then
+                rm -rf -- "$existing_release_dir"
+                return 1
+              fi
+              if ! expected_hash="$(sha256sum "release/$asset" | cut -d' ' -f1)"; then
+                rm -rf -- "$existing_release_dir"
+                return 1
+              fi
+              if [[ "$existing_hash" != "$expected_hash" ]]; then
+                rm -rf -- "$existing_release_dir"
+                return 1
+              fi
+            done
+            rm -rf -- "$existing_release_dir"
+          }
+          release_json="$(
+            gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets,isDraft,isPrerelease,tagName 2>/dev/null || true
+          )"
+          if [[ -n "$release_json" ]]; then
+            if ! is_draft="$(jq -r '.isDraft' <<<"$release_json")"; then
+              exit 1
+            fi
+            if ! is_prerelease="$(jq -r '.isPrerelease' <<<"$release_json")"; then
+              exit 1
+            fi
+            if ! tag_name="$(jq -r '.tagName' <<<"$release_json")"; then
+              exit 1
+            fi
+            if [[ "$tag_name" != "$TAG" ]]; then
+              exit 1
+            fi
+            if [[ "$is_draft" == "true" ]]; then
+              if [[ "$is_prerelease" == "true" ]]; then
+                echo "GitHub Release $TAG is an unexpected prerelease draft" >&2
+                exit 1
+              fi
+              if ! unexpected_assets="$(
+                jq -r '.assets[].name' <<<"$release_json" |
+                while IFS= read -r asset; do
+                  is_expected=false
+                  for expected_asset in "${expected_assets[@]}"; do
+                    if [[ "$asset" == "$expected_asset" ]]; then
+                      is_expected=true
+                      break
+                    fi
+                  done
+                  if [[ "$is_expected" != true ]]; then
+                    printf '%s\n' "$asset"
+                  fi
+                done
+              )"; then
+                exit 1
+              fi
+              if [[ -n "$unexpected_assets" ]]; then
+                echo "draft release contains unexpected assets: $unexpected_assets" >&2
+                exit 1
+              fi
+              if ! verify_tag_identity; then
+                echo "release tag identity changed before draft recovery" >&2
+                exit 1
+              fi
+              if ! gh release upload "$TAG" release/* \
+                --repo "$GITHUB_REPOSITORY" \
+                --clobber; then
+                exit 1
+              fi
+              if ! verify_release_asset_names; then
+                echo "draft release asset set did not match the candidate bundle" >&2
+                exit 1
+              fi
+              if ! gh release edit "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --draft=false \
+                --title "Excise $TAG"; then
+                exit 1
+              fi
+              exit 0
+            fi
+            if [[ "$is_prerelease" == "true" ]]; then
+              echo "GitHub Release $TAG is an unexpected prerelease" >&2
+              exit 1
+            fi
+            if ! verify_tag_identity; then
+              echo "release tag identity changed before published-release reuse" >&2
+              exit 1
+            fi
+            if ! verify_existing_release; then
+              echo "published release does not match the approved candidate bundle" >&2
+              exit 1
+            fi
+            exit 0
+          fi
+          if ! verify_tag_identity; then
+            echo "release tag identity could not be verified before creation" >&2
+            exit 1
+          fi
+          if ! gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "Excise $TAG" \
+            --generate-notes; then
+            exit 1
+          fi
+          if ! gh release upload "$TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber; then
+            exit 1
+          fi
+          if ! verify_release_asset_names; then
+            echo "new release asset set did not match the candidate bundle" >&2
+            exit 1
+          fi
+          if ! gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --title "Excise $TAG"; then
+            exit 1
+          fi
+
+  publish-crate:
+    name: Publish crate to crates.io
+    if: github.event_name == 'push'
+    needs: [release-gate, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/excise
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.release-gate.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup override set 1.88.0
+      - name: Verify checked-out tag and manifest version
+        shell: bash
+        env:
+          EXPECTED_TAG: ${{ needs.release-gate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.release-gate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/tags/$EXPECTED_TAG"
+          test "$GITHUB_REF_TYPE" = tag
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          test "$manifest_version" = "${EXPECTED_TAG#v}"
+      - name: Publish version if absent
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_TAG: ${{ needs.release-gate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.release-gate.outputs.source_sha }}
+          EXPECTED_TAG_OBJECT_SHA: ${{ needs.release-gate.outputs.tag_object_sha }}
+          VERSION: ${{ needs.release-gate.outputs.version }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${EXPECTED_TAG}")"
+          object_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          test "$object_type" = tag
+          object_sha="$(jq -r '.object.sha' <<<"$tag_ref")"
+          test "$object_sha" = "$EXPECTED_TAG_OBJECT_SHA"
+          object_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.sha')"
+          test "$object_sha" = "$EXPECTED_SHA"
+          crate_url="https://crates.io/api/v1/crates/excise/${VERSION}"
+          user_agent="excise-release/${VERSION} (+https://github.com/findyourexit/excise)"
+          package_path="target/package/excise-${VERSION}.crate"
+          package_checksum=""
+          prepare_local_crate() {
+            if [[ -n "$package_checksum" ]]; then
+              return
+            fi
+            cargo package --package excise --locked --no-verify
+            test -s "$package_path"
+            package_checksum="$(sha256sum "$package_path" | cut -d' ' -f1)"
+          }
+          verify_existing_crate() {
+            prepare_local_crate
+            local metadata yanked checksum
+            metadata="$(curl --location --silent --show-error --user-agent "$user_agent" "$crate_url")"
+            yanked="$(jq -r 'if (.version.yanked | type) == "boolean" then (.version.yanked | tostring) else error("version.yanked must be boolean") end' <<<"$metadata")"
+            checksum="$(jq -r '.version.checksum // empty' <<<"$metadata")"
+            test "$yanked" = "false"
+            test "$checksum" = "$package_checksum"
+          }
+          status="$(curl --location --silent --show-error --output /dev/null --write-out '%{http_code}' --user-agent "$user_agent" "$crate_url")"
+          case "$status" in
+            200)
+              verify_existing_crate
+              echo "excise ${VERSION} is already published with matching bytes; skipping cargo publish"
+              exit 0
+              ;;
+            404)
+              ;;
+            *)
+              echo "unexpected crates.io response: HTTP ${status}" >&2
+              exit 1
+              ;;
+          esac
+          if cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"; then
+            exit 0
+          fi
+          echo "cargo publish failed; checking for an idempotent concurrent publication" >&2
+          for attempt in 1 2 3 4 5; do
+            echo "checking crates.io after publish attempt ${attempt}" >&2
+            sleep 10
+            status="$(curl --location --silent --show-error --output /dev/null --write-out '%{http_code}' --user-agent "$user_agent" "$crate_url")"
+            if [[ "$status" == 200 ]]; then
+              verify_existing_crate
+              echo "excise ${VERSION} became available with matching bytes after the publish attempt"
+              exit 0
+            fi
+          done
+          exit 1
+
+  publish-homebrew:
+    name: Update first-party Homebrew tap
+    if: github.event_name == 'push'
+    needs: [release-gate, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: homebrew-tap-publication
+      cancel-in-progress: false
+    environment:
+      name: homebrew-tap
+      url: https://github.com/findyourexit/homebrew-tap
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.release-gate.outputs.source_sha }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Verify checked-out source
+        shell: bash
+        env:
+          EXPECTED_TAG: ${{ needs.release-gate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.release-gate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/tags/$EXPECTED_TAG"
+          test "$GITHUB_REF_TYPE" = tag
+          test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
+          manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' source/Cargo.toml | sed -n '1p')"
+          test "$manifest_version" = "${EXPECTED_TAG#v}"
+      - name: Download approved release bundle
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v8
+        with:
+          name: excise-release-bundle
+          path: release
+      - name: Check release hashes and calculate Homebrew values
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected_hash() {
+            local archive="$1"
+            awk -v name="$archive" '$2 == name || $2 == "./" name { print $1 }' release/checksums.sha256
+          }
+          check_hash() {
+            local archive="$1"
+            local expected
+            expected="$(expected_hash "$archive")"
+            test -n "$expected"
+            test "$expected" = "$(sha256sum "release/$archive" | cut -d' ' -f1)"
+            printf '%s' "$expected"
+          }
+          EXCISE_SHA256_X86_64_UNKNOWN_LINUX_GNU="$(check_hash "excise-x86_64-unknown-linux-gnu-v${VERSION}.tar.gz")"
+          EXCISE_SHA256_AARCH64_UNKNOWN_LINUX_GNU="$(check_hash "excise-aarch64-unknown-linux-gnu-v${VERSION}.tar.gz")"
+          EXCISE_SHA256_X86_64_APPLE_DARWIN="$(check_hash "excise-x86_64-apple-darwin-v${VERSION}.tar.gz")"
+          EXCISE_SHA256_AARCH64_APPLE_DARWIN="$(check_hash "excise-aarch64-apple-darwin-v${VERSION}.tar.gz")"
+          export EXCISE_SHA256_X86_64_UNKNOWN_LINUX_GNU
+          export EXCISE_SHA256_AARCH64_UNKNOWN_LINUX_GNU
+          export EXCISE_SHA256_X86_64_APPLE_DARWIN
+          export EXCISE_SHA256_AARCH64_APPLE_DARWIN
+          {
+            printf 'EXCISE_SHA256_X86_64_UNKNOWN_LINUX_GNU=%s\n' "$EXCISE_SHA256_X86_64_UNKNOWN_LINUX_GNU"
+            printf 'EXCISE_SHA256_AARCH64_UNKNOWN_LINUX_GNU=%s\n' "$EXCISE_SHA256_AARCH64_UNKNOWN_LINUX_GNU"
+            printf 'EXCISE_SHA256_X86_64_APPLE_DARWIN=%s\n' "$EXCISE_SHA256_X86_64_APPLE_DARWIN"
+            printf 'EXCISE_SHA256_AARCH64_APPLE_DARWIN=%s\n' "$EXCISE_SHA256_AARCH64_APPLE_DARWIN"
+          } >> "$GITHUB_ENV"
+      - name: Check out first-party Homebrew tap
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: findyourexit/homebrew-tap
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+          persist-credentials: false
+      - name: Reject stale Homebrew publication
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          formula=homebrew-tap/Formula/excise.rb
+          if [[ ! -f "$formula" ]]; then
+            exit 0
+          fi
+          current_versions="$(
+            sed -n 's/^[[:space:]]*url "[^"]*\/v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\/[^\"]*"/\1/p' "$formula" |
+              sort -u
+          )"
+          version_count="$(printf '%s\n' "$current_versions" | sed '/^$/d' | wc -l)"
+          test "$version_count" = 1
+          current_version="$current_versions"
+          if [[ "$current_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            current_major="${BASH_REMATCH[1]}"
+            current_minor="${BASH_REMATCH[2]}"
+            current_patch="${BASH_REMATCH[3]}"
+          else
+            echo "could not determine the current Homebrew formula version" >&2
+            exit 1
+          fi
+          if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            expected_major="${BASH_REMATCH[1]}"
+            expected_minor="${BASH_REMATCH[2]}"
+            expected_patch="${BASH_REMATCH[3]}"
+          else
+            echo "release version is not semantic: $VERSION" >&2
+            exit 1
+          fi
+          if (( 10#$current_major > 10#$expected_major ||
+                (10#$current_major == 10#$expected_major &&
+                 (10#$current_minor > 10#$expected_minor ||
+                  (10#$current_minor == 10#$expected_minor &&
+                   10#$current_patch > 10#$expected_patch))) )); then
+            echo "Homebrew tap already contains newer version $current_version; refusing $VERSION" >&2
+            exit 1
+          fi
+      - name: Render and validate only Formula/excise.rb
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
+          FORMULA_PATH: ${{ github.workspace }}/homebrew-tap/Formula/excise.rb
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$FORMULA_PATH")"
+          (
+            cd source
+            EXCISE_RELEASE_VERSION="$VERSION" \
+            EXCISE_HOMEBREW_FORMULA="$FORMULA_PATH" \
+            cargo run --locked --package xtask -- render-homebrew
+          )
+          test -s "$FORMULA_PATH"
+          git -C homebrew-tap diff --quiet -- . ':(exclude)Formula/excise.rb'
+          test -z "$(git -C homebrew-tap ls-files --others --exclude-standard -- . ':(exclude)Formula/excise.rb')"
+      - name: Commit and push formula when changed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          EXPECTED_TAG: ${{ needs.release-gate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.release-gate.outputs.source_sha }}
+          EXPECTED_TAG_OBJECT_SHA: ${{ needs.release-gate.outputs.tag_object_sha }}
+          VERSION: ${{ needs.release-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${EXPECTED_TAG}")"
+          object_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          test "$object_type" = tag
+          object_sha="$(jq -r '.object.sha' <<<"$tag_ref")"
+          test "$object_sha" = "$EXPECTED_TAG_OBJECT_SHA"
+          object_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.sha')"
+          test "$object_sha" = "$EXPECTED_SHA"
+          git -C homebrew-tap add -- Formula/excise.rb
+          staged_files="$(git -C homebrew-tap diff --cached --name-only)"
+          if [[ -z "$staged_files" ]]; then
+            echo "Homebrew formula already matches ${VERSION}"
+            exit 0
+          fi
+          test "$staged_files" = "Formula/excise.rb"
+          git -C homebrew-tap \
+            -c user.name="findyourexit release automation" \
+            -c user.email="release-automation@findyourexit.invalid" \
+            commit -m "excise ${VERSION}"
+          git -C homebrew-tap remote set-url origin "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/findyourexit/homebrew-tap.git"
+          git -C homebrew-tap push origin HEAD:main
