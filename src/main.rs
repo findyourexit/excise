@@ -54,6 +54,7 @@ fn run_main() -> i32 {
     let monochrome_locked = config.monochrome && config.theme != excise::theme::ThemeId::Monochrome;
     let settings = RuntimeSettings {
         root: root.resolved.as_path().to_path_buf(),
+        root_identity: root.identity.clone(),
         scan_threads: config.scan_threads,
         event_capacity: config.event_buffer,
         cross_filesystems: config.cross_filesystems,

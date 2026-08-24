@@ -935,7 +935,7 @@ mod tests {
         tree.add_entry(&metadata, &path, identity)
             .expect("fixture should be added")
             .expect("fixture should remain materialized");
-        tree.complete_directory(root.path())
+        tree.complete_directory(root.path(), None)
             .expect("fixture root should complete");
         tree.finalize().expect("fixture tree should finalize");
 

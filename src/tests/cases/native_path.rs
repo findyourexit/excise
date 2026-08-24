@@ -6,12 +6,14 @@ use crate::native_path::{NativePath, ResolvedRoot, identity_for, safe_display_pa
 
 #[test]
 fn safe_display_escapes_terminal_and_bidi_controls() {
-    let displayed = safe_display_path(Path::new("safe/\u{1b}[31m/\u{202e}name"));
+    let displayed = safe_display_path(Path::new("safe/\u{1b}[31m/\u{202e}\u{206a}name"));
     assert!(displayed.deceptive);
     assert!(!displayed.text.contains('\u{1b}'));
     assert!(!displayed.text.contains('\u{202e}'));
+    assert!(!displayed.text.contains('\u{206a}'));
     assert!(displayed.text.contains("\\x1b"));
     assert!(displayed.text.contains("\\u{202e}"));
+    assert!(displayed.text.contains("\\u{206a}"));
 }
 
 #[test]

@@ -10,8 +10,13 @@ use crate::tests::cases::test_utils::test_backend_factory;
 use crate::tests::fakes::{BackendOperation, TerminalEvent, TerminalEvents};
 
 fn settings(root: &std::path::Path) -> RuntimeSettings {
+    let metadata = std::fs::symlink_metadata(root).expect("runtime root metadata should exist");
+    let root_identity = crate::native_path::identity_for(root, &metadata)
+        .expect("runtime root identity should be readable")
+        .expect("runtime root should not be a symbolic link");
     RuntimeSettings {
         root: root.to_path_buf(),
+        root_identity,
         scan_threads: 1,
         event_capacity: 16,
         cross_filesystems: false,
@@ -146,6 +151,487 @@ fn graceful_quit_during_scan_is_precise_cancellation() {
     assert!(
         matches!(outcome, OperationOutcome::Cancelled { precise: true, .. }),
         "unexpected outcome: {outcome:?}"
+    );
+}
+
+#[cfg(unix)]
+struct DelayedSoftCancelInput {
+    events: Vec<Option<Event>>,
+}
+
+#[cfg(unix)]
+impl DelayedSoftCancelInput {
+    fn new(mut events: Vec<Option<Event>>) -> Self {
+        events.reverse();
+        Self { events }
+    }
+}
+
+#[cfg(unix)]
+impl InputSource for DelayedSoftCancelInput {
+    fn poll(&mut self, _timeout: Duration) -> Result<bool, AppError> {
+        Ok(!self.events.is_empty())
+    }
+
+    fn read(&mut self) -> Result<InputEvent, AppError> {
+        let event = self
+            .events
+            .pop()
+            .ok_or_else(|| AppError::Invariant("fake input exhausted after poll".to_string()))?;
+        if matches!(
+            &event,
+            Some(Event::Key(KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }))
+        ) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(event.map_or(InputEvent::Barrier, InputEvent::Terminal))
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn soft_cancel_wins_when_revalidation_event_follows_input() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = DelayedSoftCancelInput::new(vec![
+        None,
+        Some(key(KeyCode::Down, KeyModifiers::NONE)),
+        Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Some(key(KeyCode::Char('s'), KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+    ]);
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("soft cancellation should restore cleanly");
+    let OperationOutcome::Partial {
+        completed_entries,
+        failed_entries,
+        ..
+    } = outcome
+    else {
+        panic!("expected a partial cancellation result, got {outcome:?}");
+    };
+    assert_eq!(completed_entries, 0);
+    assert_eq!(failed_entries, 1);
+    assert!(target.exists(), "soft-cancelled target must remain");
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[cfg(any(unix, windows))]
+struct ReplanInput {
+    events: Vec<Option<Event>>,
+    target: std::path::PathBuf,
+    changed: bool,
+    remove_on_confirm: bool,
+    change_on_plan: bool,
+    remove_on_plan: bool,
+    replace_directory_on_trigger: bool,
+}
+
+#[cfg(any(unix, windows))]
+impl ReplanInput {
+    fn new(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
+        let mut events = events;
+        events.reverse();
+        Self {
+            events,
+            target,
+            changed: false,
+            remove_on_confirm: false,
+            change_on_plan: false,
+            remove_on_plan: false,
+            replace_directory_on_trigger: false,
+        }
+    }
+    fn missing(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
+        let mut input = Self::new(events, target);
+        input.remove_on_confirm = true;
+        input
+    }
+    fn planning_change(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
+        let mut input = Self::new(events, target);
+        input.change_on_plan = true;
+        input
+    }
+
+    fn planning_missing(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
+        let mut input = Self::new(events, target);
+        input.change_on_plan = true;
+        input.remove_on_plan = true;
+        input
+    }
+
+    #[cfg(unix)]
+    fn planning_directory_replacement(
+        events: Vec<Option<Event>>,
+        target: std::path::PathBuf,
+    ) -> Self {
+        let mut input = Self::new(events, target);
+        input.change_on_plan = true;
+        input.replace_directory_on_trigger = true;
+        input
+    }
+
+    #[cfg(unix)]
+    fn directory_replacement(events: Vec<Option<Event>>, target: std::path::PathBuf) -> Self {
+        let mut input = Self::new(events, target);
+        input.replace_directory_on_trigger = true;
+        input
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl InputSource for ReplanInput {
+    fn poll(&mut self, _timeout: Duration) -> Result<bool, AppError> {
+        Ok(!self.events.is_empty())
+    }
+
+    fn read(&mut self) -> Result<InputEvent, AppError> {
+        let event = self
+            .events
+            .pop()
+            .ok_or_else(|| AppError::Invariant("fake input exhausted after poll".to_string()))?;
+        let trigger = if self.change_on_plan {
+            KeyCode::Backspace
+        } else {
+            KeyCode::Char('y')
+        };
+        if !self.changed
+            && matches!(
+                &event,
+                Some(Event::Key(KeyEvent {
+                    code,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })) if *code == trigger
+            )
+        {
+            if self.replace_directory_on_trigger {
+                let displaced = self.target.with_file_name("displaced-target");
+                std::fs::rename(&self.target, displaced)
+                    .expect("original directory should be displaced");
+                std::fs::create_dir(&self.target).expect("replacement directory should be created");
+                std::fs::write(self.target.join("replacement"), b"replacement")
+                    .expect("replacement child should be written");
+            } else if self.remove_on_confirm || self.remove_on_plan {
+                std::fs::remove_file(&self.target).expect("post-plan target should be removed");
+            } else {
+                std::fs::write(&self.target, b"changed-after-plan")
+                    .expect("post-plan replacement should be written");
+            }
+            self.changed = true;
+        }
+        Ok(event.map_or(InputEvent::Barrier, InputEvent::Terminal))
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn changed_plan_rescans_before_reprompting_and_does_not_reuse_stale_review() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::new(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("stale plan should be rebuilt after the focused rescan");
+    assert!(
+        matches!(outcome, OperationOutcome::Exact(_)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(!target.exists(), "freshly planned target should be deleted");
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_directory_target_rescans_parent_before_reprompting() {
+    let root = tempfile::tempdir().expect("deletion root should exist");
+    let target = root.path().join("target");
+    let displaced = root.path().join("displaced-target");
+    std::fs::create_dir(&target).expect("deletion target should be created");
+    std::fs::write(target.join("old-child"), b"old")
+        .expect("initial directory child should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::planning_directory_replacement(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let mut settings = settings(root.path());
+    settings.disable_delete_confirmation = true;
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings,
+        Box::new(VirtualClock::new()),
+    )
+    .expect("directory replacement should trigger a parent rescan");
+    assert!(
+        matches!(outcome, OperationOutcome::Exact(_)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(
+        !target.exists(),
+        "fresh replacement target should be deleted"
+    );
+    assert!(
+        displaced.join("old-child").exists(),
+        "old occupant should remain untouched"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn final_directory_replacement_rescans_parent_before_reprompting() {
+    let root = tempfile::tempdir().expect("deletion root should exist");
+    let target = root.path().join("target");
+    let displaced = root.path().join("displaced-target");
+    std::fs::create_dir(&target).expect("deletion target should be created");
+    std::fs::write(target.join("old-child"), b"old")
+        .expect("initial directory child should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::directory_replacement(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let mut settings = settings(root.path());
+    settings.disable_delete_confirmation = true;
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings,
+        Box::new(VirtualClock::new()),
+    )
+    .expect("final directory replacement should trigger a parent rescan");
+    assert!(
+        matches!(outcome, OperationOutcome::Exact(_)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(
+        !target.exists(),
+        "fresh replacement target should be deleted"
+    );
+    assert!(
+        displaced.join("old-child").exists(),
+        "old occupant should remain untouched"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn changed_plan_during_planning_rescans_before_reprompting() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::planning_change(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("planning drift should trigger a focused rescan");
+    assert!(
+        matches!(outcome, OperationOutcome::Exact(_)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(!target.exists(), "freshly planned target should be deleted");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn missing_plan_target_reports_partial_summary() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::planning_missing(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("missing planning target should produce a partial summary");
+    let OperationOutcome::Partial {
+        completed_entries,
+        failed_entries,
+        value: summary,
+    } = outcome
+    else {
+        panic!("missing planning target must not return exact: {outcome:?}");
+    };
+    assert_eq!(completed_entries, 0);
+    assert_eq!(failed_entries, 1);
+    assert_eq!(summary.deletion_missing_entries, 1);
+    assert!(!target.exists(), "missing target should remain absent");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn missing_final_validation_reports_partial_summary() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    std::fs::write(&target, b"payload").expect("deletion target should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::missing(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        target.clone(),
+    );
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("missing final validation should produce a partial summary");
+    let OperationOutcome::Partial {
+        completed_entries,
+        failed_entries,
+        value: summary,
+    } = outcome
+    else {
+        panic!("missing final validation must not return exact: {outcome:?}");
+    };
+    assert_eq!(completed_entries, 0);
+    assert_eq!(failed_entries, 1);
+    assert_eq!(summary.deletion_missing_entries, 1);
+    assert!(!target.exists(), "missing target should remain absent");
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_directory_change_is_rescanned_before_reprompting() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let target = root.path().join("target");
+    let mutation = target.join("new-child");
+    std::fs::create_dir(&target).expect("deletion directory should be created");
+    std::fs::write(target.join("old-child"), b"old")
+        .expect("initial directory child should be written");
+    let (_, _, backend) = test_backend_factory(80, 24);
+    let input = ReplanInput::new(
+        vec![
+            None,
+            Some(key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        mutation,
+    );
+    let mut settings = settings(root.path());
+    settings.disable_delete_confirmation = true;
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings,
+        Box::new(VirtualClock::new()),
+    )
+    .expect("persistent directory change should trigger a focused rescan");
+    assert!(
+        matches!(outcome, OperationOutcome::Exact(_)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(
+        !target.exists(),
+        "freshly planned directory should be deleted; outcome: {outcome:?}"
     );
 }
 

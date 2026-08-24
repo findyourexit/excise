@@ -132,6 +132,7 @@ pub enum UnscannedReason {
     FilesystemBoundary,
     Excluded(String),
     Metadata(String),
+    Replacement(String),
     MemoryAggregation,
 }
 

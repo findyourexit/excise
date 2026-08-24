@@ -226,6 +226,27 @@ impl IdentityStore {
     pub fn spill_path(&self) -> Option<&Path> {
         self.is_spilled().then(|| self.session.path())
     }
+    #[cfg(all(test, windows))]
+    pub(crate) fn corrupt_spill_record_for_test(
+        &mut self,
+        file_id: &FileId,
+    ) -> Result<(), ModelError> {
+        self.flush_pending()?;
+        let Storage::Disk { database, .. } = &mut self.storage else {
+            return Err(ModelError::Invariant(
+                "identity store did not spill".to_string(),
+            ));
+        };
+        let key = serde_json::to_vec(file_id).map_err(identity_error)?;
+        let transaction = database.begin_write().map_err(identity_error)?;
+        {
+            let mut table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+            table
+                .insert(key.as_slice(), &b"corrupt"[..])
+                .map_err(identity_error)?;
+        }
+        transaction.commit().map_err(identity_error)
+    }
 
     #[must_use]
     pub fn internal_scan_paths(&self) -> Vec<PathBuf> {
@@ -310,6 +331,17 @@ impl IdentityStore {
         self.insert_by_key(&key, record, existing.is_none())?;
         Ok(existing)
     }
+    pub(crate) fn refresh_declared_links(
+        &mut self,
+        file_id: &FileId,
+        declared_links: Option<u64>,
+    ) -> Result<(), ModelError> {
+        let Some(mut record) = self.get(file_id)? else {
+            return Ok(());
+        };
+        record.declared_links = declared_links;
+        self.upsert_record(file_id, &record).map(|_| ())
+    }
 
     /// Repoints only one identity's participants using a caller-sorted removal set.
     ///
@@ -387,9 +419,14 @@ impl IdentityStore {
                             }
                             last_key = Some(key);
                         }
-                        let has_more = match entries.next() {
-                            Some(Ok(_)) => true,
-                            Some(Err(error)) => return Err(identity_error(error)),
+                        let has_more = match last_key.as_deref() {
+                            Some(last_key) => table
+                                .range::<&[u8]>((Bound::Excluded(last_key), Bound::Unbounded))
+                                .map_err(identity_error)?
+                                .next()
+                                .transpose()
+                                .map_err(identity_error)?
+                                .is_some(),
                             None => false,
                         };
                         (updates, last_key, has_more)
@@ -1093,6 +1130,39 @@ mod tests {
             .expect("identity should remain");
         assert_eq!(record.nodes, vec![NodeId(12), NodeId(5)]);
         assert_eq!(record.allocation_node, Some(NodeId(12)));
+    }
+
+    #[test]
+    fn remapping_spilled_participants_preserves_page_boundary_records() {
+        const RECORDS: u32 = 600;
+        let mut store = IdentityStore::new(1).expect("private session should initialize");
+        for index in 0..RECORDS {
+            let node = NodeId(index);
+            store
+                .observe(
+                    &FileId::new_inode(10, u64::from(index)),
+                    Some(1),
+                    ByteBounds::exact(4096),
+                    Some(node),
+                    Some(node),
+                )
+                .expect("spilled identity should be stored");
+        }
+
+        let mut removed = (0..RECORDS).map(NodeId).collect::<Vec<_>>();
+        let replacement = NodeId(RECORDS + 1);
+        store
+            .remap_removed_nodes(&mut removed, replacement)
+            .expect("all spilled records should be remapped");
+
+        for index in 0..RECORDS {
+            let record = store
+                .get(&FileId::new_inode(10, u64::from(index)))
+                .expect("identity lookup should succeed")
+                .expect("identity should remain");
+            assert_eq!(record.nodes, vec![replacement]);
+            assert_eq!(record.allocation_node, Some(replacement));
+        }
     }
 
     #[test]

@@ -57,8 +57,13 @@ fuzz_target!(|data: &[u8]| {
         KeyModifiers::NONE,
     ))));
 
+    let metadata = std::fs::symlink_metadata(&root).expect("fuzz root metadata should exist");
+    let root_identity = excise::native_path::identity_for(&root, &metadata)
+        .expect("fuzz root identity should be readable")
+        .expect("fuzz root should not be a symbolic link");
     let settings = RuntimeSettings {
         root: root.clone(),
+        root_identity,
         scan_threads: 1,
         event_capacity: 16,
         cross_filesystems: false,

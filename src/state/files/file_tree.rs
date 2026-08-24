@@ -1,9 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
 use crate::deletion::{
     DeletionEntryOutcome, DeletionReport, PlannedKind, PlannedSnapshot, ReviewedEntry,
+    validate_scan_root_identity,
 };
 use crate::filter::FilterPattern;
 use crate::model::{
@@ -12,6 +14,7 @@ use crate::model::{
 };
 use crate::native_path::NativeIdentity;
 use crate::state::tiles::{FileMetadata, files_in_folder};
+use file_id::FileId;
 
 struct RescanStage {
     target_id: NodeId,
@@ -26,6 +29,7 @@ pub struct FileTree {
     pub failed_to_read: u64,
     pub path_in_filesystem: PathBuf,
     arena: Arena,
+    root_identity: Option<NativeIdentity>,
     show_apparent_size: bool,
     filter: Option<FilterPattern>,
     filter_root: Option<PathBuf>,
@@ -43,6 +47,7 @@ impl FileTree {
         Ok(Self {
             current_path: vec![arena.root()],
             arena,
+            root_identity: None,
             path_in_filesystem,
             space_freed: 0,
             failed_to_read: 0,
@@ -51,6 +56,20 @@ impl FileTree {
             filter_root: None,
             rescan: None,
         })
+    }
+
+    pub fn new_with_root_identity(
+        path_in_filesystem: PathBuf,
+        root_identity: NativeIdentity,
+        show_apparent_size: bool,
+        process_memory_mib: usize,
+    ) -> Result<Self, ModelError> {
+        validate_scan_root_identity(&path_in_filesystem, &root_identity)
+            .map_err(|error| ModelError::Invariant(error.to_string()))?;
+        let mut tree = Self::new(path_in_filesystem, show_apparent_size, process_memory_mib)?;
+        tree.root_identity = Some(root_identity.clone());
+        tree.arena.set_root_identity(root_identity);
+        Ok(tree)
     }
 
     #[must_use]
@@ -106,6 +125,72 @@ impl FileTree {
     #[must_use]
     pub fn entry_snapshot(&self, id: NodeId) -> Option<crate::model::EntrySnapshot> {
         self.arena.node(id).map(|node| node.snapshot.clone())
+    }
+
+    #[must_use]
+    pub fn identity_for_path(&self, path: &Path) -> Option<NativeIdentity> {
+        let id = self.arena.path_ids(path)?.last().copied()?;
+        self.arena.node(id)?.snapshot.identity.clone()
+    }
+    pub fn deletion_target_for_path(
+        &self,
+        path: &Path,
+    ) -> Result<crate::state::FileToDelete, ModelError> {
+        let ids = self
+            .arena
+            .path_ids(path)
+            .ok_or_else(|| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
+        let node_id = *ids
+            .last()
+            .ok_or_else(|| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
+        if ids.iter().any(|id| {
+            self.arena
+                .node(*id)
+                .is_none_or(|node| node.state != NodeState::Complete)
+        }) {
+            return Err(ModelError::Invariant(
+                "deletion requires a fully materialized path".to_string(),
+            ));
+        }
+        let node = self
+            .arena
+            .node(node_id)
+            .ok_or_else(|| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
+        if node.kind.is_synthetic() {
+            return Err(ModelError::Invariant(
+                "deletion requires a fully materialized subtree".to_string(),
+            ));
+        }
+        let relative = path
+            .strip_prefix(&self.path_in_filesystem)
+            .map_err(|_| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
+        let (file_type, num_descendants) = match node.kind {
+            NodeKind::Directory => (
+                crate::state::tiles::FileType::Folder,
+                Some(node.metrics.descendants),
+            ),
+            NodeKind::File | NodeKind::Link => (crate::state::tiles::FileType::File, None),
+            NodeKind::Root | NodeKind::Synthetic(_) => {
+                return Err(ModelError::Invariant(
+                    "scan roots and synthetic nodes cannot be deleted".to_string(),
+                ));
+            }
+        };
+        Ok(crate::state::FileToDelete {
+            node_id,
+            synthetic: false,
+            path_in_filesystem: self.path_in_filesystem.clone(),
+            path_to_file: relative.iter().map(OsStr::to_os_string).collect(),
+            file_type,
+            num_descendants,
+            size: if self.show_apparent_size {
+                node.metrics.apparent_bytes
+            } else {
+                node.metrics.allocated_bytes.lower
+            },
+            expected_snapshot: node.snapshot.clone(),
+            reviewed_entries: Vec::new(),
+        })
     }
 
     pub fn reviewed_subtree(
@@ -209,17 +294,51 @@ impl FileTree {
         }
     }
 
+    #[allow(dead_code)]
     pub fn apply_deletion_report(&mut self, report: &DeletionReport) {
+        let _ = self.try_apply_deletion_report(report);
+    }
+
+    pub fn try_apply_deletion_report(&mut self, report: &DeletionReport) -> Result<(), ModelError> {
+        let mut affected_link_counts: HashMap<FileId, Option<u64>> = HashMap::new();
         for result in &report.entries {
-            if matches!(
+            if !matches!(
                 result.outcome,
                 DeletionEntryOutcome::Deleted | DeletionEntryOutcome::Missing
+            ) || !matches!(
+                result.entry.snapshot.kind,
+                PlannedKind::File | PlannedKind::Link
             ) {
-                let path = self.path_in_filesystem.join(&result.entry.relative_path);
-                self.arena.remove_path(&path);
+                continue;
             }
+            let file_id = result.entry.snapshot.identity.file_id;
+            let post_delete = matches!(result.outcome, DeletionEntryOutcome::Deleted)
+                .then(|| result.entry.snapshot.identity.link_count)
+                .flatten()
+                .map(|count| count.saturating_sub(1));
+            affected_link_counts
+                .entry(file_id)
+                .and_modify(|current| {
+                    *current = match (*current, post_delete) {
+                        (Some(_), Some(next)) => Some(next),
+                        _ => None,
+                    };
+                })
+                .or_insert(post_delete);
         }
-        self.arena.rebuild();
+        let removed_paths = report
+            .entries
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result.outcome,
+                    DeletionEntryOutcome::Deleted | DeletionEntryOutcome::Missing
+                )
+            })
+            .map(|result| self.path_in_filesystem.join(&result.entry.relative_path))
+            .collect::<Vec<_>>();
+        self.arena
+            .try_remove_paths_with_link_counts(&removed_paths, &affected_link_counts)?;
         if report.changed_entries() > 0
             || report.failed_entries() > 0
             || report.unattempted_entries() > 0
@@ -233,15 +352,10 @@ impl FileTree {
         let freed = if self.show_apparent_size {
             report.deleted_apparent_bytes()
         } else {
-            report.entries.iter().fold(0_u128, |total, result| {
-                if matches!(result.outcome, DeletionEntryOutcome::Deleted) {
-                    total.saturating_add(result.entry.snapshot.allocated_bytes.unwrap_or(0))
-                } else {
-                    total
-                }
-            })
+            report.deleted_allocated_bytes()
         };
         self.space_freed = self.space_freed.saturating_add(freed);
+        Ok(())
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -289,11 +403,15 @@ impl FileTree {
         record_unscanned_to(&mut self.arena, &pinned, path, &reason)
     }
 
-    pub fn complete_directory(&mut self, path: &Path) -> Result<(), ModelError> {
+    pub fn complete_directory(
+        &mut self,
+        path: &Path,
+        expected_identity: Option<&NativeIdentity>,
+    ) -> Result<(), ModelError> {
         if let Some(stage) = self.rescan.as_mut() {
-            stage.arena.complete_directory(path)
+            stage.arena.complete_directory(path, expected_identity)
         } else {
-            self.arena.complete_directory(path)
+            self.arena.complete_directory(path, expected_identity)
         }
     }
 
@@ -453,7 +571,7 @@ impl FileTree {
                 .filter(|node| {
                     matches!(
                         node.unscanned_reason.as_ref(),
-                        Some(UnscannedReason::Metadata(_))
+                        Some(UnscannedReason::Metadata(_) | UnscannedReason::Replacement(_))
                     )
                 })
                 .count(),
@@ -514,11 +632,24 @@ fn record_unscanned_to(
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    #[cfg(any(unix, windows))]
+    use std::ffi::OsString;
     use std::fs;
 
-    use super::*;
-    use crate::model::SyntheticKind;
+    #[cfg(any(unix, windows))]
+    use crate::deletion::{
+        DeletionEntryOutcome, DeletionEntryResult, DeletionReport, build_plan, execute_plan,
+    };
+    #[cfg(any(unix, windows))]
+    use crate::model::ByteBounds;
+    use crate::model::{NodeKind, SyntheticKind};
     use crate::native_path::identity_for;
+    #[cfg(any(unix, windows))]
+    use crate::state::FileToDelete;
+    #[cfg(any(unix, windows))]
+    use crate::state::tiles::FileType;
+
+    use super::*;
 
     fn add(tree: &mut FileTree, path: &Path) {
         let metadata = fs::symlink_metadata(path).expect("fixture metadata should exist");
@@ -624,7 +755,7 @@ mod tests {
         add(&mut tree, &target);
         add(&mut tree, &old);
         for path in [&target, root.path()] {
-            tree.complete_directory(path)
+            tree.complete_directory(path, None)
                 .expect("fixture directory should complete");
         }
         tree.finalize().expect("fixture tree should finalize");
@@ -668,7 +799,7 @@ mod tests {
             add(&mut tree, path);
         }
         for path in [&target, &sibling, root.path()] {
-            tree.complete_directory(path)
+            tree.complete_directory(path, None)
                 .expect("fixture directory should complete");
         }
         tree.finalize().expect("fixture tree should finalize");
@@ -681,7 +812,7 @@ mod tests {
         tree.begin_rescan(target.clone(), None)
             .expect("focused rescan should stage");
         add(&mut tree, &replacement);
-        tree.complete_directory(&target)
+        tree.complete_directory(&target, None)
             .expect("staged target should complete");
         tree.increment_failed_to_read();
         assert_eq!(tree.failed_to_read, 0);
@@ -715,7 +846,7 @@ mod tests {
             add(&mut tree, path);
         }
         for path in [&target, &sibling, root.path()] {
-            tree.complete_directory(path)
+            tree.complete_directory(path, None)
                 .expect("fixture directory should complete");
         }
         tree.finalize().expect("fixture tree should finalize");
@@ -730,7 +861,7 @@ mod tests {
         tree.begin_rescan(target.clone(), None)
             .expect("focused rescan should stage");
         add(&mut tree, &replacement);
-        tree.complete_directory(&target)
+        tree.complete_directory(&target, None)
             .expect("staged target should complete");
         tree.finish_rescan().expect("staged target should merge");
 
@@ -781,7 +912,7 @@ mod tests {
             &outside,
             root.path(),
         ] {
-            tree.complete_directory(path)
+            tree.complete_directory(path, None)
                 .expect("fixture directory should complete");
         }
         tree.finalize().expect("fixture tree should finalize");
@@ -841,7 +972,7 @@ mod tests {
             add(&mut tree, path);
         }
         for path in [&target, &sibling, root.path()] {
-            tree.complete_directory(path)
+            tree.complete_directory(path, None)
                 .expect("fixture directory should complete");
         }
         tree.finalize().expect("fixture tree should finalize");
@@ -851,12 +982,212 @@ mod tests {
         tree.begin_rescan(target.clone(), None)
             .expect("focused rescan should stage");
         add(&mut tree, &inside);
-        tree.complete_directory(&target)
+        tree.complete_directory(&target, None)
             .expect("staged target should complete");
         tree.finish_rescan().expect("staged target should merge");
 
         assert_eq!(node_id_at(&tree, &outside), outside_id);
         assert_eq!(tree.identity_count(), 1);
         assert_eq!(tree.total_node().metrics.allocated_bytes, allocated_before);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn replaced_root_directory_is_rejected_before_model_creation() {
+        let parent = tempfile::tempdir().expect("scan parent should exist");
+        let scan_root = parent.path().join("scan-root");
+        let original = parent.path().join("original-root");
+        fs::create_dir(&scan_root).expect("scan root should be created");
+        let metadata = fs::symlink_metadata(&scan_root).expect("root metadata should exist");
+        let identity = identity_for(&scan_root, &metadata)
+            .expect("root identity should be readable")
+            .expect("root should not be a symbolic link");
+        fs::rename(&scan_root, &original).expect("original root should be displaced");
+        fs::create_dir(&scan_root).expect("replacement root should be created");
+
+        assert!(
+            FileTree::new_with_root_identity(
+                scan_root,
+                identity,
+                false,
+                crate::model::MIN_PROCESS_MIB,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_root_symlink_is_rejected_before_model_creation() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().expect("scan parent should exist");
+        let scan_root = parent.path().join("scan-root");
+        let outside = parent.path().join("outside-root");
+        fs::create_dir(&scan_root).expect("scan root should be created");
+        fs::create_dir(&outside).expect("outside root should be created");
+        let metadata = fs::symlink_metadata(&scan_root).expect("root metadata should exist");
+        let identity = identity_for(&scan_root, &metadata)
+            .expect("root identity should be readable")
+            .expect("root should not be a symbolic link");
+        fs::remove_dir(&scan_root).expect("original root should be removed");
+        symlink(&outside, &scan_root).expect("replacement symlink should be created");
+
+        assert!(
+            FileTree::new_with_root_identity(
+                scan_root,
+                identity,
+                false,
+                crate::model::MIN_PROCESS_MIB,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn partial_hard_link_deletion_rebuilds_identity_metrics() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"payload").expect("hard-link source should be written");
+        fs::hard_link(&first, &second).expect("hard link should be created");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            false,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &first);
+        add(&mut tree, &second);
+        tree.complete_directory(root.path(), None)
+            .expect("root should complete");
+        tree.finalize().expect("tree should finalize");
+        let first_id = node_id_at(&tree, &first);
+        let snapshot = tree
+            .entry_snapshot(first_id)
+            .expect("first snapshot should exist");
+        let target = FileToDelete {
+            node_id: first_id,
+            synthetic: false,
+            path_in_filesystem: root.path().to_path_buf(),
+            path_to_file: vec![OsString::from("first")],
+            file_type: FileType::File,
+            num_descendants: None,
+            size: snapshot.apparent_bytes,
+            expected_snapshot: snapshot.clone(),
+            reviewed_entries: tree
+                .reviewed_subtree(first_id, 1 << 20)
+                .expect("first subtree should be reviewable"),
+        };
+        let plan = build_plan(root.path(), target, false).expect("deletion plan should build");
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert_eq!(report.deleted_entries(), 1);
+        assert_eq!(report.deleted_allocated_bytes(), 0);
+        tree.apply_deletion_report(&report);
+
+        let second_id = node_id_at(&tree, &second);
+        let second_node = tree.node(second_id).expect("remaining link should exist");
+        let allocated = snapshot
+            .allocated_bytes
+            .map_or(ByteBounds::unknown(), ByteBounds::exact);
+        assert_eq!(second_node.metrics.allocated_bytes, allocated);
+        assert_eq!(
+            second_node
+                .snapshot
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.link_count),
+            Some(1)
+        );
+        assert_eq!(second_node.metrics.reclaimable_bytes, allocated);
+        assert!(
+            tree.nodes()
+                .all(|node| { node.kind != NodeKind::Synthetic(SyntheticKind::Shared) })
+        );
+        assert_eq!(tree.identity_count(), 1);
+        assert_eq!(tree.space_freed, 0);
+    }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn missing_hard_link_refreshes_survivor_metadata() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"payload").expect("hard-link source should be written");
+        fs::hard_link(&first, &second).expect("hard link should be created");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            false,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &first);
+        add(&mut tree, &second);
+        tree.complete_directory(root.path(), None)
+            .expect("root should complete");
+        tree.finalize().expect("tree should finalize");
+        let first_id = node_id_at(&tree, &first);
+        let snapshot = tree
+            .entry_snapshot(first_id)
+            .expect("first snapshot should exist");
+        let target = FileToDelete {
+            node_id: first_id,
+            synthetic: false,
+            path_in_filesystem: root.path().to_path_buf(),
+            path_to_file: vec![OsString::from("first")],
+            file_type: FileType::File,
+            num_descendants: None,
+            size: snapshot.apparent_bytes,
+            expected_snapshot: snapshot.clone(),
+            reviewed_entries: tree
+                .reviewed_subtree(first_id, 1 << 20)
+                .expect("first subtree should be reviewable"),
+        };
+        let plan = build_plan(root.path(), target, false).expect("deletion plan should build");
+        let entry = plan
+            .entries
+            .first()
+            .cloned()
+            .expect("deletion plan should contain the target");
+        let report = DeletionReport {
+            target_node_id: first_id,
+            root_relative_path: std::path::PathBuf::from("first"),
+            scan_root: root.path().to_path_buf(),
+            entries: vec![DeletionEntryResult {
+                entry,
+                outcome: DeletionEntryOutcome::Missing,
+            }],
+            soft_cancelled: false,
+            precise: true,
+            estimated_bytes: plan.estimated_bytes,
+        };
+        fs::remove_file(&first).expect("planned path should become missing");
+        assert_eq!(report.missing_entries(), 1);
+        tree.apply_deletion_report(&report);
+
+        let second_id = node_id_at(&tree, &second);
+        let second_node = tree.node(second_id).expect("remaining link should exist");
+        let allocated = snapshot
+            .allocated_bytes
+            .map_or(ByteBounds::unknown(), ByteBounds::exact);
+        assert_eq!(second_node.metrics.allocated_bytes, allocated);
+        assert_eq!(
+            second_node
+                .snapshot
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.link_count),
+            Some(1)
+        );
+        assert_eq!(second_node.metrics.reclaimable_bytes, allocated);
+        assert_eq!(tree.identity_count(), 1);
+        assert_eq!(tree.space_freed, 0);
     }
 }
