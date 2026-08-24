@@ -2,6 +2,12 @@
 
 Excise permanently deletes selected filesystem entries. There is no trash or undo. Begin with a disposable directory.
 
+## The 0.1.1 early-testing release
+
+The planned `0.1.1` release is for early testing. Its public library API and destructive behavior are provisional; do not use it on irreplaceable data, and do not infer stable support from a successful install. Verify the version and read the [permanent-deletion contract](safety/deletion.md) before making a scan or deletion plan.
+
+The project is independent from Diskonaut. Tags `0.1.0` through `0.11.0` are preserved Diskonaut releases, not Excise releases; do not move, reuse, or treat those tags as an Excise installation.
+
 ## Requirements
 
 - Rust 1.88 or newer
@@ -10,7 +16,7 @@ Excise permanently deletes selected filesystem entries. There is no trash or und
 
 The repository pins Rust 1.88 in `rust-toolchain.toml`.
 
-## Build and run
+## Build and run from source
 
 ```console
 git clone https://github.com/findyourexit/excise.git
@@ -21,7 +27,7 @@ cargo build --release --locked
 
 On Windows, run `target\release\excise.exe`.
 
-To install into Cargo's binary directory:
+To install the checked-out source into Cargo's binary directory:
 
 ```console
 cargo install --path . --locked
@@ -33,6 +39,27 @@ Nix users can build the locked flake:
 nix build
 ./result/bin/excise /path/to/inspect
 ```
+
+## Install 0.1.1 from a release channel
+
+Use these commands only after the `0.1.1` release is announced through the [release process](releasing.md). The crates.io package compiles locally; it is not one of the prebuilt GitHub archives:
+
+```console
+cargo install excise --version 0.1.1 --locked
+excise --version
+```
+
+When the release is promoted, the first-party binary formula will be distributed through the external [findyourexit/homebrew-tap](https://github.com/findyourexit/homebrew-tap), not Homebrew Core:
+
+```console
+brew tap findyourexit/tap https://github.com/findyourexit/homebrew-tap.git
+brew install findyourexit/tap/excise
+brew fetch --force --retry findyourexit/tap/excise
+brew test findyourexit/tap/excise
+excise --version
+```
+
+`brew fetch` checks the formula's archive URL and SHA-256, and `brew test` runs the formula smoke checks. If either check fails, stop and report the version, host platform, and formula revision; do not bypass the checksum or substitute an unverified archive.
 
 ## Start safely
 
@@ -103,3 +130,4 @@ Windows does not populate allocated-byte snapshots, so allocated and reclaimable
 - Configure persistent defaults in [Configuration](configuration.md).
 - Read the [permanent-deletion contract](safety/deletion.md) before destructive use.
 - Open `?` in the TUI for context-sensitive controls.
+- See [Support](../SUPPORT.md) for safe troubleshooting and bug reports; never publish an unintended-deletion path in a public issue.

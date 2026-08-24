@@ -1,5 +1,9 @@
 # Support
 
+## 0.1.1 early testing
+
+The planned `0.1.1` release is for early testing. Support is best effort, the public library API may change before 1.0, and no release build should be trusted with irreplaceable data. Start with [Getting started](docs/getting-started.md) and a disposable fixture.
+
 ## Usage questions
 
 Search the [documentation](docs/README.md) and existing discussions first. Use [GitHub Discussions](https://github.com/findyourexit/excise/discussions) for installation, configuration, and usage questions.
@@ -12,7 +16,7 @@ A scan permission error means Excise could not read metadata or enumerate part o
 
 A deletion `failed` result means Excise did not confirm that entry as deleted. On Unix, check write and execute permission on the parent directory. On Windows, close applications, sync clients, indexers, or antivirus software that may hold an incompatible sharing handle, then start a fresh scan. Do not infer the filesystem state from the error alone.
 
-If a deletion was hard-cancelled, its result is imprecise; rescan before acting again. Preserve the exit code and deletion-history report when asking for help.
+If a deletion was hard-cancelled, its result is imprecise; rescan before acting again. Preserve the exit code and deletion-history report when asking for help. Never continue an old deletion plan after a failed, cancelled, changed, or uncertain run.
 
 ### Boundaries and exclusions
 
@@ -30,15 +34,15 @@ Text output uses escaped display paths: terminal and bidirectional controls, new
 
 Windows does not populate allocated-byte snapshots, so allocated and reclaimable upper bounds can be unknown; use `--apparent-size` for logical file lengths. Windows deletion uses no-follow handles, but ACLs and sharing modes can still reject an entry. See [Getting started](docs/getting-started.md) for first-use and platform guidance.
 
-## Defects
+## Defects and bug reports
 
-Use the issue chooser for reproducible bugs. Include the Excise version or commit, operating system, terminal, command, filesystem context, expected behavior, and actual behavior. Replace real paths with synthetic fixtures where possible.
+Use the [issue chooser](https://github.com/findyourexit/excise/issues/new/choose) for a reproducible, non-sensitive defect. Include the Excise version or commit, operating system, terminal and shell, exact command with real paths replaced, filesystem and mount context, permissions, links or junctions, configuration, terminal dimensions, expected behavior, actual behavior, and whether deletion occurred. Preserve the exit code and relevant table/JSON or deletion-history report excerpts after removing paths, usernames, and other private data. Reproduce only on a synthetic disposable fixture when it is safe to do so; a read-only table or JSON scan is preferable to rerunning a destructive action.
+
+Do not use a public issue for a vulnerability, path or identity confusion, an unintended or over-broad deletion, a race that could invalidate consent, or any report that could teach someone to trigger data loss. Stop using the affected build and use the private [security report](https://github.com/findyourexit/excise/security/advisories/new), following [SECURITY.md](SECURITY.md). Do not include sensitive real filesystem paths when a synthetic reproduction is possible, and do not ask a reporter to rerun a potentially destructive command merely to collect logs.
 
 ## Security and deletion safety
 
-For normal first use, follow [Getting started](docs/getting-started.md) and the [permanent-deletion contract](docs/safety/deletion.md). Deletion is permanent; there is no trash or undo.
-
-Do not use a public issue for a vulnerability or an unintended-deletion path that could put users at risk. Follow [SECURITY.md](SECURITY.md) instead.
+For normal first use, follow [Getting started](docs/getting-started.md) and the [permanent-deletion contract](docs/safety/deletion.md). Deletion is permanent; there is no trash or undo. If a run may have deleted the wrong entry, stop immediately, preserve the command, exit status, and reports, and report privately rather than attempting a second deletion or cleanup command.
 
 ## Scope
 

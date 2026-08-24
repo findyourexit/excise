@@ -1,55 +1,221 @@
 # Release process
 
-This runbook defines the evidence and artifact shape expected for publication. It does not authorize a release by itself.
+This runbook defines the planned `0.1.1` early-testing release contract and the evidence required before publication. It is a procedure, not authorization; nothing in this document means that `0.1.1` has already been published.
 
-## Current distribution policy
+## The 0.1.1 contract
 
-Distribution is archive-only: the package manifest remains `publish = false`, and no package-manager or other publication channel is enabled. The `cargo-binstall` metadata and Scoop/Winget templates are validation inputs for the distribution contract, not enabled channels; passing their checks does not publish or authorize package-manager artifacts.
+The planned `0.1.1` release is for early testing. It is the first release contract that permits publishing the `excise` crate, while the public library API and destructive behavior remain provisional until the project declares a stable line. Test only with disposable data; do not treat this release as suitable for irreplaceable files.
 
-Any future distribution channel requires reviewed immutable metadata and release evidence tying that metadata to the exact protected commit and immutable release assets. Until that review is complete, keep `publish = false` and use only the archive candidate described below.
+The release commit and candidate must agree on all of the following:
 
-## Release commit
+- `Cargo.toml`, `Cargo.lock`, the CLI version, and the changelog identify `0.1.1`;
+- the crate is publishable (the release metadata must not set `publish = false`);
+- the annotated `v0.1.1` tag, when created, points to the exact protected `main` commit that passed verification;
+- six target archives, their SHA-256 manifest, the SPDX JSON SBOM, and GitHub build attestations describe that same commit and version;
+- the first-party Homebrew tap formula refers only to those immutable GitHub release assets; and
+- the tagged Nix flake and cargo-binstall metadata resolve the same immutable `0.1.1` release.
 
-A release pull request must:
+The release does not enable Scoop, WinGet, Homebrew Core, or any other package channel beyond the first-party Homebrew tap, tagged Nix flake, crates.io, and cargo-binstall metadata. Templates under `packaging/` are validation inputs unless a separately approved channel promotion says otherwise. The source formula at `packaging/homebrew-core/excise.rb.in` is for a possible future Homebrew Core submission; it is not the first-party tap formula.
 
-1. set one consistent semantic version in `Cargo.toml` and `Cargo.lock`;
-2. move user-visible entries from `Unreleased` into a dated changelog section;
-3. regenerate the man page and shell completions;
-4. validate packaging templates;
-5. pass the protected Linux, macOS, Windows, policy, benchmark, fuzz, and supply-chain checks; and
-6. contain no unrelated source changes.
+## Preconditions and clean tree
+
+Only a maintainer may start publication. Before creating a tag, dispatching a candidate, or using a publication credential:
+
+1. Merge the focused release change to protected `main`. It must update the version and lockfile, move user-visible `Unreleased` entries into the dated changelog section, regenerate the man page and shell completions, and contain no unrelated source changes.
+2. Review the deletion, accounting, schema, configuration, platform, compatibility, and early-testing notes in the release PR.
+3. Check out the exact protected commit and require a clean working tree. This check must report no tracked, staged, or untracked release input:
+
+   ```console
+   test -z "$(git status --porcelain=v1 --untracked-files=all)"
+   git diff --exit-code
+   git diff --cached --exit-code
+   ```
+
+   Do not use `--allow-dirty`, copy generated files from another checkout, or mix outputs from different commits. Ignored build output does not make a dirty tracked tree safe; inspect any unexpected ignored release input before proceeding.
+4. Confirm the commit, branch protection, and manifest version before dispatching the hosted candidate. Capture `source_sha="$(git rev-parse HEAD)"` from that exact protected commit and pass it to the workflow; the workflow rejects a moving ref, an unprotected ref, an unmerged commit, or a mismatched SHA.
+5. Obtain the release approval and environment approval before enabling any write credential. Candidate generation is read-only; publication is a separate, reviewed action.
 
 ## Local candidate
 
+Run these commands from the repository root on the clean release commit:
+
 ```console
-cargo verify
-cargo dist-local
+(
+  set -euo pipefail
+  cargo verify
+  cargo package --locked --list
+  cargo publish --locked --dry-run
+  cargo dist-local
+)
 ```
 
-`cargo dist-local` builds the host release archive and supporting metadata without publishing anything.
+`cargo verify` includes generated-file, schema, distribution-template, compilation, test, policy, fuzz, benchmark, and release-binary checks. `cargo publish --locked --dry-run` packages the exact crate without uploading it. It is the last safe check for the crates.io package contents and must pass without `--allow-dirty`.
+
+`cargo dist-local` builds the host release archive and supporting metadata without publishing anything. It writes the host archive under `dist/`, a `dist/checksums.sha256` file, and a local formula at `dist/homebrew/excise.rb`. Inspect the archive before using any hosted artifact; the archive contains the release binary, `LICENSE`, `README.md`, generated man/completion files, schemas, `excise.cdx.json`, and `provenance.local.json`.
 
 ## Hosted candidate
 
-The manually dispatched `Release candidate artifacts` workflow builds six immutable target archives for:
+The manually dispatched `Release candidate artifacts` workflow in `.github/workflows/release.yml` checks out the explicit reviewed SHA and requires the input version and dispatch ID to match the package contract. Dispatch it only from protected `main`, and abort if `main` moves between capture and dispatch:
 
-- x86_64 and AArch64 Linux;
-- x86_64 and Apple Silicon macOS; and
-- x86_64 and AArch64 Windows.
+```console
+set -euo pipefail
+source_sha="$(git rev-parse HEAD)"
+candidate_dir="$(mktemp -d "${TMPDIR:-/tmp}/excise-candidate.XXXXXX")"
+trap "$(printf 'rm -rf -- %q' "$candidate_dir")" EXIT
+dispatch_seed="$(date -u +%s)-$$-$RANDOM"
+if command -v sha256sum >/dev/null 2>&1; then
+  dispatch_id="$(printf '%s' "$dispatch_seed" | sha256sum | cut -c1-32)"
+else
+  dispatch_id="$(printf '%s' "$dispatch_seed" | shasum -a 256 | cut -c1-32)"
+fi
+run_url="$(gh workflow run release.yml --repo findyourexit/excise --ref main --field version=0.1.1 --field source_sha="$source_sha" --field dispatch_id="$dispatch_id")"
+run_id="${run_url##*/}"
+if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+  run_id="$(
+    candidate=""
+    for attempt in 1 2 3 4 5; do
+      if candidate="$(
+        gh run list \
+          --repo findyourexit/excise \
+          --workflow release.yml \
+          --event workflow_dispatch \
+          --branch main \
+          --commit "$source_sha" \
+          --limit 20 \
+          --json databaseId,headSha,headBranch,event,createdAt,displayTitle |
+        jq -r --arg expected "$source_sha" --arg dispatch_id "$dispatch_id" '
+          map(select(
+            .headSha == $expected and
+            .headBranch == "main" and
+            .event == "workflow_dispatch" and
+            .displayTitle == ("Excise release candidate " + $dispatch_id)
+          ))
+          | sort_by(.createdAt)
+          | .[].databaseId
+        '
+      )"; then
+        candidate_count="$(printf '%s\n' "$candidate" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+        if [[ "$candidate_count" == "1" && "$candidate" =~ ^[0-9]+$ ]]; then
+          printf '%s' "$candidate"
+          break
+        fi
+        if (( candidate_count > 1 )); then
+          echo "multiple workflow runs matched dispatch ID $dispatch_id" >&2
+          exit 1
+        fi
+      fi
+      sleep 2
+    done
+  )"
+fi
+if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+  echo "could not resolve the dispatched workflow run ID $dispatch_id: $run_url" >&2
+  exit 1
+fi
+gh run watch "$run_id" --repo findyourexit/excise --exit-status
+gh run download "$run_id" --repo findyourexit/excise --name excise-release-candidate --dir "$candidate_dir"
+```
 
-It then produces SHA-256 checksums, an SPDX JSON dependency SBOM from the exact source checkout, and optional GitHub build provenance when `attest` is enabled. The candidate set is six immutable target archives plus checksums, SBOM, and provenance evidence when requested. The SBOM describes the locked Cargo package inventory. The checksum manifest and archive contents describe the released files. Candidate artifacts are retained for one day as short-lived validation inputs; they are not published or durable distribution assets.
+The candidate contains six immutable target archives, `checksums.sha256`, and `excise.spdx.json`. Verify the complete bundle while remaining outside the source worktree:
 
-## Publication requirements
+```console
+(
+  set -euo pipefail
+  cd "$candidate_dir"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum --check checksums.sha256
+  else
+    shasum -a 256 --check checksums.sha256
+  fi
+  jq -e '.packages | length > 1' excise.spdx.json
+  jq -e '.packages[] | select(.name == "serde")' excise.spdx.json
+  jq -e --arg version 0.1.1 '([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)' excise.spdx.json
+  for archive in excise-*.tar.gz; do tar -tzf "$archive" >/dev/null; done
+  for archive in excise-*.zip; do unzip -t "$archive" >/dev/null; done
+  for subject in excise-*.tar.gz excise-*.zip checksums.sha256 excise.spdx.json; do
+    gh attestation verify "$subject" \
+      --repo findyourexit/excise \
+      --signer-workflow findyourexit/excise/.github/workflows/release.yml \
+      --source-digest "$source_sha" \
+      --source-ref refs/heads/main
+  done
+)
+```
 
-Before a stable release, maintainers must verify:
+Confirm that every archive contains its target binary, `LICENSE`, `generated/man/excise.1`, and `schemas/scan-report.schema.json`; the SBOM and provenance files are candidate-bundle evidence and are not silently substituted for an archive. The workflow retains candidate artifacts for one day. Retention is a validation convenience, not publication or durable distribution.
+## Promotion order and publication semantics
 
-- the exact protected commit passed every required check;
-- the tag, manifest, changelog, archive names, checksums, SBOM, and provenance agree;
-- release notes call out deletion, accounting, schema, configuration, platform, and compatibility changes;
-- security advisories and yanked dependencies are clear;
-- install metadata points only to immutable release assets;
-- any future distribution channel has reviewed immutable metadata and release evidence before enablement; and
-- rollback consists of stopping distribution and publishing a corrective version, never moving an existing tag.
+After local and hosted evidence has been reviewed and approved, create the annotated `v0.1.1` tag on the verified protected commit with the reviewed candidate run ID in its message, then push it:
+
+```console
+git tag -a v0.1.1 "$source_sha" -m "candidate-run-id: $run_id"
+git push origin v0.1.1
+```
+
+The push-triggered workflow reads that immutable tag annotation, requires the exact candidate run to be successful for the tagged source SHA, verifies its checksums, archive contents, SBOM, and attestations, and promotes those exact candidate bytes without rebuilding:
+
+1. The `release` job creates the GitHub release from the promoted candidate bundle. It reuses an existing published release only after the exact tag object, complete asset set, and every asset checksum match; published mismatches and unexpected drafts are refused, while a matching non-prerelease draft may be repaired with the reverified candidate assets.
+2. The `publish-crate` job publishes the crate once after the release job succeeds. Do not run `cargo publish` manually; the job accepts an existing version only after matching its registry checksum and non-yanked state, and otherwise fails before retrying.
+3. After the `homebrew-tap` environment approval, the `publish-homebrew` job renders and pushes only `Formula/excise.rb` from the verified source SHA. Review the resulting tap commit and formula after the job; do not edit that external repository from this checkout.
+
+The crates.io package follows the release commit's Cargo exclusions (`.cargo`, `.github`, `.gitmessage`, `assets`, `tapes`, `handoff`, and `packaging`); `cargo package --locked --list` is the source of truth. It does not turn the GitHub archive or tap into crate contents. The `0.1.1` API is provisional; publishing it is not a stability promise.
+
+## Nix and cargo-binstall verification
+
+The tagged Nix flake is a source-build channel, while cargo-binstall downloads target-specific release archives. Verify the channels independently:
+
+```console
+nix flake check github:findyourexit/excise/v0.1.1
+nix eval --raw "github:findyourexit/excise/v0.1.1#packages.$(nix eval --raw --impure --expr builtins.currentSystem).default.version"
+nix run github:findyourexit/excise/v0.1.1 -- --version
+nix run github:findyourexit/excise/v0.1.1 -- --format table /path/to/inspect
+(
+  set -euo pipefail
+  binstall_dir="$(mktemp -d "${TMPDIR:-/tmp}/excise-binstall.XXXXXX")"
+  readonly binstall_dir
+  trap 'rm -rf -- "$binstall_dir"' EXIT
+  cargo binstall --no-confirm --force --install-path "$binstall_dir" --version 0.1.1 excise
+  "$binstall_dir/excise" --version
+)
+```
+
+The `nix eval` and `nix run -- --version` commands verify the tagged Nix package independently. The isolated `cargo binstall` block verifies a fresh target-specific archive and invokes that exact binary; do not treat one channel's successful command as evidence for the other.
+
+
+## Homebrew tap verification
+
+The first-party binary formula is installed from `findyourexit/homebrew-tap`, not from Homebrew Core:
+
+```console
+brew tap findyourexit/tap https://github.com/findyourexit/homebrew-tap.git
+brew install findyourexit/tap/excise
+brew fetch --force --retry findyourexit/tap/excise
+brew audit --formula --strict --online findyourexit/tap/excise
+brew test findyourexit/tap/excise
+brew info findyourexit/tap/excise
+excise --version
+```
+
+`brew fetch` checks the formula URL and SHA-256 for the host archive. `brew audit` checks formula policy, `brew test` runs the formula's version and JSON-scan smoke checks, and `brew info` confirms the selected version and tap. Also inspect the rendered formula with `brew cat findyourexit/tap/excise`; every URL must be a `releases/download/v0.1.1/` asset and every checksum must match `checksums.sha256`. The source formula in `packaging/homebrew-core/excise.rb.in` has different build semantics and must not be used as evidence that Homebrew Core has accepted the package.
+
+## Credentials and approvals
+
+Keep candidate and publication credentials separate. The candidate workflow needs read access to the source and artifact services plus the permissions required for its attestation step; it must not receive a crates.io or tap write token. A publication environment requires explicit maintainer approval and, where configured, a second reviewer:
+
+- `CARGO_REGISTRY_TOKEN` or Cargo's credential file authorizes `cargo publish`; use it only for the approved command and never print it, commit it, or put it in a tape or report.
+- `GH_TOKEN` authorizes local `gh` commands. An Actions `GITHUB_TOKEN` needs explicit `contents: write` only in the approved promotion job; the read-only candidate job must not be broadened casually.
+- The external tap requires a separately approved GitHub credential with write access to `findyourexit/homebrew-tap`; repository access is not implied by access to `findyourexit/excise`.
+
+Do not run with shell tracing (`set -x`) around secrets. Review `env`, repository selection, ref, SHA, version, and destination before each write. If a required credential or approval is absent, stop before the write step; do not substitute a personal token or a different repository.
+
+## Reruns and rollback
+
+Candidate generation is safe to rerun for a transient workflow failure, but rerun the same version and exact source SHA and revalidate the complete bundle. If source changes after a failed candidate, land the fix on protected `main`, dispatch a new candidate, and discard the old bundle; never mix archives, checksums, SBOMs, or attestations from different SHAs. A missing one-day artifact is regenerated only through the same gated workflow.
+
+Publication can be retried by rerunning the failed workflow after inspecting the GitHub tag/release/assets, the crates.io `excise` version, and the external tap commit. The release job safely reuses only a published release whose exact candidate asset set and checksums match; continue only with the missing, reviewed step, never rebuild an already published asset, and never republish an existing crate version.
+
+If a destructive-safety or release-integrity defect is found, stop promotion and mark the affected channel unavailable while preserving the candidate evidence. Do not move, delete, or overwrite an existing tag or GitHub asset. A rollback cannot undo filesystem deletion and must not ask users to rerun a destructive command; after the fix is reviewed, publish a new corrective version (for example `0.1.2`), then update each channel to that immutable version. A crates.io yank only prevents new dependency resolution; it does not erase an already downloaded crate.
 
 ## Historical tags
 
-Tags `0.1.0` through `0.11.0` are preserved Diskonaut releases. They are not Excise releases and must not be moved or reused.
+Tags `0.1.0` through `0.11.0` are preserved Diskonaut releases. They are not Excise releases and must not be moved, deleted, or reused. The `v0.1.1` tag is a new Excise tag; do not infer that the preserved `0.1.0` tag identifies Excise merely because the changelog contains an Excise `0.1.0` section.
