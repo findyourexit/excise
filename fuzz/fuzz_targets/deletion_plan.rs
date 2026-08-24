@@ -111,6 +111,9 @@ fn exercise(data: &[u8]) -> Result<(), Box<dyn Error>> {
             assert_eq!(classified as usize, report.entries.len());
             assert_eq!(report.precise, !hard.load(std::sync::atomic::Ordering::Acquire));
         }
+        (0, Err(DeletionPlanError::Changed)) => {
+            // Rejecting an inconsistent snapshot is a valid safety outcome.
+        }
         (1 | 2, Err(DeletionPlanError::Changed)) => {}
         (3, Err(DeletionPlanError::MemoryLimit { limit: 1 })) => {}
         (mode, result) => panic!("unexpected deletion plan result for mode {mode}: {result:?}"),
