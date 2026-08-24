@@ -37,10 +37,40 @@ jobs:
         run: cargo build --package excise --release --locked
 
       - name: Install pinned VHS toolchain
-        uses: charmbracelet/vhs-action@f6d7db07a432fcd3b06772628d36a57f96d95dcf # v2.1.1
-        with:
-          version: v0.11.0
+        shell: bash
+        env:
+          VHS_VERSION: 0.11.0
+          VHS_SHA256: 99cb634587eaae0473c1ea377db80c3a048c27f99fe0a7febb1a1e8cb7ee5009
+          TTYD_VERSION: 1.7.7
+          TTYD_SHA256: 8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55
+        run: |
+          set -euo pipefail
+          sudo apt-get update --yes
+          sudo apt-get install --yes ffmpeg fonts-jetbrains-mono
 
+          bin_dir="$RUNNER_TEMP/vhs-bin"
+          mkdir -p "$bin_dir"
+
+          vhs_archive="$RUNNER_TEMP/vhs.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "$vhs_archive" \
+            "https://github.com/charmbracelet/vhs/releases/download/v${VHS_VERSION}/vhs_${VHS_VERSION}_Linux_x86_64.tar.gz"
+          printf '%s  %s\n' "$VHS_SHA256" "$vhs_archive" | sha256sum --check
+          tar --extract --gzip --file "$vhs_archive" --directory "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/vhs_${VHS_VERSION}_Linux_x86_64/vhs" \
+            "$bin_dir/vhs"
+
+          ttyd_binary="$RUNNER_TEMP/ttyd.x86_64"
+          curl --fail --location --silent --show-error \
+            --output "$ttyd_binary" \
+            "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64"
+          printf '%s  %s\n' "$TTYD_SHA256" "$ttyd_binary" | sha256sum --check
+          install -m 0755 "$ttyd_binary" "$bin_dir/ttyd"
+
+          echo "$bin_dir" >> "$GITHUB_PATH"
+          printf 'CI=\nCOLORTERM=truecolor\n' >> "$GITHUB_ENV"
+          fc-cache --force
       - name: Validate VHS tape syntax
         run: vhs validate tapes/demo.tape
 
