@@ -3,6 +3,8 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 
+use crate::ui::format::display_text;
+
 pub struct NoticeBox<'a> {
     message: &'a str,
 }
@@ -28,7 +30,7 @@ impl Widget for NoticeBox<'_> {
             .fg(Color::Green)
             .bg(Color::Black)
             .add_modifier(Modifier::BOLD);
-        Paragraph::new(self.message)
+        Paragraph::new(display_text(self.message))
             .style(style)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true })
@@ -40,5 +42,29 @@ impl Widget for NoticeBox<'_> {
                     .title(" COMPLETE "),
             )
             .render(rect, buffer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::widgets::Widget;
+
+    use super::*;
+
+    #[test]
+    fn hostile_notice_text_is_escaped_and_marked() {
+        let area = Rect::new(0, 0, 40, 9);
+        let mut buffer = Buffer::empty(area);
+        NoticeBox::new("complete: bad\n\u{202e}name\u{1b}[31m").render(area, &mut buffer);
+        let text = buffer.content.iter().fold(String::new(), |mut text, cell| {
+            text.push_str(cell.symbol());
+            text
+        });
+        assert!(text.contains("[deceptive]"));
+        assert!(text.contains("\\n"));
+        assert!(text.contains("\\u{202e}"));
+        assert!(text.contains("\\x1b"));
+        assert!(!text.chars().any(char::is_control));
+        assert!(!text.contains('\u{202e}'));
     }
 }

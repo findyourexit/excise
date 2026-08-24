@@ -2,38 +2,47 @@ use ::unicode_width::UnicodeWidthStr;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Modifier, Style};
 
-use crate::native_path::safe_display_os_str;
+use crate::native_path::SafeDisplayPath;
 use crate::state::tiles::{FileType, Tile};
 use crate::theme::Theme;
-use crate::ui::format::{DisplaySize, DisplaySizeRounded, truncate_middle};
+use crate::ui::format::{
+    DisplaySize, DisplaySizeRounded, display_os_str_info, truncate_marked, truncate_middle,
+};
 use crate::ui::grid::{boundaries, draw_next_symbol};
-
 fn tile_first_line(tile: &Tile) -> String {
     let max_text_length = tile.width.saturating_sub(2);
-    let name = safe_display_os_str(&tile.name).text;
+    let name = display_os_str_info(&tile.name);
+    let deceptive = name.deceptive;
     let descendant_count = &tile.descendants;
     let filename_text = match tile.file_type {
-        FileType::File => name,
-        FileType::Folder => format!("{name}/"),
-        FileType::Synthetic => format!("[{name}]"),
+        FileType::File => name.text,
+        FileType::Folder => format!("{}/", name.text),
+        FileType::Synthetic => format!("[{}]", name.text),
     };
-    match tile.file_type {
-        FileType::File | FileType::Synthetic => truncate_middle(&filename_text, max_text_length),
+    let text = match tile.file_type {
+        FileType::File | FileType::Synthetic => filename_text,
         FileType::Folder => {
             let descendant_count = descendant_count.expect("folder should have descendants");
             let short_descendants_indication = format!("(+{descendant_count})");
             let long_descendants_indication = format!("(+{descendant_count} descendants)");
-            if filename_text.len() + long_descendants_indication.len() <= max_text_length as usize {
+            if filename_text.width() + long_descendants_indication.width()
+                <= usize::from(max_text_length)
+            {
                 format!("{filename_text} {long_descendants_indication}")
-            } else if filename_text.len() + short_descendants_indication.len()
-                <= max_text_length as usize
+            } else if filename_text.width() + short_descendants_indication.width()
+                <= usize::from(max_text_length)
             {
                 format!("{filename_text} {short_descendants_indication}")
             } else {
-                truncate_middle(&filename_text, max_text_length)
+                filename_text
             }
         }
-    }
+    };
+    truncate_marked(
+        &SafeDisplayPath { text, deceptive },
+        max_text_length,
+        truncate_middle,
+    )
 }
 
 fn tile_second_line(tile: &Tile) -> String {
@@ -319,6 +328,33 @@ mod tests {
                     assert_ne!(theme.text_inverse, theme.surface_selection, "{id:?}");
                 }
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_tile_names_keep_escaped_text_and_marker_when_narrow() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut tile = tile(FileType::File);
+        tile.width = 40;
+        tile.name = OsString::from_vec(b"bad\xffname".to_vec());
+        let rendered = tile_first_line(&tile);
+        assert!(rendered.starts_with(crate::native_path::DECEPTIVE_DISPLAY_MARKER));
+        assert!(rendered.contains("bad\\xffname"));
+        assert!(!rendered.chars().any(char::is_control));
+
+        tile.name = OsString::from("prefix-\u{202e}hostile\u{1b}[31m");
+        for width in 1..=24 {
+            tile.width = width + 2;
+            let rendered = tile_first_line(&tile);
+            assert!(!rendered.chars().any(char::is_control));
+            assert!(!rendered.contains('\u{202e}'));
+            assert!(
+                rendered.starts_with('!')
+                    || rendered.starts_with(crate::native_path::DECEPTIVE_DISPLAY_MARKER),
+                "deception marker lost at width {width}: {rendered:?}"
+            );
         }
     }
 }
