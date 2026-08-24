@@ -435,19 +435,19 @@ jobs:
             aarch64-apple-darwin; do
             archive="excise-${target}-v${EXPECTED_VERSION}.tar.gz"
             root="excise-${target}-v${EXPECTED_VERSION}"
-            tar -tzf "$archive" | grep -Fqx "$root/excise"
-            tar -tzf "$archive" | grep -Fqx "$root/LICENSE"
-            tar -tzf "$archive" | grep -Fqx "$root/generated/man/excise.1"
-            tar -tzf "$archive" | grep -Fqx "$root/schemas/scan-report.schema.json"
+            tar -tzf "$archive" | grep -Fx "$root/excise" >/dev/null
+            tar -tzf "$archive" | grep -Fx "$root/LICENSE" >/dev/null
+            tar -tzf "$archive" | grep -Fx "$root/generated/man/excise.1" >/dev/null
+            tar -tzf "$archive" | grep -Fx "$root/schemas/scan-report.schema.json" >/dev/null
           done
           for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
             archive="excise-${target}-v${EXPECTED_VERSION}.zip"
             root="excise-${target}-v${EXPECTED_VERSION}"
             unzip -t "$archive" >/dev/null
-            unzip -Z1 "$archive" | grep -Fqx "$root/excise.exe"
-            unzip -Z1 "$archive" | grep -Fqx "$root/LICENSE"
-            unzip -Z1 "$archive" | grep -Fqx "$root/generated/man/excise.1"
-            unzip -Z1 "$archive" | grep -Fqx "$root/schemas/scan-report.schema.json"
+            unzip -Z1 "$archive" | grep -Fx "$root/excise.exe" >/dev/null
+            unzip -Z1 "$archive" | grep -Fx "$root/LICENSE" >/dev/null
+            unzip -Z1 "$archive" | grep -Fx "$root/generated/man/excise.1" >/dev/null
+            unzip -Z1 "$archive" | grep -Fx "$root/schemas/scan-report.schema.json" >/dev/null
           done
           for subject in "${archives[@]}" checksums.sha256 excise.spdx.json; do
             gh attestation verify "$subject" \
