@@ -6,7 +6,13 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
-_No unreleased changes._
+_The planned 0.1.1 release remains unpublished pending verification._
+
+## [0.1.1] - Unreleased
+
+### Added
+
+* Prepared the `excise` crate for early testing; publication is gated on release verification, and its public library surface is provisional and may change before 1.0.
 
 ## [0.1.0] - 2026-08-21
 
