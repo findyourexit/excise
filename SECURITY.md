@@ -4,7 +4,7 @@ Excise performs permanent filesystem deletion, so data-loss defects are treated 
 
 ## Supported versions
 
-Excise supports the latest stable release, currently `0.1.0`. The planned `0.1.1` release is early testing and is not a stable support promise; do not trust either line with irreplaceable data.
+Excise supports the latest stable release, currently `0.1.0`. The published `0.1.1` release is for early testing and is not a stable support promise; do not trust either line with irreplaceable data.
 
 | Version | Status |
 |---|---|

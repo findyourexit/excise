@@ -4,7 +4,7 @@ Excise permanently deletes selected filesystem entries. There is no trash or und
 
 ## The 0.1.1 early-testing release
 
-The planned `0.1.1` release is for early testing. Its public library API and destructive behavior are provisional; do not use it on irreplaceable data, and do not infer stable support from a successful install. Verify the version and read the [permanent-deletion contract](safety/deletion.md) before making a scan or deletion plan.
+The published `0.1.1` release is for early testing. Its public library API and destructive behavior are provisional; do not use it on irreplaceable data, and do not infer stable support from a successful install. Verify the version and read the [permanent-deletion contract](safety/deletion.md) before making a scan or deletion plan.
 
 The project is independent from Diskonaut. Tags `0.1.0` through `0.11.0` are preserved Diskonaut releases, not Excise releases; do not move, reuse, or treat those tags as an Excise installation.
 
@@ -42,14 +42,14 @@ nix build
 
 ## Install 0.1.1 from a release channel
 
-Use these commands only after the `0.1.1` release is announced through the [release process](releasing.md). The crates.io package compiles locally; it is not one of the prebuilt GitHub archives:
+The `0.1.1` crates.io package is published and compiles locally; it is not one of the prebuilt GitHub archives:
 
 ```console
 cargo install excise --version 0.1.1 --locked
 excise --version
 ```
 
-When the release is promoted, the first-party binary formula will be distributed through the external [findyourexit/homebrew-tap](https://github.com/findyourexit/homebrew-tap), not Homebrew Core:
+The first-party binary formula is published through the external [findyourexit/homebrew-tap](https://github.com/findyourexit/homebrew-tap), not Homebrew Core:
 
 ```console
 brew tap findyourexit/tap https://github.com/findyourexit/homebrew-tap.git
