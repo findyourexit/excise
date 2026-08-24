@@ -4,6 +4,14 @@ run-name: Excise release candidate ${{ inputs.dispatch_id || github.ref_name }}
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Candidate generation or immutable publication recovery
+        required: false
+        default: candidate
+        type: choice
+        options:
+          - candidate
+          - publish-existing
       version:
         description: Expected Cargo.toml package version from protected main
         required: true
@@ -15,6 +23,14 @@ on:
       dispatch_id:
         description: Unique identifier for this candidate dispatch
         required: true
+        type: string
+      tag:
+        description: Existing annotated release tag for publication recovery
+        required: false
+        type: string
+      candidate_run_id:
+        description: Existing successful candidate workflow run for publication recovery
+        required: false
         type: string
   push:
     tags:
@@ -38,11 +54,11 @@ jobs:
       actions: read
       contents: read
     outputs:
-      tag: ${{ steps.release_identity.outputs.tag }}
-      version: ${{ github.event_name == 'workflow_dispatch' && steps.candidate_identity.outputs.version || steps.release_identity.outputs.version }}
-      candidate_run_id: ${{ steps.candidate_run.outputs.run_id }}
-      tag_object_sha: ${{ steps.candidate_run.outputs.tag_object_sha }}
-      source_sha: ${{ github.event_name == 'workflow_dispatch' && steps.candidate_identity.outputs.source_sha || steps.release_identity.outputs.source_sha }}
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing' && steps.recovery_identity.outputs.tag || steps.release_identity.outputs.tag }}
+      version: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing' && steps.recovery_identity.outputs.version || github.event_name == 'workflow_dispatch' && steps.candidate_identity.outputs.version || steps.release_identity.outputs.version }}
+      candidate_run_id: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing' && steps.recovery_identity.outputs.run_id || steps.candidate_run.outputs.run_id }}
+      tag_object_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing' && steps.recovery_identity.outputs.tag_object_sha || steps.candidate_run.outputs.tag_object_sha }}
+      source_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing' && steps.recovery_identity.outputs.source_sha || github.event_name == 'workflow_dispatch' && steps.candidate_identity.outputs.source_sha || steps.release_identity.outputs.source_sha }}
     steps:
       - name: Check out exact source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -51,7 +67,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Verify dispatch identity and manifest version
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'candidate'
         id: candidate_identity
         shell: bash
         env:
@@ -85,6 +101,80 @@ jobs:
           test "$manifest_version" = "$EXPECTED_VERSION"
           printf 'version=%s\n' "$manifest_version" >> "$GITHUB_OUTPUT"
           printf 'source_sha=%s\n' "$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+      - name: Verify existing tag and candidate identity
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing'
+        id: recovery_identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_REF: refs/heads/main
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          EXPECTED_VERSION: ${{ inputs.version }}
+          EXPECTED_DISPATCH_ID: ${{ inputs.dispatch_id }}
+          EXPECTED_TAG: ${{ inputs.tag }}
+          EXPECTED_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = "$EXPECTED_REF"
+          test "$GITHUB_REF_PROTECTED" = true
+          if [[ ! "$EXPECTED_DISPATCH_ID" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "dispatch_id must be a 32-character lowercase hexadecimal value" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must be a semantic version" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must be a stable semantic version tag" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "candidate_run_id must be a numeric workflow run ID" >&2
+            exit 1
+          fi
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.commit.sha')" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          main_relation="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${EXPECTED_SOURCE_SHA}...main" --jq '.status')"
+          case "$main_relation" in
+            ahead|identical) ;;
+            *) echo "source SHA is not reachable from protected main" >&2; exit 1 ;;
+          esac
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${EXPECTED_TAG}")"
+          object_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          test "$object_type" = tag
+          tag_object_sha="$(jq -r '.object.sha' <<<"$tag_ref")"
+          tag_message="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" --jq '.message')"
+          candidate_run_id="$(printf '%s\n' "$tag_message" | sed -n 's/^candidate-run-id: \([0-9][0-9]*\)$/\1/p')"
+          test "$candidate_run_id" = "$EXPECTED_CANDIDATE_RUN_ID"
+          candidate_run="$(gh run view "$EXPECTED_CANDIDATE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json databaseId,headSha,headBranch,event,conclusion,workflowName)"
+          jq -e \
+            --arg expected_id "$EXPECTED_CANDIDATE_RUN_ID" \
+            --arg expected_sha "$EXPECTED_SOURCE_SHA" '
+              (.databaseId | tostring) == $expected_id and
+              .headSha == $expected_sha and
+              .headBranch == "main" and
+              .event == "workflow_dispatch" and
+              .conclusion == "success" and
+              .workflowName == "Release candidate artifacts"
+            ' <<<"$candidate_run" >/dev/null
+          tag_target_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" --jq '.object.sha')"
+          test "$tag_target_sha" = "$EXPECTED_SOURCE_SHA"
+          manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          test -n "$manifest_version"
+          test "$manifest_version" = "$EXPECTED_VERSION"
+          {
+            printf 'tag=%s\n' "$EXPECTED_TAG"
+            printf 'version=%s\n' "$manifest_version"
+            printf 'source_sha=%s\n' "$EXPECTED_SOURCE_SHA"
+            printf 'run_id=%s\n' "$EXPECTED_CANDIDATE_RUN_ID"
+            printf 'tag_object_sha=%s\n' "$tag_object_sha"
+          } >> "$GITHUB_OUTPUT"
       - name: Verify release tag and manifest version
         if: github.event_name == 'push'
         id: release_identity
@@ -164,7 +254,7 @@ jobs:
           printf 'run_id=%s\n' "$candidate_run_id" >> "$GITHUB_OUTPUT"
           printf 'tag_object_sha=%s\n' "$tag_object_sha" >> "$GITHUB_OUTPUT"
   archive:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'candidate'
     needs: release-gate
     name: Build ${{ matrix.target }} archive
     runs-on: ${{ matrix.os }}
@@ -286,7 +376,7 @@ jobs:
 
 
   supply-chain:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'candidate'
     name: Checksums, SBOM, and provenance
     needs: [archive, release-gate]
     runs-on: ubuntu-24.04
@@ -381,7 +471,7 @@ jobs:
           retention-days: 1
 
   promote-candidate:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing')
     name: Promote reviewed candidate bundle
     needs: release-gate
     runs-on: ubuntu-24.04
@@ -466,7 +556,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing')
     needs: [release-gate, promote-candidate]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -726,7 +816,7 @@ jobs:
 
   publish-crate:
     name: Publish crate to crates.io
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing')
     needs: [release-gate, release]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -753,10 +843,12 @@ jobs:
         env:
           EXPECTED_TAG: ${{ needs.release-gate.outputs.tag }}
           EXPECTED_SHA: ${{ needs.release-gate.outputs.source_sha }}
+          EXPECTED_REF: ${{ github.event_name == 'push' && format('refs/tags/{0}', needs.release-gate.outputs.tag) || 'refs/heads/main' }}
+          EXPECTED_REF_TYPE: ${{ github.event_name == 'push' && 'tag' || 'branch' }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = "refs/tags/$EXPECTED_TAG"
-          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF" = "$EXPECTED_REF"
+          test "$GITHUB_REF_TYPE" = "$EXPECTED_REF_TYPE"
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
           test "$manifest_version" = "${EXPECTED_TAG#v}"
@@ -831,7 +923,7 @@ jobs:
 
   publish-homebrew:
     name: Update first-party Homebrew tap
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing')
     needs: [release-gate, release]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -857,10 +949,12 @@ jobs:
         env:
           EXPECTED_TAG: ${{ needs.release-gate.outputs.tag }}
           EXPECTED_SHA: ${{ needs.release-gate.outputs.source_sha }}
+          EXPECTED_REF: ${{ github.event_name == 'push' && format('refs/tags/{0}', needs.release-gate.outputs.tag) || 'refs/heads/main' }}
+          EXPECTED_REF_TYPE: ${{ github.event_name == 'push' && 'tag' || 'branch' }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = "refs/tags/$EXPECTED_TAG"
-          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF" = "$EXPECTED_REF"
+          test "$GITHUB_REF_TYPE" = "$EXPECTED_REF_TYPE"
           test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
           manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' source/Cargo.toml | sed -n '1p')"
           test "$manifest_version" = "${EXPECTED_TAG#v}"

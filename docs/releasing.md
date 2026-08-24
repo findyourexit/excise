@@ -214,6 +214,22 @@ Candidate generation is safe to rerun for a transient workflow failure, but reru
 
 Publication can be retried by rerunning the failed workflow after inspecting the GitHub tag/release/assets, the crates.io `excise` version, and the external tap commit. The release job safely reuses only a published release whose exact candidate asset set and checksums match; continue only with the missing, reviewed step, never rebuild an already published asset, and never republish an existing crate version.
 
+If a workflow defect is fixed on protected `main` after the release tag already exists, do not move the tag. Dispatch the fixed workflow in immutable publication-recovery mode, passing the original candidate source SHA, tag, and candidate run ID:
+
+```console
+gh workflow run release.yml \
+  --repo findyourexit/excise \
+  --ref main \
+  --field mode=publish-existing \
+  --field version="$version" \
+  --field source_sha="$source_sha" \
+  --field dispatch_id="$recovery_id" \
+  --field tag=v0.1.1 \
+  --field candidate_run_id="$run_id"
+```
+
+The recovery gate verifies that protected `main` has not moved during dispatch, that the immutable tag still targets `source_sha`, and that `run_id` is the successful candidate for that exact source before reusing its artifacts.
+
 If a destructive-safety or release-integrity defect is found, stop promotion and mark the affected channel unavailable while preserving the candidate evidence. Do not move, delete, or overwrite an existing tag or GitHub asset. A rollback cannot undo filesystem deletion and must not ask users to rerun a destructive command; after the fix is reviewed, publish a new corrective version (for example `0.1.2`), then update each channel to that immutable version. A crates.io yank only prevents new dependency resolution; it does not erase an already downloaded crate.
 
 ## Historical tags
