@@ -19,7 +19,7 @@ The release does not enable Scoop, WinGet, Homebrew Core, or any other package c
 
 ## The 0.1.2 corrective release
 
-The corrective `0.1.2` release contains the post-`0.1.1` accounting hardening and fuzz-oracle fix. It remains an early-testing release: its public library API and destructive behavior are provisional. Use `0.1.2` and `v0.1.2` in the active candidate, verification, and promotion procedure below; the `0.1.1` publication record remains historical and immutable.
+The corrective `0.1.2` release contains the post-`0.1.1` accounting hardening and fuzz-oracle fix. It is published but remains an early-testing release: its public library API and destructive behavior are provisional. Use `0.1.2` and `v0.1.2` in the active candidate, verification, and promotion procedure below; the `0.1.1` publication record remains historical and immutable.
 
 ## Preconditions and clean tree
 
@@ -157,6 +157,14 @@ The approved `0.1.1` publication used:
 - publication recovery run: [32742153533](https://github.com/findyourexit/excise/actions/runs/32742153533).
 
 The tag was never moved. The recovery workflow verified and promoted the exact candidate bytes without rebuilding them.
+
+The approved `0.1.2` publication used:
+
+- source commit: `94987c5f48b7814b6c035cb61931cf7aeb11eab0`;
+- candidate workflow run: [32798065116](https://github.com/findyourexit/excise/actions/runs/32798065116);
+- annotated tag: `v0.1.2`, carrying `candidate-run-id: 32798065116`;
+- publication workflow run: [32798482623](https://github.com/findyourexit/excise/actions/runs/32798482623);
+- post-publication native verification: [32800896471](https://github.com/findyourexit/excise/actions/runs/32800896471).
 
 The publication semantics are:
 
