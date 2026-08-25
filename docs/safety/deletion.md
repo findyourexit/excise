@@ -67,6 +67,7 @@ Normal completion and soft cancellation report every planned identity as deleted
 - new-child races;
 - symlink and Windows junction behavior;
 - permission and sharing failures;
+- deterministic Windows sharing-violation behavior;
 - partial best-effort continuation;
 - elevated and reduced-guard modes;
 - hostile name confirmation;
