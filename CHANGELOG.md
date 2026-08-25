@@ -8,6 +8,13 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 _No unreleased changes._
 
+## [0.1.2] - 2026-08-25
+
+### Fixed
+
+* Treat conflicting hard-link observations as unknown and propagate conservative reclaimable bounds.
+* Accept invalidated deletion plans in fuzz validation without classifying safe rejections as crashes.
+
 ## [0.1.1] - 2026-08-24
 
 ### Added

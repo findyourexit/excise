@@ -1,8 +1,8 @@
 # Release process
 
-This runbook records the published `0.1.1` early-testing release contract and the evidence required for publication and future corrective releases. It is a procedure, not authorization.
+This runbook records the published `0.1.1` early-testing release contract, the corrective `0.1.2` release contract, and the evidence required for future corrective releases. It is a procedure, not authorization.
 
-## The 0.1.1 contract
+## The 0.1.1 contract (historical)
 
 The published `0.1.1` release is for early testing. Its public library API and destructive behavior remain provisional until the project declares a stable line. Test only with disposable data; do not treat this release as suitable for irreplaceable files.
 
@@ -16,6 +16,10 @@ The release commit and candidate must agree on all of the following:
 - the tagged Nix flake and cargo-binstall metadata resolve the same immutable `0.1.1` release.
 
 The release does not enable Scoop, WinGet, Homebrew Core, or any other package channel beyond the first-party Homebrew tap, tagged Nix flake, crates.io, and cargo-binstall metadata. Templates under `packaging/` are validation inputs unless a separately approved channel promotion says otherwise. The source formula at `packaging/homebrew-core/excise.rb.in` is for a possible future Homebrew Core submission; it is not the first-party tap formula.
+
+## The 0.1.2 corrective release
+
+The corrective `0.1.2` release contains the post-`0.1.1` accounting hardening and fuzz-oracle fix. It remains an early-testing release: its public library API and destructive behavior are provisional. Use `0.1.2` and `v0.1.2` in the active candidate, verification, and promotion procedure below; the `0.1.1` publication record remains historical and immutable.
 
 ## Preconditions and clean tree
 
@@ -68,7 +72,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   dispatch_id="$(printf '%s' "$dispatch_seed" | shasum -a 256 | cut -c1-32)"
 fi
-run_url="$(gh workflow run release.yml --repo findyourexit/excise --ref main --field version=0.1.1 --field source_sha="$source_sha" --field dispatch_id="$dispatch_id")"
+run_url="$(gh workflow run release.yml --repo findyourexit/excise --ref main --field version=0.1.2 --field source_sha="$source_sha" --field dispatch_id="$dispatch_id")"
 run_id="${run_url##*/}"
 if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
   run_id="$(
@@ -129,7 +133,7 @@ The candidate contains six immutable target archives, `checksums.sha256`, and `e
   fi
   jq -e '.packages | length > 1' excise.spdx.json
   jq -e '.packages[] | select(.name == "serde")' excise.spdx.json
-  jq -e --arg version 0.1.1 '([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)' excise.spdx.json
+  jq -e --arg version 0.1.2 '([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)' excise.spdx.json
   for archive in excise-*.tar.gz; do tar -tzf "$archive" >/dev/null; done
   for archive in excise-*.zip; do unzip -t "$archive" >/dev/null; done
   for subject in excise-*.tar.gz excise-*.zip checksums.sha256 excise.spdx.json; do
@@ -160,23 +164,23 @@ The publication semantics are:
 2. The `publish-crate` job publishes the crate once after the release job succeeds. Do not run `cargo publish` manually; the job accepts an existing version only after matching its registry checksum and non-yanked state, and otherwise fails before retrying.
 3. After the `homebrew-tap` environment approval, the `publish-homebrew` job renders and pushes only `Formula/excise.rb` from the verified source SHA. Review the resulting tap commit and formula after the job; do not edit that external repository from this checkout.
 
-The crates.io package follows the release commit's Cargo exclusions (`.cargo`, `.github`, `.gitmessage`, `assets`, `tapes`, `handoff`, and `packaging`); `cargo package --locked --list` is the source of truth. It does not turn the GitHub archive or tap into crate contents. The `0.1.1` API is provisional; publishing it is not a stability promise.
+The crates.io package follows the release commit's Cargo exclusions (`.cargo`, `.github`, `.gitmessage`, `assets`, `tapes`, `handoff`, and `packaging`); `cargo package --locked --list` is the source of truth. It does not turn the GitHub archive or tap into crate contents. The `0.1.2` API is provisional; publishing it is not a stability promise.
 
 ## Nix and cargo-binstall verification
 
 The tagged Nix flake is a source-build channel, while cargo-binstall downloads target-specific release archives. Verify the channels independently:
 
 ```console
-nix flake check github:findyourexit/excise/v0.1.1
-nix eval --raw "github:findyourexit/excise/v0.1.1#packages.$(nix eval --raw --impure --expr builtins.currentSystem).default.version"
-nix run github:findyourexit/excise/v0.1.1 -- --version
-nix run github:findyourexit/excise/v0.1.1 -- --format table /path/to/inspect
+nix flake check github:findyourexit/excise/v0.1.2
+nix eval --raw "github:findyourexit/excise/v0.1.2#packages.$(nix eval --raw --impure --expr builtins.currentSystem).default.version"
+nix run github:findyourexit/excise/v0.1.2 -- --version
+nix run github:findyourexit/excise/v0.1.2 -- --format table /path/to/inspect
 (
   set -euo pipefail
   binstall_dir="$(mktemp -d "${TMPDIR:-/tmp}/excise-binstall.XXXXXX")"
   readonly binstall_dir
   trap 'rm -rf -- "$binstall_dir"' EXIT
-  cargo binstall --no-confirm --force --install-path "$binstall_dir" --version 0.1.1 excise
+  cargo binstall --no-confirm --force --install-path "$binstall_dir" --version 0.1.2 excise
   "$binstall_dir/excise" --version
 )
 ```
@@ -198,7 +202,7 @@ brew info findyourexit/tap/excise
 excise --version
 ```
 
-`brew fetch` checks the formula URL and SHA-256 for the host archive. `brew audit` checks formula policy, `brew test` runs the formula's version and JSON-scan smoke checks, and `brew info` confirms the selected version and tap. Also inspect the rendered formula with `brew cat findyourexit/tap/excise`; every URL must be a `releases/download/v0.1.1/` asset and every checksum must match `checksums.sha256`. The source formula in `packaging/homebrew-core/excise.rb.in` has different build semantics and must not be used as evidence that Homebrew Core has accepted the package.
+`brew fetch` checks the formula's archive URL and SHA-256, `brew audit` checks formula policy, `brew test` runs the formula's version and JSON-scan smoke checks, and `brew info` confirms the selected version and tap. Also inspect the rendered formula with `brew cat findyourexit/tap/excise`; every URL must be a `releases/download/v0.1.2/` asset and every checksum must match `checksums.sha256`. The source formula in `packaging/homebrew-core/excise.rb.in` has different build semantics and must not be used as evidence that Homebrew Core has accepted the package.
 
 ## Credentials and approvals
 
@@ -226,13 +230,13 @@ gh workflow run release.yml \
   --field version="$version" \
   --field source_sha="$source_sha" \
   --field dispatch_id="$recovery_id" \
-  --field tag=v0.1.1 \
+  --field tag=v0.1.2 \
   --field candidate_run_id="$run_id"
 ```
 
 The recovery gate verifies that protected `main` has not moved during dispatch, that the immutable tag still targets `source_sha`, and that `run_id` is the successful candidate for that exact source before reusing its artifacts.
 
-If a destructive-safety or release-integrity defect is found, stop promotion and mark the affected channel unavailable while preserving the candidate evidence. Do not move, delete, or overwrite an existing tag or GitHub asset. A rollback cannot undo filesystem deletion and must not ask users to rerun a destructive command; after the fix is reviewed, publish a new corrective version (for example `0.1.2`), then update each channel to that immutable version. A crates.io yank only prevents new dependency resolution; it does not erase an already downloaded crate.
+If a destructive-safety or release-integrity defect is found, stop promotion and mark the affected channel unavailable while preserving the candidate evidence. Do not move, delete, or overwrite an existing tag or GitHub asset. A rollback cannot undo filesystem deletion and must not ask users to rerun a destructive command; after the fix is reviewed, publish a new corrective version (for example `0.1.3`), then update each channel to that immutable version. A crates.io yank only prevents new dependency resolution; it does not erase an already downloaded crate.
 
 ## Historical tags
 

@@ -18,7 +18,7 @@ Excise is an independent successor to [Diskonaut](https://github.com/imsnif/disk
 > Excise permanently deletes selected filesystem entries. There is no trash or undo. Use it only on data you can safely remove.
 
 > [!IMPORTANT]
-The published Excise **0.1.1** release is for early testing. Start with a disposable directory, keep the default confirmation enabled, and read the [deletion contract](docs/safety/deletion.md) before selecting anything you might need.
+The published Excise **0.1.2** release is a corrective early-testing release. Start with a disposable directory, keep the default confirmation enabled, and read the [deletion contract](docs/safety/deletion.md) before selecting anything you might need.
 
 ## Why Excise
 
@@ -31,7 +31,7 @@ The published Excise **0.1.1** release is for early testing. Start with a dispos
 
 ## Quick Start
 
-All release-channel commands below target the published **0.1.1** early-testing release. Before using them, read the [release process](docs/releasing.md) and follow the disposable-fixture guidance.
+All release-channel commands below target the published **0.1.2** corrective early-testing release. Before using them, read the [release process](docs/releasing.md) and follow the disposable-fixture guidance.
 
 ### Install it
 
@@ -43,7 +43,7 @@ The first-party Homebrew tap carries the formula:
 ```console
 brew tap findyourexit/tap
 brew install findyourexit/tap/excise
-excise --version  # excise 0.1.1
+excise --version  # excise 0.1.2
 ```
 
 </details>
@@ -51,11 +51,11 @@ excise --version  # excise 0.1.1
 <details>
 <summary><strong>crates.io</strong></summary>
 
-The `0.1.1` package is published on crates.io; install it with the locked dependency graph:
+The `0.1.2` package is published on crates.io; install it with the locked dependency graph:
 
 ```console
-cargo install excise --version 0.1.1 --locked
-excise --version  # excise 0.1.1
+cargo install excise --version 0.1.2 --locked
+excise --version  # excise 0.1.2
 ```
 
 </details>
@@ -63,7 +63,7 @@ excise --version  # excise 0.1.1
 <details>
 <summary><strong>GitHub Release</strong></summary>
 
-Download the archive for your platform from the [published 0.1.1 GitHub Release](https://github.com/findyourexit/excise/releases/tag/v0.1.1). For example, Apple silicon macOS:
+Download the archive for your platform from the [published 0.1.2 GitHub Release](https://github.com/findyourexit/excise/releases/tag/v0.1.2). For example, Apple silicon macOS:
 The provenance check requires the GitHub CLI (`gh`) and a GitHub API-authenticated session.
 
 ```console
@@ -73,21 +73,21 @@ The provenance check requires the GitHub CLI (`gh`) and a GitHub API-authenticat
   readonly download_dir
   trap 'rm -rf -- "$download_dir"' EXIT
   cd "$download_dir"
-  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v0.1.1/excise-aarch64-apple-darwin-v0.1.1.tar.gz
-  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v0.1.1/checksums.sha256
+  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v0.1.2/excise-aarch64-apple-darwin-v0.1.2.tar.gz
+  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v0.1.2/checksums.sha256
   shasum -a 256 --ignore-missing --check checksums.sha256
-  source_sha="$(git ls-remote --exit-code https://github.com/findyourexit/excise.git 'refs/tags/v0.1.1^{}' | cut -f1)"
+  source_sha="$(git ls-remote --exit-code https://github.com/findyourexit/excise.git 'refs/tags/v0.1.2^{}' | cut -f1)"
   if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "could not resolve the v0.1.1 tag commit" >&2
+    echo "could not resolve the v0.1.2 tag commit" >&2
     exit 1
   fi
-  gh attestation verify excise-aarch64-apple-darwin-v0.1.1.tar.gz \
+  gh attestation verify excise-aarch64-apple-darwin-v0.1.2.tar.gz \
     --repo findyourexit/excise \
     --signer-workflow findyourexit/excise/.github/workflows/release.yml \
     --source-digest "$source_sha" \
     --source-ref refs/heads/main
-  tar --extract --gzip --file excise-aarch64-apple-darwin-v0.1.1.tar.gz
-  ./excise-aarch64-apple-darwin-v0.1.1/excise --version  # excise 0.1.1
+  tar --extract --gzip --file excise-aarch64-apple-darwin-v0.1.2.tar.gz
+  ./excise-aarch64-apple-darwin-v0.1.2/excise --version  # excise 0.1.2
 )
 ```
 
@@ -107,19 +107,19 @@ cargo install --path . --locked
 excise --version
 ```
 
-To reproduce the exact published release commit, replace `main` with `v0.1.1` in the clone command.
+To reproduce the exact published release commit, replace `main` with `v0.1.2` in the clone command.
 
 </details>
 
 <details>
 <summary><strong>Nix</strong></summary>
 
-Run or install the published `v0.1.1` flake without updating its lock file:
+Run or install the published `v0.1.2` flake without updating its lock file:
 
 ```console
-nix run github:findyourexit/excise/v0.1.1 -- --format table /path/to/inspect
-nix profile install github:findyourexit/excise/v0.1.1
-excise --version  # excise 0.1.1
+nix run github:findyourexit/excise/v0.1.2 -- --format table /path/to/inspect
+nix profile install github:findyourexit/excise/v0.1.2
+excise --version  # excise 0.1.2
 ```
 
 </details>
