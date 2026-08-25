@@ -2245,9 +2245,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn sharing_failure_is_reported_without_deleting_target() {
+    fn sharing_violation_is_reported_without_deleting_target() {
         use std::os::windows::fs::OpenOptionsExt as _;
 
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        const DELETE: u32 = 0x0001_0000;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 
@@ -2265,6 +2268,15 @@ mod tests {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(&path)
             .expect("sharing blocker should open");
+        let denied_delete = std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .expect_err("delete access should be denied by the sharing blocker");
+        assert_eq!(
+            denied_delete.raw_os_error(),
+            i32::try_from(ERROR_SHARING_VIOLATION).ok()
+        );
 
         let report = execute_plan(
             root.path(),
