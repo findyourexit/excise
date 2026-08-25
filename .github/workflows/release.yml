@@ -415,7 +415,7 @@ jobs:
           cp source/Cargo.toml source/Cargo.lock sbom-source/
           cp source/xtask/Cargo.toml sbom-source/xtask/
       - name: Download target archives
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: excise-*
           path: release
@@ -482,7 +482,7 @@ jobs:
       contents: read
     steps:
       - name: Download reviewed candidate bundle
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: excise-release-candidate
           path: release
@@ -567,7 +567,7 @@ jobs:
       contents: write
     steps:
       - name: Download approved release bundle
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: excise-release-bundle
           path: release
@@ -959,7 +959,7 @@ jobs:
           manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' source/Cargo.toml | sed -n '1p')"
           test "$manifest_version" = "${EXPECTED_TAG#v}"
       - name: Download approved release bundle
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: excise-release-bundle
           path: release
