@@ -1,8 +1,8 @@
 # Support
 
-## 0.1.2 corrective early testing
+## 0.2.0 early testing
 
-The published `0.1.2` release includes corrective accounting and fuzz-validation fixes but remains early testing. Support is best effort, the public library API may change before 1.0, and no release build should be trusted with irreplaceable data. Start with [Getting started](docs/getting-started.md) and a disposable fixture.
+The published `0.2.0` release includes the dense storage map, accessible terminal presentation, animation, overflow reporting, and retained-accounting improvements but remains early testing. Support is best effort, the public library API may change before 1.0, and no release build should be trusted with irreplaceable data. Start with [Getting started](docs/getting-started.md) and a disposable fixture.
 
 ## Usage questions
 

@@ -16,7 +16,7 @@
         let pkgs = nixpkgs.legacyPackages.${system};
         in pkgs.rustPlatform.buildRustPackage {
           pname = "excise";
-          version = "0.1.2";
+          version = "0.2.0";
           src = pkgs.lib.cleanSource self;
           cargoLock.lockFile = ./Cargo.lock;
           preCheck = ''

@@ -2,9 +2,9 @@
 
 Excise permanently deletes selected filesystem entries. There is no trash or undo. Begin with a disposable directory.
 
-## The 0.1.2 corrective early-testing release
+## The 0.2.0 early-testing release
 
-The published `0.1.2` release includes corrective accounting and fuzz-validation fixes but remains early testing. Its public library API and destructive behavior are provisional; do not use it on irreplaceable data, and do not infer stable support from a successful install. Verify the version and read the [permanent-deletion contract](safety/deletion.md) before making a scan or deletion plan.
+The published `0.2.0` release adds the dense storage map, accessible terminal presentation, animation, overflow reporting, and retained-accounting improvements while remaining early testing. Its public library API and destructive behavior are provisional; do not use it on irreplaceable data, and do not infer stable support from a successful install. Verify the version and read the [permanent-deletion contract](safety/deletion.md) before making a scan or deletion plan.
 
 The project is independent from Diskonaut. Tags `0.1.0` through `0.11.0` are preserved Diskonaut releases, not Excise releases; do not move, reuse, or treat those tags as an Excise installation.
 
@@ -40,12 +40,12 @@ nix build
 ./result/bin/excise /path/to/inspect
 ```
 
-## Install 0.1.2 from a release channel
+## Install 0.2.0 from a release channel
 
-The `0.1.2` crates.io package is published and compiles locally; it is not one of the prebuilt GitHub archives:
+The `0.2.0` crates.io package is published and compiles locally; it is not one of the prebuilt GitHub archives:
 
 ```console
-cargo install excise --version 0.1.2 --locked
+cargo install excise --version 0.2.0 --locked
 excise --version
 ```
 
@@ -86,9 +86,9 @@ The default view uses identity-unique allocated bytes. Pass `--apparent-size` wh
 
 The TUI requires stdin and stdout attached to TTYs, ANSI rendering, and alternate-screen support. It needs a window at least `32 x 8`; smaller windows show a resize message. If a terminal cannot provide these capabilities, use table or JSON mode instead. `--ascii` changes symbols and borders but does not remove the TTY requirement.
 
-### Current-main map behavior (unreleased)
+### 0.2.0 map behavior
 
-The dense half-block map, animated focus chrome, heat ramp, `geometry::MapOverflow` overflow summary, and directed map-layout transitions described below are current `main` behavior. They are not included in published `0.1.2`; build the current source above to use them.
+The dense half-block map, animated focus chrome, heat ramp, `geometry::MapOverflow` overflow summary, and directed map-layout transitions are included in the published `0.2.0` release. Build the current source above or install `0.2.0` to use them.
 
 The interactive view uses a dense half-block treemap and animated focus chrome on capable terminals. `--ascii`, monochrome mode, and reduced motion preserve the same selection, scope, and deletion information when those visual effects are unavailable or undesirable.
 

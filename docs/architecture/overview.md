@@ -43,7 +43,7 @@ The default worker count is `min(available_parallelism, 8)`, with a validated `1
 
 A flat arena keyed by stable node IDs stores names once, parent/child relationships, native identity, metrics, scan state, and aggregate state. Traversal, compaction, and destruction are iterative.
 
-On current `main`, the public `geometry::MapOverflow` summary returned by `TreeMap::overflow()` records entries omitted from the final map viewport, not merely individually small entries. It retains their count, bytes, and lower-bound uncertainty even when no overflow region can be drawn; its anchor may be a non-drawable sentinel when no free field exists, so consumers must check drawable bounds before painting; count and weight labels appear only when that region has enough usable space.
+The public `geometry::MapOverflow` summary returned by `TreeMap::overflow()` records entries omitted from the final map viewport, not merely individually small entries. It retains their count, bytes, and lower-bound uncertainty even when no overflow region can be drawn; its anchor may be a non-drawable sentinel when no free field exists, so consumers must check drawable bounds before painting; count and weight labels appear only when that region has enough usable space.
 
 The default process envelope is 512 MiB. A hard 75% model/index budget leaves 25% process headroom. Cold compaction preserves exact aggregates while active ancestors, visible nodes, and operation targets remain pinned.
 

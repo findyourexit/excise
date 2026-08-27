@@ -45,9 +45,9 @@ Run the actual terminal lifecycle tests with:
 cargo test --test pty_smoke --locked
 ```
 
-## 0.1.2 candidate checks
+## 0.2.0 candidate checks
 
-The `0.1.2` corrective release remains early testing, not a stable API or a promise that destructive behavior is safe for irreplaceable data. From a clean checkout at the release commit, run the focused checks before requesting the hosted candidate:
+The `0.2.0` release is an early-testing minor release, not a stable API or a promise that destructive behavior is safe for irreplaceable data. From a clean checkout at the release commit, run the focused checks before requesting the hosted candidate:
 
 ```console
 (
@@ -76,7 +76,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   dispatch_id="$(printf '%s' "$dispatch_seed" | shasum -a 256 | cut -c1-32)"
 fi
-run_url="$(gh workflow run release.yml --repo findyourexit/excise --ref main --field version=0.1.2 --field source_sha="$source_sha" --field dispatch_id="$dispatch_id")"
+run_url="$(gh workflow run release.yml --repo findyourexit/excise --ref main --field version=0.2.0 --field source_sha="$source_sha" --field dispatch_id="$dispatch_id")"
 run_id="${run_url##*/}"
 if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
   run_id="$(
@@ -137,29 +137,29 @@ The workflow rejects a moving or unprotected source ref, checks the exact SHA an
   fi
   jq -e '.packages | length > 1' excise.spdx.json
   jq -e '.packages[] | select(.name == "serde")' excise.spdx.json
-  jq -e --arg version 0.1.2 '([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)' excise.spdx.json
+  jq -e --arg version 0.2.0 '([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)' excise.spdx.json
   archives=(
-    excise-x86_64-unknown-linux-gnu-v0.1.2.tar.gz
-    excise-aarch64-unknown-linux-gnu-v0.1.2.tar.gz
-    excise-x86_64-apple-darwin-v0.1.2.tar.gz
-    excise-aarch64-apple-darwin-v0.1.2.tar.gz
-    excise-x86_64-pc-windows-msvc-v0.1.2.zip
-    excise-aarch64-pc-windows-msvc-v0.1.2.zip
+    excise-x86_64-unknown-linux-gnu-v0.2.0.tar.gz
+    excise-aarch64-unknown-linux-gnu-v0.2.0.tar.gz
+    excise-x86_64-apple-darwin-v0.2.0.tar.gz
+    excise-aarch64-apple-darwin-v0.2.0.tar.gz
+    excise-x86_64-pc-windows-msvc-v0.2.0.zip
+    excise-aarch64-pc-windows-msvc-v0.2.0.zip
   )
   for archive in "${archives[@]}"; do
     test -s "$archive"
   done
   for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-    archive="excise-${target}-v0.1.2.tar.gz"
-    root="excise-${target}-v0.1.2"
+    archive="excise-${target}-v0.2.0.tar.gz"
+    root="excise-${target}-v0.2.0"
     tar -tzf "$archive" | grep -Fqx "$root/excise"
     tar -tzf "$archive" | grep -Fqx "$root/LICENSE"
     tar -tzf "$archive" | grep -Fqx "$root/generated/man/excise.1"
     tar -tzf "$archive" | grep -Fqx "$root/schemas/scan-report.schema.json"
   done
   for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
-    archive="excise-${target}-v0.1.2.zip"
-    root="excise-${target}-v0.1.2"
+    archive="excise-${target}-v0.2.0.zip"
+    root="excise-${target}-v0.2.0"
     unzip -t "$archive" >/dev/null
     unzip -Z1 "$archive" | grep -Fqx "$root/excise.exe"
     unzip -Z1 "$archive" | grep -Fqx "$root/LICENSE"
@@ -179,8 +179,8 @@ The workflow rejects a moving or unprotected source ref, checks the exact SHA an
 After reviewing the candidate, create the annotated release tag with the reviewed candidate run ID in its message, then push it:
 
 ```console
-git tag -a v0.1.2 "$source_sha" -m "candidate-run-id: $run_id"
-git push origin v0.1.2
+git tag -a v0.2.0 "$source_sha" -m "candidate-run-id: $run_id"
+git push origin v0.2.0
 ```
 
 The push-triggered workflow requires that exact annotated-tag candidate ID; never substitute a different candidate run or a lightweight tag.
@@ -213,9 +213,9 @@ cargo check-generated
 
 Commit generated changes with the source contract that produced them.
 
-### Current-main demo pipeline (unreleased)
+### Current-main demo pipeline
 
-The `cargo demo` alias is current `main` behavior, not a `0.1.2` candidate command. It delegates to `xtask demo`; refresh the VHS demonstration after user-visible CLI or TUI changes and review the output before a release:
+The `cargo demo` alias is current `main` development behavior rather than a release-package command. It delegates to `xtask demo`; refresh the VHS demonstration after user-visible CLI or TUI changes and review the output before a release:
 
 ```console
 (
@@ -225,7 +225,7 @@ The `cargo demo` alias is current `main` behavior, not a `0.1.2` candidate comma
 )
 ```
 
-Run the tape from the repository root. `xtask demo` validates `tapes/demo.tape`, renders it at the tape's 24 fps, then resamples it to 20 fps while rebuilding a 64-colour palette without dithering and applying lossy GIF quantisation. It owns the `assets/demo-main.rendered.gif`, `assets/demo-main.palette.gif`, and `assets/demo-main.quantised.gif` staging paths and atomically promotes the last to `assets/demo-main.gif` only after it passes the published GIF's weight ceiling; a failure leaves the committed current-main asset untouched and never changes `assets/demo.gif`, the published `0.1.2` recording. It needs `vhs`, `ttyd`, `ffmpeg`, `ffprobe`, and `gifsicle` on `PATH`, plus a Unix-like `bash` and core utilities: the tape explicitly selects `bash`, creates its fixture under `/tmp`, and invokes utilities including `head`, `mkdir`, and `rm`.
+Run the tape from the repository root. `xtask demo` validates `tapes/demo.tape`, renders it at the tape's 24 fps, then resamples it to 20 fps while rebuilding a 64-colour palette without dithering and applying lossy GIF quantisation. It owns the `assets/demo-main.rendered.gif`, `assets/demo-main.palette.gif`, and `assets/demo-main.quantised.gif` staging paths and atomically promotes the last to `assets/demo-main.gif` only after it passes the published GIF's weight ceiling; a failure leaves the committed current-main asset untouched and never changes `assets/demo.gif`, the historical `0.1.2` recording. It needs `vhs`, `ttyd`, `ffmpeg`, `ffprobe`, and `gifsicle` on `PATH`, plus a Unix-like `bash` and core utilities: the tape explicitly selects `bash`, creates its fixture under `/tmp`, and invokes utilities including `head`, `mkdir`, and `rm`.
 
 Invoking `vhs tapes/demo.tape` directly writes an unoptimised 24 fps sequence to `assets/demo-main.gif` and skips the 20 fps resampling, palette rebuild, quantisation, and size gate, so it must not be used to refresh the committed current-main hero.
 
