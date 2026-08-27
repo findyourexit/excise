@@ -174,3 +174,35 @@ impl Node {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::sync::Arc;
+
+    use super::{EntrySnapshot, Node, NodeId, NodeKind, NodeMetrics, NodeState};
+
+    #[test]
+    fn node_literal_does_not_require_arena_accounting() {
+        let node = Node {
+            id: NodeId(7),
+            parent: None,
+            name: Arc::from(OsStr::new("fixture")),
+            kind: NodeKind::File,
+            state: NodeState::Complete,
+            children: Vec::new(),
+            metrics: NodeMetrics::default(),
+            snapshot: EntrySnapshot {
+                identity: None,
+                kind: NodeKind::File,
+                apparent_bytes: 0,
+                allocated_bytes: Some(0),
+                modified_nanos: None,
+            },
+            unscanned_reason: None,
+            last_access: 0,
+        };
+
+        assert_eq!(node.id, NodeId(7));
+    }
+}

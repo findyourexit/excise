@@ -17,9 +17,44 @@ use crate::native_path::{NativeIdentity, identity_for};
 use crate::os::physical_size;
 
 const NODE_SLOT_BYTES: usize = size_of::<Option<Box<Node>>>();
-const NODE_OVERHEAD: usize = NODE_SLOT_BYTES + size_of::<Node>() + 96;
+const RETAINED_CHILD_SLOT_BYTES: usize = size_of::<u32>();
+const SPARE_CHILD_SLOT_BYTES: usize = size_of::<u32>();
+const NODE_OVERHEAD: usize =
+    NODE_SLOT_BYTES + RETAINED_CHILD_SLOT_BYTES + SPARE_CHILD_SLOT_BYTES + size_of::<Node>() + 96;
 const DUPLICATE_ID_OVERHEAD: usize = size_of::<FileId>() + 64;
 const DEFAULT_MAX_CHILDREN: usize = 4_096;
+/// Eviction candidates kept per directory that has reached the child cap.
+///
+/// One sweep of a full directory fills the stash and the evictions that follow
+/// drain it, so a directory holding a million entries pays a sweep every sixty
+/// four evictions instead of one per entry. The fixed candidate buffer stays
+/// small beside the megabyte of nodes such a directory already holds.
+const EVICTION_STASH: usize = 64;
+type RetentionRank = (bool, u128);
+type StashedCandidate = (NodeId, Option<RetentionRank>);
+
+/// A retention-order snapshot that survives later metric growth.
+///
+/// Names and IDs do not change while a node is retained, so keeping them with
+/// the rank lets a cached frontier distinguish equal-rank entries exactly as
+/// [`Arena::retention_order`] does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetentionKey {
+    rank: RetentionRank,
+    name: Arc<OsStr>,
+    id: NodeId,
+}
+
+impl RetentionKey {
+    fn compare_candidate(
+        &self,
+        rank: RetentionRank,
+        name: &OsStr,
+        id: NodeId,
+    ) -> std::cmp::Ordering {
+        compare_retention(rank, name, id, self.rank, self.name.as_ref(), self.id)
+    }
+}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct UntrackedMetrics {
     allocated_bytes: ByteBounds,
@@ -41,6 +76,11 @@ const UNTRACKED_METRICS_OVERHEAD: usize = size_of::<NodeId>() + size_of::<Untrac
 
 pub struct Arena {
     nodes: Vec<Option<Box<Node>>>,
+    // Keeps capped-child and retained-capacity accounting O(1) without
+    // changing `Node`'s public layout.
+    retained_child_counts: Vec<u32>,
+    // Budgeted child-vector slots that survived a child removal.
+    spare_child_slots: Vec<u32>,
     free_nodes: Vec<NodeId>,
     lookup: HashMap<(NodeId, Arc<OsStr>), NodeId>,
     root: NodeId,
@@ -51,7 +91,28 @@ pub struct Arena {
     untracked_metrics: HashMap<NodeId, UntrackedMetrics>,
     access_tick: u64,
     max_children_per_directory: usize,
+    /// Per-directory eviction candidates, largest first, so the next victim
+    /// pops off the end. Only directories at the cap carry one.
+    eviction_stash: HashMap<NodeId, EvictionStash>,
+    #[cfg(test)]
+    eviction_stash_sweeps: usize,
 }
+
+/// The smallest children of one directory, captured by a single sweep.
+struct EvictionStash {
+    /// Candidates ordered by [`Arena::retention_order`], largest first.
+    /// A missing rank marks a freshly retained child that must be seated by
+    /// [`Arena::retention_order`] before it can become a victim.
+    candidates: Vec<StashedCandidate>,
+    /// The largest full retention key the sweep captured. Every child left out
+    /// ranked above it, so a stashed entry that grows past it may now sit behind
+    /// one of them and the sweep has to run again.
+    ceiling: RetentionKey,
+}
+
+const EVICTION_STASH_OVERHEAD: usize = size_of::<NodeId>() + size_of::<EvictionStash>() + 64;
+const EVICTION_STASH_ALLOCATION: usize = EVICTION_STASH_OVERHEAD
+    .saturating_add(EVICTION_STASH.saturating_mul(size_of::<StashedCandidate>()));
 
 #[allow(
     clippy::missing_errors_doc,
@@ -76,6 +137,8 @@ impl Arena {
         };
         let mut arena = Self {
             nodes: Vec::new(),
+            retained_child_counts: Vec::new(),
+            spare_child_slots: Vec::new(),
             free_nodes: Vec::new(),
             lookup: HashMap::new(),
             root,
@@ -86,6 +149,9 @@ impl Arena {
             untracked_metrics: HashMap::new(),
             access_tick: 0,
             max_children_per_directory: DEFAULT_MAX_CHILDREN,
+            eviction_stash: HashMap::new(),
+            #[cfg(test)]
+            eviction_stash_sweeps: 0,
         };
         arena.reserve_node(&root_name)?;
         arena.nodes.push(Some(Box::new(Node::new(
@@ -96,6 +162,8 @@ impl Arena {
             NodeState::Scanning,
             root_snapshot,
         ))));
+        arena.retained_child_counts.push(0);
+        arena.spare_child_slots.push(0);
         Ok(arena)
     }
 
@@ -294,7 +362,7 @@ impl Arena {
             let other = self.ensure_other(parent)?;
             self.aggregate_child_into_other(victim, other)?;
         }
-        if self.reserve_child(&name).is_err() {
+        if self.reserve_child(parent, &name).is_err() {
             let other = self.ensure_other(parent)?;
             let metrics = self.observe_leaf_metrics(
                 kind,
@@ -468,7 +536,7 @@ impl Arena {
             let other = self.ensure_other(parent)?;
             self.aggregate_child_into_other(victim, other)?;
         }
-        if self.reserve_child(&name).is_err() {
+        if self.reserve_child(parent, &name).is_err() {
             let other = self.ensure_other(parent)?;
             self.accumulate_untracked_other(parent, other, metrics)?;
             return Ok(());
@@ -676,6 +744,7 @@ impl Arena {
         let Some(candidate) = candidate else {
             return Ok(false);
         };
+        let candidate_parent = self.node(candidate).and_then(|node| node.parent);
         let children = self.children(candidate).to_vec();
         let mut metrics = self
             .node(candidate)
@@ -694,13 +763,19 @@ impl Arena {
             return Err(error);
         }
         self.remove_reusable_nodes(removed);
+        self.release_spare_child_slots(candidate);
         if let Some(node) = self.node_mut(candidate) {
-            node.children.clear();
+            // Aggregates never regain children, so discard the old directory buffer.
+            node.children = Vec::new();
             node.kind = NodeKind::Synthetic(SyntheticKind::Aggregate);
             node.state = NodeState::Aggregated;
             node.snapshot.kind = node.kind;
             node.metrics = metrics;
             node.unscanned_reason = Some(UnscannedReason::MemoryAggregation);
+        }
+        self.set_retained_child_count(candidate, 0);
+        if let Some(parent) = candidate_parent {
+            self.decrement_retained_child_count(parent);
         }
         self.insert_untracked_metrics(candidate, untracked);
         self.rebuild_metrics();
@@ -797,29 +872,103 @@ impl Arena {
     }
 
     fn remove_nodes_with_reuse(&mut self, removed: Vec<NodeId>, reuse_ids: bool) {
+        let removed_ids = removed.iter().copied().collect::<HashSet<_>>();
         for id in removed.into_iter().rev() {
+            self.remove_eviction_stash(id);
             self.remove_untracked_metrics(id);
             if let Some(node) = self.nodes.get_mut(id.index()).and_then(Option::take) {
+                let parent_is_removed = node
+                    .parent
+                    .is_some_and(|parent| removed_ids.contains(&parent));
+                self.set_retained_child_count(id, 0);
+                self.release_spare_child_slots(id);
                 if let Some(parent) = node.parent {
                     self.lookup.remove(&(parent, node.name.clone()));
-                    if let Some(parent_node) = self.node_mut(parent) {
-                        parent_node.children.retain(|child| *child != id);
-                        parent_node.children.shrink_to_fit();
-                    }
+                    self.detach_child_with_capacity(
+                        parent,
+                        id,
+                        &node.name,
+                        !node.kind.is_synthetic(),
+                        !parent_is_removed,
+                    );
                 }
-                let releasable = estimate_node(&node.name)
+                // Node and sidecar backing slots remain reserved. A surviving
+                // parent retains its child slot as a reusable credit; only a
+                // parent removed in this batch drops that child storage.
+                let node_bytes = estimate_node(&node.name)
                     .saturating_sub(NODE_SLOT_BYTES)
-                    .saturating_add(node.parent.map_or(0, |_| size_of::<NodeId>()));
-                if reuse_ids && id != self.root {
-                    self.budget
-                        .release(releasable.saturating_sub(size_of::<NodeId>()));
-                    self.free_nodes.push(id);
+                    .saturating_sub(RETAINED_CHILD_SLOT_BYTES)
+                    .saturating_sub(SPARE_CHILD_SLOT_BYTES);
+                let released_child_capacity = if parent_is_removed {
+                    size_of::<NodeId>()
                 } else {
-                    self.budget.release(releasable);
+                    0
+                };
+                self.budget
+                    .release(node_bytes.saturating_add(released_child_capacity));
+                if reuse_ids && id != self.root && self.budget.reserve(size_of::<NodeId>()).is_ok()
+                {
+                    // This is distinct from a surviving parent’s retained
+                    // child-vector slot: the ID is now stored in `free_nodes`.
+                    self.free_nodes.push(id);
                 }
             }
         }
         self.lookup.shrink_to_fit();
+    }
+
+    /// Unhooks one child from its parent.
+    ///
+    /// The name order children are held in locates the seat directly. The list
+    /// keeps its capacity: a directory at the cap trades every entry it retains
+    /// for one it gives up, so releasing the slot only to claim it again is a
+    /// copy of the whole list per entry.
+    #[cfg(test)]
+    fn detach_child(&mut self, parent: NodeId, child: NodeId, name: &Arc<OsStr>, retained: bool) {
+        self.detach_child_with_capacity(parent, child, name, retained, true);
+    }
+
+    fn detach_child_with_capacity(
+        &mut self,
+        parent: NodeId,
+        child: NodeId,
+        name: &Arc<OsStr>,
+        retained: bool,
+        retain_capacity: bool,
+    ) {
+        let seat = self.children(parent).partition_point(|existing| {
+            self.node(*existing)
+                .is_some_and(|node| node.name.cmp(name).is_lt())
+        });
+        let detached = if let Some(parent_node) = self.node_mut(parent) {
+            let child_count = parent_node.children.len();
+            if parent_node.children.get(seat) == Some(&child) {
+                parent_node.children.remove(seat);
+            } else {
+                parent_node.children.retain(|existing| *existing != child);
+            }
+            parent_node.children.len() != child_count
+        } else {
+            false
+        };
+        if retained && detached {
+            self.decrement_retained_child_count(parent);
+        }
+        if retain_capacity && detached {
+            self.increment_spare_child_slot(parent);
+        }
+        let empty_stash = if let Some(stash) = self.eviction_stash.get_mut(&parent) {
+            let ceiling_evicted = stash.ceiling.id == child;
+            stash
+                .candidates
+                .retain(|(candidate, _)| *candidate != child);
+            ceiling_evicted || stash.candidates.is_empty()
+        } else {
+            false
+        };
+        if empty_stash {
+            self.remove_eviction_stash(parent);
+        }
     }
 
     pub fn remove_path(&mut self, path: &Path) -> bool {
@@ -873,7 +1022,10 @@ impl Arena {
                 staging.root_path.to_string_lossy().into_owned(),
             ));
         }
-        let target_kind = self.node(target).map(|node| node.kind).ok_or_else(|| {
+        let (target_kind, target_parent) = self
+            .node(target)
+            .map(|node| (node.kind, node.parent))
+            .ok_or_else(|| {
             ModelError::Invariant("focused rescan target disappeared".to_string())
         })?;
         if target != self.root
@@ -892,6 +1044,15 @@ impl Arena {
         let staged_children = staged_root.children.clone();
         let staged_modified_nanos = staged_root.snapshot.modified_nanos;
         let staged_identity = staged_root.snapshot.identity.clone();
+        let staged_retained_children = staging
+            .retained_child_counts
+            .get(staging.root.index())
+            .copied()
+            .ok_or_else(|| {
+                ModelError::Invariant(
+                    "focused rescan retained count sidecar disappeared".to_string(),
+                )
+            })?;
 
         let mut removed = Vec::new();
         for child in self.children(target).to_vec() {
@@ -907,7 +1068,7 @@ impl Arena {
                 total.saturating_add(released_node_bytes(node))
             });
         let (planned_budget, reused_slots) =
-            self.plan_staged_nodes(&mut staging, &removed, &shared, released)?;
+            self.plan_staged_nodes(&mut staging, target, &removed, &shared, released)?;
         remap_staged_nodes(&mut staging, target)?;
         let mut identities = self.rebuild_focused_identities(target, &removed)?;
         merge_staged_identities(&mut identities, &mut staging, target)?;
@@ -920,11 +1081,21 @@ impl Arena {
 
         self.remove_reusable_nodes(removed);
         self.remove_reusable_nodes(shared);
+        self.remove_untracked_metrics(target);
         let mut consumed_reused_slots = 0_usize;
         for index in 1..staging.nodes.len() {
             let Some(node) = staging.nodes[index].take() else {
                 continue;
             };
+            let retained_children = staging
+                .retained_child_counts
+                .get(index)
+                .copied()
+                .ok_or_else(|| {
+                    ModelError::Invariant(
+                        "focused rescan staged retained count sidecar disappeared".to_string(),
+                    )
+                })?;
             let node = *node;
             let untracked = staging.untracked_metrics.remove(&node.id);
             if let Some(untracked) = untracked {
@@ -943,14 +1114,18 @@ impl Arena {
                 .parent
                 .expect("preflighted focused rescan child should have a parent");
             self.lookup.insert((parent, node.name.clone()), node.id);
-            self.insert_planned_node(node.id, node);
+            self.insert_planned_node(node.id, node, retained_children)?;
         }
         debug_assert_eq!(consumed_reused_slots, reused_slots);
+        let target_was_aggregate = target_kind == NodeKind::Synthetic(SyntheticKind::Aggregate);
         let replacement_kind = if target == self.root {
             NodeKind::Root
         } else {
             NodeKind::Directory
         };
+        if target_was_aggregate && let Some(parent) = target_parent {
+            self.increment_retained_child_count(parent);
+        }
         let target_node = self
             .node_mut(target)
             .expect("preflighted focused rescan target should remain available");
@@ -968,8 +1143,11 @@ impl Arena {
         if let Some(identity) = staged_identity {
             target_node.snapshot.identity = Some(identity);
         }
+        self.set_retained_child_count(target, staged_retained_children);
 
+        self.clear_eviction_stashes();
         self.budget = planned_budget;
+        self.clear_spare_child_slots(target);
         self.identities = identities;
         self.prepare_identity_metrics();
         self.rebuild_identity_metrics(identity_scratch)?;
@@ -989,9 +1167,14 @@ impl Arena {
             .collect()
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "focused graft preflight keeps all budget transitions transactional"
+    )]
     fn plan_staged_nodes(
         &self,
         staging: &mut Arena,
+        target: NodeId,
         removed: &[NodeId],
         shared: &[NodeId],
         released: usize,
@@ -1003,13 +1186,59 @@ impl Arena {
             .chain(shared.iter())
             .filter(|id| self.untracked_metrics.contains_key(id))
             .count()
+            .saturating_add(usize::from(self.untracked_metrics.contains_key(&target)))
             .saturating_mul(UNTRACKED_METRICS_OVERHEAD);
         budget.release(released_untracked);
+        let released_stashes = self
+            .eviction_stash
+            .len()
+            .saturating_mul(EVICTION_STASH_ALLOCATION);
+        budget.release(released_stashes);
         let staged_untracked = staging
             .untracked_metrics
             .len()
             .saturating_mul(UNTRACKED_METRICS_OVERHEAD);
         budget.reserve(staged_untracked)?;
+        let staged_node_count = staging
+            .nodes
+            .iter()
+            .skip(1)
+            .filter_map(Option::as_deref)
+            .count();
+        let reusable_ids = removed
+            .iter()
+            .chain(shared.iter())
+            .copied()
+            .collect::<HashSet<_>>();
+        let released_internal_edges = removed
+            .iter()
+            .chain(shared.iter())
+            .filter(|id| {
+                self.node(**id)
+                    .and_then(|node| node.parent)
+                    .is_some_and(|parent| reusable_ids.contains(&parent))
+            })
+            .count();
+        let released_spare_child_slots = removed
+            .iter()
+            .chain(shared.iter())
+            .map(|id| self.spare_child_slot_count(*id))
+            .fold(0_usize, usize::saturating_add);
+        let released_target_child_slots = self
+            .children(target)
+            .len()
+            .saturating_add(self.spare_child_slot_count(target));
+        let removed_reusable_slots = shared.len().saturating_add(removed.len());
+        let consumed_free_ids = staged_node_count
+            .saturating_sub(removed_reusable_slots)
+            .min(self.free_nodes.len());
+        let remaining_removed_ids = removed_reusable_slots.saturating_sub(staged_node_count);
+        budget.release(released_spare_child_slots.saturating_mul(size_of::<NodeId>()));
+        budget.release(released_target_child_slots.saturating_mul(size_of::<NodeId>()));
+        budget.release(released_internal_edges.saturating_mul(size_of::<NodeId>()));
+        budget.release(consumed_free_ids.saturating_mul(size_of::<NodeId>()));
+        budget.reserve(remaining_removed_ids.saturating_mul(size_of::<NodeId>()))?;
+        budget.reserve(staged_node_count.saturating_mul(size_of::<NodeId>()))?;
         let mut shared_ids = shared.iter().copied();
         let mut removed_ids = removed.iter().copied();
         let mut free_ids = self.free_nodes.iter().rev().copied();
@@ -1026,11 +1255,12 @@ impl Arena {
                 .next()
                 .or_else(|| removed_ids.next())
                 .or_else(|| free_ids.next());
-            let bytes = estimate_node(&node.name).saturating_add(size_of::<NodeId>());
+            let bytes = estimate_node(&node.name);
             let bytes = if reusable.is_some() {
                 bytes
                     .saturating_sub(NODE_SLOT_BYTES)
-                    .saturating_sub(size_of::<NodeId>())
+                    .saturating_sub(RETAINED_CHILD_SLOT_BYTES)
+                    .saturating_sub(SPARE_CHILD_SLOT_BYTES)
             } else {
                 bytes
             };
@@ -1067,14 +1297,49 @@ impl Arena {
         Ok((budget, reused_slots))
     }
 
-    fn insert_planned_node(&mut self, id: NodeId, node: Node) {
+    fn insert_planned_node(
+        &mut self,
+        id: NodeId,
+        node: Node,
+        retained_children: u32,
+    ) -> Result<(), ModelError> {
         if id.index() < self.nodes.len() {
-            debug_assert!(self.nodes[id.index()].is_none());
-            self.nodes[id.index()] = Some(Box::new(node));
+            if self.retained_child_counts.get(id.index()).is_none()
+                || self.spare_child_slots.get(id.index()).is_none()
+            {
+                return Err(ModelError::Invariant(
+                    "reusable child sidecar disappeared".to_string(),
+                ));
+            }
+            let slot = self.nodes.get_mut(id.index()).ok_or_else(|| {
+                ModelError::Invariant("reusable node slot disappeared".to_string())
+            })?;
+            if slot.is_some() {
+                return Err(ModelError::Invariant(
+                    "reusable node slot was occupied".to_string(),
+                ));
+            }
+            *slot = Some(Box::new(node));
+            self.retained_child_counts[id.index()] = retained_children;
+            self.spare_child_slots[id.index()] = 0;
         } else {
-            debug_assert_eq!(id.index(), self.nodes.len());
+            if id.index() != self.nodes.len() {
+                return Err(ModelError::Invariant(
+                    "planned node ID did not match the next arena slot".to_string(),
+                ));
+            }
+            if self.retained_child_counts.len() != self.nodes.len()
+                || self.spare_child_slots.len() != self.nodes.len()
+            {
+                return Err(ModelError::Invariant(
+                    "child sidecars did not match arena slots".to_string(),
+                ));
+            }
             self.nodes.push(Some(Box::new(node)));
+            self.retained_child_counts.push(retained_children);
+            self.spare_child_slots.push(0);
         }
+        Ok(())
     }
 
     fn rebuild_focused_identities(
@@ -1162,6 +1427,9 @@ impl Arena {
     }
 
     fn prepare_identity_metrics(&mut self) {
+        // Metrics are about to be rewritten from scratch, so any recorded
+        // eviction order no longer describes the tree.
+        self.clear_eviction_stashes();
         for node in self.nodes.iter_mut().filter_map(Option::as_deref_mut) {
             match node.kind {
                 NodeKind::File
@@ -1249,7 +1517,7 @@ impl Arena {
         }
 
         let name: Arc<OsStr> = Arc::from(name.as_os_str());
-        let id = self.allocate_child_id(&name)?;
+        let id = self.allocate_child_id(parent, &name)?;
         let node = Node::new(
             id,
             Some(parent),
@@ -1345,46 +1613,255 @@ impl Arena {
     }
 
     fn retained_child_count(&self, parent: NodeId) -> usize {
-        self.children(parent)
-            .iter()
-            .filter(|id| {
-                self.node(**id)
-                    .is_some_and(|node| !node.kind.is_synthetic())
+        self.retained_child_counts
+            .get(parent.index())
+            .copied()
+            .map_or(0, |value| {
+                usize::try_from(value).expect("retained child count fits usize")
             })
-            .count()
     }
 
-    fn smallest_retained_child(&self, parent: NodeId) -> Option<NodeId> {
-        self.children(parent)
+    fn set_retained_child_count(&mut self, parent: NodeId, count: u32) {
+        let retained_count = self
+            .retained_child_counts
+            .get_mut(parent.index())
+            .expect("retained child count sidecar missing");
+        *retained_count = count;
+    }
+
+    fn increment_retained_child_count(&mut self, parent: NodeId) {
+        let count = self
+            .retained_child_counts
+            .get_mut(parent.index())
+            .expect("retained child count sidecar missing");
+        *count = count.saturating_add(1);
+    }
+
+    fn decrement_retained_child_count(&mut self, parent: NodeId) {
+        let count = self
+            .retained_child_counts
+            .get_mut(parent.index())
+            .expect("retained child count sidecar missing");
+        *count = count.saturating_sub(1);
+    }
+
+    fn spare_child_slot_count(&self, parent: NodeId) -> usize {
+        self.spare_child_slots
+            .get(parent.index())
+            .copied()
+            .map_or(0, |value| {
+                usize::try_from(value).expect("spare child slot count fits usize")
+            })
+    }
+
+    fn increment_spare_child_slot(&mut self, parent: NodeId) {
+        let slots = self
+            .spare_child_slots
+            .get_mut(parent.index())
+            .expect("spare child slot sidecar missing");
+        *slots = slots.saturating_add(1);
+    }
+
+    fn consume_spare_child_slot(&mut self, parent: NodeId) {
+        let slots = self
+            .spare_child_slots
+            .get_mut(parent.index())
+            .expect("spare child slot sidecar missing");
+        debug_assert!(*slots > 0, "reserved child slot should remain available");
+        *slots = slots.saturating_sub(1);
+    }
+
+    fn clear_spare_child_slots(&mut self, parent: NodeId) {
+        let slots = self
+            .spare_child_slots
+            .get_mut(parent.index())
+            .expect("spare child slot sidecar missing");
+        *slots = 0;
+    }
+
+    fn release_spare_child_slots(&mut self, parent: NodeId) {
+        let released = self
+            .spare_child_slot_count(parent)
+            .saturating_mul(size_of::<NodeId>());
+        self.clear_spare_child_slots(parent);
+        self.budget.release(released);
+    }
+
+    /// The child the cap gives up next: the smallest retained entry, in the
+    /// order [`Arena::retention_order`] defines.
+    ///
+    /// Answered from the stash whenever the stash still describes the directory,
+    /// so a wide directory does not re-read every child for every entry the
+    /// scanner delivers.
+    fn smallest_retained_child(&mut self, parent: NodeId) -> Option<NodeId> {
+        if let Some(candidate) = self.stashed_victim(parent) {
+            return Some(candidate);
+        }
+        self.refill_eviction_stash(parent)
+    }
+
+    /// The stash entry that still describes its node, re-sorting every entry
+    /// whose live rank changed since the sweep.
+    ///
+    /// Entries that grow beyond the cached frontier are no longer useful, but
+    /// every remaining candidate still precedes every child the sweep skipped.
+    /// Returns [`None`] only when none of those valid candidates remain.
+    fn stashed_victim(&mut self, parent: NodeId) -> Option<NodeId> {
+        let victim = {
+            let nodes = &self.nodes;
+            let stash = self.eviction_stash.get_mut(&parent)?;
+            let (candidates, ceiling) = (&mut stash.candidates, &stash.ceiling);
+            let mut reseat = false;
+            let mut index = 0;
+            while index < candidates.len() {
+                let candidate = candidates[index].0;
+                let Some(node) = nodes
+                    .get(candidate.index())
+                    .and_then(Option::as_deref)
+                    .filter(|node| node.parent == Some(parent) && !node.kind.is_synthetic())
+                else {
+                    candidates.swap_remove(index);
+                    reseat = true;
+                    continue;
+                };
+                let current = retention_rank(node.metrics);
+                if candidates[index].1 != Some(current) {
+                    if ceiling
+                        .compare_candidate(current, node.name.as_ref(), node.id)
+                        .is_gt()
+                    {
+                        // A rank tie can still cross the frontier by name or
+                        // ID, so rank alone is not enough here.
+                        candidates.swap_remove(index);
+                        reseat = true;
+                        continue;
+                    }
+                    candidates[index].1 = Some(current);
+                    reseat = true;
+                }
+                index += 1;
+            }
+            if reseat {
+                // Every change is normalized together, keeping the cache
+                // sorted before any victim lookup uses its binary order.
+                candidates.sort_unstable_by(|(left, _), (right, _)| {
+                    retention_order_for_nodes(nodes, *right, *left)
+                });
+            }
+            candidates.last().map(|(candidate, _)| *candidate)
+        };
+        if victim.is_none() {
+            self.remove_eviction_stash(parent);
+        }
+        victim
+    }
+
+    /// Reads the directory once and keeps its smallest children.
+    fn refill_eviction_stash(&mut self, parent: NodeId) -> Option<NodeId> {
+        #[cfg(test)]
+        {
+            self.eviction_stash_sweeps = self.eviction_stash_sweeps.saturating_add(1);
+        }
+        let mut candidates = self
+            .children(parent)
             .iter()
             .copied()
             .filter(|id| self.node(*id).is_some_and(|node| !node.kind.is_synthetic()))
-            .min_by(|left, right| self.retention_order(*left, *right))
+            .collect::<Vec<_>>();
+        let keep = EVICTION_STASH.min(candidates.len());
+        if keep == 0 {
+            self.remove_eviction_stash(parent);
+            return None;
+        }
+        // Only the smallest handful are eviction candidates, and only their
+        // order among themselves matters: selecting keeps the sweep linear.
+        candidates
+            .select_nth_unstable_by(keep - 1, |left, right| self.retention_order(*left, *right));
+        candidates.truncate(keep);
+        candidates.sort_unstable_by(|left, right| self.retention_order(*right, *left));
+        let victim = candidates.last().copied();
+        let ceiling = candidates.first().and_then(|id| self.retention_key(*id))?;
+        self.remove_eviction_stash(parent);
+        if self.budget.reserve(EVICTION_STASH_ALLOCATION).is_err() {
+            return victim;
+        }
+        let mut stashed = Vec::with_capacity(EVICTION_STASH);
+        stashed.extend(candidates.into_iter().map(|id| {
+            let rank = self
+                .node(id)
+                .map_or((true, 0), |node| retention_rank(node.metrics));
+            (id, Some(rank))
+        }));
+        self.eviction_stash.insert(
+            parent,
+            EvictionStash {
+                candidates: stashed,
+                ceiling,
+            },
+        );
+        victim
+    }
+
+    /// Records a freshly retained child for the next cache refresh.
+    ///
+    /// A newly retained child was not part of the sweep, so the next victim
+    /// lookup sorts it with the full retention order before selecting a child.
+    fn stash_retained_child(&mut self, parent: NodeId, child: NodeId) {
+        let full = self
+            .eviction_stash
+            .get(&parent)
+            .is_some_and(|stash| stash.candidates.len() >= EVICTION_STASH);
+        if full {
+            self.remove_eviction_stash(parent);
+            return;
+        }
+        if let Some(stash) = self.eviction_stash.get_mut(&parent) {
+            stash.candidates.push((child, None));
+        }
+    }
+
+    fn remove_eviction_stash(&mut self, parent: NodeId) {
+        if self.eviction_stash.remove(&parent).is_some() {
+            self.budget.release(EVICTION_STASH_ALLOCATION);
+        }
+    }
+
+    /// Drops every stash. Called wherever metrics are rebuilt rather than
+    /// accumulated, since a stashed rank only stays meaningful while entries
+    /// grow.
+    fn clear_eviction_stashes(&mut self) {
+        let count = self.eviction_stash.len();
+        self.eviction_stash = HashMap::new();
+        self.budget
+            .release(count.saturating_mul(EVICTION_STASH_ALLOCATION));
+    }
+
+    fn retention_key(&self, id: NodeId) -> Option<RetentionKey> {
+        self.node(id)
+            .filter(|node| !node.kind.is_synthetic())
+            .map(|node| RetentionKey {
+                rank: retention_rank(node.metrics),
+                name: node.name.clone(),
+                id: node.id,
+            })
     }
 
     fn retention_order(&self, left: NodeId, right: NodeId) -> std::cmp::Ordering {
-        let Some(left) = self.node(left) else {
-            return std::cmp::Ordering::Less;
-        };
-        let Some(right) = self.node(right) else {
-            return std::cmp::Ordering::Greater;
-        };
-        retention_rank(left.metrics)
-            .cmp(&retention_rank(right.metrics))
-            .then_with(|| right.name.cmp(&left.name))
-            .then_with(|| right.id.cmp(&left.id))
+        retention_order_for_nodes(&self.nodes, left, right)
     }
 
     fn candidate_outranks(&self, name: &OsStr, metrics: NodeMetrics, victim: NodeId) -> bool {
         let Some(victim) = self.node(victim) else {
             return true;
         };
-        match retention_rank(metrics).cmp(&retention_rank(victim.metrics)) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => name.cmp(victim.name.as_ref()).is_lt(),
-        }
+        // A parent cannot hold two children with the same name, so an incoming
+        // entry needs the rank and name portions of `retention_order` only.
+        retention_rank(metrics)
+            .cmp(&retention_rank(victim.metrics))
+            .then_with(|| victim.name.as_ref().cmp(name))
+            .is_gt()
     }
+
     fn aggregate_child_into_other(
         &mut self,
         child: NodeId,
@@ -1477,7 +1954,7 @@ impl Arena {
             name.to_string()
         };
         let name: Arc<OsStr> = Arc::from(OsStr::new(&unique_name));
-        let id = self.allocate_child_id(&name)?;
+        let id = self.allocate_child_id(parent, &name)?;
         let mut node = Node::new(
             id,
             Some(parent),
@@ -1501,24 +1978,56 @@ impl Arena {
     }
 
     fn ensure_other(&mut self, parent: NodeId) -> Result<NodeId, ModelError> {
-        self.children(parent)
+        // The overflow entry is named "Other" unless a real entry already held
+        // that name, so the name index answers for it directly and only the
+        // renamed case pays a walk of the directory.
+        let by_name = self
+            .find_child(parent, OsStr::new("Other"))
+            .filter(|id| self.is_other_node(*id));
+        if let Some(existing) = by_name {
+            return Ok(existing);
+        }
+        let existing = self
+            .children(parent)
             .iter()
             .copied()
-            .find(|id| {
-                self.node(*id)
-                    .is_some_and(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Other))
-            })
-            .map_or_else(
-                || {
-                    self.add_synthetic(
-                        parent,
-                        "Other",
-                        SyntheticKind::Other,
-                        NodeMetrics::default(),
-                    )
-                },
-                Ok,
-            )
+            .find(|id| self.is_other_node(*id));
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+        // Eviction stashes are optional. When the mandatory overflow node needs
+        // global budget, release enough cached frontiers regardless of parent.
+        let reservation = self.other_child_reservation(parent);
+        while self.budget.used().saturating_add(reservation) > self.budget.model_limit() {
+            let Some(stash_parent) = self.eviction_stash.keys().next().copied() else {
+                break;
+            };
+            self.remove_eviction_stash(stash_parent);
+        }
+        self.add_synthetic(
+            parent,
+            "Other",
+            SyntheticKind::Other,
+            NodeMetrics::default(),
+        )
+    }
+
+    fn is_other_node(&self, id: NodeId) -> bool {
+        self.node(id)
+            .is_some_and(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Other))
+    }
+
+    fn other_child_reservation(&self, parent: NodeId) -> usize {
+        const OTHER_NAME: &str = "Other";
+        let name_bytes = if self.find_child(parent, OsStr::new(OTHER_NAME)).is_some() {
+            OTHER_NAME
+                .len()
+                .saturating_add(3)
+                .saturating_add(decimal_digits(self.nodes.len()))
+        } else {
+            OTHER_NAME.len()
+        };
+        self.child_reservation_for_name_bytes(parent, name_bytes)
     }
 
     fn add_to_other(&mut self, other: NodeId, metrics: NodeMetrics) {
@@ -1536,7 +2045,7 @@ impl Arena {
         if metrics.is_zero() || self.untracked_metrics.contains_key(&id) {
             return Ok(false);
         }
-        self.budget.reserve(UNTRACKED_METRICS_OVERHEAD)?;
+        self.reserve_after_releasing_eviction_stashes(UNTRACKED_METRICS_OVERHEAD)?;
         self.untracked_metrics
             .insert(id, UntrackedMetrics::default());
         Ok(true)
@@ -1634,6 +2143,7 @@ impl Arena {
     }
 
     fn rebuild_metrics(&mut self) {
+        self.clear_eviction_stashes();
         let mut order = (0..self.nodes.len())
             .filter_map(|index| self.nodes[index].as_ref().map(|node| node.id))
             .collect::<Vec<_>>();
@@ -1745,22 +2255,31 @@ impl Arena {
     }
 
     fn push_child(&mut self, parent: NodeId, child: NodeId) -> Result<(), ModelError> {
-        let name = self
+        let (name, retained) = self
             .node(child)
-            .map(|node| node.name.clone())
+            .map(|node| (node.name.clone(), !node.kind.is_synthetic()))
             .ok_or_else(|| ModelError::Invariant("child node missing".to_string()))?;
-        let children = self.children(parent);
-        let position = children
-            .iter()
-            .position(|existing| {
-                self.node(*existing)
-                    .is_some_and(|node| node.name.cmp(&name).is_gt())
-            })
-            .unwrap_or(children.len());
-        self.node_mut(parent)
-            .ok_or_else(|| ModelError::Invariant("parent node missing".to_string()))?
-            .children
-            .insert(position, child);
+        let reuse_spare_slot = self.spare_child_slot_count(parent) > 0;
+        // Children are kept in native name order, so the seat is a search rather
+        // than a walk: a directory at the cap would otherwise re-read four
+        // thousand names to place every entry the scanner delivers.
+        let position = self.children(parent).partition_point(|existing| {
+            self.node(*existing)
+                .is_some_and(|node| node.name.cmp(&name).is_le())
+        });
+        {
+            let parent_node = self
+                .node_mut(parent)
+                .ok_or_else(|| ModelError::Invariant("parent node missing".to_string()))?;
+            parent_node.children.insert(position, child);
+        }
+        if reuse_spare_slot {
+            self.consume_spare_child_slot(parent);
+        }
+        if retained {
+            self.increment_retained_child_count(parent);
+            self.stash_retained_child(parent, child);
+        }
         Ok(())
     }
 
@@ -1801,7 +2320,10 @@ impl Arena {
         if self.duplicate_identities.contains(&file_id) {
             return;
         }
-        if self.budget.reserve(DUPLICATE_ID_OVERHEAD).is_ok() {
+        if self
+            .reserve_after_releasing_eviction_stashes(DUPLICATE_ID_OVERHEAD)
+            .is_ok()
+        {
             self.duplicate_identities.insert(file_id);
         }
     }
@@ -1810,24 +2332,60 @@ impl Arena {
         self.budget.reserve(estimate_node(name))
     }
 
-    fn reserve_child(&mut self, name: &OsStr) -> Result<(), ModelError> {
-        let node_bytes = estimate_node(name);
+    fn child_reservation_for_name_bytes(&self, parent: NodeId, name_bytes: usize) -> usize {
+        let node_bytes = estimate_node_bytes(name_bytes);
         let node_bytes = if self.free_nodes.is_empty() {
             node_bytes
         } else {
-            node_bytes.saturating_sub(NODE_SLOT_BYTES)
+            node_bytes
+                .saturating_sub(NODE_SLOT_BYTES)
+                .saturating_sub(RETAINED_CHILD_SLOT_BYTES)
+                .saturating_sub(SPARE_CHILD_SLOT_BYTES)
         };
-        self.budget
-            .reserve(node_bytes.saturating_add(size_of::<NodeId>()))
+        let child_slot = if self.spare_child_slot_count(parent) == 0 {
+            size_of::<NodeId>()
+        } else {
+            0
+        };
+        node_bytes.saturating_add(child_slot)
     }
 
-    fn allocate_child_id(&mut self, name: &OsStr) -> Result<NodeId, ModelError> {
-        self.reserve_child(name)?;
+    fn child_reservation(&self, parent: NodeId, name: &OsStr) -> usize {
+        self.child_reservation_for_name_bytes(parent, name.as_encoded_bytes().len())
+    }
+
+    fn reserve_child(&mut self, parent: NodeId, name: &OsStr) -> Result<(), ModelError> {
+        self.reserve_after_releasing_eviction_stashes(self.child_reservation(parent, name))
+    }
+
+    fn reserve_after_releasing_eviction_stashes(
+        &mut self,
+        reservation: usize,
+    ) -> Result<(), ModelError> {
+        match self.budget.reserve(reservation) {
+            Ok(()) => Ok(()),
+            Err(error) if self.eviction_stash.is_empty() => Err(error),
+            Err(_) => {
+                self.clear_eviction_stashes();
+                self.budget.reserve(reservation)
+            }
+        }
+    }
+
+    fn allocate_child_id(&mut self, parent: NodeId, name: &OsStr) -> Result<NodeId, ModelError> {
+        self.reserve_child(parent, name)?;
         self.next_id()
     }
 
     fn insert_node(&mut self, id: NodeId, node: Node) -> Result<(), ModelError> {
         if id.index() < self.nodes.len() {
+            if self.retained_child_counts.get(id.index()).is_none()
+                || self.spare_child_slots.get(id.index()).is_none()
+            {
+                return Err(ModelError::Invariant(
+                    "reusable child sidecar disappeared".to_string(),
+                ));
+            }
             let slot = self.nodes.get_mut(id.index()).ok_or_else(|| {
                 ModelError::Invariant("reusable node slot disappeared".to_string())
             })?;
@@ -1837,6 +2395,8 @@ impl Arena {
                 ));
             }
             *slot = Some(Box::new(node));
+            self.retained_child_counts[id.index()] = 0;
+            self.spare_child_slots[id.index()] = 0;
             return Ok(());
         }
         if id.index() != self.nodes.len() {
@@ -1844,7 +2404,16 @@ impl Arena {
                 "new node ID did not match the next arena slot".to_string(),
             ));
         }
+        if self.retained_child_counts.len() != self.nodes.len()
+            || self.spare_child_slots.len() != self.nodes.len()
+        {
+            return Err(ModelError::Invariant(
+                "child sidecars did not match arena slots".to_string(),
+            ));
+        }
         self.nodes.push(Some(Box::new(node)));
+        self.retained_child_counts.push(0);
+        self.spare_child_slots.push(0);
         Ok(())
     }
 
@@ -1872,14 +2441,10 @@ impl Arena {
 }
 
 fn released_node_bytes(node: &Node) -> usize {
-    let released = estimate_node(&node.name)
+    estimate_node(&node.name)
         .saturating_sub(NODE_SLOT_BYTES)
-        .saturating_add(node.parent.map_or(0, |_| size_of::<NodeId>()));
-    if node.parent.is_some() {
-        released.saturating_sub(size_of::<NodeId>())
-    } else {
-        released
-    }
+        .saturating_sub(RETAINED_CHILD_SLOT_BYTES)
+        .saturating_sub(SPARE_CHILD_SLOT_BYTES)
 }
 
 fn staged_live_id(
@@ -2100,6 +2665,41 @@ fn preserve_unknown_upper(rebuilt: ByteBounds, previous: ByteBounds) -> ByteBoun
     }
 }
 
+fn compare_retention(
+    left_rank: RetentionRank,
+    left_name: &OsStr,
+    left_id: NodeId,
+    right_rank: RetentionRank,
+    right_name: &OsStr,
+    right_id: NodeId,
+) -> std::cmp::Ordering {
+    left_rank
+        .cmp(&right_rank)
+        .then_with(|| right_name.cmp(left_name))
+        .then_with(|| right_id.cmp(&left_id))
+}
+
+fn retention_order_for_nodes(
+    nodes: &[Option<Box<Node>>],
+    left: NodeId,
+    right: NodeId,
+) -> std::cmp::Ordering {
+    let Some(left) = nodes.get(left.index()).and_then(Option::as_deref) else {
+        return std::cmp::Ordering::Less;
+    };
+    let Some(right) = nodes.get(right.index()).and_then(Option::as_deref) else {
+        return std::cmp::Ordering::Greater;
+    };
+    compare_retention(
+        retention_rank(left.metrics),
+        left.name.as_ref(),
+        left.id,
+        retention_rank(right.metrics),
+        right.name.as_ref(),
+        right.id,
+    )
+}
+
 fn retention_rank(metrics: NodeMetrics) -> (bool, u128) {
     (
         metrics.allocated_bytes.upper.is_none(),
@@ -2108,7 +2708,20 @@ fn retention_rank(metrics: NodeMetrics) -> (bool, u128) {
 }
 
 fn estimate_node(name: &OsStr) -> usize {
-    NODE_OVERHEAD.saturating_add(name.as_encoded_bytes().len().saturating_mul(2))
+    estimate_node_bytes(name.as_encoded_bytes().len())
+}
+
+fn estimate_node_bytes(name_bytes: usize) -> usize {
+    NODE_OVERHEAD.saturating_add(name_bytes.saturating_mul(2))
+}
+
+fn decimal_digits(mut value: usize) -> usize {
+    let mut digits: usize = 1;
+    while value >= 10 {
+        value /= 10;
+        digits = digits.saturating_add(1);
+    }
+    digits
 }
 
 fn leaf_metrics(apparent: u128, allocated: ByteBounds, declared_links: Option<u64>) -> NodeMetrics {
@@ -2154,6 +2767,18 @@ mod tests {
         arena
             .add_entry(path, &metadata, identity)
             .expect("fixture should be added")
+    }
+
+    fn actual_retained_children(arena: &Arena, parent: NodeId) -> usize {
+        arena
+            .children(parent)
+            .iter()
+            .filter(|child| {
+                arena
+                    .node(**child)
+                    .is_some_and(|node| !node.kind.is_synthetic())
+            })
+            .count()
     }
 
     #[test]
@@ -2255,6 +2880,340 @@ mod tests {
     }
 
     #[test]
+    fn cold_compaction_drops_discarded_child_buffer() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cold = root.path().join("cold");
+        let first = cold.join("first");
+        let second = cold.join("second");
+        fs::create_dir(&cold).expect("cold directory should be created");
+        fs::write(&first, b"a").expect("first child should be written");
+        fs::write(&second, b"b").expect("second child should be written");
+
+        let mut arena = test_arena(root.path());
+        let cold_id = add_path(&mut arena, &cold).expect("cold directory should be retained");
+        add_path(&mut arena, &first).expect("first child should be retained");
+        add_path(&mut arena, &second).expect("second child should be retained");
+        assert!(
+            arena
+                .node(cold_id)
+                .expect("cold directory should exist")
+                .children
+                .capacity()
+                >= 2,
+            "fixture should allocate a child buffer"
+        );
+
+        assert!(
+            arena
+                .aggregate_cold_subtree(&HashSet::from([arena.root()]))
+                .expect("cold subtree should compact")
+        );
+
+        assert_eq!(
+            arena
+                .node(cold_id)
+                .expect("cold aggregate should remain")
+                .children
+                .capacity(),
+            0,
+            "an Aggregate must not retain discarded child-vector capacity"
+        );
+    }
+
+    #[test]
+    fn cold_compaction_decrements_parent_retained_children() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cold = root.path().join("cold");
+        let cold_child = cold.join("child");
+        let survivor = root.path().join("survivor");
+        fs::create_dir(&cold).expect("cold directory should be created");
+        fs::write(&cold_child, b"child").expect("cold child should be written");
+        fs::write(&survivor, b"survivor").expect("surviving file should be written");
+
+        let mut arena = test_arena(root.path());
+        let cold_id = add_path(&mut arena, &cold).expect("cold directory should be retained");
+        add_path(&mut arena, &cold_child).expect("cold child should be retained");
+        add_path(&mut arena, &survivor).expect("survivor should be retained");
+        arena.finalize().expect("model should finalize");
+        assert_eq!(arena.retained_child_count(arena.root()), 2);
+
+        assert!(
+            arena
+                .aggregate_cold_subtree(&HashSet::from([arena.root()]))
+                .expect("cold subtree should compact")
+        );
+
+        assert_eq!(
+            arena.retained_child_count(arena.root()),
+            actual_retained_children(&arena, arena.root())
+        );
+        assert_eq!(arena.retained_child_count(arena.root()), 1);
+        assert_eq!(
+            arena
+                .node(cold_id)
+                .expect("cold aggregate should remain")
+                .kind,
+            NodeKind::Synthetic(SyntheticKind::Aggregate)
+        );
+    }
+
+    #[test]
+    fn permanent_removal_keeps_surviving_child_capacity_and_sidecar_reserved() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let directory = root.path().join("directory");
+        let child = directory.join("child");
+        fs::create_dir(&directory).expect("fixture directory should be created");
+        fs::create_dir(&child).expect("fixture child should be created");
+
+        let mut arena = test_arena(root.path());
+        let directory_id = add_path(&mut arena, &directory).expect("directory should be retained");
+        let child_id = add_path(&mut arena, &child).expect("child should be retained");
+        assert_eq!(arena.retained_child_count(directory_id), 1);
+        let sidecar_len = arena.retained_child_counts.len();
+        let spare_sidecar_len = arena.spare_child_slots.len();
+        let removed = HashSet::from([directory_id, child_id]);
+        let expected_reclaimed = [directory_id, child_id]
+            .into_iter()
+            .map(|id| {
+                let node = arena.node(id).expect("removed node should exist");
+                let released_child_capacity =
+                    if node.parent.is_some_and(|parent| removed.contains(&parent)) {
+                        size_of::<NodeId>()
+                    } else {
+                        0
+                    };
+                estimate_node(&node.name)
+                    .saturating_sub(NODE_SLOT_BYTES)
+                    .saturating_sub(RETAINED_CHILD_SLOT_BYTES)
+                    .saturating_sub(SPARE_CHILD_SLOT_BYTES)
+                    .saturating_add(released_child_capacity)
+            })
+            .sum::<usize>();
+        let before_removal = arena.memory_used();
+
+        arena.remove_nodes(vec![directory_id, child_id]);
+
+        assert_eq!(arena.retained_child_counts.len(), sidecar_len);
+        assert_eq!(arena.spare_child_slots.len(), spare_sidecar_len);
+        assert_eq!(arena.retained_child_counts[directory_id.index()], 0);
+        assert_eq!(arena.retained_child_count(arena.root()), 0);
+        assert_eq!(
+            arena.memory_used(),
+            before_removal.saturating_sub(expected_reclaimed),
+            "surviving child-buffer and sidecar slots must remain budgeted after permanent removal"
+        );
+    }
+
+    #[test]
+    fn permanent_removal_keeps_surviving_parent_child_buffer_budgeted() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let child = root.path().join("child");
+        fs::write(&child, b"child").expect("fixture child should be written");
+
+        let mut arena = test_arena(root.path());
+        let child_id = add_path(&mut arena, &child).expect("child should be retained");
+        let root_id = arena.root();
+        let child_capacity = arena
+            .node(root_id)
+            .expect("root should exist")
+            .children
+            .capacity();
+        assert!(child_capacity > 0, "fixture should allocate a child buffer");
+        let node = arena.node(child_id).expect("child should exist");
+        let expected_reclaimed = estimate_node(&node.name)
+            .saturating_sub(NODE_SLOT_BYTES)
+            .saturating_sub(RETAINED_CHILD_SLOT_BYTES)
+            .saturating_sub(SPARE_CHILD_SLOT_BYTES);
+        let before_removal = arena.memory_used();
+
+        arena.remove_nodes(vec![child_id]);
+
+        assert_eq!(
+            arena
+                .node(root_id)
+                .expect("root should exist")
+                .children
+                .capacity(),
+            child_capacity,
+            "Vec::remove must retain the surviving parent buffer"
+        );
+        assert_eq!(
+            arena.memory_used(),
+            before_removal.saturating_sub(expected_reclaimed),
+            "the retained parent buffer must stay charged"
+        );
+    }
+
+    #[test]
+    fn reusable_removal_fallback_keeps_free_id_and_parent_capacity_charged() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let removed = root.path().join("removed");
+        let incoming = root.path().join("incoming-directory-with-a-longer-name");
+        fs::create_dir(&removed).expect("removed directory should be created");
+        fs::create_dir(&incoming).expect("incoming directory should be created");
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        let removed_id = add_path(&mut arena, &removed).expect("removed node should be retained");
+        arena
+            .add_synthetic(
+                root_id,
+                "Other",
+                SyntheticKind::Other,
+                NodeMetrics::default(),
+            )
+            .expect("overflow node should be retained");
+        let removed_node = arena.node(removed_id).expect("removed node should exist");
+        let released_node_bytes = estimate_node(&removed_node.name)
+            .saturating_sub(NODE_SLOT_BYTES)
+            .saturating_sub(RETAINED_CHILD_SLOT_BYTES)
+            .saturating_sub(SPARE_CHILD_SLOT_BYTES);
+        let before_removal = arena.memory_used();
+
+        arena.remove_reusable_nodes(vec![removed_id]);
+
+        assert_eq!(
+            arena.memory_used(),
+            before_removal
+                .saturating_sub(released_node_bytes)
+                .saturating_add(size_of::<NodeId>()),
+            "the free-ID entry must be charged separately from the retained parent slot"
+        );
+        assert_eq!(arena.free_nodes, vec![removed_id]);
+        assert_eq!(arena.spare_child_slot_count(root_id), 1);
+
+        let reservation = arena.child_reservation(
+            root_id,
+            incoming
+                .file_name()
+                .expect("incoming path should have a filename"),
+        );
+        let remaining = reservation.saturating_sub(1);
+        let filler = arena
+            .memory_limit()
+            .saturating_sub(arena.memory_used())
+            .checked_sub(remaining)
+            .expect("fixture budget should leave one byte too little for the incoming node");
+        arena
+            .budget
+            .reserve(filler)
+            .expect("fixture should consume the remaining budget");
+        let before_fallback = arena.memory_used();
+
+        assert!(
+            add_path(&mut arena, &incoming).is_none(),
+            "a failed reservation should aggregate into the existing Other node"
+        );
+        assert_eq!(arena.memory_used(), before_fallback);
+        assert_eq!(arena.free_nodes, vec![removed_id]);
+        assert_eq!(arena.spare_child_slot_count(root_id), 1);
+    }
+
+    #[test]
+    fn permanent_delete_reinsert_consumes_parent_spare_capacity_once() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let third = root.path().join("third");
+        for path in [&first, &second, &third] {
+            fs::create_dir(path).expect("fixture directory should be created");
+        }
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        let first_id = add_path(&mut arena, &first).expect("first node should be retained");
+        arena.remove_nodes(vec![first_id]);
+        assert_eq!(arena.spare_child_slot_count(root_id), 1);
+
+        let second_reservation = arena.child_reservation(
+            root_id,
+            second
+                .file_name()
+                .expect("second path should have a filename"),
+        );
+        assert_eq!(
+            second_reservation,
+            estimate_node(
+                second
+                    .file_name()
+                    .expect("second path should have a filename")
+            ),
+            "the permanent deletion already paid for the parent child slot"
+        );
+        let before_second = arena.memory_used();
+        let second_id = add_path(&mut arena, &second).expect("second node should be retained");
+        assert_ne!(
+            second_id, first_id,
+            "permanent deletion must not reuse the node ID"
+        );
+        assert_eq!(
+            arena.memory_used(),
+            before_second.saturating_add(second_reservation)
+        );
+        assert_eq!(arena.spare_child_slot_count(root_id), 0);
+
+        arena.remove_nodes(vec![second_id]);
+        assert_eq!(arena.spare_child_slot_count(root_id), 1);
+        let third_reservation = arena.child_reservation(
+            root_id,
+            third
+                .file_name()
+                .expect("third path should have a filename"),
+        );
+        assert_eq!(
+            third_reservation,
+            estimate_node(
+                third
+                    .file_name()
+                    .expect("third path should have a filename")
+            ),
+            "each reinsert cycle must reuse, not recharge, the retained child capacity"
+        );
+        let before_third = arena.memory_used();
+        add_path(&mut arena, &third).expect("third node should be retained");
+        assert_eq!(
+            arena.memory_used(),
+            before_third.saturating_add(third_reservation)
+        );
+        assert_eq!(arena.spare_child_slot_count(root_id), 0);
+    }
+
+    #[test]
+    fn reused_slots_reset_retained_child_sidecar() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let old = root.path().join("old");
+        let old_child = old.join("child");
+        let replacement = root.path().join("replacement");
+        let replacement_child = replacement.join("child");
+        for path in [&old, &old_child, &replacement, &replacement_child] {
+            fs::create_dir_all(path).expect("fixture directory should be created");
+        }
+
+        let mut arena = test_arena(root.path());
+        let old_id = add_path(&mut arena, &old).expect("old directory should be retained");
+        let old_child_id = add_path(&mut arena, &old_child).expect("old child should be retained");
+        assert_eq!(arena.retained_child_count(old_id), 1);
+
+        arena.remove_reusable_nodes(vec![old_id, old_child_id]);
+
+        assert_eq!(arena.retained_child_counts[old_id.index()], 0);
+        assert_eq!(arena.spare_child_slots[old_id.index()], 0);
+        assert_eq!(
+            arena.retained_child_count(arena.root()),
+            actual_retained_children(&arena, arena.root())
+        );
+        let replacement_id =
+            add_path(&mut arena, &replacement).expect("replacement directory should be retained");
+        assert_eq!(replacement_id, old_id);
+        assert_eq!(arena.retained_child_count(replacement_id), 0);
+        add_path(&mut arena, &replacement_child).expect("replacement child should be retained");
+        assert_eq!(
+            arena.retained_child_count(replacement_id),
+            actual_retained_children(&arena, replacement_id)
+        );
+    }
+
+    #[test]
     fn staged_node_remap_tolerates_unreferenced_holes() {
         let root = tempfile::tempdir().expect("model root should exist");
         let removed = root.path().join("removed");
@@ -2268,6 +3227,10 @@ mod tests {
         staging.remove_nodes_with_reuse(vec![removed_id], true);
 
         assert!(staging.node(removed_id).is_none());
+        assert_eq!(
+            staging.retained_child_count(staging.root()),
+            actual_retained_children(&staging, staging.root())
+        );
         assert!(
             remap_staged_nodes(&mut staging, NodeId(99)).is_ok(),
             "unreferenced staging holes should be ignored"
@@ -2279,6 +3242,56 @@ mod tests {
                 .parent,
             Some(NodeId(99))
         );
+    }
+
+    #[test]
+    fn focused_graft_restores_retained_children_after_aggregate() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let target = root.path().join("target");
+        let old = target.join("old");
+        let first = target.join("first");
+        let second = target.join("second");
+        fs::create_dir(&target).expect("target directory should be created");
+        fs::write(&old, b"old").expect("old child should be written");
+
+        let mut live = test_arena(root.path());
+        let target_id = add_path(&mut live, &target).expect("target should be retained");
+        add_path(&mut live, &old).expect("old child should be retained");
+        for path in [&target, root.path()] {
+            live.complete_directory(path, None)
+                .expect("live directory should complete");
+        }
+        live.finalize().expect("live model should finalize");
+        assert!(
+            live.aggregate_cold_subtree(&HashSet::from([live.root()]))
+                .expect("target should compact")
+        );
+        assert_eq!(live.retained_child_count(live.root()), 0);
+
+        fs::write(&first, b"first").expect("first replacement should be written");
+        fs::write(&second, b"second").expect("second replacement should be written");
+        let mut staging = test_arena(&target);
+        add_path(&mut staging, &first).expect("first replacement should be retained");
+        add_path(&mut staging, &second).expect("second replacement should be retained");
+        staging
+            .complete_directory(&target, None)
+            .expect("staging root should complete");
+
+        live.replace_subtree_from(target_id, staging)
+            .expect("focused graft should succeed");
+
+        let target_node = live.node(target_id).expect("target should remain");
+        assert_eq!(target_node.kind, NodeKind::Directory);
+        assert_eq!(
+            live.retained_child_count(target_id),
+            actual_retained_children(&live, target_id)
+        );
+        assert_eq!(live.retained_child_count(target_id), 2);
+        assert_eq!(
+            live.retained_child_count(live.root()),
+            actual_retained_children(&live, live.root())
+        );
+        assert_eq!(live.retained_child_count(live.root()), 1);
     }
     #[test]
     fn compaction_rehomes_hard_link_allocation_before_finalization() {
@@ -2449,6 +3462,557 @@ mod tests {
             arena.find_child(arena.root(), OsStr::new("alpha")),
             Some(alpha_id)
         );
+    }
+
+    #[test]
+    fn child_cap_reseats_fresh_equal_rank_directory_by_retention_order() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let zeta = root.path().join("zeta");
+        let beta = root.path().join("beta");
+        let alpha = root.path().join("alpha");
+        let larger = root.path().join("a-larger");
+        for path in [&zeta, &beta, &alpha] {
+            fs::create_dir(path).expect("empty directory should be created");
+        }
+        fs::write(&larger, vec![b'x'; 8 * 1024]).expect("larger file should be written");
+
+        let mut arena = test_arena(root.path());
+        arena.max_children_per_directory = 2;
+        let zeta_id = add_path(&mut arena, &zeta).expect("zeta should be retained");
+        let beta_id = add_path(&mut arena, &beta).expect("beta should be retained");
+        let alpha_id = add_path(&mut arena, &alpha).expect("alpha should replace zeta");
+        assert_eq!(alpha_id, zeta_id);
+        assert_eq!(
+            arena.retention_order(beta_id, alpha_id),
+            std::cmp::Ordering::Less
+        );
+
+        add_path(&mut arena, &larger).expect("larger file should replace beta");
+
+        assert!(arena.find_child(arena.root(), OsStr::new("zeta")).is_none());
+        assert!(arena.find_child(arena.root(), OsStr::new("beta")).is_none());
+        assert_eq!(
+            arena.find_child(arena.root(), OsStr::new("alpha")),
+            Some(alpha_id)
+        );
+        assert!(
+            arena
+                .find_child(arena.root(), OsStr::new("a-larger"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn eviction_stash_reorders_all_candidates_after_metric_growth() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        let c = root.path().join("c");
+        let d = root.path().join("d");
+        for path in [&a, &b, &c, &d] {
+            fs::create_dir(path).expect("empty directory should be created");
+        }
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        let a_id = add_path(&mut arena, &a).expect("a should be retained");
+        let b_id = add_path(&mut arena, &b).expect("b should be retained");
+        let c_id = add_path(&mut arena, &c).expect("c should be retained");
+        let d_id = add_path(&mut arena, &d).expect("d should be retained");
+        for (id, rank) in [(a_id, 10), (b_id, 7), (c_id, 5), (d_id, 1)] {
+            arena
+                .node_mut(id)
+                .expect("retained directory should exist")
+                .metrics
+                .allocated_bytes = ByteBounds::exact(rank);
+        }
+        assert_eq!(arena.refill_eviction_stash(root_id), Some(d_id));
+
+        // The stale order is a, b, c, d while the live order is a, c, d, b.
+        // Re-seating only d with `partition_point` would return d, not b.
+        arena
+            .node_mut(c_id)
+            .expect("c should remain")
+            .metrics
+            .allocated_bytes = ByteBounds::exact(9);
+        arena
+            .node_mut(d_id)
+            .expect("d should remain")
+            .metrics
+            .allocated_bytes = ByteBounds::exact(8);
+
+        assert_eq!(arena.smallest_retained_child(root_id), Some(b_id));
+    }
+
+    #[test]
+    fn eviction_stash_rebuilds_at_equal_rank_frontier_ties() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        let mut entries = Vec::with_capacity(EVICTION_STASH.saturating_add(1));
+        for index in 0..=EVICTION_STASH {
+            let path = root.path().join(format!("entry-{index:03}"));
+            fs::create_dir(&path).expect("empty directory should be created");
+            let id = add_path(&mut arena, &path).expect("entry should be retained");
+            arena
+                .node_mut(id)
+                .expect("retained entry should exist")
+                .metrics
+                .allocated_bytes = ByteBounds::exact(u128::from(index != 0));
+            entries.push(id);
+        }
+        let first = entries[0];
+        let omitted = entries[1];
+        assert_eq!(arena.refill_eviction_stash(root_id), Some(first));
+
+        // `entry-000` started below the cached frontier. Once it reaches the
+        // same rank, its name puts it above the cached `entry-002` frontier;
+        // the omitted `entry-001` is now the true smallest retained child.
+        arena
+            .node_mut(first)
+            .expect("first entry should exist")
+            .metrics
+            .allocated_bytes = ByteBounds::exact(1);
+        for id in entries.iter().copied().skip(2) {
+            let name = arena
+                .node(id)
+                .expect("cached entry should exist")
+                .name
+                .clone();
+            arena.detach_child(root_id, id, &name, true);
+        }
+
+        assert_eq!(arena.smallest_retained_child(root_id), Some(omitted));
+    }
+
+    #[test]
+    fn retention_key_uses_id_for_equal_rank_and_name_ties() {
+        let ceiling = RetentionKey {
+            rank: (false, 1),
+            name: std::sync::Arc::from(OsStr::new("same")),
+            id: NodeId(2),
+        };
+
+        assert_eq!(
+            ceiling.compare_candidate((false, 1), OsStr::new("same"), NodeId(1)),
+            std::cmp::Ordering::Greater,
+            "the lower ID must win the final retention-order tie"
+        );
+    }
+
+    #[test]
+    fn eviction_stash_yields_budget_to_flat_directory_overflow() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let retained = root.path().join("a");
+        let overflow = root.path().join("z");
+        fs::create_dir(&retained).expect("retained directory should be created");
+        fs::create_dir(&overflow).expect("overflow directory should be created");
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        arena.max_children_per_directory = 1;
+        add_path(&mut arena, &retained).expect("first directory should be retained");
+
+        let other_reservation = arena.child_reservation(root_id, OsStr::new("Other"));
+        let remaining_for_cache_and_other = EVICTION_STASH_ALLOCATION
+            .saturating_add(other_reservation)
+            .saturating_sub(1);
+        let available = arena.memory_limit().saturating_sub(arena.memory_used());
+        let filler = available
+            .checked_sub(remaining_for_cache_and_other)
+            .expect("fixture budget should fit the cache and almost fit Other");
+        arena
+            .budget
+            .reserve(filler)
+            .expect("fixture should consume the extra model budget");
+        assert_eq!(
+            arena.memory_limit().saturating_sub(arena.memory_used()),
+            remaining_for_cache_and_other
+        );
+
+        assert!(
+            add_path(&mut arena, &overflow).is_none(),
+            "an equal-rank late entry should aggregate into Other"
+        );
+        let other = arena
+            .find_child(root_id, OsStr::new("Other"))
+            .expect("representable overflow should create Other");
+        assert!(arena.is_other_node(other));
+        assert!(
+            !arena.eviction_stash.contains_key(&root_id),
+            "the optional cache must release its reservation for Other"
+        );
+        assert_eq!(
+            arena.memory_limit().saturating_sub(arena.memory_used()),
+            EVICTION_STASH_ALLOCATION.saturating_sub(1),
+            "Other should consume its reservation without retaining the cache charge"
+        );
+    }
+
+    #[test]
+    fn eviction_stashes_from_other_parents_yield_budget_to_overflow() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cached_parent = root.path().join("cached-parent");
+        let cached_child = cached_parent.join("cached-child");
+        let overflow = root.path().join("overflow");
+        fs::create_dir(&cached_parent).expect("cache parent should be created");
+        fs::create_dir(&cached_child).expect("cache child should be created");
+        fs::create_dir(&overflow).expect("overflow should be created");
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        arena.max_children_per_directory = 1;
+        let cached_parent_id =
+            add_path(&mut arena, &cached_parent).expect("cache parent should be retained");
+        let cached_child_id =
+            add_path(&mut arena, &cached_child).expect("cache child should be retained");
+        assert_eq!(
+            arena.refill_eviction_stash(cached_parent_id),
+            Some(cached_child_id)
+        );
+        assert!(arena.eviction_stash.contains_key(&cached_parent_id));
+        assert!(
+            !arena.eviction_stash.contains_key(&root_id),
+            "only the unrelated parent should hold a stash"
+        );
+
+        let other_reservation = arena.other_child_reservation(root_id);
+        let remaining_for_other = other_reservation.saturating_sub(1);
+        assert!(
+            remaining_for_other < EVICTION_STASH_ALLOCATION,
+            "the root must be unable to allocate a second stash"
+        );
+        let available = arena.memory_limit().saturating_sub(arena.memory_used());
+        let filler = available
+            .checked_sub(remaining_for_other)
+            .expect("fixture budget should leave Other one byte short");
+        arena
+            .budget
+            .reserve(filler)
+            .expect("fixture should consume the extra model budget");
+
+        assert!(
+            add_path(&mut arena, &overflow).is_none(),
+            "a globally cached frontier must not prevent mandatory Other"
+        );
+        let other = arena
+            .find_child(root_id, OsStr::new("Other"))
+            .expect("representable overflow should create Other");
+        assert!(arena.is_other_node(other));
+        assert!(
+            !arena.eviction_stash.contains_key(&cached_parent_id),
+            "Other must release an unrelated optional stash"
+        );
+        assert_eq!(arena.retained_child_count(root_id), 1);
+        assert_eq!(
+            arena.memory_limit().saturating_sub(arena.memory_used()),
+            EVICTION_STASH_ALLOCATION.saturating_sub(1),
+            "Other should consume its reservation after freeing the remote stash"
+        );
+    }
+
+    #[test]
+    fn child_reservation_retries_after_releasing_global_stashes() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cached_parent = root.path().join("cached-parent");
+        let cached_child = cached_parent.join("cached-child");
+        let incoming = root.path().join("incoming");
+        fs::create_dir(&cached_parent).expect("cache parent should be created");
+        fs::create_dir(&cached_child).expect("cache child should be created");
+        fs::create_dir(&incoming).expect("incoming directory should be created");
+
+        let mut arena = test_arena(root.path());
+        let cached_parent_id =
+            add_path(&mut arena, &cached_parent).expect("cache parent should be retained");
+        let cached_child_id =
+            add_path(&mut arena, &cached_child).expect("cache child should be retained");
+        assert_eq!(
+            arena.refill_eviction_stash(cached_parent_id),
+            Some(cached_child_id)
+        );
+        assert!(arena.eviction_stash.contains_key(&cached_parent_id));
+
+        let reservation = arena.child_reservation(
+            arena.root(),
+            incoming
+                .file_name()
+                .expect("incoming path should have a filename"),
+        );
+        assert!(
+            EVICTION_STASH_ALLOCATION >= reservation,
+            "one optional stash should make the retried reservation affordable"
+        );
+        let headroom = reservation.saturating_sub(1);
+        let filler = arena
+            .memory_limit()
+            .saturating_sub(arena.memory_used())
+            .checked_sub(headroom)
+            .expect("fixture budget should leave one byte too little for the child");
+        arena
+            .budget
+            .reserve(filler)
+            .expect("fixture should consume the extra model budget");
+
+        assert!(
+            add_path(&mut arena, &incoming).is_some(),
+            "a retained child should retry instead of becoming avoidable overflow"
+        );
+        assert!(
+            !arena.eviction_stash.contains_key(&cached_parent_id),
+            "the retry must release optional stashes globally"
+        );
+    }
+
+    #[test]
+    fn untracked_overflow_reservation_retries_after_releasing_global_stashes() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cached_parent = root.path().join("cached-parent");
+        let cached_child = cached_parent.join("cached-child");
+        let aggregated = root.path().join("aggregated");
+        fs::create_dir(&cached_parent).expect("cache parent should be created");
+        fs::create_dir(&cached_child).expect("cache child should be created");
+        fs::write(&aggregated, b"payload").expect("aggregate fixture should be written");
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        let cached_parent_id =
+            add_path(&mut arena, &cached_parent).expect("cache parent should be retained");
+        let cached_child_id =
+            add_path(&mut arena, &cached_child).expect("cache child should be retained");
+        assert_eq!(
+            arena.refill_eviction_stash(cached_parent_id),
+            Some(cached_child_id)
+        );
+        let metadata = fs::symlink_metadata(&aggregated).expect("aggregate metadata should exist");
+        let identity = identity_for(&aggregated, &metadata)
+            .expect("aggregate identity should be readable")
+            .expect("aggregate fixture should not be a link");
+        assert!(
+            arena
+                .add_entry_aggregated(&aggregated, &metadata, identity)
+                .expect("aggregate fixture should be represented")
+                .is_none()
+        );
+        let other = arena
+            .find_child(root_id, OsStr::new("Other"))
+            .expect("overflow state should exist");
+        assert!(arena.is_other_node(other));
+        assert!(!arena.untracked_metrics.contains_key(&other));
+
+        let headroom = UNTRACKED_METRICS_OVERHEAD.saturating_sub(1);
+        let filler = arena
+            .memory_limit()
+            .saturating_sub(arena.memory_used())
+            .checked_sub(headroom)
+            .expect("fixture budget should leave one byte too little for untracked state");
+        arena
+            .budget
+            .reserve(filler)
+            .expect("fixture should consume the extra model budget");
+
+        arena
+            .record_unscanned(
+                &root.path().join("Other"),
+                UnscannedReason::Metadata("fixture metadata unavailable".to_string()),
+            )
+            .expect("existing overflow state should retry its untracked reservation");
+
+        assert!(arena.untracked_metrics.contains_key(&other));
+        assert!(
+            !arena.eviction_stash.contains_key(&cached_parent_id),
+            "the untracked retry must release optional stashes globally"
+        );
+    }
+
+    #[test]
+    fn concrete_compaction_reservation_releases_global_eviction_stashes() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cold = root.path().join("cold");
+        let aggregated = cold.join("aggregated");
+        let cached_parent = root.path().join("cached-parent");
+        let cached_child = cached_parent.join("cached-child");
+        fs::create_dir(&cold).expect("cold directory should be created");
+        fs::write(&aggregated, b"aggregated").expect("aggregate fixture should be written");
+        fs::create_dir(&cached_parent).expect("cache parent should be created");
+        fs::write(&cached_child, b"cached").expect("cache child should be written");
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        let cold_id = add_path(&mut arena, &cold).expect("cold directory should be retained");
+        let metadata = fs::symlink_metadata(&aggregated).expect("aggregate metadata should exist");
+        let identity = identity_for(&aggregated, &metadata)
+            .expect("aggregate identity should be readable")
+            .expect("aggregate fixture should not be a link");
+        assert!(
+            arena
+                .add_entry_aggregated(&aggregated, &metadata, identity)
+                .expect("aggregate fixture should be represented")
+                .is_none()
+        );
+        let other = arena
+            .find_child(cold_id, OsStr::new("Other"))
+            .expect("cold directory should contain Other");
+        arena
+            .record_unscanned(
+                &cold.join("Other"),
+                UnscannedReason::Metadata("fixture metadata unavailable".to_string()),
+            )
+            .expect("Other should retain untracked metrics");
+        assert!(arena.untracked_metrics.contains_key(&other));
+
+        let cached_parent_id =
+            add_path(&mut arena, &cached_parent).expect("cache parent should be retained");
+        let cached_child_id =
+            add_path(&mut arena, &cached_child).expect("cache child should be retained");
+        assert_eq!(
+            arena.refill_eviction_stash(cached_parent_id),
+            Some(cached_child_id)
+        );
+        assert!(arena.eviction_stash.contains_key(&cached_parent_id));
+
+        let headroom = UNTRACKED_METRICS_OVERHEAD.saturating_sub(1);
+        let filler = arena
+            .memory_limit()
+            .saturating_sub(arena.memory_used())
+            .checked_sub(headroom)
+            .expect("fixture budget should leave one byte too little for compaction state");
+        arena
+            .budget
+            .reserve(filler)
+            .expect("fixture should consume the extra model budget");
+
+        assert!(
+            arena
+                .aggregate_cold_subtree(&HashSet::from([root_id, cached_parent_id]))
+                .expect("concrete compaction should release optional stashes")
+        );
+        assert_eq!(
+            arena
+                .node(cold_id)
+                .expect("cold aggregate should remain")
+                .kind,
+            NodeKind::Synthetic(SyntheticKind::Aggregate)
+        );
+        assert!(arena.untracked_metrics.contains_key(&cold_id));
+        assert!(
+            !arena.eviction_stash.contains_key(&cached_parent_id),
+            "the concrete reservation must release unrelated optional stashes"
+        );
+    }
+
+    #[test]
+    fn ascending_replacements_drain_a_single_eviction_stash() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let mut arena = test_arena(root.path());
+        arena.max_children_per_directory = EVICTION_STASH;
+        for index in 0..EVICTION_STASH {
+            let directory = root.path().join(format!("z-stashed-{index:03}"));
+            fs::create_dir(&directory).expect("stashed directory should be created");
+            add_path(&mut arena, &directory).expect("stashed directory should be retained");
+        }
+
+        for rank in 1_u128..=4 {
+            let incoming = root.path().join(format!("a-incoming-{rank:02}"));
+            fs::write(&incoming, vec![b'x'; 8 * 1024])
+                .expect("ascending replacement should be written");
+            let id =
+                add_path(&mut arena, &incoming).expect("ascending replacement should be retained");
+            arena
+                .node_mut(id)
+                .expect("ascending replacement should remain")
+                .metrics
+                .allocated_bytes = ByteBounds::exact(rank);
+        }
+
+        assert_eq!(
+            arena.eviction_stash_sweeps, 1,
+            "ascending candidates should drain the original stash instead of sweeping per insertion"
+        );
+    }
+
+    #[test]
+    fn eviction_stash_charges_and_releases_its_candidate_buffer() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let child = root.path().join("child");
+        fs::write(&child, b"child").expect("child should be written");
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        let child_id = add_path(&mut arena, &child).expect("child should be retained");
+        let before_stash = arena.memory_used();
+
+        assert_eq!(arena.refill_eviction_stash(root_id), Some(child_id));
+        assert_eq!(
+            arena.memory_used(),
+            before_stash.saturating_add(EVICTION_STASH_ALLOCATION)
+        );
+
+        let name = arena
+            .node(child_id)
+            .expect("child should remain")
+            .name
+            .clone();
+        arena.detach_child(root_id, child_id, &name, true);
+
+        assert!(!arena.eviction_stash.contains_key(&root_id));
+        assert_eq!(arena.memory_used(), before_stash);
+    }
+
+    #[test]
+    fn removing_a_stashed_directory_releases_its_eviction_cache() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let directory = root.path().join("directory");
+        let child = directory.join("child");
+        fs::create_dir(&directory).expect("directory should be created");
+        fs::create_dir(&child).expect("child directory should be created");
+
+        let mut arena = test_arena(root.path());
+        arena.max_children_per_directory = 1;
+        let directory_id = add_path(&mut arena, &directory).expect("directory should be retained");
+        let child_id = add_path(&mut arena, &child).expect("child should be retained");
+        assert_eq!(arena.refill_eviction_stash(directory_id), Some(child_id));
+
+        let other = arena
+            .ensure_other(arena.root())
+            .expect("root overflow node should be retained");
+        arena
+            .aggregate_child_into_other(directory_id, other)
+            .expect("directory aggregation should succeed");
+
+        assert!(!arena.eviction_stash.contains_key(&directory_id));
+    }
+
+    #[test]
+    fn evicting_a_stash_ceiling_releases_the_cached_name() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"first").expect("first child should be written");
+        fs::write(&second, b"second").expect("second child should be written");
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        add_path(&mut arena, &first).expect("first child should be retained");
+        add_path(&mut arena, &second).expect("second child should be retained");
+        let before_stash = arena.memory_used();
+        arena
+            .refill_eviction_stash(root_id)
+            .expect("two children should produce a stash candidate");
+        assert_eq!(
+            arena.memory_used(),
+            before_stash.saturating_add(EVICTION_STASH_ALLOCATION)
+        );
+
+        let ceiling = arena
+            .eviction_stash
+            .get(&root_id)
+            .expect("stash should be present")
+            .ceiling
+            .id;
+        arena.remove_reusable_nodes(vec![ceiling]);
+
+        assert!(!arena.eviction_stash.contains_key(&root_id));
+        assert!(arena.memory_used() < before_stash);
     }
 
     #[test]
@@ -2716,6 +4280,24 @@ mod tests {
         assert_eq!(node.state, NodeState::Uncertain);
         assert_eq!(node.metrics.allocated_bytes, ByteBounds::unknown());
         assert_eq!(node.metrics.reclaimable_bytes, ByteBounds::unknown());
+    }
+
+    #[test]
+    fn unreadable_root_preserves_reason_and_unknown_bounds_after_rebuild() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let mut arena = test_arena(root.path());
+        let reason = UnscannedReason::Metadata("root metadata denied".to_string());
+
+        arena
+            .record_unscanned(root.path(), reason.clone())
+            .expect("root uncertainty should be recorded");
+        arena.rebuild();
+
+        let root_node = arena.node(arena.root()).expect("root should remain");
+        assert_eq!(root_node.state, NodeState::Uncertain);
+        assert_eq!(root_node.unscanned_reason.as_ref(), Some(&reason));
+        assert_eq!(root_node.metrics.allocated_bytes.upper, None);
+        assert_eq!(root_node.metrics.reclaimable_bytes.upper, None);
     }
     #[cfg(unix)]
     #[test]
