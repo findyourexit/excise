@@ -28,7 +28,7 @@ A host may not be able to install every target. The published target set has sep
 | `aarch64-unknown-linux-gnu` (AArch64 Linux) | Release target; compile/archive only | Hosted release build/archive job |
 | `aarch64-pc-windows-msvc` (AArch64 Windows) | Release target; compile/archive only | Hosted release build/archive job |
 
-Only the native behavioral rows carry published runtime-behavior evidence. Compile-only targets must not be treated as fully behaviorally validated: a successful hosted build or archive demonstrates release compilation and packaging, not native runtime compatibility.
+Only the native behavioral rows carry published runtime-behavior evidence. For `1.0.0`, only those rows should be classified as fully supported; compile-only targets must remain build-only or best-effort until native behavior is demonstrated. A successful hosted build or archive demonstrates release compilation and packaging, not native runtime compatibility.
 
 ## Fast feedback
 
@@ -243,8 +243,8 @@ Crash artifacts and evolving corpora are ignored. Curated seeds under `fuzz/seed
 ## Benchmarks
 
 ```console
-cargo bench --bench core --locked -- --noplot
-cargo bench --bench tachyonfx --locked -- --noplot
+cargo bench --bench core --features internal --locked -- --noplot
+cargo bench --bench tachyonfx --features internal --locked -- --noplot
 ```
 
 Treat small host-local changes as noise unless supported by repeated statistical evidence on comparable hardware.

@@ -217,10 +217,10 @@ impl AnimationScheduler {
     }
 
     #[must_use]
-    pub fn pending_slots(&self) -> usize {
+    #[allow(dead_code)]
+    pub(crate) fn pending_slots(&self) -> usize {
         self.pending.len()
     }
-
     fn schedule(&mut self, key: EffectKey, effect: EffectKind) {
         if self.enabled {
             self.pending.insert(key, effect);

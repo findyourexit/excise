@@ -2916,7 +2916,6 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "cargo_metadata",
- "clap",
  "clap_complete",
  "clap_mangen",
  "excise",

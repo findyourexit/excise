@@ -1,6 +1,7 @@
 #[cfg(target_os = "linux")]
 #[test]
 fn headless_json_round_trips_invalid_utf8_filename() -> anyhow::Result<()> {
+    use base64::Engine as _;
     use std::os::unix::ffi::OsStringExt as _;
     use std::process::Command;
 
@@ -32,11 +33,12 @@ fn headless_json_round_trips_invalid_utf8_filename() -> anyhow::Result<()> {
                 .is_some_and(|display| display.contains("invalid-\\xff-name"))
         })
         .ok_or_else(|| anyhow::anyhow!("invalid-byte entry should be reported"))?;
-    let encoded: excise::native_path::EncodedNativePath =
-        serde_json::from_value(entry["path"].clone())?;
-    let decoded = excise::native_path::NativePath::decode(&encoded)?;
+    let encoded = entry["path"]["data"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("native path data should be a string"))?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded)?;
     anyhow::ensure!(
-        decoded.as_path() == path,
+        decoded.as_slice() == path.as_os_str().as_bytes(),
         "native path should round-trip exactly"
     );
     anyhow::ensure!(

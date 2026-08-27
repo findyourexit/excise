@@ -20,20 +20,27 @@ fn config_rejects_unknown_fields_and_versions() {
         .expect_err("unknown config field should fail");
     assert!(matches!(error, AppError::Config(_)));
 
-    let error = RuntimeConfig::from_layers(
-        cli(&["excise"]),
-        Some(&FileConfig {
-            version: 99,
-            ..FileConfig::default()
-        }),
-        EnvironmentOverrides::default(),
-        PathBuf::from("cwd"),
-        None,
-    )
-    .expect_err("unsupported config version should fail");
-    assert!(matches!(error, AppError::Config(_)));
+    for version in [0, 2, u16::MAX] {
+        let error = RuntimeConfig::from_layers(
+            cli(&["excise"]),
+            Some(&FileConfig {
+                version,
+                ..FileConfig::default()
+            }),
+            EnvironmentOverrides::default(),
+            PathBuf::from("cwd"),
+            None,
+        )
+        .expect_err("unsupported config version should fail");
+        assert!(matches!(&error, AppError::Config(_)));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unsupported config version {version}; expected 1")),
+            "version {version} should explain the stable configuration boundary"
+        );
+    }
 }
-
 #[test]
 fn malformed_scanner_exclusion_is_a_configuration_error() {
     let error = RuntimeConfig::from_layers(

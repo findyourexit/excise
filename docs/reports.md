@@ -8,7 +8,7 @@ Excise produces bounded reports rather than claiming a complete inventory when t
 excise --format table /path/to/inspect
 ```
 
-Table mode is intended for people and shell pipelines. It does not initialize a TTY. Paths are escaped for safe display.
+Table mode is intended for people and shell pipelines. Its headings, column order, and layout are human-facing and not a machine-compatibility contract; use JSON for machine consumers. It does not initialize a TTY. Paths are escaped for safe display.
 
 ## JSON output
 

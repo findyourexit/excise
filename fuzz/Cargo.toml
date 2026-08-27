@@ -9,7 +9,7 @@ rust-version = "1.88"
 cargo-fuzz = true
 
 [dependencies]
-excise = { path = ".." }
+excise = { path = "..", features = ["fuzzing"] }
 crossterm = "0.29"
 file-id = "0.2.3"
 libfuzzer-sys = "0.4.13"

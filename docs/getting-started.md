@@ -88,7 +88,7 @@ The TUI requires stdin and stdout attached to TTYs, ANSI rendering, and alternat
 
 ### 0.2.0 map behavior
 
-The dense half-block map, animated focus chrome, heat ramp, `geometry::MapOverflow` overflow summary, and directed map-layout transitions are included in the published `0.2.0` release. Build the current source above or install `0.2.0` to use them.
+The dense half-block map, animated focus chrome, heat ramp, overflow summary, and directed map-layout transitions are included in the published `0.2.0` release. Build the current source above or install `0.2.0` to use them.
 
 The interactive view uses a dense half-block treemap and animated focus chrome on capable terminals. `--ascii`, monochrome mode, and reduced motion preserve the same selection, scope, and deletion information when those visual effects are unavailable or undesirable.
 
