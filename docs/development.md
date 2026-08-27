@@ -61,7 +61,7 @@ The `0.1.2` corrective release remains early testing, not a stable API or a prom
 )
 ```
 
-The aliases in `.cargo/config.toml` map `cargo verify`, `cargo check-generated`, and `cargo dist-local` to the locked `xtask` commands. `cargo package --locked --list` exposes the exact crates.io file set; `cargo publish --locked --dry-run` validates packaging without uploading. `cargo dist-local` writes the host archive, `dist/checksums.sha256`, and `dist/homebrew/excise.rb`; it does not publish or authorize a release.
+The candidate aliases used above in `.cargo/config.toml` map `cargo verify`, `cargo check-generated`, and `cargo dist-local` to locked `xtask` commands. `cargo package --locked --list` exposes the exact crates.io file set; `cargo publish --locked --dry-run` validates packaging without uploading. `xtask dist-local` owns the local `dist/` staging path and writes the host archive, `dist/checksums.sha256`, and `dist/homebrew/excise.rb`; it neither publishes them nor authorizes a release.
 
 For the hosted candidate, dispatch the workflow only from the exact protected `main` commit and pass the manifest version, reviewed commit SHA, and a unique dispatch ID explicitly:
 
@@ -211,19 +211,23 @@ cargo generate
 cargo check-generated
 ```
 
-Commit generated changes with the source contract that produced them. Regenerate VHS demonstrations after user-visible CLI or TUI changes and review the output before a release:
+Commit generated changes with the source contract that produced them.
+
+### Current-main demo pipeline (unreleased)
+
+The `cargo demo` alias is current `main` behavior, not a `0.1.2` candidate command. It delegates to `xtask demo`; refresh the VHS demonstration after user-visible CLI or TUI changes and review the output before a release:
 
 ```console
 (
   set -euo pipefail
   cargo +1.88.0 build --release --locked --package excise
-  for tape in tapes/*.tape; do
-    vhs "$tape"
-  done
+  cargo demo
 )
 ```
 
-Run the tapes from the repository root. Each tape owns its output path; do not move recordings into a different path to make a check pass. The repository intentionally ignores generated media under `docs/**/assets/`, `docs/**/recordings/`, and `docs/**/*.cast`; preserve the checked-in tape source and obtain a reviewer approval for any externally published recording.
+Run the tape from the repository root. `xtask demo` validates `tapes/demo.tape`, renders it at the tape's 24 fps, then resamples it to 20 fps while rebuilding a 64-colour palette without dithering and applying lossy GIF quantisation. It owns the `assets/demo-main.rendered.gif`, `assets/demo-main.palette.gif`, and `assets/demo-main.quantised.gif` staging paths and atomically promotes the last to `assets/demo-main.gif` only after it passes the published GIF's weight ceiling; a failure leaves the committed current-main asset untouched and never changes `assets/demo.gif`, the published `0.1.2` recording. It needs `vhs`, `ttyd`, `ffmpeg`, `ffprobe`, and `gifsicle` on `PATH`, plus a Unix-like `bash` and core utilities: the tape explicitly selects `bash`, creates its fixture under `/tmp`, and invokes utilities including `head`, `mkdir`, and `rm`.
+
+Invoking `vhs tapes/demo.tape` directly writes an unoptimised 24 fps sequence to `assets/demo-main.gif` and skips the 20 fps resampling, palette rebuild, quantisation, and size gate, so it must not be used to refresh the committed current-main hero.
 
 ## Fuzzing
 

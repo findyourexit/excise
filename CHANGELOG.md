@@ -6,7 +6,42 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+* Added the current `main` (unreleased) `cargo demo` alias and its `xtask demo` command. `xtask demo` validates `tapes/demo.tape`, stages its rendering under `assets/demo-main.*.gif`, resamples the tape's 24 fps GIF to 20 fps while rebuilding a non-dithered 64-colour palette and applying lossy GIF quantisation, and atomically promotes `assets/demo-main.gif` only after the size gate passes. `assets/demo.gif` remains the published `0.1.2` recording for the historical README. The hosted demo workflow now uses it; the tape and current-main README hero asset were refreshed.
+
+* Added the public `geometry::MapOverflow` and `TreeMap::overflow() -> Option<geometry::MapOverflow>` APIs. They summarize entries omitted from the final map viewport, retaining their count, byte total, and lower-bound uncertainty even when the layout cannot draw an overflow region.
+
+### Changed
+
+* Reworked the TUI presentation with Catppuccin-inspired pane chrome, dense half-block treemap surfaces, animated focus borders, and contextual command help.
+* Layered dialogs over a scrim so a modal always separates from the map behind it, including on terminals without colour.
+* Rendered the treemap with shading density instead of colour whenever colour is unavailable (`NO_COLOR` or a monochrome theme), keeping entries distinguishable in a two-colour terminal.
+* Labelled the empty folder state in the narrow list layout, which previously drew nothing at all.
+* Centred each map entry's label on both axes; it previously hung from the left edge of the entry.
+* Marked the map cursor with brightness instead of an animated outline: the selected entry lifts out of the colour band while every other entry sinks toward the canvas, keeping its own hue. In map layout, pane borders remain the only animated focus signal.
+* Made directed map-layout navigation read as one zoom: opening an entry grows its contents out of the chosen rectangle; on drill-out, departing contents contract into the pivot while the incoming parent layout grows out of it. Replaced entries stay on screen while they recede instead of blinking away; pane chrome and other UI do not participate in the transition.
+* Kept a cursor on the map whenever it has entries to hold one: it arms on the largest entry, survives a folder swap or a streaming scan refresh, and holds at the edges rather than clearing, so the inspector always describes something.
+* Selected the folder just left when stepping out, instead of restoring whichever index the previous layout happened to use.
+* Seated the inspector beside the map as soon as the terminal can afford both panes, and stacked it below when there is enough vertical room for both; on shorter supported terminals the map keeps the full body. It previously vanished entirely below 120 columns.
+* Ran the pane title chip through the same colour cycle as the border it sits in, so the label reads as part of the frame rather than a plaque bolted onto it.
+* Coloured ordinary map entries by size on a blue-to-red heat ramp fitted to comparable entries in the folder on screen, so the relative weight of what is in front of the reader is legible before a single label is read. When comparable sizes produce a distinguishable log-space range, the largest is red and the smallest blue; equal or near-equal sizes that collapse at the ramp's rendering precision rest mid-ramp. Semantic colours (uncertain, shared, aggregated) never participate in the ramp, and the monochrome shading fallback is untouched.
+* Showed entries omitted from the final map viewport as a `MapOverflow` stipple anchored in its own region rather than scattering dots over a drawn entry. Where the region has enough width, it names how many entries it stands for; with enough width and a second drawable label row, it also reports their weight.
+* Labelled a map entry too narrow to carry both figures with its size rather than its share of the folder. A 4 KiB file beside a megabyte of neighbours rounded to `0%`, which reads as nothing worth looking at; a size always carries a unit and cannot round away.
+* Fitted the command line under the map to the terminal by dropping whole commands, longest-tail first. At every adaptive footer tier that can advertise an Enter action, it retains `Enter open/rescan`; tiers too narrow to fit that hint omit it rather than shortening it. A narrow terminal previously advertised a bare `delete` with no key attached and dropped `/ filter` before commands it had room for; every advertised command now names the key it means and keeps the widest tier's order.
+* Retired the whole-screen colour washes that fired on navigation, focus, state changes, scan progress, and aggregation. Effects are now one-shot acknowledgements painted over the header band alone — completion, errors, and deletion results — so nothing fades across the map while it is being read.
+* Kept retained-entry accounting incremental in the scanner: a directory sitting at the retained-child cap previously swept its children twice for every entry delivered to it, once to count identities and once to find an eviction candidate. Wide directories no longer slow down as they fill; the retained set is unchanged.
+* **Breaking library API:** `animation::EXCEPTIONAL_MOTION`, `animation::EffectKey::{Navigation, Focus, StateChange, ScanProgress, Aggregation}`, and `AnimationScheduler::{schedule_navigation, schedule_focus, schedule_state_change, schedule_scan_progress, schedule_aggregation}` have been removed. Those retired effects have no scheduler replacement: use `ROUTINE_MOTION` for resize or streaming layout motion, `NAVIGATION_MOTION` for drills, and the retained `schedule_completion`, `schedule_error`, and `schedule_deletion_result` only for header acknowledgements. `AnimationScheduler::process` is now `process(now, buffer, area, surface)`: `area` remains the header-band paint target, while the full-terminal `surface: Rect` alone selects the cadence tier. In `geometry`, `Tile::{y, height}` changed from `u16` terminal rows to `u32` half-rows. `Tile::get_horizontal_overlap_with` now returns `u32` half-rows. Use `Tile::{top_row, bottom_row, rows}` for `u32` terminal-row values, pass a `u32` terminal row to `covers_row`, and use `HALF_ROWS_PER_CELL` to convert. `TreeMap::unrenderable_tile_coordinates: Option<(u16, u32)>` now uses `(terminal_column, half_row)` rather than `(terminal_column, terminal_row)`.
+
+### Fixed
+
+* Animated map transitions across every frame they need instead of one frame per keypress. The layout tween had no clock of its own, so drilling into a folder left the map frozen mid-morph until the next unrelated event.
+* Held the fast animation cadence while the map is moving, so a large terminal no longer samples a 160 ms transition two or three times.
+* Stopped an idle session from consuming a freshly scheduled effect: the first frame after a pause charged the whole idle wait to the new effect, which retired it before it was ever drawn.
+* Re-aimed the map transition at each streaming scan update instead of restarting its clock, which is what made a map judder while entries were still arriving.
+* Stopped pressing Enter on a file from recording navigation history and arming a transition, which the next unrelated refresh then played back as a movement nobody asked for.
+* Stopped the map calling a directory empty when it holds entries omitted from the final viewport. A folder of several thousand small files laid out to nothing and reported "Folder is empty"; it now retains its `MapOverflow` summary instead.
+* Stopped two entries writing their names into the same cells while the map is moving. Mid-transition each entry is interpolated toward its own target, so neighbours briefly pass through each other; both names are centred in their own entry, and the later write landed inside the earlier name and left a word belonging to neither entry. The entry on top keeps its name and the one underneath goes quiet until the layout settles.
 
 ## [0.1.2] - 2026-08-25
 

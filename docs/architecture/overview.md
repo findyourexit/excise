@@ -43,6 +43,8 @@ The default worker count is `min(available_parallelism, 8)`, with a validated `1
 
 A flat arena keyed by stable node IDs stores names once, parent/child relationships, native identity, metrics, scan state, and aggregate state. Traversal, compaction, and destruction are iterative.
 
+On current `main`, the public `geometry::MapOverflow` summary returned by `TreeMap::overflow()` records entries omitted from the final map viewport, not merely individually small entries. It retains their count, bytes, and lower-bound uncertainty even when no overflow region can be drawn; its anchor may be a non-drawable sentinel when no free field exists, so consumers must check drawable bounds before painting; count and weight labels appear only when that region has enough usable space.
+
 The default process envelope is 512 MiB. A hard 75% model/index budget leaves 25% process headroom. Cold compaction preserves exact aggregates while active ancestors, visible nodes, and operation targets remain pinned.
 
 ### Accounting
@@ -66,6 +68,10 @@ mutation adapter ──┘                                            └──�
 ```
 
 Domain code does not depend on terminal widgets. UI code does not mutate the filesystem. Visual effects consume rendered semantic output, never the reverse.
+
+The shell presents independent workspaces with low-ink pane gaps, title chips, and active-focus chrome. The storage map remains densely tessellated inside its pane: half-block cells carry shaded foreground and background halves instead of inserting gaps between entries.
+
+Map movement is application state, not an effect. The board holds the geometry every entry is drawn at, the geometry it is heading for, and one clock; a layout change re-aims that tween from wherever entries currently sit rather than restarting it, which is what lets a streaming scan keep moving without juddering. Directed transitions apply only to map layout. Navigation supplies a pivot — the rectangle a drill radiates from — so opening an entry grows its contents out of it. On a drill-out, departing contents contract into that pivot while the incoming parent layout grows out of it. Entries the incoming layout no longer contains keep being drawn until they have finished receding into the pivot. If a pivot cannot be resolved, the board settles without a directed tween, or waits for list selection when that is the only missing geometry. Effects remain confined to the header band, acknowledging events rather than repainting the map.
 
 ## Architectural constraints
 
