@@ -168,6 +168,10 @@ impl ResolvedRoot {
 
 /// # Errors
 /// Returns an I/O error when the platform identity provider cannot inspect the path.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "The shared identity API returns platform inspection errors on Windows and unsupported targets."
+)]
 pub fn identity_for(path: &Path, metadata: &Metadata) -> io::Result<Option<NativeIdentity>> {
     #[cfg(unix)]
     let (file_id, link_count, reparse_point) = {

@@ -25,6 +25,15 @@ The corrective `0.1.2` release contains the post-`0.1.1` accounting hardening an
 
 The `0.2.0` release packages the dense storage map, accessible terminal presentation, animation, overflow reporting, and retained-accounting work described in the changelog. It is a minor release because the public library API changed; it remains early testing, and its public library API and destructive behavior are provisional. Use `0.2.0` and `v0.2.0` in the active candidate, verification, and promotion procedure below.
 
+The approved `0.2.0` publication used:
+
+- source commit: `f8329ce3ec5d338ee15459ec96a1f8897321b4ef`;
+- candidate workflow run: https://github.com/findyourexit/excise/actions/runs/33045125756;
+- immutable publication workflow run: https://github.com/findyourexit/excise/actions/runs/33045511141;
+- annotated tag: `v0.2.0`, pointing to the exact source commit;
+- successful native verification: https://github.com/findyourexit/excise/actions/runs/33044958150;
+- published GitHub Release assets, crates.io package, first-party Homebrew Tap, cargo-binstall metadata, and tagged Nix flake.
+
 ## Preconditions and clean tree
 
 Only a maintainer may start publication. Before creating a tag, dispatching a candidate, or using a publication credential:
@@ -249,6 +258,38 @@ gh workflow run release.yml \
 The recovery gate verifies that protected `main` has not moved during dispatch, that the immutable tag still targets `source_sha`, and that `run_id` is the successful candidate for that exact source before reusing its artifacts.
 
 If a destructive-safety or release-integrity defect is found, stop promotion and mark the affected channel unavailable while preserving the candidate evidence. Do not move, delete, or overwrite an existing tag or GitHub asset. A rollback cannot undo filesystem deletion and must not ask users to rerun a destructive command; after the fix is reviewed, publish a new corrective version (for example `0.2.1`), then update each channel to that immutable version. A crates.io yank only prevents new dependency resolution; it does not erase an already downloaded crate.
+
+## v1.0.0 readiness gate
+
+`1.0.0` is authorized only after the public behavior, supported-platform policy, safety evidence, and release procedure below are explicit and reviewed. The `0.2.x` line remains early testing until this gate is complete.
+
+### Contract decisions to freeze
+
+| Area | Required v1 decision | Current position |
+| --- | --- | --- |
+| CLI | Freeze command names, flags, defaults, help text, and non-TTY behavior. Additive changes are permitted; incompatible changes require a major version. | Existing CLI and generated artifacts are the candidate baseline. |
+| Environment and configuration | Preserve command line > environment > versioned TOML > defaults. Reject unknown or invalid values. Reject every file version other than `1`; do not silently migrate or reinterpret configuration. | `version = 1`, precedence, and rejection are implemented and tested. |
+| Table output | Classify table output as human-facing and non-stable. Preserve safety semantics and escaping, but direct machine consumers to JSON rather than parsing headings or columns. | JSON is the machine-readable compatibility surface; table layout is explicitly non-stable. |
+| JSON reports | Keep `scan-report`, `deletion-history`, and `native-path` schema v1 meanings stable. Add fields only when consumers can ignore them; bump the schema version for incompatible changes. | Published v1 schemas use strict unknown-field rejection and have regression validation. |
+| Exit classes | Preserve the documented numeric classes and the rule that uncertain, partial, and interrupted results remain distinguishable from exact results. | Codes are implemented and tested. |
+| Deletion | Preserve no-follow identity binding, independent enumeration, revalidation, root and synthetic-node rejection, explicit partial results, and the permanent/no-undo contract. | The deletion contract and focused safety suite are the baseline. |
+| Accounting | Preserve identity-unique allocated bytes, separate apparent bytes, conservative reclaimable bounds, and explicit unknowns. Do not claim physical shared-extent exactness. | The accounting contract and fixtures are the baseline. |
+| Library API | Treat the CLI, configuration, and versioned reports as the supported product surface. Rust implementation modules are private; the crate-root bridges used by the binary and tooling are hidden and carry no semver guarantee. | The private implementation boundary is implemented; the crate exposes no supported Rust API. |
+| Platforms | Make only native behavioral targets fully supported in `1.0.0`; classify compile/archive-only targets as build-only until native behavior evidence promotes them. | Linux x86_64, macOS AArch64, and Windows x86_64 have native evidence; the remaining three published targets are build/archive-only. |
+| Distribution and governance | Require exact protected-commit artifacts, checksums, SBOM, provenance, rollback, and an explicit release-approval authority. | Artifact identity and rollback are operational; the second-maintainer approval path is not yet established. |
+
+### Required exit evidence
+
+Before the `v1.0.0` release PR can be approved, attach:
+
+1. a reviewed public-contract decision record covering every row above;
+2. upgrade and compatibility tests for CLI/configuration (including rejection of unsupported versions), table safety and escaping, JSON schemas, native paths, and exit classes;
+3. native behavioral evidence for every target classified as supported, plus an explicit disposition for build-only targets;
+4. focused security reviews of deletion, identity, spill, terminal restoration, and release supply chain;
+5. dependency, unsafe-boundary, fuzz, benchmark, packaging, SBOM, checksum, and provenance evidence from the exact release commit;
+6. a clean-protected-commit release rehearsal and a documented corrective-release procedure.
+
+An empty consumer-feedback queue is not evidence that a behavior is safe. Keep the early-testing warning until the gate has evidence, not merely until the version number changes.
 
 ## Historical tags
 

@@ -1,6 +1,5 @@
-use clap::CommandFactory as _;
 use clap_complete::Shell;
-use excise::config::Cli;
+use excise::cli_command;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -98,7 +97,7 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
 }
 
 fn release_version() -> Result<String, Box<dyn Error>> {
-    let command = Cli::command();
+    let command = cli_command();
     let version = command
         .get_version()
         .ok_or_else(|| io::Error::other("CLI version was absent"))?;
@@ -515,6 +514,8 @@ fn run_dynamic_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
             "bench",
             "--bench",
             "tachyonfx",
+            "--features",
+            "internal",
             "--locked",
             "--",
             "--noplot",
@@ -533,6 +534,8 @@ fn run_dynamic_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
             "bench",
             "--bench",
             "core",
+            "--features",
+            "internal",
             "--locked",
             "--",
             "--noplot",
@@ -677,7 +680,7 @@ struct GeneratedArtifact {
 fn generated_artifacts() -> Result<Vec<GeneratedArtifact>, Box<dyn Error>> {
     let mut artifacts = Vec::new();
     let mut man = Vec::new();
-    clap_mangen::Man::new(Cli::command()).render(&mut man)?;
+    clap_mangen::Man::new(cli_command()).render(&mut man)?;
     let mut man = String::from_utf8(man)?
         .lines()
         .map(str::trim_end)
@@ -695,7 +698,7 @@ fn generated_artifacts() -> Result<Vec<GeneratedArtifact>, Box<dyn Error>> {
         (Shell::PowerShell, "_excise.ps1"),
         (Shell::Elvish, "excise.elv"),
     ] {
-        let mut command = Cli::command();
+        let mut command = cli_command();
         let mut bytes = Vec::new();
         clap_complete::generate(shell, &mut command, "excise", &mut bytes);
         artifacts.push(GeneratedArtifact {

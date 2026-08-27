@@ -10,7 +10,9 @@ use crossbeam_channel::{RecvTimeoutError, TryRecvError};
 use crossterm::event::Event;
 use ratatui::backend::Backend;
 
-pub use clock::{Clock, SystemClock, VirtualClock};
+#[cfg(any(test, feature = "fuzzing", feature = "internal"))]
+pub use clock::VirtualClock;
+pub(crate) use clock::{Clock, SystemClock};
 use worker::{WorkerEvent, WorkerPool};
 
 use crate::App;

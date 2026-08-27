@@ -6,7 +6,11 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+* Added the v1.0.0 release-readiness gate covering public contracts, compatibility, support classification, safety evidence, and exact-commit publication.
+* Established the conservative v1 baseline: configuration versions other than `1` are rejected, table output is human-facing rather than machine-stable, and only native behavioral targets qualify for full support.
+* Removed the provisional public Rust module exports from the supported surface; the CLI and documented configuration/report contracts remain the compatibility boundary.
 
 ## [0.2.0] - 2026-08-27
 

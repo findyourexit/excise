@@ -41,9 +41,9 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal
           rustup override set 1.88.0
       - name: Run statistical render benchmark
-        run: cargo bench --bench tachyonfx --locked -- --noplot
+        run: cargo bench --bench tachyonfx --features internal --locked -- --noplot
       - name: Run statistical core benchmark
-        run: cargo bench --bench core --locked -- --noplot
+        run: cargo bench --bench core --features internal --locked -- --noplot
       - name: Preserve Criterion measurements
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v7
         with:
