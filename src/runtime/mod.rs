@@ -246,14 +246,18 @@ where
     fn process_one_input(&mut self) -> Result<bool, AppError> {
         match self.input.read()? {
             InputEvent::Barrier => {
-                self.render()?;
-                self.wait_for_quiescence()?;
+                self.animation.set_activity_suspended(true);
+                let result = (|| {
+                    self.render()?;
+                    self.wait_for_quiescence()
+                })();
+                self.animation.set_activity_suspended(false);
+                result?;
                 Ok(true)
             }
             InputEvent::Terminal(Event::Resize(_, _)) => {
                 self.app.reset_ui_mode();
                 self.app.mark_dirty();
-                self.animation.schedule_navigation();
                 Ok(false)
             }
             InputEvent::Terminal(event) => {
@@ -268,12 +272,12 @@ where
     fn handle_input_command(&mut self, command: InputCommand) -> Result<(), AppError> {
         let now = self.clock.now();
         match command {
-            InputCommand::Navigation if self.app.ui_mode.allows_motion() => {
-                self.animation.schedule_navigation();
-                self.animation.schedule_focus();
-                self.app.mark_dirty();
+            InputCommand::Navigation => {
+                if self.app.ui_mode.allows_motion() {
+                    self.app.mark_dirty();
+                }
             }
-            InputCommand::None | InputCommand::Navigation => {}
+            InputCommand::None => {}
             InputCommand::PathError => {
                 self.app.set_path_to_red();
                 self.schedule(now, TimedAction::ResetPathColor, TRANSIENT_STATUS_DURATION);
@@ -296,7 +300,6 @@ where
                 self.scan_active = true;
                 self.rescan_active = true;
                 self.next_loading_frame = now.saturating_add(LOADING_FRAME_INTERVAL);
-                self.animation.schedule_aggregation();
             }
             InputCommand::CancelRescan => {
                 if self.rescan_active {
@@ -453,11 +456,9 @@ where
                 }
                 self.summary.identified_entries =
                     u64::try_from(self.app.identity_count()).unwrap_or(u64::MAX);
-                self.animation.schedule_scan_progress();
             }
             WorkerEvent::ScanDirectoryComplete { path, identity } => {
                 self.app.complete_directory(&path, identity.as_ref())?;
-                self.animation.schedule_state_change();
             }
             WorkerEvent::ScanUnscanned { path, reason } => {
                 self.summary.unscanned_entries += 1;
@@ -657,7 +658,6 @@ where
         self.scan_active = true;
         self.rescan_active = true;
         self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
-        self.animation.schedule_aggregation();
         Ok(())
     }
 
