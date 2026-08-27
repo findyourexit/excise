@@ -1,12 +1,14 @@
 # Support
 
-## 0.3.0 early testing
+## 1.0.0 stable
 
-The `0.3.0` release makes the CLI, configuration, and versioned JSON reports the supported product contracts. Its Rust implementation modules are private by default, while repository-only fuzzing and benchmark access uses explicit feature gates. Support remains best effort, and no early-testing release should be trusted with irreplaceable data. Start with [Getting started](docs/getting-started.md) and a disposable fixture.
+The `1.0.0` release freezes the CLI, configuration, and versioned JSON report contracts. Deletion remains permanent with no trash or undo. Start with [Getting started](docs/getting-started.md), use a disposable fixture first, and report safety or release-integrity defects privately under [SECURITY.md](SECURITY.md).
+
+The `0.3.x` releases were early testing and are superseded. They are retained in the changelog and release history for provenance only.
 
 ## `1.0.0` support matrix
 
-The planned stable runtime support set is:
+The stable runtime support set is:
 
 | Target | `1.0.0` status | Evidence |
 | --- | --- | --- |
@@ -63,4 +65,4 @@ For normal first use, follow [Getting started](docs/getting-started.md) and the 
 
 ## Scope
 
-Support is best effort. The project does not provide private consulting, emergency recovery, or guarantees for pre-release builds. The repository preserves Diskonaut history and historical tags for archival reference; they are not Excise releases, and historical Diskonaut releases are unsupported. See [Project lineage](docs/lineage.md).
+Support commitments apply only to the native targets marked Supported in the matrix; build-only targets and filesystem-provider-specific behavior remain best-effort. The project does not provide private consulting, emergency recovery, or guarantees for unreleased builds. The repository preserves Diskonaut history and historical tags for archival reference; they are not Excise releases, and historical Diskonaut releases are unsupported. See [Project lineage](docs/lineage.md).

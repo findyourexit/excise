@@ -1,6 +1,6 @@
 # Release process
 
-This runbook records the published `0.1.1` early-testing release contract, the corrective `0.1.2` release contract, the published `0.2.0` release evidence, and the evidence required for the `0.3.0` release and future releases. It is a procedure, not authorization.
+This runbook records the historical early-testing releases through `0.3.0` and the procedure for the first stable `1.0.0` release and future releases. It is a procedure, not authorization.
 
 ## The 0.1.1 contract (historical)
 
@@ -36,14 +36,18 @@ The approved `0.2.0` publication used:
 
 ## The 0.3.0 early-testing release
 
-The `0.3.0` release packages the private Rust API boundary and compatibility-policy work described in the changelog. It is a breaking minor release because provisional Rust module paths are removed from the default public surface; it remains early testing, and its destructive behavior is provisional. Use `0.3.0` and `v0.3.0` in the active candidate, verification, and promotion procedure below.
+The `0.3.0` release packages the private Rust API boundary and compatibility-policy work described in the changelog. It was a breaking minor release because provisional Rust module paths were removed from the default public surface; its destructive behavior was provisional, and its publication record is historical and immutable. The active candidate, verification, and promotion procedure below targets `1.0.0`.
+
+## The 1.0.0 stable release
+
+The `1.0.0` release freezes the CLI, configuration, versioned JSON reports, deletion and accounting semantics, native support policy, and exact-commit distribution procedure described by the v1 contract decision record below. It is the first stable release; later incompatible changes require a major version, while additive report and configuration changes must preserve the documented compatibility rules.
 
 ## Preconditions and clean tree
 
 Only a maintainer may start publication. Before creating a tag, dispatching a candidate, or using a publication credential:
 
 1. Merge the focused release change to protected `main`. It must update the version and lockfile, move user-visible `Unreleased` entries into the dated changelog section, regenerate the man page and shell completions, and contain no unrelated source changes.
-2. Review the deletion, accounting, schema, configuration, platform, compatibility, and early-testing notes in the release PR.
+2. Review the deletion, accounting, schema, configuration, platform, compatibility, and release notes in the release PR.
 3. Check out the exact protected commit and require a clean working tree. This check must report no tracked, staged, or untracked release input:
 
    ```console
@@ -89,7 +93,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   dispatch_id="$(printf '%s' "$dispatch_seed" | shasum -a 256 | cut -c1-32)"
 fi
-run_url="$(gh workflow run release.yml --repo findyourexit/excise --ref main --field version=0.3.0 --field source_sha="$source_sha" --field dispatch_id="$dispatch_id")"
+run_url="$(gh workflow run release.yml --repo findyourexit/excise --ref main --field version=1.0.0 --field source_sha="$source_sha" --field dispatch_id="$dispatch_id")"
 run_id="${run_url##*/}"
 if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
   run_id="$(
@@ -150,7 +154,7 @@ The candidate contains six immutable target archives, `checksums.sha256`, and `e
   fi
   jq -e '.packages | length > 1' excise.spdx.json
   jq -e '.packages[] | select(.name == "serde")' excise.spdx.json
-  jq -e --arg version 0.3.0 '([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)' excise.spdx.json
+  jq -e --arg version 1.0.0 '([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)' excise.spdx.json
   for archive in excise-*.tar.gz; do tar -tzf "$archive" >/dev/null; done
   for archive in excise-*.zip; do unzip -t "$archive" >/dev/null; done
   for subject in excise-*.tar.gz excise-*.zip checksums.sha256 excise.spdx.json; do
@@ -189,23 +193,23 @@ The publication semantics are:
 2. The `publish-crate` job publishes the crate once after the release job succeeds. Do not run `cargo publish` manually; the job accepts an existing version only after matching its registry checksum and non-yanked state, and otherwise fails before retrying.
 3. After the `homebrew-tap` environment approval, the `publish-homebrew` job renders and pushes only `Formula/excise.rb` from the verified source SHA. Review the resulting tap commit and formula after the job; do not edit that external repository from this checkout.
 
-The crates.io package follows the release commit's Cargo exclusions (`.cargo`, `.github`, `.gitmessage`, `assets`, `tapes`, `handoff`, and `packaging`); `cargo package --locked --list` is the source of truth. It does not turn the GitHub archive or tap into crate contents. The `0.3.0` API boundary is CLI-only; publishing it is not a promise of a supported Rust library.
+The crates.io package follows the release commit's Cargo exclusions (`.cargo`, `.github`, `.gitmessage`, `assets`, `tapes`, `handoff`, and `packaging`); `cargo package --locked --list` is the source of truth. It does not turn the GitHub archive or tap into crate contents. The `1.0.0` API boundary is CLI-only; publishing it is not a promise of a supported Rust library.
 
 ## Nix and cargo-binstall verification
 
 The tagged Nix flake is a source-build channel, while cargo-binstall downloads target-specific release archives. Verify the channels independently:
 
 ```console
-nix flake check github:findyourexit/excise/v0.3.0
-nix eval --raw "github:findyourexit/excise/v0.3.0#packages.$(nix eval --raw --impure --expr builtins.currentSystem).default.version"
-nix run github:findyourexit/excise/v0.3.0 -- --version
-nix run github:findyourexit/excise/v0.3.0 -- --format table /path/to/inspect
+nix flake check github:findyourexit/excise/v1.0.0
+nix eval --raw "github:findyourexit/excise/v1.0.0#packages.$(nix eval --raw --impure --expr builtins.currentSystem).default.version"
+nix run github:findyourexit/excise/v1.0.0 -- --version
+nix run github:findyourexit/excise/v1.0.0 -- --format table /path/to/inspect
 (
   set -euo pipefail
   binstall_dir="$(mktemp -d "${TMPDIR:-/tmp}/excise-binstall.XXXXXX")"
   readonly binstall_dir
   trap 'rm -rf -- "$binstall_dir"' EXIT
-  cargo binstall --no-confirm --force --install-path "$binstall_dir" --version 0.3.0 excise
+  cargo binstall --no-confirm --force --install-path "$binstall_dir" --version 1.0.0 excise
   "$binstall_dir/excise" --version
 )
 ```
@@ -227,7 +231,7 @@ brew info findyourexit/tap/excise
 excise --version
 ```
 
-`brew fetch` checks the formula's archive URL and SHA-256, `brew audit` checks formula policy, `brew test` runs the formula's version and JSON-scan smoke checks, and `brew info` confirms the selected version and tap. Also inspect the rendered formula with `brew cat findyourexit/tap/excise`; every URL must be a `releases/download/v0.3.0/` asset and every checksum must match `checksums.sha256`. The source formula in `packaging/homebrew-core/excise.rb.in` has different build semantics and must not be used as evidence that Homebrew Core has accepted the package.
+`brew fetch` checks the formula's archive URL and SHA-256, `brew audit` checks formula policy, `brew test` runs the formula's version and JSON-scan smoke checks, and `brew info` confirms the selected version and tap. Also inspect the rendered formula with `brew cat findyourexit/tap/excise`; every URL must be a `releases/download/v1.0.0/` asset and every checksum must match `checksums.sha256`. The source formula in `packaging/homebrew-core/excise.rb.in` has different build semantics and must not be used as evidence that Homebrew Core has accepted the package.
 
 ## Credentials and approvals
 
@@ -255,7 +259,7 @@ gh workflow run release.yml \
   --field version="$version" \
   --field source_sha="$source_sha" \
   --field dispatch_id="$recovery_id" \
-  --field tag=v0.3.0 \
+  --field tag=v1.0.0 \
   --field candidate_run_id="$run_id"
 ```
 
@@ -265,7 +269,7 @@ If a destructive-safety or release-integrity defect is found, stop promotion and
 
 ## v1.0.0 readiness gate
 
-`1.0.0` is authorized only after the public behavior, supported-platform policy, safety evidence, and release procedure below are explicit and reviewed. The `0.3.x` line remains early testing until this gate is complete.
+The `1.0.0` release is the first stable line and is authorized only after the public behavior, supported-platform policy, safety evidence, and release procedure below are explicit and reviewed. The `0.3.x` line remains historical early testing.
 
 ### Contract decision record
 

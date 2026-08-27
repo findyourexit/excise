@@ -1,10 +1,10 @@
 # Getting started
 
-Excise permanently deletes selected filesystem entries. There is no trash or undo. Begin with a disposable directory.
+Excise permanently deletes selected filesystem entries without trash or undo. Begin with a disposable directory.
 
-## The 0.3.0 early-testing release
+## The 1.0.0 stable release
 
-The `0.3.0` release makes the CLI, configuration, and versioned JSON reports the supported product contracts while keeping the Rust implementation modules private by default. It remains early testing; do not use it on irreplaceable data, and do not infer stable support from a successful install. Verify the version and read the [permanent-deletion contract](safety/deletion.md) before making a scan or deletion plan.
+The `1.0.0` release freezes the CLI, configuration, and versioned JSON report contracts. Excise permanently deletes selected entries without trash or undo; begin with a disposable directory, verify the version, and read the [permanent-deletion contract](safety/deletion.md) before making a scan or deletion plan. The preceding `0.3.x` releases were early testing and are superseded.
 
 The project is independent from Diskonaut. Tags `0.1.0` through `0.11.0` are preserved Diskonaut releases, not Excise releases; do not move, reuse, or treat those tags as an Excise installation.
 
@@ -16,7 +16,7 @@ The project is independent from Diskonaut. Tags `0.1.0` through `0.11.0` are pre
 
 The repository pins Rust 1.88 in `rust-toolchain.toml`.
 
-For the planned `1.0.0` support policy, x86_64 Linux, AArch64 macOS, and x86_64 Windows have native runtime evidence. x86_64 macOS, AArch64 Linux, and AArch64 Windows have release artifacts but remain build-only/best-effort until native behavior is demonstrated. Filesystem-provider caveats are documented in [Support](../SUPPORT.md).
+For the `1.0.0` support policy, x86_64 Linux, AArch64 macOS, and x86_64 Windows have native runtime evidence and are fully supported. x86_64 macOS, AArch64 Linux, and AArch64 Windows have release artifacts but remain build-only/best-effort until native behavior is demonstrated. Filesystem-provider caveats are documented in [Support](../SUPPORT.md).
 
 ## Build and run from source
 
@@ -42,12 +42,12 @@ nix build
 ./result/bin/excise /path/to/inspect
 ```
 
-## Install 0.3.0 from a release channel
+## Install 1.0.0 from a release channel
 
-The `0.3.0` package is published on crates.io and compiles locally; it is not one of the prebuilt GitHub archives:
+The `1.0.0` package is published on crates.io and compiles locally; it is not one of the prebuilt GitHub archives:
 
 ```console
-cargo install excise --version 0.3.0 --locked
+cargo install excise --version 1.0.0 --locked
 excise --version
 ```
 
@@ -90,7 +90,7 @@ The TUI requires stdin and stdout attached to TTYs, ANSI rendering, and alternat
 
 ### Current map behavior
 
-The dense half-block map, animated focus chrome, heat ramp, overflow summary, and directed map-layout transitions are included in the published `0.3.0` release. Build the current source above or install `0.3.0` to use them.
+The dense half-block map, animated focus chrome, heat ramp, overflow summary, and directed map-layout transitions are included in the published `1.0.0` release. Build the current source above or install `1.0.0` to use them.
 
 The interactive view uses a dense half-block treemap and animated focus chrome on capable terminals. `--ascii`, monochrome mode, and reduced motion preserve the same selection, scope, and deletion information when those visual effects are unavailable or undesirable.
 
