@@ -86,6 +86,18 @@ The default view uses identity-unique allocated bytes. Pass `--apparent-size` wh
 
 The TUI requires stdin and stdout attached to TTYs, ANSI rendering, and alternate-screen support. It needs a window at least `32 x 8`; smaller windows show a resize message. If a terminal cannot provide these capabilities, use table or JSON mode instead. `--ascii` changes symbols and borders but does not remove the TTY requirement.
 
+### Current-main map behavior (unreleased)
+
+The dense half-block map, animated focus chrome, heat ramp, `geometry::MapOverflow` overflow summary, and directed map-layout transitions described below are current `main` behavior. They are not included in published `0.1.2`; build the current source above to use them.
+
+The interactive view uses a dense half-block treemap and animated focus chrome on capable terminals. `--ascii`, monochrome mode, and reduced motion preserve the same selection, scope, and deletion information when those visual effects are unavailable or undesirable.
+
+In a colour-capable map, ordinary entry colour carries size. The map fits a blue-to-red ramp to the comparable ordinary entries in the folder currently on screen. When comparable sizes produce a distinguishable log-space range, the largest comparable entry is red and the smallest is blue; equal or near-equal sizes that collapse at the ramp's rendering precision rest mid-ramp rather than claiming either extreme. Colour is comparative within one folder, so the same directory can change colour as you drill into it. Aggregated, shared, and uncertain entries keep their own semantic colours and never contribute to or appear on the ramp.
+
+Entries omitted from the final map viewport are collected into one logical `MapOverflow` summary rather than treated as absent or only as individually too-small entries. When the layout can safely reserve a lower-right field, the renderer shows that summary as a textured region; if no drawable field exists, the summary remains available logically but no region or labels are painted. Count and weight labels appear only when the drawable field has enough width and height. When displayed in allocated-size mode, an uncertain total with a zero lower bound is labelled `?`; an exact zero is `0B`; and an uncertain nonzero lower bound uses inclusive ASCII `>=` in ASCII mode (and `≥` otherwise) rather than an exact total. Filter with `/` or zoom with `+` to bring omitted entries back into view.
+
+Directed transitions are map-layout-only: opening an entry grows its contents out of the chosen rectangle. On drill-out, departing contents contract into the pivot while the incoming parent layout grows out of it; pane chrome and other UI stay in place.
+
 ## Noninteractive use
 
 Table and JSON modes run without a TTY, raw mode, or alternate screen, so use them for redirected output, shell pipelines, CI, or terminals without TUI capabilities:
