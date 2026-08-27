@@ -6,7 +6,9 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+* Defined the planned `1.0.0` support matrix: x86_64 Linux, AArch64 macOS, and x86_64 Windows are fully supported by native evidence; the other three published archives remain build-only/best-effort with documented filesystem-provider caveats.
 
 ## [0.3.0] - 2026-08-27
 
