@@ -88,9 +88,9 @@ The default view uses identity-unique allocated bytes. Pass `--apparent-size` wh
 
 The TUI requires stdin and stdout attached to TTYs, ANSI rendering, and alternate-screen support. It needs a window at least `32 x 8`; smaller windows show a resize message. If a terminal cannot provide these capabilities, use table or JSON mode instead. `--ascii` changes symbols and borders but does not remove the TTY requirement.
 
-### 0.2.0 map behavior
+### Current map behavior
 
-The dense half-block map, animated focus chrome, heat ramp, overflow summary, and directed map-layout transitions are included in the published `0.2.0` release. Build the current source above or install `0.2.0` to use them.
+The dense half-block map, animated focus chrome, heat ramp, overflow summary, and directed map-layout transitions are included in the published `0.3.0` release. Build the current source above or install `0.3.0` to use them.
 
 The interactive view uses a dense half-block treemap and animated focus chrome on capable terminals. `--ascii`, monochrome mode, and reduced motion preserve the same selection, scope, and deletion information when those visual effects are unavailable or undesirable.
 
