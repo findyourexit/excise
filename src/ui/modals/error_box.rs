@@ -1,17 +1,25 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::style::Style;
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 
+use crate::theme::Theme;
 use crate::ui::format::display_text;
+use crate::ui::pane::{readable_text_on, render_modal};
 
 pub struct ErrorBox<'a> {
     error_message: &'a str,
+    theme: Theme,
+    ascii: bool,
 }
 
 impl<'a> ErrorBox<'a> {
-    pub const fn new(error_message: &'a str) -> Self {
-        Self { error_message }
+    pub const fn new(error_message: &'a str, theme: Theme, ascii: bool) -> Self {
+        Self {
+            error_message,
+            theme,
+            ascii,
+        }
     }
 }
 
@@ -25,26 +33,22 @@ impl Widget for ErrorBox<'_> {
             width.min(area.width),
             height.min(area.height),
         );
-        Clear.render(rect, buffer);
-        let style = Style::default()
-            .fg(Color::Red)
-            .bg(Color::Black)
-            .add_modifier(Modifier::BOLD);
+        let inner = render_modal(
+            buffer,
+            rect,
+            "! ERROR",
+            self.theme,
+            self.theme.text_danger,
+            self.ascii,
+        );
         Paragraph::new(format!(
             "{}\n\n[Esc] dismiss",
             display_text(self.error_message)
         ))
-        .style(style)
+        .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Double)
-                .border_style(style)
-                .title(" ! ERROR "),
-        )
-        .render(rect, buffer);
+        .render(inner, buffer);
     }
 }
 
@@ -52,13 +56,20 @@ impl Widget for ErrorBox<'_> {
 mod tests {
     use ratatui::widgets::Widget;
 
+    use crate::theme::ThemeId;
+
     use super::*;
 
     #[test]
     fn hostile_error_text_is_escaped_and_marked() {
         let area = Rect::new(0, 0, 40, 9);
         let mut buffer = Buffer::empty(area);
-        ErrorBox::new("permission denied: bad\n\u{202e}name\u{1b}[31m").render(area, &mut buffer);
+        ErrorBox::new(
+            "permission denied: bad\n\u{202e}name\u{1b}[31m",
+            Theme::for_id(ThemeId::ExciseDark),
+            false,
+        )
+        .render(area, &mut buffer);
         let text = buffer.content.iter().fold(String::new(), |mut text, cell| {
             text.push_str(cell.symbol());
             text

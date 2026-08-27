@@ -1,17 +1,25 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::style::Style;
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 
+use crate::theme::Theme;
 use crate::ui::format::display_text;
+use crate::ui::pane::{readable_text_on, render_modal};
 
 pub struct NoticeBox<'a> {
     message: &'a str,
+    theme: Theme,
+    ascii: bool,
 }
 
 impl<'a> NoticeBox<'a> {
-    pub const fn new(message: &'a str) -> Self {
-        Self { message }
+    pub const fn new(message: &'a str, theme: Theme, ascii: bool) -> Self {
+        Self {
+            message,
+            theme,
+            ascii,
+        }
     }
 }
 
@@ -25,23 +33,19 @@ impl Widget for NoticeBox<'_> {
             width,
             height,
         );
-        Clear.render(rect, buffer);
-        let style = Style::default()
-            .fg(Color::Green)
-            .bg(Color::Black)
-            .add_modifier(Modifier::BOLD);
+        let inner = render_modal(
+            buffer,
+            rect,
+            "COMPLETE",
+            self.theme,
+            self.theme.state_complete,
+            self.ascii,
+        );
         Paragraph::new(display_text(self.message))
-            .style(style)
+            .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
-                    .border_style(style)
-                    .title(" COMPLETE "),
-            )
-            .render(rect, buffer);
+            .render(inner, buffer);
     }
 }
 
@@ -49,13 +53,20 @@ impl Widget for NoticeBox<'_> {
 mod tests {
     use ratatui::widgets::Widget;
 
+    use crate::theme::ThemeId;
+
     use super::*;
 
     #[test]
     fn hostile_notice_text_is_escaped_and_marked() {
         let area = Rect::new(0, 0, 40, 9);
         let mut buffer = Buffer::empty(area);
-        NoticeBox::new("complete: bad\n\u{202e}name\u{1b}[31m").render(area, &mut buffer);
+        NoticeBox::new(
+            "complete: bad\n\u{202e}name\u{1b}[31m",
+            Theme::for_id(ThemeId::ExciseDark),
+            false,
+        )
+        .render(area, &mut buffer);
         let text = buffer.content.iter().fold(String::new(), |mut text, cell| {
             text.push_str(cell.symbol());
             text

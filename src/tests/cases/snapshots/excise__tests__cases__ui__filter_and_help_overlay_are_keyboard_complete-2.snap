@@ -4,31 +4,31 @@ expression: normalized
 ---
  EXCISE  /tmp/excise_tests/filter_and_help_overlay  ◆ COMPLETE                                      
  allocated ##.#K   reclaim ##.#K   apparent 12.0K   2 entries                                       
-────────────────────────────────────────────────────────────────────────────────────────────────────
-┌ STORAGE MAP ─────────────────────────────────────────────────────────────────────────────────────┐
-│┌─────────────────────────────────────────────────────────────────────────────────────────────────┤
-││          ╔ EXCISE COMMANDS ═════════════════════════════════════════════════════════╗           │
-││          ║Explore                                                                   ║           │
-││          ║  arrows                 move focus                                       ║           │
-││          ║  h/j/k/l                Vim preset movement                              ║           │
-││          ║  Ctrl-b/n/p/f           Emacs preset movement                            ║           │
-││          ║  Enter                  open or focused rescan                           ║           │
-││          ║  Esc                    parent / cancel                                  ║           │
-││          ║  +  -  0                zoom in / out / reset                            ║           │
-││          ║  /                      exact or glob filter                             ║           │
-││          ║                                                                          ║           │
-││          ║Safety                                                                    ║           │
-││          ║  Backspace              plan permanent deletion                          ║           │
-││          ║  q / Ctrl-c             quit or interruption options                     ║           │
-││          ║  synthetic aggregates   never directly deletable                         ║           │
-││          ║  new/changed entries    skipped by identity plan                         ║           │
-││          ║                                                                          ║           │
-││          ║[Esc/?/q] close help                                                      ║           │
-││          ║                                                                          ║           │
-││          ║                                                                          ║           │
-││          ╚══════════════════════════════════════════════════════════════════════════╝           │
-││                                                                                                 │
-││                                                                                                 │
-└┴─────────────────────────────────────────────────────────────────────────────────────────────────┘
- / filter  arrows/Vim move  Enter open/rescan  Backspace delete  ? help  mem 96.0M/384.0M           
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+▟▐ STORAGE MAP ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▏██████████████████████████████████████████████████████████████████████████████████████████████████▕
+▏███████████▟▐ EXCISE COMMANDS ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜███████████▕
+▏███████████▏Explore                                                                   ▕███████████▕
+▏███████████▏  arrows                 move focus                                       ▕███████████▕
+▏███████████▏  h/j/k/l                Vim preset movement                              ▕███████████▕
+▏███████████▏  Enter                  open or focused rescan                           ▕███████████▕
+▏███████████▏  Esc                    parent / cancel                                  ▕███████████▕
+▏███████████▏  +  -  0                zoom in / out / reset                            ▕███████████▕
+▏███████████▏  /                      exact or glob filter                             ▕███████████▕
+▏███████████▏  e                      export scan report                               ▕███████████▕
+▏███████████▏  t                      cycle themes                                     ▕███████████▕
+▏███████████▏                                                                          ▕███████████▕
+▏███████████▏Safety                                                                    ▕███████████▕
+▔▔▔▔▔▔▔▔▔▔▔▔▏  Backspace              plan permanent deletion                          ▕▔▔▔▔▔▔▔▔▔▔▔▔
+            ▏  q / Ctrl-c             quit or interruption options                     ▕            
+▟▐ INSPECT ▌▏  synthetic aggregates   never directly deletable                         ▕▔▔▔▔▔▔▔▔▔▔▔▜
+▏file2      ▏  new/changed entries    skipped by identity plan                         ▕           ▕
+▏◆ COMPLETE ▏[Esc/?/q] close help                                                      ▕           ▕
+▏allocated #▏                                                                          ▕           ▕
+▏apparent 8.▏                                                                          ▕           ▕
+▏identity  …▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔           ▕
+▏links     # · scope     materialized                                                              ▕
+▏Actions unavailable                                                                               ▕
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+ arrows/hjkl move  Enter open/rescan  / filter  e export  t theme  Backspace delete  ? help         
 Excise · REDUCED MOTION

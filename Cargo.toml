@@ -57,6 +57,7 @@ cap-primitives = "4.0.2"
 clap = { version = "4.6", features = ["derive"] }
 filesize = "0.2.0"
 unicode-width = "0.2.2"
+unicode-segmentation = "1.13.3"
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 crossbeam-channel = "0.5.16"
 directories = "6.0.0"

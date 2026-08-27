@@ -1,16 +1,25 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
+
+use crate::theme::Theme;
+use crate::ui::pane::{readable_text_on, render_modal};
 
 pub struct ConfirmBox {
     save_preferences: bool,
+    theme: Theme,
+    ascii: bool,
 }
 
 impl ConfirmBox {
-    pub const fn new(save_preferences: bool) -> Self {
-        Self { save_preferences }
+    pub const fn new(save_preferences: bool, theme: Theme, ascii: bool) -> Self {
+        Self {
+            save_preferences,
+            theme,
+            ascii,
+        }
     }
 }
 
@@ -24,11 +33,14 @@ impl Widget for ConfirmBox {
             width,
             height,
         );
-        Clear.render(rect, buffer);
-        let style = Style::default()
-            .fg(Color::White)
-            .bg(Color::Black)
-            .add_modifier(Modifier::BOLD);
+        let inner = render_modal(
+            buffer,
+            rect,
+            "EXIT",
+            self.theme,
+            self.theme.focus,
+            self.ascii,
+        );
         let lines = if self.save_preferences {
             vec![
                 Line::from(""),
@@ -45,15 +57,8 @@ impl Widget for ConfirmBox {
             ]
         };
         Paragraph::new(lines)
-            .style(style)
+            .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
             .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
-                    .border_style(style)
-                    .title(" EXIT "),
-            )
-            .render(rect, buffer);
+            .render(inner, buffer);
     }
 }

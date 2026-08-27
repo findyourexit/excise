@@ -311,6 +311,29 @@ impl Theme {
             ),
         }
     }
+
+    /// Returns a stable, theme-local palette for dense map surfaces.
+    ///
+    /// These roles are intentionally derived from the semantic palette so every
+    /// built-in theme, including monochrome and high contrast, remains usable.
+    #[must_use]
+    pub const fn map_color(self, index: usize) -> Color {
+        match index % 8 {
+            0 => self.focus,
+            1 => self.state_shared,
+            2 => self.state_aggregated,
+            3 => self.state_scanning,
+            4 => self.state_rescanning,
+            5 => self.text_danger,
+            6 => self.state_uncertain,
+            _ => self.text_secondary,
+        }
+    }
+
+    #[must_use]
+    pub const fn map_surface(self) -> Color {
+        self.surface_panel
+    }
 }
 
 #[allow(
@@ -396,6 +419,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn map_accents_remain_distinct_from_the_surface() {
+        for id in ThemeId::ALL {
+            let theme = Theme::for_id(id);
+            if id != ThemeId::Monochrome {
+                assert_ne!(theme.map_color(0), theme.surface_base);
+                assert_ne!(theme.map_color(1), theme.surface_base);
+                assert_ne!(theme.map_color(0), theme.map_color(1));
+            }
+        }
+    }
     #[test]
     fn theme_cycle_visits_all_built_ins() {
         let mut current = ThemeId::ExciseDark;
