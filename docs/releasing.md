@@ -42,6 +42,20 @@ The `0.3.0` release packages the private Rust API boundary and compatibility-pol
 
 The `1.0.0` release freezes the CLI, configuration, versioned JSON reports, deletion and accounting semantics, native support policy, and exact-commit distribution procedure described by the v1 contract decision record below. It is the first stable release; later incompatible changes require a major version, while additive report and configuration changes must preserve the documented compatibility rules.
 
+## Approved `1.0.0` publication
+
+The approved stable publication used:
+
+- source commit: `b384a9ca6ac8d4853574083945d4a10d22b16817`;
+- protected-main native verification: https://github.com/findyourexit/excise/actions/runs/33117864079;
+- exact-SHA candidate workflow: https://github.com/findyourexit/excise/actions/runs/33118939870;
+- annotated tag: `v1.0.0`, carrying `candidate-run-id: 33118939870` and pointing to the exact source commit;
+- immutable publication workflow: https://github.com/findyourexit/excise/actions/runs/33119398710;
+- GitHub Release: https://github.com/findyourexit/excise/releases/tag/v1.0.0;
+- first-party Homebrew Tap formula commit: https://github.com/findyourexit/homebrew-tap/commit/9157017d736c23037e100ca6f13317f52c9c8683.
+
+The published bundle contains six target archives, `checksums.sha256`, and `excise.spdx.json`. The checksum manifest, SBOM, archive contents, and all eight GitHub attestations were independently verified after publication. crates.io, cargo-binstall, Homebrew, and the tagged Nix flake each reported `1.0.0`; the support classifications are recorded in [SUPPORT.md](../SUPPORT.md), and corrective-release handling remains governed by [Reruns and rollback](#reruns-and-rollback).
+
 ## Preconditions and clean tree
 
 Only a maintainer may start publication. Before creating a tag, dispatching a candidate, or using a publication credential:
