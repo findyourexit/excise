@@ -579,14 +579,18 @@ fn run_behavior_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
     )?;
     run(
         cargo,
+        "CLI contract smoke",
+        &["test", "--test", "cli_contract_smoke", "--locked"],
+    )?;
+    run(
+        cargo,
+        "native path smoke",
+        &["test", "--test", "native_path_smoke", "--locked"],
+    )?;
+    run(
+        cargo,
         "package verification",
-        &[
-            "package",
-            "--package",
-            "excise",
-            "--locked",
-            "--allow-dirty",
-        ],
+        &["package", "--package", "excise", "--locked"],
     )?;
     run(cargo, "dependency policy", &["deny", "check"])
 }

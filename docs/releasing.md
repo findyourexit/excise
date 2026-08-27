@@ -267,7 +267,7 @@ If a destructive-safety or release-integrity defect is found, stop promotion and
 
 `1.0.0` is authorized only after the public behavior, supported-platform policy, safety evidence, and release procedure below are explicit and reviewed. The `0.3.x` line remains early testing until this gate is complete.
 
-### Contract decisions to freeze
+### Contract decision record
 
 | Area | Required v1 decision | Current position |
 | --- | --- | --- |
@@ -280,14 +280,18 @@ If a destructive-safety or release-integrity defect is found, stop promotion and
 | Accounting | Preserve identity-unique allocated bytes, separate apparent bytes, conservative reclaimable bounds, and explicit unknowns. Do not claim physical shared-extent exactness. | The accounting contract and fixtures are the baseline. |
 | Library API | Treat the CLI, configuration, and versioned reports as the supported product surface. Rust implementation modules are private; the crate-root bridges used by the binary and tooling are hidden and carry no semver guarantee. | The private implementation boundary is implemented; the crate exposes no supported Rust API. |
 | Platforms | Make only native behavioral targets fully supported in `1.0.0`; classify compile/archive-only targets as build-only until native behavior evidence promotes them. | Decision recorded: three native targets are supported; three compile-only archives remain published and explicitly best-effort. |
-| Distribution and governance | Require exact protected-commit artifacts, checksums, SBOM, provenance, rollback, and an explicit release-approval authority. | Artifact identity and rollback are operational; the second-maintainer approval path is not yet established. |
+| Distribution and governance | Require exact protected-commit artifacts, checksums, SBOM, provenance, rollback, and an explicit release-approval authority. | Artifact identity and rollback are operational; the lead-maintainer approval authority is explicit in `GOVERNANCE.md`, with a second-maintainer review to apply when one is appointed. |
+
+The table above is the normative `1.0.0` public-contract decision record. Maintain it through reviewed pull requests; any implementation change that affects a row requires that row to be re-reviewed before release authorization. The current authority is explicit: the lead maintainer listed in `MAINTAINERS.md` owns final product, safety, and release decisions and may authorize publication only after this gate, the protected-main ruleset checks, and the publication-environment approval pass. No second maintainer is currently appointed; when one is appointed, the additional approval requirements in `GOVERNANCE.md` apply.
+
+The release candidate must also record the exact source commit, candidate run, artifact checksums, SBOM, attestations, package-channel results, and reviewer decision against this table. A passing automated check is evidence for its scope; it is not approval for a different scope.
 
 ### Required exit evidence
 
 Before the `v1.0.0` release PR can be approved, attach:
 
 1. a reviewed public-contract decision record covering every row above;
-2. upgrade and compatibility tests for CLI/configuration (including rejection of unsupported versions), table safety and escaping, JSON schemas, native paths, and exit classes;
+2. upgrade and compatibility tests for CLI/configuration (including rejection of unsupported versions), table safety and escaping, JSON schemas, native paths, and exit classes; `tests/cli_contract_smoke.rs` must exercise the binary-level portion of this contract;
 3. native behavioral evidence for every target classified as supported, plus an explicit disposition for build-only targets;
 4. focused security reviews of deletion, identity, spill, terminal restoration, and release supply chain;
 5. dependency, unsafe-boundary, fuzz, benchmark, packaging, SBOM, checksum, and provenance evidence from the exact release commit;

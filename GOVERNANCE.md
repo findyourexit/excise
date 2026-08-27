@@ -3,6 +3,7 @@
 ## Maintainer model
 
 Excise currently uses a lead-maintainer model. The lead maintainer has final responsibility for product direction, safety, releases, and project administration. Delegated authority is recorded in [MAINTAINERS.md](MAINTAINERS.md).
+Until a second maintainer is appointed, the lead maintainer may approve stable releases and material safety or release-trust changes after the required public review, evidence, protected-main ruleset checks, and publication-environment approval. This is the current release authority; it does not imply that a second maintainer exists.
 
 When a second maintainer is appointed:
 

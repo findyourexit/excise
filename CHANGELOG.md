@@ -9,6 +9,9 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 ### Changed
 
 * Defined the planned `1.0.0` support matrix: x86_64 Linux, AArch64 macOS, and x86_64 Windows are fully supported by native evidence; the other three published archives remain build-only/best-effort with documented filesystem-provider caveats.
+* Tightened release verification so Cargo package checks reject dirty tracked or untracked release input, and added binary-level CLI contract smoke coverage for configuration errors, exit classes, JSON schema output, and hostile table paths.
+
+* Recorded the normative `1.0.0` contract decision record and explicit current lead-maintainer release authority.
 
 ## [0.3.0] - 2026-08-27
 
