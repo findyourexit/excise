@@ -2,7 +2,7 @@
 #[test]
 fn headless_json_round_trips_invalid_utf8_filename() -> anyhow::Result<()> {
     use base64::Engine as _;
-    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
     use std::process::Command;
 
     let root = tempfile::tempdir()?;
