@@ -9,7 +9,7 @@ description = "Surgical terminal storage navigator"
 keywords = ["disk-usage", "filesystem", "terminal", "tui"]
 categories = ["command-line-utilities", "filesystem"]
 
-version = "0.1.2"
+version = "0.2.0"
 authors = ["Aram Drevekenin <aram@poor.dev>", "Tom Larcher <tom.larcher@gmail.com>"]
 readme = "README.md"
 homepage = "https://github.com/findyourexit/excise"

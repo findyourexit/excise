@@ -6,9 +6,13 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+_No unreleased changes._
+
+## [0.2.0] - 2026-08-27
+
 ### Added
 
-* Added the current `main` (unreleased) `cargo demo` alias and its `xtask demo` command. `xtask demo` validates `tapes/demo.tape`, stages its rendering under `assets/demo-main.*.gif`, resamples the tape's 24 fps GIF to 20 fps while rebuilding a non-dithered 64-colour palette and applying lossy GIF quantisation, and atomically promotes `assets/demo-main.gif` only after the size gate passes. `assets/demo.gif` remains the published `0.1.2` recording for the historical README. The hosted demo workflow now uses it; the tape and current-main README hero asset were refreshed.
+* Added the `cargo demo` alias and its `xtask demo` command. `xtask demo` validates `tapes/demo.tape`, stages its rendering under `assets/demo-main.*.gif`, resamples the tape's 24 fps GIF to 20 fps while rebuilding a non-dithered 64-colour palette and applying lossy GIF quantisation, and atomically promotes `assets/demo-main.gif` only after the size gate passes. `assets/demo.gif` remains the historical `0.1.2` recording for the README. The hosted demo workflow now uses it; the tape and current-main README hero asset were refreshed.
 
 * Added the public `geometry::MapOverflow` and `TreeMap::overflow() -> Option<geometry::MapOverflow>` APIs. They summarize entries omitted from the final map viewport, retaining their count, byte total, and lower-bound uncertainty even when the layout cannot draw an overflow region.
 
