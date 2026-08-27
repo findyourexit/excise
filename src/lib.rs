@@ -33,8 +33,14 @@ pub use terminal::{
     TerminalSession, TerminalState, TerminalTransition, TerminalTransitionError, validate_terminal,
 };
 
+/// Map layout types.
+///
+/// `Tile` coordinates are terminal columns horizontally and half-rows
+/// vertically, so `HALF_ROWS_PER_CELL` is part of reading a laid-out map.
 pub mod geometry {
-    pub use crate::state::tiles::{FileMetadata, FileType, Tile, TreeMap};
+    /// This summary describes entries that do not fit at the current map size.
+    pub use crate::state::tiles::MapOverflow;
+    pub use crate::state::tiles::{FileMetadata, FileType, HALF_ROWS_PER_CELL, Tile, TreeMap};
 }
 
 #[cfg(test)]
