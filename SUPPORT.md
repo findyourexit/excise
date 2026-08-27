@@ -4,6 +4,23 @@
 
 The `0.3.0` release makes the CLI, configuration, and versioned JSON reports the supported product contracts. Its Rust implementation modules are private by default, while repository-only fuzzing and benchmark access uses explicit feature gates. Support remains best effort, and no early-testing release should be trusted with irreplaceable data. Start with [Getting started](docs/getting-started.md) and a disposable fixture.
 
+## `1.0.0` support matrix
+
+The planned stable runtime support set is:
+
+| Target | `1.0.0` status | Evidence |
+| --- | --- | --- |
+| x86_64 Linux (`x86_64-unknown-linux-gnu`) | Supported | Native CI, native PTY checks, and release archive |
+| AArch64 macOS (`aarch64-apple-darwin`) | Supported | Native CI, native PTY checks, and release archive |
+| x86_64 Windows (`x86_64-pc-windows-msvc`) | Supported | Native CI, native PTY checks, and release archive |
+| x86_64 macOS (`x86_64-apple-darwin`) | Build-only/best-effort | Release compilation and archive only |
+| AArch64 Linux (`aarch64-unknown-linux-gnu`) | Build-only/best-effort | Release compilation and archive only |
+| AArch64 Windows (`aarch64-pc-windows-msvc`) | Build-only/best-effort | Release compilation and archive only |
+
+The three build-only archives remain available for experimentation, but a successful download or compilation is not evidence of native runtime compatibility.
+
+Filesystem-provider-specific ACL, sharing, allocation, network or remote filesystem, reflink, clone, compression, and shared-extent behavior is best-effort unless separately evidenced. Unknown allocation remains explicit. Interactive use requires the documented TTY, ANSI, alternate-screen, and minimum-size capabilities; use table or JSON mode for non-TTY environments.
+
 ## Usage questions
 
 Search the [documentation](docs/README.md) and existing discussions first. Use [GitHub Discussions](https://github.com/findyourexit/excise/discussions) for installation, configuration, and usage questions.

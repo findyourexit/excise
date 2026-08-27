@@ -265,7 +265,7 @@ If a destructive-safety or release-integrity defect is found, stop promotion and
 
 ## v1.0.0 readiness gate
 
-`1.0.0` is authorized only after the public behavior, supported-platform policy, safety evidence, and release procedure below are explicit and reviewed. The `0.2.x` line remains early testing until this gate is complete.
+`1.0.0` is authorized only after the public behavior, supported-platform policy, safety evidence, and release procedure below are explicit and reviewed. The `0.3.x` line remains early testing until this gate is complete.
 
 ### Contract decisions to freeze
 
@@ -279,7 +279,7 @@ If a destructive-safety or release-integrity defect is found, stop promotion and
 | Deletion | Preserve no-follow identity binding, independent enumeration, revalidation, root and synthetic-node rejection, explicit partial results, and the permanent/no-undo contract. | The deletion contract and focused safety suite are the baseline. |
 | Accounting | Preserve identity-unique allocated bytes, separate apparent bytes, conservative reclaimable bounds, and explicit unknowns. Do not claim physical shared-extent exactness. | The accounting contract and fixtures are the baseline. |
 | Library API | Treat the CLI, configuration, and versioned reports as the supported product surface. Rust implementation modules are private; the crate-root bridges used by the binary and tooling are hidden and carry no semver guarantee. | The private implementation boundary is implemented; the crate exposes no supported Rust API. |
-| Platforms | Make only native behavioral targets fully supported in `1.0.0`; classify compile/archive-only targets as build-only until native behavior evidence promotes them. | Linux x86_64, macOS AArch64, and Windows x86_64 have native evidence; the remaining three published targets are build/archive-only. |
+| Platforms | Make only native behavioral targets fully supported in `1.0.0`; classify compile/archive-only targets as build-only until native behavior evidence promotes them. | Decision recorded: three native targets are supported; three compile-only archives remain published and explicitly best-effort. |
 | Distribution and governance | Require exact protected-commit artifacts, checksums, SBOM, provenance, rollback, and an explicit release-approval authority. | Artifact identity and rollback are operational; the second-maintainer approval path is not yet established. |
 
 ### Required exit evidence

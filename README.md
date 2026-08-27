@@ -95,7 +95,7 @@ The provenance check requires the GitHub CLI (`gh`) and a GitHub API-authenticat
 )
 ```
 
-The release provides archives for AArch64 and x86_64 macOS, AArch64 and x86_64 Linux, and x86_64 and AArch64 Windows. The example verifies the selected archive before extraction or execution; verify the remaining release assets before placing a binary on your `PATH`.
+The release provides archives for AArch64 and x86_64 macOS, AArch64 and x86_64 Linux, and x86_64 and AArch64 Windows. For the planned `1.0.0` support policy, x86_64 Linux, AArch64 macOS, and x86_64 Windows are fully supported by native evidence; the other three archives are build-only/best-effort until native behavioral evidence exists.
 
 </details>
 

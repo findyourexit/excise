@@ -16,6 +16,8 @@ The project is independent from Diskonaut. Tags `0.1.0` through `0.11.0` are pre
 
 The repository pins Rust 1.88 in `rust-toolchain.toml`.
 
+For the planned `1.0.0` support policy, x86_64 Linux, AArch64 macOS, and x86_64 Windows have native runtime evidence. x86_64 macOS, AArch64 Linux, and AArch64 Windows have release artifacts but remain build-only/best-effort until native behavior is demonstrated. Filesystem-provider caveats are documented in [Support](../SUPPORT.md).
+
 ## Build and run from source
 
 ```console

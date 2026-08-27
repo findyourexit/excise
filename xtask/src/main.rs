@@ -73,6 +73,17 @@ const WINDOWS_RELEASE_ASSETS: [WindowsReleaseAsset; 2] = [
     },
 ];
 
+const NATIVE_SUPPORT_TARGETS: [&str; 3] = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+];
+const BUILD_ONLY_TARGETS: [&str; 3] = [
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-pc-windows-msvc",
+];
+
 fn main() {
     if let Err(error) = dispatch() {
         eprintln!("verification failed: {error}");
@@ -86,11 +97,12 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
         Some("generate") => write_generated(),
         Some("check-generated") => check_generated(),
         Some("check-distribution") => check_distribution_contract(&release_version()?),
+        Some("check-support-matrix") => check_support_matrix(),
         Some("render-homebrew") => render_homebrew_formula(),
         Some("dist-local") => build_local_dist(),
         Some("demo") => render_demo(),
         _ => Err(io::Error::other(
-            "usage: cargo xtask <verify|generate|check-generated|check-distribution|render-homebrew|dist-local|demo>",
+            "usage: cargo xtask <verify|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo>",
         )
         .into()),
     }
@@ -102,6 +114,90 @@ fn release_version() -> Result<String, Box<dyn Error>> {
         .get_version()
         .ok_or_else(|| io::Error::other("CLI version was absent"))?;
     Ok(version.to_owned())
+}
+
+fn check_support_matrix() -> Result<(), Box<dyn Error>> {
+    let ci = fs::read_to_string(".github/workflows/ci.yml")?;
+    let release = fs::read_to_string(".github/workflows/release.yml")?;
+    let development = fs::read_to_string("docs/development.md")?;
+    let support = fs::read_to_string("SUPPORT.md")?;
+
+    for target in NATIVE_SUPPORT_TARGETS {
+        require_text(&ci, target, "native CI target")?;
+        require_row(
+            &development,
+            target,
+            "Supported in `1.0.0`",
+            "docs/development.md",
+        )?;
+        require_row(&support, target, "| Supported |", "SUPPORT.md")?;
+    }
+    for target in BUILD_ONLY_TARGETS {
+        if ci.contains(target) {
+            return Err(io::Error::other(format!(
+                "build-only target {target} must not appear in the native CI matrix"
+            ))
+            .into());
+        }
+        require_text(&release, target, "release archive target")?;
+        require_row(
+            &development,
+            target,
+            "Build-only/best-effort",
+            "docs/development.md",
+        )?;
+        require_row(&support, target, "Build-only/best-effort", "SUPPORT.md")?;
+    }
+    require_text(
+        &development,
+        "Filesystem-provider-specific",
+        "filesystem caveat in docs/development.md",
+    )?;
+    require_text(
+        &support,
+        "Filesystem-provider-specific",
+        "filesystem caveat in SUPPORT.md",
+    )?;
+
+    for asset in UNIX_RELEASE_ASSETS {
+        require_text(&release, asset.target, "Unix release target")?;
+    }
+    for asset in WINDOWS_RELEASE_ASSETS {
+        require_text(&release, asset.target, "Windows release target")?;
+    }
+    println!(
+        "Support matrix validated: {} native targets, {} build-only targets.",
+        NATIVE_SUPPORT_TARGETS.len(),
+        BUILD_ONLY_TARGETS.len()
+    );
+    Ok(())
+}
+
+fn require_text(contents: &str, needle: &str, description: &str) -> Result<(), Box<dyn Error>> {
+    if contents.contains(needle) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("missing {description}: {needle}")).into())
+    }
+}
+
+fn require_row(
+    contents: &str,
+    target: &str,
+    marker: &str,
+    source: &str,
+) -> Result<(), Box<dyn Error>> {
+    if contents
+        .lines()
+        .any(|line| line.contains(target) && line.contains(marker))
+    {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{source} has no support row for {target} marked {marker}"
+        ))
+        .into())
+    }
 }
 
 /// Frames per second the published recording keeps.
@@ -400,6 +496,7 @@ fn verify() -> Result<(), Box<dyn Error>> {
     run_behavior_checks(&cargo)?;
     check_generated()?;
     check_distribution_contract(&release_version()?)?;
+    check_support_matrix()?;
     run_dynamic_checks(&cargo)?;
 
     println!("\nLocal verification passed.");

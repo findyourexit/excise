@@ -15,20 +15,28 @@ rustup target add \
   x86_64-pc-windows-msvc
 ```
 
-A host may not be able to install every target. The published target set has separate native-behavior and release-artifact evidence.
+The published target set has separate native-behavior and release-artifact evidence. The `1.0.0` support policy is runtime evidence first: only native behavioral targets are fully supported.
 
 ## Target evidence
 
 | Target | Support classification | Published evidence |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` (x86_64 Linux) | Native behavioral target | Native verification plus hosted release build/archive |
-| `aarch64-apple-darwin` (AArch64 macOS) | Native behavioral target | Native verification plus hosted release build/archive |
-| `x86_64-pc-windows-msvc` (x86_64 Windows) | Native behavioral target | Native verification plus hosted release build/archive |
-| `x86_64-apple-darwin` (x86_64 macOS) | Release target; compile/archive only | Hosted release build/archive job |
-| `aarch64-unknown-linux-gnu` (AArch64 Linux) | Release target; compile/archive only | Hosted release build/archive job |
-| `aarch64-pc-windows-msvc` (AArch64 Windows) | Release target; compile/archive only | Hosted release build/archive job |
+| `x86_64-unknown-linux-gnu` (x86_64 Linux) | Supported in `1.0.0`; native behavioral target | Native verification plus hosted release build/archive |
+| `aarch64-apple-darwin` (AArch64 macOS) | Supported in `1.0.0`; native behavioral target | Native verification plus hosted release build/archive |
+| `x86_64-pc-windows-msvc` (x86_64 Windows) | Supported in `1.0.0`; native behavioral target | Native verification plus hosted release build/archive |
+| `x86_64-apple-darwin` (x86_64 macOS) | Build-only/best-effort; compile/archive only | Hosted release build/archive job |
+| `aarch64-unknown-linux-gnu` (AArch64 Linux) | Build-only/best-effort; compile/archive only | Hosted release build/archive job |
+| `aarch64-pc-windows-msvc` (AArch64 Windows) | Build-only/best-effort; compile/archive only | Hosted release build/archive job |
 
-Only the native behavioral rows carry published runtime-behavior evidence. For `1.0.0`, only those rows should be classified as fully supported; compile-only targets must remain build-only or best-effort until native behavior is demonstrated. A successful hosted build or archive demonstrates release compilation and packaging, not native runtime compatibility.
+The native behavioral rows are the complete `1.0.0` runtime support set. The release pipeline continues to publish all six archives, but the three compile-only targets carry no native runtime guarantee and remain best-effort until promoted by native evidence. A successful hosted build or archive demonstrates release compilation and packaging, not native runtime compatibility.
+
+The target rows and workflow matrices are checked by `cargo run --locked --package xtask -- check-support-matrix` and are included in `cargo verify`.
+
+## Filesystem and terminal scope
+
+The supported runtime target policy applies to local filesystem paths accessed through the documented operating-system APIs. Filesystem-provider-specific ACL, sharing, allocation, network or remote filesystem, reflink, clone, compression, and shared-extent behavior is best-effort unless separately evidenced; unknown allocation remains explicit rather than guessed.
+
+Interactive support requires stdin and stdout TTYs, ANSI rendering, alternate-screen support, and a window at least `32 x 8`. Table and JSON modes are the supported non-TTY path for redirection, pipelines, CI, and terminals without those capabilities.
 
 ## Fast feedback
 
