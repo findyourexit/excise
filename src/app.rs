@@ -23,10 +23,12 @@ use crate::report::{
     write_scan_report_json,
 };
 use crate::state::files::FileTree;
-use crate::state::tiles::Board;
+use crate::state::tiles::{Board, Pivot};
 use crate::state::{FileToDelete, UiEffects};
 use crate::theme::Theme;
 use crate::ui::Display;
+use crate::ui::palette::ColorCycle;
+
 const MIB: usize = 1024 * 1024;
 const MINIMUM_PLAN_BYTES: usize = 4 * 1024;
 
@@ -235,6 +237,7 @@ where
         if full_screen_size.width < 32 || full_screen_size.height < 8 {
             self.ui_mode = UiMode::ScreenTooSmall;
         }
+        let selection_before = self.board.currently_selected().is_some();
         self.display.render(
             &self.file_tree,
             &mut self.board,
@@ -247,11 +250,25 @@ where
             ascii,
             monochrome,
             self.keymap,
+            self.custom_keys.as_ref(),
             self.mouse_enabled,
             self.delete_confirmation_disabled,
             reduced_motion,
         )?;
-        self.dirty = false;
+        let has_selection = self.board.currently_selected().is_some();
+        // Rendering lays out the board and can establish or clear its selection.
+        let selection_changed =
+            matches!(&self.ui_mode, UiMode::Normal) && selection_before != has_selection;
+        let animate_focus = matches!(&self.ui_mode, UiMode::Normal)
+            && has_selection
+            && ColorCycle::can_animate(theme.focus);
+        animation.set_activity(animate_focus);
+        // The map tween runs on wall-clock time, so the loop has to keep waking up
+        // until it settles; nothing else in the frame would ask for those frames.
+        animation.set_geometry_active(self.board.is_transitioning());
+        // The workspace pane observes selection before board layout. Queue one
+        // corrective draw whenever layout changes that selection.
+        self.dirty = selection_changed;
         Ok(true)
     }
 
@@ -453,25 +470,45 @@ where
     }
 
     pub fn enter_selected(&mut self) {
-        self.board.record_current_index_and_zoom_level();
-        if let Some(tile) = self.board.currently_selected()
-            && self.file_tree.enter_folder(tile.node_id)
-        {
-            self.board.reset_zoom_index();
-            self.board.reset_selected_index();
-            self.render_and_update_board();
+        let Some(target) = self.board.currently_selected().map(|tile| tile.node_id) else {
+            return;
+        };
+        let pivot = self
+            .board
+            .selected_rendered_geometry()
+            .or_else(|| self.board.selected_geometry());
+        // Nothing is recorded and nothing moves unless the folder actually opens:
+        // pressing Enter on a file used to push a history entry and arm a
+        // transition that the next unrelated refresh would then play back.
+        if !self.file_tree.enter_folder(target) {
+            return;
         }
+        self.board.record_current_zoom_level();
+        if let Some(pivot) = pivot {
+            self.board.pivot_transition_on_geometry(pivot);
+        }
+        self.board.reset_zoom_index();
+        self.board.reset_selected_index();
+        self.render_and_update_board();
     }
 
     pub fn go_up(&mut self) -> bool {
+        let leaving = self.file_tree.current_id();
         let succeeded = self.file_tree.leave_folder();
-        if let Some((index, zoom_level)) = self.board.pop_previous_index_and_zoom_level() {
-            if let Some(index) = index {
-                self.board.set_selected_index(index);
-            }
+        if let Some(zoom_level) = self.board.pop_previous_zoom_level() {
             self.board.set_zoom_index(zoom_level);
         }
+        if succeeded {
+            // The folder being left becomes the pivot: its contents collapse into
+            // the rectangle it occupies in the parent, and the parent grows out of
+            // the same rectangle. The cursor lands on it too, so the reader comes
+            // back out standing where they went in.
+            self.board.pivot_transition_on(Pivot::Entry(leaving));
+        }
         self.render_and_update_board();
+        if succeeded && !self.board.select_node(leaving) {
+            self.board.select_largest();
+        }
         succeeded
     }
 
@@ -964,7 +1001,11 @@ fn model_error(error: ModelError) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::backend::TestBackend;
+    use std::sync::{Arc, Mutex};
+
+    use ratatui::backend::{Backend, TestBackend};
+
+    use crate::tests::fakes::TestBackend as ResizableTestBackend;
 
     #[cfg(unix)]
     use crate::deletion::{PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan};
@@ -974,6 +1015,507 @@ mod tests {
     use crate::state::tiles::FileType;
 
     use super::*;
+
+    fn map_entry(id: u32, percentage: f64) -> crate::state::tiles::FileMetadata {
+        crate::state::tiles::FileMetadata {
+            node_id: crate::model::NodeId(id),
+            name: std::ffi::OsString::from(format!("entry-{id}")),
+            size: 4096,
+            apparent_size: 4096,
+            descendants: None,
+            percentage,
+            file_type: crate::state::tiles::FileType::File,
+            synthetic_kind: None,
+            uncertain: false,
+        }
+    }
+
+    fn add_fixture_entry(app: &mut App<TestBackend>, path: &std::path::Path) {
+        let metadata = std::fs::symlink_metadata(path).expect("fixture metadata should exist");
+        let identity = crate::native_path::identity_for(path, &metadata)
+            .expect("fixture identity should be readable")
+            .expect("fixture should not be a link");
+        app.add_entry_to_base_folder(&metadata, path.to_path_buf(), identity)
+            .expect("fixture entry should be added");
+    }
+
+    fn draw<B: Backend>(app: &mut App<B>, animation: &mut AnimationScheduler, now: u64) {
+        app.mark_dirty();
+        app.render_if_dirty(
+            animation,
+            Duration::from_millis(now),
+            "test",
+            Theme::for_id(crate::theme::ThemeId::ExciseDark),
+            true,
+            false,
+            false,
+        )
+        .expect("render should succeed");
+    }
+
+    #[test]
+    fn a_map_tween_keeps_the_frame_clock_running_until_it_settles() {
+        let root = tempfile::tempdir().expect("temp dir should be created");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+
+        app.board
+            .change_files(vec![map_entry(1, 0.6), map_entry(2, 0.4)]);
+        draw(&mut app, &mut animation, 0);
+        assert!(!app.board.is_list_layout());
+        assert_eq!(animation.next_frame_at(), None);
+
+        // A new dataset arms the layout tween; nothing else in the frame would ask
+        // the owner loop to wake up for it.
+        app.board
+            .change_files(vec![map_entry(1, 0.2), map_entry(2, 0.8)]);
+        draw(&mut app, &mut animation, 10);
+        assert!(app.board.is_transitioning());
+        assert_eq!(
+            animation.next_frame_at(),
+            Some(Duration::from_millis(10) + crate::animation::ACTIVE_FRAME_INTERVAL)
+        );
+
+        draw(&mut app, &mut animation, 400);
+        assert!(!app.board.is_transitioning());
+        assert_eq!(animation.next_frame_at(), None);
+    }
+
+    #[test]
+    fn resizing_from_too_small_to_a_map_arms_focus_activity_after_layout() {
+        let root = tempfile::tempdir().expect("temp dir should be created");
+        let terminal_events = Arc::new(Mutex::new(Vec::new()));
+        let draw_events = Arc::new(Mutex::new(Vec::new()));
+        let terminal_width = Arc::new(Mutex::new(31));
+        let terminal_height = Arc::new(Mutex::new(8));
+        let backend = ResizableTestBackend::new(
+            terminal_events,
+            draw_events,
+            Arc::clone(&terminal_width),
+            Arc::clone(&terminal_height),
+        );
+        let mut app = App::new(
+            backend,
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+
+        app.loaded = true;
+        app.ui_mode = UiMode::Normal;
+        app.board
+            .change_files(vec![map_entry(1, 0.6), map_entry(2, 0.4)]);
+        draw(&mut app, &mut animation, 0);
+        assert!(matches!(&app.ui_mode, UiMode::ScreenTooSmall));
+        assert!(app.board.currently_selected().is_none());
+        assert_eq!(animation.next_frame_at(), None);
+
+        *terminal_width
+            .lock()
+            .expect("terminal width should be writable") = 160;
+        *terminal_height
+            .lock()
+            .expect("terminal height should be writable") = 48;
+        app.reset_ui_mode();
+        assert!(matches!(&app.ui_mode, UiMode::Normal));
+        draw(&mut app, &mut animation, 10);
+
+        assert!(app.board.currently_selected().is_some());
+        assert!(
+            !app.board.is_transitioning(),
+            "the initial valid layout must not be what keeps the frame clock running"
+        );
+        assert!(
+            animation.is_running(),
+            "the new selection must activate focused chrome immediately"
+        );
+        assert!(animation.next_frame_at().is_some());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the resize regression covers every non-animated focus mode together"
+    )]
+    fn resizing_from_too_small_to_a_map_queues_pane_correction_without_activity() {
+        for (case, theme_id, monochrome, reduced_motion) in [
+            (
+                "reduced motion",
+                crate::theme::ThemeId::ExciseDark,
+                false,
+                true,
+            ),
+            ("monochrome", crate::theme::ThemeId::ExciseDark, true, false),
+            (
+                "non-RGB focus",
+                crate::theme::ThemeId::HighContrast,
+                false,
+                false,
+            ),
+        ] {
+            let root = tempfile::tempdir().expect("temp dir should be created");
+            let terminal_events = Arc::new(Mutex::new(Vec::new()));
+            let draw_events = Arc::new(Mutex::new(Vec::new()));
+            let terminal_width = Arc::new(Mutex::new(31));
+            let terminal_height = Arc::new(Mutex::new(8));
+            let backend = ResizableTestBackend::new(
+                terminal_events,
+                Arc::clone(&draw_events),
+                Arc::clone(&terminal_width),
+                Arc::clone(&terminal_height),
+            );
+            let mut app = App::new(
+                backend,
+                root.path().to_path_buf(),
+                false,
+                false,
+                128,
+                KeyPreset::Vim,
+                None,
+                false,
+            )
+            .expect("app should initialize");
+            let mut animation = AnimationScheduler::new(reduced_motion, monochrome, Duration::ZERO);
+
+            app.loaded = true;
+            app.ui_mode = UiMode::Normal;
+            app.board
+                .change_files(vec![map_entry(1, 0.6), map_entry(2, 0.4)]);
+            app.render_if_dirty(
+                &mut animation,
+                Duration::ZERO,
+                "test",
+                Theme::for_id(theme_id),
+                true,
+                monochrome,
+                reduced_motion,
+            )
+            .expect("too-small render should succeed");
+
+            *terminal_width
+                .lock()
+                .expect("terminal width should be writable") = 160;
+            *terminal_height
+                .lock()
+                .expect("terminal height should be writable") = 48;
+            app.reset_ui_mode();
+            assert!(matches!(&app.ui_mode, UiMode::Normal));
+
+            assert!(
+                app.render_if_dirty(
+                    &mut animation,
+                    Duration::from_millis(10),
+                    "test",
+                    Theme::for_id(theme_id),
+                    true,
+                    monochrome,
+                    reduced_motion,
+                )
+                .expect("valid resize render should succeed"),
+                "{case} should render the resized map"
+            );
+            assert!(app.board.currently_selected().is_some());
+            assert_eq!(
+                animation.next_frame_at(),
+                None,
+                "{case} should not depend on activity to redraw the pane"
+            );
+            assert!(
+                app.dirty,
+                "{case} should queue the active-pane correction without input"
+            );
+
+            assert!(
+                app.render_if_dirty(
+                    &mut animation,
+                    Duration::from_millis(11),
+                    "test",
+                    Theme::for_id(theme_id),
+                    true,
+                    monochrome,
+                    reduced_motion,
+                )
+                .expect("corrective render should succeed"),
+                "{case} should perform the queued correction"
+            );
+            assert!(
+                !app.dirty,
+                "{case} correction should settle the dirty state"
+            );
+            assert_eq!(
+                draw_events
+                    .lock()
+                    .expect("draw events should be readable")
+                    .len(),
+                2,
+                "{case} should draw once for layout and once for the active pane"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the resize regression covers every focus mode together"
+    )]
+    fn resizing_to_an_empty_map_queues_pane_correction_after_selection_removal() {
+        for (case, theme_id, monochrome, reduced_motion) in [
+            (
+                "animated focus",
+                crate::theme::ThemeId::ExciseDark,
+                false,
+                false,
+            ),
+            (
+                "reduced motion",
+                crate::theme::ThemeId::ExciseDark,
+                false,
+                true,
+            ),
+            ("monochrome", crate::theme::ThemeId::ExciseDark, true, false),
+            (
+                "non-RGB focus",
+                crate::theme::ThemeId::HighContrast,
+                false,
+                false,
+            ),
+        ] {
+            let root = tempfile::tempdir().expect("temp dir should be created");
+            let terminal_events = Arc::new(Mutex::new(Vec::new()));
+            let draw_events = Arc::new(Mutex::new(Vec::new()));
+            let terminal_width = Arc::new(Mutex::new(71));
+            let terminal_height = Arc::new(Mutex::new(48));
+            let backend = ResizableTestBackend::new(
+                terminal_events,
+                Arc::clone(&draw_events),
+                Arc::clone(&terminal_width),
+                Arc::clone(&terminal_height),
+            );
+            let mut app = App::new(
+                backend,
+                root.path().to_path_buf(),
+                false,
+                false,
+                128,
+                KeyPreset::Vim,
+                None,
+                false,
+            )
+            .expect("app should initialize");
+            let mut animation = AnimationScheduler::new(reduced_motion, monochrome, Duration::ZERO);
+
+            app.loaded = true;
+            app.ui_mode = UiMode::Normal;
+            // The list can select entries that a map must summarize as overflow.
+            app.board
+                .change_files(vec![map_entry(1, 0.0), map_entry(2, 0.0)]);
+            assert!(
+                app.render_if_dirty(
+                    &mut animation,
+                    Duration::ZERO,
+                    "test",
+                    Theme::for_id(theme_id),
+                    true,
+                    monochrome,
+                    reduced_motion,
+                )
+                .expect("narrow list render should succeed")
+            );
+            assert!(app.board.is_list_layout());
+            assert!(app.board.currently_selected().is_some());
+            assert!(
+                app.dirty,
+                "{case} list layout should queue its initial correction"
+            );
+            assert!(
+                app.render_if_dirty(
+                    &mut animation,
+                    Duration::from_millis(1),
+                    "test",
+                    Theme::for_id(theme_id),
+                    true,
+                    monochrome,
+                    reduced_motion,
+                )
+                .expect("initial list correction should succeed")
+            );
+            assert!(!app.dirty);
+            let draws_before_resize = draw_events
+                .lock()
+                .expect("draw events should be readable")
+                .len();
+
+            *terminal_width
+                .lock()
+                .expect("terminal width should be writable") = 160;
+            app.mark_dirty();
+            assert!(
+                app.render_if_dirty(
+                    &mut animation,
+                    Duration::from_millis(10),
+                    "test",
+                    Theme::for_id(theme_id),
+                    true,
+                    monochrome,
+                    reduced_motion,
+                )
+                .expect("wide map render should succeed"),
+                "{case} should render the resized map"
+            );
+            assert!(!app.board.is_list_layout());
+            assert!(app.board.currently_selected().is_none());
+            assert_eq!(
+                animation.next_frame_at(),
+                None,
+                "{case} should not depend on activity to redraw the pane"
+            );
+            assert!(
+                app.dirty,
+                "{case} should queue the inactive-pane correction without input"
+            );
+
+            assert!(
+                app.render_if_dirty(
+                    &mut animation,
+                    Duration::from_millis(11),
+                    "test",
+                    Theme::for_id(theme_id),
+                    true,
+                    monochrome,
+                    reduced_motion,
+                )
+                .expect("corrective render should succeed"),
+                "{case} should perform the queued correction"
+            );
+            assert!(
+                !app.dirty,
+                "{case} correction should settle the dirty state"
+            );
+            assert_eq!(
+                draw_events
+                    .lock()
+                    .expect("draw events should be readable")
+                    .len(),
+                draws_before_resize + 2,
+                "{case} should draw once for layout and once for the inactive pane"
+            );
+        }
+    }
+
+    #[test]
+    fn entering_a_folder_mid_tween_uses_its_rendered_rectangle_as_the_pivot() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let folder = root.path().join("folder");
+        let first = folder.join("first");
+        let second = folder.join("second");
+        std::fs::create_dir(&folder).expect("fixture folder should be created");
+        std::fs::write(&first, b"first").expect("first fixture should be written");
+        std::fs::write(&second, b"second").expect("second fixture should be written");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            true,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        for path in [folder.as_path(), first.as_path(), second.as_path()] {
+            add_fixture_entry(&mut app, path);
+        }
+        for path in [folder.as_path(), root.path()] {
+            app.complete_directory(path, None)
+                .expect("fixture directory should complete");
+        }
+        app.finalize_scan().expect("fixture tree should finalize");
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 120, 24));
+        app.render_and_update_board();
+        app.board.advance_geometry(Duration::ZERO, true);
+
+        let settled_rendered = app
+            .board
+            .selected_rendered_rect()
+            .expect("a settled map should render its selection");
+        let settled_target = app
+            .board
+            .selected_rect()
+            .expect("a settled map should have a selection");
+        assert_eq!(settled_rendered, settled_target);
+
+        app.board
+            .change_area(ratatui::layout::Rect::new(8, 3, 140, 32));
+        app.board.advance_geometry(Duration::ZERO, false);
+        app.board.advance_geometry(Duration::from_millis(80), false);
+        assert!(app.board.is_transitioning());
+        let rendered = app
+            .board
+            .selected_rendered_rect()
+            .expect("the selected entry should still be rendered mid-tween");
+        let target = app
+            .board
+            .selected_rect()
+            .expect("the selected entry should have a target rectangle");
+        assert_ne!(rendered, target);
+
+        app.enter_selected();
+        app.board.advance_geometry(Duration::from_millis(81), false);
+
+        let child_origin = app
+            .board
+            .selected_rendered_rect()
+            .expect("opening the fixture folder should render its selected entry");
+        assert_eq!(child_origin, rendered);
+        assert_ne!(child_origin, target);
+    }
+
+    #[test]
+    fn a_frame_that_hides_the_map_settles_the_tween_instead_of_holding_the_clock() {
+        let root = tempfile::tempdir().expect("temp dir should be created");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+
+        app.board
+            .change_files(vec![map_entry(1, 0.6), map_entry(2, 0.4)]);
+        draw(&mut app, &mut animation, 0);
+        app.board
+            .change_files(vec![map_entry(1, 0.2), map_entry(2, 0.8)]);
+        assert!(app.board.is_transitioning());
+
+        app.ui_mode = UiMode::ScreenTooSmall;
+        draw(&mut app, &mut animation, 10);
+
+        assert!(!app.board.is_transitioning());
+        assert_eq!(animation.next_frame_at(), None);
+    }
 
     fn report(estimated_bytes: usize) -> DeletionReport {
         DeletionReport {
