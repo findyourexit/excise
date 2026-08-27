@@ -52,37 +52,210 @@ fn metric_value_range(line: &str, marker: &str) -> Option<std::ops::Range<usize>
     Some(value_start..value_end)
 }
 
+const CANONICAL_IDENTITY: &str = "Inode { device_id: ########, inode_number: ######## }";
+const IDENTITY_VARIANTS: [&str; 3] = ["Inode", "LowRes", "HighRes"];
+
+/// Canonical identity text, fitted to the width the inspector cell offers.
+///
+/// The value is ASCII, so character count and display width agree.
+fn canonical_identity(width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if CANONICAL_IDENTITY.width() <= width {
+        let mut value = CANONICAL_IDENTITY.to_string();
+        value.extend(std::iter::repeat_n(' ', width - CANONICAL_IDENTITY.width()));
+        return value;
+    }
+    let mut value: String = CANONICAL_IDENTITY.chars().take(width - 1).collect();
+    value.push('…');
+    value
+}
+
+/// Returns the byte length of an inspector middle-truncation marker.
+fn identity_truncation_marker_len(value: &str) -> Option<usize> {
+    if value.starts_with("[...]") {
+        Some("[...]".len())
+    } else {
+        value.starts_with("[..]").then_some("[..]".len())
+    }
+}
+
+/// Returns the byte length of a canonical identity at the front of a cell.
+///
+/// Snapshots are normalised before `insta` compares them, so this must accept
+/// both the full placeholder value and a prefix which ends at its ellipsis.
+/// Keeping that exception exact prevents an ASCII grid overlay from becoming
+/// part of the identity merely because a complete variant came before it.
+fn canonical_identity_end(value: &str) -> Option<usize> {
+    if let Some(remainder) = value.strip_prefix(CANONICAL_IDENTITY) {
+        let padding = remainder
+            .chars()
+            .take_while(|character| *character == ' ')
+            .map(char::len_utf8)
+            .sum::<usize>();
+        return Some(CANONICAL_IDENTITY.len() + padding);
+    }
+
+    let prefix_len = value
+        .bytes()
+        .zip(CANONICAL_IDENTITY.bytes())
+        .take_while(|(actual, expected)| actual == expected)
+        .count();
+    (prefix_len > 0
+        && value
+            .get(prefix_len..)
+            .is_some_and(|remainder| remainder.starts_with('…')))
+    .then_some(prefix_len + '…'.len_utf8())
+}
+
+/// Returns the byte offset where a rendered identity cell ends.
+///
+/// `PANE_BORDER_SET` uses `▟ ▜ ▔ ▏ ▕ ▐ ▌`, and `dense_grid` uses
+/// `▀ ░ ▒ ▓ █ ·`, so any non-ASCII glyph ends a cell unless it immediately
+/// follows an exact inspector truncation marker. ASCII grid shades do too.
+/// Canonical normalizer output is recognised separately above, which keeps its
+/// placeholder hashes and ellipsis idempotent without treating overlay paint
+/// as identity text.
+fn identity_cell_content_end(value: &str, structured_identity: bool) -> usize {
+    if let Some(end) = canonical_identity_end(value) {
+        return end;
+    }
+
+    let mut end = 0;
+    let mut after_truncation_marker = false;
+    while let Some(rest) = value.get(end..) {
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        if let Some(marker_len) = identity_truncation_marker_len(rest) {
+            end += marker_len;
+            after_truncation_marker = true;
+            continue;
+        }
+        if !character.is_ascii() {
+            if character == '…' && (after_truncation_marker || structured_identity) {
+                end += character.len_utf8();
+                continue;
+            }
+            break;
+        }
+        if character == '|' {
+            break;
+        }
+        if structured_identity {
+            if matches!(character, '-' | '=' | '+' | '#' | '.') {
+                break;
+            }
+            after_truncation_marker = false;
+            end += character.len_utf8();
+            continue;
+        }
+        if matches!(character, '\n' | '\r' | '-' | '=' | '+' | '#' | '.') {
+            break;
+        }
+        after_truncation_marker = false;
+        end += character.len_utf8();
+    }
+    end
+}
+
+/// Reports whether a partial variant is interrupted by an actual truncation marker.
+fn has_truncated_identity_variant(value: &str) -> bool {
+    IDENTITY_VARIANTS.iter().any(|variant| {
+        (1..variant.len()).any(|prefix_len| {
+            value
+                .strip_prefix(&variant[..prefix_len])
+                .is_some_and(|rest| identity_truncation_marker_len(rest).is_some())
+        })
+    })
+}
+
+fn has_identity_overlay_after(value: &str, content_end: usize) -> bool {
+    value.get(content_end..).is_some_and(|suffix| {
+        suffix
+            .chars()
+            .find(|character| !character.is_whitespace())
+            .is_some_and(|character| {
+                matches!(
+                    character,
+                    '▔' | '▟'
+                        | '▜'
+                        | '▏'
+                        | '▐'
+                        | '▌'
+                        | '░'
+                        | '▒'
+                        | '▓'
+                        | '█'
+                        | '·'
+                        | '-'
+                        | '='
+                        | '+'
+                        | '#'
+                        | '.'
+                )
+            })
+    })
+}
+
+/// Reports whether the marker begins immediately inside an inspector or modal cell.
+///
+/// A map label can use the same words as a filesystem identity, but it cannot
+/// begin directly after the cell's left vertical frame.
+fn is_identity_cell_left_edge(character: char) -> bool {
+    matches!(character, '▏' | '│' | '║' | '|')
+}
+
+/// Replaces an identity cell with one canonical value of the same width.
+///
+/// Identity carries filesystem numbers whose digit counts vary by machine, and
+/// Windows reports a different identity variant entirely, so the inspector's
+/// truncation lands on a different character on every platform. An overlay can
+/// also clip the cell down to one character of the variant name, which is
+/// still `I` on Unix and `L` or `H` on Windows. Replacing the whole cell — rather
+/// than masking digits inside it — is what keeps these frames comparable across
+/// the targets CI runs.
 fn normalize_identity_cell(line: &str) -> String {
-    let Some((start, marker)) = ["identity  ", "identity "].into_iter().find_map(|marker| {
+    let Some((start, marker, end)) = ["identity  ", "identity "].into_iter().find_map(|marker| {
         let start = line.find(marker)?;
         let value_start = start + marker.len();
-        let value = line.get(value_start..)?;
-        (value.starts_with("Inod") || value.starts_with("LowR") || value.starts_with("HighR"))
-            .then_some((start, marker))
+        let rest = line.get(value_start..)?;
+        let has_complete_variant = IDENTITY_VARIANTS
+            .iter()
+            .any(|variant| rest.starts_with(variant));
+        let has_truncated_variant = has_truncated_identity_variant(rest);
+        let structured_identity = IDENTITY_VARIANTS.iter().any(|variant| {
+            rest.strip_prefix(variant)
+                .is_some_and(|suffix| suffix.starts_with(" {"))
+        }) || has_truncated_variant;
+        let content_end = identity_cell_content_end(rest, structured_identity);
+        let end = value_start + content_end;
+        let value = line.get(value_start..end)?.trim_end();
+        let has_abbreviated_variant = !has_complete_variant
+            && IDENTITY_VARIANTS
+                .iter()
+                .any(|variant| variant.starts_with(value))
+            && has_identity_overlay_after(rest, content_end);
+        let is_inspector_or_modal_cell = line[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_identity_cell_left_edge);
+        (!value.is_empty()
+            && is_inspector_or_modal_cell
+            && (has_complete_variant || has_abbreviated_variant || has_truncated_variant))
+            .then_some((start, marker, end))
     }) else {
         return line.to_string();
     };
-    let Some(relative_end) = line[start..].find(['│', '║']) else {
-        return line.to_string();
-    };
-    let end = start + relative_end;
-    let cell = &line[start..end];
-    let cell_width = cell.width();
+    let cell_width = line[start..end].width();
 
-    let canonical = if marker == "identity " {
-        let full = "identity Inode { device_id: ########, inode_number: ######## }";
-        let truncated = "identity Inode { device_id: ########, inode_number: …";
-        let target_width: usize = if cell_width < full.width() { 54 } else { 76 };
-        let value = if target_width == 54 { truncated } else { full };
-        let mut canonical = value.to_string();
-        canonical.extend(std::iter::repeat_n(
-            ' ',
-            target_width.saturating_sub(canonical.width()),
-        ));
-        canonical
-    } else {
-        "identity  Inod[...]ber: ######## }".to_string()
-    };
+    let mut canonical = String::with_capacity(cell_width);
+    canonical.push_str(marker);
+    canonical.push_str(&canonical_identity(
+        cell_width.saturating_sub(marker.width()),
+    ));
+
     let mut normalized = String::with_capacity(line.len());
     normalized.push_str(&line[..start]);
     normalized.push_str(&canonical);
@@ -94,9 +267,13 @@ fn normalize_snapshot(frame: &str) -> String {
     let mut normalized = String::with_capacity(frame.len());
     for raw_line in frame.split_inclusive('\n') {
         let line = normalize_identity_cell(raw_line);
-        let identity_start = line
-            .find("identity ")
-            .map_or(usize::MAX, |index| index + "identity ".len());
+        let identity_start = (line != raw_line)
+            .then(|| {
+                line.find("identity ")
+                    .map(|index| index + "identity ".len())
+            })
+            .flatten()
+            .unwrap_or(usize::MAX);
         let links_start = line
             .find("links ")
             .map_or(usize::MAX, |index| index + "links ".len());
@@ -133,6 +310,171 @@ fn normalize_snapshot(frame: &str) -> String {
         }
     }
     normalized
+}
+
+/// The identity cell is the one place a frame carries machine-specific text:
+/// Unix reports an inode, Windows a file index, and their digit counts differ,
+/// so an unnormalized cell makes these snapshots unportable. CI runs all three
+/// targets against the same committed frames.
+#[test]
+fn identity_cells_read_the_same_on_every_platform() {
+    let unix = "▏identity  Inode { device_id: 16777232, inode_number: 1234567 }  ▕";
+    let windows = "▏identity  LowRes { volume_serial: 9, file_index: 88 }           ▕";
+    assert_eq!(unix.width(), windows.width(), "fixtures must share a width");
+    assert_eq!(normalize_snapshot(unix), normalize_snapshot(windows));
+
+    // An overlay can clip the cell down to one character of the variant name.
+    let unix_clipped = "▏identity  I▔▔▔▔▔▔▔▔▔▔▕";
+    let windows_clipped = "▏identity  L▔▔▔▔▔▔▔▔▔▔▕";
+    assert_eq!(
+        normalize_snapshot(unix_clipped),
+        normalize_snapshot(windows_clipped)
+    );
+    assert!(normalize_snapshot(unix_clipped).contains("identity  …▔"));
+    let bare_prefix = "▏identity  I          ▕";
+    assert_eq!(
+        normalize_snapshot(bare_prefix),
+        bare_prefix,
+        "a bare variant prefix must not be treated as clipped identity"
+    );
+    let neighboring_paint = "▏identity  I          ▕▓▓";
+    assert_eq!(
+        normalize_snapshot(neighboring_paint),
+        neighboring_paint,
+        "paint after the closing border is outside the identity cell"
+    );
+}
+
+/// ASCII overlays reuse the map's shades and grain, so they must end an
+/// identity cell before the platform-specific variant can be identified.
+#[test]
+fn identity_cells_stop_at_ascii_chrome() {
+    let unix = "|identity  I----------|";
+    let low_res = "|identity  L----------|";
+    let high_res = "|identity  H----------|";
+
+    assert_eq!(normalize_snapshot(unix), normalize_snapshot(low_res));
+    assert_eq!(normalize_snapshot(unix), normalize_snapshot(high_res));
+    assert_eq!(normalize_snapshot(unix), "|identity  …----------|");
+
+    for chrome in ['=', '+', '#', '.'] {
+        let unix = format!("|identity  I{chrome}|");
+        let windows = format!("|identity  L{chrome}|");
+
+        assert_eq!(
+            normalize_snapshot(&unix),
+            normalize_snapshot(&windows),
+            "{chrome} must end the identity cell"
+        );
+    }
+}
+
+/// Complete variants still end where an ASCII grid overlay begins. Canonical
+/// placeholder text is the sole `#`-bearing identity value that remains valid.
+#[test]
+fn complete_identity_variants_stop_before_ascii_chrome() {
+    let unix = "|identity  Inode ----------|";
+    let windows = "|identity  LowRes----------|";
+    assert_eq!(unix.width(), windows.width(), "fixtures must share a width");
+
+    let normalized = normalize_snapshot(unix);
+    assert_eq!(normalized, normalize_snapshot(windows));
+    assert_eq!(normalized, "|identity  Inode…----------|");
+    assert_eq!(normalized.width(), unix.width());
+    assert_eq!(normalize_snapshot(&normalized), normalized);
+
+    let clipped = "|identity  Inode----------|";
+    assert_eq!(normalize_snapshot(clipped), "|identity  Inod…----------|");
+
+    let canonical = "|identity  Inode { device_id: ########, inode_number: ######## }----------|";
+    assert_eq!(normalize_snapshot(canonical), canonical);
+}
+
+/// Raw structured identities can be obscured before their closing brace. The
+/// ASCII overlay must stay observable rather than being replaced as identity
+/// content.
+#[test]
+fn open_structured_identity_cells_stop_before_ascii_chrome() {
+    for chrome in ['-', '=', '+', '#', '.'] {
+        // The spacer makes the otherwise different variant names the same width.
+        let unix = format!("|identity  Inode {{ x: 1 {chrome}overlay|");
+        let windows = format!("|identity  LowRes {{ x: 1{chrome}overlay|");
+        assert_eq!(unix.width(), windows.width(), "fixtures must share a width");
+
+        let normalized = normalize_snapshot(&unix);
+        assert_eq!(normalized, normalize_snapshot(&windows));
+        assert!(
+            normalized.ends_with(&format!("{chrome}overlay|")),
+            "{chrome} overlay must remain visible: {normalized}"
+        );
+        assert_eq!(normalize_snapshot(&normalized), normalized);
+    }
+}
+
+/// The inspector middle-truncates a value it cannot fit, and `truncate_middle`
+/// spells that elision `[...]`. Those dots sit inside the identity, so a cell
+/// that stops on them keeps the machine's own digits either side of the marker
+/// and the frame stops being portable — the one thing normalising is here for.
+#[test]
+fn middle_truncated_identity_cells_normalise_whole() {
+    let unix = "▏identity  Inode { device_i[...]32, inode_number: 1234567 }▕";
+    let windows = "▏identity  LowRes { volume_[...]l: 9, file_index: 8888888 }▕";
+    assert_eq!(unix.width(), windows.width(), "fixtures must share a width");
+
+    let normalized = normalize_snapshot(unix);
+    assert_eq!(normalized, normalize_snapshot(windows));
+    assert_eq!(
+        normalized.width(),
+        unix.width(),
+        "a normalised cell must still fit the frame it came from"
+    );
+    assert!(
+        !normalized.contains("[...]"),
+        "the whole cell is replaced, marker included: {normalized}"
+    );
+}
+
+/// A narrow inspector may truncate inside a variant name before it can identify
+/// the platform-specific identity type. Its exact elision marker is enough to
+/// identify the cell without mistaking similarly named map entries for one.
+#[test]
+fn variant_prefixes_truncated_by_markers_normalise_whole_cells() {
+    for (unix, windows) in [
+        ("▏identity  Ino[...]…▕", "▏identity  Low[...]…▕"),
+        ("▏identity  Ino[..]…▕", "▏identity  Low[..]…▕"),
+    ] {
+        assert_eq!(unix.width(), windows.width(), "fixtures must share a width");
+
+        let normalized = normalize_snapshot(unix);
+        assert_eq!(normalized, normalize_snapshot(windows));
+        assert_eq!(normalized.width(), unix.width());
+        assert!(!normalized.contains('['));
+        assert_eq!(normalize_snapshot(&normalized), normalized);
+    }
+}
+
+/// A map filename may look like a complete, abbreviated, or truncated
+/// filesystem identity but has no inspector or modal cell around it, so its
+/// rendered text remains observable.
+#[test]
+fn map_entries_named_like_identities_remain_visible() {
+    let map_entry = "▓▓identity I▓▓";
+    let truncated_map_entry = "▓▓identity Ino[...]…▓▓";
+
+    assert_eq!(normalize_snapshot(map_entry), map_entry);
+    assert_eq!(normalize_snapshot(truncated_map_entry), truncated_map_entry);
+    for complete_map_entry in [
+        "▓▓identity Inode secret▓▓",
+        "▓▓identity LowRes secret▓▓",
+        "▓▓identity HighRes secret▓▓",
+        "▓▓identity Inode 123 secret▓▓",
+    ] {
+        assert_eq!(
+            normalize_snapshot(complete_map_entry),
+            complete_map_entry,
+            "map text must remain byte-for-byte unchanged"
+        );
+    }
 }
 
 macro_rules! assert_snapshot {
@@ -260,6 +602,44 @@ fn medium_width() {
 
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
+}
+
+#[test]
+fn list_title_uses_the_workspace_inner_width() {
+    for width in [72, 73] {
+        let (terminal_events, terminal_draw_events, backend) = test_backend_factory(width, 50);
+        let keyboard_events = Box::new(wait_and_quit_events(1, true));
+        let temp_dir_path = create_root_temp_dir(&format!("list_title_at_{width}"))
+            .expect("failed to create temp dir");
+        create_temp_file(temp_dir_path.path().join("file"), 4096)
+            .expect("failed to create temp file");
+
+        start(
+            backend,
+            keyboard_events,
+            temp_dir_path.path().to_path_buf(),
+            SHOW_APPARENT_SIZE,
+            DELETE_CONFIRMATION_ENABLED,
+        );
+        drop(temp_dir_path);
+
+        assert_terminal_lifecycle(
+            &terminal_events
+                .lock()
+                .expect("failed to lock test terminal events"),
+        );
+        let frames = terminal_draw_events
+            .lock()
+            .expect("failed to lock test draw events");
+        assert!(
+            frames.iter().any(|frame| frame.contains(" LIST ")),
+            "the {width}-column list must be labelled LIST"
+        );
+        assert!(
+            frames.iter().all(|frame| !frame.contains(" STORAGE MAP ")),
+            "the {width}-column list must not be labelled STORAGE MAP"
+        );
+    }
 }
 
 #[test]
@@ -612,7 +992,7 @@ fn enter_folder() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'j'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char '\n')));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
@@ -666,7 +1046,6 @@ fn enter_folder() {
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
-    assert_snapshot!(&terminal_draw_events_mirror[3]);
 }
 
 #[test]
@@ -674,7 +1053,7 @@ fn enter_folder_medium_width() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(90, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'j'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char '\n')));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
@@ -743,7 +1122,6 @@ fn enter_folder_medium_width() {
         );
     }
     assert_snapshot!(&terminal_draw_events_mirror[2]);
-    assert_snapshot!(&terminal_draw_events_mirror[3]);
 }
 
 #[test]
@@ -751,7 +1129,7 @@ fn enter_folder_small_width() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(60, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'j'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char '\n')));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
@@ -806,7 +1184,6 @@ fn enter_folder_small_width() {
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_compact_inspector(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
-    assert_snapshot!(&terminal_draw_events_mirror[3]);
 }
 
 #[test]
@@ -935,7 +1312,7 @@ fn cannot_move_into_small_files() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 2).collect();
-    events.push(Some(key!(char 'j'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -1019,7 +1396,6 @@ fn cannot_move_into_small_files() {
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
-    assert_snapshot!(&terminal_draw_events_mirror[4]);
 }
 
 #[test]
@@ -1081,7 +1457,7 @@ fn move_down_and_enter_folder() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 2).collect();
-    events.push(Some(key!(char 'j'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'j')));
     events.push(None);
@@ -1138,7 +1514,6 @@ fn move_down_and_enter_folder() {
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
-    assert_snapshot!(&terminal_draw_events_mirror[4]);
 }
 
 #[test]
@@ -1146,7 +1521,7 @@ fn noop_when_entering_file() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'j'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'j')));
     events.push(None);
@@ -1205,7 +1580,7 @@ fn move_up_and_enter_folder() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'j'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'j')));
     events.push(None);
@@ -1265,7 +1640,6 @@ fn move_up_and_enter_folder() {
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
     assert_snapshot!(&terminal_draw_events_mirror[4]);
-    assert_snapshot!(&terminal_draw_events_mirror[5]);
 }
 
 #[test]
@@ -1273,7 +1647,7 @@ fn move_right_and_enter_folder() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -1330,7 +1704,6 @@ fn move_right_and_enter_folder() {
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
-    assert_snapshot!(&terminal_draw_events_mirror[4]);
 }
 
 #[test]
@@ -1338,7 +1711,7 @@ fn move_left_and_enter_folder() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -1398,17 +1771,16 @@ fn move_left_and_enter_folder() {
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
     assert_snapshot!(&terminal_draw_events_mirror[4]);
-    assert_snapshot!(&terminal_draw_events_mirror[5]);
 }
 
 #[test]
-fn enter_largest_folder_with_no_selected_tile() {
+fn enter_opens_the_biggest_entry_a_fresh_map_points_at() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
     events.push(Some(key!(char '\n')));
-    // here we sleep extra to allow the blink events to happen and be tested before the app exits
-    // with the following ctrl-c
+    // Extra idle frames so the drill transition plays out before ctrl-c ends the
+    // session: the frames under test are the ones during the movement.
     events.push(None);
     events.push(None);
     events.push(None);
@@ -1417,7 +1789,7 @@ fn enter_largest_folder_with_no_selected_tile() {
     events.push(Some(key!(char 'y')));
     let keyboard_events = Box::new(TerminalEvents::new(events));
 
-    let temp_dir_path = create_root_temp_dir("enter_largest_folder_with_no_selected_tile")
+    let temp_dir_path = create_root_temp_dir("enter_opens_the_biggest_entry_a_fresh_map_points_at")
         .expect("failed to create temp dir");
 
     let mut subfolder_1_path = temp_dir_path.path().to_path_buf();
@@ -1461,11 +1833,11 @@ fn enter_largest_folder_with_no_selected_tile() {
 }
 
 #[test]
-fn clear_selection_when_moving_off_screen_edges() {
+fn the_cursor_holds_at_the_map_edge() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -1513,7 +1885,6 @@ fn clear_selection_when_moving_off_screen_edges() {
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
-    assert_snapshot!(&terminal_draw_events_mirror[4]);
 }
 
 #[test]
@@ -1521,7 +1892,7 @@ fn esc_to_go_up() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -1582,7 +1953,6 @@ fn esc_to_go_up() {
     assert_snapshot!(&terminal_draw_events_mirror[2]);
     assert_snapshot!(&terminal_draw_events_mirror[3]);
     assert_snapshot!(&terminal_draw_events_mirror[4]);
-    assert_snapshot!(&terminal_draw_events_mirror[5]);
 }
 
 #[test]
@@ -1590,7 +1960,7 @@ fn noop_when_pressing_esc_at_base_folder() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -1658,7 +2028,6 @@ fn noop_when_pressing_esc_at_base_folder() {
     assert_snapshot!(&terminal_draw_events_mirror[4]);
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
-    assert_snapshot!(&terminal_draw_events_mirror[7]);
 }
 
 #[test]
@@ -1666,7 +2035,7 @@ fn delete_file() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
@@ -1747,7 +2116,7 @@ fn delete_file_no_confirmation() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
@@ -1827,7 +2196,7 @@ fn cant_delete_file_with_term_too_small() {
     let (terminal_events, _terminal_draw_events, backend) = test_backend_factory(49, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
@@ -1895,7 +2264,7 @@ fn delete_folder() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -1984,7 +2353,7 @@ fn delete_folder_no_confirmation() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -2070,7 +2439,7 @@ fn delete_folder_small_window() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(60, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'j'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'j')));
     events.push(None);
@@ -2164,7 +2533,7 @@ fn delete_folder_small_window_no_confirmation() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(60, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'j'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'j')));
     events.push(None);
@@ -2253,7 +2622,7 @@ fn delete_folder_with_multiple_children() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -2373,7 +2742,7 @@ fn delete_folder_with_multiple_children_no_confirmation() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char 'l')));
     events.push(None);
@@ -2483,19 +2852,24 @@ fn delete_folder_with_multiple_children_no_confirmation() {
     assert_snapshot!(&terminal_draw_events_mirror[6]);
 }
 
+/// The map arms a cursor as soon as it has entries, so the first Backspace of a
+/// session already has a target and raises the confirmation. Answering `n`
+/// leaves the filesystem untouched.
 #[test]
-fn pressing_delete_with_no_selected_tile() {
+fn a_fresh_map_already_has_a_delete_target() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
     events.push(Some(key!(Backspace)));
+    events.push(None);
+    events.push(Some(key!(char 'n')));
     events.push(None);
     events.push(Some(key!(ctrl 'c')));
     events.push(None);
     events.push(Some(key!(char 'y')));
     let keyboard_events = Box::new(TerminalEvents::new(events));
 
-    let temp_dir_path = create_root_temp_dir("pressing_delete_with_no_selected_tile")
+    let temp_dir_path = create_root_temp_dir("a_fresh_map_already_has_a_delete_target")
         .expect("failed to create temp dir");
 
     let mut subfolder_1_path = temp_dir_path.path().to_path_buf();
@@ -2548,6 +2922,20 @@ fn pressing_delete_with_no_selected_tile() {
 
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
+    let confirmation_index = terminal_draw_events_mirror
+        .iter()
+        .position(|frame| frame.contains("PERMANENT FILE DELETION"))
+        .expect("fresh-map deletion should reach confirmation");
+    terminal_draw_events_mirror
+        .iter()
+        .skip(confirmation_index.saturating_add(1))
+        .find(|frame| {
+            frame.contains("STORAGE MAP")
+                && !frame.contains("PERMANENT FILE DELETION")
+                && !frame.contains("BUILDING IDENTITY PLAN")
+                && !frame.contains("Quit Excise?")
+        })
+        .expect("n should return to the normal map before quitting");
 }
 
 #[test]
@@ -2555,7 +2943,7 @@ fn delete_file_press_n() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
@@ -2698,11 +3086,11 @@ fn permission_denied_when_deleting() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char '\n')));
     events.push(None);
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
@@ -2773,7 +3161,6 @@ fn permission_denied_when_deleting() {
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
     assert_snapshot!(&terminal_draw_events_mirror[7]);
-    assert_snapshot!(&terminal_draw_events_mirror[8]);
 }
 #[cfg(not(target_os = "windows"))]
 #[test]
@@ -2781,11 +3168,11 @@ fn permission_denied_when_deleting_no_confirmation() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
 
     let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(char '\n')));
     events.push(None);
-    events.push(Some(key!(char 'l'))); // once to place selected marker on screen
+    events.push(None); // the map arms its own cursor; no priming keypress needed
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
@@ -2852,8 +3239,6 @@ fn permission_denied_when_deleting_no_confirmation() {
     assert_snapshot!(&terminal_draw_events_mirror[3]);
     assert_snapshot!(&terminal_draw_events_mirror[4]);
     assert_snapshot!(&terminal_draw_events_mirror[5]);
-    assert_snapshot!(&terminal_draw_events_mirror[6]);
-    assert_snapshot!(&terminal_draw_events_mirror[7]);
 }
 
 #[test]

@@ -138,7 +138,7 @@ fn initial_ready_marker() -> &'static [u8] {
     if windows_conpty() {
         scan_ready_marker()
     } else {
-        b"Folder is empty"
+        b"SCANNING"
     }
 }
 

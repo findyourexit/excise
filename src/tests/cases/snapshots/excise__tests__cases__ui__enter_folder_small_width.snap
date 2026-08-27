@@ -4,51 +4,51 @@ expression: normalized
 ---
  EXCISE  /tmp/excise_[...]r_small_width  ◆ COMPLETE         
  allocated ##.#K   reclaim ##.#K   apparent 16.0K   4 entrie
-────────────────────────────────────────────────────────────
-┌ LIST ────────────────────────────────────────────────────┐
-│ ▸ subfolder_wi[...]e_a_long_name       8.0K   50.0%      │
-│   file2                                4.0K   25.0%      │
-│   file3                                4.0K   25.0%      │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
- arrows move  Enter open  Backspace delete  ? help          
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+▟▐ LIST ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▏▌▸ subfolder_wi[...]e_a_long_name       8.0K   50.0%      ▕
+▏   file2                                4.0K   25.0%      ▕
+▏   file3                                4.0K   25.0%      ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▏                                                          ▕
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+                                                            
+▟▐ INSPECT ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▏subfolder_with_quite_a_long_name                          ▕
+▏◆ COMPLETE · directory                                    ▕
+▏allocated #.#K · reclaim #.#K                             ▕
+▏apparent 8.0K · entries 1                                 ▕
+▏identity  Inode { device_id: ########, inode_number: ####…▕
+▏links     # · scope     materialized                      ▕
+▏Enter open · Backspace permanent delete                   ▕
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+ arrows/hjkl move  Enter open/rescan  / filter  ? help      
 Excise · REDUCED MOTION

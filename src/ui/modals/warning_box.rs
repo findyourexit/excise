@@ -1,13 +1,19 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::style::Style;
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 
-pub struct WarningBox;
+use crate::theme::Theme;
+use crate::ui::pane::{readable_text_on, render_modal};
+
+pub struct WarningBox {
+    theme: Theme,
+    ascii: bool,
+}
 
 impl WarningBox {
-    pub const fn new() -> Self {
-        Self
+    pub const fn new(theme: Theme, ascii: bool) -> Self {
+        Self { theme, ascii }
     }
 }
 
@@ -21,22 +27,23 @@ impl Widget for WarningBox {
             width.min(area.width),
             height.min(area.height),
         );
-        Clear.render(rect, buffer);
-        let style = Style::default()
-            .fg(Color::Yellow)
-            .bg(Color::Black)
-            .add_modifier(Modifier::BOLD);
-        Paragraph::new("Deletion is locked until scanning or focused rescanning completes.\n\n[Any key] dismiss")
-            .style(style)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
-                    .border_style(style)
-                    .title(" WARNING "),
-            )
-            .render(rect, buffer);
+        let inner = render_modal(
+            buffer,
+            rect,
+            "WARNING",
+            self.theme,
+            self.theme.state_aggregated,
+            self.ascii,
+        );
+        Paragraph::new(
+            "Deletion is locked until scanning or focused rescanning completes.\n\n[Any key] dismiss",
+        )
+        .style(Style::default().fg(readable_text_on(
+            self.theme,
+            self.theme.surface_raised,
+        )))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .render(inner, buffer);
     }
 }

@@ -1,12 +1,14 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::deletion::{ConfirmationChallenge, DeletionPlan, DeletionReport, PlannedKind};
 use crate::state::FileToDelete;
+use crate::theme::Theme;
 use crate::ui::format::{DisplaySize, display_path_end, display_text};
+use crate::ui::pane::{readable_text_on, render_modal};
 
 #[derive(Clone, Copy)]
 pub enum DeletionView<'a> {
@@ -29,12 +31,16 @@ pub enum DeletionView<'a> {
 
 pub struct MessageBox<'a> {
     view: DeletionView<'a>,
+    theme: Theme,
+    ascii: bool,
 }
 
 impl<'a> MessageBox<'a> {
-    pub const fn planning(target: &'a FileToDelete) -> Self {
+    pub const fn planning(target: &'a FileToDelete, theme: Theme, ascii: bool) -> Self {
         Self {
             view: DeletionView::Planning(target),
+            theme,
+            ascii,
         }
     }
 
@@ -43,6 +49,8 @@ impl<'a> MessageBox<'a> {
         input: &'a str,
         elevated: bool,
         reduced_guardrails: bool,
+        theme: Theme,
+        ascii: bool,
     ) -> Self {
         Self {
             view: DeletionView::Confirm {
@@ -51,27 +59,35 @@ impl<'a> MessageBox<'a> {
                 elevated,
                 reduced_guardrails,
             },
+            theme,
+            ascii,
         }
     }
 
-    pub const fn deleting(planned_entries: u64, stopping: bool) -> Self {
+    pub const fn deleting(planned_entries: u64, stopping: bool, theme: Theme, ascii: bool) -> Self {
         Self {
             view: DeletionView::Deleting {
                 planned_entries,
                 stopping,
             },
+            theme,
+            ascii,
         }
     }
 
-    pub const fn cancel(planned_entries: u64) -> Self {
+    pub const fn cancel(planned_entries: u64, theme: Theme, ascii: bool) -> Self {
         Self {
             view: DeletionView::Cancel { planned_entries },
+            theme,
+            ascii,
         }
     }
 
-    pub const fn result(report: &'a DeletionReport) -> Self {
+    pub const fn result(report: &'a DeletionReport, theme: Theme, ascii: bool) -> Self {
         Self {
             view: DeletionView::Result(report),
+            theme,
+            ascii,
         }
     }
 }
@@ -86,35 +102,44 @@ impl Widget for MessageBox<'_> {
             width,
             height,
         );
-        let danger = Style::default()
-            .fg(Color::Red)
-            .bg(Color::Black)
-            .add_modifier(Modifier::BOLD);
         let title = match &self.view {
-            DeletionView::Planning(_) => " ! BUILDING IDENTITY PLAN ",
+            DeletionView::Planning(_) => "! BUILDING IDENTITY PLAN",
             DeletionView::Confirm { plan, .. } => {
                 match plan.root_snapshot().map(|item| item.kind) {
-                    Some(PlannedKind::Directory) => " ! PERMANENT DIRECTORY DELETION ",
-                    Some(PlannedKind::Link) => " ! PERMANENT LINK DELETION ",
-                    _ => " ! PERMANENT FILE DELETION ",
+                    Some(PlannedKind::Directory) => "! PERMANENT DIRECTORY DELETION",
+                    Some(PlannedKind::Link) => "! PERMANENT LINK DELETION",
+                    _ => "! PERMANENT FILE DELETION",
                 }
             }
-            DeletionView::Deleting { stopping: true, .. } => " ! STOPPING PERMANENT DELETION ",
-            DeletionView::Deleting { .. } => " ! PERMANENT DELETION ACTIVE ",
-            DeletionView::Cancel { .. } => " ! INTERRUPT DELETION ",
-            DeletionView::Result(report) if report.precise => " ! DELETION RESULT · PRECISE ",
-            DeletionView::Result(_) => " ! DELETION RESULT · UNKNOWN ",
+            DeletionView::Deleting { stopping: true, .. } => "! STOPPING PERMANENT DELETION",
+            DeletionView::Deleting { .. } => "! PERMANENT DELETION ACTIVE",
+            DeletionView::Cancel { .. } => "! INTERRUPT DELETION",
+            DeletionView::Result(report) if report.precise => {
+                if self.ascii {
+                    "! DELETION RESULT . PRECISE"
+                } else {
+                    "! DELETION RESULT · PRECISE"
+                }
+            }
+            DeletionView::Result(_) => {
+                if self.ascii {
+                    "! DELETION RESULT . UNKNOWN"
+                } else {
+                    "! DELETION RESULT · UNKNOWN"
+                }
+            }
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Double)
-            .border_style(danger)
-            .title(Span::styled(title, danger));
-        Clear.render(message_rect, buf);
-        let inner = block.inner(message_rect);
-        block.render(message_rect, buf);
-        Paragraph::new(lines(self.view, inner.width))
-            .style(danger)
+        let inner = render_modal(
+            buf,
+            message_rect,
+            title,
+            self.theme,
+            self.theme.text_danger,
+            self.ascii,
+        );
+        let text = readable_text_on(self.theme, self.theme.surface_raised);
+        Paragraph::new(lines(self.view, inner.width, self.ascii))
+            .style(Style::default().fg(text).add_modifier(Modifier::BOLD))
             .alignment(Alignment::Left)
             .wrap(Wrap { trim: true })
             .render(inner, buf);
@@ -125,7 +150,8 @@ impl Widget for MessageBox<'_> {
     clippy::too_many_lines,
     reason = "each deletion phase is kept in one exhaustive presentation match"
 )]
-fn lines(view: DeletionView<'_>, width: u16) -> Vec<Line<'static>> {
+fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> {
+    let separator = if ascii { "." } else { "·" };
     match view {
         DeletionView::Planning(target) => vec![
             Line::from(""),
@@ -154,14 +180,14 @@ fn lines(view: DeletionView<'_>, width: u16) -> Vec<Line<'static>> {
                 Line::from(display_path_end(&plan.target.full_path(), width)),
                 Line::from(truncate(&identity, width)),
                 Line::from(format!(
-                    "{} planned entries · {} logical",
+                    "{} planned entries {separator} {} logical",
                     plan.planned_entries(),
                     DisplaySize(plan.apparent_bytes as f64)
                 )),
                 Line::from(""),
                 Line::from("This cannot be undone. New or changed entries are skipped."),
             ];
-            append_safety_labels(&mut content, reduced_guardrails, elevated, width);
+            append_safety_labels(&mut content, reduced_guardrails, elevated, width, ascii);
             match &plan.challenge {
                 ConfirmationChallenge::ConfirmFile => {
                     content.push(Line::from("Press y to permanently delete this entry."));
@@ -235,9 +261,13 @@ fn append_safety_labels(
     reduced_guardrails: bool,
     elevated: bool,
     width: u16,
+    ascii: bool,
 ) {
+    let separator = if ascii { "." } else { "·" };
     if reduced_guardrails && elevated && width < 56 {
-        content.push(Line::from("ELEVATED · REDUCED GUARDRAILS ACTIVE"));
+        content.push(Line::from(format!(
+            "ELEVATED {separator} REDUCED GUARDRAILS ACTIVE"
+        )));
     } else {
         if reduced_guardrails {
             content.push(Line::from("SESSION-ONLY REDUCED GUARDRAILS ACTIVE"));
@@ -283,6 +313,7 @@ mod tests {
                 stopping: true,
             },
             78,
+            false,
         );
         let text = text(&lines);
         assert!(text.contains("Stopping after current entry…"));
@@ -295,12 +326,12 @@ mod tests {
     #[test]
     fn confirmation_safety_labels_are_independent() {
         let mut lines = Vec::new();
-        append_safety_labels(&mut lines, true, true, 78);
+        append_safety_labels(&mut lines, true, true, 78, false);
         let expanded_text = text(&lines);
         assert!(expanded_text.contains("REDUCED GUARDRAILS ACTIVE"));
         assert!(expanded_text.contains("ELEVATED PRIVILEGES ACTIVE"));
         let mut compact = Vec::new();
-        append_safety_labels(&mut compact, true, true, 48);
+        append_safety_labels(&mut compact, true, true, 48, false);
         let compact = text(&compact);
         assert!(compact.contains("ELEVATED"));
         assert!(compact.contains("REDUCED GUARDRAILS ACTIVE"));

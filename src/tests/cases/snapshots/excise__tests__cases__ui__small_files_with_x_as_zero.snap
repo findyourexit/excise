@@ -4,51 +4,51 @@ expression: normalized
 ---
  EXCISE  /tmp/ex[...]_as_zero  ◆ COMPLETE         
  allocated #.#M   reclaim #.#M   apparent 2.4M   1
-──────────────────────────────────────────────────
-┌ LIST ──────────────────────────────────────────┐
-│   file1                      1.0M   41.9%      │
-│   file2                      1.0M   41.9%      │
-│   small_file1                4.0K    0.2%      │
-│   small_file10               4.0K    0.2%      │
-│   small_file11               4.0K    0.2%      │
-│   small_file12               4.0K    0.2%      │
-│   small_file13               4.0K    0.2%      │
-│   small_file14               4.0K    0.2%      │
-│   small_file15               4.0K    0.2%      │
-│   small_file16               4.0K    0.2%      │
-│   small_file17               4.0K    0.2%      │
-│   small_file18               4.0K    0.2%      │
-│   small_file19               4.0K    0.2%      │
-│   small_file2                4.0K    0.2%      │
-│   small_file20               4.0K    0.2%      │
-│   small_file21               4.0K    0.2%      │
-│   small_file22               4.0K    0.2%      │
-│   small_file23               4.0K    0.2%      │
-│   small_file24               4.0K    0.2%      │
-│   small_file25               4.0K    0.2%      │
-│   small_file26               4.0K    0.2%      │
-│   small_file27               4.0K    0.2%      │
-│   small_file28               4.0K    0.2%      │
-│   small_file29               4.0K    0.2%      │
-│   small_file3                4.0K    0.2%      │
-│   small_file30               4.0K    0.2%      │
-│   small_file31               4.0K    0.2%      │
-│   small_file32               4.0K    0.2%      │
-│   small_file33               4.0K    0.2%      │
-│   small_file34               4.0K    0.2%      │
-│   small_file35               4.0K    0.2%      │
-│   small_file36               4.0K    0.2%      │
-│   small_file37               4.0K    0.2%      │
-│   small_file38               4.0K    0.2%      │
-│   small_file39               4.0K    0.2%      │
-│   small_file4                4.0K    0.2%      │
-│   small_file40               4.0K    0.2%      │
-│   small_file41               4.0K    0.2%      │
-│   small_file42               4.0K    0.2%      │
-│   small_file43               4.0K    0.2%      │
-│   small_file44               4.0K    0.2%      │
-│   small_file45               4.0K    0.2%      │
-│   small_file46               4.0K    0.2%      │
-└────────────────────────────────────────────────┘
- arrows move  Enter open  Backspace delete  ? help
-58 more entries below · use arrows to scroll
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+▟▐ LIST ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▏▌  file1                      1.0M   41.9%      ▕
+▏   file2                      1.0M   41.9%      ▕
+▏   small_file1                4.0K    0.2%      ▕
+▏   small_file10               4.0K    0.2%      ▕
+▏   small_file11               4.0K    0.2%      ▕
+▏   small_file12               4.0K    0.2%      ▕
+▏   small_file13               4.0K    0.2%      ▕
+▏   small_file14               4.0K    0.2%      ▕
+▏   small_file15               4.0K    0.2%      ▕
+▏   small_file16               4.0K    0.2%      ▕
+▏   small_file17               4.0K    0.2%      ▕
+▏   small_file18               4.0K    0.2%      ▕
+▏   small_file19               4.0K    0.2%      ▕
+▏   small_file2                4.0K    0.2%      ▕
+▏   small_file20               4.0K    0.2%      ▕
+▏   small_file21               4.0K    0.2%      ▕
+▏   small_file22               4.0K    0.2%      ▕
+▏   small_file23               4.0K    0.2%      ▕
+▏   small_file24               4.0K    0.2%      ▕
+▏   small_file25               4.0K    0.2%      ▕
+▏   small_file26               4.0K    0.2%      ▕
+▏   small_file27               4.0K    0.2%      ▕
+▏   small_file28               4.0K    0.2%      ▕
+▏   small_file29               4.0K    0.2%      ▕
+▏   small_file3                4.0K    0.2%      ▕
+▏   small_file30               4.0K    0.2%      ▕
+▏   small_file31               4.0K    0.2%      ▕
+▏   small_file32               4.0K    0.2%      ▕
+▏   small_file33               4.0K    0.2%      ▕
+▏   small_file34               4.0K    0.2%      ▕
+▏   small_file35               4.0K    0.2%      ▕
+▏   small_file36               4.0K    0.2%      ▕
+▏   small_file37               4.0K    0.2%      ▕
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+                                                  
+▟▐ INSPECT ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▏file1                                           ▕
+▏◆ COMPLETE · file                               ▕
+▏allocated #.#M                                  ▕
+▏reclaim   #.#M                                  ▕
+▏apparent 1.0M · entries 0                       ▕
+▏identity  Inode { device_id: ########, inode_nu…▕
+▏links     # · scope     materialized            ▕
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+ arrows/hjkl move  Enter open/rescan  ? help      
+68 more entries below · use arrows to scroll
