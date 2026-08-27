@@ -89,8 +89,9 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
         Some("check-distribution") => check_distribution_contract(&release_version()?),
         Some("render-homebrew") => render_homebrew_formula(),
         Some("dist-local") => build_local_dist(),
+        Some("demo") => render_demo(),
         _ => Err(io::Error::other(
-            "usage: cargo xtask <verify|generate|check-generated|check-distribution|render-homebrew|dist-local>",
+            "usage: cargo xtask <verify|generate|check-generated|check-distribution|render-homebrew|dist-local|demo>",
         )
         .into()),
     }
@@ -102,6 +103,296 @@ fn release_version() -> Result<String, Box<dyn Error>> {
         .get_version()
         .ok_or_else(|| io::Error::other("CLI version was absent"))?;
     Ok(version.to_owned())
+}
+
+/// Frames per second the published recording keeps.
+///
+/// VHS captures faster than a README needs. Twenty is the floor that still
+/// carries a 160 ms map tween: below it the encoder saves nothing, because each
+/// surviving frame simply differs from its predecessor by more.
+const DEMO_FRAMERATE: u32 = 20;
+/// Palette size for the published recording.
+///
+/// The interface paints flat colour, so a small palette costs nothing visible
+/// and every colour dropped is bytes saved on every frame.
+const DEMO_COLORS: u32 = 64;
+/// Lossy quantisation budget for `gifsicle`.
+///
+/// Measured against the same recording, this trades no observable fidelity on
+/// flat surfaces and does not make idle frames shimmer.
+const DEMO_LOSSY: u32 = 50;
+/// Ceiling the published recording must stay under.
+///
+/// A README hero is fetched by everyone who visits the page, so weight is a
+/// user-visible property. The optimised pipeline lands near 1.1 MiB; this
+/// catches a regression that silently restores dithering or full frame rate,
+/// which alone would triple the asset.
+const DEMO_MAX_BYTES: u64 = 1_572_864;
+/// Minimum duration retained by the tape's final asserted states.
+const DEMO_MIN_DURATION_SECONDS: f64 = 10.0;
+/// Minimum frames retained after VHS's frame deduplication.
+const DEMO_MIN_FRAMES: u64 = 160;
+
+/// The current `main` README hero.
+///
+/// `assets/demo.gif` intentionally remains the published `0.1.2` recording,
+/// because the release README references that path through the moving `main`
+/// branch URL.
+const DEMO_CURRENT_MAIN_GIF: &str = "assets/demo-main.gif";
+/// Staging output from `vhs`.
+///
+/// The tape names the current-main GIF so it can also be rendered directly,
+/// but the task overrides that destination so a failed recording cannot reach
+/// the published current-main asset.
+const DEMO_RENDERED: &str = "assets/demo-main.rendered.gif";
+/// Intermediate for the palette pass.
+///
+/// The extension is load-bearing: `ffmpeg` picks its muxer from it.
+const DEMO_INTERMEDIATE: &str = "assets/demo-main.palette.gif";
+/// Staging output from `gifsicle`.
+///
+/// Quantisation must finish and satisfy the download budget before this file
+/// replaces the published current-main GIF.
+const DEMO_QUANTISED: &str = "assets/demo-main.quantised.gif";
+const DEMO_TAPE: &str = "tapes/demo.tape";
+
+/// Renders the README hero recording and shrinks it to publishable weight.
+///
+/// `vhs` alone writes a dithered, full-rate GIF several times larger than the
+/// same frames need. Dithering is the dominant cost — it turns flat terminal
+/// cells into per-pixel noise that no frame differ can compress — so the
+/// optimisation pass rebuilds the palette without it before quantising.
+fn render_demo() -> Result<(), Box<dyn Error>> {
+    let _cleanup = DemoArtifactCleanup::install();
+    DemoArtifactCleanup::clear_stale()?;
+
+    run(OsStr::new("vhs"), "validate tape", &["validate", DEMO_TAPE])?;
+    run_vhs("render tape", &["--output", DEMO_RENDERED, DEMO_TAPE])?;
+
+    let rendered = created_recording_len(DemoArtifactCleanup::rendered(), "render tape")?;
+
+    let filter = format!(
+        "fps={DEMO_FRAMERATE},split[a][b];[a]palettegen=max_colors={DEMO_COLORS}[p];[b][p]paletteuse=dither=none"
+    );
+    run(
+        OsStr::new("ffmpeg"),
+        "reduce palette",
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            DEMO_RENDERED,
+            "-filter_complex",
+            &filter,
+            DEMO_INTERMEDIATE,
+        ],
+    )?;
+
+    let lossy = format!("--lossy={DEMO_LOSSY}");
+    run(
+        OsStr::new("gifsicle"),
+        "quantise frames",
+        &["-O3", &lossy, DEMO_INTERMEDIATE, "-o", DEMO_QUANTISED],
+    )?;
+
+    let published = created_output_len(DemoArtifactCleanup::quantised(), "quantise frames")?;
+    if published > DEMO_MAX_BYTES {
+        return Err(io::Error::other(format!(
+            "{DEMO_CURRENT_MAIN_GIF} is {published} bytes, above the {DEMO_MAX_BYTES} byte ceiling"
+        ))
+        .into());
+    }
+
+    DemoArtifactCleanup::clear_transients()?;
+    fs::rename(DemoArtifactCleanup::quantised(), DEMO_CURRENT_MAIN_GIF)?;
+    println!("\n{DEMO_CURRENT_MAIN_GIF}: {rendered} bytes rendered, {published} bytes published");
+    Ok(())
+}
+
+/// Removes disposable demo artifacts whenever the render pipeline exits.
+///
+/// The checked-in GIF stays outside this guard so failures leave the last
+/// published recording untouched.
+struct DemoArtifactCleanup;
+
+impl DemoArtifactCleanup {
+    fn install() -> Self {
+        Self
+    }
+
+    fn rendered() -> &'static Path {
+        Path::new(DEMO_RENDERED)
+    }
+
+    fn intermediate() -> &'static Path {
+        Path::new(DEMO_INTERMEDIATE)
+    }
+
+    fn quantised() -> &'static Path {
+        Path::new(DEMO_QUANTISED)
+    }
+
+    fn clear_stale() -> io::Result<()> {
+        Self::clear_all()
+    }
+
+    fn clear_transients() -> io::Result<()> {
+        remove_demo_files(&[Self::rendered(), Self::intermediate()])
+    }
+
+    fn clear_all() -> io::Result<()> {
+        remove_demo_files(&[Self::rendered(), Self::intermediate(), Self::quantised()])
+    }
+}
+
+impl Drop for DemoArtifactCleanup {
+    fn drop(&mut self) {
+        if let Err(error) = Self::clear_all() {
+            eprintln!("could not clean demo staging artifacts: {error}");
+        }
+    }
+}
+
+fn remove_demo_files(paths: &[&Path]) -> io::Result<()> {
+    let mut first_error: Option<io::Error> = None;
+
+    for &path in paths {
+        if let Err(error) = remove_file_if_exists(path) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("could not remove {}: {error}", path.display()),
+        )),
+    }
+}
+
+/// Verifies that a stage created a usable output after its staging path was cleared.
+///
+/// VHS can report a successful command after its encoder has failed, so a
+/// successful exit status alone does not prove that a GIF is available.
+fn created_output_len(path: &Path, stage: &str) -> io::Result<u64> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{stage} did not create {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "{stage} created {} but it is not a regular file",
+            path.display()
+        )));
+    }
+
+    let len = metadata.len();
+    if len == 0 {
+        return Err(io::Error::other(format!(
+            "{stage} created an empty {}",
+            path.display()
+        )));
+    }
+    Ok(len)
+}
+/// Verifies that the staged GIF contains the complete demo rather than a
+/// non-empty prefix left behind by a failed VHS encoder.
+fn created_recording_len(path: &Path, stage: &str) -> io::Result<u64> {
+    let len = created_output_len(path, stage)?;
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration,nb_read_frames",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| command_start_error(stage, OsStr::new("ffprobe"), &error))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "{stage} could not inspect {} with ffprobe: {detail}",
+            path.display()
+        )));
+    }
+    let document: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        io::Error::other(format!(
+            "{stage} returned invalid ffprobe JSON for {}: {error}",
+            path.display()
+        ))
+    })?;
+    let stream = document
+        .get("streams")
+        .and_then(Value::as_array)
+        .and_then(|streams| streams.first())
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "{stage} produced no inspectable video stream in {}",
+                path.display()
+            ))
+        })?;
+    let duration = stream
+        .get("duration")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "{stage} produced no finite GIF duration in {}",
+                path.display()
+            ))
+        })?;
+    let frames = stream
+        .get("nb_read_frames")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "{stage} produced no GIF frame count in {}",
+                path.display()
+            ))
+        })?;
+    validate_demo_recording_metrics(duration, frames).map_err(|error| {
+        io::Error::other(format!(
+            "{stage} output {} is incomplete: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(len)
+}
+
+fn validate_demo_recording_metrics(duration: f64, frames: u64) -> io::Result<()> {
+    if !duration.is_finite() || duration < DEMO_MIN_DURATION_SECONDS {
+        return Err(io::Error::other(format!(
+            "duration {duration:.3}s is below the {DEMO_MIN_DURATION_SECONDS:.3}s minimum"
+        )));
+    }
+    if frames < DEMO_MIN_FRAMES {
+        return Err(io::Error::other(format!(
+            "{frames} frames are below the {DEMO_MIN_FRAMES}-frame minimum"
+        )));
+    }
+    Ok(())
 }
 
 fn verify() -> Result<(), Box<dyn Error>> {
@@ -303,9 +594,39 @@ fn check_installed_cross_targets(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn command_start_error(label: &str, program: &OsStr, error: &io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{label} could not start `{}`: {error}",
+            program.to_string_lossy()
+        ),
+    )
+}
+
 fn run(program: &OsStr, label: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
+    run_command(program, label, args, |_| {})
+}
+
+fn run_vhs(label: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
+    run_command(OsStr::new("vhs"), label, args, |command| {
+        command.env_remove("VHS_PUBLISH");
+    })
+}
+
+fn run_command(
+    program: &OsStr,
+    label: &str,
+    args: &[&str],
+    configure: impl FnOnce(&mut Command),
+) -> Result<(), Box<dyn Error>> {
     println!("\n==> {label}");
-    let status = Command::new(program).args(args).status()?;
+    let mut command = Command::new(program);
+    command.args(args);
+    configure(&mut command);
+    let status = command
+        .status()
+        .map_err(|error| command_start_error(label, program, &error))?;
     if status.success() {
         Ok(())
     } else {
@@ -326,7 +647,9 @@ fn run_with_env(
     if !cfg!(windows) {
         command.env("EXCISE_PTY_BUDGETS", "1");
     }
-    let status = command.status()?;
+    let status = command
+        .status()
+        .map_err(|error| command_start_error(label, program, &error))?;
     if status.success() {
         Ok(())
     } else {
@@ -1460,6 +1783,12 @@ fn verify_archive(path: &Path, root: &str, binary: &str) -> Result<(), Box<dyn E
 mod tests {
     use super::*;
 
+    #[test]
+    fn demo_recording_metrics_reject_truncated_captures() {
+        assert!(validate_demo_recording_metrics(10.4, 177).is_ok());
+        assert!(validate_demo_recording_metrics(9.9, 177).is_err());
+        assert!(validate_demo_recording_metrics(10.4, 159).is_err());
+    }
     const TEST_VERSION: &str = "1.2.3";
 
     fn render_test_template(template: &str) -> String {
