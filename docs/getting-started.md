@@ -2,9 +2,9 @@
 
 Excise permanently deletes selected filesystem entries. There is no trash or undo. Begin with a disposable directory.
 
-## The 0.2.0 early-testing release
+## The 0.3.0 early-testing release
 
-The published `0.2.0` release adds the dense storage map, accessible terminal presentation, animation, overflow reporting, and retained-accounting improvements while remaining early testing. Its public library API and destructive behavior are provisional; do not use it on irreplaceable data, and do not infer stable support from a successful install. Verify the version and read the [permanent-deletion contract](safety/deletion.md) before making a scan or deletion plan.
+The `0.3.0` release makes the CLI, configuration, and versioned JSON reports the supported product contracts while keeping the Rust implementation modules private by default. It remains early testing; do not use it on irreplaceable data, and do not infer stable support from a successful install. Verify the version and read the [permanent-deletion contract](safety/deletion.md) before making a scan or deletion plan.
 
 The project is independent from Diskonaut. Tags `0.1.0` through `0.11.0` are preserved Diskonaut releases, not Excise releases; do not move, reuse, or treat those tags as an Excise installation.
 
@@ -40,12 +40,12 @@ nix build
 ./result/bin/excise /path/to/inspect
 ```
 
-## Install 0.2.0 from a release channel
+## Install 0.3.0 from a release channel
 
-The `0.2.0` crates.io package is published and compiles locally; it is not one of the prebuilt GitHub archives:
+The `0.3.0` package is published on crates.io and compiles locally; it is not one of the prebuilt GitHub archives:
 
 ```console
-cargo install excise --version 0.2.0 --locked
+cargo install excise --version 0.3.0 --locked
 excise --version
 ```
 

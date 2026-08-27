@@ -18,9 +18,9 @@ Excise is an independent successor to [Diskonaut](https://github.com/imsnif/disk
 > Excise permanently deletes selected filesystem entries. There is no trash or undo. Use it only on data you can safely remove.
 
 > [!IMPORTANT]
-The published Excise **0.2.0** release is an early-testing release with the dense storage map, accessible terminal presentation, and accounting improvements described below. Start with a disposable directory, keep the default confirmation enabled, and read the [deletion contract](docs/safety/deletion.md) before selecting anything you might need.
+The `0.3.0` release is an early-testing release with the private Rust API boundary and the dense storage map, accessible terminal presentation, and accounting improvements described below. Start with a disposable directory, keep the default confirmation enabled, and read the [deletion contract](docs/safety/deletion.md) before selecting anything you might need.
 
-The hero above, dense half-block map, per-folder heat ramp, overflow summary, and directed map-layout transitions are part of the published `0.2.0` experience. Build the current source above or install the release packages to use them. `assets/demo-main.gif` is the current-main recording, while `assets/demo.gif` remains the historical `0.1.2` recording for the versioned README.
+The hero above, dense half-block map, per-folder heat ramp, overflow summary, and directed map-layout transitions are part of the current `0.3.0` experience. Build the current source above or install the release packages to use them. `assets/demo-main.gif` is the current-main recording, while `assets/demo.gif` remains the historical `0.1.2` recording for the versioned README.
 
 ## Why Excise
 
@@ -35,7 +35,7 @@ The hero above, dense half-block map, per-folder heat ramp, overflow summary, an
 
 ## Quick Start
 
-All release-channel commands below target the published **0.2.0** early-testing release. Before using them, read the [release process](docs/releasing.md) and follow the disposable-fixture guidance.
+All release-channel commands below target the `0.3.0` early-testing release. Before using them, read the [release process](docs/releasing.md) and follow the disposable-fixture guidance.
 
 ### Install it
 
@@ -47,7 +47,7 @@ The first-party Homebrew tap carries the formula:
 ```console
 brew tap findyourexit/tap
 brew install findyourexit/tap/excise
-excise --version  # excise 0.2.0
+excise --version  # excise 0.3.0
 ```
 
 </details>
@@ -55,11 +55,11 @@ excise --version  # excise 0.2.0
 <details>
 <summary><strong>crates.io</strong></summary>
 
-The `0.2.0` package is published on crates.io; install it with the locked dependency graph:
+The `0.3.0` package is published on crates.io; install it with the locked dependency graph:
 
 ```console
-cargo install excise --version 0.2.0 --locked
-excise --version  # excise 0.2.0
+cargo install excise --version 0.3.0 --locked
+excise --version  # excise 0.3.0
 ```
 
 </details>
@@ -67,7 +67,7 @@ excise --version  # excise 0.2.0
 <details>
 <summary><strong>GitHub Release</strong></summary>
 
-Download the archive for your platform from the [published 0.2.0 GitHub Release](https://github.com/findyourexit/excise/releases/tag/v0.2.0). For example, Apple silicon macOS:
+Download the archive for your platform from the `0.3.0` GitHub Release. For example, Apple silicon macOS:
 The provenance check requires the GitHub CLI (`gh`) and a GitHub API-authenticated session.
 
 ```console
@@ -77,21 +77,21 @@ The provenance check requires the GitHub CLI (`gh`) and a GitHub API-authenticat
   readonly download_dir
   trap 'rm -rf -- "$download_dir"' EXIT
   cd "$download_dir"
-  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v0.2.0/excise-aarch64-apple-darwin-v0.2.0.tar.gz
-  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v0.2.0/checksums.sha256
+  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v0.3.0/excise-aarch64-apple-darwin-v0.3.0.tar.gz
+  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v0.3.0/checksums.sha256
   shasum -a 256 --ignore-missing --check checksums.sha256
-  source_sha="$(git ls-remote --exit-code https://github.com/findyourexit/excise.git 'refs/tags/v0.2.0^{}' | cut -f1)"
+  source_sha="$(git ls-remote --exit-code https://github.com/findyourexit/excise.git 'refs/tags/v0.3.0^{}' | cut -f1)"
   if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "could not resolve the v0.2.0 tag commit" >&2
+    echo "could not resolve the v0.3.0 tag commit" >&2
     exit 1
   fi
-  gh attestation verify excise-aarch64-apple-darwin-v0.2.0.tar.gz \
+  gh attestation verify excise-aarch64-apple-darwin-v0.3.0.tar.gz \
     --repo findyourexit/excise \
     --signer-workflow findyourexit/excise/.github/workflows/release.yml \
     --source-digest "$source_sha" \
     --source-ref refs/heads/main
-  tar --extract --gzip --file excise-aarch64-apple-darwin-v0.2.0.tar.gz
-  ./excise-aarch64-apple-darwin-v0.2.0/excise --version  # excise 0.2.0
+  tar --extract --gzip --file excise-aarch64-apple-darwin-v0.3.0.tar.gz
+  ./excise-aarch64-apple-darwin-v0.3.0/excise --version  # excise 0.3.0
 )
 ```
 
@@ -111,19 +111,19 @@ cargo install --path . --locked
 excise --version
 ```
 
-To reproduce the exact published release commit, replace `main` with `v0.2.0` in the clone command.
+To reproduce the exact published release commit, replace `main` with `v0.3.0` in the clone command.
 
 </details>
 
 <details>
 <summary><strong>Nix</strong></summary>
 
-Run or install the published `v0.2.0` flake without updating its lock file:
+Run or install the published `v0.3.0` flake without updating its lock file:
 
 ```console
-nix run github:findyourexit/excise/v0.2.0 -- --format table /path/to/inspect
-nix profile install github:findyourexit/excise/v0.2.0
-excise --version  # excise 0.2.0
+nix run github:findyourexit/excise/v0.3.0 -- --format table /path/to/inspect
+nix profile install github:findyourexit/excise/v0.3.0
+excise --version  # excise 0.3.0
 ```
 
 </details>
