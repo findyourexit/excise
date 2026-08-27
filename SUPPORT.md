@@ -1,8 +1,8 @@
 # Support
 
-## 0.2.0 early testing
+## 0.3.0 early testing
 
-The published `0.2.0` release includes the dense storage map, accessible terminal presentation, animation, overflow reporting, and retained-accounting improvements but remains early testing. Support is best effort, the public library API may change before 1.0, and no release build should be trusted with irreplaceable data. Start with [Getting started](docs/getting-started.md) and a disposable fixture.
+The `0.3.0` release makes the CLI, configuration, and versioned JSON reports the supported product contracts. Its Rust implementation modules are private by default, while repository-only fuzzing and benchmark access uses explicit feature gates. Support remains best effort, and no early-testing release should be trusted with irreplaceable data. Start with [Getting started](docs/getting-started.md) and a disposable fixture.
 
 ## Usage questions
 
