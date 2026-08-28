@@ -16,7 +16,7 @@ Maintainers are expected to:
 
 - protect deletion, terminal, accounting, privacy, and schema contracts;
 - require evidence appropriate to the risk of each change;
-- preserve contributor attribution and DCO provenance;
+- preserve contributor attribution and authorship records;
 - keep dependencies, workflows, and release inputs reviewable and pinned;
 - avoid commitments beyond current maintainer capacity; and
 - disclose conflicts of interest relevant to dependencies or distribution.
