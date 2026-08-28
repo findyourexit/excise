@@ -46,15 +46,9 @@ Keep pull requests focused and reviewable. Include:
 
 Snapshot changes are product changes. Review them deliberately and explain meaningful differences.
 
-## Developer Certificate of Origin
+## Commit and Attribution
 
-Every new commit must include a `Signed-off-by` trailer certifying the [Developer Certificate of Origin 1.1](https://developercertificate.org/):
-
-```text
-Signed-off-by: Your Name <you@example.com>
-```
-
-Use `git commit -s`. Excise does not require a CLA or copyright assignment. Historical commits retain their original authorship; do not rewrite another contributor's identity to add a sign-off they did not provide.
+Excise does not require a contributor license agreement or copyright assignment. Historical commits retain their original authorship. Do not rewrite another contributor's identity.
 
 To enable the repository's Conventional Commit template in this clone:
 

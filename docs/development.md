@@ -259,4 +259,4 @@ Treat small host-local changes as noise unless supported by repeated statistical
 
 ## Pull requests
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for DCO, review, safety, accessibility, and documentation requirements.
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for review, safety, accessibility, authorship, and documentation requirements.

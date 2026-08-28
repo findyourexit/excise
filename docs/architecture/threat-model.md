@@ -81,10 +81,3 @@ Validate before raw mode; use RAII restoration; test failures and panics in a PT
 | Repeated focus transitions | Replace keyed effect; memory remains bounded |
 | Quit during deletion | Offer soft cancel, hard cancel, or back |
 
-## Out of scope for 1.0
-
-- malicious kernel/filesystem daemon;
-- atomic recursive deletion;
-- recovery/undo;
-- exact physical shared-extent accounting;
-- protecting data after explicit correctly scoped permanent deletion.

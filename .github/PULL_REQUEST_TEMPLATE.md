@@ -19,6 +19,5 @@
 - [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings` passes.
 - [ ] `cargo test --workspace --locked` passes.
 - [ ] User-facing documentation and generated artifacts are current.
-- [ ] Every new commit includes a DCO `Signed-off-by` trailer.
 
 Closes #
