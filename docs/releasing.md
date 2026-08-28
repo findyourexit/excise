@@ -58,7 +58,24 @@ The published bundle contains six target archives, `checksums.sha256`, and `exci
 
 ## The 1.0.1 Patch Release
 
-Use `1.0.1` for a narrowly scoped correction after `1.0.0`. A patch release must preserve the documented command-line, configuration, report, deletion, accounting, and support behavior. It should include a focused regression test or documentation correction, update the `Unreleased` notes, and repeat the exact protected-commit candidate, checksum, software bill of materials, attestation, package-channel, and rollback checks before publication. Do not publish `1.0.1` until a concrete correction has been accepted.
+The `1.0.1` release contains the housekeeping documentation rewrites, the DCO requirement removal, and the support-matrix documentation fixes described in the changelog. It is the first patch release on the v1 stable line.
+
+## Approved `1.0.1` Publication
+
+The approved patch publication used:
+
+- Source commit: `6dddc26c6f7f2c9cb75b5715d00f315d5ac91d5c`.
+- Protected-main native verification: https://github.com/findyourexit/excise/actions/runs/33149660834
+- Exact-SHA candidate workflow: https://github.com/findyourexit/excise/actions/runs/33151782132
+- Annotated tag: `v1.0.1`, carrying `candidate-run-id: 33151782132` and pointing to the exact source commit.
+- Immutable publication workflow: https://github.com/findyourexit/excise/actions/runs/33152146266
+- GitHub Release: https://github.com/findyourexit/excise/releases/tag/v1.0.1
+
+The published bundle contains six target archives, `checksums.sha256`, and `excise.spdx.json`. The checksum manifest, software bill of materials, archive contents, and all eight GitHub attestations were independently verified after publication. crates.io and Homebrew each reported `1.0.1`.
+
+## The 1.0.2 Patch Release
+
+Use `1.0.2` for a narrowly scoped correction after `1.0.1`. A patch release must preserve the documented command-line, configuration, report, deletion, accounting, and support behavior. It should include a focused correction, update the `Unreleased` notes, and repeat the exact protected-commit candidate, checksum, software bill of materials, attestation, package-channel, and rollback checks before publication.
 
 ## Preconditions & Clean Tree
 
