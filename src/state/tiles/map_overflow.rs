@@ -1,12 +1,12 @@
 /// Entries the map has no room to draw at this size, summarised for the reader.
 ///
-/// This is a rendering limit, not a model limit: every entry counted here is a
+/// This is a rendering limit rather than a model limit. Every entry counted here is a
 /// real, individually tracked node that a larger pane or a drill would draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapOverflow {
     /// Terminal column where the overflow region starts when one is drawable.
     ///
-    /// A zero-sized layout still reports its accounting summary; then this and
+    /// A zero-sized layout still reports its accounting summary. This and
     /// `y` identify the logical boundary rather than a paintable cell.
     pub x: u16,
     /// Half-row the overflow region starts at (see `HALF_ROWS_PER_CELL`).

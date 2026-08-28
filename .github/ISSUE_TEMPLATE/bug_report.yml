@@ -29,17 +29,17 @@ body:
     id: terminal
     attributes:
       label: Terminal
-      description: Terminal application and shell, if relevant.
+      description: Terminal application and shell, when relevant.
       placeholder: "Windows Terminal 1.x with PowerShell 7"
   - type: textarea
     id: reproduction
     attributes:
-      label: Minimal reproduction
-      description: Use synthetic paths and fixtures; remove sensitive filesystem information.
+      label: Small example
+      description: Use temporary test data and remove sensitive file system information.
       placeholder: |
-        1. Create ...
-        2. Run `excise ...`
-        3. Press ...
+        1. Create a temporary folder.
+        2. Run `excise /path/to/folder`.
+        3. Describe what happened.
     validations:
       required: true
   - type: textarea
@@ -58,7 +58,7 @@ body:
     id: context
     attributes:
       label: Relevant context
-      description: Filesystem type, links, mounts, permissions, terminal dimensions, configuration, logs, or report excerpts.
+      description: File system type, links, mounts, permissions, terminal dimensions, configuration, logs, or report excerpts.
   - type: checkboxes
     id: checks
     attributes:

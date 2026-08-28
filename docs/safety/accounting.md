@@ -1,67 +1,67 @@
-# Storage accounting contract
+# Space Accounting Contract
 
-## Headline metric
+## Main Measure
 
-Excise reports **identity-unique allocated bytes** as its primary size.
+Excise reports allocated space counted once for each file identity.
 
-- Count regular-file allocation once per filesystem identity.
-- Count symlink/reparse-object allocation where the platform exposes it.
-- Exclude directory metadata allocation for consistent cross-platform semantics.
-- Keep apparent/logical bytes as a separate metric.
-- Never silently replace unknown allocated bytes with apparent bytes.
+- A regular file is counted once even when it has more than one name.
+- The space used by a symbolic link or reparse object is counted when the platform provides it.
+- Directory metadata space is excluded for consistent behavior across platforms.
+- File length remains a separate measure.
+- Unknown allocated space is never replaced with file length.
 
-## Hard links
+## Files With More Than One Name
 
-Track observed identity, allocated bytes, declared link count where available, and observed paths.
+Track each observed identity, its allocated space, its declared link count when available, and the paths that point to it.
 
-- Deduplicate identity allocation globally within scan scope.
-- Linked path entries remain visible but own zero additional unique bytes.
-- Allocation referenced from multiple child subtrees appears under a synthetic `Shared` node at the observed lowest common ancestor.
-- `Shared` is informational and never deletable.
+- Count each identity once within the scan scope.
+- Keep every path visible, but give later paths no additional unique space.
+- Show space referenced by several child folders under a synthetic `Shared` entry at the lowest observed common parent.
+- Treat `Shared` as information only. It is never a deletion target.
 
-## Reclaimable bounds
+## Space That Deletion Can Reclaim
 
-For each real subtree, calculate:
+For each real folder, report the following values:
 
-- known identity-unique allocation;
-- conservative lower bound of bytes reclaimable by deleting the planned subtree;
-- upper bound where link observations permit one;
-- unknown contribution and unknown-entry/subtree counts.
+- Known space counted once per identity
+- A conservative lower bound for space that deletion can reclaim
+- An upper bound when link observations make one possible
+- Unknown space and the number of unknown files or folders
 
-Links that may exist outside scan scope prevent false exactness.
+A link that may exist outside the scan scope prevents an unjustified exact total.
 
-## Unknown data
+## Unknown Data
 
-A failed metadata/allocation query contributes unknown bytes. An unreadable directory contributes unbounded unknown descendants. Ancestors remain lower-bounded and visibly uncertain.
+A failed space or metadata query contributes unknown space. An unreadable folder contributes an unknown number of descendants. Parent folders keep a lower bound and show the uncertainty.
 
-Expected user exclusions and one-filesystem boundaries define scope; report those boundaries separately instead of treating them as read failures.
+User exclusions and one-file-system boundaries define the scan scope. Excise reports those boundaries separately instead of calling them read failures.
 
-Configured user exclusions and foreign-filesystem boundaries remain visible as zero-byte scoped records with their reason. Verified Excise-owned session and scanner-queue paths are a different class: they are omitted silently before model insertion, never enter user accounting or reports, and are matched only by their exact active native paths. Similarly named user content is scanned normally.
+Configured exclusions and foreign file-system boundaries remain visible as zero-byte records with a reason. Excise-owned session and scanner paths are different. Excise omits them before they enter the working model or reports, and it matches only their exact active paths. User files with similar names are scanned normally.
 
-## Shared extents limitation
+## Shared Physical Storage
 
-Version 1.0 deduplicates filesystem identities, not physical extents. Reflinks, clones, transparent filesystem deduplication, and compressed/shared extents can still cause overcounting. This limitation appears in documentation and relevant report metadata.
+Version 1.0 counts file identities rather than physical storage blocks. Copy-on-write files, clones, transparent file-system deduplication, compression, and shared physical storage can therefore cause an overcount. The reports and support documentation disclose this limit.
 
-## Memory and spill
+## Memory & Temporary Storage
 
-Hard-link identity tracking may spill minimum identity/accounting data into a permission-restricted, session-only temporary store. If exact tracking cannot continue securely, stop with an actionable failure rather than weaken the accounting definition.
+Identity tracking can use a permission-restricted, session-only temporary store when the records do not fit in memory. If exact tracking cannot continue safely, Excise stops with an actionable error rather than weakening the accounting definition.
 
-## Treemap invariants
+## Map Invariants
 
-- Child geometry adds to the parent's represented known allocation.
+- Child areas add up to the parent's represented known space.
 - `Shared` and `Other` preserve additive totals.
-- Unknown contribution is represented outside falsely numeric area.
-- Geometry is finite, deterministic, in bounds, and non-overlapping.
-- Animation interpolates between valid old/new geometries and never changes the underlying numbers.
+- Unknown space is shown outside any falsely exact area.
+- Map geometry is finite, repeatable, inside its bounds, and non-overlapping.
+- Animation moves between valid old and new geometry without changing the underlying numbers.
 
-## Required fixtures
+## Required Fixtures
 
-- multiple links in one directory;
-- links split across sibling/deep subtrees;
-- links outside selected subtree and outside scan scope;
-- sparse and compressed files;
-- unreadable allocation metadata;
-- inaccessible directories;
-- zero and maximum-size values;
-- aggregation and identity-spill pressure;
-- platform-specific identity providers.
+- Several names for one file in a directory
+- Names for one file split across sibling and deep folders
+- Names for one file outside the selected folder and outside the scan scope
+- Sparse and compressed files
+- Missing allocated-space metadata
+- Inaccessible directories
+- Zero and maximum-size values
+- Aggregation and pressure on temporary identity storage
+- Platform-specific identity sources

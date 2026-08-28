@@ -1,19 +1,19 @@
 # Configuration
 
-Excise resolves configuration in this order:
+Excise reads configuration in this order:
 
-1. command-line options;
-2. environment variables;
-3. a versioned TOML file; and
-4. built-in defaults.
+1. Command-line options
+2. Environment variables
+3. A versioned TOML file
+4. Built-in defaults
 
-Unknown keys, unsupported versions, invalid ranges, invalid enum values, and conflicting custom keys are errors.
+Unknown keys, unsupported versions, invalid ranges, invalid choices, and conflicting custom keys cause a configuration error.
 
-## Select a file
+## Select A File
 
-Use `--config FILE` or `EXCISE_CONFIG`. Without either, Excise reads `config.toml` from the operating system's standard per-user configuration directory for the `excise` application when that file exists.
+Use `--config FILE` or `EXCISE_CONFIG` to choose a file. Without either, Excise reads `config.toml` from the operating system's standard per-user configuration directory when that file exists.
 
-## TOML schema
+## TOML File
 
 ```toml
 version = 1
@@ -37,7 +37,7 @@ keymap = "vim"
 format = "tui"
 ```
 
-Custom movement requires four distinct, unmodified printable ASCII keys that do not replace normal-mode commands:
+Custom movement requires four different, unmodified printable ASCII keys. The keys must not replace normal commands:
 
 ```toml
 [runtime]
@@ -50,39 +50,39 @@ up = "w"
 right = "d"
 ```
 
-`runtime.output` is valid only when `runtime.format` is `table` or `json`.
+`runtime.output` works only when `runtime.format` is `table` or `json`.
 
 ## Fields
 
 | Field | Meaning | Valid values |
 |---|---|---|
-| `scanner.threads` | Scanner worker count | `1..=32` |
-| `scanner.event_buffer` | Bounded worker-event capacity | `16..=4096` |
-| `scanner.apparent_size` | Prefer logical length in the UI | boolean |
-| `scanner.cross_filesystems` | Traverse beyond the starting filesystem | boolean |
-| `scanner.exclusions` | Ordered gitignore-style patterns | string array |
-| `model.process_memory_mib` | Whole-process memory envelope | at least 128 MiB and no more than detected memory |
-| `runtime.reduced_motion` | Disable nonessential transitions | boolean |
-| `runtime.theme` | Built-in semantic theme | run `excise --help` for names |
-| `runtime.ascii` | Use ASCII symbols and borders | boolean |
-| `runtime.mouse` | Enable mouse capture and selection | boolean |
-| `runtime.keymap` | Movement preset | `vim`, `emacs`, `custom` |
-| `runtime.format` | Output mode | `tui`, `table`, `json` |
-| `runtime.output` | Noninteractive report destination | path |
+| `scanner.threads` | Number of scanner workers | 1 through 32 |
+| `scanner.event_buffer` | Capacity of the worker event queue | 16 through 4096 |
+| `scanner.apparent_size` | Prefer logical length in the interface | true or false |
+| `scanner.cross_filesystems` | Traverse beyond the starting file system | true or false |
+| `scanner.exclusions` | Ordered gitignore-style patterns | An array of strings |
+| `model.process_memory_mib` | Whole-process memory limit | At least 128 MiB and no more than detected memory |
+| `runtime.reduced_motion` | Disable nonessential transitions | true or false |
+| `runtime.theme` | Built-in color theme | See `excise --help` for names |
+| `runtime.ascii` | Use ASCII symbols and borders | true or false |
+| `runtime.mouse` | Enable mouse selection | true or false |
+| `runtime.keymap` | Movement preset | `vim`, `emacs`, or `custom` |
+| `runtime.format` | Output mode | `tui`, `table`, or `json` |
+| `runtime.output` | Report destination for noninteractive output | A path |
 
-The default memory envelope is 512 MiB or detected available memory when lower. Excise reserves 25% as process headroom and limits the model/index portion to 75%.
+The default memory limit is 512 MiB or the detected available memory when that is lower. Excise reserves 25 percent as process headroom and limits working data to the remaining 75 percent.
 
-## Environment variables
+## Environment Variables
 
 | Variable | Corresponding setting |
 |---|---|
-| `EXCISE_CONFIG` | explicit configuration file |
-| `EXCISE_ROOT` | scan root |
+| `EXCISE_CONFIG` | Explicit configuration file |
+| `EXCISE_ROOT` | Scan root |
 | `EXCISE_SCAN_THREADS` | `scanner.threads` |
 | `EXCISE_EVENT_BUFFER` | `scanner.event_buffer` |
 | `EXCISE_APPARENT_SIZE` | `scanner.apparent_size` |
 | `EXCISE_CROSS_FILESYSTEMS` | `scanner.cross_filesystems` |
-| `EXCISE_EXCLUDE` | semicolon-separated exclusion patterns |
+| `EXCISE_EXCLUDE` | Exclusion patterns separated by semicolons |
 | `EXCISE_MEMORY_MIB` | `model.process_memory_mib` |
 | `EXCISE_REDUCED_MOTION` | `runtime.reduced_motion` |
 | `EXCISE_THEME` | `runtime.theme` |
@@ -91,10 +91,10 @@ The default memory envelope is 512 MiB or detected available memory when lower. 
 | `EXCISE_KEYMAP` | `runtime.keymap` |
 | `EXCISE_FORMAT` | `runtime.format` |
 | `EXCISE_OUTPUT` | `runtime.output` |
-| `NO_COLOR` | force monochrome rendering when present |
+| `NO_COLOR` | Force monochrome rendering when present |
 
-Boolean environment values accept `true`/`false`, `yes`/`no`, `on`/`off`, and `1`/`0`, case-insensitively.
+Boolean environment values accept `true`, `false`, `yes`, `no`, `on`, `off`, `1`, and `0`, without regard to letter case.
 
-## Deletion confirmation
+## Deletion Confirmation
 
-`--disable-delete-confirmation` does not remove deletion guardrails. It enables a visible, session-only reduced confirmation mode. It is intentionally not available in the persistent configuration file or environment.
+`--disable-delete-confirmation` does not remove deletion safeguards. It enables a visible, session-only reduced confirmation mode. It is intentionally unavailable in the persistent configuration file and environment.

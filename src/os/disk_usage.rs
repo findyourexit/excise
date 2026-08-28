@@ -52,7 +52,7 @@ fn windows_allocation_size(handle: &File) -> io::Result<u64> {
     };
 
     let mut information = FILE_STANDARD_INFO::default();
-    // SAFETY: the handle is borrowed and valid for this call; `information`
+    // SAFETY: the handle is borrowed and valid for this call. `information`
     // is an aligned writable output value whose size is passed exactly.
     if unsafe {
         GetFileInformationByHandleEx(

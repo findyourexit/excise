@@ -34,7 +34,7 @@ workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
 deny = [
-  { crate = "failure", reason = "unmaintained error stack; use anyhow or typed errors" },
+  { crate = "failure", reason = "unmaintained error stack. Use anyhow or typed errors." },
   { crate = "structopt", reason = "superseded by Clap derive" },
   { crate = "tui", reason = "renamed and superseded by Ratatui" },
 ]

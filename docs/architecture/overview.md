@@ -1,83 +1,64 @@
 # Architecture
 
-## Ownership model
+## Ownership Model
 
-One synchronous main-thread loop owns application state, terminal state, semantic layout, rendering, and visual-effect lifecycle. Scanner and deletion workers perform bounded blocking filesystem work and send typed events through bounded channels.
+One main loop owns application state, terminal state, layout, rendering, and visual effects. Scanner and deletion workers perform blocking file system work in the background. They send typed events through queues with fixed limits.
 
-```text
-Terminal input and timer ──────────┐
-Scanner workers ─── typed batches ─┼─> Owner loop ─> Model ─> Semantic layout ─> Ratatui buffer
-Deletion worker ─── typed results ─┘                                      └─> visual effects
-```
-
-Effects transform the rendered buffer after semantic widgets and layout are complete. They never own product state or determine whether an operation is safe.
+Visual effects run after the interface has prepared its content. They never own product state and never decide whether an operation is safe.
 
 ## Components
 
-### CLI and configuration
+### Command Line & Configuration
 
-- Parse and validate command-line, environment, and TOML configuration before terminal initialization.
-- Apply command line > environment > versioned file > defaults.
-- Reject unknown keys and invalid bounds.
-- Keep table and JSON report modes independent of a TTY.
+Excise reads and validates command-line options, environment variables, and the TOML configuration file before it starts the terminal interface. It applies values in this order: command line, environment, versioned file, and defaults. It rejects unknown keys and invalid limits. Table and JSON reports work without a terminal.
 
-### Terminal session
+### Terminal Session
 
-An RAII guard owns raw mode, alternate screen, cursor visibility, colors, and optional mouse capture. Restoration runs on normal return, typed errors, and panic unwind, with an explicit hard-cancellation fallback.
+A terminal session guard owns raw input mode, the separate screen, cursor visibility, colors, and optional mouse capture. It restores the terminal after normal return, a typed error, a panic, or a forced cancellation.
 
-### Owner loop
+### Main Loop
 
-- Poll Crossterm with a bounded timeout.
-- Process input and worker events before optional visual frames.
-- Render only when state is dirty.
-- Cap active effects at 30 frames per second and drop overdue frames.
-- Replace stale transitions by stable effect key.
+The main loop polls terminal input with a bounded timeout. It processes input and worker events before drawing visual effects. It redraws only when state has changed. It limits active effects to 30 frames per second and drops overdue frames. A new transition replaces an older transition with the same purpose.
 
 ### Scanner
 
-A bounded scanner pool performs iterative, no-follow traversal. Directory tasks and worker events use bounded queues; overflow task state can spill to a permission-restricted session store rather than grow resident memory without limit. Backpressure never silently drops an entry.
+The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. When temporary working data reaches its memory limit, the scanner can use a permission-restricted store for the session instead of growing without limit. Backpressure never silently drops an entry.
 
-The default worker count is `min(available_parallelism, 8)`, with a validated `1..=32` override. Exclusions and filesystem boundaries are explicit model records; symlink targets are never traversed.
+The default worker count is the smaller of the available processor count and eight. The configured value must be between one and 32. Exclusions and file system boundaries remain visible in the working model. Link targets are never traversed.
 
-### Model
+### Working Model
 
-A flat arena keyed by stable node IDs stores names once, parent/child relationships, native identity, metrics, scan state, and aggregate state. Traversal, compaction, and destruction are iterative.
+A table indexed by stable node numbers stores each name once along with its parent, children, file identity, measurements, scan state, and summary state. Walking, compacting, and removing entries use loops rather than the call stack.
 
-The map's internal `MapOverflow` summary records entries omitted from the final map viewport, not merely individually small entries. It retains their count, bytes, and lower-bound uncertainty even when no overflow region can be drawn; its anchor may be a non-drawable sentinel when no free field exists, so the renderer checks drawable bounds before painting; count and weight labels appear only when that region has enough usable space.
+The map keeps a `MapOverflow` summary for entries that do not fit in the final view. It retains their count, space, and uncertainty even when there is no room to draw an overflow region. The renderer checks the available drawing area before it paints the summary and shows count or weight labels only when there is enough room.
 
-The default process envelope is 512 MiB. A hard 75% model/index budget leaves 25% process headroom. Cold compaction preserves exact aggregates while active ancestors, visible nodes, and operation targets remain pinned.
+The default process memory limit is 512 MiB. Working data may use 75 percent of that limit, leaving 25 percent for the rest of the process. Compaction preserves exact summaries while visible entries, active parents, and deletion targets remain available.
 
-### Accounting
+### Space Accounting
 
-The identity table deduplicates hard links globally within scan scope. When exact identity state exceeds its resident budget, a permission-restricted session-only store retains minimum identity and accounting data. Unknown values propagate as bounds rather than guessed numbers.
+The identity table counts files with more than one name once within the scan scope. When exact identity data exceeds the memory limit, a permission-restricted store for the current session keeps the minimum records needed for accounting. Unknown values remain bounds rather than becoming guessed numbers.
 
 ### Deletion
 
-The owner builds and reviews a complete identity plan. Platform adapters execute no-follow, capability-relative operations and revalidate identity, type, size, allocation, and modification state before each mutation. Changed entries are skipped; newly observed identities are never added to consent.
+The main loop builds and reviews a complete deletion plan. Platform code works relative to the confirmed parent and does not follow links. It checks the file identity, type, size, allocation, and modification state before each deletion. Changed entries are skipped. Newly observed entries are never added to the consented plan.
 
 ### Reports
 
-Versioned `scan-report` and `deletion-history` documents share a stable native-path encoding. Reports describe the bounded logical model and explicitly carry uncertainty and aggregation.
+Versioned `scan-report` and `deletion-history` documents use the same stable encoding for file paths. Reports describe the bounded working model and identify uncertainty and summary entries explicitly.
 
-## Dependency direction
+## Dependency Direction
 
-```text
-platform adapters ─┐
-scanner ───────────┼─> domain model and accounting ─> application state ─> UI
-mutation adapter ──┘                                            └────────> reports
-```
+Platform code supplies file information to the scanner and deletion code. The scanner supplies information to the working model and space accounting. Application state supplies data to the interface. The reporting code reads the resulting state. Domain code does not depend on terminal widgets, and interface code does not change the file system.
 
-Domain code does not depend on terminal widgets. UI code does not mutate the filesystem. Visual effects consume rendered semantic output, never the reverse.
+The storage map uses dense half-block cells inside its pane. Each cell can carry foreground and background shading without inserting gaps between entries. Map movement belongs to application state. The board keeps the current position, the next position, and one transition clock. A new scan can redirect the transition from its current position without restarting it.
 
-The shell presents independent workspaces with low-ink pane gaps, title chips, and active-focus chrome. The storage map remains densely tessellated inside its pane: half-block cells carry shaded foreground and background halves instead of inserting gaps between entries.
+Opening an entry grows its contents from the selected rectangle. Moving back contracts the departing contents into that rectangle while the parent view grows from it. Entries that are no longer in the parent view remain visible until they finish moving away. If the selected rectangle cannot be resolved, the board settles without a directed transition.
 
-Map movement is application state, not an effect. The board holds the geometry every entry is drawn at, the geometry it is heading for, and one clock; a layout change re-aims that tween from wherever entries currently sit rather than restarting it, which is what lets a streaming scan keep moving without juddering. Directed transitions apply only to map layout. Navigation supplies a pivot — the rectangle a drill radiates from — so opening an entry grows its contents out of it. On a drill-out, departing contents contract into that pivot while the incoming parent layout grows out of it. Entries the incoming layout no longer contains keep being drawn until they have finished receding into the pivot. If a pivot cannot be resolved, the board settles without a directed tween, or waits for list selection when that is the only missing geometry. Effects remain confined to the header band, acknowledging events rather than repainting the map.
+## Architectural Constraints
 
-## Architectural constraints
-
-- no multiple threads mutating application or terminal state;
-- no unbounded channels or recursive model ownership;
-- no shell commands for traversal or deletion;
-- no runtime network client or telemetry;
-- unsafe code is confined to the audited Windows FFI adapter; domain, model, runtime, and UI code remain safe Rust;
-- no new runtime executor without public design review.
+- No multiple threads may change application or terminal state.
+- No queue or model owner may grow without a limit.
+- No shell command may perform scanning or deletion.
+- No network client or telemetry may run as part of the program.
+- Unsafe code is confined to the reviewed Windows system interface. Domain, model, runtime, and interface code remain safe Rust.
+- A new background task system requires public design review.

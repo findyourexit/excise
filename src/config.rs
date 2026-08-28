@@ -191,10 +191,10 @@ pub struct Cli {
     /// Enable mouse capture and selection
     pub mouse: bool,
     #[arg(long, value_enum, value_name = "PRESET")]
-    /// Keyboard preset; arrows and safety keys always work
+    /// Keyboard preset. Arrows and safety keys always work.
     pub keymap: Option<KeyPreset>,
     #[arg(long, value_enum)]
-    /// Output mode; table and JSON never acquire a terminal
+    /// Output mode. Table and JSON never acquire a terminal.
     pub format: Option<OutputFormat>,
     #[arg(long, value_name = "FILE")]
     /// Write a noninteractive report to FILE instead of stdout

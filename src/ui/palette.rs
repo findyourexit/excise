@@ -8,7 +8,7 @@
 //! band, so no entry can out-shout its neighbours.
 //!
 //! Themes whose palette is not truecolour (monochrome, high contrast) return
-//! [`None`] from [`MapPalette::for_theme`]; callers fall back to shading glyphs.
+//! [`None`] from [`MapPalette::for_theme`]. Callers fall back to shading glyphs.
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -281,8 +281,8 @@ impl MapPalette {
             (panel.lightness + DARK_TILE_LIFT).min(DARK_TILE_CEILING)
         };
         // The canvas sits a touch *above* the panel rather than below it. Space
-        // the treemap cannot allocate — rounding slivers, and the gaps that open
-        // mid-zoom — then reads as part of the surface instead of as a hole
+        // the treemap cannot allocate, rounding slivers and the gaps that open
+        // mid-zoom then read as part of the surface instead of as a hole
         // punched through the interface.
         let backdrop = Oklch {
             lightness: if light_theme {

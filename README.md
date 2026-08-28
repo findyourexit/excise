@@ -12,13 +12,12 @@
 
 A terminal tool for understanding and removing exactly the files and folders you choose.
 
-Excise combines an interactive storage map with careful space accounting, clear resource limits, safe handling of unusual file names, and a deliberate review before permanent deletion. It is an independent successor to [Diskonaut](https://github.com/imsnif/diskonaut). Diskonaut history and release tags remain preserved, while Excise has its own product and release line.
+Excise combines an interactive storage map with careful space accounting, clear resource limits, safe handling of unusual file names, and a deliberate review before permanent deletion.
+
+It is an independent fork and spiritual successor to [Diskonaut](https://github.com/imsnif/diskonaut). Diskonaut history and release tags remain preserved, while Excise has its own product and release line.
 
 > [!WARNING]
 > Excise permanently deletes selected files and folders. There is no trash or undo. Use it only with data you can safely remove.
-
-> [!IMPORTANT]
-> `1.0.0` is the first stable release of the command-line tool, its configuration, and its versioned JSON reports. The code behind the tool is private, and the project does not promise a stable Rust programming interface.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/findyourexit/excise/main/assets/demo-main.gif" alt="Excise scanning a disposable fixture in the terminal" width="900" />
@@ -54,7 +53,7 @@ excise --version  # excise 1.0.0
 
 Download the [v1.0.0 release](https://github.com/findyourexit/excise/releases/tag/v1.0.0) for macOS, Linux, and Windows on Apple silicon, Intel, or Arm systems.
 
-Only x86_64 Linux, AArch64 macOS, and x86_64 Windows have full platform support because they are tested on those platforms. The other archives are build-only and best effort. See the [support policy](SUPPORT.md).
+Only x86_64 Linux, AArch64 macOS, and x86_64 Windows have full platform support because they are tested on those platforms. The other archives are build-only and best effort. See the [Support Policy](SUPPORT.md).
 
 </details>
 
@@ -76,30 +75,29 @@ nix run github:findyourexit/excise/v1.0.0 -- --format table /path/to/inspect
 
 </details>
 
-### First Scan
+### Start Excise
 
-Start with a disposable folder and a read-only output mode:
+Open the terminal interface with the simplest command:
 
 ```console
-(
-  set -euo pipefail
-  folder="$(mktemp -d "${TMPDIR:-/tmp}/excise-quick-start.XXXXXX")"
-  readonly folder
-  trap 'rm -rf -- "$folder"' EXIT
-  printf 'sample\n' > "$folder/file.txt"
-  printf 'nested sample\n' > "$folder/nested.txt"
-  excise --format table "$folder"
-)
+excise
 ```
 
-For the interactive terminal interface, omit `--format table`. Keep the default deletion confirmation enabled until you understand the review flow. Never substitute a home directory, a filesystem root, a mounted volume, or another path containing data you cannot lose.
+The default interface starts in the current folder. Keep the default deletion confirmation enabled until you understand the review flow. Never start in a home directory, a filesystem root, a mounted volume, or another path containing data you cannot lose.
 
 ## Usage
 
-```console
-# Interactive terminal interface
-excise /path/to/inspect
+### Start the Terminal Interface
 
+Run Excise without arguments to open the interface in the current folder:
+
+```console
+excise
+```
+
+### Other Ways to Use Excise
+
+```console
 # Readable output for people
 excise --format table /path/to/inspect
 
@@ -115,35 +113,12 @@ Configuration takes values in this order: command line, environment, versioned T
 ## What Excise Does
 
 - **Careful space accounting:** Excise keeps the disk space assigned to files separate from their file length. It counts files with more than one name once and keeps unknown values unknown.
-- **Clear limits:** Scanner queues, worker counts, memory use, temporary file records, reports, and interface history have explicit limits.
+- **Clear limits:** Scan queues, worker counts, memory use, temporary file records, reports, and interface history have explicit limits.
 - **Safe review before deletion:** Deletion plans record the files and folders that were reviewed. Excise does not follow links, checks for changes before deletion, and never includes new entries silently.
 - **Reliable terminal behavior:** The terminal is restored after normal exit, errors, panics, cancellation, and forced interruption.
 - **Accessible interaction:** Keyboard controls, narrow layouts, plain ASCII output, monochrome output, and reduced motion preserve the important safety information.
 - **Useful reports:** Table output is intended for people to read. JSON output uses stable, versioned formats for scan results, deletion history, and file paths.
 - **Readable maps:** The interface uses allocated space by default. Ordinary entries receive colours based on their relative size in the visible folder. Uncertain, shared, and summary entries keep their own meaning. Entries that do not fit remain visible as an overflow summary instead of making a folder look empty.
-
-## Safety Model
-
-Excise offers deletion only for complete entries that it has fully examined on a platform with tested deletion support. It refuses filesystem roots and summary entries. Before asking for confirmation, it compares the live files and folders with the reviewed plan. It checks every planned entry again immediately before deletion.
-
-Changed, replaced, missing, newly created, permission-blocked, and uncertain entries are never silently deleted. A soft cancellation reports the work completed so far. A forced cancellation restores the terminal immediately and reports that the final filesystem state may be uncertain. There is no recovery or undo mechanism.
-
-Read the [permanent deletion contract](docs/safety/deletion.md), [space accounting contract](docs/safety/accounting.md), and [threat model](docs/architecture/threat-model.md) before relying on destructive behavior.
-
-## Support Policy
-
-| Target | v1.0.0 status | Evidence |
-|---|---|---|
-| x86_64 Linux (`x86_64-unknown-linux-gnu`) | Supported | Native testing, terminal testing, and release archive |
-| AArch64 macOS (`aarch64-apple-darwin`) | Supported | Native testing, terminal testing, and release archive |
-| x86_64 Windows (`x86_64-pc-windows-msvc`) | Supported | Native testing, terminal testing, and release archive |
-| x86_64 macOS (`x86_64-apple-darwin`) | Build-only and best effort | Release compilation and archive only |
-| AArch64 Linux (`aarch64-unknown-linux-gnu`) | Build-only and best effort | Release compilation and archive only |
-| AArch64 Windows (`aarch64-pc-windows-msvc`) | Build-only and best effort | Release compilation and archive only |
-
-Only the first three targets have full platform support. The remaining archives are published for people who want to experiment, but a successful download or build does not prove that the program runs correctly on that target.
-
-Behavior can vary with file system types, access rules, network file systems, files that share storage with copies, compression, and shared physical storage. These cases remain best effort unless they have separate evidence. Unknown allocated space remains explicit. See [SUPPORT.md](SUPPORT.md) for limitations and troubleshooting.
 
 ## Terminal Controls
 
@@ -163,18 +138,41 @@ Behavior can vary with file system types, access rules, network file systems, fi
 
 The interactive interface needs standard input and output connected to a terminal, terminal color and control support, a separate screen for the interface, and a window at least `32 x 8`. Use table or JSON mode for redirection, pipelines, continuous integration, and terminals without those capabilities. `--output FILE` works only with table or JSON mode.
 
+## Safety Model
+
+Excise offers deletion only for complete entries that it has fully examined on a platform with tested deletion support. It refuses filesystem roots and summary entries. Before asking for confirmation, it compares the live files and folders with the reviewed plan. It checks every planned entry again immediately before deletion.
+
+Changed, replaced, missing, newly created, permission-blocked, and uncertain entries are never silently deleted. A soft cancellation reports the work completed so far. A forced cancellation restores the terminal immediately and reports that the final filesystem state may be uncertain. There is no recovery or undo mechanism.
+
+Read the [permanent deletion contract](docs/safety/deletion.md), [space accounting contract](docs/safety/accounting.md), and [threat model](docs/architecture/threat-model.md) before relying on destructive behavior.
+
+## Support Policy
+
+| Target | v1.0.0 status | Evidence |
+|---|---|---|
+| x86_64 Linux (`x86_64-unknown-linux-gnu`) | Supported | Testing on Linux, terminal testing, and release archive |
+| AArch64 macOS (`aarch64-apple-darwin`) | Supported | Testing on macOS, terminal testing, and release archive |
+| x86_64 Windows (`x86_64-pc-windows-msvc`) | Supported | Testing on Windows, terminal testing, and release archive |
+| x86_64 macOS (`x86_64-apple-darwin`) | Build-only and best effort | Release compilation and archive only |
+| AArch64 Linux (`aarch64-unknown-linux-gnu`) | Build-only and best effort | Release compilation and archive only |
+| AArch64 Windows (`aarch64-pc-windows-msvc`) | Build-only and best effort | Release compilation and archive only |
+
+Only the first three targets have full platform support. The remaining archives are published for people who want to experiment, but a successful download or build does not prove that the program runs correctly on that target.
+
+Behavior can vary with file system types, access rules, network file systems, files that share storage with copies, compression, and shared physical storage. These cases remain best effort unless they have separate evidence. Unknown allocated space remains explicit. See [SUPPORT.md](SUPPORT.md) for limitations and troubleshooting.
+
 ## Documentation
 
-- [Getting started](docs/getting-started.md)
+- [Getting Started](docs/getting-started.md)
 - [Configuration](docs/configuration.md)
-- [Reports and JSON formats](docs/reports.md)
-- [Permanent deletion contract](docs/safety/deletion.md)
-- [Space accounting contract](docs/safety/accounting.md)
-- [Architecture and threat model](docs/architecture/overview.md)
+- [Reports and JSON Formats](docs/reports.md)
+- [Permanent Deletion Contract](docs/safety/deletion.md)
+- [Space Accounting Contract](docs/safety/accounting.md)
+- [Architecture and Threat Model](docs/architecture/overview.md)
 - [Development](docs/development.md)
-- [Release process](docs/releasing.md)
-- [Support policy](SUPPORT.md)
-- [Security policy](SECURITY.md)
+- [Release Process](docs/releasing.md)
+- [Support Policy](SUPPORT.md)
+- [Security Policy](SECURITY.md)
 - [Governance](GOVERNANCE.md)
 
 ## Development

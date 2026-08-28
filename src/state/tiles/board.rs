@@ -21,7 +21,7 @@ enum PivotResolution {
 }
 
 /// Map-space geometry keeps half-row coordinates wide enough for any terminal
-/// `Rect`; terminal `Rect`s are only used at the public API boundary.
+/// `Rect`. Terminal `Rect`s are only used at the public API boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TileGeometry {
     x: u16,
@@ -65,8 +65,8 @@ pub struct Board {
     list_layout: bool,
     list_offset: usize,
     view: Option<DatasetView>,
-    /// Geometry actually drawn this frame. Always identity-aligned with `tiles`;
-    /// only the four rectangle fields differ, and only while a tween is running.
+    /// Geometry actually drawn this frame. It always keeps the same identities as `tiles`.
+    /// Only the four rectangle fields differ while a transition is running.
     rendered_tiles: Vec<Tile>,
     /// Entries the incoming layout no longer contains, kept on screen for the
     /// length of a drill so the map contracts into the entry that replaced it
@@ -174,7 +174,7 @@ impl Board {
         self.fill_from_selected(selected);
     }
     /// Drops a resolved drill pivot once no movement remains. A stationary pivot
-    /// is retained only for same-view scan arrivals; resize and zoom are new
+    /// is retained only for same-view scan arrivals. Resize and zoom are new
     /// layouts and must not make later entries grow from that old rectangle.
     fn expire_stationary_pivot(&mut self) {
         if self.transition_origin.is_some() && !self.is_transitioning() {
@@ -233,7 +233,7 @@ impl Board {
     /// unavailable.
     ///
     /// `Pivot::Entry` waits for the incoming layout to expose the folder being
-    /// left; a narrow list may need to reveal that identity first.
+    /// left. A narrow list may need to reveal that identity first.
     fn resolve_pivot(&mut self) -> PivotResolution {
         let geometry_pivot = self.pending_pivot_geometry.take();
         let Some(pivot) = self.pending_pivot else {
@@ -385,8 +385,8 @@ impl Board {
             selected.and_then(|id| self.tiles.iter().position(|tile| tile.node_id == id));
         // The map always holds a cursor while it has entries to hold one on. A
         // folder whose contents were just replaced would otherwise come up with
-        // nothing selected, emptying the inspector and leaving the reader to hunt
-        // for the entry that matters — which is the biggest one, at index zero.
+        // Nothing is selected, so the inspector is empty and the reader must hunt
+        // for the entry that matters. It is the biggest one at index zero.
         if self.selected_index.is_none() {
             self.select_largest();
         }
@@ -911,7 +911,7 @@ impl Board {
     /// The terminal-cell rectangle the selected entry will occupy once the current
     /// tween settles.
     ///
-    /// Use `selected_rendered_rect` for the rectangle the reader saw; this
+    /// Use `selected_rendered_rect` for the rectangle the reader saw. This
     /// accessor stays on `tiles` for callers that need target geometry.
     #[allow(
         dead_code,
@@ -950,20 +950,20 @@ impl Board {
 /// What the next dataset swap should zoom around.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Pivot {
-    /// A terminal-cell rectangle in the layout on screen now — the entry being opened.
+    /// A terminal-cell rectangle in the layout on screen now, representing the entry being opened.
     #[allow(
         dead_code,
-        reason = "terminal-cell pivot remains available for compatibility; internal drills carry half-row geometry"
+        reason = "Terminal-cell pivot remains available for compatibility. Internal drills carry half-row geometry"
     )]
     Rect(Rect),
-    /// An entry in the layout about to be built — the folder being left, which
+    /// An entry in the layout about to be built. It is the folder being left, which
     /// has no geometry until its parent is laid out again.
     Entry(NodeId),
 }
 
 /// Ease-out cubic.
 ///
-/// A drill should leave immediately and arrive gently; linear motion over the
+/// A drill should leave immediately and arrive gently. Linear motion over the
 /// same span reads as a slide with a hard stop at both ends.
 fn ease_out(progress: f64) -> f64 {
     let remaining = 1.0 - progress.clamp(0.0, 1.0);

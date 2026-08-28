@@ -143,19 +143,19 @@ fn check_support_matrix() -> Result<(), Box<dyn Error>> {
         require_row(
             &development,
             target,
-            "Build-only/best-effort",
+            "Build-only and best effort",
             "docs/development.md",
         )?;
-        require_row(&support, target, "Build-only/best-effort", "SUPPORT.md")?;
+        require_row(&support, target, "Build-only and best effort", "SUPPORT.md")?;
     }
     require_text(
         &development,
-        "Filesystem-provider-specific",
+        "Behavior can vary with file system types",
         "filesystem caveat in docs/development.md",
     )?;
     require_text(
         &support,
-        "Filesystem-provider-specific",
+        "Behavior can vary with file system types",
         "filesystem caveat in SUPPORT.md",
     )?;
 
@@ -219,7 +219,7 @@ const DEMO_LOSSY: u32 = 50;
 /// Ceiling the published recording must stay under.
 ///
 /// A README hero is fetched by everyone who visits the page, so weight is a
-/// user-visible property. The optimised pipeline lands near 1.1 MiB; this
+/// user-visible property. The optimised pipeline lands near 1.1 MiB. This
 /// catches a regression that silently restores dithering or full frame rate,
 /// which alone would triple the asset.
 const DEMO_MAX_BYTES: u64 = 1_572_864;
@@ -254,8 +254,8 @@ const DEMO_TAPE: &str = "tapes/demo.tape";
 /// Renders the README hero recording and shrinks it to publishable weight.
 ///
 /// `vhs` alone writes a dithered, full-rate GIF several times larger than the
-/// same frames need. Dithering is the dominant cost — it turns flat terminal
-/// cells into per-pixel noise that no frame differ can compress — so the
+/// same frames need. Dithering is the dominant cost. It turns flat terminal
+/// cells into per-pixel noise that no frame differ can compress, so the
 /// optimisation pass rebuilds the palette without it before quantising.
 fn render_demo() -> Result<(), Box<dyn Error>> {
     let _cleanup = DemoArtifactCleanup::install();

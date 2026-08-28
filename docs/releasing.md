@@ -1,62 +1,66 @@
-# Release process
+# Release Process
 
 This runbook records the historical early-testing releases through `0.3.0` and the procedure for the first stable `1.0.0` release and future releases. It is a procedure, not authorization.
 
-## The 0.1.1 contract (historical)
+## The 0.1.1 Contract (Historical)
 
-The published `0.1.1` release is for early testing. Its public library API and destructive behavior remain provisional until the project declares a stable line. Test only with disposable data; do not treat this release as suitable for irreplaceable files.
+The published `0.1.1` release was for early testing. Its public library API and destructive behavior remained provisional until the project declared a stable line. Users were instructed to test only with disposable data and not to use it with irreplaceable files.
 
 The release commit and candidate must agree on all of the following:
 
-- `Cargo.toml`, `Cargo.lock`, the CLI version, and the changelog identify `0.1.1`;
-- the crate is publishable (the release metadata must not set `publish = false`);
-- the annotated `v0.1.1` tag points to the exact protected `main` commit that passed verification;
-- six target archives, their SHA-256 manifest, the SPDX JSON SBOM, and GitHub build attestations describe that same commit and version;
-- the first-party Homebrew tap formula refers only to those immutable GitHub release assets; and
-- the tagged Nix flake and cargo-binstall metadata resolve the same immutable `0.1.1` release.
+- `Cargo.toml`, `Cargo.lock`, the command-line version, and the changelog identify `0.1.1`.
+- The crate is publishable. The release metadata must not set `publish = false`.
+- The annotated `v0.1.1` tag points to the exact protected `main` commit that passed verification.
+- Six target archives, their SHA-256 manifest, the SPDX JSON software bill of materials, and GitHub build attestations describe that same commit and version.
+- The first-party Homebrew tap formula refers only to those immutable GitHub release assets.
+- The tagged Nix flake and cargo-binstall metadata resolve the same immutable `0.1.1` release.
 
-The release does not enable Scoop, WinGet, Homebrew Core, or any other package channel beyond the first-party Homebrew tap, tagged Nix flake, crates.io, and cargo-binstall metadata. Templates under `packaging/` are validation inputs unless a separately approved channel promotion says otherwise. The source formula at `packaging/homebrew-core/excise.rb.in` is for a possible future Homebrew Core submission; it is not the first-party tap formula.
+The release did not enable Scoop, WinGet, Homebrew Core, or any other package channel beyond the first-party Homebrew tap, tagged Nix flake, crates.io, and cargo-binstall metadata. Templates under `packaging/` are validation inputs unless a separately approved channel promotion says otherwise. The source formula at `packaging/homebrew-core/excise.rb.in` is for a possible future Homebrew Core submission. It is not the first-party tap formula.
 
-## The 0.1.2 corrective release (historical)
+## The 0.1.2 Corrective Release (Historical)
 
 The corrective `0.1.2` release contains the post-`0.1.1` accounting hardening and fuzz-oracle fix. It is published but remains an early-testing release: its public library API and destructive behavior are provisional. The `0.1.2` publication record remains historical and immutable.
 
-## The 0.2.0 early-testing release
+## The 0.2.0 Early-Testing Release
 
-The `0.2.0` release packages the dense storage map, accessible terminal presentation, animation, overflow reporting, and retained-accounting work described in the changelog. It was a minor early-testing release because the public library API changed; its publication record is historical and immutable.
+The `0.2.0` release packaged the dense storage map, accessible terminal presentation, animation, overflow reporting, and retained accounting work described in the changelog. It was a minor early-testing release because the public library API changed. Its publication record is historical and immutable.
 
 The approved `0.2.0` publication used:
 
-- source commit: `f8329ce3ec5d338ee15459ec96a1f8897321b4ef`;
-- candidate workflow run: https://github.com/findyourexit/excise/actions/runs/33045125756;
-- immutable publication workflow run: https://github.com/findyourexit/excise/actions/runs/33045511141;
-- annotated tag: `v0.2.0`, pointing to the exact source commit;
-- successful native verification: https://github.com/findyourexit/excise/actions/runs/33044958150;
+- Source commit: `f8329ce3ec5d338ee15459ec96a1f8897321b4ef`.
+- Candidate workflow run: https://github.com/findyourexit/excise/actions/runs/33045125756
+- Immutable publication workflow run: https://github.com/findyourexit/excise/actions/runs/33045511141
+- Annotated tag: `v0.2.0`, pointing to the exact source commit.
+- Successful native verification: https://github.com/findyourexit/excise/actions/runs/33044958150
 - published GitHub Release assets, crates.io package, first-party Homebrew Tap, cargo-binstall metadata, and tagged Nix flake.
 
-## The 0.3.0 early-testing release
+## The 0.3.0 Early-Testing Release
 
-The `0.3.0` release packages the private Rust API boundary and compatibility-policy work described in the changelog. It was a breaking minor release because provisional Rust module paths were removed from the default public surface; its destructive behavior was provisional, and its publication record is historical and immutable. The active candidate, verification, and promotion procedure below targets `1.0.0`.
+The `0.3.0` release packaged the private Rust API boundary and compatibility-policy work described in the changelog. It was a breaking minor release because provisional Rust module paths were removed from the default public surface. Its destructive behavior was provisional, and its publication record is historical and immutable. The active candidate, verification, and promotion procedure below targets `1.0.0`.
 
-## The 1.0.0 stable release
+## The 1.0.0 Stable Release
 
-The `1.0.0` release freezes the CLI, configuration, versioned JSON reports, deletion and accounting semantics, native support policy, and exact-commit distribution procedure described by the v1 contract decision record below. It is the first stable release; later incompatible changes require a major version, while additive report and configuration changes must preserve the documented compatibility rules.
+The `1.0.0` release freezes the command-line tool, configuration, versioned JSON reports, deletion and accounting semantics, platform support policy, and exact-commit distribution procedure described by the v1 contract decision record below. It is the first stable release. Later incompatible changes require a major version. Additive report and configuration changes must preserve the documented compatibility rules.
 
-## Approved `1.0.0` publication
+## Approved `1.0.0` Publication
 
 The approved stable publication used:
 
-- source commit: `b384a9ca6ac8d4853574083945d4a10d22b16817`;
-- protected-main native verification: https://github.com/findyourexit/excise/actions/runs/33117864079;
-- exact-SHA candidate workflow: https://github.com/findyourexit/excise/actions/runs/33118939870;
-- annotated tag: `v1.0.0`, carrying `candidate-run-id: 33118939870` and pointing to the exact source commit;
-- immutable publication workflow: https://github.com/findyourexit/excise/actions/runs/33119398710;
-- GitHub Release: https://github.com/findyourexit/excise/releases/tag/v1.0.0;
+- Source commit: `b384a9ca6ac8d4853574083945d4a10d22b16817`.
+- Protected-main native verification: https://github.com/findyourexit/excise/actions/runs/33117864079
+- Exact-SHA candidate workflow: https://github.com/findyourexit/excise/actions/runs/33118939870
+- Annotated tag: `v1.0.0`, carrying `candidate-run-id: 33118939870` and pointing to the exact source commit.
+- Immutable publication workflow: https://github.com/findyourexit/excise/actions/runs/33119398710
+- GitHub Release: https://github.com/findyourexit/excise/releases/tag/v1.0.0
 - first-party Homebrew Tap formula commit: https://github.com/findyourexit/homebrew-tap/commit/9157017d736c23037e100ca6f13317f52c9c8683.
 
-The published bundle contains six target archives, `checksums.sha256`, and `excise.spdx.json`. The checksum manifest, SBOM, archive contents, and all eight GitHub attestations were independently verified after publication. crates.io, cargo-binstall, Homebrew, and the tagged Nix flake each reported `1.0.0`; the support classifications are recorded in [SUPPORT.md](../SUPPORT.md), and corrective-release handling remains governed by [Reruns and rollback](#reruns-and-rollback).
+The published bundle contains six target archives, `checksums.sha256`, and `excise.spdx.json`. The checksum manifest, software bill of materials, archive contents, and all eight GitHub attestations were independently verified after publication. crates.io, cargo-binstall, Homebrew, and the tagged Nix flake each reported `1.0.0`. The support classifications are recorded in [SUPPORT.md](../SUPPORT.md). Corrective-release handling remains governed by [Reruns and Rollback](#reruns-and-rollback).
 
-## Preconditions and clean tree
+## The 1.0.1 Patch Release
+
+Use `1.0.1` for a narrowly scoped correction after `1.0.0`. A patch release must preserve the documented command-line, configuration, report, deletion, accounting, and support behavior. It should include a focused regression test or documentation correction, update the `Unreleased` notes, and repeat the exact protected-commit candidate, checksum, software bill of materials, attestation, package-channel, and rollback checks before publication. Do not publish `1.0.1` until a concrete correction has been accepted.
+
+## Preconditions & Clean Tree
 
 Only a maintainer may start publication. Before creating a tag, dispatching a candidate, or using a publication credential:
 
@@ -70,11 +74,11 @@ Only a maintainer may start publication. Before creating a tag, dispatching a ca
    git diff --cached --exit-code
    ```
 
-   Do not use `--allow-dirty`, copy generated files from another checkout, or mix outputs from different commits. Ignored build output does not make a dirty tracked tree safe; inspect any unexpected ignored release input before proceeding.
-4. Confirm the commit, branch protection, and manifest version before dispatching the hosted candidate. Capture `source_sha="$(git rev-parse HEAD)"` from that exact protected commit and pass it to the workflow; the workflow rejects a moving ref, an unprotected ref, an unmerged commit, or a mismatched SHA.
-5. Obtain the release approval and environment approval before enabling any write credential. Candidate generation is read-only; publication is a separate, reviewed action.
+   Do not use `--allow-dirty`, copy generated files from another checkout, or mix outputs from different commits. Ignored build output does not make a dirty tracked tree safe. Inspect any unexpected ignored release input before proceeding.
+4. Confirm the commit, branch protection, and manifest version before dispatching the hosted candidate. Capture `source_sha="$(git rev-parse HEAD)"` from that exact protected commit and pass it to the workflow. The workflow rejects a moving ref, an unprotected ref, an unmerged commit, or a mismatched SHA.
+5. Obtain the release approval and environment approval before enabling any write credential. Candidate generation is read-only. Publication is a separate, reviewed action.
 
-## Local candidate
+## Local Candidate
 
 Run these commands from the repository root on the clean release commit:
 
@@ -90,9 +94,9 @@ Run these commands from the repository root on the clean release commit:
 
 `cargo verify` includes generated-file, schema, distribution-template, compilation, test, policy, fuzz, benchmark, and release-binary checks. `cargo publish --locked --dry-run` packages the exact crate without uploading it. It is the last safe check for the crates.io package contents and must pass without `--allow-dirty`.
 
-`cargo dist-local` builds the host release archive and supporting metadata without publishing anything. It writes the host archive under `dist/`, a `dist/checksums.sha256` file, and a local formula at `dist/homebrew/excise.rb`. Inspect the archive before using any hosted artifact; the archive contains the release binary, `LICENSE`, `README.md`, generated man/completion files, schemas, `excise.cdx.json`, and `provenance.local.json`.
+`cargo dist-local` builds the host release archive and supporting metadata without publishing anything. It writes the host archive under `dist/`, a `dist/checksums.sha256` file, and a local formula at `dist/homebrew/excise.rb`. Inspect the archive before using any hosted artifact. The archive contains the release binary, `LICENSE`, `README.md`, generated man and completion files, schemas, `excise.cdx.json`, and `provenance.local.json`.
 
-## Hosted candidate
+## Hosted Candidate
 
 The manually dispatched `Release candidate artifacts` workflow in `.github/workflows/release.yml` checks out the explicit reviewed SHA and requires the input version and dispatch ID to match the package contract. Dispatch it only from protected `main`, and abort if `main` moves between capture and dispatch:
 
@@ -181,35 +185,36 @@ The candidate contains six immutable target archives, `checksums.sha256`, and `e
 )
 ```
 
-Confirm that every archive contains its target binary, `LICENSE`, `generated/man/excise.1`, and `schemas/scan-report.schema.json`; the SBOM and provenance files are candidate-bundle evidence and are not silently substituted for an archive. The workflow retains candidate artifacts for one day. Retention is a validation convenience, not publication or durable distribution.
-## Promotion order and publication semantics
+Confirm that every archive contains its target binary, `LICENSE`, `generated/man/excise.1`, and `schemas/scan-report.schema.json`. The software bill of materials and provenance files are candidate-bundle evidence and are not silently substituted for an archive. The workflow retains candidate artifacts for one day. Retention is a validation convenience, not publication or durable distribution.
+
+## Promotion Order & Publication Semantics
 
 The approved `0.1.1` publication used:
 
-- source commit: `59eb0d17295eaef99305521651107c28dce27613`;
-- candidate workflow run: [32733774029](https://github.com/findyourexit/excise/actions/runs/32733774029);
-- annotated tag: `v0.1.1`, carrying `candidate-run-id: 32733774029`;
+- Source commit: `59eb0d17295eaef99305521651107c28dce27613`.
+- Candidate workflow run: [32733774029](https://github.com/findyourexit/excise/actions/runs/32733774029)
+- Annotated tag: `v0.1.1`, carrying `candidate-run-id: 32733774029`.
 - publication recovery run: [32742153533](https://github.com/findyourexit/excise/actions/runs/32742153533).
 
 The tag was never moved. The recovery workflow verified and promoted the exact candidate bytes without rebuilding them.
 
 The approved `0.1.2` publication used:
 
-- source commit: `94987c5f48b7814b6c035cb61931cf7aeb11eab0`;
-- candidate workflow run: [32798065116](https://github.com/findyourexit/excise/actions/runs/32798065116);
-- annotated tag: `v0.1.2`, carrying `candidate-run-id: 32798065116`;
-- publication workflow run: [32798482623](https://github.com/findyourexit/excise/actions/runs/32798482623);
+- Source commit: `94987c5f48b7814b6c035cb61931cf7aeb11eab0`.
+- Candidate workflow run: [32798065116](https://github.com/findyourexit/excise/actions/runs/32798065116)
+- Annotated tag: `v0.1.2`, carrying `candidate-run-id: 32798065116`.
+- Publication workflow run: [32798482623](https://github.com/findyourexit/excise/actions/runs/32798482623)
 - post-publication native verification: [32800896471](https://github.com/findyourexit/excise/actions/runs/32800896471).
 
 The publication semantics are:
 
-1. The `release` job creates the GitHub release from the promoted candidate bundle. It reuses an existing published release only after the exact tag object, complete asset set, and every asset checksum match; published mismatches and unexpected drafts are refused, while a matching non-prerelease draft may be repaired with the reverified candidate assets.
-2. The `publish-crate` job publishes the crate once after the release job succeeds. Do not run `cargo publish` manually; the job accepts an existing version only after matching its registry checksum and non-yanked state, and otherwise fails before retrying.
-3. After the `homebrew-tap` environment approval, the `publish-homebrew` job renders and pushes only `Formula/excise.rb` from the verified source SHA. Review the resulting tap commit and formula after the job; do not edit that external repository from this checkout.
+1. The `release` job creates the GitHub release from the promoted candidate bundle. It reuses an existing published release only after the exact tag object, complete asset set, and every asset checksum match. Published mismatches and unexpected drafts are refused. A matching non-prerelease draft may be repaired with the reverified candidate assets.
+2. The `publish-crate` job publishes the crate once after the release job succeeds. Do not run `cargo publish` manually. The job accepts an existing version only after matching its registry checksum and non-yanked state. Otherwise it fails before retrying.
+3. After the `homebrew-tap` environment approval, the `publish-homebrew` job renders and pushes only `Formula/excise.rb` from the verified source SHA. Review the resulting tap commit and formula after the job. Do not edit that external repository from this checkout.
 
-The crates.io package follows the release commit's Cargo exclusions (`.cargo`, `.github`, `.gitmessage`, `assets`, `tapes`, `handoff`, and `packaging`); `cargo package --locked --list` is the source of truth. It does not turn the GitHub archive or tap into crate contents. The `1.0.0` API boundary is CLI-only; publishing it is not a promise of a supported Rust library.
+The crates.io package follows the release commit's Cargo exclusions (`.cargo`, `.github`, `.gitmessage`, `assets`, `tapes`, `handoff`, and `packaging`). `cargo package --locked --list` is the source of truth. The package does not turn the GitHub archive or tap into crate contents. The `1.0.0` API boundary is command-line only. Publishing it is not a promise of a supported Rust library.
 
-## Nix and cargo-binstall verification
+## Nix & cargo-binstall Verification
 
 The tagged Nix flake is a source-build channel, while cargo-binstall downloads target-specific release archives. Verify the channels independently:
 
@@ -228,10 +233,10 @@ nix run github:findyourexit/excise/v1.0.0 -- --format table /path/to/inspect
 )
 ```
 
-The `nix eval` and `nix run -- --version` commands verify the tagged Nix package independently. The isolated `cargo binstall` block verifies a fresh target-specific archive and invokes that exact binary; do not treat one channel's successful command as evidence for the other.
+The `nix eval` and `nix run -- --version` commands verify the tagged Nix package independently. The isolated `cargo binstall` block verifies a fresh target-specific archive and invokes that exact binary. Do not treat one channel's successful command as evidence for the other.
 
 
-## Homebrew tap verification
+## Homebrew Tap Verification
 
 The first-party binary formula is installed from `findyourexit/homebrew-tap`, not from Homebrew Core:
 
@@ -245,23 +250,23 @@ brew info findyourexit/tap/excise
 excise --version
 ```
 
-`brew fetch` checks the formula's archive URL and SHA-256, `brew audit` checks formula policy, `brew test` runs the formula's version and JSON-scan smoke checks, and `brew info` confirms the selected version and tap. Also inspect the rendered formula with `brew cat findyourexit/tap/excise`; every URL must be a `releases/download/v1.0.0/` asset and every checksum must match `checksums.sha256`. The source formula in `packaging/homebrew-core/excise.rb.in` has different build semantics and must not be used as evidence that Homebrew Core has accepted the package.
+`brew fetch` checks the formula's archive URL and SHA-256. `brew audit` checks formula policy. `brew test` runs the formula's version and JSON scan smoke checks. `brew info` confirms the selected version and tap. Also inspect the rendered formula with `brew cat findyourexit/tap/excise`. Every URL must be a `releases/download/v1.0.0/` asset and every checksum must match `checksums.sha256`. The source formula in `packaging/homebrew-core/excise.rb.in` has different build semantics and must not be used as evidence that Homebrew Core has accepted the package.
 
-## Credentials and approvals
+## Credentials & Approvals
 
-Keep candidate and publication credentials separate. The candidate workflow needs read access to the source and artifact services plus the permissions required for its attestation step; it must not receive a crates.io or tap write token. A publication environment requires explicit maintainer approval and, where configured, a second reviewer:
+Keep candidate and publication credentials separate. The candidate workflow needs read access to the source and artifact services plus the permissions required for its attestation step. It must not receive a crates.io or tap write token. A publication environment requires explicit maintainer approval and, where configured, a second reviewer:
 
-- `CARGO_REGISTRY_TOKEN` or Cargo's credential file authorizes `cargo publish`; use it only for the approved command and never print it, commit it, or put it in a tape or report.
-- `GH_TOKEN` authorizes local `gh` commands. An Actions `GITHUB_TOKEN` needs explicit `contents: write` only in the approved promotion job; the read-only candidate job must not be broadened casually.
-- The external tap requires a separately approved GitHub credential with write access to `findyourexit/homebrew-tap`; repository access is not implied by access to `findyourexit/excise`.
+- `CARGO_REGISTRY_TOKEN` or Cargo's credential file authorizes `cargo publish`. Use it only for the approved command. Never print it, commit it, or put it in a tape or report.
+- `GH_TOKEN` authorizes local `gh` commands. An Actions `GITHUB_TOKEN` needs explicit `contents: write` only in the approved promotion job. The read-only candidate job must not be broadened casually.
+- The external tap requires a separately approved GitHub credential with write access to `findyourexit/homebrew-tap`. Repository access is not implied by access to `findyourexit/excise`.
 
-Do not run with shell tracing (`set -x`) around secrets. Review `env`, repository selection, ref, SHA, version, and destination before each write. If a required credential or approval is absent, stop before the write step; do not substitute a personal token or a different repository.
+Do not run with shell tracing (`set -x`) around secrets. Review `env`, repository selection, ref, SHA, version, and destination before each write. If a required credential or approval is absent, stop before the write step. Do not substitute a personal token or a different repository.
 
-## Reruns and rollback
+## Reruns & Rollback
 
-Candidate generation is safe to rerun for a transient workflow failure, but rerun the same version and exact source SHA and revalidate the complete bundle. If source changes after a failed candidate, land the fix on protected `main`, dispatch a new candidate, and discard the old bundle; never mix archives, checksums, SBOMs, or attestations from different SHAs. A missing one-day artifact is regenerated only through the same gated workflow.
+Candidate generation is safe to rerun for a transient workflow failure, but rerun the same version and exact source SHA and revalidate the complete bundle. If source changes after a failed candidate, land the fix on protected `main`, dispatch a new candidate, and discard the old bundle. Never mix archives, checksums, software bills of materials, or attestations from different SHAs. A missing one-day artifact is regenerated only through the same gated workflow.
 
-Publication can be retried by rerunning the failed workflow after inspecting the GitHub tag/release/assets, the crates.io `excise` version, and the external tap commit. The release job safely reuses only a published release whose exact candidate asset set and checksums match; continue only with the missing, reviewed step, never rebuild an already published asset, and never republish an existing crate version.
+Publication can be retried by rerunning the failed workflow after inspecting the GitHub tag, release, assets, the crates.io `excise` version, and the external tap commit. The release job safely reuses only a published release whose exact candidate asset set and checksums match. Continue only with the missing, reviewed step. Never rebuild an already published asset and never republish an existing crate version.
 
 If a workflow defect is fixed on protected `main` after the release tag already exists, do not move the tag. Dispatch the fixed workflow in immutable publication-recovery mode, passing the original candidate source SHA, tag, and candidate run ID:
 
@@ -279,44 +284,44 @@ gh workflow run release.yml \
 
 The recovery gate verifies that protected `main` has not moved during dispatch, that the immutable tag still targets `source_sha`, and that `run_id` is the successful candidate for that exact source before reusing its artifacts.
 
-If a destructive-safety or release-integrity defect is found, stop promotion and mark the affected channel unavailable while preserving the candidate evidence. Do not move, delete, or overwrite an existing tag or GitHub asset. A rollback cannot undo filesystem deletion and must not ask users to rerun a destructive command; after the fix is reviewed, publish a new corrective version (for example `0.2.1`), then update each channel to that immutable version. A crates.io yank only prevents new dependency resolution; it does not erase an already downloaded crate.
+If a deletion-safety or release-integrity defect is found, stop promotion and mark the affected channel unavailable while preserving the candidate evidence. Do not move, delete, or overwrite an existing tag or GitHub asset. A rollback cannot undo filesystem deletion and must not ask users to rerun a destructive command. After the fix is reviewed, publish a new corrective version, such as `0.2.1`, then update each channel to that immutable version. A crates.io yank only prevents new dependency resolution. It does not erase an already downloaded crate.
 
-## v1.0.0 readiness gate
+## v1.0.0 Readiness Gate
 
 The `1.0.0` release is the first stable line and is authorized only after the public behavior, supported-platform policy, safety evidence, and release procedure below are explicit and reviewed. The `0.3.x` line remains historical early testing.
 
-### Contract decision record
+### Contract Decision Record
 
 | Area | Required v1 decision | Current position |
 | --- | --- | --- |
-| CLI | Freeze command names, flags, defaults, help text, and non-TTY behavior. Additive changes are permitted; incompatible changes require a major version. | Existing CLI and generated artifacts are the candidate baseline. |
-| Environment and configuration | Preserve command line > environment > versioned TOML > defaults. Reject unknown or invalid values. Reject every file version other than `1`; do not silently migrate or reinterpret configuration. | `version = 1`, precedence, and rejection are implemented and tested. |
-| Table output | Classify table output as human-facing and non-stable. Preserve safety semantics and escaping, but direct machine consumers to JSON rather than parsing headings or columns. | JSON is the machine-readable compatibility surface; table layout is explicitly non-stable. |
-| JSON reports | Keep `scan-report`, `deletion-history`, and `native-path` schema v1 meanings stable. Add fields only when consumers can ignore them; bump the schema version for incompatible changes. | Published v1 schemas use strict unknown-field rejection and have regression validation. |
-| Exit classes | Preserve the documented numeric classes and the rule that uncertain, partial, and interrupted results remain distinguishable from exact results. | Codes are implemented and tested. |
-| Deletion | Preserve no-follow identity binding, independent enumeration, revalidation, root and synthetic-node rejection, explicit partial results, and the permanent/no-undo contract. | The deletion contract and focused safety suite are the baseline. |
-| Accounting | Preserve identity-unique allocated bytes, separate apparent bytes, conservative reclaimable bounds, and explicit unknowns. Do not claim physical shared-extent exactness. | The accounting contract and fixtures are the baseline. |
-| Library API | Treat the CLI, configuration, and versioned reports as the supported product surface. Rust implementation modules are private; the crate-root bridges used by the binary and tooling are hidden and carry no semver guarantee. | The private implementation boundary is implemented; the crate exposes no supported Rust API. |
-| Platforms | Make only native behavioral targets fully supported in `1.0.0`; classify compile/archive-only targets as build-only until native behavior evidence promotes them. | Decision recorded: three native targets are supported; three compile-only archives remain published and explicitly best-effort. |
-| Distribution and governance | Require exact protected-commit artifacts, checksums, SBOM, provenance, rollback, and an explicit release-approval authority. | Artifact identity and rollback are operational; the lead-maintainer approval authority is explicit in `GOVERNANCE.md`, with a second-maintainer review to apply when one is appointed. |
+| Command line | Freeze command names, options, defaults, help text, and noninteractive behavior. Additive changes are permitted. Incompatible changes require a major version. | Existing command definitions and generated files are the candidate baseline. |
+| Environment and configuration | Preserve command line, environment, versioned TOML file, and default precedence. Reject unknown or invalid values. Reject every file version other than `1`. Do not silently migrate or reinterpret configuration. | `version = 1`, precedence, and rejection are implemented and tested. |
+| Table output | Treat table output as human-facing and not stable for programs. Preserve safety and escaping. Direct programmatic consumers to JSON instead of parsing headings or columns. | JSON is the machine-readable format. Table layout is not stable. |
+| JSON reports | Keep the meanings of the `scan-report`, `deletion-history`, and `native-path` version 1 formats stable. Add fields only when consumers can ignore them. Increase the format version for incompatible changes. | Published version 1 formats reject unknown fields and have regression tests. |
+| Exit classes | Preserve the documented numeric classes. Keep uncertain, partial, and interrupted results distinct from exact results. | Codes are implemented and tested. |
+| Deletion | Preserve file identity checks without following links, independent listing, repeated checks, root and summary rejection, explicit partial results, and permanent deletion. | The deletion contract and focused safety suite are the baseline. |
+| Accounting | Preserve space counted once per file identity, separate file length, conservative reclaimable bounds, and explicit unknowns. Do not claim exact physical shared-storage totals. | The accounting contract and fixtures are the baseline. |
+| Rust interface | Treat the command-line tool, configuration, and versioned reports as the supported product. Rust implementation modules are private. The crate carries no stable Rust interface promise. | The private implementation boundary is implemented. The crate exposes no supported Rust interface. |
+| Platforms | Fully support only targets tested on the actual system. Keep build-only targets clearly marked until they have runtime evidence. | Three targets are supported. Three archives remain published for best-effort use. |
+| Distribution and governance | Require exact protected-commit artifacts, checksums, a software bill of materials, origin records, rollback, and an explicit release authority. | Artifact identity and rollback are operational. The lead maintainer authority is explicit in `GOVERNANCE.md`, with an additional maintainer review when one is appointed. |
 
-The table above is the normative `1.0.0` public-contract decision record. Maintain it through reviewed pull requests; any implementation change that affects a row requires that row to be re-reviewed before release authorization. The current authority is explicit: the lead maintainer listed in `MAINTAINERS.md` owns final product, safety, and release decisions and may authorize publication only after this gate, the protected-main ruleset checks, and the publication-environment approval pass. No second maintainer is currently appointed; when one is appointed, the additional approval requirements in `GOVERNANCE.md` apply.
+The table above is the normative `1.0.0` public-contract decision record. Maintain it through reviewed pull requests. Any implementation change that affects a row requires that row to be reviewed again before release authorization. The lead maintainer listed in `MAINTAINERS.md` owns final product, safety, and release decisions and may authorize publication only after this gate, protected-main ruleset checks, and publication-environment approval. When a second maintainer is appointed, the additional requirements in `GOVERNANCE.md` apply.
 
-The release candidate must also record the exact source commit, candidate run, artifact checksums, SBOM, attestations, package-channel results, and reviewer decision against this table. A passing automated check is evidence for its scope; it is not approval for a different scope.
+The release candidate must also record the exact source commit, candidate run, artifact checksums, software bill of materials, attestations, package-channel results, and reviewer decision against this table. A passing automated check is evidence for its scope. It is not approval for a different scope.
 
-### Required exit evidence
+### Required Exit Evidence
 
 Before the `v1.0.0` release PR can be approved, attach:
 
-1. a reviewed public-contract decision record covering every row above;
-2. upgrade and compatibility tests for CLI/configuration (including rejection of unsupported versions), table safety and escaping, JSON schemas, native paths, and exit classes; `tests/cli_contract_smoke.rs` must exercise the binary-level portion of this contract;
-3. native behavioral evidence for every target classified as supported, plus an explicit disposition for build-only targets;
-4. focused security reviews of deletion, identity, spill, terminal restoration, and release supply chain;
-5. dependency, unsafe-boundary, fuzz, benchmark, packaging, SBOM, checksum, and provenance evidence from the exact release commit;
-6. a clean-protected-commit release rehearsal and a documented corrective-release procedure.
+1. A reviewed public-contract decision record covering every row above.
+2. Upgrade and compatibility tests for command-line behavior and configuration, including rejection of unsupported versions, table safety and escaping, JSON formats, file paths, and exit classes. `tests/cli_contract_smoke.rs` must exercise the binary-level portion of this contract.
+3. Runtime evidence on every target classified as supported, together with an explicit disposition for build-only targets.
+4. Focused security reviews of deletion, file identity, temporary storage, terminal restoration, and release systems.
+5. Dependency, unsafe-boundary, fuzz, benchmark, packaging, software bill of materials, checksum, and provenance evidence from the exact release commit.
+6. A clean protected-commit release rehearsal and a documented corrective-release procedure.
 
-An empty consumer-feedback queue is not evidence that a behavior is safe. Keep the early-testing warning until the gate has evidence, not merely until the version number changes.
+An empty list of user reports is not evidence that a behavior is safe. Keep the early-testing warning until the gate has evidence, not merely until the version number changes.
 
-## Historical tags
+## Historical Tags
 
-Tags `0.1.0` through `0.11.0` are preserved Diskonaut releases. They are not Excise releases and must not be moved, deleted, or reused. The `v0.1.1` tag is a new Excise tag; do not infer that the preserved `0.1.0` tag identifies Excise merely because the changelog contains an Excise `0.1.0` section.
+Tags `0.1.0` through `0.11.0` are preserved Diskonaut releases. They are not Excise releases and must not be moved, deleted, or reused. The `v0.1.1` tag is a new Excise tag. Do not infer that the preserved `0.1.0` tag identifies Excise merely because the changelog contains an Excise `0.1.0` section.

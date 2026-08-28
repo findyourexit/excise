@@ -49,7 +49,7 @@ pub(crate) const ASCII_PANE_BORDER_SET: Set = Set {
 
 /// Draws a pane and returns its content area.
 ///
-/// Frame, then travelling cycle, then title chip — strictly in that order. The
+/// Frame, then travelling cycle, then title chip, strictly in that order. The
 /// chip is painted last so the animation underneath can never overwrite it,
 /// which is the failure mode of animating a `Block` title in place.
 #[allow(
@@ -318,7 +318,7 @@ fn static_chip_style(lead: Color, theme: Theme, monochrome: bool) -> Style {
             .fg(ink)
             .bg(lead)
             .add_modifier(Modifier::BOLD),
-        // Palette terminals cannot be measured for contrast; let the terminal
+        // Palette terminals cannot be measured for contrast. Let the terminal
         // invert the chip for us, as exabind does.
         None => Style::default()
             .fg(lead)

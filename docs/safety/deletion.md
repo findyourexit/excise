@@ -1,76 +1,78 @@
-# Permanent deletion contract
+# Permanent Deletion Contract
 
 ## Meaning
 
-Excise permanently removes the confirmed filesystem identities. It does not use trash, a retained quarantine, or undo in 1.0. Linux and Apple adapters use a transient unpredictable same-parent name only while one identity is verified and mutated. Recursive deletion is not globally atomic.
+Excise permanently removes the confirmed file identities. It does not use a trash folder, a quarantine area, or an undo feature. Linux and Apple systems use a temporary unpredictable name in the same parent directory while one identity is checked and removed. Recursive deletion is not one atomic operation.
 
 ## Eligibility
 
-Deletion can be armed only when:
+Deletion can be prepared only when all of these conditions hold:
 
-- the selected node is real, not `Other` or `Shared`;
-- the selected subtree is materialized and complete;
-- the entry is not the scan root, filesystem root, or drive root;
-- the platform has an audited handle-relative adapter;
-- no unresolved scan/identity state prevents a trustworthy plan.
+- The selected entry is real and is not `Other` or `Shared`.
+- Excise has fully examined the selected folder and its descendants.
+- The entry is not the scan root, a file system root, or a drive root.
+- The platform has a reviewed method for deleting the entry without following links.
+- No unresolved scan or identity problem makes the plan untrustworthy.
 
-## Plan construction
+## Plan Construction
 
-1. Copy every materialized scan-model descendant identity into the review contract.
-2. Independently enumerate the live subtree with bounded memory and directory-handle use, recording native relative path, identity, type, allocated/logical size, modification state, and required ordering.
-3. Require an exact path-and-snapshot set match, then revalidate again immediately before confirmation.
-4. If anything changed, discard the plan, rescan, and re-prompt.
+1. Copy every examined descendant identity into the review plan.
+2. List the current contents of the live folder separately. Record each relative path, identity, type, size, allocation, modification state, and required deletion order.
+3. Require the live list and the reviewed list to match exactly. Check them again immediately before confirmation.
+4. If anything changed, discard the plan, scan again, and ask for confirmation again.
 
-Consent covers only planned identities. It never covers future path occupants or new children.
+Consent covers only the identities in the plan. It never covers a new entry that appears later at the same path.
 
 ## Confirmation
 
-- Files: explicit modal confirmation.
-- Safe printable directories: type exact leaf name by default.
-- Hostile/untypeable names: show escaped full path plus identity and require a generated challenge such as `DELETE K7M4`.
-- Session-only reduced mode: modal plus a distinct confirm action.
-- Reduced mode is visibly active and never persisted.
-- Root/Administrator is visibly warned; identity controls remain unchanged.
+- Files require an explicit confirmation dialog.
+- Safe printable directories require their exact leaf name by default.
+- Hostile or untypeable names show an escaped full path and identity. They require a generated challenge such as `DELETE K7M4`.
+- A session-only reduced mode uses a dialog and a separate confirmation action.
+- Reduced mode is visible and is never saved.
+- Root and Administrator accounts receive a visible warning. The identity checks remain unchanged.
 
-A brief modal-entry effect may run without blocking cancel/back input. The irreversible confirmation action remains disabled until the content reaches its stable final buffer; path, challenge, warnings, and choices then remain static while awaiting consent.
+A short dialog animation may run without blocking cancel or back input. The irreversible action stays disabled until the dialog reaches its final stable content. The path, challenge, warnings, and choices then remain unchanged while waiting for consent.
 
 ## Execution
 
-The deletion worker uses no-follow, capability-relative APIs. Linux and Apple atomically exchange one entry with an unpredictable same-parent placeholder before validating and removing the isolated name; replacement occupants at the original path are never removed. Windows opens the entry no-follow with delete access and applies disposition to that verified handle. For every planned entry:
+The deletion worker uses platform file operations that do not follow links. Linux and Apple systems temporarily exchange one directory entry with an unpredictable name in the same parent before checking and removing the isolated entry. A replacement at the original path is never removed. Windows opens the confirmed entry without following a reparse point and applies deletion to that verified handle.
 
-1. Resolve relative to its confirmed parent capability without following links.
-2. Bind the mutation to one namespace-isolated Unix identity or one Windows file handle.
-3. Revalidate identity, type, size, allocation, and modification state relevant to the confirmed plan.
-4. Delete only if every relevant field still matches; otherwise restore the namespace, record the exact outcome, and skip it.
-5. Record success, changed identity, permission/sharing error, disappearance, namespace-recovery error, or other failure.
-6. Complete recovery for that entry, then continue independently safe planned siblings.
+For every planned entry, Excise does the following:
 
-Model updates are derived only from confirmed results.
+1. Resolve it from the confirmed parent without following links.
+2. Bind the operation to the confirmed file identity or Windows file handle.
+3. Check the identity, type, size, allocation, and modification state against the review plan.
+4. Delete the entry only when every relevant value still matches. Otherwise restore the temporary name, record the exact result, and skip the entry.
+5. Record success, a changed identity, a permission or sharing error, a missing entry, a recovery error, or another failure.
+6. Finish recovery for that entry before continuing with other planned entries that remain safe.
+
+The working model changes only from confirmed deletion results.
 
 ## Interruption
 
-Quit during mutation offers:
+Quitting during deletion offers these choices:
 
-- **Soft cancel:** stop between entries and return a precise partial report (exit class 3 in headless contexts).
-- **Hard cancel:** from either the interruption prompt or a pending soft stop, detach blocked worker calls, restore the terminal immediately, and return an imprecise exit-130 outcome. The worker starts no further entry after the active call returns.
-- **Back:** continue deletion before a soft stop is committed.
+- **Soft cancel:** Stop between entries and return a precise partial report. The noninteractive exit code is 3.
+- **Forced cancel:** From the interruption prompt or a pending soft stop, release blocked operations, restore the terminal immediately, and return an imprecise exit code of 130. The worker starts no new entry after the active operation returns.
+- **Back:** Continue the deletion before a soft stop is committed.
 
-A first supported interrupt opens the precise soft-cancel choice. `h` or a second `Ctrl-C` remains an explicit hard escape hatch while the active filesystem call is pending.
+The first supported interrupt opens the precise soft-cancel choice. Pressing `h` or pressing `Ctrl-C` again remains an explicit forced escape while a file system call is pending.
 
 ## Result
 
-Normal completion and soft cancellation report every planned identity as deleted, changed, missing, failed, or unattempted. The in-memory session history has a fixed process-memory budget, streams directly to the versioned `deletion-history` schema, and releases retained reports after a successful export.
+Normal completion and soft cancellation report every planned identity as deleted, changed, missing, failed, or unattempted. Session history has a fixed memory limit. It writes directly to the versioned `deletion-history` format and releases retained reports after a successful export.
 
-## Required evidence
+## Required Evidence
 
-- file↔directory replacement races;
-- new-child races;
-- symlink and Windows junction behavior;
-- permission and sharing failures;
-- deterministic Windows sharing-violation behavior;
-- partial best-effort continuation;
-- elevated and reduced-guard modes;
-- hostile name confirmation;
-- soft/hard cancellation and terminal restoration;
-- native Tier-1 adapter tests;
-- deletion-plan fuzzing.
+- File and directory replacement races
+- New-child races
+- Symbolic link and Windows junction behavior
+- Permission and sharing failures
+- Deterministic Windows sharing-violation behavior
+- Partial continuation when some entries cannot be deleted
+- Elevated and reduced-safeguard modes
+- Hostile-name confirmation
+- Soft and forced cancellation with terminal restoration
+- Tests of each supported platform deletion method
+- Randomized tests for deletion-plan construction

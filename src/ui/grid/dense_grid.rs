@@ -142,7 +142,7 @@ impl<'a> DenseRectangleGrid<'a> {
 
         // The folder being left sits beneath the incoming layout. While geometry
         // moves, walk the same stack from front to back and rasterize only each
-        // tile's exposed half-rows; that has the normal paint result without
+        // tile's exposed half-rows. That has the normal paint result without
         // repainting a pivot once for every child that starts inside it.
         let departing_scale = HeatScale::for_ramp_tiles(self.departing);
         let scale = HeatScale::for_ramp_tiles(self.rectangles);
@@ -464,8 +464,8 @@ impl TileInk {
 /// The ramp fitted to one folder: where each entry sits between the smallest
 /// and the largest thing drawn beside it.
 ///
-/// Sizes are heavy-tailed — one entry routinely holds more than everything
-/// around it put together — so positions are taken in log space. Measuring
+/// Sizes are heavy-tailed. One entry routinely holds more than everything
+/// around it put together, so positions are taken in log space. Measuring
 /// against both ends rather than the largest alone means the whole ramp is
 /// spent on the folder in front of the reader instead of collapsing into the
 /// cold end whenever one entry dominates.
@@ -476,7 +476,7 @@ struct HeatScale {
 }
 
 impl HeatScale {
-    /// Nothing to compare — a lone entry, or a folder of one size — rests in
+    /// Nothing to compare, so a lone entry or a folder of one size rests in
     /// the middle of the ramp rather than claiming either extreme.
     const NEUTRAL: f32 = 0.5;
 
@@ -551,8 +551,8 @@ struct ShadedInk<'a> {
 struct RasterCoverage {
     rows: BTreeMap<u32, BTreeMap<u16, u16>>,
     /// Rectangles whose clipped footprints are entirely owned after a tile has
-    /// been processed. Initial drill frames often stack every incoming tile on
-    /// one pivot; an exact region hit avoids probing every raster row again.
+    /// been processed. One pivot often owns every incoming tile on the first
+    /// frame of a drill. An exact region hit avoids probing every raster row again.
     fully_covered_regions: BTreeMap<(u16, u16), BTreeMap<u32, u32>>,
 }
 
@@ -636,8 +636,8 @@ fn tile_paint_order(
 fn shaded_tile_style(ink: ShadedInk<'_>, selected: bool) -> Style {
     let style = Style::default().fg(ink.text).bg(ink.surface);
     if selected {
-        // A full block must keep its own foreground in reverse-video fallbacks;
-        // otherwise it becomes the map surface and disappears. Reset-valued
+        // A full block must keep its own foreground in reverse-video fallbacks.
+        // Otherwise it becomes the map surface and disappears. Reset-valued
         // monochrome themes still need reverse video for a non-colour cue.
         if ink.surface == Color::Reset {
             style.add_modifier(Modifier::BOLD | Modifier::REVERSED)
@@ -651,7 +651,7 @@ fn shaded_tile_style(ink: ShadedInk<'_>, selected: bool) -> Style {
     }
 }
 
-/// `Rect::bottom` saturates at `u16::MAX`; map-space geometry must instead
+/// `Rect::bottom` saturates at `u16::MAX`. Map-space geometry must instead
 /// retain the full origin-plus-extent before it reaches the terminal buffer.
 fn area_bottom_row(area: Rect) -> u32 {
     u32::from(area.y) + u32::from(area.height)
@@ -909,8 +909,8 @@ fn raster_region_is_covered(
 }
 
 /// Paints the portions of a span that no front entry has claimed. Coverage rows
-/// are merged, so only the direct predecessor can reach `left`; every earlier
-/// span is necessarily wholly left and need not be traversed again.
+/// Coverage rows are merged. Only the direct predecessor can reach `left`.
+/// Every earlier span is necessarily wholly left and need not be traversed again.
 fn paint_uncovered_intervals(
     ranges: &BTreeMap<u16, u16>,
     left: u16,
@@ -1494,7 +1494,7 @@ fn draw_overflow_label(
     };
     let x = region.x.saturating_add(inset);
     // The map can carry rows beyond the `u16` terminal address space. Do not
-    // narrow until this exact write; an inaccessible label simply stays offscreen.
+    // narrow until this exact write. An inaccessible label simply stays offscreen.
     let Ok(y) = u16::try_from(region.y) else {
         return;
     };
@@ -2508,7 +2508,7 @@ mod tests {
     #[test]
     fn uncovered_interval_painting_preserves_disjoint_coverage_spans() {
         // The first span is wholly left of the query. The second is the only
-        // predecessor that can cover its left edge; later disjoint spans leave
+        // predecessor that can cover its left edge. Later disjoint spans leave
         // precisely the gaps that need painting.
         let ranges =
             std::collections::BTreeMap::from([(0, 2), (4, 7), (9, 11), (13, 15), (18, 20)]);
@@ -2750,7 +2750,7 @@ mod tests {
 
     #[test]
     fn labels_only_use_fully_owned_terminal_rows() {
-        // The first entry owns only row 1; its lower and upper boundary rows
+        // The first entry owns only row 1. Its lower and upper boundary rows
         // share a cell with neighbours. Its detail must not overwrite row 2.
         let mut upper = tile(0, 1, 20, 4, 1);
         upper.name = OsString::from("upper");

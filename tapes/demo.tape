@@ -1,6 +1,6 @@
-# Deterministic current-main hero demo for the README (-> assets/demo-main.gif).
+# Deterministic current-main hero demo for the README. It writes assets/demo-main.gif.
 #
-# The fixture and its explicit TUI configuration are created in guarded
+# The fixture and its explicit terminal interface configuration are created in guarded
 # temporary paths. Excise is pointed only at the generated fixture and the
 # tape never enters deletion mode or sends a deletion confirmation. Cleanup is
 # limited to those generated paths.
@@ -9,7 +9,7 @@
 #   cargo +1.88.0 build --release --locked && cargo demo
 # Requires vhs, ttyd, ffmpeg, ffprobe, and gifsicle on PATH.
 #
-# `vhs tapes/demo.tape` alone renders a correct but much heavier GIF; the xtask
+# `vhs tapes/demo.tape` alone renders a correct but much heavier GIF. The xtask
 # adds the palette and quantisation pass that makes the asset publishable.
 #
 # The geometry below matches the width the README displays, so the published
@@ -56,7 +56,7 @@ Sleep 900ms
 # leaving contracts the folder back into the rectangle it came from.
 #
 # Every state this tape is meant to show is asserted with Wait+Screen. VHS
-# injects keystrokes through a browser terminal and drops one occasionally; a
+# injects keystrokes through a browser terminal and drops one occasionally. A
 # silent drop would publish a recording missing the state it exists to show.
 # The assertions turn that into a failed render instead.
 Enter
