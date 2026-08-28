@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/findyourexit/excise/main/assets/demo-main.gif" alt="Excise scanning a disposable fixture in the terminal" width="900" />
+  <img src="assets/excise-header.png" alt="Excise, a surgical terminal storage navigator" />
 </p>
 
 # Excise
@@ -7,42 +7,29 @@
 [![Native verification](https://github.com/findyourexit/excise/actions/workflows/ci.yml/badge.svg)](https://github.com/findyourexit/excise/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/findyourexit/excise)](https://github.com/findyourexit/excise/releases)
 [![crates.io](https://img.shields.io/crates/v/excise.svg)](https://crates.io/crates/excise)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-2f74c0)](rust-toolchain.toml)
+[![Rust 1.88](https://img.shields.io/badge/Rust-1.88-2f74c0)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT-2f855a)](LICENSE)
 
-Excise is a surgical terminal storage navigator. It combines a responsive treemap with identity-aware storage accounting, bounded scanning, lossless native paths, and guarded permanent deletion.
+A terminal tool for understanding and removing exactly the files and folders you choose.
 
-Excise is an independent successor to [Diskonaut](https://github.com/imsnif/diskonaut). The repository preserves Diskonaut's history and release tags while giving the project a new product, architecture, and maintenance life.
+Excise combines an interactive storage map with careful space accounting, clear resource limits, safe handling of unusual file names, and a deliberate review before permanent deletion. It is an independent successor to [Diskonaut](https://github.com/imsnif/diskonaut). Diskonaut history and release tags remain preserved, while Excise has its own product and release line.
 
 > [!WARNING]
-> Excise permanently deletes selected filesystem entries. There is no trash or undo. Use it only on data you can safely remove.
+> Excise permanently deletes selected files and folders. There is no trash or undo. Use it only with data you can safely remove.
 
 > [!IMPORTANT]
-The `1.0.0` release is the first stable release of the CLI, configuration, and versioned JSON report contracts. Start with a disposable directory, keep the default confirmation enabled, and read the [deletion contract](docs/safety/deletion.md) before selecting anything you might need.
+> `1.0.0` is the first stable release of the command-line tool, its configuration, and its versioned JSON reports. The code behind the tool is private, and the project does not promise a stable Rust programming interface.
 
-The hero above, dense half-block map, per-folder heat ramp, overflow summary, and directed map-layout transitions are part of the current `1.0.0` experience. Build the current source above or install the release packages to use them. `assets/demo-main.gif` is the current-main recording, while `assets/demo.gif` remains the historical `0.1.2` recording for the versioned README.
-
-## Why Excise
-
-- **Honest storage accounting:** apparent and allocated bytes remain distinct; hard-linked identities are counted once; unknown data stays unknown.
-- **Bounded operation:** scanner queues, worker counts, model memory, identity spill, reports, and UI history have explicit limits.
-- **Race-aware deletion:** plans bind to filesystem identities, never follow links, revalidate before mutation, and never sweep newly created entries.
-- **Terminal discipline:** terminal setup is RAII-owned and restored on normal exit, errors, panics, cancellation, and hard interruption.
-- **Accessible terminal UI:** keyboard-first controls, narrow-terminal layouts, ASCII mode, monochrome mode, and reduced motion preserve the same information.
-- **Headless reports:** deterministic table and versioned JSON output work without a TTY.
-- **Size you can see:** on a colour-capable map, ordinary entries are coloured on a heat ramp fitted to the comparable entries in the folder on screen. When comparable sizes produce a distinguishable log-space range, its largest comparable entry is red and its smallest is blue before you read a single label; equal or near-equal sizes that collapse at the ramp's rendering precision rest mid-ramp. Uncertain, shared, and aggregated entries retain their semantic colours. The cursor lifts out of that band while every other entry sinks, so focus never competes with size.
-- **Directed map-layout navigation:** opening an entry grows its contents out of the rectangle you chose. On drill-out, departing contents contract into the pivot while the incoming parent layout grows out of it, so a drill reads as one movement rather than a swapped screen; pane chrome and other UI do not participate in that transition.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/findyourexit/excise/main/assets/demo-main.gif" alt="Excise scanning a disposable fixture in the terminal" width="900" />
+</p>
 
 ## Quick Start
 
-All release-channel commands below target the stable `1.0.0` release. Before using them, read the [release process](docs/releasing.md) and follow the disposable-fixture guidance.
-
-### Install it
+### Install
 
 <details>
-<summary><strong>Homebrew (macOS)</strong></summary>
-
-The first-party Homebrew tap carries the formula:
+<summary><strong>Homebrew for macOS</strong></summary>
 
 ```console
 brew tap findyourexit/tap
@@ -55,8 +42,6 @@ excise --version  # excise 1.0.0
 <details>
 <summary><strong>crates.io</strong></summary>
 
-The `1.0.0` package is published on crates.io; install it with the locked dependency graph:
-
 ```console
 cargo install excise --version 1.0.0 --locked
 excise --version  # excise 1.0.0
@@ -65,161 +50,147 @@ excise --version  # excise 1.0.0
 </details>
 
 <details>
-<summary><strong>GitHub Release</strong></summary>
+<summary><strong>Pre-built Binaries</strong></summary>
 
-Download the archive for your platform from the `1.0.0` GitHub Release. For example, Apple silicon macOS:
-The provenance check requires the GitHub CLI (`gh`) and a GitHub API-authenticated session.
+Download the [v1.0.0 release](https://github.com/findyourexit/excise/releases/tag/v1.0.0) for macOS, Linux, and Windows on Apple silicon, Intel, or Arm systems.
 
-```console
-(
-  set -euo pipefail
-  download_dir="$(mktemp -d "${TMPDIR:-/tmp}/excise-download.XXXXXX")"
-  readonly download_dir
-  trap 'rm -rf -- "$download_dir"' EXIT
-  cd "$download_dir"
-  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v1.0.0/excise-aarch64-apple-darwin-v1.0.0.tar.gz
-  curl --fail --location --remote-name https://github.com/findyourexit/excise/releases/download/v1.0.0/checksums.sha256
-  shasum -a 256 --ignore-missing --check checksums.sha256
-  source_sha="$(git ls-remote --exit-code https://github.com/findyourexit/excise.git 'refs/tags/v1.0.0^{}' | cut -f1)"
-  if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "could not resolve the v1.0.0 tag commit" >&2
-    exit 1
-  fi
-  gh attestation verify excise-aarch64-apple-darwin-v1.0.0.tar.gz \
-    --repo findyourexit/excise \
-    --signer-workflow findyourexit/excise/.github/workflows/release.yml \
-    --source-digest "$source_sha" \
-    --source-ref refs/heads/main
-  tar --extract --gzip --file excise-aarch64-apple-darwin-v1.0.0.tar.gz
-  ./excise-aarch64-apple-darwin-v1.0.0/excise --version  # excise 1.0.0
-)
-```
-
-The release provides archives for AArch64 and x86_64 macOS, AArch64 and x86_64 Linux, and x86_64 and AArch64 Windows. For the stable `1.0.0` support policy, x86_64 Linux, AArch64 macOS, and x86_64 Windows are fully supported by native evidence; the other three archives are build-only/best-effort until native behavioral evidence exists.
+Only x86_64 Linux, AArch64 macOS, and x86_64 Windows have full platform support because they are tested on those platforms. The other archives are build-only and best effort. See the [support policy](SUPPORT.md).
 
 </details>
 
 <details>
-<summary><strong>Build from source</strong></summary>
-
-To build the current protected `main` source:
+<summary><strong>Build From Source</strong></summary>
 
 ```console
-git clone --branch main --depth 1 https://github.com/findyourexit/excise.git
+git clone --branch v1.0.0 --depth 1 https://github.com/findyourexit/excise.git
 cd excise
 cargo install --path . --locked
 excise --version
 ```
 
-To reproduce the exact published release commit, replace `main` with `v1.0.0` in the clone command.
-
-</details>
-
-<details>
-<summary><strong>Nix</strong></summary>
-
-Run or install the published `1.0.0` flake without updating its lock file:
+Nix users can run the tagged release without changing its lock file:
 
 ```console
 nix run github:findyourexit/excise/v1.0.0 -- --format table /path/to/inspect
-nix profile install github:findyourexit/excise/v1.0.0
-excise --version  # excise 1.0.0
 ```
 
 </details>
 
-### Run a safe first scan
+### First Scan
 
-This fixture is created under a platform temporary directory and is the only path passed to Excise. The subshell keeps the cleanup trap local and the readonly variable bound to the directory created by `mktemp`:
+Start with a disposable folder and a read-only output mode:
 
 ```console
 (
   set -euo pipefail
-  fixture="$(mktemp -d "${TMPDIR:-/tmp}/excise-quick-start.XXXXXX")"
-  readonly fixture
-  trap 'rm -rf -- "$fixture"' EXIT
-  printf 'sample\n' > "$fixture/file.txt"
-  printf 'nested sample\n' > "$fixture/nested.txt"
-  excise --format table "$fixture"
+  folder="$(mktemp -d "${TMPDIR:-/tmp}/excise-quick-start.XXXXXX")"
+  readonly folder
+  trap 'rm -rf -- "$folder"' EXIT
+  printf 'sample\n' > "$folder/file.txt"
+  printf 'nested sample\n' > "$folder/nested.txt"
+  excise --format table "$folder"
 )
 ```
 
-For an interactive scan, replace `--format table` with the default TUI invocation. On Windows, use a disposable directory created with the platform's temporary-directory tools. Never substitute a home directory, filesystem root, mounted volume, or another path containing data you cannot lose.
-
-See [Getting started](docs/getting-started.md) for platform notes and safer first-use guidance.
+For the interactive terminal interface, omit `--format table`. Keep the default deletion confirmation enabled until you understand the review flow. Never substitute a home directory, a filesystem root, a mounted volume, or another path containing data you cannot lose.
 
 ## Usage
 
 ```console
-# Interactive terminal UI
+# Interactive terminal interface
 excise /path/to/inspect
 
-# Noninteractive summary
+# Readable output for people
 excise --format table /path/to/inspect
 
-# Versioned machine-readable report
+# Machine-readable JSON report
 excise --format json --output scan.json /path/to/inspect
 
-# Stay on the starting filesystem and exclude build output
+# Keep the scan on one filesystem and skip build output
 excise --exclude target/ --exclude .git/ /path/to/inspect
 ```
 
-Configuration precedence is command line, environment, versioned TOML, then defaults. Run `excise --help` for the complete option list and see [Configuration](docs/configuration.md) for examples.
+Configuration takes values in this order: command line, environment, versioned TOML file, and defaults. Configuration `version` must be `1`. Unknown fields and unsupported versions are rejected. See [Configuration](docs/configuration.md) for the file format and examples.
 
-### Core controls
+## What Excise Does
 
-| Control | Action |
+- **Careful space accounting:** Excise keeps the disk space assigned to files separate from their file length. It counts files with more than one name once and keeps unknown values unknown.
+- **Clear limits:** Scanner queues, worker counts, memory use, temporary file records, reports, and interface history have explicit limits.
+- **Safe review before deletion:** Deletion plans record the files and folders that were reviewed. Excise does not follow links, checks for changes before deletion, and never includes new entries silently.
+- **Reliable terminal behavior:** The terminal is restored after normal exit, errors, panics, cancellation, and forced interruption.
+- **Accessible interaction:** Keyboard controls, narrow layouts, plain ASCII output, monochrome output, and reduced motion preserve the important safety information.
+- **Useful reports:** Table output is intended for people to read. JSON output uses stable, versioned formats for scan results, deletion history, and file paths.
+- **Readable maps:** The interface uses allocated space by default. Ordinary entries receive colours based on their relative size in the visible folder. Uncertain, shared, and summary entries keep their own meaning. Entries that do not fit remain visible as an overflow summary instead of making a folder look empty.
+
+## Safety Model
+
+Excise offers deletion only for complete entries that it has fully examined on a platform with tested deletion support. It refuses filesystem roots and summary entries. Before asking for confirmation, it compares the live files and folders with the reviewed plan. It checks every planned entry again immediately before deletion.
+
+Changed, replaced, missing, newly created, permission-blocked, and uncertain entries are never silently deleted. A soft cancellation reports the work completed so far. A forced cancellation restores the terminal immediately and reports that the final filesystem state may be uncertain. There is no recovery or undo mechanism.
+
+Read the [permanent deletion contract](docs/safety/deletion.md), [space accounting contract](docs/safety/accounting.md), and [threat model](docs/architecture/threat-model.md) before relying on destructive behavior.
+
+## Support Policy
+
+| Target | v1.0.0 status | Evidence |
+|---|---|---|
+| x86_64 Linux (`x86_64-unknown-linux-gnu`) | Supported | Native testing, terminal testing, and release archive |
+| AArch64 macOS (`aarch64-apple-darwin`) | Supported | Native testing, terminal testing, and release archive |
+| x86_64 Windows (`x86_64-pc-windows-msvc`) | Supported | Native testing, terminal testing, and release archive |
+| x86_64 macOS (`x86_64-apple-darwin`) | Build-only and best effort | Release compilation and archive only |
+| AArch64 Linux (`aarch64-unknown-linux-gnu`) | Build-only and best effort | Release compilation and archive only |
+| AArch64 Windows (`aarch64-pc-windows-msvc`) | Build-only and best effort | Release compilation and archive only |
+
+Only the first three targets have full platform support. The remaining archives are published for people who want to experiment, but a successful download or build does not prove that the program runs correctly on that target.
+
+Behavior can vary with file system types, access rules, network file systems, files that share storage with copies, compression, and shared physical storage. These cases remain best effort unless they have separate evidence. Unknown allocated space remains explicit. See [SUPPORT.md](SUPPORT.md) for limitations and troubleshooting.
+
+## Terminal Controls
+
+| Key | Action |
 |---|---|
-| Arrow keys | Move selection |
-| `h j k l` | Vim movement preset |
-| `Enter` | Open or focused rescan |
-| `Esc` | Go back or cancel the current interaction |
+| Arrow keys | Move the selection |
+| `h j k l` | Use the Vim movement preset |
+| `Enter` | Open a folder or rescan it |
+| `Esc` | Go back or cancel the current action |
 | `/` | Filter the current view |
-| `+`, `-`, `0` | Zoom in, zoom out, reset zoom |
+| `+`, `-`, `0` | Zoom in, zoom out, or reset zoom |
 | `e` | Export the current scan or deletion history |
 | `t` | Cycle themes |
-| `?` | Open in-application help |
-| `Backspace` | Begin a permanent-deletion plan |
+| `?` | Open the built-in help |
+| `Backspace` | Begin a permanent deletion plan |
 | `q`, `Ctrl-C` | Exit or interrupt safely |
 
-On narrower adaptive footer command tiers, whenever an Enter action is shown, it retains the exact `Enter open/rescan` hint; a tier that cannot fit it omits that command rather than abbreviating it.
-
-## Safety model
-
-Deletion is available only for complete, materialized, real entries. Excise rejects roots and synthetic aggregate nodes, independently enumerates the reviewed subtree, compares the live identity set with the scan model, and revalidates each entry immediately before mutation. Changed, replaced, missing, or newly created entries are not silently deleted.
-
-Read the [deletion contract](docs/safety/deletion.md), [storage accounting contract](docs/safety/accounting.md), and [threat model](docs/architecture/threat-model.md) before relying on destructive behavior.
+The interactive interface needs standard input and output connected to a terminal, terminal color and control support, a separate screen for the interface, and a window at least `32 x 8`. Use table or JSON mode for redirection, pipelines, continuous integration, and terminals without those capabilities. `--output FILE` works only with table or JSON mode.
 
 ## Documentation
 
 - [Getting started](docs/getting-started.md)
 - [Configuration](docs/configuration.md)
-- [Reports and schemas](docs/reports.md)
-- [Architecture](docs/architecture/overview.md)
+- [Reports and JSON formats](docs/reports.md)
+- [Permanent deletion contract](docs/safety/deletion.md)
+- [Space accounting contract](docs/safety/accounting.md)
+- [Architecture and threat model](docs/architecture/overview.md)
 - [Development](docs/development.md)
 - [Release process](docs/releasing.md)
-- [Project lineage](docs/lineage.md)
+- [Support policy](SUPPORT.md)
+- [Security policy](SECURITY.md)
+- [Governance](GOVERNANCE.md)
 
-## Demo recording (current main)
+## Development
 
-The current-main `cargo demo` alias delegates to `xtask demo`; it is a development helper rather than a release-package command. The hero recording is generated by [VHS](https://github.com/charmbracelet/vhs) from [`tapes/demo.tape`](tapes/demo.tape). The tape creates a fresh temporary fixture, scans only that fixture, and exits without entering deletion mode or sending a deletion confirmation. `xtask demo` requires VHS, `ttyd`, `ffmpeg`, `ffprobe`, and `gifsicle` on `PATH`, plus a Unix-like `bash` and core utilities: the tape explicitly selects `bash`, creates its fixture under `/tmp`, and invokes utilities including `head`, `mkdir`, and `rm`.
+Excise uses Rust 1.88 and the 2024 edition. Run the complete local verification gate with:
 
 ```console
-(
-  set -euo pipefail
-  cargo +1.88.0 build --release --locked
-  cargo demo  # current-main alias for xtask demo; writes assets/demo-main.gif
-)
+cargo verify
 ```
 
-`xtask demo` validates the tape and renders it at the tape's 24 fps, then resamples it to 20 fps while rebuilding a 64-colour palette without dithering before lossy GIF quantisation. It owns the staging paths and only atomically promotes the size-gated result to `assets/demo-main.gif`, so a failed render leaves the current-main recording untouched and never changes `assets/demo.gif`, the historical `0.1.2` recording. Dithering, not palette size, dominates the weight of a recorded terminal: it converts flat cells into per-pixel noise that no frame differ can compress. Skipping it and capping the palette at 64 colours keeps the flat interface compact without visible loss. Running `vhs tapes/demo.tape` directly writes an unoptimised 24 fps sequence to `assets/demo-main.gif`; it skips the 20 fps resampling, palette rebuild, quantisation, and size gate, so it must not be used to refresh the committed hero.
+This checks formatting, workflows, dependency rules, documentation links, compilation, supported builds, Rust lint checks, unit and snapshot tests, terminal behavior, package contents, limited fuzz testing, benchmarks, generated files, JSON formats, distribution templates, and release binary size.
 
-The [demo workflow](.github/workflows/demo.yml) runs the same pipeline and uploads the GIF as a build artifact on pull requests and pushes to `main`; it never commits generated media or pushes to `main`. `assets/` and `tapes/` are demo-only and excluded from release package metadata.
+The current main demonstration is generated with `cargo demo`. See [Development](docs/development.md) before refreshing the VHS recording. The committed `assets/demo-main.gif` is the current demonstration, while `assets/demo.gif` remains the historical `0.1.2` recording.
 
-## Community
+## Community & License
 
 Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), use [GitHub Discussions](https://github.com/findyourexit/excise/discussions) for questions, and follow [SECURITY.md](SECURITY.md) for private vulnerability or data-loss reports.
 
-## License
-
-MIT. See [LICENSE](LICENSE). Diskonaut's original copyright and contributor history are preserved.
+MIT. See [LICENSE](LICENSE).
