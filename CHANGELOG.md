@@ -4,13 +4,15 @@ All notable Excise changes are documented here. The format follows [Keep a Chang
 
 Excise preserves the historical Diskonaut changelog below. Diskonaut versions and tags are not Excise releases.
 
-## [Unreleased]
+## [1.0.1] - 2026-08-28
 
 ### Changed
 
 * Clarified the first-run path in the README and supporting documentation. The simplest `excise` command now leads the usage guidance, while detailed scan examples remain in the getting-started guide.
 
 * Reworded the safety, support, configuration, architecture, and release documentation in plain English without changing product behavior.
+
+* Removed the Developer Certificate of Origin sign-off requirement for contributors. No contributor license agreement or copyright assignment has ever been required; historical authorship records are unchanged.
 
 ## [1.0.0] - 2026-08-27
 
