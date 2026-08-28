@@ -21,12 +21,12 @@ The published target set has separate native-behavior and release-artifact evide
 
 | Target | Support classification | Published evidence |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` (x86_64 Linux) | Supported in `1.0.0`; native behavioral target | Native verification plus hosted release build/archive |
-| `aarch64-apple-darwin` (AArch64 macOS) | Supported in `1.0.0`; native behavioral target | Native verification plus hosted release build/archive |
-| `x86_64-pc-windows-msvc` (x86_64 Windows) | Supported in `1.0.0`; native behavioral target | Native verification plus hosted release build/archive |
-| `x86_64-apple-darwin` (x86_64 macOS) | Build-only/best-effort; compile/archive only | Hosted release build/archive job |
-| `aarch64-unknown-linux-gnu` (AArch64 Linux) | Build-only/best-effort; compile/archive only | Hosted release build/archive job |
-| `aarch64-pc-windows-msvc` (AArch64 Windows) | Build-only/best-effort; compile/archive only | Hosted release build/archive job |
+| `x86_64-unknown-linux-gnu` (x86_64 Linux) | Supported in `1.0.0` and tested on the target system | Native checks and hosted release archive |
+| `aarch64-apple-darwin` (AArch64 macOS) | Supported in `1.0.0` and tested on the target system | Native checks and hosted release archive |
+| `x86_64-pc-windows-msvc` (x86_64 Windows) | Supported in `1.0.0` and tested on the target system | Native checks and hosted release archive |
+| `x86_64-apple-darwin` (x86_64 macOS) | Build-only and best effort | Hosted release archive |
+| `aarch64-unknown-linux-gnu` (AArch64 Linux) | Build-only and best effort | Hosted release archive |
+| `aarch64-pc-windows-msvc` (AArch64 Windows) | Build-only and best effort | Hosted release archive |
 
 The native behavioral rows are the complete `1.0.0` runtime support set. The release pipeline continues to publish all six archives, but the three compile-only targets carry no native runtime guarantee and remain best-effort until promoted by native evidence. A successful hosted build or archive demonstrates release compilation and packaging, not native runtime compatibility.
 
@@ -34,7 +34,7 @@ The target rows and workflow matrices are checked by `cargo run --locked --packa
 
 ## Filesystem and terminal scope
 
-The supported runtime target policy applies to local filesystem paths accessed through the documented operating-system APIs. Filesystem-provider-specific ACL, sharing, allocation, network or remote filesystem, reflink, clone, compression, and shared-extent behavior is best-effort unless separately evidenced; unknown allocation remains explicit rather than guessed.
+The supported runtime target policy applies to local filesystem paths accessed through the documented operating-system APIs. Behavior can vary with file system types, access rules, network file systems, copy-on-write files, clones, compression, and shared physical storage. These cases remain best effort unless they have separate evidence. Unknown allocated space remains explicit rather than guessed.
 
 Interactive support requires stdin and stdout TTYs, ANSI rendering, alternate-screen support, and a window at least `32 x 8`. Table and JSON modes are the supported non-TTY path for redirection, pipelines, CI, and terminals without those capabilities.
 
