@@ -655,7 +655,7 @@ fn is_session_directory_name(name: &std::ffi::OsStr) -> bool {
 #[cfg(not(windows))]
 fn reclaim_stale_session(path: &Path, now: SystemTime) -> Result<bool, ModelError> {
     // This private-path check is the ownership proof on platforms without a
-    // held cleanup handle; failure means this candidate is left untouched.
+    // held cleanup handle. Failure means this candidate is left untouched.
     verify_private_directory(path)?;
     if !is_stale_session(path, now)? {
         return Ok(false);

@@ -21,8 +21,8 @@ _excise() {
 '*--exclude=[Ordered gitignore-style exclusion pattern]:PATTERN:_default' \
 '--memory-mib=[Whole-process memory envelope in MiB]:MIB:_default' \
 '--theme=[Built-in semantic color theme]:THEME:(excise-dark excise-light high-contrast monochrome dracula tokyo-night catppuccin-mocha catppuccin-latte gruvbox-dark gruvbox-light nord solarized-dark solarized-light one-dark monokai)' \
-'--keymap=[Keyboard preset; arrows and safety keys always work]:PRESET:(vim custom emacs)' \
-'--format=[Output mode; table and JSON never acquire a terminal]:FORMAT:(tui table json)' \
+'--keymap=[Keyboard preset. Arrows and safety keys always work]:PRESET:(vim custom emacs)' \
+'--format=[Output mode. Table and JSON never acquire a terminal]:FORMAT:(tui table json)' \
 '--output=[Write a noninteractive report to FILE instead of stdout]:FILE:_files' \
 '-a[Show apparent file sizes instead of allocated bytes]' \
 '--apparent-size[Show apparent file sizes instead of allocated bytes]' \

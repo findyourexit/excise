@@ -1,5 +1,5 @@
 {
-  description = "Excise — surgical terminal storage navigator";
+  description = "Excise, a surgical terminal storage navigator";
 
   inputs.nixpkgs.url = "https://api.flakehub.com/f/NixOS/nixpkgs/0.tar.gz";
 

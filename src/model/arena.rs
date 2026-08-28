@@ -117,7 +117,7 @@ const EVICTION_STASH_ALLOCATION: usize = EVICTION_STASH_OVERHEAD
 #[allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
-    reason = "Arena operations share ModelError as their uniform boundary for filesystem paths, bounded storage, and identity persistence; repeating that contract on each method obscures the model API."
+    reason = "Arena operations share ModelError as their uniform boundary for filesystem paths, bounded storage, and identity persistence. Repeating that contract on each method obscures the model API."
 )]
 impl Arena {
     pub fn new(root_path: PathBuf, mut budget: MemoryBudget) -> Result<Self, ModelError> {
@@ -893,7 +893,7 @@ impl Arena {
                     );
                 }
                 // Node and sidecar backing slots remain reserved. A surviving
-                // parent retains its child slot as a reusable credit; only a
+                // parent retains its child slot as a reusable credit. Only a
                 // parent removed in this batch drops that child storage.
                 let node_bytes = estimate_node(&node.name)
                     .saturating_sub(NODE_SLOT_BYTES)
@@ -3566,7 +3566,7 @@ mod tests {
         assert_eq!(arena.refill_eviction_stash(root_id), Some(first));
 
         // `entry-000` started below the cached frontier. Once it reaches the
-        // same rank, its name puts it above the cached `entry-002` frontier;
+        // same rank, its name puts it above the cached `entry-002` frontier.
         // the omitted `entry-001` is now the true smallest retained child.
         arena
             .node_mut(first)

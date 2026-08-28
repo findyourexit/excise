@@ -1,7 +1,7 @@
 //! Excise's supported product is the `excise` command-line program.
 //!
 //! The library target shares private implementation modules with the binary. It is not a
-//! supported Rust API; use the CLI and its documented configuration and report contracts.
+//! supported Rust API. Use the command-line tool and its documented configuration and report contracts.
 
 #![allow(
     clippy::unnested_or_patterns,

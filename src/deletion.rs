@@ -948,7 +948,7 @@ fn execute_windows_entry(root: &File, entry: &mut PlannedEntry) -> DeletionEntry
     };
     if kind == PlannedKind::File {
         // A pathname-independent post-open hard-link count can still change
-        // before handle deletion; report regular-file allocation conservatively.
+        // before handle deletion. Report regular-file allocation conservatively.
         entry.snapshot.identity.link_count = None;
     } else {
         entry.snapshot.identity.link_count = actual.identity.link_count;

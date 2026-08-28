@@ -2,25 +2,25 @@
 
 ## Use Excise
 
-- [Getting started](getting-started.md)
+- [Getting Started](getting-started.md)
 - [Configuration](configuration.md)
-- [Reports and schemas](reports.md)
+- [Reports & JSON Formats](reports.md)
 
-## Understand the system
+## Understand The System
 
 - [Architecture](architecture/overview.md)
-- [Threat model](architecture/threat-model.md)
-- [Permanent-deletion contract](safety/deletion.md)
-- [Storage accounting contract](safety/accounting.md)
+- [Threat Model](architecture/threat-model.md)
+- [Permanent Deletion Contract](safety/deletion.md)
+- [Space Accounting Contract](safety/accounting.md)
 
-## Contribute and maintain
+## Contribute & Maintain
 
-- [Development guide](development.md)
-- [Release and distribution policy](releasing.md)
-- [Project lineage](lineage.md)
+- [Development Guide](development.md)
+- [Release & Distribution Policy](releasing.md)
+- [Project Lineage](lineage.md)
 
-## Published schemas
+## Published Formats
 
-- [Scan report](schemas/scan-report.schema.json)
-- [Deletion history](schemas/deletion-history.schema.json)
-- [Native path](schemas/native-path.schema.json)
+- [Scan Report](schemas/scan-report.schema.json)
+- [Deletion History](schemas/deletion-history.schema.json)
+- [Native Path](schemas/native-path.schema.json)

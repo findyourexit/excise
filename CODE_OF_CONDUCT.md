@@ -1,28 +1,28 @@
-# Contributor Covenant Code of Conduct
+# Contributor Covenant Code Of Conduct
 
-## Our pledge
+## Our Pledge
 
 We pledge to make participation in Excise harassment-free for everyone, regardless of age, body size, disability, ethnicity, sex characteristics, gender identity and expression, level of experience, education, socioeconomic status, nationality, personal appearance, race, religion, or sexual identity and orientation.
 
-## Our standards
+## Our Standards
 
 Positive behavior includes:
 
-- using welcoming and inclusive language;
-- respecting differing viewpoints and experiences;
-- accepting constructive criticism gracefully;
-- focusing on what is best for users and the community;
-- showing empathy toward other participants.
+- Using welcoming and inclusive language.
+- Respecting differing viewpoints and experiences.
+- Accepting constructive criticism gracefully.
+- Focusing on what is best for users and the community.
+- Showing empathy toward other participants.
 
 Unacceptable behavior includes:
 
-- sexualized language or imagery and unwelcome sexual attention;
-- trolling, insulting or derogatory comments, and personal or political attacks;
-- public or private harassment;
-- publishing another person's private information without explicit permission;
-- conduct that could reasonably be considered inappropriate in a professional setting.
+- Sexualized language or imagery and unwelcome sexual attention.
+- Trolling, insulting or derogatory comments, and personal or political attacks.
+- Public or private harassment.
+- Publishing another person's private information without explicit permission.
+- Conduct that could reasonably be considered inappropriate in a professional setting.
 
-## Maintainer responsibilities
+## Maintainer Responsibilities
 
 Maintainers must clarify and enforce these standards fairly. They may remove, edit, or reject contributions and may temporarily or permanently exclude participants whose behavior is inappropriate, threatening, offensive, or harmful.
 

@@ -18,10 +18,10 @@ solarized-dark\t''
 solarized-light\t''
 one-dark\t''
 monokai\t''"
-complete -c excise -l keymap -d 'Keyboard preset; arrows and safety keys always work' -r -f -a "vim\t''
+complete -c excise -l keymap -d 'Keyboard preset. Arrows and safety keys always work' -r -f -a "vim\t''
 custom\t''
 emacs\t''"
-complete -c excise -l format -d 'Output mode; table and JSON never acquire a terminal' -r -f -a "tui\t''
+complete -c excise -l format -d 'Output mode. Table and JSON never acquire a terminal' -r -f -a "tui\t''
 table\t''
 json\t''"
 complete -c excise -l output -d 'Write a noninteractive report to FILE instead of stdout' -r -F

@@ -5,7 +5,7 @@ use crate::state::tiles::{FileMetadata, HALF_ROWS_PER_CELL, MapOverflow, RectFlo
 /// Columns that visually match one half-row of vertical extent.
 ///
 /// A terminal cell is roughly two and a half times taller than it is wide, so a
-/// half-row — the unit the map lays out in — is worth about 1.25 columns.
+/// A half-row, the unit the map lays out in, is worth about 1.25 columns.
 const HEIGHT_WIDTH_RATIO: f64 = 1.25;
 /// Half-rows, i.e. one full terminal row plus the label row beneath it.
 const MINIMUM_HEIGHT: u32 = 4;

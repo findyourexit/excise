@@ -213,8 +213,8 @@ fn is_identity_cell_left_edge(character: char) -> bool {
 /// Windows reports a different identity variant entirely, so the inspector's
 /// truncation lands on a different character on every platform. An overlay can
 /// also clip the cell down to one character of the variant name, which is
-/// still `I` on Unix and `L` or `H` on Windows. Replacing the whole cell — rather
-/// than masking digits inside it — is what keeps these frames comparable across
+/// still `I` on Unix and `L` or `H` on Windows. Replacing the whole cell rather
+/// than masking digits inside it is what keeps these frames comparable across
 /// the targets CI runs.
 fn normalize_identity_cell(line: &str) -> String {
     let Some((start, marker, end)) = ["identity  ", "identity "].into_iter().find_map(|marker| {
@@ -414,7 +414,7 @@ fn open_structured_identity_cells_stop_before_ascii_chrome() {
 /// The inspector middle-truncates a value it cannot fit, and `truncate_middle`
 /// spells that elision `[...]`. Those dots sit inside the identity, so a cell
 /// that stops on them keeps the machine's own digits either side of the marker
-/// and the frame stops being portable — the one thing normalising is here for.
+/// and the frame stops being portable, which is the one thing normalising is here for.
 #[test]
 fn middle_truncated_identity_cells_normalise_whole() {
     let unix = "▏identity  Inode { device_i[...]32, inode_number: 1234567 }▕";

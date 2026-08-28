@@ -24,7 +24,7 @@ fn fuzz_size(record: &[u8]) -> u128 {
 
 fuzz_target!(|data: &[u8]| {
     // Decode the first eight fuzz bytes as independent `u16` components,
-    // including zero and `u16::MAX`; a literal preserves them unchanged.
+    // including zero and `u16::MAX`. A literal preserves them unchanged.
     let area = Rect {
         x: u16_at(data, 0),
         y: u16_at(data, 2),
@@ -37,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
     let total = records
         .chunks_exact(2)
         .fold(0_u128, |sum, record| sum.saturating_add(fuzz_size(record)));
-    // Deliberately retain fuzzer order; TreeMap must not require largest-first
+    // Deliberately retain fuzzer order. TreeMap must not require largest-first
     // input to keep a renderable suffix after a tiny entry.
     let files = records
         .chunks_exact(2)

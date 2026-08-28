@@ -263,8 +263,8 @@ where
             && has_selection
             && ColorCycle::can_animate(theme.focus);
         animation.set_activity(animate_focus);
-        // The map tween runs on wall-clock time, so the loop has to keep waking up
-        // until it settles; nothing else in the frame would ask for those frames.
+        // The map transition runs on wall-clock time, so the loop has to keep waking up
+        // until it settles. Nothing else in the frame would ask for those frames.
         animation.set_geometry_active(self.board.is_transitioning());
         // The workspace pane observes selection before board layout. Queue one
         // corrective draw whenever layout changes that selection.
@@ -1075,7 +1075,7 @@ mod tests {
         assert!(!app.board.is_list_layout());
         assert_eq!(animation.next_frame_at(), None);
 
-        // A new dataset arms the layout tween; nothing else in the frame would ask
+        // A new dataset arms the layout transition. Nothing else in the frame would ask
         // the owner loop to wake up for it.
         app.board
             .change_files(vec![map_entry(1, 0.2), map_entry(2, 0.8)]);

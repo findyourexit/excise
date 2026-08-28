@@ -377,7 +377,7 @@ fn is_semantic_theme_color(color: Color, theme: Theme) -> bool {
 /// Whether a dialog is layered over the interface this frame.
 ///
 /// The exhaustive match in [`Display::render`] keeps this honest: a new mode
-/// has to be classified there, and an unclassified one scrims — a dialog that
+/// has to be classified there, and an unclassified one scrims a dialog that
 /// is too separated costs nothing, one that dissolves into the map costs a
 /// misread deletion.
 const fn shows_modal(ui_mode: &UiMode) -> bool {
@@ -840,11 +840,11 @@ fn render_inspector(
         _ => None,
     };
     let identity = node.snapshot.identity.as_ref().map_or_else(
-        || "identity  —".to_string(),
+        || "identity  unknown".to_string(),
         |identity| format!("identity  {:?}", identity.file_id),
     );
     let link_detail = node.snapshot.identity.as_ref().map_or_else(
-        || "links     —".to_string(),
+        || "links     unknown".to_string(),
         |identity| {
             identity.link_count.map_or_else(
                 || "links     unknown".to_string(),
