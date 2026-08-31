@@ -4,6 +4,18 @@ All notable Excise changes are documented here. The format follows [Keep a Chang
 
 Excise preserves the historical Diskonaut changelog below. Diskonaut versions and tags are not Excise releases.
 
+## [1.0.2] - 2026-09-01
+
+### Changed
+
+* Reduced the number of filesystem stat calls during directory traversal. The root-path validity check was removed from the inner per-entry loop, a redundant cap-primitives stat that preceded the standard-library stat in each entry's processing was removed, and three sequential directory task validations at the close of each directory scan were consolidated to one.
+
+* Eliminated JSON serialization overhead in the identity store. File identity records are now keyed directly by `FileId` in the in-memory store rather than by their JSON-encoded bytes, removing one allocation per scanned file during identity lookup.
+
+* Replaced the blocking disk enumeration in the mount-root check with two direct filesystem stat calls. The previous implementation called `sysinfo::Disks::new_with_refreshed_list`, which on macOS queries every mounted volume for its available capacity via Apple's storage framework. That call can block indefinitely when a volume is in certain APFS snapshot states. The new implementation compares the device identifiers of a path and its parent using `lstat`, which is a direct kernel call with no involvement from CoreFoundation or StorageKit.
+
+* Arena nodes are now stored directly inside the arena vector rather than behind individual heap allocations. Each `Box<Node>` was a separate small allocation; inlining the node data reduces allocator pressure and improves cache locality when traversing large trees.
+
 ## [1.0.1] - 2026-08-28
 
 ### Changed
