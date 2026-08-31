@@ -77,6 +77,18 @@ The published bundle contains six target archives, `checksums.sha256`, and `exci
 
 Use `1.0.2` for a narrowly scoped correction after `1.0.1`. A patch release must preserve the documented command-line, configuration, report, deletion, accounting, and support behavior. It should include a focused correction, update the `Unreleased` notes, and repeat the exact protected-commit candidate, checksum, software bill of materials, attestation, package-channel, and rollback checks before publication.
 
+
+## Approved `1.0.2` Publication
+
+The approved patch publication used:
+
+- Source commit: `10e0803f91e2bb2aaa8f8572fc24a0fba4c23ffd`.
+- Protected-main candidate workflow run: https://github.com/findyourexit/excise/actions/runs/33408059484
+- Annotated tag: `v1.0.2`, carrying `candidate-run-id: 33408059484` and pointing to the exact source commit.
+- Publication workflow run: https://github.com/findyourexit/excise/actions/runs/33408563018
+- GitHub Release: https://github.com/findyourexit/excise/releases/tag/v1.0.2
+
+The published bundle contains six target archives, `checksums.sha256`, and `excise.spdx.json`. All checksums, archives, and SBOM verified. crates.io and Homebrew tap updated.
 ## Preconditions & Clean Tree
 
 Only a maintainer may start publication. Before creating a tag, dispatching a candidate, or using a publication credential:
