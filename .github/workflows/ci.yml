@@ -36,8 +36,8 @@ jobs:
       - name: Install pinned MSRV
         shell: bash
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
-          rustup override set 1.88.0
+          rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+          rustup override set 1.98.0
           rustc --version --verbose
       - name: Install dependency policy tool
         shell: bash

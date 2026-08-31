@@ -18,7 +18,11 @@ pub fn truncate_middle(row: &str, max_length: u16) -> String {
     if max_length < 6 {
         truncate_iter_to_unicode_width(row.chars(), max_length as usize)
     } else if row.width() as u16 > max_length {
-        let marker = if max_length % 2 == 0 { "[...]" } else { "[..]" };
+        let marker = if max_length.is_multiple_of(2) {
+            "[...]"
+        } else {
+            "[..]"
+        };
         let remaining = usize::from(max_length).saturating_sub(marker.width());
         let first_width = remaining / 2;
         let second_width = remaining.saturating_sub(first_width);

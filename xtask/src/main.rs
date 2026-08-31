@@ -353,10 +353,10 @@ fn remove_demo_files(paths: &[&Path]) -> io::Result<()> {
     let mut first_error: Option<io::Error> = None;
 
     for &path in paths {
-        if let Err(error) = remove_file_if_exists(path) {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
+        if let Err(error) = remove_file_if_exists(path)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
     }
 
@@ -1735,7 +1735,7 @@ fn validate_winget_manifest(rendered: &str, version: &str) -> Result<(), Box<dyn
             format!("{context} must publish the excise command alias"),
         )?;
         require(
-            windows_archive_executable(asset, version) == PathBuf::from(relative_path),
+            windows_archive_executable(asset, version) == *relative_path,
             format!("{context} would not install the wrapped executable"),
         )?;
     }

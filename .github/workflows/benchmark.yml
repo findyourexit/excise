@@ -38,8 +38,8 @@ jobs:
           printf 'Release SHA: %s\n' "$RELEASE_SHA"
       - name: Install pinned MSRV
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup override set 1.88.0
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
       - name: Run statistical render benchmark
         run: cargo bench --bench tachyonfx --features internal --locked -- --noplot
       - name: Run statistical core benchmark
