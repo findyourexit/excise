@@ -53,7 +53,7 @@ pub(crate) fn merge_declared_links(current: Option<u64>, observed: Option<u64>) 
     }
 }
 enum Storage {
-    Memory(HashMap<Vec<u8>, IdentityRecord>),
+    Memory(HashMap<FileId, IdentityRecord>),
     Disk {
         database: Database,
         count: usize,
@@ -188,8 +188,7 @@ impl IdentityStore {
         node: Option<NodeId>,
         allocation_node: Option<NodeId>,
     ) -> Result<(bool, IdentityRecord), ModelError> {
-        let key = serde_json::to_vec(file_id).map_err(identity_error)?;
-        let existing = self.get_by_key(&key)?;
+        let existing = self.get(file_id)?;
         let is_new = existing.is_none();
         let mut record = existing.unwrap_or(IdentityRecord {
             observed_links: 0,
@@ -208,20 +207,36 @@ impl IdentityStore {
             let value = serde_json::to_vec(&record).map_err(identity_error)?;
             self.estimated_bytes = self
                 .estimated_bytes
-                .saturating_add(key.len())
+                .saturating_add(std::mem::size_of::<FileId>())
                 .saturating_add(value.len())
                 .saturating_add(IDENTITY_ENTRY_OVERHEAD);
             if self.estimated_bytes > self.memory_limit {
                 self.spill_to_disk()?;
             }
         }
-        self.insert_by_key(&key, &record, is_new)?;
+        self.insert(file_id, &record, is_new)?;
         Ok((is_new, record))
     }
 
     pub fn get(&self, file_id: &FileId) -> Result<Option<IdentityRecord>, ModelError> {
-        let key = serde_json::to_vec(file_id).map_err(identity_error)?;
-        self.get_by_key(&key)
+        match &self.storage {
+            Storage::Memory(records) => Ok(records.get(file_id).cloned()),
+            Storage::Disk {
+                database, pending, ..
+            } => {
+                let key = serde_json::to_vec(file_id).map_err(identity_error)?;
+                if let Some(record) = pending.get(&key) {
+                    return Ok(Some(record.clone()));
+                }
+                let transaction = database.begin_read().map_err(identity_error)?;
+                let table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+                table
+                    .get(key.as_slice())
+                    .map_err(identity_error)?
+                    .map(|value| serde_json::from_slice(value.value()).map_err(identity_error))
+                    .transpose()
+            }
+        }
     }
 
     #[must_use]
@@ -289,11 +304,8 @@ impl IdentityStore {
         self.flush_pending()?;
         match &self.storage {
             Storage::Memory(records) => {
-                for (key, record) in records {
-                    visitor(
-                        serde_json::from_slice(key).map_err(identity_error)?,
-                        record.clone(),
-                    )?;
+                for (file_id, record) in records {
+                    visitor(*file_id, record.clone())?;
                 }
             }
             Storage::Disk { database, .. } => {
@@ -316,26 +328,25 @@ impl IdentityStore {
         file_id: &FileId,
         record: &IdentityRecord,
     ) -> Result<Option<IdentityRecord>, ModelError> {
-        let key = serde_json::to_vec(file_id).map_err(identity_error)?;
-        let existing = self.get_by_key(&key)?;
+        let existing = self.get(file_id)?;
         if matches!(self.storage, Storage::Memory(_)) {
             let value = serde_json::to_vec(record).map_err(identity_error)?;
             let previous = existing.as_ref().map_or(0, |current| {
-                key.len()
+                std::mem::size_of::<FileId>()
                     .saturating_add(serde_json::to_vec(current).map_or(0, |encoded| encoded.len()))
                     .saturating_add(IDENTITY_ENTRY_OVERHEAD)
             });
             self.estimated_bytes = self
                 .estimated_bytes
                 .saturating_sub(previous)
-                .saturating_add(key.len())
+                .saturating_add(std::mem::size_of::<FileId>())
                 .saturating_add(value.len())
                 .saturating_add(IDENTITY_ENTRY_OVERHEAD);
             if self.estimated_bytes > self.memory_limit {
                 self.spill_to_disk()?;
             }
         }
-        self.insert_by_key(&key, record, existing.is_none())?;
+        self.insert(file_id, record, existing.is_none())?;
         Ok(existing)
     }
     pub(crate) fn refresh_declared_links(
@@ -363,12 +374,11 @@ impl IdentityStore {
         if removed.is_empty() {
             return Ok(());
         }
-        let key = serde_json::to_vec(file_id).map_err(identity_error)?;
-        let Some(mut record) = self.get_by_key(&key)? else {
+        let Some(mut record) = self.get(file_id)? else {
             return Ok(());
         };
         if remap_record_nodes(&mut record, removed, replacement) {
-            self.insert_by_key(&key, &record, false)?;
+            self.insert(file_id, &record, false)?;
         }
         Ok(())
     }
@@ -490,7 +500,8 @@ impl IdentityStore {
             let transaction = database.begin_write().map_err(identity_error)?;
             {
                 let mut table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
-                for (key, record) in records {
+                for (file_id, record) in records {
+                    let key = serde_json::to_vec(file_id).map_err(identity_error)?;
                     let value = serde_json::to_vec(record).map_err(identity_error)?;
                     table
                         .insert(key.as_slice(), value.as_slice())
@@ -508,39 +519,20 @@ impl IdentityStore {
         Ok(())
     }
 
-    fn get_by_key(&self, key: &[u8]) -> Result<Option<IdentityRecord>, ModelError> {
-        match &self.storage {
-            Storage::Memory(records) => Ok(records.get(key).cloned()),
-            Storage::Disk {
-                database, pending, ..
-            } => {
-                if let Some(record) = pending.get(key) {
-                    return Ok(Some(record.clone()));
-                }
-                let transaction = database.begin_read().map_err(identity_error)?;
-                let table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
-                table
-                    .get(key)
-                    .map_err(identity_error)?
-                    .map(|value| serde_json::from_slice(value.value()).map_err(identity_error))
-                    .transpose()
-            }
-        }
-    }
-
-    fn insert_by_key(
+    fn insert(
         &mut self,
-        key: &[u8],
+        file_id: &FileId,
         record: &IdentityRecord,
         is_new: bool,
     ) -> Result<(), ModelError> {
         let should_flush = match &mut self.storage {
             Storage::Memory(records) => {
-                records.insert(key.to_vec(), record.clone());
+                records.insert(*file_id, record.clone());
                 false
             }
             Storage::Disk { count, pending, .. } => {
-                pending.insert(key.to_vec(), record.clone());
+                let key = serde_json::to_vec(file_id).map_err(identity_error)?;
+                pending.insert(key, record.clone());
                 if is_new {
                     *count = count.saturating_add(1);
                 }
