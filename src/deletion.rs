@@ -12,7 +12,8 @@ use cap_primitives::ambient_authority;
 use cap_primitives::fs::{self as cap_fs, FollowSymlinks};
 use file_id::FileId;
 use serde::{Deserialize, Serialize};
-use sysinfo::Disks;
+#[cfg(not(unix))]
+use sysinfo::{DiskRefreshKind, Disks};
 
 use crate::model::NodeId;
 use crate::model::NodeKind;
@@ -1268,10 +1269,21 @@ fn is_mount_root(path: &Path) -> io::Result<bool> {
     if canonical.parent().is_none_or(|parent| parent == canonical) {
         return Ok(true);
     }
-    let disks = Disks::new_with_refreshed_list();
-    Ok(disks.list().iter().any(|disk| {
-        std::fs::canonicalize(disk.mount_point()).is_ok_and(|mount| mount == canonical)
-    }))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let path_dev = std::fs::symlink_metadata(&canonical)?.dev();
+        let parent = canonical.parent().expect("non-root path has a parent");
+        let parent_dev = std::fs::symlink_metadata(parent)?.dev();
+        Ok(path_dev != parent_dev)
+    }
+    #[cfg(not(unix))]
+    {
+        let disks = Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing());
+        Ok(disks.list().iter().any(|disk| {
+            std::fs::canonicalize(disk.mount_point()).is_ok_and(|mount| mount == canonical)
+        }))
+    }
 }
 
 fn relative_target(target: &FileToDelete) -> Result<PathBuf, DeletionPlanError> {
