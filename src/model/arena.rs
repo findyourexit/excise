@@ -16,11 +16,11 @@ use super::{
 use crate::native_path::{NativeIdentity, identity_for};
 use crate::os::physical_size;
 
-const NODE_SLOT_BYTES: usize = size_of::<Option<Box<Node>>>();
+const NODE_SLOT_BYTES: usize = size_of::<Option<Node>>();
 const RETAINED_CHILD_SLOT_BYTES: usize = size_of::<u32>();
 const SPARE_CHILD_SLOT_BYTES: usize = size_of::<u32>();
 const NODE_OVERHEAD: usize =
-    NODE_SLOT_BYTES + RETAINED_CHILD_SLOT_BYTES + SPARE_CHILD_SLOT_BYTES + size_of::<Node>() + 96;
+    NODE_SLOT_BYTES + RETAINED_CHILD_SLOT_BYTES + SPARE_CHILD_SLOT_BYTES + 96;
 const DUPLICATE_ID_OVERHEAD: usize = size_of::<FileId>() + 64;
 const DEFAULT_MAX_CHILDREN: usize = 4_096;
 /// Eviction candidates kept per directory that has reached the child cap.
@@ -75,7 +75,7 @@ impl UntrackedMetrics {
 const UNTRACKED_METRICS_OVERHEAD: usize = size_of::<NodeId>() + size_of::<UntrackedMetrics>() + 64;
 
 pub struct Arena {
-    nodes: Vec<Option<Box<Node>>>,
+    nodes: Vec<Option<Node>>,
     // Keeps capped-child and retained-capacity accounting O(1) without
     // changing `Node`'s public layout.
     retained_child_counts: Vec<u32>,
@@ -154,14 +154,14 @@ impl Arena {
             eviction_stash_sweeps: 0,
         };
         arena.reserve_node(&root_name)?;
-        arena.nodes.push(Some(Box::new(Node::new(
+        arena.nodes.push(Some(Node::new(
             root,
             None,
             root_name,
             NodeKind::Root,
             NodeState::Scanning,
             root_snapshot,
-        ))));
+        )));
         arena.retained_child_counts.push(0);
         arena.spare_child_slots.push(0);
         Ok(arena)
@@ -210,17 +210,15 @@ impl Arena {
 
     #[must_use]
     pub fn node(&self, id: NodeId) -> Option<&Node> {
-        self.nodes.get(id.index()).and_then(Option::as_deref)
+        self.nodes.get(id.index()).and_then(Option::as_ref)
     }
 
     pub fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.nodes
-            .get_mut(id.index())
-            .and_then(Option::as_deref_mut)
+        self.nodes.get_mut(id.index()).and_then(Option::as_mut)
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = &Node> {
-        self.nodes.iter().filter_map(Option::as_deref)
+        self.nodes.iter().filter_map(Option::as_ref)
     }
 
     pub fn add_entry(
@@ -732,7 +730,7 @@ impl Arena {
         let candidate = self
             .nodes
             .iter()
-            .filter_map(Option::as_deref)
+            .filter_map(Option::as_ref)
             .filter(|node| {
                 node.kind == NodeKind::Directory
                     && node.state != NodeState::Aggregated
@@ -843,7 +841,7 @@ impl Arena {
         let shared = self
             .nodes
             .iter()
-            .filter_map(Option::as_deref)
+            .filter_map(Option::as_ref)
             .filter(|node| {
                 node.kind == NodeKind::Synthetic(SyntheticKind::Shared)
                     && removed.binary_search(&node.id).is_err()
@@ -1096,7 +1094,6 @@ impl Arena {
                         "focused rescan staged retained count sidecar disappeared".to_string(),
                     )
                 })?;
-            let node = *node;
             let untracked = staging.untracked_metrics.remove(&node.id);
             if let Some(untracked) = untracked {
                 debug_assert!(!self.untracked_metrics.contains_key(&node.id));
@@ -1157,7 +1154,7 @@ impl Arena {
     fn shared_nodes_outside(&self, target: NodeId, removed: &[NodeId]) -> Vec<NodeId> {
         self.nodes
             .iter()
-            .filter_map(Option::as_deref)
+            .filter_map(Option::as_ref)
             .filter(|node| {
                 node.kind == NodeKind::Synthetic(SyntheticKind::Shared)
                     && node.id != target
@@ -1203,7 +1200,7 @@ impl Arena {
             .nodes
             .iter()
             .skip(1)
-            .filter_map(Option::as_deref)
+            .filter_map(Option::as_ref)
             .count();
         let reusable_ids = removed
             .iter()
@@ -1245,12 +1242,7 @@ impl Arena {
         let mut next_append = self.nodes.len();
         let mut reused_slots = 0_usize;
         let mut id_remaps = Vec::with_capacity(staging.nodes.len());
-        for node in staging
-            .nodes
-            .iter_mut()
-            .skip(1)
-            .filter_map(Option::as_deref_mut)
-        {
+        for node in staging.nodes.iter_mut().skip(1).filter_map(Option::as_mut) {
             let reusable = shared_ids
                 .next()
                 .or_else(|| removed_ids.next())
@@ -1319,7 +1311,7 @@ impl Arena {
                     "reusable node slot was occupied".to_string(),
                 ));
             }
-            *slot = Some(Box::new(node));
+            *slot = Some(node);
             self.retained_child_counts[id.index()] = retained_children;
             self.spare_child_slots[id.index()] = 0;
         } else {
@@ -1335,7 +1327,7 @@ impl Arena {
                     "child sidecars did not match arena slots".to_string(),
                 ));
             }
-            self.nodes.push(Some(Box::new(node)));
+            self.nodes.push(Some(node));
             self.retained_child_counts.push(retained_children);
             self.spare_child_slots.push(0);
         }
@@ -1386,7 +1378,7 @@ impl Arena {
         let candidates = self
             .nodes
             .iter()
-            .filter_map(Option::as_deref)
+            .filter_map(Option::as_ref)
             .filter_map(|node| {
                 node.snapshot
                     .identity
@@ -1430,7 +1422,7 @@ impl Arena {
         // Metrics are about to be rewritten from scratch, so any recorded
         // eviction order no longer describes the tree.
         self.clear_eviction_stashes();
-        for node in self.nodes.iter_mut().filter_map(Option::as_deref_mut) {
+        for node in self.nodes.iter_mut().filter_map(Option::as_mut) {
             match node.kind {
                 NodeKind::File
                     if node.state == NodeState::Complete && node.unscanned_reason.is_none() =>
@@ -1717,7 +1709,7 @@ impl Arena {
                 let candidate = candidates[index].0;
                 let Some(node) = nodes
                     .get(candidate.index())
-                    .and_then(Option::as_deref)
+                    .and_then(Option::as_ref)
                     .filter(|node| node.parent == Some(parent) && !node.kind.is_synthetic())
                 else {
                     candidates.swap_remove(index);
@@ -2388,7 +2380,7 @@ impl Arena {
                     "reusable node slot was occupied".to_string(),
                 ));
             }
-            *slot = Some(Box::new(node));
+            *slot = Some(node);
             self.retained_child_counts[id.index()] = 0;
             self.spare_child_slots[id.index()] = 0;
             return Ok(());
@@ -2405,7 +2397,7 @@ impl Arena {
                 "child sidecars did not match arena slots".to_string(),
             ));
         }
-        self.nodes.push(Some(Box::new(node)));
+        self.nodes.push(Some(node));
         self.retained_child_counts.push(0);
         self.spare_child_slots.push(0);
         Ok(())
@@ -2442,7 +2434,7 @@ fn released_node_bytes(node: &Node) -> usize {
 }
 
 fn staged_live_id(
-    nodes: &[Option<Box<Node>>],
+    nodes: &[Option<Node>],
     stage_root: NodeId,
     id: NodeId,
     target: NodeId,
@@ -2452,7 +2444,7 @@ fn staged_live_id(
     }
     nodes
         .get(id.index())
-        .and_then(Option::as_deref)
+        .and_then(Option::as_ref)
         .map(|node| node.id)
         .ok_or_else(|| ModelError::Invariant("staged node mapping disappeared".to_string()))
 }
@@ -2460,7 +2452,7 @@ fn staged_live_id(
 fn remap_staged_nodes(staging: &mut Arena, target: NodeId) -> Result<(), ModelError> {
     let stage_root = staging.root;
     for index in 1..staging.nodes.len() {
-        let Some(node) = staging.nodes[index].as_deref() else {
+        let Some(node) = staging.nodes[index].as_ref() else {
             continue;
         };
         let (parent, children) = {
@@ -2478,7 +2470,7 @@ fn remap_staged_nodes(staging: &mut Arena, target: NodeId) -> Result<(), ModelEr
             (parent, children)
         };
         let node = staging.nodes[index]
-            .as_deref_mut()
+            .as_mut()
             .ok_or_else(|| ModelError::Invariant("staged node mapping disappeared".to_string()))?;
         node.parent = Some(parent);
         node.children = children;
@@ -2557,7 +2549,7 @@ fn remove_deleted_participants(
 
 fn remap_staged_record(
     record: &mut IdentityRecord,
-    nodes: &[Option<Box<Node>>],
+    nodes: &[Option<Node>],
     stage_root: NodeId,
     target: NodeId,
 ) -> Result<(), ModelError> {
@@ -2674,14 +2666,14 @@ fn compare_retention(
 }
 
 fn retention_order_for_nodes(
-    nodes: &[Option<Box<Node>>],
+    nodes: &[Option<Node>],
     left: NodeId,
     right: NodeId,
 ) -> std::cmp::Ordering {
-    let Some(left) = nodes.get(left.index()).and_then(Option::as_deref) else {
+    let Some(left) = nodes.get(left.index()).and_then(Option::as_ref) else {
         return std::cmp::Ordering::Less;
     };
-    let Some(right) = nodes.get(right.index()).and_then(Option::as_deref) else {
+    let Some(right) = nodes.get(right.index()).and_then(Option::as_ref) else {
         return std::cmp::Ordering::Greater;
     };
     compare_retention(
