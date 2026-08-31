@@ -177,7 +177,7 @@ impl Oklch {
             hue: self.hue,
         };
         let lead = tinted_ink(fill, [dark.to_rgb(), light.to_rgb()], LEAD_CONTRAST_FLOOR)
-            .map_or_else(|| strongest_neutral(fill), |ink| ink);
+            .unwrap_or_else(|| strongest_neutral(fill));
         let detail = tinted_ink(
             fill,
             [
@@ -186,7 +186,7 @@ impl Oklch {
             ],
             DETAIL_CONTRAST_FLOOR,
         )
-        .map_or_else(|| strongest_neutral(fill), |ink| ink);
+        .unwrap_or_else(|| strongest_neutral(fill));
         (color_from_rgb(lead), color_from_rgb(detail))
     }
 }
@@ -765,10 +765,10 @@ pub(crate) fn derived_for_with_monochrome(
     let slot = usize::from(monochrome);
     DERIVED_PALETTE.with(|memo| {
         let mut memo = memo.borrow_mut();
-        if let Some(derived) = memo[slot] {
-            if derived.key == key {
-                return (derived.cycle, derived.map);
-            }
+        if let Some(derived) = memo[slot]
+            && derived.key == key
+        {
+            return (derived.cycle, derived.map);
         }
         let derived = DerivedPalette {
             key,

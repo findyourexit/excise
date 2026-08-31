@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-The workspace uses Rust 1.88 and edition 2024. Install the pinned toolchain and supported compilation targets:
+The workspace uses Rust 1.98 and edition 2024. Install the pinned toolchain and supported compilation targets:
 
 ```console
 rustup show
@@ -228,7 +228,7 @@ The `cargo demo` alias is current `main` development behavior rather than a rele
 ```console
 (
   set -euo pipefail
-  cargo +1.88.0 build --release --locked --package excise
+  cargo +1.98.0 build --release --locked --package excise
   cargo demo
 )
 ```

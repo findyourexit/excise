@@ -72,8 +72,9 @@ pub fn assert_terminal_lifecycle(events: &[TerminalEvent]) {
     assert_eq!(frames.len() % 3, 0, "incomplete draw frame: {frames:?}");
     assert!(
         frames
-            .chunks_exact(3)
-            .all(|frame| frame == [Draw, HideCursor, Flush]),
-        "unexpected terminal frame sequence: {frames:?}"
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .all(|frame| frame == &[Draw, HideCursor, Flush]),
     );
 }

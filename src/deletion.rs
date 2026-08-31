@@ -758,12 +758,11 @@ where
     };
     match removal {
         Ok(()) => {
-            if let Some(link_hold) = link_hold.as_ref() {
-                if !link_hold_matches_count(&parent, link_hold, actual.identity.link_count)
+            if let Some(link_hold) = link_hold.as_ref()
+                && !link_hold_matches_count(&parent, link_hold, actual.identity.link_count)
                     .unwrap_or(false)
-                {
-                    entry.snapshot.identity.link_count = None;
-                }
+            {
+                entry.snapshot.identity.link_count = None;
             }
             let finalization =
                 finalize_placeholder(&parent, &original_name, &detached_name, &placeholder);

@@ -1402,9 +1402,8 @@ mod tests {
             state.pending = 1;
         }
 
-        let error = match queue.take(&cancelled, &failed, &root_invalid) {
-            Ok(_) => panic!("out-of-root spill path should be rejected"),
-            Err(error) => error,
+        let Err(error) = queue.take(&cancelled, &failed, &root_invalid) else {
+            panic!("out-of-root spill path should be rejected")
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }

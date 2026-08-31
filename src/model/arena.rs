@@ -2284,10 +2284,7 @@ impl Arena {
     }
 
     fn propagate_add(&mut self, mut id: NodeId, metrics: NodeMetrics) {
-        loop {
-            let Some(node) = self.node_mut(id) else {
-                break;
-            };
+        while let Some(node) = self.node_mut(id) {
             if node
                 .unscanned_reason
                 .as_ref()
@@ -2304,10 +2301,7 @@ impl Arena {
     }
 
     fn propagate_descendant(&mut self, mut id: NodeId, count: u64) {
-        loop {
-            let Some(node) = self.node_mut(id) else {
-                break;
-            };
+        while let Some(node) = self.node_mut(id) {
             node.metrics.descendants = node.metrics.descendants.saturating_add(count);
             let Some(parent) = node.parent else {
                 break;

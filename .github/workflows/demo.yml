@@ -30,8 +30,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup override set 1.88.0
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
 
       - name: Build release binary
         run: cargo build --package excise --release --locked

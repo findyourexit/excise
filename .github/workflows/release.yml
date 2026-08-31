@@ -301,9 +301,9 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          rustup toolchain install 1.88.0 --profile minimal --no-self-update
-          rustup target add "$TARGET" --toolchain 1.88.0
-          rustup override set 1.88.0
+          rustup toolchain install 1.98.0 --profile minimal --no-self-update
+          rustup target add "$TARGET" --toolchain 1.98.0
+          rustup override set 1.98.0
       - name: Build locked release binary
         shell: bash
         env:
@@ -836,8 +836,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.88.0 --profile minimal --no-self-update
-          rustup override set 1.88.0
+          rustup toolchain install 1.98.0 --profile minimal --no-self-update
+          rustup override set 1.98.0
       - name: Verify checked-out tag and manifest version
         shell: bash
         env:

@@ -10,11 +10,11 @@ The project is independent from Diskonaut. Tags `0.1.0` through `0.11.0` are pre
 
 ## Requirements
 
-- Rust 1.88 or newer
+- Rust 1.98 or newer
 - A terminal with color and separate-screen support for the interactive interface
 - Linux, macOS, or Windows
 
-The repository pins Rust 1.88 in `rust-toolchain.toml`.
+The repository pins Rust 1.98 in `rust-toolchain.toml`.
 
 For the `1.0.0` support policy, x86_64 Linux, AArch64 macOS, and x86_64 Windows have been tested on the target systems and are fully supported. x86_64 macOS, AArch64 Linux, and AArch64 Windows have release artifacts but remain build-only and best effort until they have been tested on the target systems. File system limitations are documented in [Support](../SUPPORT.md).
 
