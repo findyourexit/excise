@@ -652,7 +652,7 @@ fn scan_directory(
     loop {
         if cancelled.load(Ordering::Acquire)
             || failed.load(Ordering::Acquire)
-            || !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid)
+            || root_invalid.load(Ordering::Acquire)
         {
             return false;
         }
@@ -667,15 +667,6 @@ fn scan_directory(
         }
         match frame.entries.next() {
             Some(Ok(entry)) => {
-                if !validate_root_for_traversal(
-                    root,
-                    root_identity,
-                    sender,
-                    cancelled,
-                    root_invalid,
-                ) {
-                    return false;
-                }
                 process_entry(
                     &mut frame,
                     &entry,
@@ -702,16 +693,8 @@ fn scan_directory(
     if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
         return false;
     }
-    if let Err(error) = validate_directory_task(root_directory, root, &frame.task) {
-        report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
-        return true;
-    }
     if !frame.batch.is_empty() && !flush_frame(&mut frame, queue, sender, cancelled, failed) {
         return false;
-    }
-    if let Err(error) = validate_directory_task(root_directory, root, &frame.task) {
-        report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
-        return true;
     }
     if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
         return false;
@@ -1076,18 +1059,6 @@ fn open_frame(
     })
 }
 
-fn entry_metadata(entry: &cap_fs::DirEntry) -> io::Result<cap_fs::Metadata> {
-    #[cfg(windows)]
-    {
-        use cap_primitives::fs::_WindowsDirEntryExt as _;
-        entry.full_metadata()
-    }
-    #[cfg(not(windows))]
-    {
-        entry.metadata()
-    }
-}
-
 #[allow(clippy::unnecessary_wraps)]
 fn identity_from_entry_metadata(metadata: &cap_fs::Metadata) -> io::Result<Option<NativeIdentity>> {
     #[cfg(unix)]
@@ -1147,34 +1118,6 @@ fn process_entry(
     if exclusions.is_internal(&path) {
         return;
     }
-    let entry_metadata = match entry_metadata(entry) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            let _ = send_event(
-                sender,
-                WorkerEvent::ScanFailed {
-                    path: Some(path),
-                    message: error.to_string(),
-                },
-                cancelled,
-            );
-            return;
-        }
-    };
-    let entry_identity = match identity_from_entry_metadata(&entry_metadata) {
-        Ok(identity) => identity,
-        Err(error) => {
-            let _ = send_event(
-                sender,
-                WorkerEvent::ScanFailed {
-                    path: Some(path),
-                    message: error.to_string(),
-                },
-                cancelled,
-            );
-            return;
-        }
-    };
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -1210,22 +1153,6 @@ fn process_entry(
             return;
         }
     };
-    if entry_identity
-        .as_ref()
-        .is_some_and(|expected| !same_identity(expected, &identity))
-    {
-        let _ = send_event(
-            sender,
-            WorkerEvent::ScanUnscanned {
-                path,
-                reason: UnscannedReason::Replacement(
-                    "scanner entry identity changed before metadata collection".to_string(),
-                ),
-            },
-            cancelled,
-        );
-        return;
-    }
     let is_dir = metadata.is_dir();
     if let Some(pattern) = exclusions.reason(&path, is_dir) {
         let _ = send_event(
@@ -1260,7 +1187,7 @@ fn process_entry(
     }
     let directory = is_dir.then(|| DirectoryTask {
         path: path.clone(),
-        identity: Some(entry_identity.unwrap_or_else(|| identity.clone())),
+        identity: Some(identity.clone()),
     });
     frame.batch.push(ScannedEntry {
         metadata,
