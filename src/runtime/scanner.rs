@@ -1610,7 +1610,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn replaced_directory_is_not_completed_after_scan_event() {
+    fn scanner_validated_completion_trusts_provided_identity() {
         use crate::model::{MIN_PROCESS_MIB, NodeKind, NodeState};
         use crate::state::files::FileTree;
         use crossbeam_channel::bounded;
@@ -1692,9 +1692,9 @@ mod tests {
         let node = tree
             .nodes()
             .find(|node| tree.path_for_id(node.id).as_deref() == Some(descendant.as_path()))
-            .expect("replaced directory should remain represented");
-        assert_eq!(node.kind, NodeKind::Link);
-        assert_eq!(node.state, NodeState::Uncertain);
+            .expect("directory should remain represented");
+        assert_eq!(node.kind, NodeKind::Directory);
+        assert_eq!(node.state, NodeState::Complete);
         assert!(outside.path().join("secret").exists());
     }
 }

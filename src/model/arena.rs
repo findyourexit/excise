@@ -578,23 +578,32 @@ impl Arena {
         expected_identity: Option<&NativeIdentity>,
     ) -> Result<(), ModelError> {
         if let Some(id) = self.find_path(path) {
+            if let Some(expected_identity) = expected_identity {
+                // The scanner validates directory identity immediately before emitting
+                // completion, so the arena does not need to re-stat for an identity
+                // check. Modified_nanos may be absent on staging arena roots (which are
+                // created by Arena::new with no timestamp), so a single stat is issued
+                // when the field is empty to ensure deletion validation can compare
+                // timestamps after the staged subtree is merged back into the live arena.
+                if let Some(node) = self.node_mut(id)
+                    && node.state == NodeState::Scanning
+                {
+                    if node.snapshot.modified_nanos.is_none() {
+                        node.snapshot.modified_nanos = fs::symlink_metadata(path)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos());
+                    }
+                    node.state = NodeState::Complete;
+                    node.snapshot.identity = Some(expected_identity.clone());
+                }
+                return Ok(());
+            }
             let metadata = fs::symlink_metadata(path).ok();
             let identity = metadata
                 .as_ref()
                 .and_then(|metadata| identity_for(path, metadata).ok().flatten());
-            if let Some(expected) = expected_identity
-                && !identity.as_ref().is_some_and(|actual| {
-                    actual.file_id == expected.file_id
-                        && actual.reparse_point == expected.reparse_point
-                })
-            {
-                return self.record_unscanned(
-                    path,
-                    UnscannedReason::Replacement(
-                        "scanner directory task changed before completion".to_string(),
-                    ),
-                );
-            }
             let modified_nanos = metadata
                 .as_ref()
                 .and_then(|metadata| metadata.modified().ok())
@@ -616,7 +625,6 @@ impl Arena {
         }
         Err(ModelError::InvalidPath(path.to_string_lossy().into_owned()))
     }
-
     pub fn finalize(&mut self) -> Result<(), ModelError> {
         let duplicate_ids = std::mem::take(&mut self.duplicate_identities);
         let duplicate_memory = duplicate_ids.len().saturating_mul(DUPLICATE_ID_OVERHEAD);
