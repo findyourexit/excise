@@ -124,6 +124,11 @@ pub(crate) fn handle_keypress<B: Backend>(evt: &Event, app: &mut App<B>) -> Inpu
 }
 
 fn handle_keypress_loading_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+    if matches!(evt, key!(Backspace)) {
+        return app
+            .prompt_file_deletion()
+            .map_or(InputCommand::None, InputCommand::PlanDeletion);
+    }
     handle_navigation(evt, app, true)
 }
 
@@ -321,6 +326,13 @@ fn handle_keypress_planning_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> I
             app.prompt_exit();
             InputCommand::None
         }
+        // Pre-arm deletion so it fires automatically once planning completes,
+        // but only for single-key challenges (files, or reduced-guardrails dirs).
+        // Silently no-ops for directories requiring a typed name.
+        key!(Enter) => {
+            app.arm_deletion_enter();
+            InputCommand::None
+        }
         _ => InputCommand::None,
     }
 }
@@ -346,8 +358,12 @@ fn handle_keypress_delete_confirm_mode<B: Backend>(evt: &Event, app: &mut App<B>
             app.pop_confirmation_character();
             InputCommand::None
         }
+        // For single-key challenges (ConfirmFile / ReducedGuard), Enter acts as
+        // a primary confirm key by auto-filling the expected 'y' before
+        // delegating to take_confirmed_deletion_plan. For TypeName/TypePhrase,
+        // Enter confirms if and only if the typed input already matches.
         key!(Enter) => app
-            .take_confirmed_deletion_plan()
+            .arm_and_confirm_deletion_plan()
             .map_or(InputCommand::None, InputCommand::RevalidateDeletion),
         Event::Key(KeyEvent {
             code: KeyCode::Char(character),
@@ -515,6 +531,8 @@ mod tests {
         use crate::state::tiles::FileType;
 
         let (root, mut app) = app();
+        // Mark loaded so normal_mode() returns Normal, not Loading.
+        app.loaded = true;
         app.ui_mode = UiMode::PlanningDeletion(Box::new(FileToDelete {
             node_id: NodeId(1),
             synthetic: false,

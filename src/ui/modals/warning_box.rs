@@ -20,7 +20,7 @@ impl WarningBox {
 impl Widget for WarningBox {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         let width = area.width.saturating_sub(2).clamp(30, 72).min(area.width);
-        let height = area.height.saturating_sub(2).clamp(7, 9).min(area.height);
+        let height = 9_u16.min(area.height);
         let rect = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
@@ -36,12 +36,9 @@ impl Widget for WarningBox {
             self.ascii,
         );
         Paragraph::new(
-            "Deletion is locked until scanning or focused rescanning completes.\n\n[Any key] dismiss",
+            "Deletion is locked during rescanning. Wait for it to complete.\n\n[Any key] dismiss",
         )
-        .style(Style::default().fg(readable_text_on(
-            self.theme,
-            self.theme.surface_raised,
-        )))
+        .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
         .render(inner, buffer);

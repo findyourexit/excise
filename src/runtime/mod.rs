@@ -309,7 +309,14 @@ where
                 }
             }
             InputCommand::PlanDeletion(target) => {
-                if self.scan_active || self.deletion_active {
+                // Allow planning during the initial scan (rescan_active=false);
+                // block during rescans since the deletion worker is busy there.
+                if self.rescan_active || self.deletion_active {
+                    // prompt_file_deletion already moved the app to PlanningDeletion;
+                    // undo that so the user is not left in a planning screen with
+                    // no worker request behind it (e.g. a fast Esc+Backspace sequence
+                    // during loading where the cancelled worker has not yet replied).
+                    self.app.normal_mode();
                     return Ok(());
                 }
                 let reduced_guardrails = self.app.reduced_deletion_guardrails();
@@ -546,6 +553,26 @@ where
                         self.summary.model_limit_bytes = limit;
                         self.summary.identity_spilled = spilled;
                         self.app.start_ui();
+                        // Pick up any deletion replan that was deferred while the
+                        // initial scan ran to avoid concurrent scan conflicts.
+                        match self.app.rebuild_deletion_replan() {
+                            Some(crate::app::DeletionReplanResult::Ready(target)) => {
+                                let reduced_guardrails = self.app.reduced_deletion_guardrails();
+                                let maximum_bytes = self.app.maximum_deletion_plan_bytes();
+                                self.workers()?.request_deletion_plan(
+                                    *target,
+                                    reduced_guardrails,
+                                    maximum_bytes,
+                                )?;
+                                self.deletion_active = true;
+                            }
+                            Some(crate::app::DeletionReplanResult::Missing) => {
+                                self.summary.deletion_missing_entries =
+                                    self.summary.deletion_missing_entries.saturating_add(1);
+                                self.app.complete_missing_deletion();
+                            }
+                            None => {}
+                        }
                         self.animation.schedule_completion();
                     }
                 }
@@ -556,9 +583,23 @@ where
             } => {
                 self.deletion_active = false;
                 match result {
-                    Ok(plan) => self.app.deletion_plan_ready(target_node_id, Ok(plan)),
+                    Ok(plan) => {
+                        if let Some(auto_confirmed) =
+                            self.app.deletion_plan_ready(target_node_id, Ok(plan))
+                        {
+                            // Enter was pre-armed; skip the confirm dialog and
+                            // jump straight to revalidation.
+                            self.workers()?.revalidate_deletion(*auto_confirmed)?;
+                            self.deletion_active = true;
+                        }
+                    }
                     Err(error) if error.is_stale() => {
-                        if let Some(target) =
+                        if self.scan_active && !self.rescan_active {
+                            // Initial scan still running; starting a competing deletion
+                            // rescan would corrupt untagged scan-event routing. Store
+                            // the replan target and let ScanFinished pick it up.
+                            self.app.defer_pending_deletion_replan(target_node_id);
+                        } else if let Some(target) =
                             self.app.begin_pending_deletion_replan(target_node_id)?
                         {
                             self.start_deletion_rescan(target)?;
@@ -571,7 +612,8 @@ where
                     }
                     Err(error) => {
                         self.animation.schedule_error();
-                        self.app
+                        let _ = self
+                            .app
                             .deletion_plan_ready(target_node_id, Err(error.to_string()));
                     }
                 }
@@ -595,11 +637,18 @@ where
                         self.app.complete_missing_deletion();
                     }
                     Err((plan, _error)) => {
-                        let Some(target) = self.app.begin_deletion_replan(target_node_id, *plan)?
-                        else {
-                            return Ok(());
-                        };
-                        self.start_deletion_rescan(target)?;
+                        if self.scan_active && !self.rescan_active {
+                            // Initial scan still running; defer without a competing rescan.
+                            self.app
+                                .defer_deletion_replan_from_plan(target_node_id, *plan);
+                        } else {
+                            let Some(target) =
+                                self.app.begin_deletion_replan(target_node_id, *plan)?
+                            else {
+                                return Ok(());
+                            };
+                            self.start_deletion_rescan(target)?;
+                        }
                     }
                 }
             }
