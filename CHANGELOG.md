@@ -4,6 +4,16 @@ All notable Excise changes are documented here. The format follows [Keep a Chang
 
 Excise preserves the historical Diskonaut changelog below. Diskonaut versions and tags are not Excise releases.
 
+## [1.1.1] - 2026-09-01
+
+### Fixed
+
+* Directory deletion now works correctly regardless of whether the initial scan is still running or whether directory contents were evicted from the bounded in-memory model due to memory pressure. The previous release required a complete in-memory snapshot of every file in the subtree before allowing a deletion plan to proceed; this blocked deletion of any directory whose descendants were still scanning or had been aggregated, even when the directory's own node was fully scanned. The planning worker now builds the deletion plan from its own fresh live filesystem walk, matching the approach used by Diskonaut. File and link deletion retains per-entry identity snapshots for targeted single-entry safety.
+
+### Changed
+
+* Added `cargo create-release-tag <version> <sha> <candidate-run-id>` as a `cargo xtask` subcommand. It creates an annotated release tag in the format required by the release workflow, embedding `candidate-run-id: <id>` in the tag message. The `docs/releasing.md` runbook now documents the annotated-tag creation step between bundle verification and the push that triggers the release workflow.
+
 ## [1.1.0] - 2026-09-01
 
 ### Changed
