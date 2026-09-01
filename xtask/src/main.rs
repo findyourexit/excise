@@ -92,7 +92,9 @@ fn main() {
 }
 
 fn dispatch() -> Result<(), Box<dyn Error>> {
-    match env::args().nth(1).as_deref() {
+    let mut args = env::args();
+    let _ = args.next();
+    match args.next().as_deref() {
         Some("verify") => verify(),
         Some("generate") => write_generated(),
         Some("check-generated") => check_generated(),
@@ -101,8 +103,9 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
         Some("render-homebrew") => render_homebrew_formula(),
         Some("dist-local") => build_local_dist(),
         Some("demo") => render_demo(),
+        Some("create-release-tag") => create_release_tag(args),
         _ => Err(io::Error::other(
-            "usage: cargo xtask <verify|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo>",
+            "usage: cargo xtask <verify|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|create-release-tag>",
         )
         .into()),
     }
@@ -114,6 +117,138 @@ fn release_version() -> Result<String, Box<dyn Error>> {
         .get_version()
         .ok_or_else(|| io::Error::other("CLI version was absent"))?;
     Ok(version.to_owned())
+}
+
+fn create_release_tag(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let (Some(version), Some(source_sha), Some(candidate_run_id), None) =
+        (args.next(), args.next(), args.next(), args.next())
+    else {
+        return Err(io::Error::other(
+            "usage: cargo create-release-tag <VERSION> <SOURCE_SHA> <CANDIDATE_RUN_ID>",
+        )
+        .into());
+    };
+
+    require(
+        is_release_version(&version),
+        format!("release version must use MAJOR.MINOR.PATCH: {version}"),
+    )?;
+    require(
+        is_commit_sha(&source_sha),
+        format!("source SHA must be a 40-character hexadecimal commit ID: {source_sha}"),
+    )?;
+    require(
+        is_numeric(&candidate_run_id),
+        format!("candidate run ID must contain only digits: {candidate_run_id}"),
+    )?;
+
+    let manifest_version = cargo_toml_version()?;
+    require(
+        manifest_version == version,
+        format!(
+            "Cargo.toml version {manifest_version} does not match requested release version {version}"
+        ),
+    )?;
+
+    let head = current_head_sha()?;
+    require(
+        head.eq_ignore_ascii_case(&source_sha),
+        format!(
+            "current HEAD {head} does not match requested source SHA {source_sha}; run this command from the reviewed release commit"
+        ),
+    )?;
+
+    let tag_name = format!("v{version}");
+    let message = format!("candidate-run-id: {candidate_run_id}");
+    let output = Command::new("git")
+        .args(["tag", "-a", &tag_name, &source_sha, "-m", &message])
+        .output()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "could not create annotated tag {tag_name}: {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail = if stderr.is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(io::Error::other(format!(
+            "could not create annotated tag {tag_name}: {detail}"
+        ))
+        .into());
+    }
+
+    println!("Created annotated tag {tag_name}.");
+    println!("Push it with `git push origin {tag_name}`.");
+    Ok(())
+}
+
+fn cargo_toml_version() -> Result<String, Box<dyn Error>> {
+    let mut command = cargo_metadata::MetadataCommand::new();
+    command.no_deps();
+    let metadata = command
+        .exec()
+        .map_err(|error| io::Error::other(format!("could not read Cargo.toml: {error}")))?;
+    let package = metadata
+        .root_package()
+        .ok_or_else(|| io::Error::other("Cargo.toml did not describe a root package"))?;
+    Ok(package.version.to_string())
+}
+
+fn current_head_sha() -> Result<String, Box<dyn Error>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| {
+            io::Error::other(format!("could not run `git rev-parse HEAD`: {error}"))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail = if stderr.is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(io::Error::other(format!("`git rev-parse HEAD` failed: {detail}")).into());
+    }
+
+    let head = String::from_utf8(output.stdout)
+        .map_err(|error| {
+            io::Error::other(format!(
+                "`git rev-parse HEAD` returned invalid UTF-8: {error}"
+            ))
+        })?
+        .trim()
+        .to_owned();
+    require(
+        is_commit_sha(&head),
+        format!("`git rev-parse HEAD` returned an invalid commit SHA: {head}"),
+    )?;
+    Ok(head)
+}
+
+fn is_release_version(value: &str) -> bool {
+    let mut components = value.split('.');
+    for _ in 0..3 {
+        let Some(component) = components.next() else {
+            return false;
+        };
+        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+    }
+    components.next().is_none()
+}
+
+fn is_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_numeric(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn check_support_matrix() -> Result<(), Box<dyn Error>> {
