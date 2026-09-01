@@ -4,7 +4,7 @@ All notable Excise changes are documented here. The format follows [Keep a Chang
 
 Excise preserves the historical Diskonaut changelog below. Diskonaut versions and tags are not Excise releases.
 
-## [Unreleased]
+## [1.1.0] - 2026-09-01
 
 ### Changed
 
