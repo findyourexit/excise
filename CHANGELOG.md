@@ -4,6 +4,18 @@ All notable Excise changes are documented here. The format follows [Keep a Chang
 
 Excise preserves the historical Diskonaut changelog below. Diskonaut versions and tags are not Excise releases.
 
+## [Unreleased]
+
+### Changed
+
+* Deletion is no longer locked until the initial scan completes. Entries that have been fully examined are now deletable while scanning continues. Previously, pressing `Backspace` during a scan showed a blocking warning; now it proceeds immediately when the selected entry is complete and is refused with a clear error when it is not.
+
+* `Enter` is now the primary confirmation key for file deletions and for directory deletions under `--disable-delete-confirmation`. Previously these required typing `y`. Both keys work; `Enter` is now displayed first in the confirm dialog.
+
+* Pressing `Enter` during the identity plan build phase pre-arms confirmation for single-key challenges. When the plan completes, deletion begins immediately without a separate confirm step. This reduces the file deletion flow to `Backspace` → `Enter`, matching the speed users expect from interactive storage navigators.
+
+* Updated the warning shown when deletion is attempted during a rescan. The message previously implied the initial scan was also a barrier; it now correctly states that deletion is locked only during rescanning.
+
 ## [1.0.2] - 2026-09-01
 
 ### Changed

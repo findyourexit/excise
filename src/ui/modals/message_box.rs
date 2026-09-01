@@ -12,7 +12,14 @@ use crate::ui::pane::{readable_text_on, render_modal};
 
 #[derive(Clone, Copy)]
 pub enum DeletionView<'a> {
-    Planning(&'a FileToDelete),
+    Planning {
+        target: &'a FileToDelete,
+        enter_armed: bool,
+        /// Whether Enter pre-arming is applicable for this target (i.e. the
+        /// challenge will be single-key). False for directories that require a
+        /// typed name and for entries with deceptive filenames (`TypePhrase`).
+        armable: bool,
+    },
     Confirm {
         plan: &'a DeletionPlan,
         input: &'a str,
@@ -36,9 +43,19 @@ pub struct MessageBox<'a> {
 }
 
 impl<'a> MessageBox<'a> {
-    pub const fn planning(target: &'a FileToDelete, theme: Theme, ascii: bool) -> Self {
+    pub const fn planning(
+        target: &'a FileToDelete,
+        enter_armed: bool,
+        armable: bool,
+        theme: Theme,
+        ascii: bool,
+    ) -> Self {
         Self {
-            view: DeletionView::Planning(target),
+            view: DeletionView::Planning {
+                target,
+                enter_armed,
+                armable,
+            },
             theme,
             ascii,
         }
@@ -103,7 +120,7 @@ impl Widget for MessageBox<'_> {
             height,
         );
         let title = match &self.view {
-            DeletionView::Planning(_) => "! BUILDING IDENTITY PLAN",
+            DeletionView::Planning { .. } => "! BUILDING IDENTITY PLAN",
             DeletionView::Confirm { plan, .. } => {
                 match plan.root_snapshot().map(|item| item.kind) {
                     Some(PlannedKind::Directory) => "! PERMANENT DIRECTORY DELETION",
@@ -153,15 +170,37 @@ impl Widget for MessageBox<'_> {
 fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> {
     let separator = if ascii { "." } else { "·" };
     match view {
-        DeletionView::Planning(target) => vec![
-            Line::from(""),
-            Line::from(display_path_end(&target.full_path(), width)),
-            Line::from(""),
-            Line::from("Enumerating a no-follow identity snapshot."),
-            Line::from("Deletion is disabled until the plan is complete."),
-            Line::from(""),
-            Line::from("[Esc] cancel"),
-        ],
+        DeletionView::Planning {
+            target,
+            enter_armed,
+            armable,
+        } => {
+            let status_line = if enter_armed {
+                "Armed: will execute when plan is ready."
+            } else {
+                "Verifying target snapshot."
+            };
+            // Only show the Enter hint when this target can actually be pre-armed
+            // (i.e. the challenge will be single-key: a non-deceptive file, or any
+            // entry under reduced guardrails). Directories requiring a typed name
+            // and entries with deceptive filenames (TypePhrase challenge) are not
+            // armable; showing the hint there would be misleading.
+            let key_line = if enter_armed {
+                String::from("[Esc] disarm and cancel")
+            } else if armable {
+                format!("[Enter] arm for immediate execution {separator} [Esc] cancel")
+            } else {
+                String::from("[Esc] cancel")
+            };
+            vec![
+                Line::from(""),
+                Line::from(display_path_end(&target.full_path(), width)),
+                Line::from(""),
+                Line::from(status_line),
+                Line::from(""),
+                Line::from(key_line),
+            ]
+        }
         DeletionView::Confirm {
             plan,
             input,
@@ -190,10 +229,10 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
             append_safety_labels(&mut content, reduced_guardrails, elevated, width, ascii);
             match &plan.challenge {
                 ConfirmationChallenge::ConfirmFile => {
-                    content.push(Line::from("Press y to permanently delete this entry."));
+                    content.push(Line::from("[Enter] or y to permanently delete this entry."));
                 }
                 ConfirmationChallenge::ReducedGuard => {
-                    content.push(Line::from("Press y to arm permanent deletion."));
+                    content.push(Line::from("[Enter] or y to arm permanent deletion."));
                 }
                 ConfirmationChallenge::TypeName(expected) => {
                     content.push(Line::from(format!("Type exact name: {expected}")));

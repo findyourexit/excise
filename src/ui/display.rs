@@ -15,7 +15,7 @@ use crate::animation::AnimationScheduler;
 use crate::config::{CustomKeyBindings, KeyPreset};
 use crate::error::AppError;
 use crate::model::{ByteBounds, NodeKind, NodeState, SyntheticKind, UnscannedReason};
-use crate::native_path::SafeDisplayPath;
+use crate::native_path::{SafeDisplayPath, safe_display_os_str};
 use crate::os::is_user_admin;
 use crate::state::UiEffects;
 use crate::state::files::FileTree;
@@ -92,6 +92,7 @@ where
         custom_keys: Option<&CustomKeyBindings>,
         mouse_enabled: bool,
         reduced_guardrails: bool,
+        deletion_enter_armed: bool,
         reduced_motion: bool,
     ) -> Result<(), AppError> {
         self.terminal
@@ -218,8 +219,26 @@ where
 
                 match ui_mode {
                     UiMode::PlanningDeletion(target) => {
-                        frame
-                            .render_widget(MessageBox::planning(target, theme, ascii), full_screen);
+                        // Mirror the challenge_for() deceptive-name check: a deceptive
+                        // leaf always produces a TypePhrase challenge so arming is
+                        // meaningless; non-folder entries (or any entry under reduced
+                        // guardrails) with safe names produce a single-key challenge.
+                        let leaf_deceptive = target
+                            .path_to_file
+                            .last()
+                            .is_some_and(|n| safe_display_os_str(n).deceptive);
+                        let armable = !leaf_deceptive
+                            && (reduced_guardrails || target.file_type != FileType::Folder);
+                        frame.render_widget(
+                            MessageBox::planning(
+                                target,
+                                deletion_enter_armed,
+                                armable,
+                                theme,
+                                ascii,
+                            ),
+                            full_screen,
+                        );
                     }
                     UiMode::DeleteConfirm {
                         plan: Some(plan),
@@ -778,7 +797,21 @@ fn inspector_action(
                 "Filter input · Enter apply · Esc cancel"
             }
         }
-        UiMode::Loading | UiMode::Rescanning { .. } => {
+        UiMode::Loading => {
+            // Deletion is available during the initial scan for complete entries.
+            if !synthetic && complete {
+                if ascii {
+                    "Scanning . [Backspace] permanent delete"
+                } else {
+                    "Scanning · [Backspace] permanent delete"
+                }
+            } else if ascii {
+                "Scanning . deletion unavailable"
+            } else {
+                "Scanning · deletion unavailable"
+            }
+        }
+        UiMode::Rescanning { .. } => {
             if ascii {
                 "Scanning . deletion unavailable"
             } else {
@@ -1085,7 +1118,7 @@ fn render_status(
             area.width,
         )),
         UiMode::Loading => Some(ui_effects.last_read_path.as_ref().map_or_else(
-            || format!("~ SCANNING {separator} deletion locked"),
+            || "~ SCANNING".to_string(),
             |path| status_with_path("~ SCANNING ", path, "", area.width),
         )),
         _ if file_tree.failed_to_read > 0 => {
@@ -1408,6 +1441,7 @@ mod tests {
                 false,
                 KeyPreset::Vim,
                 None,
+                false,
                 false,
                 false,
                 false,
@@ -1851,6 +1885,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             )
             .expect("display should render");
 
@@ -1900,6 +1935,7 @@ mod tests {
                 false,
                 KeyPreset::Vim,
                 None,
+                false,
                 false,
                 false,
                 false,
@@ -1995,6 +2031,20 @@ mod tests {
                 true,
                 false,
             ),
+            "Scanning · deletion unavailable"
+        );
+        // Loading mode: complete non-synthetic entries now show the Backspace action.
+        assert_eq!(
+            inspector_action(&UiMode::Loading, false, true, false),
+            "Scanning · [Backspace] permanent delete"
+        );
+        // Incomplete or synthetic entries during loading still report unavailability.
+        assert_eq!(
+            inspector_action(&UiMode::Loading, false, false, false),
+            "Scanning · deletion unavailable"
+        );
+        assert_eq!(
+            inspector_action(&UiMode::Loading, true, true, false),
             "Scanning · deletion unavailable"
         );
     }
@@ -2258,7 +2308,7 @@ mod tests {
     #[test]
     fn safety_labels_survive_every_transient_status() {
         for status in [
-            "~ SCANNING · deletion locked",
+            "~ SCANNING",
             "~ RESCANNING /target · deletion locked",
             "/ filter_  [Enter] apply",
             "? 2 unreadable entries",

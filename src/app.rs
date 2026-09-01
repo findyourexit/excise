@@ -16,14 +16,14 @@ use crate::deletion::{
 use crate::error::AppError;
 use crate::filter::FilterPattern;
 use crate::model::{ModelError, NodeState, SyntheticKind, UnscannedReason};
-use crate::native_path::{NativeIdentity, identity_for};
+use crate::native_path::{NativeIdentity, identity_for, safe_display_os_str};
 use crate::outcome::RunSummary;
 use crate::report::{
     ReportError, scan_is_uncertain, scan_report_state, write_deletion_history_json,
     write_scan_report_json,
 };
 use crate::state::files::FileTree;
-use crate::state::tiles::{Board, Pivot};
+use crate::state::tiles::{Board, FileType, Pivot};
 use crate::state::{FileToDelete, UiEffects};
 use crate::theme::Theme;
 use crate::ui::Display;
@@ -117,6 +117,7 @@ where
     deletion_history_bytes: usize,
     deletion_history_limit: usize,
     deletion_replan: Option<FileToDelete>,
+    deletion_enter_armed: bool,
     preferences_dirty: bool,
     keymap: KeyPreset,
     custom_keys: Option<CustomKeyBindings>,
@@ -215,6 +216,7 @@ where
             deletion_history_bytes: 0,
             deletion_history_limit: process_memory_mib.saturating_mul(MIB) / 8,
             deletion_history: Vec::new(),
+            deletion_enter_armed: false,
             deletion_replan: None,
         }
     }
@@ -253,6 +255,7 @@ where
             self.custom_keys.as_ref(),
             self.mouse_enabled,
             self.delete_confirmation_disabled,
+            self.deletion_enter_armed,
             reduced_motion,
         )?;
         let has_selection = self.board.currently_selected().is_some();
@@ -331,9 +334,26 @@ where
     }
 
     pub fn start_ui(&mut self) {
-        self.ui_mode = UiMode::Normal;
         self.loaded = true;
-        self.render_and_update_board();
+        // Only move to Normal if no deletion flow is active; a deletion started
+        // during loading must not be silently discarded when the scan finishes.
+        if matches!(
+            self.ui_mode,
+            UiMode::PlanningDeletion(_)
+                | UiMode::DeleteConfirm { .. }
+                | UiMode::Deleting { .. }
+                | UiMode::DeletionCancel { .. }
+                | UiMode::DeletionResult { .. }
+        ) {
+            self.mark_dirty();
+        } else {
+            // The arm is only valid inside PlanningDeletion. Any mode not in the
+            // preserved list (e.g. Exiting when q was pressed during planning) has
+            // no valid deletion target, so clear it.
+            self.deletion_enter_armed = false;
+            self.ui_mode = UiMode::Normal;
+            self.render_and_update_board();
+        }
         emit_pty_test_marker("SCAN_COMPLETE");
     }
     pub fn add_entry_to_base_folder(
@@ -393,6 +413,7 @@ where
     }
 
     pub fn reset_ui_mode(&mut self) {
+        self.deletion_enter_armed = false;
         if !matches!(self.ui_mode, UiMode::Loading | UiMode::Normal) {
             self.ui_mode = if self.loaded {
                 UiMode::Normal
@@ -518,6 +539,16 @@ where
         let kind = self.file_tree.node_kind(currently_selected.node_id)?;
         let synthetic = kind.is_synthetic();
         let full_path = self.file_tree.path_for_id(currently_selected.node_id)?;
+        // Guard against NodeId reuse during loading: verify the model's current
+        // leaf name AND parent directory for this NodeId match what the board
+        // tile was displaying. A same-basename entry in a different directory
+        // would pass a name-only check; the parent check catches that case.
+        let current_folder = self.file_tree.get_current_path();
+        if full_path.file_name() != Some(currently_selected.name.as_os_str())
+            || full_path.parent() != Some(current_folder.as_path())
+        {
+            return None;
+        }
         let relative = full_path
             .strip_prefix(&self.file_tree.path_in_filesystem)
             .ok()?;
@@ -592,27 +623,55 @@ where
         self.remaining_deletion_history_bytes() / 2
     }
 
+    /// Called when the deletion worker finishes planning. Returns the plan when
+    /// it should be immediately forwarded to the worker for revalidation
+    /// (Enter was pre-armed and the challenge is single-key).
+    #[must_use]
     pub fn deletion_plan_ready(
         &mut self,
         target_node_id: crate::model::NodeId,
         result: Result<Box<DeletionPlan>, String>,
-    ) {
+    ) -> Option<Box<DeletionPlan>> {
+        // Always consume the arm flag; it no longer matters once we leave planning.
+        let enter_armed = std::mem::replace(&mut self.deletion_enter_armed, false);
         if !matches!(
             &self.ui_mode,
             UiMode::PlanningDeletion(current) if current.node_id == target_node_id
         ) {
-            return;
+            return None;
         }
         match result {
             Ok(plan) => {
+                // If Enter was pre-armed and the challenge is a single-key type,
+                // skip the confirm dialog and proceed straight to revalidation.
+                if enter_armed
+                    && matches!(
+                        plan.challenge,
+                        ConfirmationChallenge::ConfirmFile | ConfirmationChallenge::ReducedGuard
+                    )
+                {
+                    let planned_entries = plan.planned_entries();
+                    self.ui_mode = UiMode::Deleting {
+                        planned_entries,
+                        stopping: false,
+                    };
+                    self.ui_effects.deletion_in_progress = true;
+                    self.mark_dirty();
+                    return Some(plan);
+                }
                 self.ui_mode = UiMode::DeleteConfirm {
                     plan: Some(plan),
                     input: String::new(),
                 };
+                self.mark_dirty();
+                None
             }
-            Err(error) => self.ui_mode = UiMode::ErrorMessage(error),
+            Err(error) => {
+                self.ui_mode = UiMode::ErrorMessage(error);
+                self.mark_dirty();
+                None
+            }
         }
-        self.mark_dirty();
     }
 
     pub fn push_confirmation_character(&mut self, character: char) {
@@ -726,6 +785,9 @@ where
                 .map_or_else(|| target.path_in_filesystem.clone(), Path::to_path_buf)
         };
         target.reviewed_entries.clear();
+        // The plan was stale: the target may have changed since the user armed Enter.
+        // Clear the arm so a replacement identity requires fresh confirmation.
+        self.deletion_enter_armed = false;
         self.begin_rescan(rescan_target.clone())?;
         self.deletion_replan = Some(target);
         self.ui_effects.deletion_in_progress = false;
@@ -760,9 +822,53 @@ where
         Some(DeletionReplanResult::Ready(Box::new(target)))
     }
 
-    pub(crate) fn complete_missing_deletion(&mut self) {
+    /// Defers a stale `PlanningDeletion` target for later without staging a
+    /// model rescan. Used when the deletion plan came back stale but the
+    /// initial scan is still active; starting a competing rescan would corrupt
+    /// untagged scan-event routing. The stored replan is picked up by
+    /// `rebuild_deletion_replan` once `ScanFinished` fires.
+    pub(crate) fn defer_pending_deletion_replan(&mut self, target_node_id: crate::model::NodeId) {
+        let target = match &self.ui_mode {
+            UiMode::PlanningDeletion(t) if t.node_id == target_node_id => (**t).clone(),
+            _ => return,
+        };
+        self.deletion_replan = Some(target);
+        self.deletion_enter_armed = false;
         self.ui_effects.deletion_in_progress = false;
-        self.ui_mode = UiMode::Normal;
+        // Return to Loading; the initial scan is still running and the user
+        // should see that, not a stale planning overlay.
+        self.ui_mode = UiMode::Loading;
+        self.mark_dirty();
+    }
+
+    /// Defers a stale revalidation replan without staging a model rescan.
+    /// Used when revalidation returned stale but the initial scan is still active.
+    pub(crate) fn defer_deletion_replan_from_plan(
+        &mut self,
+        target_node_id: crate::model::NodeId,
+        plan: DeletionPlan,
+    ) {
+        if plan.target.node_id != target_node_id {
+            self.show_error("Deletion validation returned an unexpected target");
+            return;
+        }
+        let mut target = plan.target;
+        target.reviewed_entries.clear();
+        self.deletion_replan = Some(target);
+        self.deletion_enter_armed = false;
+        self.ui_effects.deletion_in_progress = false;
+        self.ui_mode = UiMode::Loading;
+        self.mark_dirty();
+    }
+
+    pub(crate) fn complete_missing_deletion(&mut self) {
+        self.deletion_enter_armed = false;
+        self.ui_effects.deletion_in_progress = false;
+        self.ui_mode = if self.loaded {
+            UiMode::Normal
+        } else {
+            UiMode::Loading
+        };
         self.render_and_update_board();
     }
 
@@ -875,7 +981,55 @@ where
         })
     }
 
+    /// Sets the deletion enter arm flag when in `PlanningDeletion` mode for a
+    /// challenge that will be a single-key confirm (files, or any entry when
+    /// guardrails are reduced). No-ops for directories with the name-typing
+    /// challenge and for any entry with a deceptive name (`TypePhrase` challenge).
+    pub fn arm_deletion_enter(&mut self) {
+        if let UiMode::PlanningDeletion(target) = &self.ui_mode {
+            // Deceptive names always produce a TypePhrase challenge; arming is
+            // meaningless and the UI would display "Armed" while the plan later
+            // opens a typing prompt. Mirror the challenge_for() deceptive check.
+            let leaf_deceptive = target
+                .path_to_file
+                .last()
+                .is_some_and(|name| safe_display_os_str(name).deceptive);
+            if !leaf_deceptive
+                && (self.delete_confirmation_disabled || target.file_type != FileType::Folder)
+            {
+                self.deletion_enter_armed = true;
+                self.mark_dirty();
+            }
+        }
+    }
+
+    /// Whether deletion enter is currently armed.
+    #[must_use]
+    pub const fn deletion_enter_is_armed(&self) -> bool {
+        self.deletion_enter_armed
+    }
+
+    /// Confirms the active deletion plan, auto-filling the expected single
+    /// character for `ConfirmFile`/`ReducedGuard` challenges so that Enter
+    /// works as a primary confirmation key alongside the typed keys.
+    pub fn arm_and_confirm_deletion_plan(&mut self) -> Option<DeletionPlan> {
+        if let UiMode::DeleteConfirm {
+            plan: Some(plan),
+            input,
+        } = &mut self.ui_mode
+            && matches!(
+                plan.challenge,
+                ConfirmationChallenge::ConfirmFile | ConfirmationChallenge::ReducedGuard
+            )
+            && input.is_empty()
+        {
+            input.push('y');
+        }
+        self.take_confirmed_deletion_plan()
+    }
+
     pub fn show_error(&mut self, message: impl Into<String>) {
+        self.deletion_enter_armed = false;
         self.ui_effects.deletion_in_progress = false;
         self.ui_mode = UiMode::ErrorMessage(message.into());
         self.mark_dirty();
@@ -883,8 +1037,13 @@ where
 
     pub fn normal_mode(&mut self) {
         self.deletion_replan = None;
+        self.deletion_enter_armed = false;
         self.ui_effects.deletion_in_progress = false;
-        self.ui_mode = UiMode::Normal;
+        self.ui_mode = if self.loaded {
+            UiMode::Normal
+        } else {
+            UiMode::Loading
+        };
         self.render_and_update_board();
     }
 
@@ -908,6 +1067,7 @@ where
     pub fn cancel_rescan(&mut self) -> Result<(), AppError> {
         self.file_tree.cancel_rescan().map_err(model_error)?;
         self.deletion_replan = None;
+        self.deletion_enter_armed = false;
         self.ui_mode = UiMode::Normal;
         self.render_and_update_board();
         Ok(())

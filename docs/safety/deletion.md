@@ -25,14 +25,14 @@ Consent covers only the identities in the plan. It never covers a new entry that
 
 ## Confirmation
 
-- Files require an explicit confirmation dialog.
-- Safe printable directories require their exact leaf name by default.
+- Files confirm with `Enter` or `y` in the confirmation dialog.
+- Safe printable directories require their exact leaf name followed by `Enter` by default.
 - Hostile or untypeable names show an escaped full path and identity. They require a generated challenge such as `DELETE K7M4`.
-- A session-only reduced mode uses a dialog and a separate confirmation action.
+- A session-only reduced mode accepts `Enter` or `y` for all entries except hostile names.
 - Reduced mode is visible and is never saved.
 - Root and Administrator accounts receive a visible warning. The identity checks remain unchanged.
 
-A short dialog animation may run without blocking cancel or back input. The irreversible action stays disabled until the dialog reaches its final stable content. The path, challenge, warnings, and choices then remain unchanged while waiting for consent.
+While the identity plan is being built, pressing `Enter` pre-arms confirmation for single-key challenges (files and reduced-guardrail entries). When the plan completes with a single-key challenge, execution begins immediately without showing the separate confirm dialog. The irreversible action does not start until the plan is complete and the pre-arming key has been given. For typed-name and generated challenges, the confirm dialog is always shown and the user must type the required input before execution begins.
 
 ## Execution
 

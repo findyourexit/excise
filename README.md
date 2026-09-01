@@ -140,7 +140,7 @@ The interactive interface needs standard input and output connected to a termina
 
 ## Safety Model
 
-Excise offers deletion only for complete entries that it has fully examined on a platform with tested deletion support. It refuses filesystem roots and summary entries. Before asking for confirmation, it compares the live files and folders with the reviewed plan. It checks every planned entry again immediately before deletion.
+Excise offers deletion only for complete entries that it has fully examined on a platform with tested deletion support. Fully examined entries are deletable while the initial scan is still running; you do not need to wait for the full scan to finish. Deletion is locked during focused rescanning. It refuses filesystem roots and summary entries. Before execution, it compares the live files and folders with the reviewed plan. It checks every planned entry again immediately before deletion.
 
 Changed, replaced, missing, newly created, permission-blocked, and uncertain entries are never silently deleted. A soft cancellation reports the work completed so far. A forced cancellation restores the terminal immediately and reports that the final filesystem state may be uncertain. There is no recovery or undo mechanism.
 
