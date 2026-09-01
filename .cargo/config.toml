@@ -1,6 +1,7 @@
 [alias]
 verify = "run --locked --package xtask -- verify"
 generate = "run --locked --package xtask -- generate"
+create-release-tag = "run --locked --package xtask -- create-release-tag"
 check-generated = "run --locked --package xtask -- check-generated"
 dist-local = "run --locked --package xtask -- dist-local"
 demo = "run --locked --package xtask -- demo"

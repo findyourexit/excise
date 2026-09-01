@@ -216,6 +216,19 @@ The candidate contains six immutable target archives, `checksums.sha256`, and `e
 
 Confirm that every archive contains its target binary, `LICENSE`, `generated/man/excise.1`, and `schemas/scan-report.schema.json`. The software bill of materials and provenance files are candidate-bundle evidence and are not silently substituted for an archive. The workflow retains candidate artifacts for one day. Retention is a validation convenience, not publication or durable distribution.
 
+## Create Annotated Release Tag
+
+Only after the candidate bundle passes every verification, create the immutable release tag from the reviewed source checkout. The tag must be annotated, point to the candidate's exact source SHA, and carry the successful candidate workflow run ID in a message formatted as `candidate-run-id: $run_id`.
+
+For the current `1.1.0` release, use the `source_sha` and `run_id` captured in the hosted-candidate step, then push the tag that triggers the release workflow:
+
+```console
+cargo create-release-tag 1.1.0 "$source_sha" "$run_id"
+git push origin v1.1.0
+```
+
+Do **not** use `gh release create` to create this tag: it creates a lightweight tag, which fails the release-validation gate before publication.
+
 ## Promotion Order & Publication Semantics
 
 The approved `0.1.1` publication used:
