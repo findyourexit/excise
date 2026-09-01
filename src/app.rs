@@ -591,6 +591,27 @@ where
             self.show_error("Deletion requires a complete, materialized entry");
             return None;
         }
+        // Pre-check the full subtree before building the reviewed list, so the
+        // user sees an actionable message rather than an internal invariant error.
+        if let Err(reason) = self
+            .file_tree
+            .subtree_deletion_eligibility(file_to_delete.node_id)
+        {
+            let message = match reason {
+                "still scanning" => {
+                    "This directory has entries that are still being scanned. \
+                     Deletion is available for fully scanned entries; \
+                     wait for the scan to complete and try again."
+                }
+                _ => {
+                    "Some entries in this directory are held as a memory-efficient \
+                     aggregate and cannot be individually verified for deletion. \
+                     Navigate into the directory to select specific items to delete."
+                }
+            };
+            self.show_error(message);
+            return None;
+        }
         file_to_delete.reviewed_entries = match self
             .file_tree
             .reviewed_subtree(file_to_delete.node_id, self.maximum_deletion_plan_bytes())
