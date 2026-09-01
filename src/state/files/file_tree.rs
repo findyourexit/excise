@@ -193,36 +193,6 @@ impl FileTree {
         })
     }
 
-    /// Returns a human-readable ineligibility reason if any node in the
-    /// subtree rooted at `root` cannot currently be reviewed for deletion,
-    /// or `Ok(())` if the subtree is fully eligible.
-    ///
-    /// Call this before [`Self::reviewed_subtree`] to surface actionable
-    /// messages rather than internal invariant errors.
-    pub fn subtree_deletion_eligibility(&self, root: NodeId) -> Result<(), &'static str> {
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            let Some(node) = self.arena.node(id) else {
-                continue;
-            };
-            // Shared entries are excluded by the deletion review and worker; skip them.
-            if node.kind == NodeKind::Synthetic(SyntheticKind::Shared) {
-                continue;
-            }
-            match node.state {
-                NodeState::Scanning => return Err("still scanning"),
-                NodeState::Aggregated => return Err("aggregated"),
-                NodeState::Uncertain => return Err("uncertain"),
-                NodeState::Complete => {}
-            }
-            if node.kind.is_synthetic() {
-                return Err("aggregated");
-            }
-            stack.extend(node.children.iter().copied());
-        }
-        Ok(())
-    }
-
     pub fn reviewed_subtree(
         &self,
         root: NodeId,

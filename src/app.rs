@@ -591,37 +591,24 @@ where
             self.show_error("Deletion requires a complete, materialized entry");
             return None;
         }
-        // Pre-check the full subtree before building the reviewed list, so the
-        // user sees an actionable message rather than an internal invariant error.
-        if let Err(reason) = self
-            .file_tree
-            .subtree_deletion_eligibility(file_to_delete.node_id)
-        {
-            let message = match reason {
-                "still scanning" => {
-                    "This directory has entries that are still being scanned. \
-                     Deletion is available for fully scanned entries; \
-                     wait for the scan to complete and try again."
-                }
-                _ => {
-                    "Some entries in this directory are held as a memory-efficient \
-                     aggregate and cannot be individually verified for deletion. \
-                     Navigate into the directory to select specific items to delete."
+        // For file and link targets, build a per-entry reviewed list used by
+        // the planning worker to detect model-vs-filesystem drift. For directory
+        // targets, skip this: the worker performs its own live filesystem walk
+        // and uses that as the authoritative plan, matching diskonaut's simpler
+        // deletion model. The directory identity check in the worker (via
+        // validate_model_snapshot) still ensures we target the right directory.
+        if file_to_delete.file_type != FileType::Folder {
+            file_to_delete.reviewed_entries = match self
+                .file_tree
+                .reviewed_subtree(file_to_delete.node_id, self.maximum_deletion_plan_bytes())
+            {
+                Ok(entries) => entries,
+                Err(error) => {
+                    self.show_error(error.to_string());
+                    return None;
                 }
             };
-            self.show_error(message);
-            return None;
         }
-        file_to_delete.reviewed_entries = match self
-            .file_tree
-            .reviewed_subtree(file_to_delete.node_id, self.maximum_deletion_plan_bytes())
-        {
-            Ok(entries) => entries,
-            Err(error) => {
-                self.show_error(error.to_string());
-                return None;
-            }
-        };
         self.deletion_replan = None;
         self.ui_mode = UiMode::PlanningDeletion(Box::new(file_to_delete.display_copy()));
         self.mark_dirty();

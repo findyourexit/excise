@@ -458,15 +458,19 @@ pub(crate) fn build_plan_cancellable_with_root_identity(
     target
         .reviewed_entries
         .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    if entries.len() != target.reviewed_entries.len()
-        || entries.iter().any(|entry| {
-            target
-                .reviewed_entries
-                .binary_search_by(|reviewed| reviewed.relative_path.cmp(&entry.relative_path))
-                .ok()
-                .and_then(|index| target.reviewed_entries.get(index))
-                .is_none_or(|reviewed| reviewed.snapshot != entry.snapshot)
-        })
+    // reviewed_entries is empty for directory targets (the live walk above is
+    // the authoritative plan). For file and link targets it is always populated
+    // and the comparison detects model-vs-filesystem drift before committing.
+    if !target.reviewed_entries.is_empty()
+        && (entries.len() != target.reviewed_entries.len()
+            || entries.iter().any(|entry| {
+                target
+                    .reviewed_entries
+                    .binary_search_by(|reviewed| reviewed.relative_path.cmp(&entry.relative_path))
+                    .ok()
+                    .and_then(|index| target.reviewed_entries.get(index))
+                    .is_none_or(|reviewed| reviewed.snapshot != entry.snapshot)
+            }))
     {
         return Err(DeletionPlanError::Changed);
     }
