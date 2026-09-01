@@ -438,7 +438,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "equivalent"
-version = "1.0.2"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "excise"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64",
