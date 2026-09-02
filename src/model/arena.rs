@@ -757,13 +757,43 @@ impl Arena {
             .map_or(NodeMetrics::default(), |node| node.metrics);
         metrics.descendants = metrics.descendants.saturating_add(1);
         let untracked = self.untracked_metrics_for_subtree(candidate);
-        let reserved = self.reserve_untracked_slot(candidate, untracked)?;
         let mut removed = Vec::new();
         for child in children {
             self.collect_subtree_ids(child, &mut removed);
         }
+        // The model may already be at its hard limit precisely when it needs to
+        // collapse a subtree. Re-key one summary that will be removed rather than
+        // reserving a second slot before the old tree can release its storage.
+        let (reserved, recycled_untracked) =
+            if untracked.is_zero() || self.untracked_metrics.contains_key(&candidate) {
+                (false, None)
+            } else if let Some(source) = removed
+                .iter()
+                .copied()
+                .find(|id| self.untracked_metrics.contains_key(id))
+            {
+                let source_metrics = self
+                    .untracked_metrics
+                    .remove(&source)
+                    .expect("untracked source must exist");
+                let previous = self
+                    .untracked_metrics
+                    .insert(candidate, UntrackedMetrics::default());
+                debug_assert!(previous.is_none());
+                (false, Some((source, source_metrics)))
+            } else {
+                (self.reserve_untracked_slot(candidate, untracked)?, None)
+            };
         if let Err(error) = self.identities.remap_removed_nodes(&mut removed, candidate) {
-            if reserved {
+            if let Some((source, source_metrics)) = recycled_untracked {
+                let recycled = self
+                    .untracked_metrics
+                    .remove(&candidate)
+                    .expect("recycled untracked slot must exist");
+                debug_assert!(recycled.is_zero());
+                let previous = self.untracked_metrics.insert(source, source_metrics);
+                debug_assert!(previous.is_none());
+            } else if reserved {
                 self.remove_untracked_metrics(candidate);
             }
             return Err(error);
@@ -3892,6 +3922,60 @@ mod tests {
             !arena.eviction_stash.contains_key(&cached_parent_id),
             "the concrete reservation must release unrelated optional stashes"
         );
+    }
+
+    #[test]
+    fn compaction_reuses_untracked_slot_at_the_model_limit() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cold = root.path().join("cold");
+        let aggregated = cold.join("aggregated");
+        fs::create_dir(&cold).expect("cold directory should be created");
+        fs::write(&aggregated, b"aggregated").expect("aggregate fixture should be written");
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        let cold_id = add_path(&mut arena, &cold).expect("cold directory should be retained");
+        let metadata = fs::symlink_metadata(&aggregated).expect("aggregate metadata should exist");
+        let identity = identity_for(&aggregated, &metadata)
+            .expect("aggregate identity should be readable")
+            .expect("aggregate fixture should not be a link");
+        assert!(
+            arena
+                .add_entry_aggregated(&aggregated, &metadata, identity)
+                .expect("aggregate fixture should be represented")
+                .is_none()
+        );
+        let other = arena
+            .find_child(cold_id, OsStr::new("Other"))
+            .expect("cold directory should contain Other");
+        arena
+            .record_unscanned(
+                &cold.join("Other"),
+                UnscannedReason::Metadata("fixture metadata unavailable".to_string()),
+            )
+            .expect("Other should retain untracked metrics");
+        assert!(arena.untracked_metrics.contains_key(&other));
+
+        let remaining = arena.memory_limit().saturating_sub(arena.memory_used());
+        arena
+            .budget
+            .reserve(remaining)
+            .expect("test should consume the remaining model budget");
+
+        assert!(
+            arena
+                .aggregate_cold_subtree(&HashSet::from([root_id]))
+                .expect("compaction should reuse a removed untracked slot")
+        );
+        assert_eq!(
+            arena
+                .node(cold_id)
+                .expect("cold aggregate should remain")
+                .kind,
+            NodeKind::Synthetic(SyntheticKind::Aggregate)
+        );
+        assert!(arena.untracked_metrics.contains_key(&cold_id));
+        assert!(!arena.untracked_metrics.contains_key(&other));
     }
 
     #[test]
