@@ -777,6 +777,72 @@ mod tests {
     }
 
     #[test]
+    fn leaving_deep_navigation_reclaims_a_summarized_branch_at_memory_limit() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let mut directories = Vec::new();
+        let mut current = root.path().to_path_buf();
+        for level in 0..9 {
+            current.push(format!("level-{level}"));
+            fs::create_dir(&current).expect("deep fixture directory should be created");
+            directories.push(current.clone());
+        }
+        let aggregated = current.join("aggregated");
+        let pending = root.path().join("pending");
+        fs::write(&aggregated, b"aggregated").expect("aggregate fixture should be written");
+        fs::write(&pending, b"pending").expect("pending fixture should be written");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        for directory in &directories {
+            add(&mut tree, directory);
+        }
+        let metadata = fs::symlink_metadata(&aggregated).expect("aggregate metadata should exist");
+        let identity = identity_for(&aggregated, &metadata)
+            .expect("aggregate identity should be readable")
+            .expect("aggregate fixture should not be a link");
+        assert!(
+            tree.arena
+                .add_entry_aggregated(&aggregated, &metadata, identity)
+                .expect("aggregate fixture should be represented")
+                .is_none()
+        );
+        tree.arena
+            .record_unscanned(
+                &current.join("Other"),
+                UnscannedReason::Metadata("fixture metadata unavailable".to_string()),
+            )
+            .expect("Other should retain untracked metrics");
+
+        for directory in &directories {
+            assert!(tree.enter_folder(node_id_at(&tree, directory)));
+        }
+        for _ in &directories {
+            assert!(tree.leave_folder());
+        }
+        assert_eq!(
+            tree.current_path.len(),
+            1,
+            "navigation should return to root"
+        );
+
+        tree.arena
+            .consume_remaining_budget_for_test()
+            .expect("fixture should consume its model budget");
+        add(&mut tree, &pending);
+
+        let compacted = node_id_at(&tree, &directories[0]);
+        assert_eq!(
+            tree.node_kind(compacted),
+            Some(NodeKind::Synthetic(SyntheticKind::Aggregate))
+        );
+        assert!(tree.path_for_id(node_id_at(&tree, &pending)).is_some());
+    }
+
+    #[test]
     fn cancelled_focused_rescan_discards_staging_without_touching_live_tree() {
         let root = tempfile::tempdir().expect("rescan root should exist");
         let target = root.path().join("target");
