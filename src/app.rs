@@ -305,14 +305,43 @@ where
         self.custom_keys.as_ref()
     }
 
+    #[must_use]
+    pub fn current_folder_path(&self) -> PathBuf {
+        self.file_tree.get_current_path()
+    }
+
+    #[must_use]
+    pub(crate) fn map_is_transitioning(&self) -> bool {
+        self.board.is_transitioning()
+    }
+
     pub fn render_and_update_board(&mut self) {
+        self.update_board();
+        self.mark_dirty();
+    }
+
+    /// Applies background scan data only after a reader-visible drill settles.
+    ///
+    /// A scan refresh lands directly at its final geometry rather than perpetually
+    /// retargeting the map tween while the scanner is active.
+    pub fn refresh_board_from_scan(&mut self) -> bool {
+        if self.board.is_transitioning() {
+            return false;
+        }
+        if self.update_board() {
+            self.board.settle_geometry();
+            self.mark_dirty();
+        }
+        true
+    }
+
+    fn update_board(&mut self) -> bool {
         let folder = self.file_tree.current_id();
         let filter = self.file_tree.filter().map(FilterPattern::raw);
         let files = self
             .file_tree
             .files_in_current_folder(self.board.zoom_level);
-        self.board.change_files_for_view(files, folder, filter);
-        self.mark_dirty();
+        self.board.change_files_for_view(files, folder, filter)
     }
 
     pub const fn increment_loading_progress_indicator(&mut self) {

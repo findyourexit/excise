@@ -21,6 +21,13 @@ fn config_error(message: impl std::fmt::Display) -> AppError {
 pub const CONFIG_VERSION: u16 = 1;
 const DEFAULT_EVENT_BUFFER: usize = 256;
 const MAX_SCANNER_THREADS: usize = 32;
+const DEFAULT_MAX_SCANNER_THREADS: usize = 8;
+
+fn default_scan_threads(available: usize) -> usize {
+    available
+        .saturating_sub(1)
+        .clamp(1, DEFAULT_MAX_SCANNER_THREADS)
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -344,9 +351,8 @@ impl RuntimeConfig {
             )));
         }
 
-        let default_threads = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(8);
+        let default_threads =
+            default_scan_threads(std::thread::available_parallelism().map_or(1, usize::from));
         let file_scanner = file.map(|file| &file.scanner);
         let file_runtime = file.map(|file| &file.runtime);
         let file_model = file.map(|file| &file.model);
@@ -626,6 +632,15 @@ fn validate_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_scan_threads_leaves_a_cpu_for_interaction() {
+        assert_eq!(default_scan_threads(1), 1);
+        assert_eq!(default_scan_threads(2), 1);
+        assert_eq!(default_scan_threads(8), 7);
+        assert_eq!(default_scan_threads(9), 8);
+        assert_eq!(default_scan_threads(64), 8);
+    }
 
     #[test]
     fn configuration_errors_escape_terminal_controls() {

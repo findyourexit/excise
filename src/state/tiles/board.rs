@@ -137,12 +137,16 @@ impl Board {
         files: Vec<FileMetadata>,
         folder: NodeId,
         filter: Option<&str>,
-    ) {
+    ) -> bool {
         let changed = self.view.as_ref().is_none_or(|view| {
             view.folder != folder
                 || view.filter.as_deref() != filter
                 || view.zoom_level != self.zoom_level
         });
+        let data_changed = self.files != files;
+        if !changed && !data_changed {
+            return false;
+        }
         if changed && self.pending_pivot.is_none() && self.pending_pivot_geometry.is_none() {
             self.clear_retained_pivot();
         }
@@ -154,7 +158,9 @@ impl Board {
             });
         }
         self.replace_files(files, changed);
+        true
     }
+
     pub fn change_area(&mut self, area: Rect) {
         if self.area != area {
             self.expire_stationary_pivot();
@@ -1963,14 +1969,14 @@ mod tests {
         board.change_area(Rect::new(0, 0, 80, 24));
         let mut files = vec![file(1, 0.8)];
         files.extend((2..=101).map(|id| file(id, 0.002)));
-        board.change_files(files.clone());
+        assert!(board.change_files_for_view(files.clone(), NodeId(1), None));
         board.advance_geometry(Duration::ZERO, true);
         assert!(!board.tiles.is_empty());
         let overflow = board
             .rendered_overflow()
             .expect("the tiny entries require an overflow summary");
 
-        board.change_files(files);
+        assert!(!board.change_files_for_view(files, NodeId(1), None));
 
         assert!(!board.is_transitioning());
         assert_eq!(board.rendered_overflow(), Some(overflow));
