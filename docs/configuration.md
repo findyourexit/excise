@@ -71,6 +71,7 @@ right = "d"
 | `runtime.output` | Report destination for noninteractive output | A path |
 
 The default memory limit is 512 MiB or the detected available memory when that is lower. Excise reserves 25 percent as process headroom and limits working data to the remaining 75 percent.
+By default, Excise uses one less than the detected available processor count, clamped from one through eight workers, so interactive input retains a processor when possible.
 
 ## Environment Variables
 

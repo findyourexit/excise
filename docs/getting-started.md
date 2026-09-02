@@ -42,12 +42,12 @@ nix build
 ./result/bin/excise /path/to/inspect
 ```
 
-## Install 1.0.0 From A Release Channel
+## Install 1.2.0 From A Release Channel
 
-The `1.0.0` package is published on crates.io and can also be built locally. It is not one of the pre-built GitHub archives:
+The `1.2.0` package is published on crates.io and can also be built locally. It is not one of the pre-built GitHub archives:
 
 ```console
-cargo install excise --version 1.0.0 --locked
+cargo install excise --version 1.2.0 --locked
 excise --version
 ```
 
@@ -88,7 +88,7 @@ Use a temporary directory appropriate to your platform on Windows.
 
 Keep the default confirmation enabled for first use. Select a real file or directory and press `Backspace` to begin a permanent deletion plan. You do not need to wait for the full scan to finish; entries that have been fully examined are already deletable while scanning continues. Review the escaped path, file identity, and number of planned entries. The scan root, a file system or drive root, synthetic `Shared` and `Other` entries, aggregate entries, and incomplete or uncertain subtrees are not deletion targets. Press `Esc` to cancel.
 
-Files confirm with `Enter` or `y`. While the identity plan is still being built, pressing `Enter` pre-arms confirmation for files and reduced-guardrail entries; the deletion starts as soon as the plan is ready without a separate confirm step. Safe printable directories require their exact leaf name followed by `Enter`. Hostile or untypeable names require a generated challenge. `--disable-delete-confirmation` enables a visible, session-only reduced confirmation mode that accepts `Enter` or `y` for all entries except hostile names. It does not remove the other safeguards and is not saved. Prefer an ordinary user for first use. Root and Administrator accounts receive a warning and do not change the identity checks.
+Files and safe printable directories confirm with `Enter` or `y`. While the identity plan is still being built, pressing `Enter` pre-arms confirmation for those entries and reduced-guardrail entries; the deletion starts as soon as the plan is ready without a separate confirm step. Hostile or untypeable names require a generated challenge. `--disable-delete-confirmation` enables a visible, session-only reduced confirmation mode that accepts `Enter` or `y` for all entries except hostile names. It does not remove the other safeguards and is not saved. Prefer an ordinary user for first use. Root and Administrator accounts receive a warning and do not change the identity checks.
 
 Every planned entry is listed independently and checked again immediately before deletion. Changed, replaced, missing, or newly created entries are never silently deleted. A run can therefore be partial. There is no trash or undo.
 
@@ -100,7 +100,7 @@ The interactive interface requires standard input and output connected to a term
 
 ### Current Map Behavior
 
-The dense half-block map, animated focus border, heat ramp, overflow summary, and directed map transitions are included in the published `1.0.0` release. Build the current source or install `1.0.0` to use them.
+The dense half-block map, animated focus border, heat ramp, overflow summary, and directed map transitions are included in the stable release. Build the current source or install `1.2.0` to use them.
 
 The interactive view uses a dense map and animated focus border on capable terminals. `--ascii`, monochrome mode, and reduced motion preserve the same selection, scope, and deletion information when visual effects are unavailable or undesirable.
 

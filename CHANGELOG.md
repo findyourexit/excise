@@ -4,6 +4,19 @@ All notable Excise changes are documented here. The format follows [Keep a Chang
 
 Excise preserves the historical Diskonaut changelog below. Diskonaut versions and tags are not Excise releases.
 
+## [1.2.0] - 2026-09-02
+
+### Changed
+
+* Simplified the ordinary directory-deletion review flow to use a single-key confirmation. Directories with deceptive names still require their generated safety challenge.
+* Directory deletion plans can exceed the retained file and link history budget. The planning dialog estimates entries, and deletion displays live per-identity progress while execution runs.
+* The default scanner worker count reserves one available processor for user interaction and never exceeds eight workers.
+
+### Fixed
+
+* Treemap navigation stays responsive during active scans. Folder drills render before queued scanner work, and scanner model updates wait while treemap geometry is moving instead of skipping navigation frames.
+* Tree compaction continues at the model memory limit after deep navigation returns to the root by reusing an untracked summary slot from the subtree being removed.
+
 ## [1.1.1] - 2026-09-01
 
 ### Fixed

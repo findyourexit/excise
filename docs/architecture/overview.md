@@ -18,13 +18,13 @@ A terminal session guard owns raw input mode, the separate screen, cursor visibi
 
 ### Main Loop
 
-The main loop polls terminal input with a bounded timeout. It processes input and worker events before drawing visual effects. It redraws only when state has changed. It limits active effects to 30 frames per second and drops overdue frames. A new transition replaces an older transition with the same purpose.
+The main loop polls terminal input with a bounded timeout. It renders each folder drill before it resumes queued scanner work, applies staged scan batches one entry per input poll, and uses bounded-channel backpressure while treemap geometry is moving. It redraws only when state has changed. It limits active effects to 30 frames per second and drops overdue frames. A new transition replaces an older transition with the same purpose.
 
 ### Scanner
 
 The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. When temporary working data reaches its memory limit, the scanner can use a permission-restricted store for the session instead of growing without limit. Backpressure never silently drops an entry.
 
-The default worker count is the smaller of the available processor count and eight. The configured value must be between one and 32. Exclusions and file system boundaries remain visible in the working model. Link targets are never traversed.
+The default worker count leaves one available processor for the owner loop when possible and is clamped from one through eight. The configured value must be between one and 32. Exclusions and file system boundaries remain visible in the working model. Link targets are never traversed.
 
 ### Working Model
 
