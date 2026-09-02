@@ -2270,9 +2270,6 @@ fn delete_folder() {
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
-    for character in "subfolder1".chars() {
-        events.push(Some(key!(char character)));
-    }
     events.push(Some(key!(Enter)));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
     // with the following ctrl-c
@@ -2447,9 +2444,6 @@ fn delete_folder_small_window() {
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
-    for character in "subfolder1".chars() {
-        events.push(Some(key!(char character)));
-    }
     events.push(Some(key!(Enter)));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
     // with the following ctrl-c
@@ -2628,9 +2622,6 @@ fn delete_folder_with_multiple_children() {
     events.push(None);
     events.push(Some(key!(Backspace)));
     events.push(None);
-    for character in "subfolder1".chars() {
-        events.push(Some(key!(char character)));
-    }
     events.push(Some(key!(Enter)));
     // here we sleep extra to allow the blink events to happen and be tested before the app exits
     // with the following ctrl-c

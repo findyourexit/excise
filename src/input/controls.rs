@@ -52,6 +52,10 @@ impl InputSource for TerminalEvents {
 
 pub(crate) enum InputCommand {
     None,
+    /// A folder entry or exit (Enter/Esc drill). Treated as a batch boundary so
+    /// each folder change gets its own render before the next input is processed.
+    /// Arrow-key selection moves remain in Navigation (no boundary) to stay fast.
+    Drill,
     Navigation,
     PathError,
     StartRescan(PathBuf),
@@ -248,14 +252,14 @@ fn handle_navigation<B: Backend>(evt: &Event, app: &mut App<B>, loading: bool) -
         }
         key!(char '\n') | key!(Enter) => app
             .handle_enter()
-            .map_or(InputCommand::Navigation, InputCommand::StartRescan),
+            .map_or(InputCommand::Drill, InputCommand::StartRescan),
         key!(Backspace) if loading => {
             app.show_warning_modal();
             InputCommand::None
         }
         key!(Esc) => {
             if app.go_up() {
-                InputCommand::Navigation
+                InputCommand::Drill
             } else {
                 InputCommand::PathError
             }
@@ -497,27 +501,39 @@ mod tests {
     #[test]
     fn deletion_cancel_keys_defer_state_changes_to_runtime() {
         let (_root, mut app) = app();
-        app.ui_mode = UiMode::DeletionCancel { planned_entries: 1 };
+        app.ui_mode = UiMode::DeletionCancel {
+            planned_entries: 1,
+            completed: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
 
         let command = handle_keypress(&key(KeyCode::Char('s'), KeyModifiers::NONE), &mut app);
         assert!(matches!(command, InputCommand::SoftCancelDeletion));
         assert!(matches!(
             &app.ui_mode,
-            UiMode::DeletionCancel { planned_entries: 1 }
+            UiMode::DeletionCancel {
+                planned_entries: 1,
+                ..
+            }
         ));
 
         let command = handle_keypress(&key(KeyCode::Char('b'), KeyModifiers::NONE), &mut app);
         assert!(matches!(command, InputCommand::ResumeDeletion));
         assert!(matches!(
             &app.ui_mode,
-            UiMode::DeletionCancel { planned_entries: 1 }
+            UiMode::DeletionCancel {
+                planned_entries: 1,
+                ..
+            }
         ));
     }
 
     #[test]
     fn deletion_cancel_hard_key_still_exits() {
         let (_root, mut app) = app();
-        app.ui_mode = UiMode::DeletionCancel { planned_entries: 1 };
+        app.ui_mode = UiMode::DeletionCancel {
+            planned_entries: 1,
+            completed: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
 
         let command = handle_keypress(&key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut app);
         assert!(matches!(command, InputCommand::HardCancel));

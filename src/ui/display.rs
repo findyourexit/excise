@@ -258,14 +258,23 @@ where
                     }
                     UiMode::Deleting {
                         planned_entries,
+                        completed,
                         stopping,
                     } => {
                         frame.render_widget(
-                            MessageBox::deleting(*planned_entries, *stopping, theme, ascii),
+                            MessageBox::deleting(
+                                *planned_entries,
+                                completed.load(std::sync::atomic::Ordering::Relaxed),
+                                *stopping,
+                                theme,
+                                ascii,
+                            ),
                             full_screen,
                         );
                     }
-                    UiMode::DeletionCancel { planned_entries } => {
+                    UiMode::DeletionCancel {
+                        planned_entries, ..
+                    } => {
                         frame.render_widget(
                             MessageBox::cancel(*planned_entries, theme, ascii),
                             full_screen,

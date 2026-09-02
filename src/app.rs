@@ -3,6 +3,7 @@ use std::fs::Metadata;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use ratatui::backend::Backend;
@@ -72,10 +73,12 @@ pub enum UiMode {
     },
     Deleting {
         planned_entries: u64,
+        completed: Arc<AtomicU64>,
         stopping: bool,
     },
     DeletionCancel {
         planned_entries: u64,
+        completed: Arc<AtomicU64>,
     },
     DeletionResult {
         report: Arc<DeletionReport>,
@@ -265,7 +268,11 @@ where
         let animate_focus = matches!(&self.ui_mode, UiMode::Normal)
             && has_selection
             && ColorCycle::can_animate(theme.focus);
-        animation.set_activity(animate_focus);
+        // Keep the render loop awake during deletion so the progress counter
+        // in UiMode::Deleting stays live. The animation scheduler fires at
+        // ~30fps when activity is true; without this the screen is static until
+        // DeletionFinished arrives.
+        animation.set_activity(animate_focus || self.ui_effects.deletion_in_progress);
         // The map transition runs on wall-clock time, so the loop has to keep waking up
         // until it settles. Nothing else in the frame would ask for those frames.
         animation.set_geometry_active(self.board.is_transitioning());
@@ -659,8 +666,10 @@ where
                     )
                 {
                     let planned_entries = plan.planned_entries();
+                    let completed = Arc::new(AtomicU64::new(0));
                     self.ui_mode = UiMode::Deleting {
                         planned_entries,
+                        completed,
                         stopping: false,
                     };
                     self.ui_effects.deletion_in_progress = true;
@@ -719,8 +728,10 @@ where
             return None;
         };
         let planned_entries = plan.planned_entries();
+        let completed = Arc::new(AtomicU64::new(0));
         self.ui_mode = UiMode::Deleting {
             planned_entries,
+            completed,
             stopping: false,
         };
         self.ui_effects.deletion_in_progress = true;
@@ -735,10 +746,15 @@ where
     pub fn prompt_deletion_cancel(&mut self) {
         if let UiMode::Deleting {
             planned_entries,
+            ref completed,
             stopping: false,
         } = self.ui_mode
         {
-            self.ui_mode = UiMode::DeletionCancel { planned_entries };
+            let completed = Arc::clone(completed);
+            self.ui_mode = UiMode::DeletionCancel {
+                planned_entries,
+                completed,
+            };
             self.mark_dirty();
         }
     }
@@ -881,9 +897,15 @@ where
     }
 
     pub fn resume_deletion(&mut self, stopping: bool) {
-        if let UiMode::DeletionCancel { planned_entries } = self.ui_mode {
+        if let UiMode::DeletionCancel {
+            planned_entries,
+            ref completed,
+        } = self.ui_mode
+        {
+            let completed = Arc::clone(completed);
             self.ui_mode = UiMode::Deleting {
                 planned_entries,
+                completed,
                 stopping,
             };
             self.mark_dirty();
@@ -1015,6 +1037,18 @@ where
     #[must_use]
     pub const fn deletion_enter_is_armed(&self) -> bool {
         self.deletion_enter_armed
+    }
+
+    /// Returns the live completion counter stored in `UiMode::Deleting`, if
+    /// currently in that mode. The runtime clones this and passes it to the
+    /// deletion worker so both threads share the same atomic.
+    #[must_use]
+    pub fn deletion_progress_counter(&self) -> Option<Arc<AtomicU64>> {
+        if let UiMode::Deleting { ref completed, .. } = self.ui_mode {
+            Some(Arc::clone(completed))
+        } else {
+            None
+        }
     }
 
     /// Confirms the active deletion plan, auto-filling the expected single

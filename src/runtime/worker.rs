@@ -3,7 +3,7 @@ use std::fs::Metadata;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bo
 
 use crate::deletion::{
     DeletionPlan, DeletionPlanError, DeletionReport, build_plan_cancellable,
-    build_plan_cancellable_with_root_identity, execute_plan, revalidate_plan_cancellable,
+    build_plan_cancellable_with_root_identity, execute_plan_counted, revalidate_plan_cancellable,
 };
 use crate::error::AppError;
 #[cfg(test)]
@@ -71,7 +71,10 @@ enum WorkerCommand {
     },
     RevalidateDeletion(DeletionPlan),
     Rescan(ScannerOptions),
-    ExecuteDeletion(DeletionPlan),
+    ExecuteDeletion {
+        plan: DeletionPlan,
+        progress: Arc<AtomicU64>,
+    },
 }
 
 pub struct WorkerPool {
@@ -161,9 +164,13 @@ impl WorkerPool {
             .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
     }
 
-    pub fn execute_deletion(&self, plan: DeletionPlan) -> Result<(), AppError> {
+    pub fn execute_deletion(
+        &self,
+        plan: DeletionPlan,
+        progress: Arc<AtomicU64>,
+    ) -> Result<(), AppError> {
         self.commands
-            .send(WorkerCommand::ExecuteDeletion(plan))
+            .send(WorkerCommand::ExecuteDeletion { plan, progress })
             .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
     }
 
@@ -292,8 +299,8 @@ fn deletion_worker(
                 scanner::run(options, sender, rescan_cancelled.as_ref());
                 continue;
             }
-            WorkerCommand::ExecuteDeletion(plan) => WorkerEvent::DeletionFinished {
-                report: execute_plan(scan_root, plan, soft_cancelled, cancelled),
+            WorkerCommand::ExecuteDeletion { plan, progress } => WorkerEvent::DeletionFinished {
+                report: execute_plan_counted(scan_root, plan, soft_cancelled, cancelled, &progress),
             },
         };
         if !send_event(sender, event, cancelled) {
@@ -483,7 +490,7 @@ mod tests {
 
         workers.soft_cancel_deletion();
         workers
-            .execute_deletion(plan)
+            .execute_deletion(plan, Arc::new(AtomicU64::new(0)))
             .expect("execution should be queued after cancellation");
         let report = loop {
             match workers
@@ -516,7 +523,7 @@ mod tests {
         workers.soft_cancel_deletion();
         workers.resume_deletion();
         workers
-            .execute_deletion(plan)
+            .execute_deletion(plan, Arc::new(AtomicU64::new(0)))
             .expect("execution should be queued after resuming");
 
         let report = loop {

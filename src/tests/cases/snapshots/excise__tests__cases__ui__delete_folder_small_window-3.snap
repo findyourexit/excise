@@ -21,12 +21,12 @@ expression: normalized
 ▏                                                          ▕
 ▏ ▟▐ ! PERMANENT DELETION ACTIVE ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜ ▕
 ▏ ▏                                                      ▕ ▕
-▏ ▏Executing 2 planned identities.                       ▕ ▕
-▏ ▏Every entry is revalidated immediately before         ▕ ▕
-▏ ▏mutation.                                             ▕ ▕
+▏ ▏0 of 2 · revalidated before each mutation             ▕ ▕
 ▏ ▏New and changed entries are never swept.              ▕ ▕
 ▏ ▏                                                      ▕ ▕
 ▏ ▏[Esc/q] interruption options                          ▕ ▕
+▏ ▏                                                      ▕ ▕
+▏ ▏                                                      ▕ ▕
 ▏ ▏                                                      ▕ ▕
 ▏ ▏                                                      ▕ ▕
 ▏ ▏                                                      ▕ ▕

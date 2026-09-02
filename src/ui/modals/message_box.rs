@@ -28,6 +28,7 @@ pub enum DeletionView<'a> {
     },
     Deleting {
         planned_entries: u64,
+        completed: u64,
         stopping: bool,
     },
     Cancel {
@@ -81,10 +82,17 @@ impl<'a> MessageBox<'a> {
         }
     }
 
-    pub const fn deleting(planned_entries: u64, stopping: bool, theme: Theme, ascii: bool) -> Self {
+    pub const fn deleting(
+        planned_entries: u64,
+        completed: u64,
+        stopping: bool,
+        theme: Theme,
+        ascii: bool,
+    ) -> Self {
         Self {
             view: DeletionView::Deleting {
                 planned_entries,
+                completed,
                 stopping,
             },
             theme,
@@ -178,13 +186,15 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
             let status_line = if enter_armed {
                 "Armed: will execute when plan is ready."
             } else {
-                "Verifying target snapshot."
+                "Building identity plan."
             };
-            // Only show the Enter hint when this target can actually be pre-armed
-            // (i.e. the challenge will be single-key: a non-deceptive file, or any
-            // entry under reduced guardrails). Directories requiring a typed name
-            // and entries with deceptive filenames (TypePhrase challenge) are not
-            // armable; showing the hint there would be misleading.
+            // Show the in-memory entry count as a planning estimate when available.
+            // For directories this is populated from the scanned subtree; for files
+            // it is always 1. The tilde signals it is an estimate, not the final plan.
+            let estimate_line = target.num_descendants.map(|n| {
+                let label = if n == 1 { "entry" } else { "entries" };
+                format!("~{n} {label} expected")
+            });
             let key_line = if enter_armed {
                 String::from("[Esc] disarm and cancel")
             } else if armable {
@@ -192,14 +202,18 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
             } else {
                 String::from("[Esc] cancel")
             };
-            vec![
+            let mut lines = vec![
                 Line::from(""),
                 Line::from(display_path_end(&target.full_path(), width)),
                 Line::from(""),
                 Line::from(status_line),
-                Line::from(""),
-                Line::from(key_line),
-            ]
+            ];
+            if let Some(estimate) = estimate_line {
+                lines.push(Line::from(estimate));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(key_line));
+            lines
         }
         DeletionView::Confirm {
             plan,
@@ -250,22 +264,25 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
         }
         DeletionView::Deleting {
             planned_entries,
+            completed,
             stopping: false,
         } => vec![
             Line::from(""),
-            Line::from(format!("Executing {planned_entries} planned identities.")),
-            Line::from("Every entry is revalidated immediately before mutation."),
+            Line::from(format!(
+                "{completed} of {planned_entries} {separator} revalidated before each mutation"
+            )),
             Line::from("New and changed entries are never swept."),
             Line::from(""),
             Line::from("[Esc/q] interruption options"),
         ],
         DeletionView::Deleting {
             planned_entries,
+            completed,
             stopping: true,
         } => vec![
             Line::from(""),
             Line::from(format!(
-                "Stopping after current entry… {planned_entries} planned."
+                "Stopping after current entry… {completed} of {planned_entries}."
             )),
             Line::from("No further entry will start."),
             Line::from("Waiting for the active identity mutation to finish."),
@@ -349,6 +366,7 @@ mod tests {
         let lines = lines(
             DeletionView::Deleting {
                 planned_entries: 12,
+                completed: 7,
                 stopping: true,
             },
             78,
