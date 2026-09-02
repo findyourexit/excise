@@ -36,7 +36,7 @@ The approved `0.2.0` publication used:
 
 ## The 0.3.0 Early-Testing Release
 
-The `0.3.0` release packaged the private Rust API boundary and compatibility-policy work described in the changelog. It was a breaking minor release because provisional Rust module paths were removed from the default public surface. Its destructive behavior was provisional, and its publication record is historical and immutable. The active candidate, verification, and promotion procedure below targets `1.0.0`.
+The `0.3.0` release packaged the private Rust API boundary and compatibility-policy work described in the changelog. It was a breaking minor release because provisional Rust module paths were removed from the default public surface. Its destructive behavior was provisional, and its publication record is historical and immutable. The active candidate, verification, and promotion procedure below applies to the stable v1 line.
 
 ## The 1.0.0 Stable Release
 
@@ -132,6 +132,8 @@ The manually dispatched `Release candidate artifacts` workflow in `.github/workf
 ```console
 set -euo pipefail
 source_sha="$(git rev-parse HEAD)"
+version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+test -n "$version"
 candidate_dir="$(mktemp -d "${TMPDIR:-/tmp}/excise-candidate.XXXXXX")"
 trap "$(printf 'rm -rf -- %q' "$candidate_dir")" EXIT
 dispatch_seed="$(date -u +%s)-$$-$RANDOM"
@@ -140,7 +142,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   dispatch_id="$(printf '%s' "$dispatch_seed" | shasum -a 256 | cut -c1-32)"
 fi
-run_url="$(gh workflow run release.yml --repo findyourexit/excise --ref main --field version=1.0.0 --field source_sha="$source_sha" --field dispatch_id="$dispatch_id")"
+run_url="$(gh workflow run release.yml --repo findyourexit/excise --ref main --field version="$version" --field source_sha="$source_sha" --field dispatch_id="$dispatch_id")"
 run_id="${run_url##*/}"
 if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
   run_id="$(
@@ -201,7 +203,7 @@ The candidate contains six immutable target archives, `checksums.sha256`, and `e
   fi
   jq -e '.packages | length > 1' excise.spdx.json
   jq -e '.packages[] | select(.name == "serde")' excise.spdx.json
-  jq -e --arg version 1.0.0 '([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)' excise.spdx.json
+  jq -e --arg version "$version" '([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)' excise.spdx.json
   for archive in excise-*.tar.gz; do tar -tzf "$archive" >/dev/null; done
   for archive in excise-*.zip; do unzip -t "$archive" >/dev/null; done
   for subject in excise-*.tar.gz excise-*.zip checksums.sha256 excise.spdx.json; do
@@ -220,11 +222,11 @@ Confirm that every archive contains its target binary, `LICENSE`, `generated/man
 
 Only after the candidate bundle passes every verification, create the immutable release tag from the reviewed source checkout. The tag must be annotated, point to the candidate's exact source SHA, and carry the successful candidate workflow run ID in a message formatted as `candidate-run-id: $run_id`.
 
-For the current `1.1.0` release, use the `source_sha` and `run_id` captured in the hosted-candidate step, then push the tag that triggers the release workflow:
+Use the `version`, `source_sha`, and `run_id` captured in the hosted-candidate step, then push the tag that triggers the release workflow:
 
 ```console
-cargo create-release-tag 1.1.0 "$source_sha" "$run_id"
-git push origin v1.1.0
+cargo create-release-tag "$version" "$source_sha" "$run_id"
+git push origin "v$version"
 ```
 
 Do **not** use `gh release create` to create this tag: it creates a lightweight tag, which fails the release-validation gate before publication.
@@ -258,19 +260,19 @@ The crates.io package follows the release commit's Cargo exclusions (`.cargo`, `
 
 ## Nix & cargo-binstall Verification
 
-The tagged Nix flake is a source-build channel, while cargo-binstall downloads target-specific release archives. Verify the channels independently:
+With `version` set to the published manifest version, verify the tagged Nix flake and cargo-binstall archive independently:
 
 ```console
-nix flake check github:findyourexit/excise/v1.0.0
-nix eval --raw "github:findyourexit/excise/v1.0.0#packages.$(nix eval --raw --impure --expr builtins.currentSystem).default.version"
-nix run github:findyourexit/excise/v1.0.0 -- --version
-nix run github:findyourexit/excise/v1.0.0 -- --format table /path/to/inspect
+nix flake check "github:findyourexit/excise/v${version}"
+nix eval --raw "github:findyourexit/excise/v${version}#packages.$(nix eval --raw --impure --expr builtins.currentSystem).default.version"
+nix run "github:findyourexit/excise/v${version}" -- --version
+nix run "github:findyourexit/excise/v${version}" -- --format table /path/to/inspect
 (
   set -euo pipefail
   binstall_dir="$(mktemp -d "${TMPDIR:-/tmp}/excise-binstall.XXXXXX")"
   readonly binstall_dir
   trap 'rm -rf -- "$binstall_dir"' EXIT
-  cargo binstall --no-confirm --force --install-path "$binstall_dir" --version 1.0.0 excise
+  cargo binstall --no-confirm --force --install-path "$binstall_dir" --version "$version" excise
   "$binstall_dir/excise" --version
 )
 ```
@@ -292,7 +294,7 @@ brew info findyourexit/tap/excise
 excise --version
 ```
 
-`brew fetch` checks the formula's archive URL and SHA-256. `brew audit` checks formula policy. `brew test` runs the formula's version and JSON scan smoke checks. `brew info` confirms the selected version and tap. Also inspect the rendered formula with `brew cat findyourexit/tap/excise`. Every URL must be a `releases/download/v1.0.0/` asset and every checksum must match `checksums.sha256`. The source formula in `packaging/homebrew-core/excise.rb.in` has different build semantics and must not be used as evidence that Homebrew Core has accepted the package.
+`brew fetch` checks the formula's archive URL and SHA-256. `brew audit` checks formula policy. `brew test` runs the formula's version and JSON scan smoke checks. `brew info` confirms the selected version and tap. Also inspect the rendered formula with `brew cat findyourexit/tap/excise`. Every URL must be a `releases/download/v${version}/` asset and every checksum must match `checksums.sha256`. The source formula in `packaging/homebrew-core/excise.rb.in` has different build semantics and must not be used as evidence that Homebrew Core has accepted the package.
 
 ## Credentials & Approvals
 
@@ -320,7 +322,7 @@ gh workflow run release.yml \
   --field version="$version" \
   --field source_sha="$source_sha" \
   --field dispatch_id="$recovery_id" \
-  --field tag=v1.0.0 \
+  --field tag="v$version" \
   --field candidate_run_id="$run_id"
 ```
 
