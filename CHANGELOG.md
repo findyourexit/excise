@@ -4,6 +4,12 @@ All notable Excise changes are documented here. The format follows [Keep a Chang
 
 Excise preserves the historical Diskonaut changelog below. Diskonaut versions and tags are not Excise releases.
 
+## [1.2.1] - 2026-09-02
+
+### Fixed
+
+* The tagged Nix flake now derives its package version from `Cargo.toml`. The immutable `v1.2.0` flake built the correct executable but exposed `1.0.0`; this corrective release exposes `1.2.1`.
+
 ## [1.2.0] - 2026-09-02
 
 ### Changed

@@ -4,18 +4,19 @@ Excise permanently deletes files and folders. Data-loss defects are therefore se
 
 ## Supported Versions
 
-Excise supports the latest stable release, currently `1.2.0`. The `0.3.x` line was early testing and is superseded. Report safety defects against the affected stable release or development commit. Do not trust superseded releases with irreplaceable data.
+Excise supports the latest stable release, currently `1.2.1`. The `0.3.x` line was early testing and is superseded. Report safety defects against the affected stable release or development commit. Do not trust superseded releases with irreplaceable data.
 
 | Version | Status |
 |---|---|
-| `1.2.0` | Supported stable line |
-| `1.1.x` | Superseded stable releases. Upgrade to `1.2.0`. |
-| `1.0.x` | Superseded stable releases. Upgrade to `1.2.0`. |
-| `0.3.0` | Superseded early testing. Upgrade to `1.2.0`. |
-| `0.2.0` | Superseded early testing. Upgrade to `1.2.0`. |
-| `0.1.2` | Superseded early testing. Upgrade to `1.2.0`. |
-| `0.1.1` | Superseded early testing. Upgrade to `1.2.0`. |
-| `0.1.0` | Superseded early testing. Upgrade to `1.2.0`. |
+| `1.2.1` | Supported stable line |
+| `1.2.0` | Superseded release. Upgrade to `1.2.1`. |
+| `1.1.x` | Superseded stable releases. Upgrade to `1.2.1`. |
+| `1.0.x` | Superseded stable releases. Upgrade to `1.2.1`. |
+| `0.3.0` | Superseded early testing. Upgrade to `1.2.1`. |
+| `0.2.0` | Superseded early testing. Upgrade to `1.2.1`. |
+| `0.1.2` | Superseded early testing. Upgrade to `1.2.1`. |
+| `0.1.1` | Superseded early testing. Upgrade to `1.2.1`. |
+| `0.1.0` | Superseded early testing. Upgrade to `1.2.1`. |
 | `main` | Development only |
 
 ## Report Privately

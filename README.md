@@ -33,7 +33,7 @@ It is an independent fork and spiritual successor to [Diskonaut](https://github.
 ```console
 brew tap findyourexit/tap
 brew install findyourexit/tap/excise
-excise --version  # excise 1.2.0
+excise --version  # excise 1.2.1
 ```
 
 </details>
@@ -42,8 +42,8 @@ excise --version  # excise 1.2.0
 <summary><strong>crates.io</strong></summary>
 
 ```console
-cargo install excise --version 1.2.0 --locked
-excise --version  # excise 1.2.0
+cargo install excise --version 1.2.1 --locked
+excise --version  # excise 1.2.1
 ```
 
 </details>
@@ -51,7 +51,7 @@ excise --version  # excise 1.2.0
 <details>
 <summary><strong>Pre-built Binaries</strong></summary>
 
-Download the [v1.2.0 release](https://github.com/findyourexit/excise/releases/tag/v1.2.0) for macOS, Linux, and Windows on Apple silicon, Intel, or Arm systems.
+Download the [v1.2.1 release](https://github.com/findyourexit/excise/releases/tag/v1.2.1) for macOS, Linux, and Windows on Apple silicon, Intel, or Arm systems.
 
 Only x86_64 Linux, AArch64 macOS, and x86_64 Windows have full platform support because they are tested on those platforms. The other archives are build-only and best effort. See the [Support Policy](SUPPORT.md).
 
@@ -61,7 +61,7 @@ Only x86_64 Linux, AArch64 macOS, and x86_64 Windows have full platform support 
 <summary><strong>Build From Source</strong></summary>
 
 ```console
-git clone --branch v1.2.0 --depth 1 https://github.com/findyourexit/excise.git
+git clone --branch v1.2.1 --depth 1 https://github.com/findyourexit/excise.git
 cd excise
 cargo install --path . --locked
 excise --version
@@ -70,7 +70,7 @@ excise --version
 Nix users can run the tagged release without changing its lock file:
 
 ```console
-nix run github:findyourexit/excise/v1.2.0 -- --format table /path/to/inspect
+nix run github:findyourexit/excise/v1.2.1 -- --format table /path/to/inspect
 ```
 
 </details>
