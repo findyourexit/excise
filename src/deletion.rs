@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use cap_primitives::ambient_authority;
@@ -541,7 +541,7 @@ pub fn execute_plan(
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
 ) -> DeletionReport {
-    execute_plan_windows(scan_root, plan, soft_cancelled, hard_cancelled)
+    execute_plan_windows(scan_root, plan, soft_cancelled, hard_cancelled, None)
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
@@ -556,6 +556,53 @@ pub fn execute_plan(
         plan,
         "permanent deletion is unavailable on this target",
     )
+}
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub(crate) fn execute_plan_counted(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    soft_cancelled: &AtomicBool,
+    hard_cancelled: &AtomicBool,
+    progress: &AtomicU64,
+) -> DeletionReport {
+    execute_plan_unix_with_hooks(
+        scan_root,
+        plan,
+        soft_cancelled,
+        hard_cancelled,
+        || {},
+        |_| {
+            progress.fetch_add(1, Ordering::Relaxed);
+        },
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn execute_plan_counted(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    soft_cancelled: &AtomicBool,
+    hard_cancelled: &AtomicBool,
+    progress: &AtomicU64,
+) -> DeletionReport {
+    execute_plan_windows(
+        scan_root,
+        plan,
+        soft_cancelled,
+        hard_cancelled,
+        Some(progress),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
+pub(crate) fn execute_plan_counted(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    soft_cancelled: &AtomicBool,
+    hard_cancelled: &AtomicBool,
+    _progress: &AtomicU64,
+) -> DeletionReport {
+    execute_plan(scan_root, plan, soft_cancelled, hard_cancelled)
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -854,6 +901,7 @@ fn execute_plan_windows(
     plan: DeletionPlan,
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
+    progress: Option<&AtomicU64>,
 ) -> DeletionReport {
     let root = match open_root(scan_root, &plan.scan_root_identity) {
         Ok(root) => root,
@@ -886,6 +934,9 @@ fn execute_plan_windows(
                 .entry(file_id)
                 .and_modify(|count| *count = count.saturating_add(1))
                 .or_insert(1);
+        }
+        if let Some(p) = progress {
+            p.fetch_add(1, Ordering::Relaxed);
         }
         results.push(DeletionEntryResult { entry, outcome });
     }
@@ -1342,11 +1393,7 @@ fn challenge_for(
     if reduced_guardrails {
         return ConfirmationChallenge::ReducedGuard;
     }
-    if snapshot.kind == PlannedKind::Directory {
-        ConfirmationChallenge::TypeName(name.text)
-    } else {
-        ConfirmationChallenge::ConfirmFile
-    }
+    ConfirmationChallenge::ConfirmFile
 }
 
 fn challenge_code(file_id: &FileId) -> String {
@@ -2122,7 +2169,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_directory_and_reduced_guardrails_use_distinct_challenges() {
+    fn directory_uses_confirm_file_and_reduced_guardrails_uses_reduced_guard() {
         let root = tempfile::tempdir().expect("deletion root should exist");
         let path = root.path().join("target");
         std::fs::create_dir(&path).expect("target directory should be created");
@@ -2131,10 +2178,7 @@ mod tests {
             build_plan(root.path(), reviewed.clone(), false).expect("guarded plan should build");
         let reduced = build_plan(root.path(), reviewed, true).expect("reduced plan should build");
 
-        assert_eq!(
-            guarded.challenge,
-            ConfirmationChallenge::TypeName("target".to_string())
-        );
+        assert_eq!(guarded.challenge, ConfirmationChallenge::ConfirmFile);
         assert_eq!(reduced.challenge, ConfirmationChallenge::ReducedGuard);
     }
 

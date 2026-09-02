@@ -20,6 +20,7 @@ use crate::animation::AnimationScheduler;
 use crate::config::{CustomKeyBindings, KeyPreset, SafePreferences, save_safe_preferences};
 use crate::error::{AppError, ExitClass};
 use crate::input::{InputCommand, InputEvent, InputSource, handle_keypress};
+use crate::model::NodeKind;
 use crate::native_path::{
     DECEPTIVE_DISPLAY_MARKER, NativeIdentity, safe_display_path_text, safe_display_text,
 };
@@ -264,8 +265,9 @@ where
             }
             InputEvent::Terminal(event) => {
                 let command = handle_keypress(&event, &mut self.app);
+                let is_drill = matches!(command, InputCommand::Drill);
                 self.handle_input_command(command)?;
-                Ok(false)
+                Ok(is_drill)
             }
         }
     }
@@ -274,7 +276,7 @@ where
     fn handle_input_command(&mut self, command: InputCommand) -> Result<(), AppError> {
         let now = self.clock.now();
         match command {
-            InputCommand::Navigation => {
+            InputCommand::Drill | InputCommand::Navigation => {
                 if self.app.ui_mode.allows_motion() {
                     self.app.mark_dirty();
                 }
@@ -320,7 +322,16 @@ where
                     return Ok(());
                 }
                 let reduced_guardrails = self.app.reduced_deletion_guardrails();
-                let maximum_bytes = self.app.maximum_deletion_plan_bytes();
+                // Directories use a live filesystem walk for planning (no reviewed_entries)
+                // and their post-deletion history is already guarded by try_complete_deletion.
+                // Capping directory plans at maximum_deletion_plan_bytes() is unnecessary and
+                // causes a hard stop for large directories. Files/links keep the cap so the
+                // history budget remains predictable.
+                let maximum_bytes = if target.expected_snapshot.kind == NodeKind::Directory {
+                    usize::MAX
+                } else {
+                    self.app.maximum_deletion_plan_bytes()
+                };
                 self.workers()?
                     .request_deletion_plan(target, reduced_guardrails, maximum_bytes)?;
                 self.deletion_active = true;
@@ -625,7 +636,10 @@ where
                 self.deletion_active = false;
                 match result {
                     Ok(plan) => {
-                        self.workers()?.execute_deletion(*plan)?;
+                        let progress = self.app.deletion_progress_counter().unwrap_or_else(|| {
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))
+                        });
+                        self.workers()?.execute_deletion(*plan, progress)?;
                         self.deletion_active = true;
                     }
                     Err((_plan, error)) if error.is_cancelled() => {
