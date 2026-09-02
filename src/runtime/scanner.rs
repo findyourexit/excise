@@ -17,7 +17,10 @@ use super::worker::{ScannedEntry, WorkerEvent, send_event};
 use crate::model::UnscannedReason;
 use crate::native_path::{EncodedNativePath, NativeIdentity, NativePath, identity_for};
 
-const BATCH_SIZE: usize = 128;
+// The owner stages each batch and applies one entry per input poll. Keep batches
+// bounded so backpressure stays small while the map is navigating.
+const BATCH_SIZE: usize = 32;
+
 const TASK_QUEUE_PER_WORKER: usize = 8;
 const MAX_SPILLED_TASK_BYTES: usize = 1024 * 1024;
 const SPILL_LENGTH_BYTES: u64 = 8;

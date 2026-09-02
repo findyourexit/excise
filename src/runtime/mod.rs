@@ -2,6 +2,7 @@ mod clock;
 mod scanner;
 mod worker;
 
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,7 +14,7 @@ use ratatui::backend::Backend;
 #[cfg(any(test, feature = "fuzzing", feature = "internal"))]
 pub use clock::VirtualClock;
 pub(crate) use clock::{Clock, SystemClock};
-use worker::{WorkerEvent, WorkerPool};
+use worker::{ScannedEntry, WorkerEvent, WorkerPool};
 
 use crate::App;
 use crate::animation::AnimationScheduler;
@@ -34,7 +35,6 @@ const IDLE_INPUT_WAIT: Duration = Duration::from_secs(60 * 60);
 const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const TRANSIENT_STATUS_DURATION: Duration = Duration::from_millis(250);
 const MAX_INPUT_BATCH: usize = 32;
-const MAX_WORKER_BATCH: usize = 128;
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -84,6 +84,12 @@ where
     settings: RuntimeSettings,
     summary: RunSummary,
     scan_active: bool,
+    /// Scan data relevant to the displayed folder arrived since its last refresh.
+    scan_view_dirty: bool,
+    /// Folder whose incoming scan changes may refresh the visible map.
+    scan_view_root: PathBuf,
+    /// One scanner batch, drained a single model mutation at a time.
+    pending_scan_entries: VecDeque<ScannedEntry>,
     scan_cancelled: bool,
     rescan_active: bool,
     cancelled_while_scanning: bool,
@@ -127,6 +133,7 @@ where
         },
         settings.event_capacity,
     )?;
+    let scan_view_root = app.current_folder_path();
     let animation = AnimationScheduler::new(settings.reduced_motion, settings.monochrome, now);
     OwnerLoop {
         app,
@@ -137,6 +144,9 @@ where
         settings,
         summary: RunSummary::default(),
         scan_active: true,
+        scan_view_dirty: false,
+        scan_view_root,
+        pending_scan_entries: VecDeque::new(),
         scan_cancelled: false,
         rescan_active: false,
         cancelled_while_scanning: false,
@@ -174,7 +184,13 @@ where
     fn run_loop(&mut self) -> Result<OperationOutcome<RunSummary>, AppError> {
         self.render()?;
         while self.app.is_running {
-            let mut did_work = self.process_input_batch()?;
+            let input_processed = self.process_input_batch()?;
+            let mut did_work = input_processed;
+            // A keystroke must be drawn before background work can spend another
+            // scheduling slice. This keeps cursor feedback independent of scan load.
+            if input_processed {
+                did_work |= self.render()?;
+            }
             if !self.app.is_running && self.scan_active {
                 self.cancelled_while_scanning = true;
             }
@@ -275,6 +291,7 @@ where
     #[allow(clippy::too_many_lines)]
     fn handle_input_command(&mut self, command: InputCommand) -> Result<(), AppError> {
         let now = self.clock.now();
+        let drilled = matches!(command, InputCommand::Drill);
         match command {
             InputCommand::Drill | InputCommand::Navigation => {
                 if self.app.ui_mode.allows_motion() {
@@ -435,6 +452,9 @@ where
             }
             InputCommand::HardCancel => self.hard_cancelled = true,
         }
+        if drilled {
+            self.scan_view_root = self.app.current_folder_path();
+        }
         if !self.app.ui_mode.allows_motion() {
             self.animation.cancel_all();
         }
@@ -442,45 +462,63 @@ where
     }
 
     fn process_worker_batch(&mut self) -> Result<bool, AppError> {
-        let mut processed = false;
-        for _ in 0..MAX_WORKER_BATCH {
-            let event = match self.workers()?.events().try_recv() {
-                Ok(event) => event,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if self.scan_active || self.deletion_active {
-                        return Err(AppError::Worker(
-                            "worker event channel disconnected".to_string(),
-                        ));
-                    }
-                    break;
-                }
-            };
-            self.handle_worker_event(event)?;
-            processed = true;
+        // A drill owns the frame clock until its geometry settles. Let the bounded
+        // channel apply backpressure instead of letting scan mutations skip frames.
+        if self.app.map_is_transitioning() || self.input.poll(Duration::ZERO)? {
+            return Ok(false);
         }
-        Ok(processed)
+        if self.process_pending_scan_entry()? {
+            return Ok(true);
+        }
+        let event = match self.workers()?.events().try_recv() {
+            Ok(event) => event,
+            Err(TryRecvError::Empty) => return Ok(false),
+            Err(TryRecvError::Disconnected) => {
+                if self.scan_active || self.deletion_active {
+                    return Err(AppError::Worker(
+                        "worker event channel disconnected".to_string(),
+                    ));
+                }
+                return Ok(false);
+            }
+        };
+        self.handle_worker_event(event)?;
+        Ok(true)
+    }
+
+    fn process_pending_scan_entry(&mut self) -> Result<bool, AppError> {
+        let Some(entry) = self.pending_scan_entries.pop_front() else {
+            return Ok(false);
+        };
+        self.handle_scan_entry(entry)?;
+        Ok(true)
+    }
+
+    fn handle_scan_entry(&mut self, entry: ScannedEntry) -> Result<(), AppError> {
+        self.scan_view_dirty |= !self.rescan_active && entry.path.starts_with(&self.scan_view_root);
+        self.summary.scanned_entries = self.summary.scanned_entries.saturating_add(1);
+        self.app
+            .add_entry_to_base_folder(&entry.metadata, entry.path, entry.identity)?;
+        self.summary.identified_entries =
+            u64::try_from(self.app.identity_count()).unwrap_or(u64::MAX);
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
     fn handle_worker_event(&mut self, event: WorkerEvent) -> Result<(), AppError> {
         match event {
             WorkerEvent::ScanBatch { entries } => {
-                self.summary.scanned_entries += entries.len() as u64;
-                for entry in entries {
-                    self.app.add_entry_to_base_folder(
-                        &entry.metadata,
-                        entry.path,
-                        entry.identity,
-                    )?;
-                }
-                self.summary.identified_entries =
-                    u64::try_from(self.app.identity_count()).unwrap_or(u64::MAX);
+                debug_assert!(self.pending_scan_entries.is_empty());
+                self.pending_scan_entries.extend(entries);
             }
             WorkerEvent::ScanDirectoryComplete { path, identity } => {
+                self.scan_view_dirty |=
+                    !self.rescan_active && path.starts_with(&self.scan_view_root);
                 self.app.complete_directory(&path, identity.as_ref())?;
             }
             WorkerEvent::ScanUnscanned { path, reason } => {
+                self.scan_view_dirty |=
+                    !self.rescan_active && path.starts_with(&self.scan_view_root);
                 self.summary.unscanned_entries += 1;
                 self.summary.last_unscanned_path = Some(safe_display_path_text(&path));
                 self.summary.last_unscanned_reason = Some(display_reason(&reason));
@@ -507,6 +545,10 @@ where
                 self.app.record_unscanned(&path, reason)?;
             }
             WorkerEvent::ScanFailed { path, message } => {
+                self.scan_view_dirty |= !self.rescan_active
+                    && path
+                        .as_deref()
+                        .is_some_and(|path| path.starts_with(&self.scan_view_root));
                 let message = safe_display_text(&message);
                 self.summary.unscanned_entries += 1;
                 self.summary.unreadable_entries += 1;
@@ -525,6 +567,7 @@ where
             }
             WorkerEvent::ScanFinished { cancelled } => {
                 self.scan_active = false;
+                self.scan_view_dirty = false;
                 if self.rescan_active {
                     self.rescan_active = false;
                     if cancelled {
@@ -722,6 +765,7 @@ where
         })?;
         self.scan_active = true;
         self.rescan_active = true;
+        self.scan_view_dirty = false;
         self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
         Ok(())
     }
@@ -745,7 +789,9 @@ where
 
         if self.settings.animate_loading && self.scan_active && now >= self.next_loading_frame {
             self.app.increment_loading_progress_indicator();
-            self.app.render_and_update_board();
+            if self.scan_view_dirty && self.app.refresh_board_from_scan() {
+                self.scan_view_dirty = false;
+            }
             self.next_loading_frame = now.saturating_add(LOADING_FRAME_INTERVAL);
             processed = true;
         }
@@ -821,10 +867,13 @@ where
 
     fn wait_for_quiescence(&mut self) -> Result<(), AppError> {
         while self.scan_active || self.deletion_active {
+            if self.process_pending_scan_entry()? {
+                self.render()?;
+                continue;
+            }
             match self.workers()?.events().recv_timeout(WORKER_POLL_INTERVAL) {
                 Ok(event) => {
                     self.handle_worker_event(event)?;
-                    self.process_worker_batch()?;
                     self.render()?;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -1036,6 +1085,253 @@ pub const fn outcome_exit_class(outcome: &OperationOutcome<RunSummary>) -> ExitC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+
+    struct PendingInput;
+
+    impl InputSource for PendingInput {
+        fn poll(&mut self, _timeout: Duration) -> Result<bool, AppError> {
+            Ok(true)
+        }
+
+        fn read(&mut self) -> Result<InputEvent, AppError> {
+            panic!("pending input must not be read while processing worker events");
+        }
+    }
+
+    struct InputAfterFirstPoll {
+        polls: u8,
+    }
+
+    impl InputSource for InputAfterFirstPoll {
+        fn poll(&mut self, _timeout: Duration) -> Result<bool, AppError> {
+            let pending = self.polls > 0;
+            self.polls = self.polls.saturating_add(1);
+            Ok(pending)
+        }
+
+        fn read(&mut self) -> Result<InputEvent, AppError> {
+            panic!("input must only be observed while processing worker events");
+        }
+    }
+
+    #[test]
+    fn pending_input_yields_before_a_scan_batch() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let entry = root.path().join("entry");
+        std::fs::write(&entry, b"x").expect("test entry should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let scan_view_root = app.current_folder_path();
+        let workers = WorkerPool::start(
+            scanner::ScannerOptions {
+                root: root.path().to_path_buf(),
+                root_identity: Some(root_identity.clone()),
+                threads: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                internal_paths: app.internal_scan_paths(),
+            },
+            1,
+        )
+        .expect("workers should start");
+        let mut owner = OwnerLoop {
+            app,
+            input: Box::new(PendingInput),
+            workers: Some(workers),
+            clock: Box::new(VirtualClock::new()),
+            animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            settings: RuntimeSettings {
+                root: root.path().to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: true,
+                monochrome: true,
+                animate_loading: false,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: true,
+            },
+            summary: RunSummary::default(),
+            scan_active: true,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            rescan_active: false,
+            cancelled_while_scanning: false,
+            hard_cancelled: false,
+            deletion_active: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: Duration::ZERO,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while owner
+            .workers
+            .as_ref()
+            .is_some_and(|workers| workers.events().is_empty())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scanner never queued its first event"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let processed = owner
+            .process_worker_batch()
+            .expect("worker batch should yield cleanly");
+        let scanned_entries = owner.summary.scanned_entries;
+        owner
+            .workers
+            .take()
+            .expect("workers should still be owned")
+            .shutdown()
+            .expect("workers should shut down");
+
+        assert!(!processed, "queued input must preempt scan work");
+        assert_eq!(scanned_entries, 0);
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the preemption regression constructs an isolated owner loop and its scan batch"
+    )]
+    #[test]
+    fn pending_input_interrupts_a_scan_batch_between_entries() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::write(&first, b"a").expect("first test entry should be created");
+        std::fs::write(&second, b"b").expect("second test entry should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let scan_view_root = app.current_folder_path();
+        let first_metadata =
+            std::fs::symlink_metadata(&first).expect("first test metadata should exist");
+        let first_identity = crate::native_path::identity_for(&first, &first_metadata)
+            .expect("first test identity should be readable")
+            .expect("first test entry should not be a link");
+        let second_metadata =
+            std::fs::symlink_metadata(&second).expect("second test metadata should exist");
+        let second_identity = crate::native_path::identity_for(&second, &second_metadata)
+            .expect("second test identity should be readable")
+            .expect("second test entry should not be a link");
+        let mut owner = OwnerLoop {
+            app,
+            input: Box::new(InputAfterFirstPoll { polls: 0 }),
+            workers: None,
+            clock: Box::new(VirtualClock::new()),
+            animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            settings: RuntimeSettings {
+                root: root.path().to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: true,
+                monochrome: true,
+                animate_loading: false,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: true,
+            },
+            summary: RunSummary::default(),
+            scan_active: true,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            rescan_active: false,
+            cancelled_while_scanning: false,
+            hard_cancelled: false,
+            deletion_active: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: Duration::ZERO,
+        };
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanBatch {
+                entries: vec![
+                    ScannedEntry {
+                        metadata: first_metadata,
+                        path: first,
+                        identity: first_identity,
+                    },
+                    ScannedEntry {
+                        metadata: second_metadata,
+                        path: second,
+                        identity: second_identity,
+                    },
+                ],
+            })
+            .expect("scan batch should be staged");
+        assert_eq!(owner.summary.scanned_entries, 0);
+        assert_eq!(owner.pending_scan_entries.len(), 2);
+
+        assert!(
+            owner
+                .process_worker_batch()
+                .expect("first scan entry should be processed")
+        );
+        assert_eq!(owner.summary.scanned_entries, 1);
+        assert_eq!(owner.pending_scan_entries.len(), 1);
+        assert!(
+            !owner
+                .process_worker_batch()
+                .expect("pending input should preempt the second scan entry")
+        );
+        assert_eq!(owner.summary.scanned_entries, 1);
+        assert_eq!(owner.pending_scan_entries.len(), 1);
+    }
 
     #[test]
     fn export_notice_preserves_deceptive_path_marker() {

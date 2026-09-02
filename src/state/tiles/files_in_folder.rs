@@ -10,7 +10,7 @@ pub enum FileType {
     Synthetic,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileMetadata {
     pub node_id: NodeId,
     pub name: OsString,
