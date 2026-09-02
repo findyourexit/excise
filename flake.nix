@@ -16,7 +16,7 @@
         let pkgs = nixpkgs.legacyPackages.${system};
         in pkgs.rustPlatform.buildRustPackage {
           pname = "excise";
-          version = "1.0.0";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
           src = pkgs.lib.cleanSource self;
           cargoLock.lockFile = ./Cargo.lock;
           preCheck = ''

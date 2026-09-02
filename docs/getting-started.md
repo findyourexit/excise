@@ -42,12 +42,12 @@ nix build
 ./result/bin/excise /path/to/inspect
 ```
 
-## Install 1.2.0 From A Release Channel
+## Install 1.2.1 From A Release Channel
 
-The `1.2.0` package is published on crates.io and can also be built locally. It is not one of the pre-built GitHub archives:
+The `1.2.1` package is published on crates.io and can also be built locally. It is not one of the pre-built GitHub archives:
 
 ```console
-cargo install excise --version 1.2.0 --locked
+cargo install excise --version 1.2.1 --locked
 excise --version
 ```
 
@@ -100,7 +100,7 @@ The interactive interface requires standard input and output connected to a term
 
 ### Current Map Behavior
 
-The dense half-block map, animated focus border, heat ramp, overflow summary, and directed map transitions are included in the stable release. Build the current source or install `1.2.0` to use them.
+The dense half-block map, animated focus border, heat ramp, overflow summary, and directed map transitions are included in the stable release. Build the current source or install `1.2.1` to use them.
 
 The interactive view uses a dense map and animated focus border on capable terminals. `--ascii`, monochrome mode, and reduced motion preserve the same selection, scope, and deletion information when visual effects are unavailable or undesirable.
 
