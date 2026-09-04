@@ -661,7 +661,11 @@ impl Arena {
             }
             return Ok(());
         }
-        if self.path_is_aggregated(path) {
+        // Scanner tasks may finish after this path was compacted or evicted to
+        // make room for a later batch. Completion only updates a retained,
+        // scanning directory, so an in-root late completion is deliberately a
+        // no-op rather than a whole-scan model failure.
+        if path.starts_with(&self.root_path) {
             return Ok(());
         }
         Err(ModelError::InvalidPath(path.to_string_lossy().into_owned()))
@@ -2331,29 +2335,6 @@ impl Arena {
             current = self.find_child(current, component)?;
         }
         Some(current)
-    }
-
-    fn path_is_aggregated(&self, path: &Path) -> bool {
-        let Ok(relative) = path.strip_prefix(&self.root_path) else {
-            return false;
-        };
-        let mut current = self.root;
-        for component in relative {
-            if self
-                .node(current)
-                .is_some_and(|node| node.kind.is_synthetic())
-            {
-                return true;
-            }
-            let Some(next) = self.find_child(current, component) else {
-                return self.children(current).iter().any(|id| {
-                    self.node(*id)
-                        .is_some_and(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Other))
-                });
-            };
-            current = next;
-        }
-        false
     }
 
     fn push_child(&mut self, parent: NodeId, child: NodeId) -> Result<(), ModelError> {
