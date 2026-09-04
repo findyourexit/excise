@@ -463,16 +463,26 @@ impl Arena {
                 self.remove_nodes_with_accounting(removed)?;
             } else {
                 let unknown = matches!(reason, UnscannedReason::Metadata(_));
-                if let Some(node) = self.node_mut(existing) {
-                    node.state = unscanned_state(&reason);
-                    node.unscanned_reason = Some(reason);
-                    if scoped_zero {
-                        node.metrics = NodeMetrics::default();
-                    } else if unknown {
-                        node.metrics.allocated_bytes.upper = None;
-                        node.metrics.reclaimable_bytes.upper = None;
-                    }
+                let state = unscanned_state(&reason);
+                let mut metrics =
+                    self.node(existing)
+                        .map(|node| node.metrics)
+                        .ok_or_else(|| {
+                            ModelError::Invariant("unscanned node disappeared".to_string())
+                        })?;
+                if scoped_zero {
+                    metrics = NodeMetrics::default();
+                } else if unknown {
+                    metrics.allocated_bytes.upper = None;
+                    metrics.reclaimable_bytes.upper = None;
                 }
+                self.reserve_untracked_compaction_slot(existing, metrics)?;
+                let node = self.node_mut(existing).ok_or_else(|| {
+                    ModelError::Invariant("unscanned node disappeared".to_string())
+                })?;
+                node.state = state;
+                node.unscanned_reason = Some(reason);
+                node.metrics = metrics;
                 if scoped_zero {
                     self.rebuild_metrics();
                 }
@@ -534,7 +544,11 @@ impl Arena {
             let other = self.ensure_other(parent)?;
             self.aggregate_child_into_other(victim, other)?;
         }
+        let reserved_untracked = self.reserve_untracked_compaction_slot(parent, metrics)?;
         if self.reserve_child(parent, &name).is_err() {
+            if reserved_untracked {
+                self.remove_untracked_metrics(parent);
+            }
             let other = self.ensure_other(parent)?;
             self.accumulate_untracked_other(parent, other, metrics)?;
             return Ok(());
@@ -565,6 +579,14 @@ impl Arena {
         node.metrics = metrics;
         node.unscanned_reason = Some(reason);
         self.insert_node(id, node)?;
+        if reserved_untracked {
+            let reservation = self
+                .untracked_metrics
+                .remove(&parent)
+                .expect("untracked reservation should remain available");
+            let previous = self.untracked_metrics.insert(id, reservation);
+            debug_assert!(previous.is_none());
+        }
         self.lookup.insert((parent, name), id);
         self.push_child(parent, id)?;
         self.propagate_add(parent, metrics);
@@ -2065,6 +2087,25 @@ impl Arena {
             node.metrics.add(metrics);
             node.metrics.descendants = node.metrics.descendants.saturating_add(1);
         }
+    }
+    // A concrete unscanned node keeps its metrics until compaction. Reserving
+    // this slot before the hard limit lets compaction re-key it without a new
+    // allocation.
+    fn reserve_untracked_compaction_slot(
+        &mut self,
+        id: NodeId,
+        metrics: NodeMetrics,
+    ) -> Result<bool, ModelError> {
+        if id == self.root {
+            return Ok(false);
+        }
+        self.reserve_untracked_slot(
+            id,
+            UntrackedMetrics {
+                allocated_bytes: metrics.allocated_bytes,
+                reclaimable_bytes: metrics.reclaimable_bytes,
+            },
+        )
     }
 
     fn reserve_untracked_slot(
