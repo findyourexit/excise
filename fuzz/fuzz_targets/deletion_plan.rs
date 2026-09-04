@@ -98,7 +98,7 @@ fn exercise(data: &[u8]) -> Result<(), Box<dyn Error>> {
         maximum_bytes,
     );
     match (mode, result) {
-        (0, Ok(plan)) => {
+        (0 | 3, Ok(plan)) => {
             let soft = AtomicBool::new(data.get(2).is_some_and(|byte| byte & 1 != 0));
             let hard = AtomicBool::new(data.get(2).is_some_and(|byte| byte & 2 != 0));
             let report = execute_plan(root.path(), plan, &soft, &hard);
@@ -111,11 +111,10 @@ fn exercise(data: &[u8]) -> Result<(), Box<dyn Error>> {
             assert_eq!(classified as usize, report.entries.len());
             assert_eq!(report.precise, !hard.load(std::sync::atomic::Ordering::Acquire));
         }
-        (0, Err(DeletionPlanError::Changed)) => {
+        (0 | 3, Err(DeletionPlanError::Changed)) => {
             // Rejecting an inconsistent snapshot is a valid safety outcome.
         }
         (1 | 2, Err(DeletionPlanError::Changed)) => {}
-        (3, Err(DeletionPlanError::MemoryLimit { limit: 1 })) => {}
         (mode, result) => panic!("unexpected deletion plan result for mode {mode}: {result:?}"),
     }
     assert!(outside_file.exists());
