@@ -8,7 +8,7 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use excise::error::AppError;
 use excise::input::{InputEvent, InputSource};
-use excise::runtime::{RuntimeSettings, VirtualClock, run};
+use excise::runtime::{run, RuntimeSettings, VirtualClock};
 use libfuzzer_sys::fuzz_target;
 use ratatui::backend::TestBackend;
 
@@ -69,6 +69,7 @@ fuzz_target!(|data: &[u8]| {
         cross_filesystems: false,
         exclusions: Vec::new(),
         memory_mib: excise::model::DEFAULT_PROCESS_MIB,
+        temporary_storage_mib: 2,
         apparent_size: true,
         disable_delete_confirmation: false,
         reduced_motion: true,

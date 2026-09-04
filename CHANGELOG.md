@@ -6,11 +6,16 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-04
+
 ### Fixed
 
 * Scanner directory-task, identity, and directory-deletion-plan/result spill files now share a fixed per-session temporary-storage limit. Deletion plan and outcome records are authenticated with a process-private key and, on Windows, held in atomically created exclusive files outside the selected target; capacity or storage-read failures produce a safe incomplete outcome instead of an unbounded report, while an unretainable directory plan stops before confirmation without deleting an entry.
 * Scanner directory-completion events that arrive after model compaction now safely no-op instead of terminating a long root scan with an invalid-model-path error.
 * Full-system scans now release an exhausted private identity spill database and continue with explicit unknown physical-allocation and reclaimability bounds, instead of terminating after the bounded temporary-storage limit is reached.
+* Full-system scans no longer fail when compaction aggregates an unreadable entry at the configured model-memory limit; the aggregate reuses an already billed summary slot instead of requiring a new allocation.
+* Repeated hard-link observations are coalesced through compaction and remapping, keeping participant storage bounded while preserving exact link accounting.
+* Model-memory compaction preserves collapsed subtree and ancestor metrics incrementally instead of rebuilding global metrics for every cap-limited insertion retry.
 
 ## [1.2.1] - 2026-09-02
 

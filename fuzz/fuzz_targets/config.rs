@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use excise::config::{Cli, EnvironmentOverrides, RuntimeConfig, parse_file_config};
+use excise::config::{parse_file_config, Cli, EnvironmentOverrides, RuntimeConfig};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -17,6 +17,7 @@ fuzz_target!(|data: &[u8]| {
             cross_filesystems: false,
             exclusions: Vec::new(),
             memory_mib: None,
+            temporary_storage_mib: None,
             reduced_motion: false,
             theme: None,
             ascii: false,
