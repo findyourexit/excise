@@ -6,6 +6,12 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-09-04
+
+### Fixed
+
+* Directory-deletion-plan fuzz coverage now accepts the intended bounded temporary-storage spill path and replays its regression case.
+
 ## [1.2.2] - 2026-09-04
 
 ### Fixed
