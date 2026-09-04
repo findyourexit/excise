@@ -1262,6 +1262,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn late_directory_completion_after_model_eviction_is_ignored() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let evicted = root.path().join("evicted");
+        fs::create_dir(&evicted).expect("fixture directory should be created");
+        let metadata = fs::symlink_metadata(&evicted).expect("fixture metadata should exist");
+        let identity = identity_for(&evicted, &metadata)
+            .expect("fixture identity should be readable")
+            .expect("fixture should have an identity");
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            false,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &evicted);
+        assert!(
+            tree.arena
+                .try_remove_path(&evicted)
+                .expect("fixture eviction should rebuild identities")
+        );
+
+        tree.complete_directory(&evicted, Some(&identity))
+            .expect("late scanner completion below the scan root should be ignored");
+        assert!(tree.arena.path_ids(&evicted).is_none());
+    }
+
+    #[test]
+    fn directory_completion_outside_the_scan_root_remains_rejected() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let outside = tempfile::tempdir().expect("outside directory should exist");
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            false,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+
+        assert!(matches!(
+            tree.complete_directory(outside.path(), None),
+            Err(crate::model::ModelError::InvalidPath(_))
+        ));
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn partial_hard_link_deletion_rebuilds_identity_metrics() {
