@@ -661,7 +661,7 @@ impl Arena {
                 let mut participants = record
                     .nodes
                     .iter()
-                    .copied()
+                    .map(|(id, _)| *id)
                     .filter(|id| self.node(*id).is_some())
                     .collect::<Vec<_>>();
                 participants.sort_unstable();
@@ -2582,14 +2582,12 @@ fn remove_replaced_participants(
     let removed_links = record
         .nodes
         .iter()
-        .filter(|id| is_replaced_node(**id, target, removed))
-        .count();
+        .filter(|(id, _)| is_replaced_node(*id, target, removed))
+        .fold(0_u64, |total, (_, links)| total.saturating_add(*links));
     record
         .nodes
-        .retain(|id| !is_replaced_node(*id, target, removed));
-    record.observed_links = record
-        .observed_links
-        .saturating_sub(u64::try_from(removed_links).unwrap_or(u64::MAX));
+        .retain(|(id, _)| !is_replaced_node(*id, target, removed));
+    record.observed_links = record.observed_links.saturating_sub(removed_links);
     if record.nodes.is_empty() {
         return None;
     }
@@ -2597,7 +2595,7 @@ fn remove_replaced_participants(
         .allocation_node
         .is_some_and(|id| is_replaced_node(id, target, removed))
     {
-        record.allocation_node = record.nodes.first().copied();
+        record.allocation_node = record.nodes.first().map(|(id, _)| *id);
     }
     Some(record)
 }
@@ -2608,12 +2606,12 @@ fn remove_deleted_participants(
     let removed_links = record
         .nodes
         .iter()
-        .filter(|id| removed.binary_search(id).is_ok())
-        .count();
-    record.nodes.retain(|id| removed.binary_search(id).is_err());
-    record.observed_links = record
-        .observed_links
-        .saturating_sub(u64::try_from(removed_links).unwrap_or(u64::MAX));
+        .filter(|(id, _)| removed.binary_search(id).is_ok())
+        .fold(0_u64, |total, (_, links)| total.saturating_add(*links));
+    record
+        .nodes
+        .retain(|(id, _)| removed.binary_search(id).is_err());
+    record.observed_links = record.observed_links.saturating_sub(removed_links);
     if record.nodes.is_empty() {
         return None;
     }
@@ -2621,7 +2619,7 @@ fn remove_deleted_participants(
         .allocation_node
         .is_some_and(|id| removed.binary_search(&id).is_ok())
     {
-        record.allocation_node = record.nodes.first().copied();
+        record.allocation_node = record.nodes.first().map(|(id, _)| *id);
     }
     Some(record)
 }
@@ -2632,9 +2630,10 @@ fn remap_staged_record(
     stage_root: NodeId,
     target: NodeId,
 ) -> Result<(), ModelError> {
-    for id in &mut record.nodes {
+    for (id, _) in &mut record.nodes {
         *id = staged_live_id(nodes, stage_root, *id, target)?;
     }
+    record.coalesce_nodes();
     if let Some(id) = record.allocation_node {
         record.allocation_node = Some(staged_live_id(nodes, stage_root, id, target)?);
     }
@@ -2658,6 +2657,7 @@ fn merge_identity_record(
             existing.allocation_node = record.allocation_node;
         }
         existing.nodes.extend(record.nodes);
+        existing.coalesce_nodes();
         store.upsert_record(file_id, &existing)?;
     } else {
         store.upsert_record(file_id, &record)?;
@@ -3414,6 +3414,111 @@ mod tests {
                 .allocated_bytes,
             shared.metrics.allocated_bytes
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn spilled_fanout_hard_links_coalesce_remaps_and_delete_exactly() {
+        const COLD_LINKS: u64 = 128;
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cold = root.path().join("cold");
+        fs::create_dir(&cold).expect("cold directory should be created");
+        let first = cold.join("link-000");
+        fs::write(&first, b"payload").expect("fixture should be written");
+        let mut cold_links = vec![first.clone()];
+        for index in 1..COLD_LINKS {
+            let path = cold.join(format!("link-{index:03}"));
+            fs::hard_link(&first, &path).expect("hard link should be created");
+            cold_links.push(path);
+        }
+        let survivor = root.path().join("survivor");
+        fs::hard_link(&first, &survivor).expect("hard link should be created");
+        let metadata = fs::symlink_metadata(&first).expect("fixture metadata should be readable");
+        let file_id = identity_for(&first, &metadata)
+            .expect("fixture identity should be readable")
+            .expect("fixture should not be a symbolic link")
+            .file_id;
+
+        let mut arena = test_arena(root.path());
+        arena.identities = IdentityStore::new(1).expect("identity store should initialize");
+        let cold_id = add_path(&mut arena, &cold).expect("cold directory should be retained");
+        for path in &cold_links {
+            add_path(&mut arena, path).expect("cold hard link should be retained");
+        }
+        let survivor_id = add_path(&mut arena, &survivor).expect("survivor should be retained");
+        assert!(arena.identities.is_spilled());
+        assert!(
+            arena
+                .aggregate_cold_subtree(&HashSet::from([arena.root()]))
+                .expect("cold subtree should compact")
+        );
+
+        let record = arena
+            .identities
+            .get(&file_id)
+            .expect("identity lookup should succeed")
+            .expect("identity should remain");
+        assert_eq!(record.observed_links, COLD_LINKS + 1);
+        assert_eq!(record.nodes, vec![(cold_id, COLD_LINKS), (survivor_id, 1)]);
+        assert_eq!(record.allocation_node, Some(cold_id));
+
+        arena
+            .finalize()
+            .expect("hard links should finalize after compaction");
+        let shared = arena
+            .children(arena.root())
+            .iter()
+            .filter_map(|id| arena.node(*id))
+            .find(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Shared))
+            .expect("shared allocation should remain visible at the common ancestor");
+        let shared_allocation = shared.metrics.allocated_bytes;
+        assert_eq!(shared.parent, Some(arena.root()));
+        assert_eq!(
+            arena
+                .node(cold_id)
+                .expect("cold aggregate should remain")
+                .metrics
+                .allocated_bytes,
+            ByteBounds::exact(0)
+        );
+        assert_eq!(
+            arena
+                .node(survivor_id)
+                .expect("survivor should remain")
+                .metrics
+                .allocated_bytes,
+            ByteBounds::exact(0)
+        );
+
+        assert!(arena.remove_path(&cold));
+        let record = arena
+            .identities
+            .get(&file_id)
+            .expect("identity lookup should succeed")
+            .expect("surviving identity should remain");
+        assert_eq!(record.observed_links, 1);
+        assert_eq!(record.nodes, vec![(survivor_id, 1)]);
+        assert_eq!(record.allocation_node, Some(survivor_id));
+        assert_eq!(
+            arena
+                .node(survivor_id)
+                .expect("survivor should remain")
+                .metrics
+                .allocated_bytes,
+            shared_allocation
+        );
+        assert_eq!(
+            arena
+                .node(arena.root())
+                .expect("root should remain")
+                .metrics
+                .allocated_bytes,
+            shared_allocation
+        );
+        assert!(arena.children(arena.root()).iter().all(|id| {
+            arena
+                .node(*id)
+                .is_none_or(|node| node.kind != NodeKind::Synthetic(SyntheticKind::Shared))
+        }));
     }
 
     #[test]
