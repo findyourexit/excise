@@ -10,8 +10,10 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
 
 use crate::deletion::{
-    DeletionPlan, DeletionPlanError, DeletionReport, build_plan_cancellable,
-    build_plan_cancellable_with_root_identity, execute_plan_counted, revalidate_plan_cancellable,
+    DeletionPlan, DeletionPlanError, DeletionReport,
+    build_plan_cancellable_with_root_identity_and_temporary_storage,
+    build_plan_cancellable_with_temporary_storage, execute_plan_counted,
+    revalidate_plan_cancellable,
 };
 use crate::error::AppError;
 #[cfg(test)]
@@ -20,6 +22,7 @@ use crate::native_path::DECEPTIVE_DISPLAY_MARKER;
 use crate::native_path::safe_display_path_text;
 use crate::native_path::{NativeIdentity, safe_display_text};
 use crate::state::FileToDelete;
+use crate::temporary_storage::TemporaryStorage;
 
 use super::scanner::{self, ScannerOptions};
 
@@ -98,6 +101,7 @@ impl WorkerPool {
         let deletion_soft_cancelled = Arc::new(AtomicBool::new(false));
         let scan_root = scanner_options.root.clone();
         let scan_root_identity = scanner_options.root_identity.clone();
+        let temporary_storage = scanner_options.temporary_storage.clone();
 
         let scanner = scanner::spawn(scanner_options, event_sender.clone(), cancelled.clone())
             .map_err(|error| AppError::io("could not spawn scanner worker", error))?;
@@ -112,6 +116,7 @@ impl WorkerPool {
                 deletion_worker(
                     &scan_root,
                     scan_root_identity.as_ref(),
+                    &temporary_storage,
                     &command_receiver,
                     &event_sender,
                     &worker_plan_cancelled,
@@ -237,6 +242,7 @@ impl WorkerPool {
 fn deletion_worker(
     scan_root: &std::path::Path,
     scan_root_identity: Option<&NativeIdentity>,
+    temporary_storage: &TemporaryStorage,
     commands: &Receiver<WorkerCommand>,
     sender: &Sender<WorkerEvent>,
     plan_cancelled: &AtomicBool,
@@ -261,21 +267,23 @@ fn deletion_worker(
             } => {
                 let target_node_id = target.node_id;
                 let result = if let Some(identity) = scan_root_identity {
-                    build_plan_cancellable_with_root_identity(
+                    build_plan_cancellable_with_root_identity_and_temporary_storage(
                         scan_root,
                         identity.clone(),
                         target,
                         reduced_guardrails,
                         plan_cancelled,
                         maximum_bytes,
+                        temporary_storage,
                     )
                 } else {
-                    build_plan_cancellable(
+                    build_plan_cancellable_with_temporary_storage(
                         scan_root,
                         target,
                         reduced_guardrails,
                         plan_cancelled,
                         maximum_bytes,
+                        temporary_storage,
                     )
                 }
                 .map(Box::new);
@@ -976,8 +984,7 @@ mod tests {
         use std::time::UNIX_EPOCH;
 
         use crate::deletion::{
-            ConfirmationChallenge, DeletionPlan, PlannedEntry, PlannedKind, PlannedSnapshot,
-            ReviewedEntry, current_scan_root_identity,
+            PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan, current_scan_root_identity,
         };
         use crate::native_path::identity_for;
         use crate::state::FileToDelete;
@@ -1021,20 +1028,9 @@ mod tests {
                 snapshot: snapshot.clone(),
             }],
         };
+        let plan = build_plan(root.path(), target, false).expect("deletion plan should build");
         let root_identity =
             current_scan_root_identity(root.path()).expect("scan root identity should be readable");
-        let plan = DeletionPlan {
-            target,
-            root_relative_path: std::path::PathBuf::from("target"),
-            scan_root_identity: root_identity.clone(),
-            entries: vec![PlannedEntry {
-                relative_path: std::path::PathBuf::from("target"),
-                snapshot,
-            }],
-            challenge: ConfirmationChallenge::ConfirmFile,
-            apparent_bytes: 8,
-            estimated_bytes: 1,
-        };
         let mut scanner_options = options(root.path(), 1);
         scanner_options.root_identity = Some(root_identity);
         let workers = WorkerPool::start(scanner_options, 16).expect("workers should start");
@@ -1061,7 +1057,7 @@ mod tests {
             }
         };
         let (returned, error) = result.expect_err("changed confirmation should be rejected");
-        assert_eq!(returned.entries.len(), 1);
+        assert_eq!(returned.planned_entries(), 1);
         assert!(error.is_stale());
         workers.shutdown().expect("workers should stop");
     }

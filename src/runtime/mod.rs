@@ -21,7 +21,6 @@ use crate::animation::AnimationScheduler;
 use crate::config::{CustomKeyBindings, KeyPreset, SafePreferences, save_safe_preferences};
 use crate::error::{AppError, ExitClass};
 use crate::input::{InputCommand, InputEvent, InputSource, handle_keypress};
-use crate::model::NodeKind;
 use crate::native_path::{
     DECEPTIVE_DISPLAY_MARKER, NativeIdentity, safe_display_path_text, safe_display_text,
 };
@@ -348,18 +347,14 @@ where
                     return Ok(());
                 }
                 let reduced_guardrails = self.app.reduced_deletion_guardrails();
-                // Directories use a live filesystem walk for planning (no reviewed_entries)
-                // and their post-deletion history is already guarded by try_complete_deletion.
-                // Capping directory plans at maximum_deletion_plan_bytes() is unnecessary and
-                // causes a hard stop for large directories. Files/links keep the cap so the
-                // history budget remains predictable.
-                let maximum_bytes = if target.expected_snapshot.kind == NodeKind::Directory {
-                    usize::MAX
-                } else {
-                    self.app.maximum_deletion_plan_bytes()
-                };
-                self.workers()?
-                    .request_deletion_plan(target, reduced_guardrails, maximum_bytes)?;
+                // File and link plans remain resident. Directory planners spill identities after
+                // this same budget into the shared, bounded temporary-storage reservation.
+                let maximum_bytes = self.app.maximum_deletion_plan_bytes();
+                self.workers()?.request_deletion_plan(
+                    *target,
+                    reduced_guardrails,
+                    maximum_bytes,
+                )?;
                 self.deletion_active = true;
             }
             InputCommand::CancelDeletionPlan => self.workers()?.cancel_deletion_plan(),
@@ -367,7 +362,7 @@ where
                 if self.deletion_active {
                     return Ok(());
                 }
-                self.workers()?.revalidate_deletion(plan)?;
+                self.workers()?.revalidate_deletion(*plan)?;
                 self.deletion_active = true;
             }
             InputCommand::ExportScan => {

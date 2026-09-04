@@ -44,9 +44,9 @@ Version 1.0 counts file identities rather than physical storage blocks. Copy-on-
 
 ## Memory & Temporary Storage
 
-Each scan session has one fixed temporary-storage budget, 512 MiB by default, shared by queued scanner directory tasks and private identity spill files. The session marker and every owned file reserve capacity before they grow, release it only after the file is shrunk or removed, and remain inside the existing private-path and active-session checks.
+Each session has one fixed temporary-storage budget, 512 MiB by default, shared by queued scanner directory tasks, private identity spill files, and overflow directory deletion-plan and outcome records. Every owned file reserves capacity before it grows and releases it only after shrinking or cleanup. Unix deletion records use anonymous files; Windows atomically creates them in the selected target's parent with a current-user-only DACL, exclusive sharing, and delete-on-close, so the target cannot contain them. Plan and outcome records also carry a process-private authentication tag so a named file cannot silently change consent or reporting.
 
-If queued scanner work cannot reserve capacity, the scanner reports an actionable failure and does not complete that partial scan as exact. If identity persistence cannot reserve capacity, exact accounting stops with an actionable error rather than weakening the accounting definition. Capacity failures neither drop queued work silently nor leave owned temporary files outside the session accounting.
+If queued scanner work cannot reserve capacity, the scanner reports an actionable failure and does not complete that partial scan as exact. If identity persistence cannot reserve capacity, exact accounting stops with an actionable error rather than weakening the accounting definition. If a directory plan cannot reserve enough capacity for every reviewed identity and outcome, it stops before confirmation and deletes no entry. A post-consent result-storage failure stops new mutations and returns an explicit incomplete result for focused rescan. Capacity failures neither drop queued work silently nor leave owned temporary files outside the session accounting.
 
 ## Map Invariants
 

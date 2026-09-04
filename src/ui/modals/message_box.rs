@@ -129,13 +129,11 @@ impl Widget for MessageBox<'_> {
         );
         let title = match &self.view {
             DeletionView::Planning { .. } => "! BUILDING IDENTITY PLAN",
-            DeletionView::Confirm { plan, .. } => {
-                match plan.root_snapshot().map(|item| item.kind) {
-                    Some(PlannedKind::Directory) => "! PERMANENT DIRECTORY DELETION",
-                    Some(PlannedKind::Link) => "! PERMANENT LINK DELETION",
-                    _ => "! PERMANENT FILE DELETION",
-                }
-            }
+            DeletionView::Confirm { plan, .. } => match plan.root_snapshot().kind {
+                PlannedKind::Directory => "! PERMANENT DIRECTORY DELETION",
+                PlannedKind::Link => "! PERMANENT LINK DELETION",
+                PlannedKind::File => "! PERMANENT FILE DELETION",
+            },
             DeletionView::Deleting { stopping: true, .. } => "! STOPPING PERMANENT DELETION",
             DeletionView::Deleting { .. } => "! PERMANENT DELETION ACTIVE",
             DeletionView::Cancel { .. } => "! INTERRUPT DELETION",
@@ -223,11 +221,7 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
         } => {
             let reduced_guardrails = reduced_guardrails
                 || matches!(&plan.challenge, ConfirmationChallenge::ReducedGuard);
-            let snapshot = plan.root_snapshot();
-            let identity = snapshot.map_or_else(
-                || "identity unavailable".to_string(),
-                |snapshot| format!("identity {:?}", snapshot.identity.file_id),
-            );
+            let identity = format!("identity {:?}", plan.root_snapshot().identity.file_id);
             let mut content = vec![
                 Line::from(""),
                 Line::from(display_path_end(&plan.target.full_path(), width)),
@@ -303,7 +297,9 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
             Line::from(format!("failed        {}", report.failed_entries())),
             Line::from(format!("unattempted   {}", report.unattempted_entries())),
             Line::from(""),
-            Line::from(if report.precise {
+            Line::from(if !report.reporting_complete() {
+                "Result reporting is incomplete; rescan required. [Enter/Esc] close"
+            } else if report.precise {
                 "Result is precise. [Enter/Esc] close"
             } else {
                 "Result is unknown; rescan required. [Enter/Esc] close"

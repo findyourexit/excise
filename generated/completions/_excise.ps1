@@ -26,7 +26,7 @@ Register-ArgumentCompleter -Native -CommandName 'excise' -ScriptBlock {
             [CompletionResult]::new('--event-buffer', '--event-buffer', [CompletionResultType]::ParameterName, 'Bounded worker-event capacity (16-4096)')
             [CompletionResult]::new('--exclude', '--exclude', [CompletionResultType]::ParameterName, 'Ordered gitignore-style exclusion pattern')
             [CompletionResult]::new('--memory-mib', '--memory-mib', [CompletionResultType]::ParameterName, 'Whole-process memory envelope in MiB')
-            [CompletionResult]::new('--temporary-storage-mib', '--temporary-storage-mib', [CompletionResultType]::ParameterName, 'Combined scanner-task and identity temporary storage limit per session (2+)')
+            [CompletionResult]::new('--temporary-storage-mib', '--temporary-storage-mib', [CompletionResultType]::ParameterName, 'Combined scanner-task, directory-plan/result, and identity-spill temporary storage limit per session (2+)')
             [CompletionResult]::new('--theme', '--theme', [CompletionResultType]::ParameterName, 'Built-in semantic color theme')
             [CompletionResult]::new('--keymap', '--keymap', [CompletionResultType]::ParameterName, 'Keyboard preset. Arrows and safety keys always work')
             [CompletionResult]::new('--format', '--format', [CompletionResultType]::ParameterName, 'Output mode. Table and JSON never acquire a terminal')

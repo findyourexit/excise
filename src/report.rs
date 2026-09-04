@@ -455,11 +455,12 @@ impl Serialize for StreamingDeletionEntries<'_> {
     where
         S: Serializer,
     {
-        let mut entries = serializer.serialize_seq(Some(self.report.entries.len()))?;
+        let mut entries = serializer.serialize_seq(None)?;
         for result in &self.report.entries {
+            let result = result.map_err(S::Error::custom)?;
             entries.serialize_element(&DeletionHistoryEntryRef {
                 scan_root: &self.report.scan_root,
-                result,
+                result: &result,
             })?;
         }
         entries.end()
@@ -776,7 +777,8 @@ mod tests {
                     },
                 },
                 outcome: DeletionEntryOutcome::Deleted,
-            }],
+            }]
+            .into(),
             soft_cancelled: false,
             precise: true,
             estimated_bytes: 0,
@@ -864,8 +866,6 @@ mod tests {
     }
     #[test]
     fn hostile_paths_in_exports_are_marked_and_escaped() {
-        use crate::deletion::{DeletionEntryResult, PlannedEntry, PlannedSnapshot};
-
         let parent = tempfile::tempdir().expect("report parent should exist");
         let root = parent.path().join("scan-\u{202e}-root");
         std::fs::create_dir(&root).expect("report root should be created");
@@ -900,8 +900,9 @@ mod tests {
         let display_root = document["display_root"]
             .as_str()
             .expect("scan display root should be a string");
-        assert!(display_root.contains(DECEPTIVE_DISPLAY_MARKER));
-        assert!(display_root.contains("\\u{202e}"));
+        assert!(
+            display_root.contains(DECEPTIVE_DISPLAY_MARKER) && display_root.contains("\\u{202e}"),
+        );
         let entry = document["entries"]
             .as_array()
             .and_then(|entries| {
@@ -915,15 +916,21 @@ mod tests {
         let display_path = entry["display_path"]
             .as_str()
             .expect("scan display path should be a string");
-        assert!(display_path.contains(DECEPTIVE_DISPLAY_MARKER));
-        assert!(display_path.contains("\\x1b"));
-        assert!(!display_path.contains('\u{1b}'));
-
+        assert!(
+            display_path.contains(DECEPTIVE_DISPLAY_MARKER)
+                && display_path.contains("\\x1b")
+                && !display_path.contains('\u{1b}'),
+        );
         let mut table = Vec::new();
         write_scan_report_table(&tree, &mut table).expect("hostile scan table should serialize");
-        let table = String::from_utf8(table).expect("scan table should be UTF-8");
-        assert!(table.contains(DECEPTIVE_DISPLAY_MARKER));
-        assert!(table.contains("\\x1b"));
+        let table = String::from_utf8(table).expect("table export should be UTF-8");
+        assert!(table.contains(DECEPTIVE_DISPLAY_MARKER) && table.contains("\\x1b"));
+
+        assert_hostile_deletion_history(root, entry_identity);
+    }
+
+    fn assert_hostile_deletion_history(root: PathBuf, entry_identity: NativeIdentity) {
+        use crate::deletion::{DeletionEntryResult, PlannedEntry, PlannedSnapshot};
 
         let report = Arc::new(DeletionReport {
             target_node_id: NodeId(1),
@@ -941,7 +948,8 @@ mod tests {
                     },
                 },
                 outcome: DeletionEntryOutcome::Deleted,
-            }],
+            }]
+            .into(),
             soft_cancelled: false,
             precise: true,
             estimated_bytes: 0,
@@ -1007,7 +1015,8 @@ mod tests {
                     },
                     outcome: DeletionEntryOutcome::Failed(hostile),
                 },
-            ],
+            ]
+            .into(),
             soft_cancelled: false,
             precise: true,
             estimated_bytes: 0,

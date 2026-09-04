@@ -340,8 +340,16 @@ impl FileTree {
     }
 
     pub fn try_apply_deletion_report(&mut self, report: &DeletionReport) -> Result<(), ModelError> {
+        if !report.reporting_complete() || report.entries.is_spilled() {
+            self.mark_deletion_result_uncertain(report);
+            return Ok(());
+        }
+        let Some(entries) = report.entries.as_slice() else {
+            self.mark_deletion_result_uncertain(report);
+            return Ok(());
+        };
         let mut affected_link_counts: HashMap<FileId, Option<u64>> = HashMap::new();
-        for result in &report.entries {
+        for result in entries {
             if !matches!(
                 result.outcome,
                 DeletionEntryOutcome::Deleted | DeletionEntryOutcome::Missing
@@ -366,8 +374,7 @@ impl FileTree {
                 })
                 .or_insert(post_delete);
         }
-        let removed_paths = report
-            .entries
+        let removed_paths = entries
             .iter()
             .filter(|result| {
                 matches!(
@@ -396,6 +403,20 @@ impl FileTree {
         };
         self.space_freed = self.space_freed.saturating_add(freed);
         Ok(())
+    }
+
+    fn mark_deletion_result_uncertain(&mut self, report: &DeletionReport) {
+        let root = self.path_in_filesystem.join(&report.root_relative_path);
+        self.arena.mark_path_uncertain(
+            &root,
+            UnscannedReason::Metadata("deletion result requires a focused rescan".to_string()),
+        );
+        let freed = if self.show_apparent_size {
+            report.deleted_apparent_bytes()
+        } else {
+            report.deleted_allocated_bytes()
+        };
+        self.space_freed = self.space_freed.saturating_add(freed);
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -682,7 +703,8 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     use crate::deletion::{
-        DeletionEntryOutcome, DeletionEntryResult, DeletionReport, build_plan, execute_plan,
+        DeletionEntryOutcome, DeletionEntryResult, DeletionReport, PlannedEntry, build_plan,
+        execute_plan,
     };
     #[cfg(any(unix, windows))]
     use crate::model::ByteBounds;
@@ -1348,11 +1370,10 @@ mod tests {
                 .expect("first subtree should be reviewable"),
         };
         let plan = build_plan(root.path(), target, false).expect("deletion plan should build");
-        let entry = plan
-            .entries
-            .first()
-            .cloned()
-            .expect("deletion plan should contain the target");
+        let entry = PlannedEntry {
+            relative_path: std::path::PathBuf::from("first"),
+            snapshot: plan.root_snapshot().clone(),
+        };
         let report = DeletionReport {
             target_node_id: first_id,
             root_relative_path: std::path::PathBuf::from("first"),
@@ -1360,7 +1381,8 @@ mod tests {
             entries: vec![DeletionEntryResult {
                 entry,
                 outcome: DeletionEntryOutcome::Missing,
-            }],
+            }]
+            .into(),
             soft_cancelled: false,
             precise: true,
             estimated_bytes: plan.estimated_bytes,

@@ -1,28 +1,47 @@
-use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
 
 use cap_primitives::ambient_authority;
 use cap_primitives::fs::{self as cap_fs, FollowSymlinks};
 use file_id::FileId;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 #[cfg(not(unix))]
 use sysinfo::{DiskRefreshKind, Disks};
 
 use crate::model::NodeId;
 use crate::model::NodeKind;
 use crate::native_path::{
-    NativeIdentity, identity_for, safe_display_os_str, safe_display_path_text, safe_display_text,
+    EncodedNativePath, NativeIdentity, NativePath, identity_for, safe_display_os_str,
+    safe_display_path_text, safe_display_text,
 };
 use crate::state::FileToDelete;
+use crate::temporary_storage::{TemporaryStorage, TemporaryStorageReservation};
 
 pub const DEFAULT_PLAN_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const SPILL_RECORD_LENGTH_BYTES: u64 = 8;
+const SPILL_RECORD_MAC_BYTES: u64 = 32;
+const SPILL_MAC_BYTES: usize = 32;
+const HMAC_BLOCK_BYTES: usize = 64;
+const MAX_PLAN_SPILL_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_OUTCOME_DETAIL_BYTES: usize = 512;
+const OUTCOME_DETAIL_TRUNCATION: &str = "…";
+const MAX_JSON_ESCAPED_BYTES_PER_INPUT_BYTE: usize = 6;
+const RESULT_SPILL_ENVELOPE_BYTES: usize = 64;
+const MAX_RESULT_SPILL_RECORD_BYTES: usize = MAX_PLAN_SPILL_RECORD_BYTES
+    + MAX_OUTCOME_DETAIL_BYTES * MAX_JSON_ESCAPED_BYTES_PER_INPUT_BYTE
+    + RESULT_SPILL_ENVELOPE_BYTES;
+const MAX_RESIDENT_DIRECTORY_TASKS: usize = 64;
+
+type PlanSpillFile = File;
 
 #[must_use]
 pub const fn deletion_supported() -> bool {
@@ -37,7 +56,7 @@ pub enum PlannedKind {
     Link,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlannedSnapshot {
     pub identity: NativeIdentity,
     pub kind: PlannedKind,
@@ -76,12 +95,20 @@ impl ConfirmationChallenge {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+enum PlanEntries {
+    InMemory(Vec<PlannedEntry>),
+    Spilled(RefCell<RecordSpill>),
+}
+
+#[derive(Debug)]
 pub struct DeletionPlan {
     pub target: FileToDelete,
     pub root_relative_path: PathBuf,
     pub scan_root_identity: NativeIdentity,
-    pub entries: Vec<PlannedEntry>,
+    entries: PlanEntries,
+    result_storage: PlannedResultStorage,
+    root_snapshot: PlannedSnapshot,
     pub challenge: ConfirmationChallenge,
     pub apparent_bytes: u128,
     pub estimated_bytes: usize,
@@ -90,19 +117,541 @@ pub struct DeletionPlan {
 impl DeletionPlan {
     #[must_use]
     pub fn planned_entries(&self) -> u64 {
-        u64::try_from(self.entries.len()).unwrap_or(u64::MAX)
+        self.entries.len()
     }
 
     #[must_use]
-    pub fn root_snapshot(&self) -> Option<&PlannedSnapshot> {
-        self.entries
-            .iter()
-            .find(|entry| entry.relative_path == self.root_relative_path)
-            .map(|entry| &entry.snapshot)
+    pub fn root_snapshot(&self) -> &PlannedSnapshot {
+        &self.root_snapshot
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
+struct RecordSpill {
+    file: PlanSpillFile,
+    length: u64,
+    records: u64,
+    reservation: TemporaryStorageReservation,
+    maximum_payload: u64,
+    authentication: SpillAuthenticationKey,
+}
+
+struct SpillAuthenticationKey([u8; SPILL_MAC_BYTES]);
+
+impl fmt::Debug for SpillAuthenticationKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SpillAuthenticationKey([redacted])")
+    }
+}
+
+impl SpillAuthenticationKey {
+    fn new() -> io::Result<Self> {
+        let mut key = [0_u8; SPILL_MAC_BYTES];
+        getrandom::fill(&mut key).map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(Self(key))
+    }
+
+    fn tag(&self, offset: u64, payload_len: [u8; 8], payload: &[u8]) -> [u8; SPILL_MAC_BYTES] {
+        let mut key_block = [0_u8; HMAC_BLOCK_BYTES];
+        key_block[..self.0.len()].copy_from_slice(&self.0);
+        let mut inner_pad = key_block;
+        let mut outer_pad = key_block;
+        for byte in &mut inner_pad {
+            *byte ^= 0x36;
+        }
+        for byte in &mut outer_pad {
+            *byte ^= 0x5c;
+        }
+
+        let mut inner = Sha256::new();
+        inner.update(inner_pad);
+        inner.update(b"excise/deletion-spill-v1\0");
+        inner.update(offset.to_le_bytes());
+        inner.update(payload_len);
+        inner.update(payload);
+        let inner = inner.finalize();
+
+        let mut outer = Sha256::new();
+        outer.update(outer_pad);
+        outer.update(inner);
+        let digest = outer.finalize();
+        let mut tag = [0_u8; SPILL_MAC_BYTES];
+        tag.copy_from_slice(&digest);
+        tag
+    }
+
+    fn matches(
+        &self,
+        offset: u64,
+        payload_len: [u8; 8],
+        payload: &[u8],
+        actual: &[u8; SPILL_MAC_BYTES],
+    ) -> bool {
+        let expected = self.tag(offset, payload_len, payload);
+        expected
+            .iter()
+            .zip(actual)
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct SpilledPlanEntry {
+    relative_path: EncodedNativePath,
+    snapshot: PlannedSnapshot,
+}
+
+enum SpillVisitError<E> {
+    Io(io::Error),
+    Visitor(E),
+}
+
+#[derive(Debug)]
+struct PendingDirectories {
+    resident: Vec<PlannedEntry>,
+    spill: Option<RecordSpill>,
+}
+
+impl PlanEntries {
+    #[must_use]
+    fn len(&self) -> u64 {
+        match self {
+            Self::InMemory(entries) => u64::try_from(entries.len()).unwrap_or(u64::MAX),
+            Self::Spilled(spill) => spill.borrow().records,
+        }
+    }
+
+    fn push(
+        &mut self,
+        entry: PlannedEntry,
+        spill: bool,
+        temporary_storage: &TemporaryStorage,
+        spill_directory: &Path,
+    ) -> io::Result<()> {
+        if spill && matches!(self, Self::InMemory(_)) {
+            let retained = match self {
+                Self::InMemory(entries) => std::mem::take(entries),
+                Self::Spilled(_) => Vec::new(),
+            };
+            let mut spilled = RecordSpill::new(
+                temporary_storage,
+                MAX_PLAN_SPILL_RECORD_BYTES,
+                spill_directory,
+            )?;
+            for retained_entry in retained {
+                spilled.push(&encode_spilled_entry(&retained_entry)?)?;
+            }
+            *self = Self::Spilled(RefCell::new(spilled));
+        }
+        match self {
+            Self::InMemory(entries) => {
+                entries
+                    .try_reserve_exact(1)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                entries.push(entry);
+                Ok(())
+            }
+            Self::Spilled(spilled) => spilled.get_mut().push(&encode_spilled_entry(&entry)?),
+        }
+    }
+
+    fn try_for_each<F>(&self, target: &Path, mut visit: F) -> Result<(), DeletionPlanError>
+    where
+        F: FnMut(&PlannedEntry) -> Result<(), DeletionPlanError>,
+    {
+        match self {
+            Self::InMemory(entries) => {
+                for entry in entries {
+                    validate_entry_for_target(&entry.relative_path, target)?;
+                    visit(entry)?;
+                }
+                Ok(())
+            }
+            Self::Spilled(spilled) => match spilled.borrow_mut().visit(|payload| {
+                let entry =
+                    decode_spilled_entry(&payload).map_err(|error| plan_io(target, error))?;
+                validate_entry_for_target(&entry.relative_path, target)?;
+                visit(&entry)
+            }) {
+                Ok(()) => Ok(()),
+                Err(SpillVisitError::Io(error)) => Err(plan_io(target, error)),
+                Err(SpillVisitError::Visitor(error)) => Err(error),
+            },
+        }
+    }
+
+    fn pop_reverse(&mut self, target: &Path) -> Result<Option<PlannedEntry>, DeletionPlanError> {
+        match self {
+            Self::InMemory(entries) => {
+                let Some(entry) = entries.last() else {
+                    return Ok(None);
+                };
+                validate_entry_for_target(&entry.relative_path, target)?;
+                Ok(entries.pop())
+            }
+            Self::Spilled(spilled) => {
+                let Some(payload) = spilled
+                    .get_mut()
+                    .pop()
+                    .map_err(|error| plan_io(target, error))?
+                else {
+                    return Ok(None);
+                };
+                let entry =
+                    decode_spilled_entry(&payload).map_err(|error| plan_io(target, error))?;
+                validate_entry_for_target(&entry.relative_path, target)?;
+                Ok(Some(entry))
+            }
+        }
+    }
+}
+
+impl PendingDirectories {
+    fn push(
+        &mut self,
+        entry: PlannedEntry,
+        temporary_storage: &TemporaryStorage,
+        spill_directory: &Path,
+    ) -> io::Result<()> {
+        if self.resident.len() < MAX_RESIDENT_DIRECTORY_TASKS {
+            self.resident.push(entry);
+            return Ok(());
+        }
+        if self.spill.is_none() {
+            self.spill = Some(RecordSpill::new(
+                temporary_storage,
+                MAX_PLAN_SPILL_RECORD_BYTES,
+                spill_directory,
+            )?);
+        }
+        let Some(spill) = self.spill.as_mut() else {
+            return Err(io::Error::other("directory plan spill was not initialized"));
+        };
+        spill.push(&encode_spilled_entry(&entry)?)
+    }
+
+    fn pop(&mut self, target: &Path) -> Result<Option<PlannedEntry>, DeletionPlanError> {
+        let entry = if let Some(entry) = self.resident.pop() {
+            entry
+        } else {
+            let Some(spill) = self.spill.as_mut() else {
+                return Ok(None);
+            };
+            let Some(payload) = spill.pop().map_err(|error| plan_io(target, error))? else {
+                return Ok(None);
+            };
+            decode_spilled_entry(&payload).map_err(|error| plan_io(target, error))?
+        };
+        validate_entry_for_target(&entry.relative_path, target)?;
+        Ok(Some(entry))
+    }
+}
+
+impl RecordSpill {
+    fn new(
+        temporary_storage: &TemporaryStorage,
+        maximum_payload: usize,
+        spill_directory: &Path,
+    ) -> io::Result<Self> {
+        let maximum_payload = u64::try_from(maximum_payload).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deletion spill record limit does not fit in u64",
+            )
+        })?;
+        Ok(Self {
+            file: new_plan_spill_file(spill_directory)?,
+            length: 0,
+            records: 0,
+            reservation: temporary_storage.reservation(0)?,
+            maximum_payload,
+            authentication: SpillAuthenticationKey::new()?,
+        })
+    }
+
+    fn reserve_to(&mut self, bytes: u64) -> io::Result<()> {
+        self.reservation.grow_to(bytes)
+    }
+
+    fn reserved_bytes(&self) -> u64 {
+        self.reservation.bytes()
+    }
+
+    fn push(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.append(payload, true)
+    }
+
+    fn push_reserved(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.append(payload, false)
+    }
+
+    fn append(&mut self, payload: &[u8], grow_reservation: bool) -> io::Result<()> {
+        let payload_len = self.payload_len(payload)?;
+        let record_len = spill_record_len(payload_len)?;
+        let next_length = self
+            .length
+            .checked_add(record_len)
+            .ok_or_else(|| io::Error::other("deletion spill offset overflow"))?;
+        let next_records = self
+            .records
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("deletion spill count overflow"))?;
+        self.verify_length()?;
+        if grow_reservation {
+            self.reservation.grow_to(next_length)?;
+        } else if next_length > self.reservation.bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "deletion result exceeds its reserved temporary storage",
+            ));
+        }
+        let header = payload_len.to_le_bytes();
+        let tag = self.authentication.tag(self.length, header, payload);
+        let file = plan_spill_file_mut(&mut self.file);
+        file.seek(SeekFrom::Start(self.length))?;
+        file.write_all(&header)?;
+        file.write_all(payload)?;
+        file.write_all(&tag)?;
+        file.write_all(&header)?;
+        self.length = next_length;
+        self.records = next_records;
+        Ok(())
+    }
+
+    fn pop(&mut self) -> io::Result<Option<Vec<u8>>> {
+        self.verify_length()?;
+        if self.records == 0 {
+            return if self.length == 0 {
+                Ok(None)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "deletion spill has bytes without records",
+                ))
+            };
+        }
+        let trailer_offset = self
+            .length
+            .checked_sub(SPILL_RECORD_LENGTH_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "deletion spill is truncated")
+            })?;
+        let mut trailer = [0_u8; 8];
+        {
+            let file = plan_spill_file_mut(&mut self.file);
+            file.seek(SeekFrom::Start(trailer_offset))?;
+            file.read_exact(&mut trailer)?;
+        }
+        let payload_len = u64::from_le_bytes(trailer);
+        if payload_len > self.maximum_payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deletion spill record exceeds the configured limit",
+            ));
+        }
+        let record_len = spill_record_len(payload_len)?;
+        let start = self.length.checked_sub(record_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deletion spill record is truncated",
+            )
+        })?;
+        let (payload, end) = self.read_record(start, self.length)?;
+        if end != self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deletion spill record length is inconsistent",
+            ));
+        }
+        plan_spill_file_mut(&mut self.file).set_len(start)?;
+        self.reservation.shrink_to(start);
+        self.length = start;
+        self.records = self
+            .records
+            .checked_sub(1)
+            .ok_or_else(|| io::Error::other("deletion spill count underflow"))?;
+        Ok(Some(payload))
+    }
+
+    fn read_at(&mut self, offset: u64) -> io::Result<(Vec<u8>, u64)> {
+        self.verify_length()?;
+        self.read_record(offset, self.length)
+    }
+
+    fn visit<E>(
+        &mut self,
+        mut visit: impl FnMut(Vec<u8>) -> Result<(), E>,
+    ) -> Result<(), SpillVisitError<E>> {
+        self.verify_length().map_err(SpillVisitError::Io)?;
+        let mut offset = 0_u64;
+        for _ in 0..self.records {
+            let (payload, next) = self
+                .read_record(offset, self.length)
+                .map_err(SpillVisitError::Io)?;
+            visit(payload).map_err(SpillVisitError::Visitor)?;
+            offset = next;
+        }
+        if offset != self.length {
+            return Err(SpillVisitError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deletion spill length does not match its records",
+            )));
+        }
+        Ok(())
+    }
+
+    fn read_record(&mut self, offset: u64, end: u64) -> io::Result<(Vec<u8>, u64)> {
+        read_spill_record(
+            &mut self.file,
+            &self.authentication,
+            self.maximum_payload,
+            offset,
+            end,
+        )
+    }
+
+    fn payload_len(&self, payload: &[u8]) -> io::Result<u64> {
+        let length = u64::try_from(payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deletion spill record length overflow",
+            )
+        })?;
+        if length > self.maximum_payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deletion spill record exceeds the configured limit",
+            ));
+        }
+        Ok(length)
+    }
+
+    fn verify_length(&mut self) -> io::Result<()> {
+        let actual = plan_spill_file_mut(&mut self.file).metadata()?.len();
+        if actual == self.length {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deletion spill file changed outside its accounting boundary",
+            ))
+        }
+    }
+}
+
+fn encode_spilled_entry(entry: &PlannedEntry) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(&SpilledPlanEntry {
+        relative_path: NativePath::new(entry.relative_path.clone()).encode(),
+        snapshot: entry.snapshot.clone(),
+    })
+    .map_err(io::Error::other)
+}
+
+fn decode_spilled_entry(payload: &[u8]) -> io::Result<PlannedEntry> {
+    let entry: SpilledPlanEntry = serde_json::from_slice(payload).map_err(io::Error::other)?;
+    let relative_path = NativePath::decode(&entry.relative_path)
+        .map_err(io::Error::other)?
+        .as_path()
+        .to_path_buf();
+    Ok(PlannedEntry {
+        relative_path,
+        snapshot: entry.snapshot,
+    })
+}
+
+fn spill_record_len(payload_len: u64) -> io::Result<u64> {
+    SPILL_RECORD_LENGTH_BYTES
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(SPILL_RECORD_MAC_BYTES))
+        .and_then(|length| length.checked_add(SPILL_RECORD_LENGTH_BYTES))
+        .ok_or_else(|| io::Error::other("deletion spill record length overflow"))
+}
+
+fn read_spill_record(
+    file: &mut PlanSpillFile,
+    authentication: &SpillAuthenticationKey,
+    maximum_payload: u64,
+    offset: u64,
+    end: u64,
+) -> io::Result<(Vec<u8>, u64)> {
+    let header_end = offset
+        .checked_add(SPILL_RECORD_LENGTH_BYTES)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "deletion spill offset overflow")
+        })?;
+    if header_end > end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion spill record is truncated",
+        ));
+    }
+    let file = plan_spill_file_mut(file);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut header = [0_u8; 8];
+    file.read_exact(&mut header)?;
+    let payload_len = u64::from_le_bytes(header);
+    if payload_len > maximum_payload {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion spill record exceeds the configured limit",
+        ));
+    }
+    let record_len = spill_record_len(payload_len)?;
+    let record_end = offset.checked_add(record_len).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "deletion spill offset overflow")
+    })?;
+    if record_end > end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion spill record is truncated",
+        ));
+    }
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion spill record length does not fit in memory",
+        )
+    })?;
+    let mut payload = vec![0_u8; payload_len];
+    file.read_exact(&mut payload)?;
+    let mut tag = [0_u8; SPILL_MAC_BYTES];
+    file.read_exact(&mut tag)?;
+    let mut trailer = [0_u8; 8];
+    file.read_exact(&mut trailer)?;
+    if trailer != header {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion spill record length is inconsistent",
+        ));
+    }
+    if !authentication.matches(offset, header, &payload, &tag) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion spill record authentication failed",
+        ));
+    }
+    Ok((payload, record_end))
+}
+
+#[cfg(windows)]
+fn new_plan_spill_file(spill_directory: &Path) -> io::Result<PlanSpillFile> {
+    crate::os::windows::create_private_temporary_file(spill_directory)
+}
+
+#[cfg(not(windows))]
+fn new_plan_spill_file(_spill_directory: &Path) -> io::Result<PlanSpillFile> {
+    tempfile::tempfile()
+}
+
+fn plan_spill_file_mut(file: &mut PlanSpillFile) -> &mut File {
+    file
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DeletionEntryOutcome {
     Deleted,
     Changed(String),
@@ -117,12 +666,541 @@ pub struct DeletionEntryResult {
     pub outcome: DeletionEntryOutcome,
 }
 
+#[derive(Deserialize, Serialize)]
+struct SpilledDeletionEntryResult {
+    relative_path: EncodedNativePath,
+    snapshot: PlannedSnapshot,
+    outcome: DeletionEntryOutcome,
+}
+
+#[derive(Debug)]
+enum PlannedResultStorage {
+    InMemory {
+        maximum_bytes: usize,
+        potential_spill_bytes: u64,
+    },
+    Spilled(RecordSpill),
+}
+
+impl PlannedResultStorage {
+    fn new(maximum_bytes: usize) -> Self {
+        Self::InMemory {
+            maximum_bytes,
+            potential_spill_bytes: 0,
+        }
+    }
+
+    fn reserve_for(
+        &mut self,
+        entry: &PlannedEntry,
+        spill: bool,
+        temporary_storage: &TemporaryStorage,
+        spill_directory: &Path,
+    ) -> io::Result<()> {
+        let record_bytes = result_spill_record_capacity(entry)?;
+        match self {
+            Self::InMemory {
+                potential_spill_bytes,
+                ..
+            } => {
+                let next = potential_spill_bytes
+                    .checked_add(record_bytes)
+                    .ok_or_else(|| {
+                        io::Error::other("deletion result spill reservation overflow")
+                    })?;
+                if spill {
+                    let mut result_spill = RecordSpill::new(
+                        temporary_storage,
+                        MAX_RESULT_SPILL_RECORD_BYTES,
+                        spill_directory,
+                    )?;
+                    result_spill.reserve_to(next)?;
+                    *self = Self::Spilled(result_spill);
+                } else {
+                    *potential_spill_bytes = next;
+                }
+            }
+            Self::Spilled(result_spill) => {
+                let next = result_spill
+                    .reserved_bytes()
+                    .checked_add(record_bytes)
+                    .ok_or_else(|| {
+                        io::Error::other("deletion result spill reservation overflow")
+                    })?;
+                result_spill.reserve_to(next)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn into_collector(self) -> ResultCollector {
+        match self {
+            Self::InMemory { maximum_bytes, .. } => ResultCollector::InMemory {
+                entries: Vec::new(),
+                estimated_bytes: 0,
+                maximum_bytes,
+                summary: DeletionSummary::default(),
+            },
+            Self::Spilled(result_spill) => ResultCollector::Spilled {
+                result_spill,
+                summary: DeletionSummary::default(),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResultCollector {
+    InMemory {
+        entries: Vec<DeletionEntryResult>,
+        estimated_bytes: usize,
+        maximum_bytes: usize,
+        summary: DeletionSummary,
+    },
+    Spilled {
+        result_spill: RecordSpill,
+        summary: DeletionSummary,
+    },
+}
+
+impl ResultCollector {
+    fn push(&mut self, mut result: DeletionEntryResult) -> io::Result<()> {
+        bound_outcome_detail(&mut result.outcome);
+        match self {
+            Self::InMemory {
+                entries,
+                estimated_bytes,
+                maximum_bytes,
+                summary,
+            } => {
+                summary.note(&result);
+                let required = result_entry_resident_bytes(&result);
+                let next = estimated_bytes.saturating_add(required);
+                if next > *maximum_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::StorageFull,
+                        "deletion result exceeds its resident storage limit",
+                    ));
+                }
+                entries
+                    .try_reserve_exact(1)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                *estimated_bytes = next;
+                entries.push(result);
+            }
+            Self::Spilled {
+                result_spill,
+                summary,
+            } => {
+                summary.note(&result);
+                let payload = encode_spilled_result(&result)?;
+                result_spill.push_reserved(&payload)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, target: &Path, complete: bool, error: Option<String>) -> DeletionEntries {
+        let error = error.map(|detail| bounded_outcome_detail(&detail));
+        match self {
+            Self::InMemory {
+                entries, summary, ..
+            } => DeletionEntries::in_memory(
+                Some(target.to_path_buf()),
+                entries,
+                summary,
+                complete,
+                error,
+            ),
+            Self::Spilled {
+                result_spill,
+                summary,
+            } => DeletionEntries::spilled(
+                target.to_path_buf(),
+                result_spill,
+                summary,
+                complete,
+                error,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DeletionSummary {
+    deleted: u64,
+    changed: u64,
+    missing: u64,
+    failed: u64,
+    unattempted: u64,
+    deleted_apparent_bytes: u128,
+    deleted_allocated_bytes: u128,
+}
+
+impl DeletionSummary {
+    fn note(&mut self, result: &DeletionEntryResult) {
+        match &result.outcome {
+            DeletionEntryOutcome::Deleted => {
+                self.deleted = self.deleted.saturating_add(1);
+                self.deleted_apparent_bytes = self
+                    .deleted_apparent_bytes
+                    .saturating_add(result.entry.snapshot.apparent_bytes);
+                if matches!(
+                    result.entry.snapshot.kind,
+                    PlannedKind::File | PlannedKind::Link
+                ) && result.entry.snapshot.identity.link_count == Some(1)
+                {
+                    self.deleted_allocated_bytes = self
+                        .deleted_allocated_bytes
+                        .saturating_add(result.entry.snapshot.allocated_bytes.unwrap_or(0));
+                }
+            }
+            DeletionEntryOutcome::Changed(_) => self.changed = self.changed.saturating_add(1),
+            DeletionEntryOutcome::Missing => self.missing = self.missing.saturating_add(1),
+            DeletionEntryOutcome::Failed(_) => self.failed = self.failed.saturating_add(1),
+            DeletionEntryOutcome::Unattempted => {
+                self.unattempted = self.unattempted.saturating_add(1);
+            }
+        }
+    }
+
+    fn from_entries(entries: &[DeletionEntryResult]) -> Self {
+        let mut summary = Self::default();
+        for entry in entries {
+            summary.note(entry);
+        }
+        summary
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeletionEntries {
+    storage: DeletionEntriesStorage,
+    target: Option<PathBuf>,
+    records: u64,
+    summary: DeletionSummary,
+    complete: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum DeletionEntriesStorage {
+    InMemory(Vec<DeletionEntryResult>),
+    Spilled(Arc<Mutex<RecordSpill>>),
+}
+
+impl DeletionEntries {
+    fn in_memory(
+        target: Option<PathBuf>,
+        entries: Vec<DeletionEntryResult>,
+        summary: DeletionSummary,
+        complete: bool,
+        error: Option<String>,
+    ) -> Self {
+        let records = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+        Self {
+            storage: DeletionEntriesStorage::InMemory(entries),
+            target,
+            records,
+            summary,
+            complete,
+            error,
+        }
+    }
+
+    fn spilled(
+        target: PathBuf,
+        result_spill: RecordSpill,
+        summary: DeletionSummary,
+        complete: bool,
+        error: Option<String>,
+    ) -> Self {
+        let records = result_spill.records;
+        Self {
+            storage: DeletionEntriesStorage::Spilled(Arc::new(Mutex::new(result_spill))),
+            target: Some(target),
+            records,
+            summary,
+            complete,
+            error,
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        usize::try_from(self.records).unwrap_or(usize::MAX)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records == 0
+    }
+
+    #[must_use]
+    pub fn reporting_complete(&self) -> bool {
+        self.complete
+    }
+
+    #[must_use]
+    pub fn reporting_error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> DeletionEntriesIter<'_> {
+        let target = self.target.as_deref();
+        let inner = match &self.storage {
+            DeletionEntriesStorage::InMemory(entries) => {
+                DeletionEntriesIterInner::InMemory(entries.iter())
+            }
+            DeletionEntriesStorage::Spilled(result_spill) => match result_spill.lock() {
+                Ok(result_spill) => DeletionEntriesIterInner::Spilled {
+                    result_spill,
+                    target,
+                    offset: 0,
+                    remaining: self.records,
+                },
+                Err(_) => DeletionEntriesIterInner::Failed(Some(io::Error::other(
+                    "deletion result storage lock was poisoned",
+                ))),
+            },
+        };
+        DeletionEntriesIter { inner }
+    }
+
+    pub(crate) fn as_slice(&self) -> Option<&[DeletionEntryResult]> {
+        match &self.storage {
+            DeletionEntriesStorage::InMemory(entries) => Some(entries),
+            DeletionEntriesStorage::Spilled(_) => None,
+        }
+    }
+
+    pub(crate) fn is_spilled(&self) -> bool {
+        matches!(self.storage, DeletionEntriesStorage::Spilled(_))
+    }
+}
+
+impl<'a> IntoIterator for &'a DeletionEntries {
+    type Item = io::Result<DeletionEntryResult>;
+    type IntoIter = DeletionEntriesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl From<Vec<DeletionEntryResult>> for DeletionEntries {
+    fn from(entries: Vec<DeletionEntryResult>) -> Self {
+        let summary = DeletionSummary::from_entries(&entries);
+        Self::in_memory(None, entries, summary, true, None)
+    }
+}
+
+pub struct DeletionEntriesIter<'a> {
+    inner: DeletionEntriesIterInner<'a>,
+}
+
+enum DeletionEntriesIterInner<'a> {
+    InMemory(std::slice::Iter<'a, DeletionEntryResult>),
+    Spilled {
+        result_spill: MutexGuard<'a, RecordSpill>,
+        target: Option<&'a Path>,
+        offset: u64,
+        remaining: u64,
+    },
+    Failed(Option<io::Error>),
+}
+
+impl Iterator for DeletionEntriesIter<'_> {
+    type Item = io::Result<DeletionEntryResult>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            DeletionEntriesIterInner::InMemory(entries) => entries.next().cloned().map(Ok),
+            DeletionEntriesIterInner::Spilled {
+                result_spill,
+                target,
+                offset,
+                remaining,
+            } => {
+                if *remaining == 0 {
+                    return None;
+                }
+                match result_spill.read_at(*offset) {
+                    Ok((payload, next)) => {
+                        match decode_spilled_result_for_target(&payload, *target) {
+                            Ok(result) => {
+                                *offset = next;
+                                *remaining = remaining.saturating_sub(1);
+                                Some(Ok(result))
+                            }
+                            Err(error) => {
+                                *remaining = 0;
+                                Some(Err(error))
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        *remaining = 0;
+                        Some(Err(error))
+                    }
+                }
+            }
+            DeletionEntriesIterInner::Failed(error) => error.take().map(Err),
+        }
+    }
+}
+
+fn encode_spilled_result(result: &DeletionEntryResult) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(&SpilledDeletionEntryResult {
+        relative_path: NativePath::new(result.entry.relative_path.clone()).encode(),
+        snapshot: result.entry.snapshot.clone(),
+        outcome: result.outcome.clone(),
+    })
+    .map_err(io::Error::other)
+}
+
+fn decode_spilled_result(payload: &[u8]) -> io::Result<DeletionEntryResult> {
+    let result: SpilledDeletionEntryResult =
+        serde_json::from_slice(payload).map_err(io::Error::other)?;
+    let relative_path = NativePath::decode(&result.relative_path)
+        .map_err(io::Error::other)?
+        .as_path()
+        .to_path_buf();
+    Ok(DeletionEntryResult {
+        entry: PlannedEntry {
+            relative_path,
+            snapshot: result.snapshot,
+        },
+        outcome: result.outcome,
+    })
+}
+
+fn decode_spilled_result_for_target(
+    payload: &[u8],
+    target: Option<&Path>,
+) -> io::Result<DeletionEntryResult> {
+    let result = decode_spilled_result(payload)?;
+    if let Some(target) = target {
+        validate_entry_for_target(&result.entry.relative_path, target).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deletion result record is outside the selected target",
+            )
+        })?;
+    }
+    Ok(result)
+}
+
+fn result_spill_record_capacity(entry: &PlannedEntry) -> io::Result<u64> {
+    let placeholder = DeletionEntryResult {
+        entry: entry.clone(),
+        outcome: DeletionEntryOutcome::Changed(String::new()),
+    };
+    let base = encode_spilled_result(&placeholder)?.len();
+    let detail = MAX_OUTCOME_DETAIL_BYTES
+        .checked_mul(MAX_JSON_ESCAPED_BYTES_PER_INPUT_BYTE)
+        .ok_or_else(|| io::Error::other("deletion result spill detail length overflow"))?;
+    let payload = base
+        .checked_add(detail)
+        .and_then(|bytes| bytes.checked_add(RESULT_SPILL_ENVELOPE_BYTES))
+        .ok_or_else(|| io::Error::other("deletion result spill record length overflow"))?;
+    if payload > MAX_RESULT_SPILL_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion result spill record exceeds the configured limit",
+        ));
+    }
+    let payload = u64::try_from(payload).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion result spill record length does not fit in u64",
+        )
+    })?;
+    spill_record_len(payload)
+}
+
+fn bound_outcome_detail(outcome: &mut DeletionEntryOutcome) {
+    match outcome {
+        DeletionEntryOutcome::Changed(detail) | DeletionEntryOutcome::Failed(detail) => {
+            *detail = bounded_outcome_detail(detail);
+        }
+        DeletionEntryOutcome::Deleted
+        | DeletionEntryOutcome::Missing
+        | DeletionEntryOutcome::Unattempted => {}
+    }
+}
+
+fn bounded_outcome_detail(detail: &str) -> String {
+    if detail.len() <= MAX_OUTCOME_DETAIL_BYTES {
+        return detail.to_owned();
+    }
+    let mut end = MAX_OUTCOME_DETAIL_BYTES.saturating_sub(OUTCOME_DETAIL_TRUNCATION.len());
+    while !detail.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut bounded = String::with_capacity(MAX_OUTCOME_DETAIL_BYTES);
+    bounded.push_str(&detail[..end]);
+    bounded.push_str(OUTCOME_DETAIL_TRUNCATION);
+    bounded
+}
+
+fn planned_entry_resident_bytes(entry: &PlannedEntry) -> usize {
+    size_of::<PlannedEntry>()
+        .saturating_add(
+            entry
+                .relative_path
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                .saturating_mul(2),
+        )
+        .saturating_add(128)
+}
+
+fn result_entry_resident_bytes(result: &DeletionEntryResult) -> usize {
+    let detail_bytes = match &result.outcome {
+        DeletionEntryOutcome::Changed(detail) | DeletionEntryOutcome::Failed(detail) => {
+            detail.len()
+        }
+        DeletionEntryOutcome::Deleted
+        | DeletionEntryOutcome::Missing
+        | DeletionEntryOutcome::Unattempted => 0,
+    };
+    size_of::<DeletionEntryResult>()
+        .saturating_add(
+            result
+                .entry
+                .relative_path
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                .saturating_mul(2),
+        )
+        .saturating_add(detail_bytes)
+        .saturating_add(128)
+}
+
+fn result_entry_bound(entry: &PlannedEntry) -> usize {
+    size_of::<DeletionEntryResult>()
+        .saturating_add(
+            entry
+                .relative_path
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                .saturating_mul(2),
+        )
+        .saturating_add(MAX_OUTCOME_DETAIL_BYTES)
+        .saturating_add(128)
+}
+
 #[derive(Clone, Debug)]
 pub struct DeletionReport {
     pub target_node_id: NodeId,
     pub root_relative_path: PathBuf,
     pub scan_root: PathBuf,
-    pub entries: Vec<DeletionEntryResult>,
+    pub entries: DeletionEntries,
     pub soft_cancelled: bool,
     pub precise: bool,
     pub estimated_bytes: usize,
@@ -131,79 +1209,47 @@ pub struct DeletionReport {
 impl DeletionReport {
     #[must_use]
     pub fn deleted_entries(&self) -> u64 {
-        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Deleted))
+        self.entries.summary.deleted
     }
 
     #[must_use]
     pub fn changed_entries(&self) -> u64 {
-        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Changed(_)))
+        self.entries.summary.changed
     }
 
     #[must_use]
     pub fn missing_entries(&self) -> u64 {
-        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Missing))
+        self.entries.summary.missing
     }
 
     #[must_use]
     pub fn failed_entries(&self) -> u64 {
-        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Failed(_)))
+        self.entries.summary.failed
     }
 
     #[must_use]
     pub fn unattempted_entries(&self) -> u64 {
-        self.count(|outcome| matches!(outcome, DeletionEntryOutcome::Unattempted))
+        self.entries.summary.unattempted
     }
 
     #[must_use]
     pub fn deleted_apparent_bytes(&self) -> u128 {
-        self.entries
-            .iter()
-            .filter(|entry| matches!(entry.outcome, DeletionEntryOutcome::Deleted))
-            .fold(0_u128, |total, entry| {
-                total.saturating_add(entry.entry.snapshot.apparent_bytes)
-            })
-    }
-    #[must_use]
-    pub fn deleted_allocated_bytes(&self) -> u128 {
-        let mut allocations = HashMap::<FileId, (u64, Option<u64>, Option<u128>)>::new();
-        for result in &self.entries {
-            if !matches!(result.outcome, DeletionEntryOutcome::Deleted) {
-                continue;
-            }
-            let snapshot = &result.entry.snapshot;
-            let allocation = allocations.entry(snapshot.identity.file_id).or_insert((
-                0,
-                snapshot.identity.link_count,
-                snapshot.allocated_bytes,
-            ));
-            allocation.0 = allocation.0.saturating_add(1);
-            allocation.1 = match (allocation.1, snapshot.identity.link_count) {
-                (Some(left), Some(right)) => Some(left.max(right)),
-                _ => None,
-            };
-            allocation.2 = match (allocation.2, snapshot.allocated_bytes) {
-                (Some(left), Some(right)) => Some(left.max(right)),
-                (left, None) | (None, left) => left,
-            };
-        }
-        allocations
-            .values()
-            .filter_map(|(deleted, links, allocated)| {
-                links
-                    .filter(|links| *links > 0 && *deleted >= *links)
-                    .and(*allocated)
-            })
-            .fold(0_u128, u128::saturating_add)
+        self.entries.summary.deleted_apparent_bytes
     }
 
-    fn count(&self, predicate: impl Fn(&DeletionEntryOutcome) -> bool) -> u64 {
-        u64::try_from(
-            self.entries
-                .iter()
-                .filter(|entry| predicate(&entry.outcome))
-                .count(),
-        )
-        .unwrap_or(u64::MAX)
+    #[must_use]
+    pub fn deleted_allocated_bytes(&self) -> u128 {
+        self.entries.summary.deleted_allocated_bytes
+    }
+
+    #[must_use]
+    pub fn reporting_complete(&self) -> bool {
+        self.entries.reporting_complete()
+    }
+
+    #[must_use]
+    pub fn reporting_error(&self) -> Option<&str> {
+        self.entries.reporting_error()
     }
 }
 
@@ -292,16 +1338,14 @@ impl DeletionPlanError {
 ///
 /// # Errors
 /// Returns a planning error when the target is ineligible, changed, unreadable, cancelled, or
-/// exceeds the bounded plan memory limit.
+/// cannot be retained within its bounded plan and temporary storage budgets.
 pub fn build_plan(
     scan_root: &Path,
     target: FileToDelete,
     reduced_guardrails: bool,
 ) -> Result<DeletionPlan, DeletionPlanError> {
-    let scan_root_identity = current_scan_root_identity(scan_root)?;
-    build_plan_cancellable_with_root_identity(
+    build_plan_cancellable(
         scan_root,
-        scan_root_identity,
         target,
         reduced_guardrails,
         &AtomicBool::new(false),
@@ -311,9 +1355,12 @@ pub fn build_plan(
 
 /// Builds an identity-bound deletion plan with explicit cancellation and memory limits.
 ///
+/// File and link plans stay resident and must fit within `maximum_bytes`. Directory plans spill
+/// their reviewed identities to bounded private temporary storage after that resident budget.
+///
 /// # Errors
 /// Returns a planning error when the target is ineligible, changed, unreadable, cancelled, or
-/// exceeds `maximum_bytes`.
+/// cannot be retained within the configured bounds.
 pub fn build_plan_cancellable(
     scan_root: &Path,
     target: FileToDelete,
@@ -321,32 +1368,55 @@ pub fn build_plan_cancellable(
     cancelled: &AtomicBool,
     maximum_bytes: usize,
 ) -> Result<DeletionPlan, DeletionPlanError> {
+    let temporary_storage = TemporaryStorage::default();
+    build_plan_cancellable_with_temporary_storage(
+        scan_root,
+        target,
+        reduced_guardrails,
+        cancelled,
+        maximum_bytes,
+        &temporary_storage,
+    )
+}
+
+pub(crate) fn build_plan_cancellable_with_temporary_storage(
+    scan_root: &Path,
+    target: FileToDelete,
+    reduced_guardrails: bool,
+    cancelled: &AtomicBool,
+    maximum_bytes: usize,
+    temporary_storage: &TemporaryStorage,
+) -> Result<DeletionPlan, DeletionPlanError> {
     let scan_root_identity = current_scan_root_identity(scan_root)?;
-    build_plan_cancellable_with_root_identity(
+    build_plan_cancellable_with_root_identity_and_temporary_storage(
         scan_root,
         scan_root_identity,
         target,
         reduced_guardrails,
         cancelled,
         maximum_bytes,
+        temporary_storage,
     )
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn build_plan_cancellable_with_root_identity(
+pub(crate) fn build_plan_cancellable_with_root_identity_and_temporary_storage(
     scan_root: &Path,
     scan_root_identity: NativeIdentity,
     mut target: FileToDelete,
     reduced_guardrails: bool,
     cancelled: &AtomicBool,
     maximum_bytes: usize,
+    temporary_storage: &TemporaryStorage,
 ) -> Result<DeletionPlan, DeletionPlanError> {
     if target.synthetic {
         return Err(DeletionPlanError::Synthetic);
     }
     let relative = relative_target(&target)?;
     let full_path = target.full_path();
-    if target.expected_snapshot.kind == NodeKind::Directory {
+    let spill_directory = deletion_spill_directory(&full_path)?;
+    let directory_target = target.expected_snapshot.kind == NodeKind::Directory;
+    if directory_target {
         let mount_root = match is_mount_root(&full_path) {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -372,32 +1442,51 @@ pub(crate) fn build_plan_cancellable_with_root_identity(
     let (snapshot, directory_handle) = inspect_relative(&root, &relative)?;
     validate_model_snapshot(&target, &snapshot)?;
     let challenge = challenge_for(&target, &snapshot, reduced_guardrails);
-    let mut entries = Vec::new();
+    let root_snapshot = snapshot.clone();
+    let mut entries = PlanEntries::InMemory(Vec::new());
+    let mut result_storage = PlannedResultStorage::new(maximum_bytes);
     let mut estimated_bytes = 0;
-
-    if let Some(handle) = directory_handle {
-        push_planned_entry(
-            &mut entries,
+    let mut apparent_bytes = root_snapshot.apparent_bytes;
+    {
+        let mut planning_storage = PlanningStorage {
+            entries: &mut entries,
+            result_storage: &mut result_storage,
+            temporary_storage,
+            spill_directory,
+        };
+        planning_storage.push(
             PlannedEntry {
                 relative_path: relative.clone(),
                 snapshot,
             },
             &mut estimated_bytes,
             maximum_bytes,
+            directory_target,
+            &relative,
         )?;
-        let mut pending = VecDeque::from([0_usize]);
-        let mut root_handle = Some(handle);
-        while let Some(index) = pending.pop_front() {
-            if cancelled.load(Ordering::Acquire) {
-                return Err(DeletionPlanError::Cancelled);
-            }
-            let relative_path = entries[index].relative_path.clone();
-            let expected = entries[index].snapshot.clone();
-            let handle = if index == 0 {
-                root_handle
-                    .take()
-                    .ok_or(DeletionPlanError::InvalidRelativePath)?
-            } else {
+
+        if directory_handle.is_some() {
+            drop(directory_handle);
+            let mut pending = PendingDirectories {
+                resident: Vec::new(),
+                spill: None,
+            };
+            pending
+                .push(
+                    PlannedEntry {
+                        relative_path: relative.clone(),
+                        snapshot: root_snapshot.clone(),
+                    },
+                    temporary_storage,
+                    spill_directory,
+                )
+                .map_err(|error| plan_io(&relative, error))?;
+            while let Some(directory) = pending.pop(&relative)? {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(DeletionPlanError::Cancelled);
+                }
+                let relative_path = directory.relative_path;
+                let expected = directory.snapshot;
                 let (actual, handle) = match inspect_relative(&root, &relative_path) {
                     Err(DeletionPlanError::Missing(_)) => return Err(DeletionPlanError::Changed),
                     result => result?,
@@ -405,85 +1494,75 @@ pub(crate) fn build_plan_cancellable_with_root_identity(
                 if actual != expected {
                     return Err(DeletionPlanError::Changed);
                 }
-                handle.ok_or(DeletionPlanError::Changed)?
-            };
-            let read_dir =
-                cap_fs::read_base_dir(&handle).map_err(|error| plan_io(&relative_path, error))?;
-            for child in read_dir {
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(DeletionPlanError::Cancelled);
-                }
-                let child = child.map_err(|error| plan_io(&relative_path, error))?;
-                let name = child.file_name();
-                validate_component(&name)?;
-                let child_relative = relative_path.join(&name);
-                let (child_snapshot, child_directory) =
-                    inspect_child(&handle, &name, &child_relative)?;
-                let directory = child_directory.is_some();
-                drop(child_directory);
-                let child_index = entries.len();
-                push_planned_entry(
-                    &mut entries,
-                    PlannedEntry {
+                let handle = handle.ok_or(DeletionPlanError::Changed)?;
+                let read_dir = cap_fs::read_base_dir(&handle)
+                    .map_err(|error| plan_io(&relative_path, error))?;
+                for child in read_dir {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(DeletionPlanError::Cancelled);
+                    }
+                    let child = child.map_err(|error| plan_io(&relative_path, error))?;
+                    let name = child.file_name();
+                    validate_component(&name)?;
+                    let child_relative = relative_path.join(&name);
+                    let (child_snapshot, child_directory) =
+                        inspect_child(&handle, &name, &child_relative)?;
+                    let directory = child_directory.is_some();
+                    drop(child_directory);
+                    let entry = PlannedEntry {
                         relative_path: child_relative,
                         snapshot: child_snapshot,
-                    },
-                    &mut estimated_bytes,
-                    maximum_bytes,
-                )?;
-                if directory {
-                    pending.push_back(child_index);
+                    };
+                    apparent_bytes = apparent_bytes.saturating_add(entry.snapshot.apparent_bytes);
+                    let pending_entry = directory.then(|| entry.clone());
+                    planning_storage.push(
+                        entry,
+                        &mut estimated_bytes,
+                        maximum_bytes,
+                        directory_target,
+                        &relative,
+                    )?;
+                    if let Some(directory) = pending_entry {
+                        pending
+                            .push(directory, temporary_storage, spill_directory)
+                            .map_err(|error| plan_io(&relative, error))?;
+                    }
                 }
             }
         }
-        entries.sort_by(|left, right| {
-            right
-                .relative_path
-                .components()
-                .count()
-                .cmp(&left.relative_path.components().count())
-                .then_with(|| left.relative_path.cmp(&right.relative_path))
-        });
-    } else {
-        push_planned_entry(
-            &mut entries,
-            PlannedEntry {
-                relative_path: relative.clone(),
-                snapshot,
-            },
-            &mut estimated_bytes,
-            maximum_bytes,
-        )?;
     }
     target
         .reviewed_entries
         .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    // reviewed_entries is empty for directory targets (the live walk above is
-    // the authoritative plan). For file and link targets it is always populated
-    // and the comparison detects model-vs-filesystem drift before committing.
-    if !target.reviewed_entries.is_empty()
-        && (entries.len() != target.reviewed_entries.len()
-            || entries.iter().any(|entry| {
-                target
-                    .reviewed_entries
-                    .binary_search_by(|reviewed| reviewed.relative_path.cmp(&entry.relative_path))
-                    .ok()
-                    .and_then(|index| target.reviewed_entries.get(index))
-                    .is_none_or(|reviewed| reviewed.snapshot != entry.snapshot)
-            }))
-    {
-        return Err(DeletionPlanError::Changed);
+    // Directory targets ordinarily have no retained model review: their fresh live walk above is
+    // authoritative. If a caller supplied one, compare it without materializing spilled records.
+    if !target.reviewed_entries.is_empty() {
+        let reviewed_len = u64::try_from(target.reviewed_entries.len()).unwrap_or(u64::MAX);
+        if entries.len() != reviewed_len {
+            return Err(DeletionPlanError::Changed);
+        }
+        entries.try_for_each(&relative, |entry| {
+            let matches_review = target
+                .reviewed_entries
+                .binary_search_by(|reviewed| reviewed.relative_path.cmp(&entry.relative_path))
+                .ok()
+                .and_then(|index| target.reviewed_entries.get(index))
+                .is_some_and(|reviewed| reviewed.snapshot == entry.snapshot);
+            if matches_review {
+                Ok(())
+            } else {
+                Err(DeletionPlanError::Changed)
+            }
+        })?;
     }
-    estimated_bytes = estimated_bytes.saturating_mul(2);
 
-    let apparent_bytes = entries.iter().fold(0_u128, |total, entry| {
-        total.saturating_add(entry.snapshot.apparent_bytes)
-    });
     let plan = DeletionPlan {
         target,
         root_relative_path: relative,
         scan_root_identity,
         entries,
+        result_storage,
+        root_snapshot,
         challenge,
         apparent_bytes,
         estimated_bytes,
@@ -506,22 +1585,23 @@ pub(crate) fn revalidate_plan_cancellable(
     cancelled: &AtomicBool,
 ) -> Result<(), DeletionPlanError> {
     let root = open_root(scan_root, &plan.scan_root_identity)?;
-    for entry in &plan.entries {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(DeletionPlanError::Cancelled);
-        }
-        let (actual, _) = match inspect_relative(&root, &entry.relative_path) {
-            Err(DeletionPlanError::Missing(path)) if path == plan.root_relative_path => {
-                return Err(DeletionPlanError::Missing(path));
+    plan.entries
+        .try_for_each(&plan.root_relative_path, |entry| {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(DeletionPlanError::Cancelled);
             }
-            Err(DeletionPlanError::Missing(_)) => return Err(DeletionPlanError::Changed),
-            result => result?,
-        };
-        if actual != entry.snapshot {
-            return Err(DeletionPlanError::Changed);
-        }
-    }
-    Ok(())
+            let (actual, _) = match inspect_relative(&root, &entry.relative_path) {
+                Err(DeletionPlanError::Missing(path)) if path == plan.root_relative_path => {
+                    return Err(DeletionPlanError::Missing(path));
+                }
+                Err(DeletionPlanError::Missing(_)) => return Err(DeletionPlanError::Changed),
+                result => result?,
+            };
+            if actual != entry.snapshot {
+                return Err(DeletionPlanError::Changed);
+            }
+            Ok(())
+        })
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -547,13 +1627,15 @@ pub fn execute_plan(
 #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
 pub fn execute_plan(
     scan_root: &Path,
-    plan: DeletionPlan,
+    mut plan: DeletionPlan,
     _soft_cancelled: &AtomicBool,
     _hard_cancelled: &AtomicBool,
 ) -> DeletionReport {
+    let result_storage = std::mem::replace(&mut plan.result_storage, PlannedResultStorage::new(0));
     failed_report(
         scan_root,
         plan,
+        result_storage.into_collector(),
         "permanent deletion is unavailable on this target",
     )
 }
@@ -639,7 +1721,7 @@ where
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn execute_plan_unix_with_hooks<F, G>(
     scan_root: &Path,
-    plan: DeletionPlan,
+    mut plan: DeletionPlan,
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
     mut after_isolation: F,
@@ -649,27 +1731,47 @@ where
     F: FnMut(),
     G: FnMut(&OsStr),
 {
+    let result_storage = std::mem::replace(&mut plan.result_storage, PlannedResultStorage::new(0));
+    let mut results = result_storage.into_collector();
     let root = match open_root(scan_root, &plan.scan_root_identity) {
         Ok(root) => root,
-        Err(error) => return failed_report(scan_root, plan, &error.to_string()),
+        Err(error) => return failed_report(scan_root, plan, results, &error.to_string()),
     };
-    let estimated_bytes = plan.estimated_bytes;
-    let target_node_id = plan.target.node_id;
     let root_relative_path = plan.root_relative_path.clone();
-    let planned_link_counts = planned_link_counts(&plan.entries);
-    let mut deleted_link_counts = HashMap::new();
-    let mut results = Vec::with_capacity(plan.entries.len());
+    if let Err(error) = plan.entries.try_for_each(&root_relative_path, |_| Ok(())) {
+        return failed_report(scan_root, plan, results, &error.to_string());
+    }
     let mut stopped = false;
-    for mut entry in plan.entries {
+    while let Some(mut entry) = match plan.entries.pop_reverse(&root_relative_path) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return plan_read_failure_report(
+                scan_root,
+                plan,
+                results,
+                &error,
+                soft_cancelled.load(Ordering::Acquire),
+            );
+        }
+    } {
         if stopped
             || soft_cancelled.load(Ordering::Acquire)
             || hard_cancelled.load(Ordering::Acquire)
         {
             stopped = true;
-            results.push(DeletionEntryResult {
+            let result = DeletionEntryResult {
                 entry,
                 outcome: DeletionEntryOutcome::Unattempted,
-            });
+            };
+            if let Err(error) = results.push(result) {
+                return result_storage_failure_report(
+                    scan_root,
+                    plan,
+                    results,
+                    &error,
+                    soft_cancelled.load(Ordering::Acquire),
+                );
+            }
             continue;
         }
         let outcome = execute_unix_entry(
@@ -678,25 +1780,27 @@ where
             &mut after_isolation,
             &mut after_inspection,
         );
-        if matches!(&outcome, DeletionEntryOutcome::Deleted) {
-            note_deleted_link(&mut entry, &planned_link_counts, &deleted_link_counts);
-            let file_id = entry.snapshot.identity.file_id;
-            deleted_link_counts
-                .entry(file_id)
-                .and_modify(|count| *count = count.saturating_add(1))
-                .or_insert(1);
+        if matches!(outcome, DeletionEntryOutcome::Deleted) {
+            note_deleted_link(&mut entry);
         }
-        results.push(DeletionEntryResult { entry, outcome });
+        let result = DeletionEntryResult { entry, outcome };
+        if let Err(error) = results.push(result) {
+            return result_storage_failure_report(
+                scan_root,
+                plan,
+                results,
+                &error,
+                soft_cancelled.load(Ordering::Acquire),
+            );
+        }
     }
-    DeletionReport {
-        target_node_id,
-        root_relative_path,
-        scan_root: scan_root.to_path_buf(),
-        entries: results,
-        soft_cancelled: soft_cancelled.load(Ordering::Acquire),
-        precise: !hard_cancelled.load(Ordering::Acquire),
-        estimated_bytes,
-    }
+    finish_report(
+        scan_root,
+        plan,
+        results,
+        soft_cancelled.load(Ordering::Acquire),
+        !hard_cancelled.load(Ordering::Acquire),
+    )
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -898,57 +2002,79 @@ where
 #[cfg(windows)]
 fn execute_plan_windows(
     scan_root: &Path,
-    plan: DeletionPlan,
+    mut plan: DeletionPlan,
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
     progress: Option<&AtomicU64>,
 ) -> DeletionReport {
+    let result_storage = std::mem::replace(&mut plan.result_storage, PlannedResultStorage::new(0));
+    let mut results = result_storage.into_collector();
     let root = match open_root(scan_root, &plan.scan_root_identity) {
         Ok(root) => root,
-        Err(error) => return failed_report(scan_root, plan, &error.to_string()),
+        Err(error) => return failed_report(scan_root, plan, results, &error.to_string()),
     };
-    let estimated_bytes = plan.estimated_bytes;
-    let target_node_id = plan.target.node_id;
     let root_relative_path = plan.root_relative_path.clone();
-    let planned_link_counts = planned_link_counts(&plan.entries);
-    let mut deleted_link_counts = HashMap::new();
-    let mut results = Vec::with_capacity(plan.entries.len());
+    if let Err(error) = plan.entries.try_for_each(&root_relative_path, |_| Ok(())) {
+        return failed_report(scan_root, plan, results, &error.to_string());
+    }
     let mut stopped = false;
-    for mut entry in plan.entries {
+    while let Some(mut entry) = match plan.entries.pop_reverse(&root_relative_path) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return plan_read_failure_report(
+                scan_root,
+                plan,
+                results,
+                &error,
+                soft_cancelled.load(Ordering::Acquire),
+            );
+        }
+    } {
         if stopped
             || soft_cancelled.load(Ordering::Acquire)
             || hard_cancelled.load(Ordering::Acquire)
         {
             stopped = true;
-            results.push(DeletionEntryResult {
+            let result = DeletionEntryResult {
                 entry,
                 outcome: DeletionEntryOutcome::Unattempted,
-            });
+            };
+            if let Err(error) = results.push(result) {
+                return result_storage_failure_report(
+                    scan_root,
+                    plan,
+                    results,
+                    &error,
+                    soft_cancelled.load(Ordering::Acquire),
+                );
+            }
             continue;
         }
         let outcome = execute_windows_entry(&root, &mut entry);
-        if matches!(&outcome, DeletionEntryOutcome::Deleted) {
-            note_deleted_link(&mut entry, &planned_link_counts, &deleted_link_counts);
-            let file_id = entry.snapshot.identity.file_id;
-            deleted_link_counts
-                .entry(file_id)
-                .and_modify(|count| *count = count.saturating_add(1))
-                .or_insert(1);
+        if matches!(outcome, DeletionEntryOutcome::Deleted) {
+            note_deleted_link(&mut entry);
         }
-        if let Some(p) = progress {
-            p.fetch_add(1, Ordering::Relaxed);
+        if let Some(progress) = progress {
+            progress.fetch_add(1, Ordering::Relaxed);
         }
-        results.push(DeletionEntryResult { entry, outcome });
+        let result = DeletionEntryResult { entry, outcome };
+        if let Err(error) = results.push(result) {
+            return result_storage_failure_report(
+                scan_root,
+                plan,
+                results,
+                &error,
+                soft_cancelled.load(Ordering::Acquire),
+            );
+        }
     }
-    DeletionReport {
-        target_node_id,
-        root_relative_path,
-        scan_root: scan_root.to_path_buf(),
-        entries: results,
-        soft_cancelled: soft_cancelled.load(Ordering::Acquire),
-        precise: !hard_cancelled.load(Ordering::Acquire),
-        estimated_bytes,
-    }
+    finish_report(
+        scan_root,
+        plan,
+        results,
+        soft_cancelled.load(Ordering::Acquire),
+        !hard_cancelled.load(Ordering::Acquire),
+    )
 }
 
 #[cfg(windows)]
@@ -1023,22 +2149,140 @@ fn execute_windows_entry(root: &File, entry: &mut PlannedEntry) -> DeletionEntry
     }
 }
 
-fn failed_report(scan_root: &Path, plan: DeletionPlan, message: &str) -> DeletionReport {
+fn failed_report(
+    scan_root: &Path,
+    mut plan: DeletionPlan,
+    mut results: ResultCollector,
+    message: &str,
+) -> DeletionReport {
+    let message = bounded_outcome_detail(message);
+    let root_relative_path = plan.root_relative_path.clone();
+    loop {
+        let entry = match plan.entries.pop_reverse(&root_relative_path) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                return plan_read_failure_report(scan_root, plan, results, &error, false);
+            }
+        };
+        let result = DeletionEntryResult {
+            entry,
+            outcome: DeletionEntryOutcome::Failed(message.clone()),
+        };
+        if let Err(error) = results.push(result) {
+            return result_storage_failure_report(scan_root, plan, results, &error, false);
+        }
+    }
+    finish_report(scan_root, plan, results, false, true)
+}
+
+fn plan_read_failure_report(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    mut results: ResultCollector,
+    error: &DeletionPlanError,
+    soft_cancelled: bool,
+) -> DeletionReport {
+    let marker = DeletionEntryResult {
+        entry: PlannedEntry {
+            relative_path: plan.root_relative_path.clone(),
+            snapshot: plan.root_snapshot.clone(),
+        },
+        outcome: DeletionEntryOutcome::Failed(format!(
+            "deletion plan storage failed during execution: {error}"
+        )),
+    };
+    if let Err(storage_error) = results.push(marker) {
+        return result_storage_failure_report(
+            scan_root,
+            plan,
+            results,
+            &storage_error,
+            soft_cancelled,
+        );
+    }
+    incomplete_report(
+        scan_root,
+        plan,
+        results,
+        soft_cancelled,
+        "deletion plan storage could not be read; no further entries were executed",
+    )
+}
+
+fn result_storage_failure_report(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    results: ResultCollector,
+    error: &io::Error,
+    soft_cancelled: bool,
+) -> DeletionReport {
+    incomplete_report(
+        scan_root,
+        plan,
+        results,
+        soft_cancelled,
+        &format!("deletion result storage failed during execution: {error}"),
+    )
+}
+
+fn finish_report(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    results: ResultCollector,
+    soft_cancelled: bool,
+    precise: bool,
+) -> DeletionReport {
+    report_from_parts(
+        scan_root,
+        plan,
+        results,
+        soft_cancelled,
+        precise,
+        true,
+        None,
+    )
+}
+
+fn incomplete_report(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    results: ResultCollector,
+    soft_cancelled: bool,
+    error: &str,
+) -> DeletionReport {
+    report_from_parts(
+        scan_root,
+        plan,
+        results,
+        soft_cancelled,
+        false,
+        false,
+        Some(bounded_outcome_detail(error)),
+    )
+}
+
+fn report_from_parts(
+    scan_root: &Path,
+    plan: DeletionPlan,
+    results: ResultCollector,
+    soft_cancelled: bool,
+    precise: bool,
+    complete: bool,
+    error: Option<String>,
+) -> DeletionReport {
+    let target_node_id = plan.target.node_id;
+    let root_relative_path = plan.root_relative_path;
+    let estimated_bytes = plan.estimated_bytes;
+    let entries = results.finish(&root_relative_path, complete, error);
     DeletionReport {
-        target_node_id: plan.target.node_id,
-        root_relative_path: plan.root_relative_path,
+        target_node_id,
+        root_relative_path,
         scan_root: scan_root.to_path_buf(),
-        entries: plan
-            .entries
-            .into_iter()
-            .map(|entry| DeletionEntryResult {
-                entry,
-                outcome: DeletionEntryOutcome::Failed(message.to_string()),
-            })
-            .collect(),
-        soft_cancelled: false,
-        precise: true,
-        estimated_bytes: plan.estimated_bytes,
+        entries,
+        soft_cancelled,
+        precise,
+        estimated_bytes,
     }
 }
 
@@ -1350,6 +2594,59 @@ fn relative_target(target: &FileToDelete) -> Result<PathBuf, DeletionPlanError> 
     }
 }
 
+/// The selected target's parent is structurally outside that target. It is used
+/// only on Windows, where an anonymous temporary file is not available.
+fn deletion_spill_directory(target: &Path) -> Result<&Path, DeletionPlanError> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let Some(parent) = parent else {
+        return Err(DeletionPlanError::Root);
+    };
+    if parent.starts_with(target) {
+        return Err(DeletionPlanError::Root);
+    }
+    Ok(parent)
+}
+
+fn validate_entry_for_target(entry: &Path, target: &Path) -> Result<(), DeletionPlanError> {
+    let mut target_components = target.components();
+    let mut entry_components = entry.components();
+    let mut has_target_component = false;
+    while let Some(target_component) = next_relative_component(&mut target_components)? {
+        has_target_component = true;
+        let Some(entry_component) = next_relative_component(&mut entry_components)? else {
+            return Err(DeletionPlanError::InvalidRelativePath);
+        };
+        if entry_component != target_component {
+            return Err(DeletionPlanError::InvalidRelativePath);
+        }
+    }
+    if !has_target_component {
+        return Err(DeletionPlanError::Root);
+    }
+    while next_relative_component(&mut entry_components)?.is_some() {}
+    Ok(())
+}
+
+fn next_relative_component<'a>(
+    components: &mut std::path::Components<'a>,
+) -> Result<Option<&'a OsStr>, DeletionPlanError> {
+    loop {
+        match components.next() {
+            Some(Component::Normal(component)) => {
+                validate_component(component)?;
+                return Ok(Some(component));
+            }
+            Some(Component::CurDir) => {}
+            Some(Component::ParentDir | Component::RootDir | Component::Prefix(_)) => {
+                return Err(DeletionPlanError::InvalidRelativePath);
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
 fn validated_components(path: &Path) -> Result<Vec<OsString>, DeletionPlanError> {
     let mut components = Vec::new();
     for component in path.components() {
@@ -1422,41 +2719,17 @@ fn same_object(expected: &NativeIdentity, actual: &NativeIdentity) -> bool {
     expected.file_id == actual.file_id && expected.reparse_point == actual.reparse_point
 }
 
-fn planned_link_counts(entries: &[PlannedEntry]) -> HashMap<FileId, u64> {
-    let mut counts: HashMap<FileId, u64> = HashMap::new();
-    for entry in entries {
-        if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link)
-            && entry.snapshot.identity.link_count.is_some()
-        {
-            counts
-                .entry(entry.snapshot.identity.file_id)
-                .and_modify(|count| *count = count.saturating_add(1))
-                .or_insert(1);
-        }
-    }
-    counts
-}
-
-fn note_deleted_link(
-    entry: &mut PlannedEntry,
-    planned: &HashMap<FileId, u64>,
-    deleted: &HashMap<FileId, u64>,
-) {
-    if !matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link) {
-        return;
-    }
-    let Some(actual) = entry.snapshot.identity.link_count else {
-        return;
-    };
-    let Some(planned) = planned.get(&entry.snapshot.identity.file_id).copied() else {
-        entry.snapshot.identity.link_count = None;
-        return;
-    };
-    let already_deleted = deleted
-        .get(&entry.snapshot.identity.file_id)
-        .copied()
-        .unwrap_or(0);
-    if actual > planned.saturating_sub(already_deleted) {
+fn note_deleted_link(entry: &mut PlannedEntry) {
+    if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link)
+        && entry
+            .snapshot
+            .identity
+            .link_count
+            .is_some_and(|count| count > 1)
+    {
+        // A retained hard link may be outside the reviewed deletion target. Only
+        // a final live link proves that its allocation was released, so avoid an
+        // unbounded identity-count map and retain no speculative link count.
         entry.snapshot.identity.link_count = None;
     }
 }
@@ -1624,35 +2897,45 @@ fn plan_io(path: &Path, error: io::Error) -> DeletionPlanError {
         kind: error.kind(),
     }
 }
-fn push_planned_entry(
-    entries: &mut Vec<PlannedEntry>,
-    entry: PlannedEntry,
-    estimated_bytes: &mut usize,
-    maximum_bytes: usize,
-) -> Result<(), DeletionPlanError> {
-    let required = size_of::<PlannedEntry>()
-        .saturating_add(
-            entry
-                .relative_path
-                .as_os_str()
-                .as_encoded_bytes()
-                .len()
-                .saturating_mul(2),
-        )
-        .saturating_add(128);
-    let next = estimated_bytes.saturating_add(required);
-    if next > maximum_bytes {
-        return Err(DeletionPlanError::MemoryLimit {
-            limit: maximum_bytes,
-        });
+struct PlanningStorage<'a> {
+    entries: &'a mut PlanEntries,
+    result_storage: &'a mut PlannedResultStorage,
+    temporary_storage: &'a TemporaryStorage,
+    spill_directory: &'a Path,
+}
+
+impl PlanningStorage<'_> {
+    fn push(
+        &mut self,
+        entry: PlannedEntry,
+        estimated_bytes: &mut usize,
+        maximum_bytes: usize,
+        allow_spill: bool,
+        context: &Path,
+    ) -> Result<(), DeletionPlanError> {
+        let required =
+            planned_entry_resident_bytes(&entry).saturating_add(result_entry_bound(&entry));
+        let next = estimated_bytes.saturating_add(required);
+        if next > maximum_bytes && !allow_spill {
+            return Err(DeletionPlanError::MemoryLimit {
+                limit: maximum_bytes,
+            });
+        }
+        let spill = allow_spill && next > maximum_bytes;
+        self.result_storage
+            .reserve_for(&entry, spill, self.temporary_storage, self.spill_directory)
+            .map_err(|error| plan_io(context, error))?;
+        self.entries
+            .push(entry, spill, self.temporary_storage, self.spill_directory)
+            .map_err(|error| plan_io(context, error))?;
+        *estimated_bytes = next;
+        Ok(())
     }
-    *estimated_bytes = next;
-    entries.push(entry);
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::temporary_storage::TemporaryStorage;
     use std::ffi::OsString;
     use std::sync::atomic::AtomicBool;
 
@@ -1846,7 +3129,7 @@ mod tests {
             false,
         )
         .expect("file plan should build");
-        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.planned_entries(), 1);
         assert_eq!(plan.challenge, ConfirmationChallenge::ConfirmFile);
 
         let report = execute_plan(
@@ -2147,6 +3430,656 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn directory_plan_spills_before_plan_and_result_residency_exceed_limit() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let snapshot = reviewed_snapshot(
+            &directory,
+            &std::fs::symlink_metadata(&directory).expect("target metadata should be readable"),
+        );
+        let plan_only_bytes = planned_entry_resident_bytes(&PlannedEntry {
+            relative_path: PathBuf::from("target"),
+            snapshot,
+        });
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            plan_only_bytes,
+            &temporary_storage,
+        )
+        .expect("directory plan should spill rather than retain plan and result together");
+
+        assert!(matches!(&plan.entries, PlanEntries::Spilled(_)));
+        assert!(matches!(
+            &plan.result_storage,
+            PlannedResultStorage::Spilled(_)
+        ));
+        drop(plan);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn large_directory_plan_spills_within_shared_temporary_storage() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        for index in 0..(MAX_RESIDENT_DIRECTORY_TASKS + 8) {
+            let child = directory.join(format!("child-{index}"));
+            std::fs::create_dir(&child).expect("child directory should be created");
+            std::fs::write(child.join("file"), b"payload").expect("child file should be created");
+        }
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("large directory plan should spill instead of hitting the resident limit");
+        let planned_entries = plan.planned_entries();
+        assert_eq!(
+            planned_entries,
+            u64::try_from(1 + 2 * (MAX_RESIDENT_DIRECTORY_TASKS + 8))
+                .expect("fixture entry count should fit"),
+        );
+        assert!(matches!(&plan.entries, PlanEntries::Spilled(_)));
+        assert!(temporary_storage.used() > 0);
+        assert!(temporary_storage.used() <= 2 * 1024 * 1024);
+        revalidate_plan(root.path(), &plan).expect("spilled plan should revalidate before consent");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), planned_entries);
+        assert_eq!(report.unattempted_entries(), 0);
+        assert_eq!(
+            u64::try_from(report.entries.len()).expect("report entry count should fit"),
+            planned_entries,
+        );
+        let reported = report
+            .entries
+            .iter()
+            .try_fold(0_u64, |count, result| {
+                result.map(|_| count.saturating_add(1))
+            })
+            .expect("spilled result should stream every entry");
+        assert_eq!(reported, planned_entries);
+        assert!(!directory.exists());
+        assert!(report.entries.is_spilled());
+        assert!(report.reporting_complete());
+        assert!(temporary_storage.used() > 0);
+        drop(report);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn tampered_spilled_plan_record_is_rejected_before_execution() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let child = directory.join("planned");
+        std::fs::write(&child, b"payload").expect("planned child should be created");
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let mut plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("directory plan should spill");
+        let PlanEntries::Spilled(spilled) = &mut plan.entries else {
+            panic!("directory plan should use a spill file");
+        };
+        let spill = spilled.get_mut();
+        let file = plan_spill_file_mut(&mut spill.file);
+        file.seek(SeekFrom::Start(SPILL_RECORD_LENGTH_BYTES))
+            .expect("spill payload should be seekable");
+        file.write_all(&[0])
+            .expect("spill payload should be mutable for the adversarial fixture");
+
+        assert!(matches!(
+            revalidate_plan(root.path(), &plan),
+            Err(DeletionPlanError::Io {
+                kind: io::ErrorKind::InvalidData,
+                ..
+            })
+        ));
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert!(!report.reporting_complete());
+        assert!(directory.exists());
+        assert!(child.exists());
+        drop(report);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn tampered_spilled_result_record_returns_a_bounded_read_error() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        std::fs::write(directory.join("planned"), b"payload")
+            .expect("planned child should be created");
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("directory plan should spill");
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        let DeletionEntriesStorage::Spilled(result_spill) = &report.entries.storage else {
+            panic!("spilled directory result should use a spill file");
+        };
+        {
+            let mut result_spill = result_spill
+                .lock()
+                .expect("result spill should not be poisoned");
+            let file = plan_spill_file_mut(&mut result_spill.file);
+            file.seek(SeekFrom::Start(SPILL_RECORD_LENGTH_BYTES))
+                .expect("result payload should be seekable");
+            file.write_all(&[0])
+                .expect("result payload should be mutable for the adversarial fixture");
+        }
+
+        let error = report
+            .entries
+            .iter()
+            .next()
+            .expect("result iterator should yield its first record")
+            .expect_err("tampered result record should fail authentication");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(report.deleted_entries(), 2);
+        drop(report);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn oversized_spilled_plan_record_is_rejected_without_execution() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let mut plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("directory plan should spill");
+        let PlanEntries::Spilled(spilled) = &mut plan.entries else {
+            panic!("directory plan should use a spill file");
+        };
+        let file = plan_spill_file_mut(&mut spilled.get_mut().file);
+        file.seek(SeekFrom::Start(0))
+            .expect("spill header should be seekable");
+        file.write_all(&u64::MAX.to_le_bytes())
+            .expect("spill header should be mutable for the adversarial fixture");
+
+        assert!(matches!(
+            revalidate_plan(root.path(), &plan),
+            Err(DeletionPlanError::Io {
+                kind: io::ErrorKind::InvalidData,
+                ..
+            })
+        ));
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert!(!report.reporting_complete());
+        assert!(directory.exists());
+        drop(report);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn cross_subtree_spilled_plan_record_is_rejected_before_execution() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let child = directory.join("planned");
+        std::fs::write(&child, b"payload").expect("planned child should be created");
+        let sibling = root.path().join("sibling");
+        std::fs::write(&sibling, b"sibling").expect("sibling should be created");
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let mut plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("directory plan should spill");
+        let sibling_snapshot = reviewed_snapshot(
+            &sibling,
+            &std::fs::symlink_metadata(&sibling).expect("sibling metadata should be readable"),
+        );
+        let mut injected =
+            RecordSpill::new(&temporary_storage, MAX_PLAN_SPILL_RECORD_BYTES, root.path())
+                .expect("spill should open");
+        injected
+            .push(
+                &encode_spilled_entry(&PlannedEntry {
+                    relative_path: PathBuf::from("sibling"),
+                    snapshot: sibling_snapshot,
+                })
+                .expect("sibling entry should encode"),
+            )
+            .expect("sibling entry should spill");
+        plan.entries = PlanEntries::Spilled(RefCell::new(injected));
+
+        assert!(matches!(
+            revalidate_plan(root.path(), &plan),
+            Err(DeletionPlanError::InvalidRelativePath)
+        ));
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert!(!report.reporting_complete());
+        assert!(directory.exists());
+        assert!(child.exists());
+        assert!(sibling.exists());
+        drop(report);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn deletion_spill_directory_uses_target_parent() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).expect("target directory should be created");
+
+        assert_eq!(
+            deletion_spill_directory(&target).expect("target parent should be usable"),
+            root.path(),
+        );
+    }
+
+    #[test]
+    fn pending_spill_rejects_cross_subtree_record() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let sibling = root.path().join("sibling");
+        std::fs::write(&sibling, b"sibling").expect("sibling should be created");
+        let snapshot = reviewed_snapshot(
+            &sibling,
+            &std::fs::symlink_metadata(&sibling).expect("sibling metadata should be readable"),
+        );
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let mut spill =
+            RecordSpill::new(&temporary_storage, MAX_PLAN_SPILL_RECORD_BYTES, root.path())
+                .expect("spill should open");
+        spill
+            .push(
+                &encode_spilled_entry(&PlannedEntry {
+                    relative_path: PathBuf::from("sibling"),
+                    snapshot,
+                })
+                .expect("sibling entry should encode"),
+            )
+            .expect("sibling entry should spill");
+        let mut pending = PendingDirectories {
+            resident: Vec::new(),
+            spill: Some(spill),
+        };
+
+        assert!(matches!(
+            pending.pop(Path::new("target")),
+            Err(DeletionPlanError::InvalidRelativePath)
+        ));
+        drop(pending);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn spilled_result_rejects_cross_subtree_record() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let sibling = root.path().join("sibling");
+        std::fs::write(&sibling, b"sibling").expect("sibling should be created");
+        let snapshot = reviewed_snapshot(
+            &sibling,
+            &std::fs::symlink_metadata(&sibling).expect("sibling metadata should be readable"),
+        );
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let mut spill = RecordSpill::new(
+            &temporary_storage,
+            MAX_RESULT_SPILL_RECORD_BYTES,
+            root.path(),
+        )
+        .expect("spill should open");
+        spill
+            .push(
+                &encode_spilled_result(&DeletionEntryResult {
+                    entry: PlannedEntry {
+                        relative_path: PathBuf::from("sibling"),
+                        snapshot,
+                    },
+                    outcome: DeletionEntryOutcome::Deleted,
+                })
+                .expect("sibling result should encode"),
+            )
+            .expect("sibling result should spill");
+        let entries = DeletionEntries::spilled(
+            PathBuf::from("target"),
+            spill,
+            DeletionSummary::default(),
+            true,
+            None,
+        );
+
+        let error = entries
+            .iter()
+            .next()
+            .expect("result iterator should yield its first record")
+            .expect_err("cross-subtree result must fail validation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(entries);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn result_spill_capacity_is_reserved_before_consent() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let mut initial_target = target(root.path(), OsString::from("target"), FileType::Folder);
+        initial_target.reviewed_entries.clear();
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            initial_target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("directory plan should spill");
+        let plan_bytes = match &plan.entries {
+            PlanEntries::InMemory(_) => panic!("directory plan should use a spill file"),
+            PlanEntries::Spilled(spill) => spill.borrow().reservation.bytes(),
+        };
+        let result_bytes = match &plan.result_storage {
+            PlannedResultStorage::InMemory { .. } => {
+                panic!("spilled directory plan should reserve spilled results")
+            }
+            PlannedResultStorage::Spilled(spill) => spill.reservation.bytes(),
+        };
+        drop(plan);
+        assert_eq!(temporary_storage.used(), 0);
+
+        let capacity = plan_bytes
+            .checked_add(result_bytes)
+            .and_then(|total| total.checked_sub(1))
+            .expect("fixture reservation should be nonzero");
+        let constrained_storage = TemporaryStorage::with_limit_bytes(capacity);
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let error = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &constrained_storage,
+        )
+        .expect_err("result capacity must be reserved before consent");
+        assert!(matches!(
+            error,
+            DeletionPlanError::Io {
+                kind: io::ErrorKind::StorageFull,
+                ..
+            }
+        ));
+        assert!(directory.exists());
+        assert_eq!(constrained_storage.used(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spilled_directory_plan_preserves_large_hard_link_accounting() {
+        const LINKS: usize = 96;
+
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let first = directory.join("link-0");
+        std::fs::write(&first, b"payload").expect("hard-link source should be created");
+        for index in 1..LINKS {
+            std::fs::hard_link(&first, directory.join(format!("link-{index}")))
+                .expect("hard link should be created");
+        }
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("hard-link directory plan should spill");
+        let mut allocation = None;
+        plan.entries
+            .try_for_each(Path::new("target"), |entry| {
+                if entry.relative_path == Path::new("target/link-0") {
+                    allocation = entry.snapshot.allocated_bytes;
+                }
+                Ok(())
+            })
+            .expect("spilled plan should be readable");
+        let allocation = allocation.expect("hard-link allocation should be known");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert!(report.entries.is_spilled());
+        assert!(report.reporting_complete());
+        assert_eq!(
+            report.deleted_entries(),
+            u64::try_from(LINKS + 1).expect("fixture entry count should fit"),
+        );
+        assert_eq!(report.deleted_allocated_bytes(), allocation);
+        assert!(!directory.exists());
+        drop(report);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn spilled_directory_plan_revalidation_rejects_replacement_before_consent() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let planned = directory.join("planned");
+        std::fs::write(&planned, b"original").expect("planned child should be created");
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("directory plan should spill");
+        assert!(matches!(&plan.entries, PlanEntries::Spilled(_)));
+
+        let original = directory.join("original");
+        std::fs::rename(&planned, &original).expect("reviewed identity should be displaced");
+        std::fs::write(&planned, b"replacement").expect("replacement should be created");
+
+        assert!(matches!(
+            revalidate_plan(root.path(), &plan),
+            Err(DeletionPlanError::Changed)
+        ));
+        assert!(directory.exists());
+        assert!(original.exists());
+        assert!(planned.exists());
+        drop(plan);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn spilled_directory_plan_soft_cancel_reports_every_identity() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        for index in 0..8 {
+            std::fs::write(directory.join(format!("file-{index}")), b"payload")
+                .expect("planned child should be created");
+        }
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("directory plan should spill");
+        let planned_entries = plan.planned_entries();
+        assert!(matches!(&plan.entries, PlanEntries::Spilled(_)));
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(true),
+            &AtomicBool::new(false),
+        );
+
+        assert!(report.soft_cancelled);
+        assert_eq!(report.unattempted_entries(), planned_entries);
+        assert_eq!(
+            u64::try_from(report.entries.len()).expect("report entry count should fit"),
+            planned_entries,
+        );
+        assert!(directory.exists());
+        for index in 0..8 {
+            assert!(directory.join(format!("file-{index}")).exists());
+        }
+        assert!(report.entries.is_spilled());
+        assert!(report.reporting_complete());
+        assert!(temporary_storage.used() > 0);
+        drop(report);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn directory_plan_storage_exhaustion_stops_before_consent() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let planned = directory.join("planned");
+        std::fs::write(&planned, b"payload").expect("planned child should be created");
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(0);
+
+        let error = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            0,
+            &temporary_storage,
+        )
+        .expect_err("an unretainable directory plan must never reach confirmation");
+
+        assert!(matches!(
+            error,
+            DeletionPlanError::Io {
+                kind: io::ErrorKind::StorageFull,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("--temporary-storage-mib"));
+        assert!(directory.exists());
+        assert!(planned.exists());
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn cancelled_spilled_directory_plan_releases_storage() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        let planned = directory.join("planned");
+        std::fs::write(&planned, b"payload").expect("planned child should be created");
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+
+        assert!(matches!(
+            build_plan_cancellable_with_temporary_storage(
+                root.path(),
+                target,
+                false,
+                &AtomicBool::new(true),
+                0,
+                &temporary_storage,
+            ),
+            Err(DeletionPlanError::Cancelled)
+        ));
+        assert!(directory.exists());
+        assert!(planned.exists());
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn deep_plan_does_not_retain_one_handle_per_level() {
@@ -2199,13 +4132,10 @@ mod tests {
             false,
         )
         .expect("link plan should build without following it");
-        assert_eq!(
-            plan.root_snapshot().map(|snapshot| snapshot.kind),
-            Some(PlannedKind::Link)
-        );
+        assert_eq!(plan.root_snapshot().kind, PlannedKind::Link);
         let link_allocation = plan
             .root_snapshot()
-            .and_then(|snapshot| snapshot.allocated_bytes)
+            .allocated_bytes
             .expect("link-object allocation should be known");
 
         let report = execute_plan(
@@ -2236,10 +4166,7 @@ mod tests {
             false,
         )
         .expect("a link to a mount root should not follow its target");
-        assert_eq!(
-            plan.root_snapshot().map(|snapshot| snapshot.kind),
-            Some(PlannedKind::Link)
-        );
+        assert_eq!(plan.root_snapshot().kind, PlannedKind::Link);
     }
 
     #[cfg(windows)]
@@ -2280,13 +4207,10 @@ mod tests {
             false,
         )
         .expect("junction plan should build without following its target");
-        assert_eq!(
-            plan.root_snapshot().map(|snapshot| snapshot.kind),
-            Some(PlannedKind::Link)
-        );
+        assert_eq!(plan.root_snapshot().kind, PlannedKind::Link);
         let junction_allocation = plan
             .root_snapshot()
-            .and_then(|snapshot| snapshot.allocated_bytes)
+            .allocated_bytes
             .expect("reparse-object allocation should be known");
 
         let report = execute_plan(
@@ -2465,7 +4389,7 @@ mod tests {
         .expect("first hard-link plan should build");
         let first_allocated = first_plan
             .root_snapshot()
-            .and_then(|snapshot| snapshot.allocated_bytes)
+            .allocated_bytes
             .expect("first allocation should be known");
         let first_report = execute_plan(
             root.path(),
@@ -2540,12 +4464,16 @@ mod tests {
             false,
         )
         .expect("directory plan should build");
-        let allocated = plan
-            .entries
-            .iter()
-            .find(|entry| entry.relative_path == Path::new("target/first"))
-            .and_then(|entry| entry.snapshot.allocated_bytes)
-            .expect("allocation should be known");
+        let mut allocated = None;
+        plan.entries
+            .try_for_each(Path::new("target"), |entry| {
+                if entry.relative_path == Path::new("target/first") {
+                    allocated = entry.snapshot.allocated_bytes;
+                }
+                Ok(())
+            })
+            .expect("directory plan should be readable");
+        let allocated = allocated.expect("allocation should be known");
 
         let report = execute_plan(
             root.path(),
