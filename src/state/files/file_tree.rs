@@ -14,6 +14,7 @@ use crate::model::{
 };
 use crate::native_path::NativeIdentity;
 use crate::state::tiles::{FileMetadata, files_in_folder};
+use crate::temporary_storage::TemporaryStorage;
 use file_id::FileId;
 
 struct RescanStage {
@@ -42,8 +43,26 @@ impl FileTree {
         show_apparent_size: bool,
         process_memory_mib: usize,
     ) -> Result<Self, ModelError> {
+        Self::new_with_temporary_storage(
+            path_in_filesystem,
+            show_apparent_size,
+            process_memory_mib,
+            TemporaryStorage::default(),
+        )
+    }
+
+    pub(crate) fn new_with_temporary_storage(
+        path_in_filesystem: PathBuf,
+        show_apparent_size: bool,
+        process_memory_mib: usize,
+        temporary_storage: TemporaryStorage,
+    ) -> Result<Self, ModelError> {
         let budget = MemoryBudget::from_mib(process_memory_mib)?;
-        let arena = Arena::new(path_in_filesystem.clone(), budget)?;
+        let arena = Arena::new_with_temporary_storage(
+            path_in_filesystem.clone(),
+            budget,
+            temporary_storage,
+        )?;
         Ok(Self {
             current_path: vec![arena.root()],
             arena,
@@ -64,9 +83,30 @@ impl FileTree {
         show_apparent_size: bool,
         process_memory_mib: usize,
     ) -> Result<Self, ModelError> {
+        Self::new_with_root_identity_and_temporary_storage(
+            path_in_filesystem,
+            root_identity,
+            show_apparent_size,
+            process_memory_mib,
+            TemporaryStorage::default(),
+        )
+    }
+
+    pub(crate) fn new_with_root_identity_and_temporary_storage(
+        path_in_filesystem: PathBuf,
+        root_identity: NativeIdentity,
+        show_apparent_size: bool,
+        process_memory_mib: usize,
+        temporary_storage: TemporaryStorage,
+    ) -> Result<Self, ModelError> {
         validate_scan_root_identity(&path_in_filesystem, &root_identity)
             .map_err(|error| ModelError::Invariant(error.to_string()))?;
-        let mut tree = Self::new(path_in_filesystem, show_apparent_size, process_memory_mib)?;
+        let mut tree = Self::new_with_temporary_storage(
+            path_in_filesystem,
+            show_apparent_size,
+            process_memory_mib,
+            temporary_storage,
+        )?;
         tree.root_identity = Some(root_identity.clone());
         tree.arena.set_root_identity(root_identity);
         Ok(tree)
@@ -478,7 +518,11 @@ impl FileTree {
         let budget = MemoryBudget::from_model_limit(remaining)?;
         self.rescan = Some(RescanStage {
             target_id,
-            arena: Arena::new(target, budget)?,
+            arena: Arena::new_with_temporary_storage(
+                target,
+                budget,
+                self.arena.temporary_storage(),
+            )?,
             filter,
             filter_root,
         });

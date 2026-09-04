@@ -4,7 +4,7 @@
 .SH NAME
 excise
 .SH SYNOPSIS
-\fBexcise\fR [\fB\-\-config\fR] [\fB\-a\fR|\fB\-\-apparent\-size\fR] [\fB\-\-scan\-threads\fR] [\fB\-\-event\-buffer\fR] [\fB\-\-cross\-filesystems\fR] [\fB\-\-exclude\fR] [\fB\-\-memory\-mib\fR] [\fB\-\-reduced\-motion\fR] [\fB\-\-theme\fR] [\fB\-\-ascii\fR] [\fB\-\-mouse\fR] [\fB\-\-keymap\fR] [\fB\-\-format\fR] [\fB\-\-output\fR] [\fB\-d\fR|\fB\-\-disable\-delete\-confirmation\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIfolder\fR]
+\fBexcise\fR [\fB\-\-config\fR] [\fB\-a\fR|\fB\-\-apparent\-size\fR] [\fB\-\-scan\-threads\fR] [\fB\-\-event\-buffer\fR] [\fB\-\-cross\-filesystems\fR] [\fB\-\-exclude\fR] [\fB\-\-memory\-mib\fR] [\fB\-\-temporary\-storage\-mib\fR] [\fB\-\-reduced\-motion\fR] [\fB\-\-theme\fR] [\fB\-\-ascii\fR] [\fB\-\-mouse\fR] [\fB\-\-keymap\fR] [\fB\-\-format\fR] [\fB\-\-output\fR] [\fB\-d\fR|\fB\-\-disable\-delete\-confirmation\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIfolder\fR]
 .SH DESCRIPTION
 .SH OPTIONS
 .TP
@@ -28,6 +28,9 @@ Ordered gitignore\-style exclusion pattern
 .TP
 \fB\-\-memory\-mib\fR \fI<MIB>\fR
 Whole\-process memory envelope in MiB
+.TP
+\fB\-\-temporary\-storage\-mib\fR \fI<MIB>\fR
+Combined scanner\-task and identity temporary storage limit per session (2+)
 .TP
 \fB\-\-reduced\-motion\fR
 Disable nonessential motion

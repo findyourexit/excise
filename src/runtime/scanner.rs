@@ -16,6 +16,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use super::worker::{ScannedEntry, WorkerEvent, send_event};
 use crate::model::UnscannedReason;
 use crate::native_path::{EncodedNativePath, NativeIdentity, NativePath, identity_for};
+use crate::temporary_storage::{TemporaryStorage, TemporaryStorageReservation};
 
 // The owner stages each batch and applies one entry per input poll. Keep batches
 // bounded so backpressure stays small while the map is navigating.
@@ -24,6 +25,7 @@ const BATCH_SIZE: usize = 32;
 const TASK_QUEUE_PER_WORKER: usize = 8;
 const MAX_SPILLED_TASK_BYTES: usize = 1024 * 1024;
 const SPILL_LENGTH_BYTES: u64 = 8;
+const TASK_SPILL_COMPACTION_BYTES: u64 = 64 * 1024;
 #[cfg(windows)]
 type TaskSpillFile = tempfile::NamedTempFile;
 #[cfg(not(windows))]
@@ -37,6 +39,7 @@ pub struct ScannerOptions {
     pub cross_filesystems: bool,
     pub exclusions: Vec<String>,
     pub internal_paths: Vec<PathBuf>,
+    pub temporary_storage: TemporaryStorage,
 }
 
 #[derive(Clone)]
@@ -63,10 +66,11 @@ struct TaskSpill {
     next_read: u64,
     next_write: u64,
     pending: usize,
+    reservation: TemporaryStorageReservation,
 }
 
 impl TaskSpill {
-    fn new() -> io::Result<(Self, Option<PathBuf>)> {
+    fn new(temporary_storage: &TemporaryStorage) -> io::Result<(Self, Option<PathBuf>)> {
         #[cfg(windows)]
         let (file, spill_path) = {
             let file = tempfile::NamedTempFile::new()?;
@@ -84,6 +88,7 @@ impl TaskSpill {
                 next_read: 0,
                 next_write: 0,
                 pending: 0,
+                reservation: temporary_storage.reservation(0)?,
             },
             spill_path,
         ))
@@ -114,6 +119,7 @@ impl TaskSpill {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("scanner task spill count overflow"))?;
 
+        self.reservation.grow_to(next_write)?;
         self.file.seek(SeekFrom::Start(self.next_write))?;
         self.file.write_all(&payload_len.to_le_bytes())?;
         self.file.write_all(&payload)?;
@@ -164,18 +170,82 @@ impl TaskSpill {
         if self.pending == 0 {
             self.next_read = 0;
             self.next_write = 0;
-            #[cfg(windows)]
-            let _ = self.file.as_file().set_len(0);
-            #[cfg(not(windows))]
-            let _ = self.file.set_len(0);
+            self.truncate(0)?;
+            self.reservation.shrink_to(0);
+        } else {
+            self.compact_after_read()?;
         }
         Ok(Some(DirectoryTask { path, identity }))
+    }
+
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            self.file.as_file().set_len(len)
+        }
+        #[cfg(not(windows))]
+        {
+            self.file.set_len(len)
+        }
+    }
+
+    fn compact_after_read(&mut self) -> io::Result<()> {
+        let remaining = self
+            .next_write
+            .checked_sub(self.next_read)
+            .ok_or_else(|| io::Error::other("scanner task spill offsets are out of order"))?;
+        if remaining == 0 {
+            return Err(io::Error::other(
+                "scanner task spill has queued tasks without record data",
+            ));
+        }
+        let compact_after = self.reservation.bytes().min(TASK_SPILL_COMPACTION_BYTES);
+        if self.next_read < compact_after && self.next_read < remaining {
+            return Ok(());
+        }
+
+        let buffer_len = usize::try_from(remaining.min(TASK_SPILL_COMPACTION_BYTES))
+            .map_err(|_| io::Error::other("scanner task spill compaction buffer is too large"))?;
+        let mut buffer = vec![0_u8; buffer_len];
+        let mut source = self.next_read;
+        let mut destination = 0_u64;
+        let mut bytes_left = remaining;
+        while bytes_left > 0 {
+            let chunk =
+                usize::try_from(bytes_left.min(TASK_SPILL_COMPACTION_BYTES)).map_err(|_| {
+                    io::Error::other("scanner task spill compaction chunk is too large")
+                })?;
+            self.file.seek(SeekFrom::Start(source))?;
+            self.file.read_exact(&mut buffer[..chunk])?;
+            self.file.seek(SeekFrom::Start(destination))?;
+            self.file.write_all(&buffer[..chunk])?;
+            let chunk = u64::try_from(chunk)
+                .map_err(|_| io::Error::other("scanner task spill compaction chunk overflow"))?;
+            source = source
+                .checked_add(chunk)
+                .ok_or_else(|| io::Error::other("scanner task spill offset overflow"))?;
+            destination = destination
+                .checked_add(chunk)
+                .ok_or_else(|| io::Error::other("scanner task spill offset overflow"))?;
+            bytes_left = bytes_left
+                .checked_sub(chunk)
+                .ok_or_else(|| io::Error::other("scanner task spill compaction underflow"))?;
+        }
+        self.truncate(remaining)?;
+        self.reservation.shrink_to(remaining);
+        self.next_read = 0;
+        self.next_write = remaining;
+        Ok(())
     }
 }
 
 impl TaskQueue {
-    fn new(root: PathBuf, capacity: usize) -> io::Result<(Self, Option<PathBuf>)> {
-        let (spill, spill_path) = TaskSpill::new()?;
+    fn new(
+        root: PathBuf,
+        capacity: usize,
+        temporary_storage: &TemporaryStorage,
+    ) -> io::Result<(Self, Option<PathBuf>)> {
+        let (spill, spill_path) = TaskSpill::new(temporary_storage)?;
         Ok((
             Self {
                 state: Mutex::new(QueueState {
@@ -350,6 +420,7 @@ pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancell
         cross_filesystems,
         exclusions: exclusion_patterns,
         internal_paths,
+        temporary_storage,
     } = options;
     if let Err(message) = validate_scan_root(&root, root_identity.as_ref()) {
         let _ = send_event(
@@ -447,6 +518,7 @@ pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancell
     let (queue, task_spill_path) = match TaskQueue::new(
         root.clone(),
         threads.saturating_mul(TASK_QUEUE_PER_WORKER).max(1),
+        &temporary_storage,
     ) {
         Ok(queue) => queue,
         Err(error) => {
@@ -1264,8 +1336,9 @@ mod tests {
 
     #[test]
     fn task_queue_spills_overflow_without_growing_the_resident_queue() {
-        let (queue, task_spill_path) = TaskQueue::new(PathBuf::from("/scan-root"), 1)
-            .expect("scanner task spill should be available");
+        let (queue, task_spill_path) =
+            TaskQueue::new(PathBuf::from("/scan-root"), 1, &TemporaryStorage::default())
+                .expect("scanner task spill should be available");
         #[cfg(windows)]
         {
             let task_spill_path = task_spill_path.expect("Windows task spill should be named");
@@ -1303,9 +1376,182 @@ mod tests {
     }
 
     #[test]
+    fn task_queue_enforces_a_total_spill_limit_and_reclaims_drained_records() {
+        let root = PathBuf::from("/scan-root");
+        let task = DirectoryTask {
+            path: root.join("queued"),
+            identity: None,
+        };
+        let payload = serde_json::to_vec(&(
+            NativePath::new(task.path.clone()).encode(),
+            task.identity.clone(),
+        ))
+        .expect("task fixture should serialize");
+        let record_bytes = SPILL_LENGTH_BYTES
+            .checked_add(u64::try_from(payload.len()).expect("task fixture length should fit"))
+            .expect("task fixture record size should fit");
+        let temporary_storage = TemporaryStorage::with_limit_bytes(record_bytes);
+        let (queue, _) = TaskQueue::new(root.clone(), 1, &temporary_storage)
+            .expect("scanner task queue should open");
+
+        queue
+            .schedule(task.clone())
+            .expect("one spill record should fit the session limit");
+        let error = queue
+            .schedule(task)
+            .expect_err("a second spill record must not exceed the session limit");
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert!(error.to_string().contains("--temporary-storage-mib"));
+        {
+            let state = queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.tasks.len(), 1);
+            assert_eq!(state.spill.pending, 1);
+        }
+        assert_eq!(temporary_storage.used(), record_bytes);
+
+        let cancelled = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let root_invalid = AtomicBool::new(false);
+        let root_task = queue
+            .take(&cancelled, &failed, &root_invalid)
+            .expect("resident task should be available")
+            .expect("resident task should exist");
+        assert_eq!(root_task.path, root);
+        queue.complete();
+        let queued_task = queue
+            .take(&cancelled, &failed, &root_invalid)
+            .expect("spilled task should be available")
+            .expect("spilled task should exist");
+        assert_eq!(queued_task.path, root.join("queued"));
+        queue.complete();
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn task_spill_compacts_consumed_records_before_the_queue_drains() {
+        let root = PathBuf::from("/scan-root");
+        let task = DirectoryTask {
+            path: root.join("queued"),
+            identity: None,
+        };
+        let payload = serde_json::to_vec(&(
+            NativePath::new(task.path.clone()).encode(),
+            task.identity.clone(),
+        ))
+        .expect("task fixture should serialize");
+        let record_bytes = SPILL_LENGTH_BYTES
+            .checked_add(u64::try_from(payload.len()).expect("task fixture length should fit"))
+            .expect("task fixture record size should fit");
+        let temporary_storage = TemporaryStorage::with_limit_bytes(
+            record_bytes
+                .checked_mul(2)
+                .expect("two task records should fit in the test limit"),
+        );
+        let (queue, _) = TaskQueue::new(root.clone(), 1, &temporary_storage)
+            .expect("scanner task queue should open");
+        queue
+            .schedule(task.clone())
+            .expect("first spill record should fit");
+        queue
+            .schedule(task.clone())
+            .expect("second spill record should fit");
+
+        let cancelled = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let root_invalid = AtomicBool::new(false);
+        queue
+            .take(&cancelled, &failed, &root_invalid)
+            .expect("resident task should be available")
+            .expect("resident task should exist");
+        queue.complete();
+        queue
+            .take(&cancelled, &failed, &root_invalid)
+            .expect("first spilled task should be available")
+            .expect("first spilled task should exist");
+        queue.complete();
+        assert_eq!(temporary_storage.used(), record_bytes);
+
+        queue
+            .schedule(task.clone())
+            .expect("resident capacity should remain bounded");
+        queue
+            .schedule(task)
+            .expect("compaction should free capacity for the next spill record");
+        assert_eq!(
+            temporary_storage.used(),
+            record_bytes.checked_mul(2).expect("test limit should fit")
+        );
+        drop(queue);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn scanner_reports_temporary_storage_exhaustion_without_completing_the_root() {
+        use crossbeam_channel::unbounded;
+
+        let root = tempfile::tempdir().expect("scan root should exist");
+        for index in 0..=TASK_QUEUE_PER_WORKER {
+            fs::create_dir(root.path().join(format!("directory-{index}")))
+                .expect("directory fixture should be created");
+        }
+        let (sender, events) = unbounded();
+        let cancelled = AtomicBool::new(false);
+        run(
+            ScannerOptions {
+                root: root.path().to_path_buf(),
+                root_identity: None,
+                threads: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                internal_paths: Vec::new(),
+                temporary_storage: TemporaryStorage::with_limit_bytes(0),
+            },
+            &sender,
+            &cancelled,
+        );
+
+        let mut saw_capacity_error = false;
+        let mut completed_root = false;
+        let mut finished = false;
+        for event in events.try_iter() {
+            match event {
+                WorkerEvent::ScanFailed { message, .. } => {
+                    saw_capacity_error |= message.contains("temporary storage capacity exhausted")
+                        && message.contains("--temporary-storage-mib");
+                }
+                WorkerEvent::ScanDirectoryComplete { path, .. } => {
+                    completed_root |= path == root.path();
+                }
+                WorkerEvent::ScanFinished { cancelled } => finished |= !cancelled,
+                WorkerEvent::ScanBatch { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        assert!(
+            saw_capacity_error,
+            "temporary-storage exhaustion should be actionable"
+        );
+        assert!(
+            finished,
+            "scanner should report a terminal event after failure"
+        );
+        assert!(
+            !completed_root,
+            "a capacity failure must not report the partially queued root as complete"
+        );
+    }
+
+    #[test]
     fn task_queue_rejects_corrupt_spill_paths_outside_root() {
         let root = PathBuf::from("/scan-root");
-        let (queue, _) = TaskQueue::new(root.clone(), 1).expect("scanner task queue should open");
+        let (queue, _) = TaskQueue::new(root.clone(), 1, &TemporaryStorage::default())
+            .expect("scanner task queue should open");
         let cancelled = AtomicBool::new(false);
         let failed = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
@@ -1393,7 +1639,7 @@ mod tests {
             .expect("descendant identity should be available");
         replace_directory_with_link(&descendant, &displaced, outside.path());
 
-        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1)
+        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
             .expect("scanner task queue should be available");
         let (sender, events) = bounded(4);
         let cancelled = AtomicBool::new(false);
@@ -1458,7 +1704,7 @@ mod tests {
             .expect("descendant identity should be available");
         replace_after_next_validation(descendant.clone(), displaced, outside.path().to_path_buf());
 
-        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1)
+        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
             .expect("scanner task queue should be available");
         let (sender, events) = bounded(8);
         let cancelled = AtomicBool::new(false);
@@ -1548,7 +1794,7 @@ mod tests {
         let escaped_path = descendant.join("outside-only");
         fs::write(&outside_only, b"outside").expect("outside fixture should be written");
 
-        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1)
+        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
             .expect("scanner task queue should be available");
         let (sender, events) = bounded(8);
         let cancelled = AtomicBool::new(false);
@@ -1637,7 +1883,7 @@ mod tests {
         tree.add_entry(&metadata, &descendant, identity.clone())
             .expect("descendant should be represented");
 
-        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1)
+        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
             .expect("scanner task queue should be available");
         let (sender, events) = bounded(8);
         let cancelled = AtomicBool::new(false);

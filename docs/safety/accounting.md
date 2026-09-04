@@ -44,7 +44,9 @@ Version 1.0 counts file identities rather than physical storage blocks. Copy-on-
 
 ## Memory & Temporary Storage
 
-Identity tracking can use a permission-restricted, session-only temporary store when the records do not fit in memory. If exact tracking cannot continue safely, Excise stops with an actionable error rather than weakening the accounting definition.
+Each scan session has one fixed temporary-storage budget, 512 MiB by default, shared by queued scanner directory tasks and private identity spill files. The session marker and every owned file reserve capacity before they grow, release it only after the file is shrunk or removed, and remain inside the existing private-path and active-session checks.
+
+If queued scanner work cannot reserve capacity, the scanner reports an actionable failure and does not complete that partial scan as exact. If identity persistence cannot reserve capacity, exact accounting stops with an actionable error rather than weakening the accounting definition. Capacity failures neither drop queued work silently nor leave owned temporary files outside the session accounting.
 
 ## Map Invariants
 

@@ -113,7 +113,7 @@ Configuration takes values in this order: command line, environment, versioned T
 ## What Excise Does
 
 - **Careful space accounting:** Excise keeps the disk space assigned to files separate from their file length. It counts files with more than one name once and keeps unknown values unknown.
-- **Clear limits:** Scan queues, worker counts, memory use, temporary file records, reports, and interface history have explicit limits.
+- **Clear limits:** Scan queues, worker counts, memory use, per-session temporary storage, reports, and interface history have explicit limits.
 - **Safe review before deletion:** Deletion plans record the files and folders that were reviewed. Excise does not follow links, checks for changes before deletion, and never includes new entries silently.
 - **Reliable terminal behavior:** The terminal is restored after normal exit, errors, panics, cancellation, and forced interruption.
 - **Accessible interaction:** Keyboard controls, narrow layouts, plain ASCII output, monochrome output, and reduced motion preserve the important safety information.

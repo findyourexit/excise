@@ -15,6 +15,7 @@ use super::{
 };
 use crate::native_path::{NativeIdentity, identity_for};
 use crate::os::physical_size;
+use crate::temporary_storage::TemporaryStorage;
 
 const NODE_SLOT_BYTES: usize = size_of::<Option<Node>>();
 const RETAINED_CHILD_SLOT_BYTES: usize = size_of::<u32>();
@@ -87,6 +88,7 @@ pub struct Arena {
     root_path: PathBuf,
     budget: MemoryBudget,
     identities: IdentityStore,
+    temporary_storage: TemporaryStorage,
     duplicate_identities: HashSet<FileId>,
     untracked_metrics: HashMap<NodeId, UntrackedMetrics>,
     access_tick: u64,
@@ -120,7 +122,15 @@ const EVICTION_STASH_ALLOCATION: usize = EVICTION_STASH_OVERHEAD
     reason = "Arena operations share ModelError as their uniform boundary for filesystem paths, bounded storage, and identity persistence. Repeating that contract on each method obscures the model API."
 )]
 impl Arena {
-    pub fn new(root_path: PathBuf, mut budget: MemoryBudget) -> Result<Self, ModelError> {
+    pub fn new(root_path: PathBuf, budget: MemoryBudget) -> Result<Self, ModelError> {
+        Self::new_with_temporary_storage(root_path, budget, TemporaryStorage::default())
+    }
+
+    pub(crate) fn new_with_temporary_storage(
+        root_path: PathBuf,
+        mut budget: MemoryBudget,
+        temporary_storage: TemporaryStorage,
+    ) -> Result<Self, ModelError> {
         let identity_budget = budget.model_limit() / 4;
         budget.reserve(identity_budget)?;
         let root_name: Arc<OsStr> = root_path
@@ -144,8 +154,12 @@ impl Arena {
             root,
             root_path,
             budget,
-            identities: IdentityStore::new(identity_budget)?,
+            identities: IdentityStore::new_with_temporary_storage(
+                identity_budget,
+                &temporary_storage,
+            )?,
             duplicate_identities: HashSet::new(),
+            temporary_storage,
             untracked_metrics: HashMap::new(),
             access_tick: 0,
             max_children_per_directory: DEFAULT_MAX_CHILDREN,
@@ -201,6 +215,11 @@ impl Arena {
     #[must_use]
     pub fn identity_spill_path(&self) -> Option<&Path> {
         self.identities.spill_path()
+    }
+
+    #[must_use]
+    pub(crate) fn temporary_storage(&self) -> TemporaryStorage {
+        self.temporary_storage.clone()
     }
 
     #[must_use]
@@ -913,7 +932,10 @@ impl Arena {
             .map(|node| node.id)
             .collect::<Vec<_>>();
         let identities = self.rebuild_identities_without(&removed, link_counts)?;
-        let identity_scratch = IdentityStore::new(self.identities.memory_limit())?;
+        let identity_scratch = IdentityStore::new_with_temporary_storage(
+            self.identities.memory_limit(),
+            &self.temporary_storage,
+        )?;
         let mut removal_order = removed.clone();
         removal_order.sort_by_key(|id| self.depth(*id));
         self.remove_nodes(removal_order);
@@ -1135,7 +1157,10 @@ impl Arena {
         let mut identities = self.rebuild_focused_identities(target, &removed)?;
         merge_staged_identities(&mut identities, &mut staging, target)?;
         identities.visit_records(|_, _| Ok(()))?;
-        let identity_scratch = IdentityStore::new(self.identities.memory_limit())?;
+        let identity_scratch = IdentityStore::new_with_temporary_storage(
+            self.identities.memory_limit(),
+            &self.temporary_storage,
+        )?;
         let children = staged_children
             .into_iter()
             .map(|child| staged_live_id(&staging.nodes, staging.root, child, target))
@@ -1404,7 +1429,8 @@ impl Arena {
         removed: &[NodeId],
     ) -> Result<IdentityStore, ModelError> {
         let identity_limit = self.identities.memory_limit().min(self.budget.headroom());
-        let mut rebuilt = IdentityStore::new(identity_limit)?;
+        let mut rebuilt =
+            IdentityStore::new_with_temporary_storage(identity_limit, &self.temporary_storage)?;
         self.identities.visit_records(|file_id, record| {
             if let Some(record) = remove_replaced_participants(record, target, removed) {
                 merge_identity_record(&mut rebuilt, &file_id, record)?;
@@ -1419,7 +1445,8 @@ impl Arena {
         link_counts: &HashMap<FileId, Option<u64>>,
     ) -> Result<IdentityStore, ModelError> {
         let identity_limit = self.identities.memory_limit().min(self.budget.headroom());
-        let mut rebuilt = IdentityStore::new(identity_limit)?;
+        let mut rebuilt =
+            IdentityStore::new_with_temporary_storage(identity_limit, &self.temporary_storage)?;
         self.identities.visit_records(|file_id, record| {
             if let Some(mut record) = remove_deleted_participants(record, removed) {
                 if let Some(link_count) = link_counts.get(&file_id) {

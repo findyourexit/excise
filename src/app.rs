@@ -26,6 +26,7 @@ use crate::report::{
 use crate::state::files::FileTree;
 use crate::state::tiles::{Board, FileType, Pivot};
 use crate::state::{FileToDelete, UiEffects};
+use crate::temporary_storage::TemporaryStorage;
 use crate::theme::Theme;
 use crate::ui::Display;
 use crate::ui::palette::ColorCycle;
@@ -170,13 +171,41 @@ where
         custom_keys: Option<CustomKeyBindings>,
         mouse_enabled: bool,
     ) -> Result<Self, AppError> {
+        Self::new_with_root_identity_and_temporary_storage(
+            terminal_backend,
+            path_in_filesystem,
+            root_identity,
+            show_apparent_size,
+            disable_delete_confirmation,
+            process_memory_mib,
+            keymap,
+            custom_keys,
+            mouse_enabled,
+            TemporaryStorage::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_root_identity_and_temporary_storage(
+        terminal_backend: B,
+        path_in_filesystem: PathBuf,
+        root_identity: NativeIdentity,
+        show_apparent_size: bool,
+        disable_delete_confirmation: bool,
+        process_memory_mib: usize,
+        keymap: KeyPreset,
+        custom_keys: Option<CustomKeyBindings>,
+        mouse_enabled: bool,
+        temporary_storage: TemporaryStorage,
+    ) -> Result<Self, AppError> {
         let display = Display::new(terminal_backend)?;
         let board = Board::new();
-        let file_tree = FileTree::new_with_root_identity(
+        let file_tree = FileTree::new_with_root_identity_and_temporary_storage(
             path_in_filesystem,
             root_identity,
             show_apparent_size,
             process_memory_mib,
+            temporary_storage,
         )
         .map_err(model_error)?;
         Ok(Self::from_parts(

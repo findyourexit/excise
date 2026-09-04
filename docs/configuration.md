@@ -27,6 +27,7 @@ exclusions = [".git/", "target/"]
 
 [model]
 process_memory_mib = 512
+temporary_storage_mib = 512
 
 [runtime]
 reduced_motion = false
@@ -62,6 +63,7 @@ right = "d"
 | `scanner.cross_filesystems` | Traverse beyond the starting file system | true or false |
 | `scanner.exclusions` | Ordered gitignore-style patterns | An array of strings |
 | `model.process_memory_mib` | Whole-process memory limit | At least 128 MiB and no more than detected memory |
+| `model.temporary_storage_mib` | Combined scanner-task and identity temporary storage per session | At least 2 MiB |
 | `runtime.reduced_motion` | Disable nonessential transitions | true or false |
 | `runtime.theme` | Built-in color theme | See `excise --help` for names |
 | `runtime.ascii` | Use ASCII symbols and borders | true or false |
@@ -71,6 +73,7 @@ right = "d"
 | `runtime.output` | Report destination for noninteractive output | A path |
 
 The default memory limit is 512 MiB or the detected available memory when that is lower. Excise reserves 25 percent as process headroom and limits working data to the remaining 75 percent.
+The default temporary-storage limit is 512 MiB per session. `model.temporary_storage_mib`, `EXCISE_TEMPORARY_STORAGE_MIB`, and `--temporary-storage-mib` set one shared cap for queued scanner directory tasks and private identity spill files. If it fills, Excise reports the incomplete scan as uncertain or stops exact identity accounting with an actionable error; it never reports the incomplete result as exact.
 By default, Excise uses one less than the detected available processor count, clamped from one through eight workers, so interactive input retains a processor when possible.
 
 ## Environment Variables
@@ -85,6 +88,7 @@ By default, Excise uses one less than the detected available processor count, cl
 | `EXCISE_CROSS_FILESYSTEMS` | `scanner.cross_filesystems` |
 | `EXCISE_EXCLUDE` | Exclusion patterns separated by semicolons |
 | `EXCISE_MEMORY_MIB` | `model.process_memory_mib` |
+| `EXCISE_TEMPORARY_STORAGE_MIB` | `model.temporary_storage_mib` |
 | `EXCISE_REDUCED_MOTION` | `runtime.reduced_motion` |
 | `EXCISE_THEME` | `runtime.theme` |
 | `EXCISE_ASCII` | `runtime.ascii` |

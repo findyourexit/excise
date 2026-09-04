@@ -22,6 +22,7 @@ fn settings(root: &std::path::Path) -> RuntimeSettings {
         cross_filesystems: false,
         exclusions: Vec::new(),
         memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+        temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
         apparent_size: true,
         disable_delete_confirmation: false,
         reduced_motion: true,

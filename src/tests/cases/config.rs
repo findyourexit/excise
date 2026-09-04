@@ -58,6 +58,25 @@ fn malformed_scanner_exclusion_is_a_configuration_error() {
 }
 
 #[test]
+fn temporary_storage_limit_must_be_at_least_two_mib() {
+    let error = RuntimeConfig::from_layers(
+        cli(&["excise", "--temporary-storage-mib", "1"]),
+        None,
+        EnvironmentOverrides::default(),
+        PathBuf::from("cwd"),
+        None,
+    )
+    .expect_err("one MiB temporary storage should fail configuration resolution");
+
+    assert!(matches!(error, AppError::Config(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("temporary storage must be between 2")
+    );
+}
+
+#[test]
 fn precedence_is_cli_then_environment_then_file_then_default() {
     let config = RuntimeConfig::from_layers(
         cli(&[
@@ -72,6 +91,8 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
             "--mouse",
             "--keymap",
             "emacs",
+            "--temporary-storage-mib",
+            "4",
             "cli-root",
         ]),
         Some(&FileConfig {
@@ -86,7 +107,10 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
                 reduced_motion: Some(false),
                 ..RuntimeFileConfig::default()
             },
-            model: ModelFileConfig::default(),
+            model: ModelFileConfig {
+                process_memory_mib: Some(crate::model::DEFAULT_PROCESS_MIB),
+                temporary_storage_mib: Some(2),
+            },
         }),
         EnvironmentOverrides {
             root: Some(PathBuf::from("env-root")),
@@ -98,6 +122,7 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
             cross_filesystems: Some(false),
             exclusions: Vec::new(),
             memory_mib: Some(crate::model::DEFAULT_PROCESS_MIB),
+            temporary_storage_mib: Some(3),
             theme: None,
             ascii: None,
             mouse: None,
@@ -113,6 +138,7 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
     assert_eq!(config.root, PathBuf::from("cli-root"));
     assert_eq!(config.scan_threads, 4);
     assert_eq!(config.event_buffer, 64);
+    assert_eq!(config.temporary_storage_mib, 4);
     assert!(config.apparent_size);
     assert!(config.reduced_motion);
     assert!(config.monochrome);

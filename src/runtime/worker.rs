@@ -409,6 +409,7 @@ mod tests {
             cross_filesystems: false,
             exclusions: Vec::new(),
             internal_paths: Vec::new(),
+            temporary_storage: crate::temporary_storage::TemporaryStorage::default(),
         }
     }
 

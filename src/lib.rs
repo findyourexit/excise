@@ -74,6 +74,7 @@ pub mod runtime;
 mod runtime;
 #[allow(dead_code)]
 mod state;
+mod temporary_storage;
 #[cfg(any(feature = "fuzzing", feature = "internal"))]
 pub mod terminal;
 #[cfg(not(any(feature = "fuzzing", feature = "internal")))]
@@ -141,6 +142,7 @@ pub(crate) fn start<B>(
         cross_filesystems: false,
         exclusions: Vec::new(),
         memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+        temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
         apparent_size: show_apparent_size,
         disable_delete_confirmation,
         reduced_motion: true,

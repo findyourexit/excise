@@ -3,6 +3,7 @@ complete -c excise -l scan-threads -d 'Scanner worker count (1-32)' -r
 complete -c excise -l event-buffer -d 'Bounded worker-event capacity (16-4096)' -r
 complete -c excise -l exclude -d 'Ordered gitignore-style exclusion pattern' -r
 complete -c excise -l memory-mib -d 'Whole-process memory envelope in MiB' -r
+complete -c excise -l temporary-storage-mib -d 'Combined scanner-task and identity temporary storage limit per session (2+)' -r
 complete -c excise -l theme -d 'Built-in semantic color theme' -r -f -a "excise-dark\t''
 excise-light\t''
 high-contrast\t''

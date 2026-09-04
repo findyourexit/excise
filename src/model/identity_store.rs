@@ -4,7 +4,7 @@ use std::io::{Read as _, Write as _};
 use std::mem::size_of;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use file_id::FileId;
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::{Builder as TempBuilder, TempDir};
 
 use super::{ByteBounds, ModelError, NodeId};
+use crate::temporary_storage::{BoundedFileBackend, TemporaryStorage, TemporaryStorageReservation};
 
 const IDENTITIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("identities");
 const IDENTITY_ENTRY_OVERHEAD: usize = size_of::<IdentityRecord>() + 96;
@@ -99,6 +100,9 @@ struct SessionDirectory {
     temporary: TempDir,
     #[cfg(windows)]
     handle: crate::os::windows::PrivateDirectoryHandle,
+    // Retained for Drop so marker bytes remain charged for this session's lifetime.
+    _marker_reservation: TemporaryStorageReservation,
+    database_reservation: Arc<Mutex<TemporaryStorageReservation>>,
 }
 
 impl Drop for IdentityStore {
@@ -116,9 +120,20 @@ struct SessionMarker {
 }
 
 impl SessionDirectory {
-    fn new() -> Result<Self, ModelError> {
+    fn new(temporary_storage: &TemporaryStorage) -> Result<Self, ModelError> {
         #[cfg(not(windows))]
         {
+            let marker = SessionMarker::new()?;
+            let marker_contents = marker.serialize();
+            let marker_bytes = u64::try_from(marker_contents.len()).map_err(|_| {
+                ModelError::Identity("spill session marker size does not fit in u64".to_string())
+            })?;
+            let marker_reservation = temporary_storage
+                .reservation(marker_bytes)
+                .map_err(identity_error)?;
+            let database_reservation = Arc::new(Mutex::new(
+                temporary_storage.reservation(0).map_err(identity_error)?,
+            ));
             let temporary = TempBuilder::new()
                 .prefix(SESSION_PREFIX)
                 .rand_bytes(32)
@@ -127,13 +142,14 @@ impl SessionDirectory {
             let path = temporary.path().to_path_buf();
             restrict_private_directory(&path)?;
             verify_private_directory(&path)?;
-            let marker = SessionMarker::new()?;
-            write_session_marker(&path, &marker)?;
+            write_session_marker(&path, &marker_contents)?;
             verify_active_session(&path, &marker)?;
             Ok(Self {
                 path,
                 marker,
                 temporary,
+                _marker_reservation: marker_reservation,
+                database_reservation,
             })
         }
 
@@ -141,31 +157,41 @@ impl SessionDirectory {
         {
             let parent = std::env::temp_dir();
             for _ in 0..SESSION_CREATE_ATTEMPTS {
+                let marker = SessionMarker::new()?;
+                let marker_contents = marker.serialize();
+                let marker_bytes = u64::try_from(marker_contents.len()).map_err(|_| {
+                    ModelError::Identity(
+                        "spill session marker size does not fit in u64".to_string(),
+                    )
+                })?;
+                let marker_reservation = temporary_storage
+                    .reservation(marker_bytes)
+                    .map_err(identity_error)?;
+                let database_reservation = Arc::new(Mutex::new(
+                    temporary_storage.reservation(0).map_err(identity_error)?,
+                ));
                 let path = parent.join(format!("{SESSION_PREFIX}{}", random_session_token()?));
                 let mut handle = match crate::os::windows::create_private_directory(&path) {
                     Ok(handle) => handle,
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(error) => return Err(identity_error(error)),
                 };
-                let marker = match SessionMarker::new().and_then(|marker| {
-                    write_session_marker(&path, &marker)?;
-                    verify_active_session(&path, &marker)?;
-                    Ok(marker)
-                }) {
-                    Ok(marker) => marker,
-                    Err(error) => {
-                        return match remove_verified_session_held(&path, &mut handle) {
-                            Ok(()) => Err(error),
-                            Err(cleanup_error) => Err(ModelError::Identity(format!(
-                                "{error}; private spill-session cleanup also failed: {cleanup_error}"
-                            ))),
-                        };
-                    }
-                };
+                if let Err(error) = write_session_marker(&path, &marker_contents)
+                    .and_then(|()| verify_active_session(&path, &marker))
+                {
+                    return match remove_verified_session_held(&path, &mut handle) {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(ModelError::Identity(format!(
+                            "{error}; private spill-session cleanup also failed: {cleanup_error}"
+                        ))),
+                    };
+                }
                 return Ok(Self {
                     path,
                     marker,
                     handle,
+                    _marker_reservation: marker_reservation,
+                    database_reservation,
                 });
             }
             Err(ModelError::Identity(
@@ -182,6 +208,10 @@ impl SessionDirectory {
 
     fn is_verified(&self) -> bool {
         verify_active_session(&self.path, &self.marker).is_ok()
+    }
+
+    fn database_reservation(&self) -> Arc<Mutex<TemporaryStorageReservation>> {
+        Arc::clone(&self.database_reservation)
     }
 }
 
@@ -202,10 +232,18 @@ impl Drop for SessionDirectory {
 )]
 impl IdentityStore {
     pub fn new(memory_limit: usize) -> Result<Self, ModelError> {
+        let temporary_storage = TemporaryStorage::default();
+        Self::new_with_temporary_storage(memory_limit, &temporary_storage)
+    }
+
+    pub(crate) fn new_with_temporary_storage(
+        memory_limit: usize,
+        temporary_storage: &TemporaryStorage,
+    ) -> Result<Self, ModelError> {
         cleanup_stale_sessions_once();
         Ok(Self {
             storage: Storage::Memory(HashMap::new()),
-            session: SessionDirectory::new()?,
+            session: SessionDirectory::new(temporary_storage)?,
             memory_limit,
             estimated_bytes: 0,
         })
@@ -513,21 +551,23 @@ impl IdentityStore {
                 return Ok(());
             };
             let path = self.session.path().join(IDENTITY_DATABASE_FILE);
-            {
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .map_err(identity_error)?;
-            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(identity_error)?;
             restrict_private_file(&path)?;
             verify_private_file(&path)?;
 
             let cache_size = (self.memory_limit / 4).clamp(64 * 1024, 16 * 1024 * 1024);
             let mut builder = RedbBuilder::new();
             builder.set_cache_size(cache_size);
-            let database = builder.create(&path).map_err(identity_error)?;
+            let backend = BoundedFileBackend::new(file, self.session.database_reservation())
+                .map_err(identity_error)?;
+            let database = builder
+                .create_with_backend(backend)
+                .map_err(identity_error)?;
             let transaction = database.begin_write().map_err(identity_error)?;
             {
                 let mut table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
@@ -860,14 +900,14 @@ impl SessionMarker {
     }
 }
 
-fn write_session_marker(directory: &Path, marker: &SessionMarker) -> Result<(), ModelError> {
+fn write_session_marker(directory: &Path, contents: &str) -> Result<(), ModelError> {
     let path = directory.join(SESSION_MARKER_FILE);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .map_err(identity_error)?;
-    file.write_all(marker.serialize().as_bytes())
+    file.write_all(contents.as_bytes())
         .map_err(identity_error)?;
     file.sync_data().map_err(identity_error)?;
     restrict_private_file(&path)?;
@@ -1060,8 +1100,11 @@ mod tests {
 
     #[test]
     fn spill_is_permission_restricted_and_removed_on_drop() {
+        const TEMPORARY_STORAGE_LIMIT: u64 = 2 * 1024 * 1024;
+        let temporary_storage = TemporaryStorage::with_limit_bytes(TEMPORARY_STORAGE_LIMIT);
         let spill_path = {
-            let mut store = IdentityStore::new(1).expect("private session should initialize");
+            let mut store = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+                .expect("private session should initialize");
             store
                 .observe(
                     &FileId::new_inode(1, 1),
@@ -1072,6 +1115,8 @@ mod tests {
                 )
                 .expect("identity should spill");
             assert!(store.is_spilled());
+            assert!(temporary_storage.used() > MAX_MARKER_BYTES);
+            assert!(temporary_storage.used() <= TEMPORARY_STORAGE_LIMIT);
             let path = store
                 .spill_path()
                 .expect("spill path should exist")
@@ -1096,6 +1141,42 @@ mod tests {
             }
             path
         };
+        assert!(!spill_path.exists());
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn identity_spill_enforces_the_session_limit_and_cleans_up_after_failure() {
+        let temporary_storage = TemporaryStorage::with_limit_bytes(MAX_MARKER_BYTES);
+        let spill_path = {
+            let mut store = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+                .expect("private session marker should fit the test limit");
+            let path = store
+                .internal_scan_paths()
+                .pop()
+                .expect("active private session should be tracked");
+            let error = store
+                .observe(
+                    &FileId::new_inode(13, 1),
+                    Some(1),
+                    ByteBounds::exact(4096),
+                    None,
+                    None,
+                )
+                .expect_err("identity spill must fail before exceeding its session limit");
+            assert!(matches!(error, ModelError::Identity(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("temporary storage capacity exhausted")
+            );
+            assert!(error.to_string().contains("--temporary-storage-mib"));
+            assert_eq!(store.len(), 0);
+            assert!(!store.is_spilled());
+            assert!(temporary_storage.used() <= MAX_MARKER_BYTES);
+            path
+        };
+        assert_eq!(temporary_storage.used(), 0);
         assert!(!spill_path.exists());
     }
     #[test]
@@ -1309,7 +1390,8 @@ mod tests {
         let path = parent.join(name);
         std::fs::create_dir(&path).expect("stale session directory should be created");
         restrict_private_directory(&path).expect("stale session directory should be private");
-        write_session_marker(&path, marker).expect("stale session marker should be written");
+        write_session_marker(&path, &marker.serialize())
+            .expect("stale session marker should be written");
         if with_database {
             let database = path.join(IDENTITY_DATABASE_FILE);
             std::fs::write(&database, b"interrupted redb state")
