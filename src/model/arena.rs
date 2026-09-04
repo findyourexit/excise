@@ -773,14 +773,13 @@ impl Arena {
             return Ok(false);
         };
         let candidate_parent = self.node(candidate).and_then(|node| node.parent);
-        let children = self.children(candidate).to_vec();
         let mut metrics = self
             .node(candidate)
             .map_or(NodeMetrics::default(), |node| node.metrics);
         metrics.descendants = metrics.descendants.saturating_add(1);
         let untracked = self.untracked_metrics_for_subtree(candidate);
         let mut removed = Vec::new();
-        for child in children {
+        for &child in self.children(candidate) {
             self.collect_subtree_ids(child, &mut removed);
         }
         // The model may already be at its hard limit precisely when it needs to
@@ -836,7 +835,12 @@ impl Arena {
             self.decrement_retained_child_count(parent);
         }
         self.insert_untracked_metrics(candidate, untracked);
-        self.rebuild_metrics();
+        // Optional eviction caches must yield their budget before the scanner
+        // retries the cap-limited insertion that triggered this compaction.
+        self.clear_eviction_stashes();
+        // `metrics` preserves the candidate's former subtree total and folds its
+        // former concrete child count into the synthetic summary. Its ancestors
+        // therefore remain exact without collecting and sorting every live node.
         Ok(true)
     }
 
@@ -2846,6 +2850,15 @@ mod tests {
             .count()
     }
 
+    fn metric_snapshot(arena: &Arena) -> Vec<(NodeId, NodeMetrics)> {
+        let mut metrics = arena
+            .nodes()
+            .map(|node| (node.id, node.metrics))
+            .collect::<Vec<_>>();
+        metrics.sort_by_key(|(id, _)| *id);
+        metrics
+    }
+
     #[test]
     fn finalization_and_deletion_rebuild_exact_metrics() {
         let root = tempfile::tempdir().expect("model root should exist");
@@ -2942,6 +2955,94 @@ mod tests {
             .complete_directory(&cold.join("nested"), None)
             .expect("completion below a compacted subtree should be harmless");
         assert_eq!(arena.children(pinned_id).len(), 1);
+    }
+
+    #[test]
+    fn repeated_cold_compaction_keeps_metrics_exact_at_the_model_limit() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cold_exact = root.path().join("cold-exact");
+        let cold_unknown = root.path().join("cold-unknown");
+        let pinned = root.path().join("pinned");
+        let exact_leaf = cold_exact.join("exact");
+        let unknown_leaf = cold_unknown.join("unknown");
+        let pinned_leaf = pinned.join("pinned");
+        for directory in [&cold_exact, &cold_unknown, &pinned] {
+            fs::create_dir(directory).expect("fixture directory should be created");
+        }
+        fs::write(&exact_leaf, b"exact").expect("exact fixture should be written");
+        fs::write(&unknown_leaf, b"unknown").expect("unknown fixture should be written");
+        fs::write(&pinned_leaf, b"pinned").expect("pinned fixture should be written");
+
+        let mut arena = test_arena(root.path());
+        let root_id = arena.root();
+        let cold_exact_id = add_path(&mut arena, &cold_exact).expect("cold exact should retain");
+        add_path(&mut arena, &exact_leaf).expect("exact leaf should retain");
+        let cold_unknown_id =
+            add_path(&mut arena, &cold_unknown).expect("cold unknown should retain");
+        add_path(&mut arena, &unknown_leaf).expect("unknown leaf should retain");
+        arena
+            .record_unscanned(
+                &unknown_leaf,
+                UnscannedReason::Metadata("fixture metadata unavailable".to_string()),
+            )
+            .expect("unknown leaf should retain its bound");
+        let pinned_id = add_path(&mut arena, &pinned).expect("pinned directory should retain");
+        add_path(&mut arena, &pinned_leaf).expect("pinned leaf should retain");
+        arena.finalize().expect("fixture model should finalize");
+
+        let expected_root_metrics = arena.node(root_id).expect("root should exist").metrics;
+        assert_eq!(expected_root_metrics.apparent_bytes, 18);
+        assert_eq!(expected_root_metrics.allocated_bytes.upper, None);
+        assert_eq!(expected_root_metrics.reclaimable_bytes.upper, None);
+        let pinned_path = arena
+            .path_ids(&pinned_leaf)
+            .expect("pinned path should be retained");
+        let pinned_nodes = HashSet::from([root_id, pinned_id]);
+
+        for candidate in [cold_exact_id, cold_unknown_id] {
+            arena
+                .consume_remaining_budget_for_test()
+                .expect("fixture should reach the model limit");
+            assert!(
+                arena
+                    .aggregate_cold_subtree(&pinned_nodes)
+                    .expect("cold subtree should compact at the model limit")
+            );
+            let node = arena.node(candidate).expect("aggregate should remain");
+            assert_eq!(node.kind, NodeKind::Synthetic(SyntheticKind::Aggregate));
+            assert_eq!(
+                arena.node(root_id).expect("root should remain").metrics,
+                expected_root_metrics,
+                "compaction must preserve exact and unknown ancestor accounting"
+            );
+            assert_eq!(
+                arena.path_ids(&pinned_leaf),
+                Some(pinned_path.clone()),
+                "pinned navigation must remain intact"
+            );
+            assert!(
+                arena.memory_used() <= arena.memory_limit(),
+                "compaction must not exceed the hard model budget"
+            );
+            if candidate == cold_unknown_id {
+                assert_eq!(node.metrics.allocated_bytes.upper, None);
+                assert!(arena.untracked_metrics.contains_key(&candidate));
+            }
+
+            let incremental_metrics = metric_snapshot(&arena);
+            arena.rebuild();
+            assert_eq!(
+                metric_snapshot(&arena),
+                incremental_metrics,
+                "compaction metrics must already match a full rebuild"
+            );
+        }
+
+        assert!(
+            !arena
+                .aggregate_cold_subtree(&pinned_nodes)
+                .expect("only the deterministic cold candidates should compact")
+        );
     }
 
     #[test]
