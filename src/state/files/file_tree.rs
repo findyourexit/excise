@@ -1308,6 +1308,30 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn identity_capacity_uncertainty_blocks_permanent_deletion() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let target = root.path().join("target");
+        fs::write(&target, b"target").expect("target should be created");
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            false,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &target);
+        assert!(
+            tree.arena
+                .mark_path_uncertain(root.path(), UnscannedReason::IdentityStorageCapacity,)
+        );
+
+        assert!(matches!(
+            tree.deletion_target_for_path(&target),
+            Err(crate::model::ModelError::Invariant(_))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn partial_hard_link_deletion_rebuilds_identity_metrics() {
         let root = tempfile::tempdir().expect("deletion root should exist");
         let first = root.path().join("first");

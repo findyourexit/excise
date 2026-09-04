@@ -22,7 +22,7 @@ The main loop polls terminal input with a bounded timeout. It renders each folde
 
 ### Scanner
 
-The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. Queued directory tasks, identity spill files, and overflow directory deletion-plan and outcome records share one per-session temporary-storage limit, reserve capacity before their files grow, and release it after shrinking or cleanup. A capacity breach reports an actionable failure and never turns incomplete work into an exact result; backpressure never silently drops an entry.
+The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. Queued directory tasks, identity spill files, and overflow directory deletion-plan and outcome records share one per-session temporary-storage limit and reserve capacity before their files grow. A queued-task capacity breach reports an actionable incomplete scan; identity-store capacity exhaustion releases its private database and continues traversal with unknown physical-accounting bounds; a deletion plan that cannot retain every reviewed identity and outcome is rejected before consent, and a post-consent result-storage failure stops new mutations with an explicit incomplete result. Backpressure never silently drops an entry.
 
 The default worker count leaves one available processor for the owner loop when possible and is clamped from one through eight. The configured value must be between one and 32. Exclusions and file system boundaries remain visible in the working model. Link targets are never traversed.
 
@@ -36,7 +36,7 @@ The default process memory limit is 512 MiB. Working data may use 75 percent of 
 
 ### Space Accounting
 
-The identity table counts files with more than one name once within the scan scope. When exact identity data exceeds the memory limit, a permission-restricted store for the current session keeps the minimum records needed for accounting within the shared temporary-storage limit. Unknown values remain bounds rather than becoming guessed numbers.
+The identity table counts files with more than one name once within the scan scope. When exact identity data exceeds the memory limit, a permission-restricted store for the current session keeps the minimum records needed for accounting within the shared temporary-storage limit. If that bounded store fills, the scan continues with unknown physical-allocation and reclaimability bounds rather than guessed values or a model failure.
 
 ### Deletion
 

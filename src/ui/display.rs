@@ -912,6 +912,7 @@ fn render_inspector(
                     }
                     UnscannedReason::SymbolicLink
                     | UnscannedReason::FilesystemBoundary
+                    | UnscannedReason::IdentityStorageCapacity
                     | UnscannedReason::MemoryAggregation => false,
                 };
                 displayed.deceptive |= deceptive;
