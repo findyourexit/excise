@@ -9,7 +9,7 @@ use excise::deletion::{
 };
 use excise::model::{EntrySnapshot, NodeId, NodeKind};
 use excise::native_path::NativeIdentity;
-use excise::{FileToDelete, geometry::FileType};
+use excise::{geometry::FileType, FileToDelete};
 use file_id::FileId;
 use libfuzzer_sys::fuzz_target;
 
@@ -48,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
         root_relative_path: PathBuf::from("target"),
         estimated_bytes: entries.len().saturating_mul(256),
         scan_root: PathBuf::from("root"),
-        entries,
+        entries: entries.into(),
         soft_cancelled: false,
         precise: true,
     };
