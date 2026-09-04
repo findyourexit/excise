@@ -843,6 +843,93 @@ mod tests {
     }
 
     #[test]
+    fn root_scan_compacts_unscanned_leaf_at_model_limit() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cold = root.path().join("cold");
+        let unreadable = cold.join("unreadable");
+        let pending = root.path().join("pending");
+        fs::create_dir(&cold).expect("cold directory should be created");
+        fs::write(&pending, b"pending").expect("pending file should be created");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &cold);
+        tree.record_unscanned(
+            &unreadable,
+            UnscannedReason::Metadata("fixture metadata unavailable".to_string()),
+        )
+        .expect("unreadable leaf should be represented");
+
+        tree.arena
+            .consume_remaining_budget_for_test()
+            .expect("fixture should consume its model budget");
+        add(&mut tree, &pending);
+        tree.finalize().expect("model should finalize");
+        let (used, limit, _) = tree.model_stats();
+        assert!(used <= limit, "compaction must preserve the model limit");
+
+        let compacted = node_id_at(&tree, &cold);
+        assert_eq!(
+            tree.node_kind(compacted),
+            Some(NodeKind::Synthetic(SyntheticKind::Aggregate))
+        );
+        assert_eq!(
+            tree.node(compacted)
+                .expect("aggregate should remain")
+                .metrics
+                .allocated_bytes
+                .upper,
+            None,
+            "the aggregated unreadable leaf must retain its unknown bound"
+        );
+        assert!(tree.path_for_id(node_id_at(&tree, &pending)).is_some());
+    }
+
+    #[test]
+    fn root_scan_compacts_existing_unreadable_directory_at_model_limit() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let cold = root.path().join("cold");
+        let unreadable = cold.join("unreadable");
+        let pending = root.path().join("pending");
+        fs::create_dir(&cold).expect("cold directory should be created");
+        fs::create_dir(&unreadable).expect("unreadable directory should be created");
+        fs::write(&pending, b"pending").expect("pending file should be created");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &cold);
+        add(&mut tree, &unreadable);
+        tree.record_unscanned(
+            &unreadable,
+            UnscannedReason::Metadata("fixture metadata unavailable".to_string()),
+        )
+        .expect("unreadable directory should be represented");
+
+        tree.arena
+            .consume_remaining_budget_for_test()
+            .expect("fixture should consume its model budget");
+        add(&mut tree, &pending);
+        tree.finalize().expect("model should finalize");
+        let (used, limit, _) = tree.model_stats();
+        assert!(used <= limit, "compaction must preserve the model limit");
+
+        let compacted = node_id_at(&tree, &cold);
+        assert_eq!(
+            tree.node_kind(compacted),
+            Some(NodeKind::Synthetic(SyntheticKind::Aggregate))
+        );
+        assert!(tree.path_for_id(node_id_at(&tree, &pending)).is_some());
+    }
+
+    #[test]
     fn cancelled_focused_rescan_discards_staging_without_touching_live_tree() {
         let root = tempfile::tempdir().expect("rescan root should exist");
         let target = root.path().join("target");
