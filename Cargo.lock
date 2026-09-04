@@ -771,6 +771,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
  "tachyonfx",
  "tempfile",

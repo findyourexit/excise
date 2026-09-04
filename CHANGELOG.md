@@ -8,7 +8,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ### Fixed
 
-* Scanner directory-task spill and identity spill files now share a fixed per-session temporary-storage limit. Capacity is reserved before a file grows, released after cleanup, and exhaustion reports an actionable incomplete scan or identity-accounting error instead of silently dropping work or claiming an exact result.
+* Scanner directory-task, identity, and directory-deletion-plan/result spill files now share a fixed per-session temporary-storage limit. Deletion plan and outcome records are authenticated with a process-private key and, on Windows, held in atomically created exclusive files outside the selected target; capacity or storage-read failures produce a safe incomplete outcome instead of an unbounded report, while an unretainable directory plan stops before confirmation without deleting an entry.
 
 ## [1.2.1] - 2026-09-02
 

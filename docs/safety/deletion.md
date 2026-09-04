@@ -16,12 +16,12 @@ Deletion can be prepared only when all of these conditions hold:
 
 ## Plan Construction
 
-1. Copy every examined descendant identity into the review plan.
-2. List the current contents of the live folder separately. Record each relative path, identity, type, size, allocation, modification state, and required deletion order.
-3. Require the live list and the reviewed list to match exactly. Check them again immediately before confirmation.
-4. If anything changed, discard the plan, scan again, and ask for confirmation again.
-
-Consent covers only the identities in the plan. It never covers a new entry that appears later at the same path.
+1. List the current contents of the live folder. Record every relative path, identity, type, size, allocation, modification state, and required deletion order.
+2. Keep directory-plan records in bounded resident memory, spilling overflow plan and outcome records under the configured temporary-storage limit. Unix uses anonymous files; Windows atomically creates a current-user-only, exclusive, delete-on-close file in the selected target's parent, outside the target.
+3. Authenticate every spilled record with a process-private key. Every decoded path must have safe components whose prefix is the selected target before revalidation or execution.
+4. Reserve resident and temporary capacity for every planned identity and outcome before confirmation. If either complete plan or report cannot be retained, discard it before confirmation and delete nothing.
+5. Require the live list and the reviewed list to match exactly. Check them again immediately before confirmation.
+6. If anything changed, discard the plan, scan again, and ask for confirmation again.
 
 ## Confirmation
 
@@ -60,7 +60,7 @@ The first supported interrupt opens the precise soft-cancel choice. Pressing `h`
 
 ## Result
 
-Normal completion and soft cancellation report every planned identity as deleted, changed, missing, failed, or unattempted. Session history has a fixed memory limit. It writes directly to the versioned `deletion-history` format and releases retained reports after a successful export.
+Normal completion and soft cancellation report every planned identity as deleted, changed, missing, failed, or unattempted through bounded resident or authenticated outcome-spill storage. Session history has a fixed memory limit and writes directly to the versioned `deletion-history` format. If outcome storage fails after consent, Excise starts no further entries, returns an explicit incomplete result, and requires a focused rescan rather than materializing an unbounded report.
 
 ## Required Evidence
 

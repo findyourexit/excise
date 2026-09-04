@@ -1,9 +1,12 @@
 #![allow(unsafe_code)]
 
+use std::fmt::Write as _;
+use std::fs::File;
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt as _;
-use std::path::Path;
+use std::os::windows::io::FromRawHandle as _;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
@@ -20,13 +23,14 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
-    FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-    FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileDispositionInfo, FileDispositionInfoEx, GetFileInformationByHandle, OPEN_EXISTING,
-    READ_CONTROL, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TEMPORARY,
+    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
+    FileDispositionInfoEx, GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL,
+    SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
@@ -47,6 +51,72 @@ pub(crate) fn is_user_admin() -> bool {
 #[cfg(not(test))]
 pub(crate) fn is_user_admin() -> bool {
     is_elevated::is_elevated()
+}
+
+/// Creates a randomly named, current-user-only temporary file in a caller-verified
+/// directory. The exclusive handle denies every sharing mode, so another process
+/// running as the same user cannot reopen or replace its record stream. Windows
+/// removes the file when this handle closes, including process termination.
+pub(crate) fn create_private_temporary_file(directory: &Path) -> io::Result<File> {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const ERROR_FILE_EXISTS: i32 = 80;
+    const ERROR_ALREADY_EXISTS: i32 = 183;
+
+    let user = CurrentUserSid::current()?;
+    let security = PrivateSecurity::new(&user)?;
+    for _ in 0..128 {
+        let path = private_temporary_path(directory)?;
+        let wide_path = wide_path(&path);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+            lpSecurityDescriptor: (&raw const security.descriptor).cast_mut().cast(),
+            bInheritHandle: 0,
+        };
+        // SAFETY: the path and security descriptor stay live during the call. CREATE_NEW
+        // makes the random name atomic; zero sharing bars any second handle, including one
+        // opened by the current user, until the delete-on-close handle is released.
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS,
+                0,
+                (&raw const attributes).cast_mut(),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS)
+            ) {
+                continue;
+            }
+            return Err(error);
+        }
+        let handle = OwnedHandle(handle);
+        verify_private_handle(handle.raw(), false, &user)?;
+        // SAFETY: `OwnedHandle::into_raw` transfers this valid owned Windows file handle
+        // exactly once to `File`, whose Drop closes it and triggers delete-on-close.
+        return Ok(unsafe { File::from_raw_handle(handle.into_raw()) });
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique private temporary file name",
+    ))
+}
+
+fn private_temporary_path(directory: &Path) -> io::Result<PathBuf> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut name = String::from(".excise-deletion-spill-");
+    for byte in random {
+        write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(directory.join(name))
 }
 
 /// A held directory handle whose share mode denies deletion while a private
@@ -603,6 +673,11 @@ struct OwnedHandle(HANDLE);
 impl OwnedHandle {
     const fn raw(&self) -> HANDLE {
         self.0
+    }
+    fn into_raw(mut self) -> HANDLE {
+        let raw = self.0;
+        self.0 = null_mut();
+        raw
     }
 
     fn close(&mut self) {

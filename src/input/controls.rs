@@ -60,9 +60,9 @@ pub(crate) enum InputCommand {
     PathError,
     StartRescan(PathBuf),
     CancelRescan,
-    PlanDeletion(FileToDelete),
+    PlanDeletion(Box<FileToDelete>),
     CancelDeletionPlan,
-    RevalidateDeletion(DeletionPlan),
+    RevalidateDeletion(Box<DeletionPlan>),
     ExportScan,
     ExportDeletionHistory,
     CycleTheme,
@@ -131,7 +131,9 @@ fn handle_keypress_loading_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> In
     if matches!(evt, key!(Backspace)) {
         return app
             .prompt_file_deletion()
-            .map_or(InputCommand::None, InputCommand::PlanDeletion);
+            .map_or(InputCommand::None, |target| {
+                InputCommand::PlanDeletion(Box::new(target))
+            });
     }
     handle_navigation(evt, app, true)
 }
@@ -154,7 +156,9 @@ fn handle_keypress_normal_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> Inp
     if matches!(evt, key!(Backspace)) {
         return app
             .prompt_file_deletion()
-            .map_or(InputCommand::None, InputCommand::PlanDeletion);
+            .map_or(InputCommand::None, |target| {
+                InputCommand::PlanDeletion(Box::new(target))
+            });
     }
     handle_navigation(evt, app, false)
 }
@@ -368,7 +372,9 @@ fn handle_keypress_delete_confirm_mode<B: Backend>(evt: &Event, app: &mut App<B>
         // Enter confirms if and only if the typed input already matches.
         key!(Enter) => app
             .arm_and_confirm_deletion_plan()
-            .map_or(InputCommand::None, InputCommand::RevalidateDeletion),
+            .map_or(InputCommand::None, |plan| {
+                InputCommand::RevalidateDeletion(Box::new(plan))
+            }),
         Event::Key(KeyEvent {
             code: KeyCode::Char(character),
             modifiers,
@@ -377,7 +383,9 @@ fn handle_keypress_delete_confirm_mode<B: Backend>(evt: &Event, app: &mut App<B>
             app.push_confirmation_character(*character);
             if app.confirmation_is_single_key() {
                 app.take_confirmed_deletion_plan()
-                    .map_or(InputCommand::None, InputCommand::RevalidateDeletion)
+                    .map_or(InputCommand::None, |plan| {
+                        InputCommand::RevalidateDeletion(Box::new(plan))
+                    })
             } else {
                 InputCommand::None
             }

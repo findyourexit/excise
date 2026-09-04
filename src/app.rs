@@ -889,16 +889,18 @@ where
                 return None;
             }
         };
-        target.reviewed_entries = match self
-            .file_tree
-            .reviewed_subtree(target.node_id, self.maximum_deletion_plan_bytes())
-        {
-            Ok(entries) => entries,
-            Err(error) => {
-                self.show_error(format!("Deletion rescan could not review target: {error}"));
-                return None;
-            }
-        };
+        if target.expected_snapshot.kind != crate::model::NodeKind::Directory {
+            target.reviewed_entries = match self
+                .file_tree
+                .reviewed_subtree(target.node_id, self.maximum_deletion_plan_bytes())
+            {
+                Ok(entries) => entries,
+                Err(error) => {
+                    self.show_error(format!("Deletion rescan could not review target: {error}"));
+                    return None;
+                }
+            };
+        }
         self.ui_mode = UiMode::PlanningDeletion(Box::new(target.display_copy()));
         self.mark_dirty();
         Some(DeletionReplanResult::Ready(Box::new(target)))
@@ -1782,7 +1784,7 @@ mod tests {
             target_node_id: crate::model::NodeId(1),
             root_relative_path: PathBuf::from("target"),
             scan_root: PathBuf::from("root"),
-            entries: Vec::new(),
+            entries: Vec::new().into(),
             soft_cancelled: false,
             precise: true,
             estimated_bytes,
@@ -1882,7 +1884,7 @@ mod tests {
         let confirmed = app
             .take_confirmed_deletion_plan()
             .expect("confirmed plan should be handed to the worker");
-        assert_eq!(confirmed.entries.len(), 1);
+        assert_eq!(confirmed.planned_entries(), 1);
         assert!(matches!(app.ui_mode, UiMode::Deleting { .. }));
         assert!(app.take_deletion_replan().is_none());
     }

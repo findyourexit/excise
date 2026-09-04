@@ -22,7 +22,7 @@ The main loop polls terminal input with a bounded timeout. It renders each folde
 
 ### Scanner
 
-The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. Queued directory tasks and identity spill files share one per-session temporary-storage limit, reserve capacity before their files grow, and release it after shrinking or cleanup. A capacity breach reports an actionable failure and never turns incomplete work into an exact result; backpressure never silently drops an entry.
+The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. Queued directory tasks, identity spill files, and overflow directory deletion-plan and outcome records share one per-session temporary-storage limit, reserve capacity before their files grow, and release it after shrinking or cleanup. A capacity breach reports an actionable failure and never turns incomplete work into an exact result; backpressure never silently drops an entry.
 
 The default worker count leaves one available processor for the owner loop when possible and is clamped from one through eight. The configured value must be between one and 32. Exclusions and file system boundaries remain visible in the working model. Link targets are never traversed.
 
@@ -40,7 +40,7 @@ The identity table counts files with more than one name once within the scan sco
 
 ### Deletion
 
-The main loop builds and reviews a complete deletion plan. Platform code works relative to the confirmed parent and does not follow links. It checks the file identity, type, size, allocation, and modification state before each deletion. Changed entries are skipped. Newly observed entries are never added to the consented plan.
+The main loop builds and reviews a complete deletion plan. Large directory plans retain a bounded resident prefix and use authenticated temporary storage outside the selected target for later plan and outcome records before consent. Platform code works relative to the confirmed parent and does not follow links. It validates each decoded plan path as a componentwise descendant of the selected target, checks the file identity, type, size, allocation, and modification state before each deletion, and skips changed entries. Newly observed entries are never added to the consented plan; a plan that cannot retain every identity and outcome is rejected before confirmation.
 
 ### Reports
 

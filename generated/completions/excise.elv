@@ -23,7 +23,7 @@ set edit:completion:arg-completer[excise] = {|@words|
             cand --event-buffer 'Bounded worker-event capacity (16-4096)'
             cand --exclude 'Ordered gitignore-style exclusion pattern'
             cand --memory-mib 'Whole-process memory envelope in MiB'
-            cand --temporary-storage-mib 'Combined scanner-task and identity temporary storage limit per session (2+)'
+            cand --temporary-storage-mib 'Combined scanner-task, directory-plan/result, and identity-spill temporary storage limit per session (2+)'
             cand --theme 'Built-in semantic color theme'
             cand --keymap 'Keyboard preset. Arrows and safety keys always work'
             cand --format 'Output mode. Table and JSON never acquire a terminal'

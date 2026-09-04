@@ -188,7 +188,7 @@ pub struct Cli {
     /// Whole-process memory envelope in MiB
     pub memory_mib: Option<usize>,
     #[arg(long, value_name = "MIB")]
-    /// Combined scanner-task and identity temporary storage limit per session (2+)
+    /// Combined scanner-task, directory-plan/result, and identity-spill temporary storage limit per session (2+)
     pub temporary_storage_mib: Option<usize>,
     #[arg(long)]
     /// Disable nonessential motion
