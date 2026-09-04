@@ -88,6 +88,7 @@ pub struct Arena {
     root_path: PathBuf,
     budget: MemoryBudget,
     identities: IdentityStore,
+    identity_accounting_exhausted: bool,
     temporary_storage: TemporaryStorage,
     duplicate_identities: HashSet<FileId>,
     untracked_metrics: HashMap<NodeId, UntrackedMetrics>,
@@ -158,6 +159,7 @@ impl Arena {
                 identity_budget,
                 &temporary_storage,
             )?,
+            identity_accounting_exhausted: false,
             duplicate_identities: HashSet::new(),
             temporary_storage,
             untracked_metrics: HashMap::new(),
@@ -481,7 +483,10 @@ impl Arena {
                 self.collect_subtree_ids(existing, &mut removed);
                 self.remove_nodes_with_accounting(removed)?;
             } else {
-                let unknown = matches!(reason, UnscannedReason::Metadata(_));
+                let unknown = matches!(
+                    reason,
+                    UnscannedReason::Metadata(_) | UnscannedReason::IdentityStorageCapacity
+                );
                 let state = unscanned_state(&reason);
                 let mut metrics =
                     self.node(existing)
@@ -671,6 +676,7 @@ impl Arena {
         Err(ModelError::InvalidPath(path.to_string_lossy().into_owned()))
     }
     pub fn finalize(&mut self) -> Result<(), ModelError> {
+        self.sync_identity_accounting_uncertainty();
         let duplicate_ids = std::mem::take(&mut self.duplicate_identities);
         let duplicate_memory = duplicate_ids.len().saturating_mul(DUPLICATE_ID_OVERHEAD);
         let finalization_result = (|| -> Result<(), ModelError> {
@@ -842,6 +848,7 @@ impl Arena {
             }
             return Err(error);
         }
+        self.sync_identity_accounting_uncertainty();
         self.remove_reusable_nodes(removed);
         self.release_spare_child_slots(candidate);
         if let Some(node) = self.node_mut(candidate) {
@@ -1239,6 +1246,7 @@ impl Arena {
         self.budget = planned_budget;
         self.clear_spare_child_slots(target);
         self.identities = identities;
+        self.sync_identity_accounting_uncertainty();
         self.prepare_identity_metrics();
         self.rebuild_identity_metrics(identity_scratch)?;
         Ok(())
@@ -1636,6 +1644,9 @@ impl Arena {
         if kind.is_directory() {
             return Ok(NodeMetrics::default());
         }
+        if self.identity_accounting_exhausted {
+            return Ok(leaf_metrics(apparent, ByteBounds::unknown(), None));
+        }
         let duplicate =
             identity.link_count != Some(1) && self.identities.get(&identity.file_id)?.is_some();
         Ok(if duplicate {
@@ -1657,6 +1668,9 @@ impl Arena {
         if kind.is_directory() {
             return Ok(NodeMetrics::default());
         }
+        if self.identity_accounting_exhausted {
+            return Ok(leaf_metrics(apparent, ByteBounds::unknown(), None));
+        }
         let (is_new, record) = self.identities.observe(
             &identity.file_id,
             identity.link_count,
@@ -1664,6 +1678,10 @@ impl Arena {
             node,
             allocation_node,
         )?;
+        if self.identities.capacity_exhausted() {
+            self.mark_identity_accounting_uncertain();
+            return Ok(leaf_metrics(apparent, ByteBounds::unknown(), None));
+        }
         if !is_new && record.declared_links.is_none() {
             self.mark_identity_reclaimable_unknown(&record);
         }
@@ -1673,6 +1691,22 @@ impl Arena {
             self.track_duplicate(identity.file_id);
             leaf_metrics(apparent, ByteBounds::exact(0), identity.link_count)
         })
+    }
+
+    fn mark_identity_accounting_uncertain(&mut self) {
+        self.identity_accounting_exhausted = true;
+        if let Some(root) = self.node_mut(self.root) {
+            root.state = NodeState::Uncertain;
+            root.unscanned_reason = Some(UnscannedReason::IdentityStorageCapacity);
+            root.metrics.allocated_bytes.upper = None;
+            root.metrics.reclaimable_bytes.upper = None;
+        }
+    }
+
+    fn sync_identity_accounting_uncertainty(&mut self) {
+        if !self.identity_accounting_exhausted && self.identities.capacity_exhausted() {
+            self.mark_identity_accounting_uncertain();
+        }
     }
     fn mark_identity_reclaimable_unknown(&mut self, record: &IdentityRecord) {
         let Some(allocation_node) = record.allocation_node else {
@@ -1982,6 +2016,7 @@ impl Arena {
             }
             return Err(error);
         }
+        self.sync_identity_accounting_uncertainty();
         self.add_to_other(other, metrics);
         self.insert_untracked_metrics(other, untracked);
         self.remove_reusable_nodes(removed);
@@ -2261,7 +2296,11 @@ impl Arena {
                 node.metrics = if node.state == NodeState::Uncertain
                     && matches!(
                         node.unscanned_reason.as_ref(),
-                        Some(UnscannedReason::Metadata(_) | UnscannedReason::Replacement(_))
+                        Some(
+                            UnscannedReason::Metadata(_)
+                                | UnscannedReason::Replacement(_)
+                                | UnscannedReason::IdentityStorageCapacity
+                        )
                     ) {
                     NodeMetrics {
                         allocated_bytes: ByteBounds::unknown(),
@@ -2694,7 +2733,8 @@ fn unscanned_state(reason: &UnscannedReason) -> NodeState {
         UnscannedReason::FilesystemBoundary
         | UnscannedReason::Excluded(_)
         | UnscannedReason::Metadata(_)
-        | UnscannedReason::Replacement(_) => NodeState::Uncertain,
+        | UnscannedReason::Replacement(_)
+        | UnscannedReason::IdentityStorageCapacity => NodeState::Uncertain,
     }
 }
 
@@ -2724,7 +2764,12 @@ fn unscanned_metrics(
         };
     }
     let mut metrics = leaf_metrics(apparent, allocated, declared_links);
-    if kind.is_directory() && matches!(reason, UnscannedReason::Metadata(_)) {
+    if kind.is_directory()
+        && matches!(
+            reason,
+            UnscannedReason::Metadata(_) | UnscannedReason::IdentityStorageCapacity
+        )
+    {
         metrics.allocated_bytes.upper = None;
         metrics.reclaimable_bytes.upper = None;
     }
@@ -5550,6 +5595,39 @@ mod tests {
             before
         );
     }
+    #[test]
+    fn identity_capacity_exhaustion_keeps_scanning_with_unknown_metrics() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"first").expect("first fixture should be written");
+        fs::write(&second, b"second").expect("second fixture should be written");
+        let temporary_storage = TemporaryStorage::with_limit_bytes(256);
+        let mut arena = test_arena(root.path());
+        arena.identities = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+            .expect("bounded identity store should initialize");
+
+        assert!(add_path(&mut arena, &first).is_some());
+        assert!(arena.identity_accounting_exhausted);
+        assert!(add_path(&mut arena, &second).is_some());
+        arena
+            .complete_directory(root.path(), None)
+            .expect("root should complete after identity capacity exhaustion");
+        arena
+            .finalize()
+            .expect("uncertain identity accounting should still finalize the scan");
+        let root_node = arena.node(arena.root()).expect("root should remain");
+        assert_eq!(root_node.state, NodeState::Uncertain);
+        assert_eq!(
+            root_node.unscanned_reason,
+            Some(UnscannedReason::IdentityStorageCapacity)
+        );
+        assert_eq!(root_node.metrics.allocated_bytes, ByteBounds::unknown());
+        assert_eq!(root_node.metrics.reclaimable_bytes, ByteBounds::unknown());
+        drop(arena);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
     #[test]
     fn corrupt_identity_spill_returns_error_without_panicking() {
         let root = tempfile::tempdir().expect("model root should exist");

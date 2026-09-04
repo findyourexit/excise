@@ -4,6 +4,7 @@ use std::io::{Read as _, Write as _};
 use std::mem::size_of;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -68,6 +69,16 @@ impl IdentityRecord {
         }
         self.nodes.truncate(retained);
     }
+
+    fn unavailable() -> Self {
+        Self {
+            observed_links: 0,
+            declared_links: None,
+            allocated_bytes: ByteBounds::unknown(),
+            allocation_node: None,
+            nodes: Vec::new(),
+        }
+    }
 }
 
 pub struct IdentityStore {
@@ -75,6 +86,7 @@ pub struct IdentityStore {
     session: SessionDirectory,
     memory_limit: usize,
     estimated_bytes: usize,
+    capacity_exhausted: bool,
 }
 
 /// Keeps a declared link count exact only while every observation agrees.
@@ -103,6 +115,7 @@ struct SessionDirectory {
     // Retained for Drop so marker bytes remain charged for this session's lifetime.
     _marker_reservation: TemporaryStorageReservation,
     database_reservation: Arc<Mutex<TemporaryStorageReservation>>,
+    database_capacity_exhausted: Arc<AtomicBool>,
 }
 
 impl Drop for IdentityStore {
@@ -121,6 +134,7 @@ struct SessionMarker {
 
 impl SessionDirectory {
     fn new(temporary_storage: &TemporaryStorage) -> Result<Self, ModelError> {
+        let database_capacity_exhausted = Arc::new(AtomicBool::new(false));
         #[cfg(not(windows))]
         {
             let marker = SessionMarker::new()?;
@@ -150,6 +164,7 @@ impl SessionDirectory {
                 temporary,
                 _marker_reservation: marker_reservation,
                 database_reservation,
+                database_capacity_exhausted,
             })
         }
 
@@ -192,6 +207,7 @@ impl SessionDirectory {
                     handle,
                     _marker_reservation: marker_reservation,
                     database_reservation,
+                    database_capacity_exhausted,
                 });
             }
             Err(ModelError::Identity(
@@ -212,6 +228,31 @@ impl SessionDirectory {
 
     fn database_reservation(&self) -> Arc<Mutex<TemporaryStorageReservation>> {
         Arc::clone(&self.database_reservation)
+    }
+
+    fn database_capacity_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.database_capacity_exhausted)
+    }
+
+    fn database_capacity_exhausted(&self) -> bool {
+        self.database_capacity_exhausted.load(Ordering::Acquire)
+    }
+
+    fn remove_database(&self) -> Result<(), ModelError> {
+        let database = self.path.join(IDENTITY_DATABASE_FILE);
+        match fs::symlink_metadata(&database) {
+            Ok(_) => {
+                verify_private_file(&database)?;
+                #[cfg(windows)]
+                crate::os::windows::delete_verified_private_file(&database)
+                    .map_err(identity_error)?;
+                #[cfg(not(windows))]
+                fs::remove_file(&database).map_err(identity_error)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(identity_error(error)),
+        }
     }
 }
 
@@ -246,6 +287,7 @@ impl IdentityStore {
             session: SessionDirectory::new(temporary_storage)?,
             memory_limit,
             estimated_bytes: 0,
+            capacity_exhausted: false,
         })
     }
 
@@ -257,37 +299,49 @@ impl IdentityStore {
         node: Option<NodeId>,
         allocation_node: Option<NodeId>,
     ) -> Result<(bool, IdentityRecord), ModelError> {
-        let existing = self.get(file_id)?;
-        let is_new = existing.is_none();
-        let mut record = existing.unwrap_or(IdentityRecord {
-            observed_links: 0,
-            declared_links,
-            allocated_bytes,
-            allocation_node,
-            nodes: Vec::new(),
-        });
-        record.observed_links = record.observed_links.saturating_add(1);
-        record.declared_links = merge_declared_links(record.declared_links, declared_links);
-        if let Some(node) = node {
-            record.observe_node(node);
+        if self.capacity_exhausted {
+            return Ok((false, IdentityRecord::unavailable()));
         }
-
-        if matches!(self.storage, Storage::Memory(_)) {
-            let value = serde_json::to_vec(&record).map_err(identity_error)?;
-            self.estimated_bytes = self
-                .estimated_bytes
-                .saturating_add(std::mem::size_of::<FileId>())
-                .saturating_add(value.len())
-                .saturating_add(IDENTITY_ENTRY_OVERHEAD);
-            if self.estimated_bytes > self.memory_limit {
-                self.spill_to_disk()?;
+        let result = (|| -> Result<(bool, IdentityRecord), ModelError> {
+            let existing = self.get(file_id)?;
+            let is_new = existing.is_none();
+            let mut record = existing.unwrap_or(IdentityRecord {
+                observed_links: 0,
+                declared_links,
+                allocated_bytes,
+                allocation_node,
+                nodes: Vec::new(),
+            });
+            record.observed_links = record.observed_links.saturating_add(1);
+            record.declared_links = merge_declared_links(record.declared_links, declared_links);
+            if let Some(node) = node {
+                record.observe_node(node);
             }
+
+            if matches!(self.storage, Storage::Memory(_)) {
+                let value = serde_json::to_vec(&record).map_err(identity_error)?;
+                self.estimated_bytes = self
+                    .estimated_bytes
+                    .saturating_add(std::mem::size_of::<FileId>())
+                    .saturating_add(value.len())
+                    .saturating_add(IDENTITY_ENTRY_OVERHEAD);
+                if self.estimated_bytes > self.memory_limit {
+                    self.spill_to_disk()?;
+                }
+            }
+            self.insert(file_id, &record, is_new)?;
+            Ok((is_new, record))
+        })();
+        match self.recover_capacity(result)? {
+            Some(observation) => Ok(observation),
+            None => Ok((false, IdentityRecord::unavailable())),
         }
-        self.insert(file_id, &record, is_new)?;
-        Ok((is_new, record))
     }
 
     pub fn get(&self, file_id: &FileId) -> Result<Option<IdentityRecord>, ModelError> {
+        if self.capacity_exhausted {
+            return Ok(None);
+        }
         match &self.storage {
             Storage::Memory(records) => Ok(records.get(file_id).cloned()),
             Storage::Disk {
@@ -311,6 +365,11 @@ impl IdentityStore {
     #[must_use]
     pub fn is_spilled(&self) -> bool {
         matches!(self.storage, Storage::Disk { .. })
+    }
+
+    #[must_use]
+    pub(crate) const fn capacity_exhausted(&self) -> bool {
+        self.capacity_exhausted
     }
 
     #[must_use]
@@ -350,6 +409,9 @@ impl IdentityStore {
 
     #[must_use]
     pub fn len(&self) -> usize {
+        if self.capacity_exhausted {
+            return 0;
+        }
         match &self.storage {
             Storage::Memory(records) => records.len(),
             Storage::Disk { count, .. } => *count,
@@ -370,7 +432,13 @@ impl IdentityStore {
         &mut self,
         mut visitor: impl FnMut(FileId, IdentityRecord) -> Result<(), ModelError>,
     ) -> Result<(), ModelError> {
-        self.flush_pending()?;
+        if self.capacity_exhausted {
+            return Ok(());
+        }
+        let flush = self.flush_pending();
+        if self.recover_capacity(flush)?.is_none() {
+            return Ok(());
+        }
         match &self.storage {
             Storage::Memory(records) => {
                 for (file_id, record) in records {
@@ -397,26 +465,37 @@ impl IdentityStore {
         file_id: &FileId,
         record: &IdentityRecord,
     ) -> Result<Option<IdentityRecord>, ModelError> {
-        let existing = self.get(file_id)?;
-        if matches!(self.storage, Storage::Memory(_)) {
-            let value = serde_json::to_vec(record).map_err(identity_error)?;
-            let previous = existing.as_ref().map_or(0, |current| {
-                std::mem::size_of::<FileId>()
-                    .saturating_add(serde_json::to_vec(current).map_or(0, |encoded| encoded.len()))
-                    .saturating_add(IDENTITY_ENTRY_OVERHEAD)
-            });
-            self.estimated_bytes = self
-                .estimated_bytes
-                .saturating_sub(previous)
-                .saturating_add(std::mem::size_of::<FileId>())
-                .saturating_add(value.len())
-                .saturating_add(IDENTITY_ENTRY_OVERHEAD);
-            if self.estimated_bytes > self.memory_limit {
-                self.spill_to_disk()?;
-            }
+        if self.capacity_exhausted {
+            return Ok(None);
         }
-        self.insert(file_id, record, existing.is_none())?;
-        Ok(existing)
+        let result = (|| -> Result<Option<IdentityRecord>, ModelError> {
+            let existing = self.get(file_id)?;
+            if matches!(self.storage, Storage::Memory(_)) {
+                let value = serde_json::to_vec(record).map_err(identity_error)?;
+                let previous = existing.as_ref().map_or(0, |current| {
+                    std::mem::size_of::<FileId>()
+                        .saturating_add(
+                            serde_json::to_vec(current).map_or(0, |encoded| encoded.len()),
+                        )
+                        .saturating_add(IDENTITY_ENTRY_OVERHEAD)
+                });
+                self.estimated_bytes = self
+                    .estimated_bytes
+                    .saturating_sub(previous)
+                    .saturating_add(std::mem::size_of::<FileId>())
+                    .saturating_add(value.len())
+                    .saturating_add(IDENTITY_ENTRY_OVERHEAD);
+                if self.estimated_bytes > self.memory_limit {
+                    self.spill_to_disk()?;
+                }
+            }
+            self.insert(file_id, record, existing.is_none())?;
+            Ok(existing)
+        })();
+        match self.recover_capacity(result)? {
+            Some(existing) => Ok(existing),
+            None => Ok(None),
+        }
     }
     pub(crate) fn refresh_declared_links(
         &mut self,
@@ -440,15 +519,19 @@ impl IdentityStore {
         removed: &[NodeId],
         replacement: NodeId,
     ) -> Result<(), ModelError> {
-        if removed.is_empty() {
+        if self.capacity_exhausted || removed.is_empty() {
             return Ok(());
         }
-        let Some(mut record) = self.get(file_id)? else {
-            return Ok(());
-        };
-        if remap_record_nodes(&mut record, removed, replacement) {
-            self.insert(file_id, &record, false)?;
-        }
+        let result = (|| -> Result<(), ModelError> {
+            let Some(mut record) = self.get(file_id)? else {
+                return Ok(());
+            };
+            if remap_record_nodes(&mut record, removed, replacement) {
+                self.insert(file_id, &record, false)?;
+            }
+            Ok(())
+        })();
+        let _ = self.recover_capacity(result)?;
         Ok(())
     }
 
@@ -461,88 +544,93 @@ impl IdentityStore {
         removed: &mut [NodeId],
         replacement: NodeId,
     ) -> Result<(), ModelError> {
-        if removed.is_empty() {
+        if self.capacity_exhausted || removed.is_empty() {
             return Ok(());
         }
-        removed.sort_unstable();
-        if self.is_spilled() {
-            self.flush_pending()?;
-        }
-        match &mut self.storage {
-            Storage::Memory(records) => {
-                for record in records.values_mut() {
-                    remap_record_nodes(record, removed, replacement);
-                }
-                Ok(())
+        let result = (|| -> Result<(), ModelError> {
+            removed.sort_unstable();
+            if self.is_spilled() {
+                self.flush_pending()?;
             }
-            Storage::Disk { database, .. } => {
-                let mut resume_after = None;
-                loop {
-                    let (updates, last_key, has_more) = {
-                        let transaction = database.begin_read().map_err(identity_error)?;
-                        let table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
-                        let mut entries = match resume_after.as_deref() {
-                            Some(key) => table
-                                .range::<&[u8]>((Bound::Excluded(key), Bound::Unbounded))
-                                .map_err(identity_error)?,
-                            None => table.iter().map_err(identity_error)?,
-                        };
-                        let mut updates = Vec::new();
-                        let mut last_key = None;
-                        for _ in 0..DISK_WRITE_BATCH {
-                            let Some(entry) = entries.next() else {
-                                break;
-                            };
-                            let (key, value) = entry.map_err(identity_error)?;
-                            let key = key.value().to_vec();
-                            let mut record =
-                                serde_json::from_slice(value.value()).map_err(identity_error)?;
-                            if remap_record_nodes(&mut record, removed, replacement) {
-                                updates.push((
-                                    key.clone(),
-                                    serde_json::to_vec(&record).map_err(identity_error)?,
-                                ));
-                            }
-                            last_key = Some(key);
-                        }
-                        let has_more = match last_key.as_deref() {
-                            Some(last_key) => table
-                                .range::<&[u8]>((Bound::Excluded(last_key), Bound::Unbounded))
-                                .map_err(identity_error)?
-                                .next()
-                                .transpose()
-                                .map_err(identity_error)?
-                                .is_some(),
-                            None => false,
-                        };
-                        (updates, last_key, has_more)
-                    };
-                    if !updates.is_empty() {
-                        let transaction = database.begin_write().map_err(identity_error)?;
-                        {
-                            let mut table =
+            match &mut self.storage {
+                Storage::Memory(records) => {
+                    for record in records.values_mut() {
+                        remap_record_nodes(record, removed, replacement);
+                    }
+                    Ok(())
+                }
+                Storage::Disk { database, .. } => {
+                    let mut resume_after = None;
+                    loop {
+                        let (updates, last_key, has_more) = {
+                            let transaction = database.begin_read().map_err(identity_error)?;
+                            let table =
                                 transaction.open_table(IDENTITIES).map_err(identity_error)?;
-                            for (key, value) in updates {
-                                table
-                                    .insert(key.as_slice(), value.as_slice())
+                            let mut entries = match resume_after.as_deref() {
+                                Some(key) => table
+                                    .range::<&[u8]>((Bound::Excluded(key), Bound::Unbounded))
+                                    .map_err(identity_error)?,
+                                None => table.iter().map_err(identity_error)?,
+                            };
+                            let mut updates = Vec::new();
+                            let mut last_key = None;
+                            for _ in 0..DISK_WRITE_BATCH {
+                                let Some(entry) = entries.next() else {
+                                    break;
+                                };
+                                let (key, value) = entry.map_err(identity_error)?;
+                                let key = key.value().to_vec();
+                                let mut record = serde_json::from_slice(value.value())
                                     .map_err(identity_error)?;
+                                if remap_record_nodes(&mut record, removed, replacement) {
+                                    updates.push((
+                                        key.clone(),
+                                        serde_json::to_vec(&record).map_err(identity_error)?,
+                                    ));
+                                }
+                                last_key = Some(key);
                             }
+                            let has_more = match last_key.as_deref() {
+                                Some(last_key) => table
+                                    .range::<&[u8]>((Bound::Excluded(last_key), Bound::Unbounded))
+                                    .map_err(identity_error)?
+                                    .next()
+                                    .transpose()
+                                    .map_err(identity_error)?
+                                    .is_some(),
+                                None => false,
+                            };
+                            (updates, last_key, has_more)
+                        };
+                        if !updates.is_empty() {
+                            let transaction = database.begin_write().map_err(identity_error)?;
+                            {
+                                let mut table =
+                                    transaction.open_table(IDENTITIES).map_err(identity_error)?;
+                                for (key, value) in updates {
+                                    table
+                                        .insert(key.as_slice(), value.as_slice())
+                                        .map_err(identity_error)?;
+                                }
+                            }
+                            transaction.commit().map_err(identity_error)?;
                         }
-                        transaction.commit().map_err(identity_error)?;
+                        if !has_more {
+                            break;
+                        }
+                        let Some(last_key) = last_key else {
+                            return Err(ModelError::Invariant(
+                                "identity store iteration advanced without a key".to_string(),
+                            ));
+                        };
+                        resume_after = Some(last_key);
                     }
-                    if !has_more {
-                        break;
-                    }
-                    let Some(last_key) = last_key else {
-                        return Err(ModelError::Invariant(
-                            "identity store iteration advanced without a key".to_string(),
-                        ));
-                    };
-                    resume_after = Some(last_key);
+                    Ok(())
                 }
-                Ok(())
             }
-        }
+        })();
+        let _ = self.recover_capacity(result)?;
+        Ok(())
     }
 
     fn spill_to_disk(&mut self) -> Result<(), ModelError> {
@@ -563,8 +651,12 @@ impl IdentityStore {
             let cache_size = (self.memory_limit / 4).clamp(64 * 1024, 16 * 1024 * 1024);
             let mut builder = RedbBuilder::new();
             builder.set_cache_size(cache_size);
-            let backend = BoundedFileBackend::new(file, self.session.database_reservation())
-                .map_err(identity_error)?;
+            let backend = BoundedFileBackend::new(
+                file,
+                self.session.database_reservation(),
+                self.session.database_capacity_signal(),
+            )
+            .map_err(identity_error)?;
             let database = builder
                 .create_with_backend(backend)
                 .map_err(identity_error)?;
@@ -588,6 +680,28 @@ impl IdentityStore {
             pending: HashMap::new(),
         };
         Ok(())
+    }
+
+    fn disable_for_capacity(&mut self) -> Result<(), ModelError> {
+        let storage = std::mem::replace(&mut self.storage, Storage::Memory(HashMap::new()));
+        drop(storage);
+        self.estimated_bytes = 0;
+        self.capacity_exhausted = true;
+        self.session.remove_database()
+    }
+
+    fn recover_capacity<T>(
+        &mut self,
+        result: Result<T, ModelError>,
+    ) -> Result<Option<T>, ModelError> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(_) if self.session.database_capacity_exhausted() => {
+                self.disable_for_capacity()?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn insert(
@@ -1146,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_spill_enforces_the_session_limit_and_cleans_up_after_failure() {
+    fn identity_spill_capacity_switches_to_untracked_and_releases_storage() {
         let temporary_storage = TemporaryStorage::with_limit_bytes(MAX_MARKER_BYTES);
         let spill_path = {
             let mut store = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
@@ -1155,7 +1269,8 @@ mod tests {
                 .internal_scan_paths()
                 .pop()
                 .expect("active private session should be tracked");
-            let error = store
+
+            let (is_new, record) = store
                 .observe(
                     &FileId::new_inode(13, 1),
                     Some(1),
@@ -1163,16 +1278,28 @@ mod tests {
                     None,
                     None,
                 )
-                .expect_err("identity spill must fail before exceeding its session limit");
-            assert!(matches!(error, ModelError::Identity(_)));
-            assert!(
-                error
-                    .to_string()
-                    .contains("temporary storage capacity exhausted")
-            );
-            assert!(error.to_string().contains("--temporary-storage-mib"));
+                .expect("capacity exhaustion should preserve the scan as uncertain");
+            assert!(!is_new);
+            assert_eq!(record.allocated_bytes, ByteBounds::unknown());
+            assert!(store.capacity_exhausted());
             assert_eq!(store.len(), 0);
             assert!(!store.is_spilled());
+            assert!(
+                store
+                    .get(&FileId::new_inode(13, 1))
+                    .expect("untracked identity lookup should not fail")
+                    .is_none()
+            );
+            store
+                .observe(
+                    &FileId::new_inode(13, 2),
+                    Some(1),
+                    ByteBounds::exact(4096),
+                    None,
+                    None,
+                )
+                .expect("subsequent identities should remain untracked without another error");
+            assert!(!path.join(IDENTITY_DATABASE_FILE).exists());
             assert!(temporary_storage.used() <= MAX_MARKER_BYTES);
             path
         };

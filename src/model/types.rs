@@ -133,9 +133,11 @@ pub enum UnscannedReason {
     Excluded(String),
     Metadata(String),
     Replacement(String),
+    /// The scan continues, but its bounded identity store can no longer prove
+    /// exact physical-allocation and reclaimability metrics.
+    IdentityStorageCapacity,
     MemoryAggregation,
 }
-
 #[derive(Clone, Debug)]
 pub struct Node {
     pub id: NodeId,

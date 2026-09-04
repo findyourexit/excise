@@ -544,7 +544,8 @@ where
                         self.summary.last_worker_error = Some(safe_display_text(message));
                         self.app.increment_failed_to_read();
                     }
-                    crate::model::UnscannedReason::MemoryAggregation => {}
+                    crate::model::UnscannedReason::IdentityStorageCapacity
+                    | crate::model::UnscannedReason::MemoryAggregation => {}
                 }
                 self.app.record_unscanned(&path, reason)?;
             }
@@ -926,6 +927,7 @@ fn display_reason(reason: &crate::model::UnscannedReason) -> String {
         }
         crate::model::UnscannedReason::SymbolicLink
         | crate::model::UnscannedReason::FilesystemBoundary
+        | crate::model::UnscannedReason::IdentityStorageCapacity
         | crate::model::UnscannedReason::MemoryAggregation => false,
     };
     let rendered = safe_display_text(&format!("{reason:?}"));
@@ -1010,7 +1012,8 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                             summary.last_worker_error = Some(safe_display_text(message));
                             tree.failed_to_read = tree.failed_to_read.saturating_add(1);
                         }
-                        crate::model::UnscannedReason::MemoryAggregation => {}
+                        crate::model::UnscannedReason::IdentityStorageCapacity
+                        | crate::model::UnscannedReason::MemoryAggregation => {}
                     }
                     tree.record_unscanned(&path, reason)
                         .map_err(|error| AppError::Model(error.to_string()))?;

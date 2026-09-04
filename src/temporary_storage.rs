@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use redb::StorageBackend;
@@ -157,6 +157,7 @@ impl Drop for TemporaryStorageReservation {
 pub(crate) struct BoundedFileBackend {
     file: Mutex<BoundedFile>,
     reservation: Arc<Mutex<TemporaryStorageReservation>>,
+    capacity_exhausted: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -169,6 +170,7 @@ impl BoundedFileBackend {
     pub(crate) fn new(
         file: File,
         reservation: Arc<Mutex<TemporaryStorageReservation>>,
+        capacity_exhausted: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let length = file.metadata()?.len();
         {
@@ -181,12 +183,24 @@ impl BoundedFileBackend {
                     "temporary storage database reservation was not empty",
                 ));
             }
-            reservation.grow_to(length)?;
+            if let Err(error) = reservation.grow_to(length) {
+                if error.kind() == io::ErrorKind::StorageFull {
+                    capacity_exhausted.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
         }
         Ok(Self {
             file: Mutex::new(BoundedFile { file, length }),
             reservation,
+            capacity_exhausted,
         })
+    }
+
+    fn note_capacity_error(&self, error: &io::Error) {
+        if error.kind() == io::ErrorKind::StorageFull {
+            self.capacity_exhausted.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -246,7 +260,10 @@ impl StorageBackend for BoundedFileBackend {
             ));
         }
         if len > file.length {
-            reservation.grow_to(len)?;
+            if let Err(error) = reservation.grow_to(len) {
+                self.note_capacity_error(&error);
+                return Err(error);
+            }
             if let Err(error) = file.file.set_len(len) {
                 reservation.shrink_to(file.length);
                 return Err(error);
@@ -309,6 +326,28 @@ fn verify_length(file: &BoundedFile) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_backend_signals_identity_capacity_exhaustion() {
+        let storage = TemporaryStorage::with_limit_bytes(0);
+        let capacity_exhausted = Arc::new(AtomicBool::new(false));
+        let backend = BoundedFileBackend::new(
+            tempfile::tempfile().expect("temporary database file should open"),
+            Arc::new(Mutex::new(
+                storage
+                    .reservation(0)
+                    .expect("empty database reservation should fit"),
+            )),
+            Arc::clone(&capacity_exhausted),
+        )
+        .expect("bounded database backend should initialize");
+
+        let error = backend
+            .set_len(1)
+            .expect_err("database growth beyond its shared storage limit should fail");
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert!(capacity_exhausted.load(Ordering::Acquire));
+    }
 
     #[test]
     fn reservations_enforce_the_shared_limit_and_release_on_drop() {
