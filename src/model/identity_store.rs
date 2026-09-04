@@ -35,7 +35,38 @@ pub struct IdentityRecord {
     pub declared_links: Option<u64>,
     pub allocated_bytes: ByteBounds,
     pub allocation_node: Option<NodeId>,
-    pub nodes: Vec<NodeId>,
+    /// Distinct participant nodes paired with their exact observed link counts.
+    pub nodes: Vec<(NodeId, u64)>,
+}
+
+impl IdentityRecord {
+    fn observe_node(&mut self, node: NodeId) {
+        match self
+            .nodes
+            .binary_search_by_key(&node, |(existing, _)| *existing)
+        {
+            Ok(index) => {
+                self.nodes[index].1 = self.nodes[index].1.saturating_add(1);
+            }
+            Err(index) => self.nodes.insert(index, (node, 1)),
+        }
+    }
+
+    pub(crate) fn coalesce_nodes(&mut self) {
+        self.nodes.sort_unstable_by_key(|(node, _)| *node);
+        let mut retained = 0_usize;
+        for index in 0..self.nodes.len() {
+            let (node, links) = self.nodes[index];
+            if retained > 0 && self.nodes[retained - 1].0 == node {
+                let (_, retained_links) = &mut self.nodes[retained - 1];
+                *retained_links = retained_links.saturating_add(links);
+            } else {
+                self.nodes[retained] = (node, links);
+                retained += 1;
+            }
+        }
+        self.nodes.truncate(retained);
+    }
 }
 
 pub struct IdentityStore {
@@ -200,7 +231,7 @@ impl IdentityStore {
         record.observed_links = record.observed_links.saturating_add(1);
         record.declared_links = merge_declared_links(record.declared_links, declared_links);
         if let Some(node) = node {
-            record.nodes.push(node);
+            record.observe_node(node);
         }
 
         if matches!(self.storage, Storage::Memory(_)) {
@@ -577,11 +608,14 @@ fn remap_record_nodes(
     replacement: NodeId,
 ) -> bool {
     let mut changed = false;
-    for node in &mut record.nodes {
-        if removed.binary_search(&*node).is_ok() {
+    for (node, _) in &mut record.nodes {
+        if removed.binary_search(node).is_ok() {
             *node = replacement;
             changed = true;
         }
+    }
+    if changed {
+        record.coalesce_nodes();
     }
     if record
         .allocation_node
@@ -1149,7 +1183,7 @@ mod tests {
             .get(&file_id)
             .expect("identity lookup should succeed")
             .expect("identity should remain");
-        assert_eq!(record.nodes, vec![NodeId(12), NodeId(5)]);
+        assert_eq!(record.nodes, vec![(NodeId(5), 1), (NodeId(12), 1)]);
         assert_eq!(record.allocation_node, Some(NodeId(12)));
     }
 
@@ -1181,9 +1215,52 @@ mod tests {
                 .get(&FileId::new_inode(10, u64::from(index)))
                 .expect("identity lookup should succeed")
                 .expect("identity should remain");
-            assert_eq!(record.nodes, vec![replacement]);
+            assert_eq!(record.nodes, vec![(replacement, 1)]);
             assert_eq!(record.allocation_node, Some(replacement));
         }
+    }
+
+    #[test]
+    fn spilled_repeated_participants_are_coalesced_after_remap() {
+        const OBSERVATIONS: u64 = 1_024;
+        let file_id = FileId::new_inode(11, 11);
+        let mut store = IdentityStore::new(1).expect("private session should initialize");
+        for _ in 0..OBSERVATIONS {
+            store
+                .observe(
+                    &file_id,
+                    Some(OBSERVATIONS),
+                    ByteBounds::exact(4096),
+                    Some(NodeId(4)),
+                    Some(NodeId(4)),
+                )
+                .expect("repeated spilled participant should be stored");
+        }
+        assert!(store.is_spilled());
+
+        store
+            .remap_nodes_for_identity(&file_id, &[NodeId(4)], NodeId(9))
+            .expect("spilled participant should be remapped");
+
+        let Storage::Disk { pending, .. } = &store.storage else {
+            panic!("identity store should spill");
+        };
+        let pending_record = pending
+            .values()
+            .next()
+            .expect("remapped record should be pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending_record.nodes.len(), 1);
+        assert_eq!(pending_record.nodes, vec![(NodeId(9), OBSERVATIONS)]);
+
+        let record = store
+            .get(&file_id)
+            .expect("identity lookup should succeed")
+            .expect("identity should remain");
+        assert_eq!(record.observed_links, OBSERVATIONS);
+        assert_eq!(record.nodes.len(), 1);
+        assert_eq!(record.nodes, vec![(NodeId(9), OBSERVATIONS)]);
+        assert_eq!(record.allocation_node, Some(NodeId(9)));
     }
 
     #[test]
@@ -1218,7 +1295,7 @@ mod tests {
             .get(&file_id)
             .expect("identity lookup should succeed")
             .expect("identity should remain");
-        assert_eq!(record.nodes, vec![NodeId(9)]);
+        assert_eq!(record.nodes, vec![(NodeId(9), 1)]);
         assert_eq!(record.allocation_node, Some(NodeId(9)));
     }
 
