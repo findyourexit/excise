@@ -22,7 +22,7 @@ The main loop polls terminal input with a bounded timeout. It renders each folde
 
 ### Scanner
 
-The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. When temporary working data reaches its memory limit, the scanner can use a permission-restricted store for the session instead of growing without limit. Backpressure never silently drops an entry.
+The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. Queued directory tasks and identity spill files share one per-session temporary-storage limit, reserve capacity before their files grow, and release it after shrinking or cleanup. A capacity breach reports an actionable failure and never turns incomplete work into an exact result; backpressure never silently drops an entry.
 
 The default worker count leaves one available processor for the owner loop when possible and is clamped from one through eight. The configured value must be between one and 32. Exclusions and file system boundaries remain visible in the working model. Link targets are never traversed.
 
@@ -36,7 +36,7 @@ The default process memory limit is 512 MiB. Working data may use 75 percent of 
 
 ### Space Accounting
 
-The identity table counts files with more than one name once within the scan scope. When exact identity data exceeds the memory limit, a permission-restricted store for the current session keeps the minimum records needed for accounting. Unknown values remain bounds rather than becoming guessed numbers.
+The identity table counts files with more than one name once within the scan scope. When exact identity data exceeds the memory limit, a permission-restricted store for the current session keeps the minimum records needed for accounting within the shared temporary-storage limit. Unknown values remain bounds rather than becoming guessed numbers.
 
 ### Deletion
 

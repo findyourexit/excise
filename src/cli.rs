@@ -61,6 +61,7 @@ pub(crate) fn run_main() -> i32 {
         cross_filesystems: config.cross_filesystems,
         exclusions: config.exclusions,
         memory_mib: config.memory_mib,
+        temporary_storage_mib: config.temporary_storage_mib,
         apparent_size: config.apparent_size,
         disable_delete_confirmation: config.disable_delete_confirmation,
         reduced_motion: config.reduced_motion,

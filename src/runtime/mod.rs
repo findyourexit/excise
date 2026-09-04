@@ -28,6 +28,7 @@ use crate::native_path::{
 use crate::outcome::{OperationOutcome, RunSummary};
 use crate::report::{ScanReport, ScanReportState, scan_report_state};
 use crate::state::files::FileTree;
+use crate::temporary_storage::TemporaryStorage;
 use crate::theme::ThemeId;
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -46,6 +47,7 @@ pub struct RuntimeSettings {
     pub cross_filesystems: bool,
     pub exclusions: Vec<String>,
     pub memory_mib: usize,
+    pub temporary_storage_mib: usize,
     pub apparent_size: bool,
     pub disable_delete_confirmation: bool,
     pub reduced_motion: bool,
@@ -82,6 +84,7 @@ where
     clock: Box<dyn Clock>,
     animation: AnimationScheduler,
     settings: RuntimeSettings,
+    temporary_storage: TemporaryStorage,
     summary: RunSummary,
     scan_active: bool,
     /// Scan data relevant to the displayed folder arrived since its last refresh.
@@ -111,7 +114,9 @@ where
     B: Backend,
 {
     let now = clock.now();
-    let app = App::new_with_root_identity(
+    let temporary_storage = TemporaryStorage::from_mib(settings.temporary_storage_mib)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let app = App::new_with_root_identity_and_temporary_storage(
         terminal_backend,
         settings.root.clone(),
         settings.root_identity.clone(),
@@ -121,6 +126,7 @@ where
         settings.keymap,
         settings.custom_keys.clone(),
         settings.mouse,
+        temporary_storage.clone(),
     )?;
     let workers = WorkerPool::start(
         scanner::ScannerOptions {
@@ -130,6 +136,7 @@ where
             cross_filesystems: settings.cross_filesystems,
             exclusions: settings.exclusions.clone(),
             internal_paths: app.internal_scan_paths(),
+            temporary_storage: temporary_storage.clone(),
         },
         settings.event_capacity,
     )?;
@@ -142,6 +149,7 @@ where
         clock,
         animation,
         settings,
+        temporary_storage,
         summary: RunSummary::default(),
         scan_active: true,
         scan_view_dirty: false,
@@ -317,6 +325,7 @@ where
                     cross_filesystems: self.settings.cross_filesystems,
                     exclusions: self.settings.exclusions.clone(),
                     internal_paths: self.app.internal_scan_paths(),
+                    temporary_storage: self.temporary_storage.clone(),
                 })?;
                 self.scan_active = true;
                 self.rescan_active = true;
@@ -762,6 +771,7 @@ where
             cross_filesystems: self.settings.cross_filesystems,
             exclusions: self.settings.exclusions.clone(),
             internal_paths: self.app.internal_scan_paths(),
+            temporary_storage: self.temporary_storage.clone(),
         })?;
         self.scan_active = true;
         self.rescan_active = true;
@@ -937,11 +947,14 @@ fn display_reason(reason: &crate::model::UnscannedReason) -> String {
 /// Returns a scanner, model, or worker error after all owned workers stop.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanReport>, AppError> {
-    let mut tree = FileTree::new_with_root_identity(
+    let temporary_storage = TemporaryStorage::from_mib(settings.temporary_storage_mib)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let mut tree = FileTree::new_with_root_identity_and_temporary_storage(
         settings.root.clone(),
         settings.root_identity.clone(),
         settings.apparent_size,
         settings.memory_mib,
+        temporary_storage.clone(),
     )
     .map_err(|error| AppError::Model(error.to_string()))?;
     let workers = WorkerPool::start(
@@ -952,6 +965,7 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
             cross_filesystems: settings.cross_filesystems,
             exclusions: settings.exclusions.clone(),
             internal_paths: tree.internal_scan_paths(),
+            temporary_storage,
         },
         settings.event_capacity,
     )?;
@@ -1146,6 +1160,7 @@ mod tests {
                 cross_filesystems: false,
                 exclusions: Vec::new(),
                 internal_paths: app.internal_scan_paths(),
+                temporary_storage: TemporaryStorage::default(),
             },
             1,
         )
@@ -1164,6 +1179,7 @@ mod tests {
                 cross_filesystems: false,
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
                 apparent_size: false,
                 disable_delete_confirmation: false,
                 reduced_motion: true,
@@ -1177,6 +1193,7 @@ mod tests {
                 config_path: None,
                 monochrome_locked: true,
             },
+            temporary_storage: TemporaryStorage::default(),
             summary: RunSummary::default(),
             scan_active: true,
             scan_view_dirty: false,
@@ -1271,6 +1288,7 @@ mod tests {
                 cross_filesystems: false,
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
                 apparent_size: false,
                 disable_delete_confirmation: false,
                 reduced_motion: true,
@@ -1284,6 +1302,7 @@ mod tests {
                 config_path: None,
                 monochrome_locked: true,
             },
+            temporary_storage: TemporaryStorage::default(),
             summary: RunSummary::default(),
             scan_active: true,
             scan_view_dirty: false,

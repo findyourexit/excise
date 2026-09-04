@@ -4,6 +4,12 @@ All notable Excise changes are documented here. The format follows [Keep a Chang
 
 Excise preserves the historical Diskonaut changelog below. Diskonaut versions and tags are not Excise releases.
 
+## [Unreleased]
+
+### Fixed
+
+* Scanner directory-task spill and identity spill files now share a fixed per-session temporary-storage limit. Capacity is reserved before a file grows, released after cleanup, and exhaustion reports an actionable incomplete scan or identity-accounting error instead of silently dropping work or claiming an exact result.
+
 ## [1.2.1] - 2026-09-02
 
 ### Fixed

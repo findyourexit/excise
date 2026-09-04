@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use crate::native_path::{safe_display_path_text, safe_display_text};
+use crate::temporary_storage::{DEFAULT_TEMPORARY_STORAGE_MIB, MIN_TEMPORARY_STORAGE_MIB};
 use crate::theme::ThemeId;
 
 fn config_error(message: impl std::fmt::Display) -> AppError {
@@ -22,6 +23,7 @@ pub const CONFIG_VERSION: u16 = 1;
 const DEFAULT_EVENT_BUFFER: usize = 256;
 const MAX_SCANNER_THREADS: usize = 32;
 const DEFAULT_MAX_SCANNER_THREADS: usize = 8;
+const MAX_TEMPORARY_STORAGE_MIB: usize = usize::MAX / (1024 * 1024);
 
 fn default_scan_threads(available: usize) -> usize {
     available
@@ -185,6 +187,9 @@ pub struct Cli {
     #[arg(long, value_name = "MIB")]
     /// Whole-process memory envelope in MiB
     pub memory_mib: Option<usize>,
+    #[arg(long, value_name = "MIB")]
+    /// Combined scanner-task and identity temporary storage limit per session (2+)
+    pub temporary_storage_mib: Option<usize>,
     #[arg(long)]
     /// Disable nonessential motion
     pub reduced_motion: bool,
@@ -239,6 +244,7 @@ pub struct ScannerFileConfig {
 #[serde(deny_unknown_fields)]
 pub struct ModelFileConfig {
     pub process_memory_mib: Option<usize>,
+    pub temporary_storage_mib: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -264,6 +270,7 @@ pub struct EnvironmentOverrides {
     pub cross_filesystems: Option<bool>,
     pub exclusions: Vec<String>,
     pub memory_mib: Option<usize>,
+    pub temporary_storage_mib: Option<usize>,
     pub monochrome: bool,
     pub theme: Option<ThemeId>,
     pub ascii: Option<bool>,
@@ -282,6 +289,7 @@ pub struct RuntimeConfig {
     pub cross_filesystems: bool,
     pub exclusions: Vec<String>,
     pub memory_mib: usize,
+    pub temporary_storage_mib: usize,
     pub apparent_size: bool,
     pub reduced_motion: bool,
     pub monochrome: bool,
@@ -373,6 +381,11 @@ impl RuntimeConfig {
             .or(environment.memory_mib)
             .or_else(|| file_model.and_then(|model| model.process_memory_mib))
             .unwrap_or(crate::model::DEFAULT_PROCESS_MIB.min(maximum_memory_mib));
+        let temporary_storage_mib = cli
+            .temporary_storage_mib
+            .or(environment.temporary_storage_mib)
+            .or_else(|| file_model.and_then(|model| model.temporary_storage_mib))
+            .unwrap_or(DEFAULT_TEMPORARY_STORAGE_MIB);
         validate_range("scanner threads", scan_threads, 1, MAX_SCANNER_THREADS)?;
         validate_range("event buffer", event_buffer, 16, 4096)?;
         validate_range(
@@ -380,6 +393,12 @@ impl RuntimeConfig {
             memory_mib,
             crate::model::MIN_PROCESS_MIB,
             maximum_memory_mib,
+        )?;
+        validate_range(
+            "temporary storage",
+            temporary_storage_mib,
+            MIN_TEMPORARY_STORAGE_MIB,
+            MAX_TEMPORARY_STORAGE_MIB,
         )?;
 
         let apparent_size = cli.apparent_size
@@ -448,6 +467,7 @@ impl RuntimeConfig {
             scan_threads,
             event_buffer,
             memory_mib,
+            temporary_storage_mib,
             apparent_size,
             cross_filesystems,
             exclusions,
@@ -497,6 +517,7 @@ impl EnvironmentOverrides {
                 })
                 .unwrap_or_default(),
             memory_mib: parse_usize_env("EXCISE_MEMORY_MIB")?,
+            temporary_storage_mib: parse_usize_env("EXCISE_TEMPORARY_STORAGE_MIB")?,
         })
     }
 }
