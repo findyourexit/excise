@@ -14,7 +14,7 @@ flate2 = "1.1.10"
 serde_json = "1.0.151"
 jsonschema = { version = "0.52.1", default-features = false }
 sha2 = "0.10"
-tar = "0.4"
+tar = "0.4.46"
 excise = { path = ".." }
 [lints]
 workspace = true
