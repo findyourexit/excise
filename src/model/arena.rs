@@ -5651,19 +5651,9 @@ mod tests {
                 Some(NodeId(1)),
             )
             .expect("identity should spill");
-        #[cfg(windows)]
         corrupt
             .corrupt_spill_record_for_test(&file_id)
             .expect("spill record should be corruptible through the database");
-        #[cfg(not(windows))]
-        {
-            let spill_path = corrupt
-                .spill_path()
-                .expect("spilled store should expose its path")
-                .to_path_buf();
-            std::fs::write(spill_path.join("identities.redb"), b"corrupt")
-                .expect("spill database should be corruptible");
-        }
         arena.identities = corrupt;
 
         let error = arena
