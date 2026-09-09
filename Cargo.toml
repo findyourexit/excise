@@ -59,7 +59,7 @@ required-features = ["internal"]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "std"] }
 crossterm = "0.29"
 anyhow = "1.0.104"
-cap-primitives = "4.0.2"
+cap-primitives = "4.0.3"
 clap = { version = "4.6.6", features = ["derive"] }
 filesize = "0.2.0"
 unicode-width = "0.2.2"
