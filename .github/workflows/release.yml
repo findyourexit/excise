@@ -61,7 +61,7 @@ jobs:
       source_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing' && steps.recovery_identity.outputs.source_sha || github.event_name == 'workflow_dispatch' && steps.candidate_identity.outputs.source_sha || steps.release_identity.outputs.source_sha }}
     steps:
       - name: Check out exact source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
           fetch-depth: 0
@@ -273,7 +273,7 @@ jobs:
           - { os: windows-2025, target: aarch64-pc-windows-msvc }
     steps:
       - name: Check out exact source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-gate.outputs.source_sha }}
           fetch-depth: 0
@@ -387,7 +387,7 @@ jobs:
       attestations: write
     steps:
       - name: Check out exact source for dependency SBOM
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-gate.outputs.source_sha }}
           fetch-depth: 0
@@ -459,7 +459,7 @@ jobs:
             ([.packages[] | select(.name == "excise" and .versionInfo == $version)] | length == 1)
           ' "$sbom" >/dev/null
       - name: Attest release candidate artifacts
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: release/*
       - name: Upload release candidate bundle
@@ -827,7 +827,7 @@ jobs:
       contents: read
     steps:
       - name: Check out exact source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-gate.outputs.source_sha }}
           fetch-depth: 0
@@ -938,7 +938,7 @@ jobs:
       contents: read
     steps:
       - name: Check out exact source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-gate.outputs.source_sha }}
           fetch-depth: 0
@@ -996,7 +996,7 @@ jobs:
             printf 'EXCISE_SHA256_AARCH64_APPLE_DARWIN=%s\n' "$EXCISE_SHA256_AARCH64_APPLE_DARWIN"
           } >> "$GITHUB_ENV"
       - name: Check out first-party Homebrew tap
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: findyourexit/homebrew-tap
           ref: main
