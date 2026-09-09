@@ -213,13 +213,13 @@ impl StorageBackend for BoundedFileBackend {
         Ok(file.length)
     }
 
-    fn read(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    fn read(&self, offset: u64, bytes: &mut [u8]) -> io::Result<()> {
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let end = offset
-            .checked_add(u64::try_from(len).map_err(|_| {
+            .checked_add(u64::try_from(bytes.len()).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "temporary storage read is too large",
@@ -237,10 +237,8 @@ impl StorageBackend for BoundedFileBackend {
                 "temporary storage read exceeds the bounded file",
             ));
         }
-        let mut bytes = vec![0; len];
         file.file.seek(SeekFrom::Start(offset))?;
-        file.file.read_exact(&mut bytes)?;
-        Ok(bytes)
+        file.file.read_exact(bytes)
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
@@ -276,7 +274,7 @@ impl StorageBackend for BoundedFileBackend {
         Ok(())
     }
 
-    fn sync_data(&self, _eventual: bool) -> io::Result<()> {
+    fn sync_data(&self) -> io::Result<()> {
         let file = self
             .file
             .lock()
@@ -347,6 +345,43 @@ mod tests {
             .expect_err("database growth beyond its shared storage limit should fail");
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         assert!(capacity_exhausted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn bounded_backend_reads_into_caller_buffer_within_reserved_length() {
+        let storage = TemporaryStorage::with_limit_bytes(3);
+        let reservation = Arc::new(Mutex::new(
+            storage
+                .reservation(0)
+                .expect("empty database reservation should fit"),
+        ));
+        let backend = BoundedFileBackend::new(
+            tempfile::tempfile().expect("temporary database file should open"),
+            Arc::clone(&reservation),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("bounded database backend should initialize");
+        backend
+            .set_len(3)
+            .expect("database growth within its shared storage limit should succeed");
+        backend
+            .write(0, b"red")
+            .expect("bounded database backend should write reserved bytes");
+
+        let mut bytes = [0; 3];
+        backend
+            .read(0, &mut bytes)
+            .expect("bounded database backend should fill the caller buffer");
+        assert_eq!(&bytes, b"red");
+        let error = backend
+            .read(1, &mut bytes)
+            .expect_err("read beyond the reserved file length should fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(storage.used(), 3);
+
+        drop(backend);
+        drop(reservation);
+        assert_eq!(storage.used(), 0);
     }
 
     #[test]

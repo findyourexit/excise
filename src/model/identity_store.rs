@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use file_id::FileId;
-use redb::{Builder as RedbBuilder, Database, ReadableTable, TableDefinition};
+use redb::{Builder as RedbBuilder, Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 #[cfg(not(windows))]
 use tempfile::{Builder as TempBuilder, TempDir};
@@ -376,7 +376,7 @@ impl IdentityStore {
     pub fn spill_path(&self) -> Option<&Path> {
         self.is_spilled().then(|| self.session.path())
     }
-    #[cfg(all(test, windows))]
+    #[cfg(test)]
     pub(crate) fn corrupt_spill_record_for_test(
         &mut self,
         file_id: &FileId,
