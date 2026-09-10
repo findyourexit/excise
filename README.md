@@ -49,6 +49,17 @@ excise --version  # excise 1.2.3
 </details>
 
 <details>
+<summary><strong>X-CMD</strong></summary>
+
+Alternatively, install it with [x-cmd](https://www.x-cmd.com/mod/eget), which downloads the pre-built binary from GitHub Releases:
+
+```bash
+x eget use findyourexit/excise
+```
+
+</details>
+
+<details>
 <summary><strong>Pre-built Binaries</strong></summary>
 
 Download the [v1.2.3 release](https://github.com/findyourexit/excise/releases/tag/v1.2.3) for macOS, Linux, and Windows on Apple silicon, Intel, or Arm systems.
