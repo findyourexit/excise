@@ -13,7 +13,7 @@ excise = { path = "..", features = ["fuzzing"] }
 crossterm = "0.29"
 file-id = "0.2.3"
 libfuzzer-sys = "0.4.13"
-serde_json = "1"
+serde_json = "1.0.151"
 unicode-width = "0.2.2"
 tempfile = "3.27.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["std"] }
