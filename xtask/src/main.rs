@@ -21,6 +21,7 @@ const SCOOP_TEMPLATE: &str = "packaging/scoop/excise.json.in";
 const WINGET_TEMPLATE: &str = "packaging/winget/FindYourExit.Excise.yaml.in";
 const HOMEBREW_TEMPLATE: &str = "packaging/homebrew/Formula/excise.rb.in";
 
+const FUZZ_TOOLCHAIN: &str = "nightly-2026-08-18";
 #[derive(Clone, Copy)]
 struct UnixReleaseAsset {
     target: &'static str,
@@ -96,6 +97,10 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
     let _ = args.next();
     match args.next().as_deref() {
         Some("verify") => verify(),
+        Some("fuzz-toolchain") => {
+            println!("{FUZZ_TOOLCHAIN}");
+            Ok(())
+        }
         Some("generate") => write_generated(),
         Some("check-generated") => check_generated(),
         Some("check-distribution") => check_distribution_contract(&release_version()?),
@@ -105,7 +110,7 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
         Some("demo") => render_demo(),
         Some("create-release-tag") => create_release_tag(args),
         _ => Err(io::Error::other(
-            "usage: cargo xtask <verify|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|create-release-tag>",
+            "usage: cargo xtask <verify|fuzz-toolchain|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|create-release-tag>",
         )
         .into()),
     }
@@ -796,7 +801,15 @@ fn run_fuzz_target(target: &str, iterations: u32) -> Result<(), Box<dyn Error>> 
     let corpus = format!("fuzz/corpus/{target}");
     let seed = format!("fuzz/seeds/{target}");
     fs::create_dir_all(&corpus)?;
-    let mut args = vec!["run", "nightly", "cargo", "fuzz", "run", target, &corpus];
+    let mut args = vec![
+        "run",
+        FUZZ_TOOLCHAIN,
+        "cargo",
+        "fuzz",
+        "run",
+        target,
+        &corpus,
+    ];
     if Path::new(&seed).is_dir() {
         args.push(&seed);
     }
