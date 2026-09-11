@@ -44,10 +44,39 @@ jobs:
         run: cargo bench --bench tachyonfx --features internal --locked -- --noplot
       - name: Run statistical core benchmark
         run: cargo bench --bench core --features internal --locked -- --noplot
-      - name: Preserve Criterion measurements
+      - name: Record reproducible benchmark context
+        shell: bash
+        run: |
+          {
+            printf 'source_sha=%s\n' "$RELEASE_SHA"
+            printf 'checked_out_sha=%s\n' "$(git rev-parse HEAD)"
+            printf 'workflow_run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'workflow_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'event_name=%s\n' "$GITHUB_EVENT_NAME"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'runner_image_os=%s\n' "${ImageOS:-unknown}"
+            printf 'runner_image_version=%s\n' "${ImageVersion:-unknown}"
+            printf '\ncommands:\n'
+            printf '%s\n' \
+              'cargo bench --bench tachyonfx --features internal --locked -- --noplot' \
+              'cargo bench --bench core --features internal --locked -- --noplot'
+            printf '\nrequested_toolchain=1.98.0\n'
+            printf '\ntoolchain:\n'
+            rustup show active-toolchain
+            rustc -Vv
+            cargo -V
+            printf '\ncargo_lock_sha256:\n'
+            sha256sum Cargo.lock
+            printf '\nsystem:\n'
+            uname -a
+            lscpu
+          } > target/criterion/benchmark-context.txt
+      - name: Preserve benchmark evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tachyonfx-criterion
+          name: criterion-benchmark-evidence
           path: target/criterion
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 90
