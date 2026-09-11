@@ -12,15 +12,10 @@ pub(crate) fn physical_size(path: &Path, metadata: &Metadata) -> io::Result<u64>
     {
         let _ = metadata;
         let handle = open_nofollow(path)?;
-        physical_size_from_handle(&handle)
+        crate::os::windows::physical_size_from_handle(&handle)
     }
     #[cfg(not(windows))]
     path.size_on_disk_fast(metadata)
-}
-
-#[cfg(windows)]
-pub(crate) fn physical_size_from_handle(handle: &File) -> io::Result<u64> {
-    windows_allocation_size(handle)
 }
 
 #[cfg(windows)]
@@ -40,31 +35,4 @@ fn open_nofollow(path: &Path) -> io::Result<File> {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         ._cap_fs_ext_follow(FollowSymlinks::No);
     cap_fs::open_ambient(path, &options, ambient_authority())
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn windows_allocation_size(handle: &File) -> io::Result<u64> {
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
-    };
-
-    let mut information = FILE_STANDARD_INFO::default();
-    // SAFETY: the handle is borrowed and valid for this call. `information`
-    // is an aligned writable output value whose size is passed exactly.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            handle.as_raw_handle(),
-            FileStandardInfo,
-            (&raw mut information).cast(),
-            u32::try_from(size_of::<FILE_STANDARD_INFO>()).unwrap_or(u32::MAX),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    u64::try_from(information.AllocationSize)
-        .map_err(|_| io::Error::other("Windows allocation size was negative"))
 }

@@ -87,8 +87,6 @@ pub mod theme;
 mod theme;
 #[allow(dead_code)]
 mod ui;
-#[cfg(windows)]
-mod windows_delete;
 
 pub(crate) use app::{App, UiMode};
 

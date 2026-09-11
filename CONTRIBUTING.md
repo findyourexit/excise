@@ -26,7 +26,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ## Engineering expectations
 
 - Correctness and data safety come before features.
-- Workspace lints deny `unsafe` by default. The audited Windows FFI boundary in `src/os/windows.rs` is the sole explicit exception; keep unsafe code confined there and document every block's safety conditions.
+- Workspace lints deny `unsafe_code` by default. The audited Windows FFI boundary in `src/os/windows.rs` is the only allowed exception; keep unsafe code confined there and document every block's safety conditions.
 - Runtime behavior remains local: do not add telemetry or network access.
 - Destructive-path changes must preserve identity checks, no-follow behavior, consent, revalidation, and partial-failure reporting.
 - Accounting changes must distinguish apparent, allocated, shared, and reclaimable bytes.

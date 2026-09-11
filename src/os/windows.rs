@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt as _;
-use std::os::windows::io::FromRawHandle as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
@@ -28,9 +28,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
-    FileDispositionInfoEx, GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL,
-    SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FileDispositionInfo, FileDispositionInfoEx, FileStandardInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle,
+    WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
@@ -239,6 +240,70 @@ pub(crate) fn is_process_active(pid: u32) -> bool {
     // SAFETY: the owned process handle and the output value remain live here.
     let query_succeeded = unsafe { GetExitCodeProcess(process, &raw mut exit_code) } != 0;
     process_query_is_active(query_succeeded, exit_code)
+}
+
+pub(crate) fn physical_size_from_handle(handle: &File) -> io::Result<u64> {
+    let mut information = FILE_STANDARD_INFO::default();
+    // SAFETY: the handle is borrowed and valid for this call. `information`
+    // is an aligned writable output value whose size is passed exactly.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            FileStandardInfo,
+            (&raw mut information).cast(),
+            u32::try_from(size_of::<FILE_STANDARD_INFO>()).unwrap_or(u32::MAX),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    u64::try_from(information.AllocationSize)
+        .map_err(|_| io::Error::other("Windows allocation size was negative"))
+}
+
+pub(crate) fn remove_open_handle(file: &File) -> io::Result<()> {
+    let handle = file.as_raw_handle();
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    // SAFETY: `handle` is owned by `file` and remains open for the call. The
+    // information pointer and byte count describe a live, correctly aligned
+    // `FILE_DISPOSITION_INFO_EX` value. The API does not retain the pointer.
+    let removed = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfoEx,
+            (&raw const disposition).cast(),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).unwrap_or(u32::MAX),
+        )
+    };
+    if removed != 0 {
+        return Ok(());
+    }
+
+    let extended_error = io::Error::last_os_error();
+    if !matches!(extended_error.raw_os_error(), Some(50 | 87)) {
+        return Err(extended_error);
+    }
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: As above, with the legacy disposition structure. This fallback
+    // remains identity-bound to the already verified handle.
+    let removed = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).unwrap_or(u32::MAX),
+        )
+    };
+    if removed == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn open_private_path(path: &Path, directory: bool, access: u32) -> io::Result<OwnedHandle> {
