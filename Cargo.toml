@@ -16,7 +16,7 @@ homepage = "https://github.com/findyourexit/excise"
 repository = "https://github.com/findyourexit/excise"
 license = "MIT"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.98"
 exclude = [
     ".cargo",
     ".github",

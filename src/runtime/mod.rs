@@ -31,7 +31,7 @@ use crate::temporary_storage::TemporaryStorage;
 use crate::theme::ThemeId;
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const IDLE_INPUT_WAIT: Duration = Duration::from_secs(60 * 60);
+const IDLE_INPUT_WAIT: Duration = Duration::from_hours(1);
 const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const TRANSIENT_STATUS_DURATION: Duration = Duration::from_millis(250);
 const MAX_INPUT_BATCH: usize = 32;

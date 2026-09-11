@@ -1,9 +1,15 @@
 {
   description = "Excise, a surgical terminal storage navigator";
 
-  inputs.nixpkgs.url = "https://api.flakehub.com/f/NixOS/nixpkgs/0.tar.gz";
+  inputs = {
+    nixpkgs.url = "https://api.flakehub.com/f/NixOS/nixpkgs/0.tar.gz";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
       systems = [
         "aarch64-darwin"
@@ -12,9 +18,18 @@
         "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      pkgsFor = system: import nixpkgs {
+        inherit system;
+        overlays = [ rust-overlay.overlays.default ];
+      };
+      rustToolchain = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+      rustPlatform = pkgs: pkgs.makeRustPlatform {
+        cargo = rustToolchain pkgs;
+        rustc = rustToolchain pkgs;
+      };
       packageFor = system:
-        let pkgs = nixpkgs.legacyPackages.${system};
-        in pkgs.rustPlatform.buildRustPackage {
+        let pkgs = pkgsFor system;
+        in (rustPlatform pkgs).buildRustPackage {
           pname = "excise";
           version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
           src = pkgs.lib.cleanSource self;
@@ -62,10 +77,10 @@
         package = packageFor system;
       });
       devShells = forAllSystems (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
+        let pkgs = pkgsFor system;
         in {
           default = pkgs.mkShell {
-            packages = [ pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy ];
+            packages = [ (rustToolchain pkgs) ];
           };
         });
     };

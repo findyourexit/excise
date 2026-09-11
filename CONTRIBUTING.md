@@ -13,7 +13,7 @@ For a substantial change, open an issue before implementation so scope and publi
 
 ## Development setup
 
-Excise uses Rust 1.88 and the 2024 edition. The pinned toolchain is declared in `rust-toolchain.toml`.
+Excise requires Rust 1.98 or later and uses the 2024 edition. Rust 1.98.0, declared in `rust-toolchain.toml`, is the pinned toolchain and the lowest compiler version tested in CI.
 
 ```console
 cargo check --workspace --all-targets --locked
