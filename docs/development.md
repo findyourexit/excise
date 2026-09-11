@@ -203,7 +203,7 @@ The push-triggered workflow requires that exact annotated-tag candidate ID; neve
 - actionlint 1.7.12;
 - lychee 0.24.2;
 - Node.js/npm for Renovate 44.34.0 validation;
-- cargo-fuzz 0.13.2 with `nightly-2026-08-18`; and
+- cargo-fuzz 0.13.2 with the pinned fuzz toolchain; and
 - all host-installable targets listed above.
 
 ```console
@@ -241,11 +241,12 @@ Invoking `vhs tapes/demo.tape` directly writes an unoptimised 24 fps sequence to
 
 ## Fuzzing
 
-The `fuzz` package is intentionally outside the main workspace. List and run targets with cargo-fuzz:
+The `fuzz` package is intentionally outside the main workspace. `cargo verify` and hosted fuzzing query the same toolchain selector from `xtask`, so update only `FUZZ_TOOLCHAIN` when rolling the pinned nightly. List and run targets with cargo-fuzz:
 
 ```console
-cargo +nightly-2026-08-18 fuzz list
-cargo +nightly-2026-08-18 fuzz run native_path -- -max_total_time=60 -max_len=4096
+fuzz_toolchain="$(cargo run --quiet --locked --package xtask -- fuzz-toolchain)"
+cargo "+$fuzz_toolchain" fuzz list
+cargo "+$fuzz_toolchain" fuzz run native_path -- -max_total_time=60 -max_len=4096
 ```
 
 Crash artifacts and evolving corpora are ignored. Curated seeds under `fuzz/seeds` are reviewed source fixtures.

@@ -31,25 +31,30 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           printf 'Release SHA: %s\n' "$RELEASE_SHA"
+      - name: Read pinned fuzz toolchain
+        run: |
+          set -euo pipefail
+          fuzz_toolchain="$(cargo run --quiet --locked --package xtask -- fuzz-toolchain)"
+          printf 'FUZZ_TOOLCHAIN=%s\n' "$fuzz_toolchain" >> "$GITHUB_ENV"
       - name: Install pinned nightly and cargo-fuzz
         run: |
-          rustup toolchain install nightly-2026-08-18 --profile minimal
-          cargo +nightly-2026-08-18 install cargo-fuzz --version 0.13.2 --locked
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+          cargo "+$FUZZ_TOOLCHAIN" install cargo-fuzz --version 0.13.2 --locked
       - name: Run bounded fuzz smoke targets
         run: |
           mkdir -p fuzz/corpus/{treemap,accounting,filter,deletion_state,deletion_plan,report}
-          cargo +nightly-2026-08-18 fuzz run truncate -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-08-18 fuzz run config -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-08-18 fuzz run native_path -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-08-18 fuzz run terminal_state -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-08-18 fuzz run tachyonfx -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-08-18 fuzz run runtime_events -- -max_total_time=30 -max_len=256
-          cargo +nightly-2026-08-18 fuzz run treemap fuzz/corpus/treemap fuzz/seeds/treemap -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-08-18 fuzz run accounting fuzz/corpus/accounting fuzz/seeds/accounting -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-08-18 fuzz run filter fuzz/corpus/filter fuzz/seeds/filter -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-08-18 fuzz run deletion_state fuzz/corpus/deletion_state fuzz/seeds/deletion_state -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-08-18 fuzz run deletion_plan fuzz/corpus/deletion_plan fuzz/seeds/deletion_plan -- -max_total_time=60 -max_len=256
-          cargo +nightly-2026-08-18 fuzz run report fuzz/corpus/report fuzz/seeds/report -- -max_total_time=60 -max_len=16384
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run truncate -- -max_total_time=60 -max_len=4096
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run config -- -max_total_time=60 -max_len=4096
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run native_path -- -max_total_time=60 -max_len=4096
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run terminal_state -- -max_total_time=60 -max_len=4096
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run tachyonfx -- -max_total_time=60 -max_len=4096
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run runtime_events -- -max_total_time=30 -max_len=256
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run treemap fuzz/corpus/treemap fuzz/seeds/treemap -- -max_total_time=60 -max_len=4096
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run accounting fuzz/corpus/accounting fuzz/seeds/accounting -- -max_total_time=60 -max_len=4096
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run filter fuzz/corpus/filter fuzz/seeds/filter -- -max_total_time=60 -max_len=4096
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run deletion_state fuzz/corpus/deletion_state fuzz/seeds/deletion_state -- -max_total_time=60 -max_len=4096
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run deletion_plan fuzz/corpus/deletion_plan fuzz/seeds/deletion_plan -- -max_total_time=60 -max_len=256
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run report fuzz/corpus/report fuzz/seeds/report -- -max_total_time=60 -max_len=16384
 
       - name: Preserve crash artifacts
         if: failure()
