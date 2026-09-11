@@ -3,7 +3,7 @@ name = "excise-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.98"
 
 [package.metadata]
 cargo-fuzz = true

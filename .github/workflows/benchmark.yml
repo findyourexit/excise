@@ -36,7 +36,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           printf 'Release SHA: %s\n' "$RELEASE_SHA"
-      - name: Install pinned MSRV
+      - name: Install minimum supported Rust 1.98.0
         run: |
           rustup toolchain install 1.98.0 --profile minimal
           rustup override set 1.98.0

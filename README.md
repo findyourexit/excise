@@ -7,7 +7,7 @@
 [![Native verification](https://github.com/findyourexit/excise/actions/workflows/ci.yml/badge.svg)](https://github.com/findyourexit/excise/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/findyourexit/excise)](https://github.com/findyourexit/excise/releases)
 [![crates.io](https://img.shields.io/crates/v/excise.svg)](https://crates.io/crates/excise)
-[![Rust 1.88](https://img.shields.io/badge/Rust-1.88-2f74c0)](rust-toolchain.toml)
+[![Rust 1.98+](https://img.shields.io/badge/Rust-1.98%2B-2f74c0)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT-2f855a)](LICENSE)
 
 A terminal tool for understanding and removing exactly the files and folders you choose.
@@ -177,7 +177,7 @@ Behavior can vary with file system types, access rules, network file systems, fi
 
 ## Development
 
-Excise uses Rust 1.88 and the 2024 edition. Run the complete local verification gate with:
+Excise requires Rust 1.98 or later and uses the 2024 edition. Rust 1.98.0 is the pinned toolchain and the lowest compiler version tested in CI. Run the complete local verification gate with:
 
 ```console
 cargo verify

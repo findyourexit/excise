@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Install pinned MSRV
+      - name: Install minimum supported Rust 1.98.0
         shell: bash
         run: |
           rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt

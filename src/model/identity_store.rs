@@ -24,7 +24,7 @@ const SESSION_MARKER_FILE: &str = ".excise-session";
 const IDENTITY_DATABASE_FILE: &str = "identities.redb";
 const SESSION_MARKER_HEADER: &str = "excise-spill-session-v1";
 const MAX_MARKER_BYTES: u64 = 256;
-const STALE_SESSION_AGE: Duration = Duration::from_secs(15 * 60);
+const STALE_SESSION_AGE: Duration = Duration::from_mins(15);
 const MAX_CLEANUP_CANDIDATES: usize = 64;
 const MAX_SESSION_ENTRIES: usize = 2;
 #[cfg(windows)]
