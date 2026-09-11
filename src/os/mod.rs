@@ -2,9 +2,6 @@ mod disk_usage;
 
 pub(crate) use disk_usage::physical_size;
 
-#[cfg(windows)]
-pub(crate) use disk_usage::physical_size_from_handle;
-
 #[cfg(target_os = "windows")]
 pub mod windows;
 

@@ -23,6 +23,8 @@ use crate::native_path::{
     EncodedNativePath, NativeIdentity, NativePath, identity_for, safe_display_os_str,
     safe_display_path_text, safe_display_text,
 };
+#[cfg(windows)]
+use crate::os::windows::{physical_size_from_handle, remove_open_handle};
 use crate::state::FileToDelete;
 use crate::temporary_storage::{TemporaryStorage, TemporaryStorageReservation};
 
@@ -2139,7 +2141,7 @@ fn execute_windows_entry(root: &File, entry: &mut PlannedEntry) -> DeletionEntry
             "identity, type, size, allocation, or modification changed".to_string(),
         );
     }
-    match crate::windows_delete::remove_open_handle(&handle) {
+    match remove_open_handle(&handle) {
         Ok(()) => DeletionEntryOutcome::Deleted,
         Err(error) if error.raw_os_error() == Some(145) => {
             DeletionEntryOutcome::Changed("directory contains a new or changed entry".to_string())
@@ -2798,7 +2800,7 @@ fn snapshot_from_open_file(handle: &File, kind: PlannedKind) -> io::Result<Plann
             u128::from(metadata.len())
         },
         allocated_bytes: (kind != PlannedKind::Directory)
-            .then(|| crate::os::physical_size_from_handle(handle))
+            .then(|| physical_size_from_handle(handle))
             .transpose()?
             .map(u128::from),
         modified_nanos,
