@@ -1273,8 +1273,19 @@ fn windows_archive_executable(asset: WindowsReleaseAsset, version: &str) -> Path
     PathBuf::from(release_asset_root(asset.target, version)).join("excise.exe")
 }
 
+fn sha256_hex(digest: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = digest.as_ref();
+    let mut rendered = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        rendered.push(char::from(HEX[usize::from(byte >> 4)]));
+        rendered.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    rendered
+}
+
 fn fixture_sha256(target: &str) -> String {
-    format!("{:x}", Sha256::digest(target.as_bytes()))
+    sha256_hex(Sha256::digest(target.as_bytes()))
 }
 
 fn distribution_template_values(version: &str) -> BTreeMap<String, String> {
@@ -2005,7 +2016,7 @@ fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(sha256_hex(hasher.finalize()))
 }
 
 fn verify_archive(path: &Path, root: &str, binary: &str) -> Result<(), Box<dyn Error>> {
@@ -2034,6 +2045,14 @@ fn verify_archive(path: &Path, root: &str, binary: &str) -> Result<(), Box<dyn E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_digest_uses_exact_lowercase_hex() {
+        assert_eq!(
+            sha256_hex(Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn demo_recording_metrics_reject_truncated_captures() {
