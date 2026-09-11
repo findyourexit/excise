@@ -252,9 +252,86 @@ Crash artifacts and evolving corpora are ignored. Curated seeds under `fuzz/seed
 
 ## Benchmarks
 
+The hosted `benchmark.yml` retains the `criterion-benchmark-evidence` artifact for 90 days. It contains Criterion's raw samples and reports from `target/criterion` plus `benchmark-context.txt`, which records the checked-out SHA, workflow run, runner image and CPU, commands, Rust toolchain, and `Cargo.lock` digest.
+
+Run the same local measurements with:
+
 ```console
-cargo bench --bench core --features internal --locked -- --noplot
-cargo bench --bench tachyonfx --features internal --locked -- --noplot
+cargo +1.98.0 bench --bench tachyonfx --features internal --locked -- --noplot
+cargo +1.98.0 bench --bench core --features internal --locked -- --noplot
+```
+
+To assess a reported regression, obtain the reference and candidate run IDs from their checks, download both evidence artifacts, and inspect their contexts before comparing measurements:
+
+```console
+set -euo pipefail
+repo=findyourexit/excise
+reference_run=<reference-run-id>
+candidate_run=<candidate-run-id>
+evidence_dir="$(mktemp -d)"
+mkdir "$evidence_dir/reference" "$evidence_dir/candidate"
+gh run download "$reference_run" --repo "$repo" \
+  --name criterion-benchmark-evidence --dir "$evidence_dir/reference"
+gh run download "$candidate_run" --repo "$repo" \
+  --name criterion-benchmark-evidence --dir "$evidence_dir/candidate"
+reference_context="$(find "$evidence_dir/reference" -type f -name benchmark-context.txt -print -quit)"
+candidate_context="$(find "$evidence_dir/candidate" -type f -name benchmark-context.txt -print -quit)"
+test -n "$reference_context" && test -n "$candidate_context"
+diff -u "$reference_context" "$candidate_context" || true
+```
+
+Only compare matching benchmark paths when the runner OS, architecture, image, CPU, and Rust toolchain are comparable. The following reads each saved Criterion median and its confidence interval without introducing a pass/fail threshold:
+
+```console
+python3 - "$evidence_dir/reference" "$evidence_dir/candidate" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def medians(root):
+    return {
+        path.parent.parent.relative_to(root).as_posix(): json.loads(path.read_text())["median"]
+        for path in root.rglob("new/estimates.json")
+    }
+
+
+reference, candidate = (medians(Path(root)) for root in sys.argv[1:])
+for name in sorted(reference.keys() | candidate.keys()):
+    if name not in reference or name not in candidate:
+        print(f"{name}: only present in one artifact")
+        continue
+    old, new = reference[name], candidate[name]
+    change = (new["point_estimate"] / old["point_estimate"] - 1) * 100
+    old_ci = old["confidence_interval"]
+    new_ci = new["confidence_interval"]
+    print(
+        f"{name}: {old['point_estimate']:.0f} ns "
+        f"[{old_ci['lower_bound']:.0f}, {old_ci['upper_bound']:.0f}] -> "
+        f"{new['point_estimate']:.0f} ns "
+        f"[{new_ci['lower_bound']:.0f}, {new_ci['upper_bound']:.0f}] "
+        f"({change:+.2f}%)"
+    )
+PY
+```
+
+If the evidence indicates a meaningful difference, repeat it in a clean disposable checkout on comparable hardware. Use the recorded source SHAs and toolchain, retain the reference baseline in `target/criterion`, then let Criterion calculate the comparison:
+
+```console
+toolchain="$(sed -n 's/^requested_toolchain=//p' "$candidate_context")"
+reference_sha="$(sed -n 's/^source_sha=//p' "$reference_context")"
+candidate_sha="$(sed -n 's/^source_sha=//p' "$candidate_context")"
+reference_ref="$(sed -n 's/^ref=//p' "$reference_context")"
+candidate_ref="$(sed -n 's/^ref=//p' "$candidate_context")"
+test -n "$toolchain" && test -n "$reference_sha" && test -n "$candidate_sha" && test -n "$reference_ref" && test -n "$candidate_ref"
+git fetch origin "$reference_ref" "$candidate_ref"
+rustup toolchain install "$toolchain" --profile minimal
+git switch --detach "$reference_sha"
+cargo +"$toolchain" bench --bench tachyonfx --features internal --locked -- --noplot --save-baseline reference
+cargo +"$toolchain" bench --bench core --features internal --locked -- --noplot --save-baseline reference
+git switch --detach "$candidate_sha"
+cargo +"$toolchain" bench --bench tachyonfx --features internal --locked -- --noplot --baseline reference
+cargo +"$toolchain" bench --bench core --features internal --locked -- --noplot --baseline reference
 ```
 
 Treat small host-local changes as noise unless supported by repeated statistical evidence on comparable hardware.
