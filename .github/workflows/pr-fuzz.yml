@@ -1,0 +1,29 @@
+name: PR deletion-plan safety fuzz
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-deletion-plan-fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deletion-plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2026-08-18 --profile minimal
+          cargo +nightly-2026-08-18 install cargo-fuzz --version 0.13.2 --locked
+      - name: Run deterministic bounded deletion-plan safety fuzzing
+        run: |
+          mkdir -p fuzz/corpus/deletion_plan
+          cargo +nightly-2026-08-18 fuzz run deletion_plan fuzz/corpus/deletion_plan fuzz/seeds/deletion_plan -- -runs=2000 -seed=236917 -max_len=256
