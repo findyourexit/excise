@@ -6,6 +6,20 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+## [1.2.4] - 2026-09-12
+
+### Changed
+
+* Documented X-CMD's `x eget use findyourexit/excise` command for installing the pre-built GitHub Release binaries.
+* Isolated private scanner queue/spill mechanics and the Windows FFI boundary to narrow the safety-audit surface without changing user-visible behavior.
+* Updated runtime, development, fuzzing, and CI dependencies, notably `crossbeam-channel` 0.5.17, `jsonschema` 0.53.0, `redb` 4.2.0, `sha2` 0.11.0, `tachyonfx` 0.25.2, and `toml` 1.1.5.
+* CI now retains reproducible benchmark evidence and its execution context for 90 days.
+
+### Fixed
+
+* Corrected the supported Rust compiler contract to Rust 1.98 or later, matching the locked dependency set and CI.
+* Local and hosted fuzz verification now share a pinned nightly toolchain. Pull requests exercise bounded directory-deletion plans across hostile names, hard links, replacements, late entries, and temporary-storage spills.
+
 ## [1.2.3] - 2026-09-04
 
 ### Fixed
