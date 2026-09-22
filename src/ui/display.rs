@@ -151,10 +151,8 @@ where
                         workspace_title(board),
                         theme,
                         has_selection,
-                        !reduced_motion,
                         monochrome,
                         ascii,
-                        now,
                     );
                     debug_assert_eq!(workspace, rendered_workspace);
                     let show_empty_label = file_tree.current_node().state == NodeState::Complete
@@ -1091,21 +1089,19 @@ fn render_inspector_with_work(
     theme: Theme,
     ascii: bool,
     monochrome: bool,
-    now: Duration,
+    _now: Duration,
 ) {
     Clear.render(area, buffer);
-    // Only the pane that owns the cursor animates. The workspace holds the
-    // selection, so the details stay a quiet reference surface below it.
+    // Inspector chrome remains a static reference while the selected map entry
+    // carries the moving focus cue.
     let inner = render_pane(
         buffer,
         area,
         "SELECTED ITEM",
         theme,
         false,
-        false,
         monochrome,
         ascii,
-        now,
     );
     let Some(tile) = board.currently_selected() else {
         Paragraph::new("Choose an item to see its space, deletion options, and scan status.")

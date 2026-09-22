@@ -342,15 +342,6 @@ where
         let has_selection = self.board.currently_selected().is_some();
         // Rendering lays out the board and can establish or clear its selection.
         let selection_changed = self.ui_mode.allows_motion() && selection_before != has_selection;
-        let background_work = matches!(self.ui_mode, UiMode::Loading | UiMode::Rescanning { .. })
-            || self.deletion_work.has_background_activity();
-        let animate_focus = self.ui_mode.allows_motion()
-            && !background_work
-            && has_selection
-            && !ascii
-            && !monochrome
-            && !reduced_motion
-            && ColorCycle::can_animate(theme.focus);
         let animate_modal = self.ui_mode.has_modal_attention()
             && !ascii
             && !monochrome
@@ -361,13 +352,10 @@ where
             && !reduced_motion
             && ColorCycle::can_animate(theme.focus)
             && self.deletion_work.has_checker_animation(now);
-        // Short map feedback keeps its responsive cadence. Persistent chrome is
-        // deliberately slower, and execution progress redraws from its own timer.
+        // Only dialogs retain persistent chrome animation. Map selection and
+        // short-lived deletion feedback add their own activity requests.
         animation.set_activity_with_cadence(
-            animate_focus
-                || animate_modal
-                || animate_deletion_checker
-                || self.ui_effects.has_deletion_departure(),
+            animate_modal || animate_deletion_checker || self.ui_effects.has_deletion_departure(),
             animate_deletion_checker || self.ui_effects.has_deletion_departure(),
         );
         // The map transition runs on wall-clock time, so the loop has to keep waking up
