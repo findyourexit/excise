@@ -17,12 +17,12 @@ use crate::error::AppError;
 use crate::model::{ByteBounds, NodeKind, NodeState, SyntheticKind, UnscannedReason};
 use crate::native_path::SafeDisplayPath;
 use crate::os::is_user_admin;
-use crate::state::UiEffects;
 use crate::state::deletion_work::{
     DeletionWork, MAX_DELETION_WORK_ITEMS, WorkRailItem, WorkRailStatus,
 };
 use crate::state::files::FileTree;
 use crate::state::tiles::{Board, FileType, Tile};
+use crate::state::{DeletionDeparture, UiEffects};
 use crate::theme::Theme;
 use crate::ui::TermTooSmall;
 use crate::ui::format::{
@@ -33,6 +33,7 @@ use crate::ui::grid::{DenseRectangleGrid, MapLayout};
 use crate::ui::modals::{
     ConfirmBox, DeletionSafety, ErrorBox, HelpBox, MessageBox, NoticeBox, ThemePicker, WarningBox,
 };
+use crate::ui::palette::ColorCycle;
 use crate::ui::pane::{
     ModalChrome, PANE_GAP, accent_at, contrast_ratio, fill_pane, readable_text_on, render_pane,
 };
@@ -100,9 +101,13 @@ where
         reduced_guardrails: bool,
         reduced_motion: bool,
     ) -> Result<(), AppError> {
+        let requires_legacy_theme_normalization = theme_requires_legacy_normalization(theme);
         self.terminal
             .draw(|frame| {
                 let full_screen = frame.area();
+                if !requires_legacy_theme_normalization {
+                    prepare_truecolor_canvas(frame.buffer_mut(), theme);
+                }
                 let elevated = is_user_admin();
                 if matches!(ui_mode, UiMode::ScreenTooSmall) {
                     board.settle_geometry();
@@ -155,6 +160,11 @@ where
                     let show_empty_label = file_tree.current_node().state == NodeState::Complete
                         && file_tree.filter().is_none();
                     let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. });
+                    let animate_deletion_checker = !ascii
+                        && !monochrome
+                        && !reduced_motion
+                        && ColorCycle::can_animate(theme.focus);
+                    let deletion_departure = ui_effects.deletion_departure();
                     if board.is_list_layout() {
                         render_list_with_work(
                             frame.buffer_mut(),
@@ -171,7 +181,15 @@ where
                     } else {
                         frame.render_widget(
                             DenseRectangleGrid::new(
-                                map_layout(board, deletion_work, show_empty_label, scanning),
+                                map_layout(
+                                    board,
+                                    deletion_work,
+                                    show_empty_label,
+                                    scanning,
+                                    deletion_departure,
+                                    now,
+                                    animate_deletion_checker,
+                                ),
                                 theme,
                                 ascii,
                                 monochrome,
@@ -213,7 +231,9 @@ where
                         ascii,
                     );
                 }
-                Self::apply_theme(frame.buffer_mut(), theme);
+                if requires_legacy_theme_normalization {
+                    Self::apply_theme(frame.buffer_mut(), theme);
+                }
                 // Effects acknowledge an event in the header band and nowhere else.
                 // They must land before an overlay so a dialog stays a still,
                 // readable decision surface.
@@ -362,6 +382,41 @@ where
     }
 }
 
+/// Fully truecolour themes never need the legacy ANSI-role remap. Give their
+/// untouched cells the final semantic canvas style before widgets draw instead.
+fn prepare_truecolor_canvas(buffer: &mut Buffer, theme: Theme) {
+    for cell in &mut buffer.content {
+        cell.fg = theme.text_primary;
+        cell.bg = theme.surface_base;
+    }
+}
+
+fn theme_requires_legacy_normalization(theme: Theme) -> bool {
+    ![
+        theme.surface_base,
+        theme.surface_panel,
+        theme.surface_raised,
+        theme.surface_selection,
+        theme.surface_danger,
+        theme.text_primary,
+        theme.text_secondary,
+        theme.text_muted,
+        theme.text_inverse,
+        theme.text_danger,
+        theme.state_scanning,
+        theme.state_complete,
+        theme.state_aggregated,
+        theme.state_rescanning,
+        theme.state_uncertain,
+        theme.state_shared,
+        theme.state_excluded,
+        theme.border,
+        theme.focus,
+    ]
+    .into_iter()
+    .all(|color| matches!(color, Color::Rgb(..)))
+}
+
 /// Whether a color is already one of the selected theme's semantic roles.
 ///
 /// Most palettes use RGB values, but High Contrast deliberately uses ANSI
@@ -440,6 +495,9 @@ fn map_layout<'a>(
     deletion_work: &'a DeletionWork,
     show_empty_label: bool,
     scanning: bool,
+    deletion_departure: Option<&'a DeletionDeparture>,
+    now: Duration,
+    animate_deletion_checker: bool,
 ) -> MapLayout<'a> {
     MapLayout {
         rectangles: board.rendered_tiles(),
@@ -450,6 +508,9 @@ fn map_layout<'a>(
         show_empty_label,
         scanning,
         deletion_work: Some(deletion_work),
+        deletion_departure,
+        now,
+        animate_deletion_checker,
     }
 }
 
@@ -799,7 +860,15 @@ fn render_list_with_work(
         }
         let marker = list_item_marker(tile, deletion_work, ascii);
         let name_width = area.width.saturating_sub(28);
-        let name = display_os_str_middle(&tile.name, name_width);
+        let name = if tile.synthetic_kind == Some(SyntheticKind::Other) {
+            let grouped = tile.descendants.map_or_else(
+                || "Grouped items".to_string(),
+                |count| format!("Grouped items ({count})"),
+            );
+            truncate_middle(&grouped, name_width)
+        } else {
+            display_os_str_middle(&tile.name, name_width)
+        };
         let size = if tile.uncertain && tile.size == 0 {
             "unknown".to_string()
         } else if tile.uncertain {
@@ -904,7 +973,14 @@ fn inspector_action(ui_mode: &UiMode, kind: NodeKind, ascii: bool) -> &'static s
                     "Enter open · Backspace delete"
                 }
             }
-            NodeKind::Synthetic(SyntheticKind::Other | SyntheticKind::Shared) => {
+            NodeKind::Synthetic(SyntheticKind::Other) => {
+                if ascii {
+                    "Grouped items . cannot open or delete"
+                } else {
+                    "Grouped items · cannot open or delete"
+                }
+            }
+            NodeKind::Synthetic(SyntheticKind::Shared) => {
                 if ascii {
                     "Virtual summary . cannot delete"
                 } else {
@@ -1045,18 +1121,27 @@ fn render_inspector_with_work(
     let Some(node) = file_tree.node(tile.node_id) else {
         return;
     };
-    let (marker, state, state_color) = view_state(
-        &UiMode::Normal,
-        node.state,
-        node.unscanned_reason.as_ref(),
-        ascii,
-        theme,
-    );
+    let grouped_summary = matches!(node.kind, NodeKind::Synthetic(SyntheticKind::Other));
+    let (marker, state, state_color) = if grouped_summary {
+        (
+            if ascii { "+" } else { "◇" },
+            "GROUPED",
+            theme.state_aggregated,
+        )
+    } else {
+        view_state(
+            &UiMode::Normal,
+            node.state,
+            node.unscanned_reason.as_ref(),
+            ascii,
+            theme,
+        )
+    };
     let kind = match node.kind {
         NodeKind::Root | NodeKind::Directory => "folder",
         NodeKind::File => "file",
         NodeKind::Link => "link",
-        NodeKind::Synthetic(SyntheticKind::Other) => "virtual summary",
+        NodeKind::Synthetic(SyntheticKind::Other) => "grouped total",
         NodeKind::Synthetic(SyntheticKind::Aggregate) => "summarized folder",
         NodeKind::Synthetic(SyntheticKind::Shared) => "shared item",
     };
@@ -1067,8 +1152,8 @@ fn render_inspector_with_work(
         "items"
     };
     let item_count = format!("{} {item_label}", node.metrics.descendants);
-    let folded_detail = matches!(node.kind, NodeKind::Synthetic(SyntheticKind::Other))
-        .then(|| format!("{item_count} summarized here"));
+    let folded_detail =
+        grouped_summary.then(|| format!("Contains {item_count} not shown separately"));
     let item_check = node.snapshot.identity.as_ref().map_or_else(
         || "Item check: unavailable".to_string(),
         |identity| format!("Item check: {:?}", identity.file_id),
@@ -1082,10 +1167,8 @@ fn render_inspector_with_work(
             )
         },
     );
-    // An Other node can represent either filter-omitted or capacity-folded
-    // items, so do not claim a cause the model does not retain.
-    let scan_detail = if matches!(node.kind, NodeKind::Synthetic(SyntheticKind::Other)) {
-        display_text_info("Scan result: summary")
+    let scan_detail = if grouped_summary {
+        display_text_info("Includes items not shown as individual tiles")
     } else {
         inspection_reason_detail(node.unscanned_reason.as_ref())
     };
@@ -1093,8 +1176,13 @@ fn render_inspector_with_work(
     let space_used = format_bounds(node.metrics.allocated_bytes);
     let can_reclaim = format_bounds(node.metrics.reclaimable_bytes);
     let content_size = DisplaySize(node.metrics.apparent_bytes as f64).to_string();
+    let name = if grouped_summary {
+        "Grouped items".to_string()
+    } else {
+        display_os_str_middle(&node.name, inner.width)
+    };
     let name_line = Line::styled(
-        display_os_str_middle(&node.name, inner.width),
+        name,
         Style::default()
             .fg(theme.text_primary)
             .add_modifier(Modifier::BOLD),
@@ -1155,7 +1243,7 @@ fn render_inspector_with_work(
         let compact_state_line = if folded_detail.is_some() {
             Line::styled(
                 truncate_middle(
-                    &format!("{marker} {state} {separator} {item_count} summarized"),
+                    &format!("{marker} {state} {separator} {item_count} grouped"),
                     inner.width,
                 ),
                 Style::default().fg(state_color),
@@ -1199,6 +1287,23 @@ fn render_inspector_with_work(
                 inner.width,
             )),
             Line::from(item_check_or_summary),
+            Line::from(truncate_marked(&scan_detail, inner.width, truncate_middle)),
+        ]
+    } else if grouped_summary {
+        vec![
+            name_line,
+            state_line,
+            Line::from(""),
+            action_or_activity,
+            Line::from(format!("Can reclaim {can_reclaim}")),
+            Line::from(format!("Space used {space_used}")),
+            Line::from(format!(
+                "Content size {content_size} {separator} {item_count}"
+            )),
+            Line::from(truncate_middle(
+                &format!("Contains {item_count} not shown separately"),
+                inner.width,
+            )),
             Line::from(truncate_marked(&scan_detail, inner.width, truncate_middle)),
         ]
     } else {
@@ -1754,7 +1859,16 @@ mod tests {
         board.change_area(Rect::new(0, 0, 72, 1));
         assert!(!board.is_transitioning());
         assert_eq!(
-            map_layout(&board, &DeletionWork::new(), true, false).overflow,
+            map_layout(
+                &board,
+                &DeletionWork::new(),
+                true,
+                false,
+                None,
+                Duration::ZERO,
+                false,
+            )
+            .overflow,
             board.overflow()
         );
     }
@@ -2117,6 +2231,26 @@ mod tests {
     }
 
     #[test]
+    fn truecolor_canvas_starts_with_semantic_defaults() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+        assert!(!theme_requires_legacy_normalization(theme));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+
+        prepare_truecolor_canvas(&mut buffer, theme);
+
+        for cell in &buffer.content {
+            assert_eq!(cell.fg, theme.text_primary);
+            assert_eq!(cell.bg, theme.surface_base);
+        }
+        assert!(theme_requires_legacy_normalization(Theme::for_id(
+            ThemeId::HighContrast
+        )));
+        assert!(theme_requires_legacy_normalization(Theme::for_id(
+            ThemeId::Monochrome
+        )));
+    }
+
+    #[test]
     fn high_contrast_state_chip_backgrounds_survive_theme_postprocessing() {
         let theme = Theme::for_id(ThemeId::HighContrast);
         for node_state in [NodeState::Scanning, NodeState::Aggregated] {
@@ -2345,7 +2479,7 @@ mod tests {
                 NodeKind::Synthetic(SyntheticKind::Other),
                 false,
             ),
-            "Virtual summary · cannot delete"
+            "Grouped items · cannot open or delete"
         );
         assert_eq!(
             inspector_action(
@@ -2386,7 +2520,7 @@ mod tests {
                 NodeKind::Synthetic(SyntheticKind::Other),
                 false,
             ),
-            "Virtual summary · cannot delete"
+            "Grouped items · cannot open or delete"
         );
     }
 
@@ -2462,7 +2596,7 @@ mod tests {
             .deletion_target_for_path(&path)
             .expect("selected file should retain a deletion target");
         let mut work = DeletionWork::new();
-        work.enqueue_confirmation(target, true, 1024)
+        work.enqueue_confirmation(target, true, 1024, Duration::ZERO)
             .expect("background deletion should retain the selected target");
         let effects = UiEffects::new();
         let mut active_buffer = Buffer::empty(area);
@@ -2485,6 +2619,75 @@ mod tests {
             .map(Cell::symbol)
             .collect::<String>();
         assert!(active_text.contains("Deletion: checking current files in background"));
+    }
+
+    #[test]
+    fn grouped_summary_inspector_explains_combined_items_without_fake_identity() {
+        let root = tempfile::tempdir().expect("inspector root should exist");
+        let matched = root.path().join("visible.log");
+        let grouped = root.path().join("hidden.tmp");
+        fs::write(&matched, b"visible").expect("visible fixture should exist");
+        fs::write(&grouped, b"grouped").expect("grouped fixture should exist");
+        let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
+            .expect("file tree should be created");
+        tree.begin_rescan(
+            root.path().to_path_buf(),
+            Some(crate::filter::FilterPattern::new("*.log").expect("filter should compile")),
+        )
+        .expect("filtered rescan should begin");
+        for path in [&matched, &grouped] {
+            let metadata = fs::symlink_metadata(path).expect("fixture metadata should exist");
+            let identity = identity_for(path, &metadata)
+                .expect("fixture identity should be readable")
+                .expect("fixture should not be a link");
+            tree.add_entry(&metadata, path, identity)
+                .expect("fixture should be accepted");
+        }
+        tree.finish_rescan().expect("filtered rescan should finish");
+        let files = tree.files_in_current_folder(0);
+        let grouped_id = files
+            .iter()
+            .find(|file| file.synthetic_kind == Some(SyntheticKind::Other))
+            .map(|file| file.node_id)
+            .expect("grouped total should be visible");
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 78, 12));
+        board.change_files(files);
+        assert!(board.select_node(grouped_id));
+
+        let area = Rect::new(0, 0, 80, 18);
+        let mut buffer = Buffer::empty(area);
+        render_inspector(
+            &mut buffer,
+            area,
+            &tree,
+            &board,
+            &UiMode::Normal,
+            Theme::for_id(ThemeId::ExciseDark),
+            false,
+            false,
+            Duration::ZERO,
+        );
+        let text = buffer.content.iter().map(Cell::symbol).collect::<String>();
+        for expected in [
+            "Grouped items",
+            "GROUPED",
+            "grouped total",
+            "Grouped items · cannot open or delete",
+            "Contains 1 item not shown separately",
+            "Includes items not shown as individual tiles",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing grouped explanation: {expected}"
+            );
+        }
+        for absent in ["Item check:", "Known names:"] {
+            assert!(
+                !text.contains(absent),
+                "grouped totals must not present inapplicable identity detail: {absent}"
+            );
+        }
     }
 
     #[test]

@@ -129,7 +129,7 @@ Configuration takes values in this order: command line, environment, versioned T
 - **Reliable terminal behavior:** The terminal is restored after normal exit, errors, panics, and boundary-safe cancellation; active filesystem work is never detached silently.
 - **Accessible interaction:** Keyboard controls, narrow layouts, plain ASCII output, monochrome output, and reduced motion preserve the important safety information.
 - **Useful reports:** Table output is intended for people to read. JSON output uses stable, versioned formats for scan results, deletion history, and file paths.
-- **Readable maps:** The interface uses allocated space by default. Ordinary entries receive colours based on their relative size in the visible folder. Uncertain, shared, and summary entries keep their own meaning. Entries that do not fit remain visible as an overflow summary instead of making a folder look empty.
+- **Readable maps:** The interface uses allocated space by default. Ordinary entries use a fixed absolute size scale, not their rank in the visible folder: 4 KiB and below are blue, 16 MiB is midpoint green, 1 GiB is yellow, and 64 GiB and above are red. `--apparent-size` applies the same scale to logical file length. Uncertain, shared, and summary entries keep their own meaning. Entries that do not fit remain visible as an overflow summary instead of making a folder look empty.
 
 ## Terminal Controls
 

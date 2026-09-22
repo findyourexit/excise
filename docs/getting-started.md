@@ -104,7 +104,7 @@ The interactive view uses a dense map, animated focus border, and animated modal
 
 Press `t` in the normal view, while scanning, or during a focused refresh to preview the theme list. Arrow keys or `j`/`k` move the preview; `Enter` keeps it for the session and `Esc` restores the prior theme.
 
-In a color-capable map, ordinary entry color carries size. Unreadable entries and summarized directories retain distinct state colors; virtual summaries stay subdued and do not affect the size scale.
+In a color-capable map, ordinary entry color carries the current space measure on one fixed absolute scale: 4 KiB and below are blue, 16 MiB is midpoint green, 1 GiB is yellow, and 64 GiB and above are red. The default measure is allocated space; `--apparent-size` uses logical file length instead. Unreadable entries and summarized directories retain distinct state colors; virtual summaries stay subdued and do not affect the size scale.
 
 Entries that do not fit in the final map view are collected into one `MapOverflow` summary. When there is enough room, the renderer shows that summary as a textured region with count and weight labels. When there is not enough room, the summary remains available in the report without drawing a misleading region.
 

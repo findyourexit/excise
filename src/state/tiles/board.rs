@@ -1078,27 +1078,26 @@ mod tests {
     }
 
     #[test]
-    fn virtual_summaries_stay_visible_but_never_take_selection() {
-        let mut summary = file(1, 0.7);
-        summary.file_type = FileType::Synthetic;
-        summary.synthetic_kind = Some(SyntheticKind::Other);
-        let mut aggregate = file(2, 0.3);
+    fn grouped_summaries_are_selectable_but_shared_totals_are_not() {
+        let mut grouped = file(1, 0.7);
+        grouped.file_type = FileType::Synthetic;
+        grouped.synthetic_kind = Some(SyntheticKind::Other);
+        let mut shared = file(2, 0.2);
+        shared.file_type = FileType::Synthetic;
+        shared.synthetic_kind = Some(SyntheticKind::Shared);
+        let mut aggregate = file(3, 0.1);
         aggregate.file_type = FileType::Folder;
         aggregate.synthetic_kind = Some(SyntheticKind::Aggregate);
         let mut board = Board::new();
         board.change_area(Rect::new(0, 0, 80, 24));
-        board.change_files(vec![summary, aggregate]);
+        board.change_files(vec![grouped, shared, aggregate]);
 
         assert_eq!(
             board.currently_selected().map(|tile| tile.node_id),
-            Some(NodeId(2))
+            Some(NodeId(1))
         );
-        assert!(!board.select_node(NodeId(1)));
-        board.move_selected_left();
-        assert_eq!(
-            board.currently_selected().map(|tile| tile.node_id),
-            Some(NodeId(2))
-        );
+        assert!(board.select_node(NodeId(1)));
+        assert!(!board.select_node(NodeId(2)));
     }
 
     fn reordered_board_mid_tween() -> Board {

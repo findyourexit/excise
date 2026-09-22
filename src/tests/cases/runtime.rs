@@ -1,3 +1,6 @@
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -5,7 +8,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crate::error::AppError;
 use crate::input::{InputEvent, InputSource};
 use crate::outcome::OperationOutcome;
-use crate::runtime::{RuntimeSettings, VirtualClock, run, scan_headless};
+use crate::runtime::{Clock, RuntimeSettings, VirtualClock, run, scan_headless};
 use crate::tests::cases::test_utils::test_backend_factory;
 use crate::tests::fakes::{BackendOperation, TerminalEvent, TerminalEvents};
 
@@ -88,6 +91,111 @@ impl InputSource for FailingInput {
     }
 }
 
+#[derive(Clone)]
+struct SharedClock(Rc<Cell<Duration>>);
+
+impl Clock for SharedClock {
+    fn now(&self) -> Duration {
+        self.0.get()
+    }
+
+    fn advance_to(&self, deadline: Duration) -> bool {
+        if deadline > self.0.get() {
+            self.0.set(deadline);
+        }
+        true
+    }
+}
+
+struct TimeoutAfterEscInput {
+    events: Vec<Option<Event>>,
+    clock: Rc<Cell<Duration>>,
+    draw_events: Arc<Mutex<Vec<String>>>,
+    frames_at_escape: Arc<Mutex<Option<usize>>>,
+    frames_before_quit: Arc<Mutex<Option<usize>>>,
+    escaped: bool,
+    waited_after_escape: bool,
+}
+
+impl TimeoutAfterEscInput {
+    fn new(
+        mut events: Vec<Option<Event>>,
+        clock: Rc<Cell<Duration>>,
+        draw_events: Arc<Mutex<Vec<String>>>,
+        frames_at_escape: Arc<Mutex<Option<usize>>>,
+        frames_before_quit: Arc<Mutex<Option<usize>>>,
+    ) -> Self {
+        events.reverse();
+        Self {
+            events,
+            clock,
+            draw_events,
+            frames_at_escape,
+            frames_before_quit,
+            escaped: false,
+            waited_after_escape: false,
+        }
+    }
+}
+
+impl InputSource for TimeoutAfterEscInput {
+    fn poll(&mut self, timeout: Duration) -> Result<bool, AppError> {
+        if self.escaped && !self.waited_after_escape {
+            if timeout.is_zero() {
+                return Ok(false);
+            }
+            self.waited_after_escape = true;
+            self.clock.set(self.clock.get().saturating_add(timeout));
+            return Ok(false);
+        }
+        Ok(!self.events.is_empty())
+    }
+
+    fn read(&mut self) -> Result<InputEvent, AppError> {
+        let event = self
+            .events
+            .pop()
+            .ok_or_else(|| AppError::Invariant("fake input exhausted after poll".to_string()))?;
+        if matches!(
+            &event,
+            Some(Event::Key(KeyEvent {
+                code: KeyCode::Esc,
+                ..
+            }))
+        ) {
+            self.escaped = true;
+            *self
+                .frames_at_escape
+                .lock()
+                .expect("escape frame record should lock") = Some(
+                self.draw_events
+                    .lock()
+                    .expect("draw event record should lock")
+                    .len(),
+            );
+        }
+        if matches!(
+            &event,
+            Some(Event::Key(KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }))
+        ) {
+            *self
+                .frames_before_quit
+                .lock()
+                .expect("quit frame record should lock") = Some(
+                self.draw_events
+                    .lock()
+                    .expect("draw event record should lock")
+                    .len(),
+            );
+        }
+        Ok(event.map_or(InputEvent::Barrier, InputEvent::Terminal))
+    }
+}
+
 #[test]
 fn input_failure_returns_error_and_cleans_terminal() {
     let root = tempfile::tempdir().expect("runtime root should exist");
@@ -150,6 +258,60 @@ fn graceful_quit_during_scan_is_precise_cancellation() {
     assert!(
         matches!(outcome, OperationOutcome::Cancelled { precise: true, .. }),
         "unexpected outcome: {outcome:?}"
+    );
+}
+
+#[test]
+fn idle_navigation_animation_renders_before_following_keypress() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let folder = root.path().join("folder");
+    let other_folder = root.path().join("other-folder");
+    std::fs::create_dir(&folder).expect("fixture folder should exist");
+    std::fs::create_dir(&other_folder).expect("second fixture folder should exist");
+    std::fs::write(folder.join("child"), vec![0_u8; 8192]).expect("fixture child should exist");
+    std::fs::write(other_folder.join("child"), vec![0_u8; 4096])
+        .expect("second fixture child should exist");
+
+    let (_, draw_events, backend) = test_backend_factory(120, 40);
+    let clock = Rc::new(Cell::new(Duration::ZERO));
+    let frames_at_escape = Arc::new(Mutex::new(None));
+    let frames_before_quit = Arc::new(Mutex::new(None));
+    let input = TimeoutAfterEscInput::new(
+        vec![
+            None,
+            Some(key(KeyCode::Enter, KeyModifiers::NONE)),
+            None,
+            Some(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ],
+        clock.clone(),
+        draw_events,
+        frames_at_escape.clone(),
+        frames_before_quit.clone(),
+    );
+    let mut runtime_settings = settings(root.path());
+    runtime_settings.reduced_motion = false;
+
+    let outcome = run(
+        backend,
+        Box::new(input),
+        runtime_settings,
+        Box::new(SharedClock(clock)),
+    )
+    .expect("navigation and exit should complete");
+    assert!(matches!(outcome, OperationOutcome::Exact(_)));
+    let frames_at_escape = frames_at_escape
+        .lock()
+        .expect("escape frame record should lock")
+        .expect("escape should have been read");
+    let frames_before_quit = frames_before_quit
+        .lock()
+        .expect("quit frame record should lock")
+        .expect("quit should have been read");
+    assert!(
+        frames_before_quit >= frames_at_escape + 2,
+        "the idle animation deadline must produce a frame before the next keypress: {frames_at_escape} -> {frames_before_quit}"
     );
 }
 

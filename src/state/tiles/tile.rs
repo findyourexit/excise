@@ -80,14 +80,11 @@ impl Tile {
         }
     }
 
-    /// Virtual totals have no stable filesystem object to open, refresh, or
-    /// delete. A materializable aggregate remains interactive.
+    /// A grouped total is selectable so its inspector can explain its contents.
+    /// A shared allocation total has no item-specific detail to inspect.
     #[must_use]
     pub const fn is_interactive(&self) -> bool {
-        !matches!(
-            self.synthetic_kind,
-            Some(SyntheticKind::Other | SyntheticKind::Shared)
-        )
+        !matches!(self.synthetic_kind, Some(SyntheticKind::Shared))
     }
 
     /// First terminal row the entry paints into.

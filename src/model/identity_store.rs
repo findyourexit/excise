@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use file_id::FileId;
-use redb::{Builder as RedbBuilder, Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Builder as RedbBuilder, Database, Durability, ReadableDatabase, ReadableTable, TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(not(windows))]
 use tempfile::{Builder as TempBuilder, TempDir};
@@ -30,6 +32,7 @@ const MAX_SESSION_ENTRIES: usize = 2;
 #[cfg(windows)]
 const SESSION_CREATE_ATTEMPTS: usize = 32;
 const DISK_WRITE_BATCH: usize = 256;
+const MIGRATION_RECORDS_PER_OBSERVATION: usize = 8;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IdentityRecord {
@@ -87,6 +90,8 @@ pub struct IdentityStore {
     memory_limit: usize,
     estimated_bytes: usize,
     capacity_exhausted: bool,
+    #[cfg(test)]
+    broad_remap_scans: usize,
 }
 
 /// Keeps a declared link count exact only while every observation agrees.
@@ -98,6 +103,14 @@ pub(crate) fn merge_declared_links(current: Option<u64>, observed: Option<u64>) 
 }
 enum Storage {
     Memory(HashMap<FileId, IdentityRecord>),
+    /// Existing in-memory records drain into a freshly initialized database in
+    /// bounded maintenance steps, while new observations go straight to disk.
+    Migrating {
+        database: Database,
+        count: usize,
+        pending: HashMap<Vec<u8>, IdentityRecord>,
+        records: HashMap<FileId, IdentityRecord>,
+    },
     Disk {
         database: Database,
         count: usize,
@@ -288,6 +301,8 @@ impl IdentityStore {
             memory_limit,
             estimated_bytes: 0,
             capacity_exhausted: false,
+            #[cfg(test)]
+            broad_remap_scans: 0,
         })
     }
 
@@ -332,9 +347,14 @@ impl IdentityStore {
             self.insert(file_id, &record, is_new)?;
             Ok((is_new, record))
         })();
-        match self.recover_capacity(result)? {
-            Some(observation) => Ok(observation),
-            None => Ok((false, IdentityRecord::unavailable())),
+        let Some(observation) = self.recover_capacity(result)? else {
+            return Ok((false, IdentityRecord::unavailable()));
+        };
+        let _ = self.advance_migration(MIGRATION_RECORDS_PER_OBSERVATION)?;
+        if self.capacity_exhausted {
+            Ok((false, IdentityRecord::unavailable()))
+        } else {
+            Ok(observation)
         }
     }
 
@@ -344,27 +364,30 @@ impl IdentityStore {
         }
         match &self.storage {
             Storage::Memory(records) => Ok(records.get(file_id).cloned()),
+            Storage::Migrating {
+                records,
+                database,
+                pending,
+                ..
+            } => {
+                if let Some(record) = records.get(file_id) {
+                    Ok(Some(record.clone()))
+                } else {
+                    read_identity_record(database, pending, file_id)
+                }
+            }
             Storage::Disk {
                 database, pending, ..
-            } => {
-                let key = serde_json::to_vec(file_id).map_err(identity_error)?;
-                if let Some(record) = pending.get(&key) {
-                    return Ok(Some(record.clone()));
-                }
-                let transaction = database.begin_read().map_err(identity_error)?;
-                let table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
-                table
-                    .get(key.as_slice())
-                    .map_err(identity_error)?
-                    .map(|value| serde_json::from_slice(value.value()).map_err(identity_error))
-                    .transpose()
-            }
+            } => read_identity_record(database, pending, file_id),
         }
     }
 
     #[must_use]
     pub fn is_spilled(&self) -> bool {
-        matches!(self.storage, Storage::Disk { .. })
+        matches!(
+            self.storage,
+            Storage::Migrating { .. } | Storage::Disk { .. }
+        )
     }
 
     #[must_use]
@@ -382,10 +405,13 @@ impl IdentityStore {
         file_id: &FileId,
     ) -> Result<(), ModelError> {
         self.flush_pending()?;
-        let Storage::Disk { database, .. } = &mut self.storage else {
-            return Err(ModelError::Invariant(
-                "identity store did not spill".to_string(),
-            ));
+        let database = match &mut self.storage {
+            Storage::Migrating { database, .. } | Storage::Disk { database, .. } => database,
+            Storage::Memory(_) => {
+                return Err(ModelError::Invariant(
+                    "identity store did not spill".to_string(),
+                ));
+            }
         };
         let key = serde_json::to_vec(file_id).map_err(identity_error)?;
         let transaction = database.begin_write().map_err(identity_error)?;
@@ -414,7 +440,7 @@ impl IdentityStore {
         }
         match &self.storage {
             Storage::Memory(records) => records.len(),
-            Storage::Disk { count, .. } => *count,
+            Storage::Migrating { count, .. } | Storage::Disk { count, .. } => *count,
         }
     }
 
@@ -426,6 +452,12 @@ impl IdentityStore {
     #[must_use]
     pub(crate) const fn memory_limit(&self) -> usize {
         self.memory_limit
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn broad_remap_scans(&self) -> usize {
+        self.broad_remap_scans
     }
 
     pub(crate) fn visit_records(
@@ -445,17 +477,15 @@ impl IdentityStore {
                     visitor(*file_id, record.clone())?;
                 }
             }
-            Storage::Disk { database, .. } => {
-                let transaction = database.begin_read().map_err(identity_error)?;
-                let table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
-                for entry in table.iter().map_err(identity_error)? {
-                    let (key, value) = entry.map_err(identity_error)?;
-                    visitor(
-                        serde_json::from_slice(key.value()).map_err(identity_error)?,
-                        serde_json::from_slice(value.value()).map_err(identity_error)?,
-                    )?;
+            Storage::Migrating {
+                records, database, ..
+            } => {
+                for (file_id, record) in records {
+                    visitor(*file_id, record.clone())?;
                 }
+                visit_disk_records(database, &mut visitor)?;
             }
+            Storage::Disk { database, .. } => visit_disk_records(database, &mut visitor)?,
         }
         Ok(())
     }
@@ -492,9 +522,14 @@ impl IdentityStore {
             self.insert(file_id, record, existing.is_none())?;
             Ok(existing)
         })();
-        match self.recover_capacity(result)? {
-            Some(existing) => Ok(existing),
-            None => Ok(None),
+        let Some(existing) = self.recover_capacity(result)? else {
+            return Ok(None);
+        };
+        let _ = self.advance_migration(MIGRATION_RECORDS_PER_OBSERVATION)?;
+        if self.capacity_exhausted {
+            Ok(None)
+        } else {
+            Ok(existing)
         }
     }
     pub(crate) fn refresh_declared_links(
@@ -509,28 +544,67 @@ impl IdentityStore {
         self.upsert_record(file_id, &record).map(|_| ())
     }
 
-    /// Repoints only one identity's participants using a caller-sorted removal set.
-    ///
-    /// This remains bounded for spilled stores because it reads and writes a
-    /// single key rather than iterating every persisted identity.
+    /// Repoints one identity's participants using a caller-sorted removal set.
     pub(crate) fn remap_nodes_for_identity(
         &mut self,
         file_id: &FileId,
         removed: &[NodeId],
         replacement: NodeId,
     ) -> Result<(), ModelError> {
-        if self.capacity_exhausted || removed.is_empty() {
+        self.remap_nodes_for_identities(std::slice::from_ref(file_id), removed, replacement)
+    }
+
+    /// Repoints a known subset of identities using one bounded database pass per batch.
+    ///
+    /// The caller supplies a sorted removal set. Records represented by an
+    /// aggregate cannot be identified from their removed nodes and must use
+    /// [`Self::remap_removed_nodes`] instead.
+    pub(crate) fn remap_nodes_for_identities(
+        &mut self,
+        file_ids: &[FileId],
+        removed: &[NodeId],
+        replacement: NodeId,
+    ) -> Result<(), ModelError> {
+        if self.capacity_exhausted || file_ids.is_empty() || removed.is_empty() {
             return Ok(());
         }
-        let result = (|| -> Result<(), ModelError> {
-            let Some(mut record) = self.get(file_id)? else {
-                return Ok(());
-            };
-            if remap_record_nodes(&mut record, removed, replacement) {
-                self.insert(file_id, &record, false)?;
+        let result = match &mut self.storage {
+            Storage::Memory(records) => {
+                for file_id in file_ids {
+                    if let Some(record) = records.get_mut(file_id) {
+                        remap_record_nodes(record, removed, replacement);
+                    }
+                }
+                Ok(())
             }
-            Ok(())
-        })();
+            Storage::Migrating {
+                records,
+                database,
+                pending,
+                ..
+            } => {
+                let mut persisted_ids = Vec::with_capacity(file_ids.len());
+                for file_id in file_ids {
+                    if let Some(record) = records.get_mut(file_id) {
+                        remap_record_nodes(record, removed, replacement);
+                    } else {
+                        persisted_ids.push(*file_id);
+                    }
+                }
+                for file_ids in persisted_ids.chunks(DISK_WRITE_BATCH) {
+                    remap_disk_records(database, pending, file_ids, removed, replacement)?;
+                }
+                Ok(())
+            }
+            Storage::Disk {
+                database, pending, ..
+            } => {
+                for file_ids in file_ids.chunks(DISK_WRITE_BATCH) {
+                    remap_disk_records(database, pending, file_ids, removed, replacement)?;
+                }
+                Ok(())
+            }
+        };
         let _ = self.recover_capacity(result)?;
         Ok(())
     }
@@ -547,6 +621,11 @@ impl IdentityStore {
         if self.capacity_exhausted || removed.is_empty() {
             return Ok(());
         }
+
+        #[cfg(test)]
+        if self.is_spilled() {
+            self.broad_remap_scans = self.broad_remap_scans.saturating_add(1);
+        }
         let result = (|| -> Result<(), ModelError> {
             removed.sort_unstable();
             if self.is_spilled() {
@@ -559,73 +638,16 @@ impl IdentityStore {
                     }
                     Ok(())
                 }
-                Storage::Disk { database, .. } => {
-                    let mut resume_after = None;
-                    loop {
-                        let (updates, last_key, has_more) = {
-                            let transaction = database.begin_read().map_err(identity_error)?;
-                            let table =
-                                transaction.open_table(IDENTITIES).map_err(identity_error)?;
-                            let mut entries = match resume_after.as_deref() {
-                                Some(key) => table
-                                    .range::<&[u8]>((Bound::Excluded(key), Bound::Unbounded))
-                                    .map_err(identity_error)?,
-                                None => table.iter().map_err(identity_error)?,
-                            };
-                            let mut updates = Vec::new();
-                            let mut last_key = None;
-                            for _ in 0..DISK_WRITE_BATCH {
-                                let Some(entry) = entries.next() else {
-                                    break;
-                                };
-                                let (key, value) = entry.map_err(identity_error)?;
-                                let key = key.value().to_vec();
-                                let mut record = serde_json::from_slice(value.value())
-                                    .map_err(identity_error)?;
-                                if remap_record_nodes(&mut record, removed, replacement) {
-                                    updates.push((
-                                        key.clone(),
-                                        serde_json::to_vec(&record).map_err(identity_error)?,
-                                    ));
-                                }
-                                last_key = Some(key);
-                            }
-                            let has_more = match last_key.as_deref() {
-                                Some(last_key) => table
-                                    .range::<&[u8]>((Bound::Excluded(last_key), Bound::Unbounded))
-                                    .map_err(identity_error)?
-                                    .next()
-                                    .transpose()
-                                    .map_err(identity_error)?
-                                    .is_some(),
-                                None => false,
-                            };
-                            (updates, last_key, has_more)
-                        };
-                        if !updates.is_empty() {
-                            let transaction = database.begin_write().map_err(identity_error)?;
-                            {
-                                let mut table =
-                                    transaction.open_table(IDENTITIES).map_err(identity_error)?;
-                                for (key, value) in updates {
-                                    table
-                                        .insert(key.as_slice(), value.as_slice())
-                                        .map_err(identity_error)?;
-                                }
-                            }
-                            transaction.commit().map_err(identity_error)?;
-                        }
-                        if !has_more {
-                            break;
-                        }
-                        let Some(last_key) = last_key else {
-                            return Err(ModelError::Invariant(
-                                "identity store iteration advanced without a key".to_string(),
-                            ));
-                        };
-                        resume_after = Some(last_key);
+                Storage::Migrating {
+                    records, database, ..
+                } => {
+                    for record in records.values_mut() {
+                        remap_record_nodes(record, removed, replacement);
                     }
-                    Ok(())
+                    remap_all_disk_records(database, removed, replacement)
+                }
+                Storage::Disk { database, .. } => {
+                    remap_all_disk_records(database, removed, replacement)
                 }
             }
         })();
@@ -634,52 +656,119 @@ impl IdentityStore {
     }
 
     fn spill_to_disk(&mut self) -> Result<(), ModelError> {
-        let (database, count) = {
-            let Storage::Memory(records) = &self.storage else {
+        if !matches!(&self.storage, Storage::Memory(_)) {
+            return Ok(());
+        }
+        let database = self.create_spill_database()?;
+        let records = match std::mem::replace(&mut self.storage, Storage::Memory(HashMap::new())) {
+            Storage::Memory(records) => records,
+            storage => {
+                self.storage = storage;
                 return Ok(());
-            };
-            let path = self.session.path().join(IDENTITY_DATABASE_FILE);
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(identity_error)?;
-            restrict_private_file(&path)?;
-            verify_private_file(&path)?;
+            }
+        };
+        self.estimated_bytes = 0;
+        self.storage = Storage::Migrating {
+            database,
+            count: records.len(),
+            pending: HashMap::new(),
+            records,
+        };
+        Ok(())
+    }
 
-            let cache_size = (self.memory_limit / 4).clamp(64 * 1024, 16 * 1024 * 1024);
-            let mut builder = RedbBuilder::new();
-            builder.set_cache_size(cache_size);
-            let backend = BoundedFileBackend::new(
-                file,
-                self.session.database_reservation(),
-                self.session.database_capacity_signal(),
-            )
-            .map_err(identity_error)?;
-            let database = builder
-                .create_with_backend(backend)
-                .map_err(identity_error)?;
-            let transaction = database.begin_write().map_err(identity_error)?;
-            {
-                let mut table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
-                for (file_id, record) in records {
-                    let key = serde_json::to_vec(file_id).map_err(identity_error)?;
-                    let value = serde_json::to_vec(record).map_err(identity_error)?;
-                    table
-                        .insert(key.as_slice(), value.as_slice())
-                        .map_err(identity_error)?;
+    /// Moves at most `maximum_records` pre-spill observations into the disk batch.
+    ///
+    /// A spill begins at the memory boundary, so eagerly rewriting every old
+    /// record would freeze the owner loop precisely when the scan is busiest.
+    pub(crate) fn advance_migration(&mut self, maximum_records: usize) -> Result<bool, ModelError> {
+        if self.capacity_exhausted || maximum_records == 0 {
+            return Ok(false);
+        }
+        let result = (|| -> Result<bool, ModelError> {
+            let Storage::Migrating {
+                database,
+                pending,
+                records,
+                ..
+            } = &mut self.storage
+            else {
+                return Ok(false);
+            };
+            let mut migrated = false;
+            for _ in 0..maximum_records {
+                let Some(file_id) = records.keys().next().copied() else {
+                    break;
+                };
+                let record = records
+                    .remove(&file_id)
+                    .expect("migration key must still identify a record");
+                let key = serde_json::to_vec(&file_id).map_err(identity_error)?;
+                pending.insert(key, record);
+                migrated = true;
+                if pending.len() >= DISK_WRITE_BATCH {
+                    flush_pending_records(database, pending)?;
                 }
             }
-            transaction.commit().map_err(identity_error)?;
-            (database, records.len())
+            Ok(migrated)
+        })();
+        let Some(migrated) = self.recover_capacity(result)? else {
+            return Ok(false);
+        };
+        self.finish_migration_if_empty();
+        Ok(migrated)
+    }
+
+    fn finish_migration_if_empty(&mut self) {
+        if !matches!(&self.storage, Storage::Migrating { records, .. } if records.is_empty()) {
+            return;
+        }
+        let storage = std::mem::replace(&mut self.storage, Storage::Memory(HashMap::new()));
+        let Storage::Migrating {
+            database,
+            count,
+            pending,
+            ..
+        } = storage
+        else {
+            unreachable!("only a finished migration may be finalized");
         };
         self.storage = Storage::Disk {
             database,
             count,
-            pending: HashMap::new(),
+            pending,
         };
-        Ok(())
+    }
+
+    fn create_spill_database(&self) -> Result<Database, ModelError> {
+        let path = self.session.path().join(IDENTITY_DATABASE_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(identity_error)?;
+        restrict_private_file(&path)?;
+        verify_private_file(&path)?;
+
+        let cache_size = (self.memory_limit / 4).clamp(64 * 1024, 16 * 1024 * 1024);
+        let mut builder = RedbBuilder::new();
+        builder.set_cache_size(cache_size);
+        let backend = BoundedFileBackend::new(
+            file,
+            self.session.database_reservation(),
+            self.session.database_capacity_signal(),
+        )
+        .map_err(identity_error)?;
+        let database = builder
+            .create_with_backend(backend)
+            .map_err(identity_error)?;
+        let transaction = begin_ephemeral_write(&database)?;
+        {
+            let _table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+        }
+        transaction.commit().map_err(identity_error)?;
+        Ok(database)
     }
 
     fn disable_for_capacity(&mut self) -> Result<(), ModelError> {
@@ -715,6 +804,24 @@ impl IdentityStore {
                 records.insert(*file_id, record.clone());
                 false
             }
+            Storage::Migrating {
+                records,
+                count,
+                pending,
+                ..
+            } => {
+                if records.contains_key(file_id) {
+                    records.insert(*file_id, record.clone());
+                    false
+                } else {
+                    let key = serde_json::to_vec(file_id).map_err(identity_error)?;
+                    pending.insert(key, record.clone());
+                    if is_new {
+                        *count = count.saturating_add(1);
+                    }
+                    pending.len() >= DISK_WRITE_BATCH
+                }
+            }
             Storage::Disk { count, pending, .. } => {
                 let key = serde_json::to_vec(file_id).map_err(identity_error)?;
                 pending.insert(key, record.clone());
@@ -731,28 +838,187 @@ impl IdentityStore {
     }
 
     fn flush_pending(&mut self) -> Result<(), ModelError> {
-        let Storage::Disk {
-            database, pending, ..
-        } = &mut self.storage
-        else {
-            return Ok(());
-        };
-        if pending.is_empty() {
-            return Ok(());
+        match &mut self.storage {
+            Storage::Migrating {
+                database, pending, ..
+            }
+            | Storage::Disk {
+                database, pending, ..
+            } => flush_pending_records(database, pending),
+            Storage::Memory(_) => Ok(()),
         }
-        let transaction = database.begin_write().map_err(identity_error)?;
-        {
-            let mut table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
-            for (key, record) in pending.iter() {
-                let value = serde_json::to_vec(record).map_err(identity_error)?;
-                table
-                    .insert(key.as_slice(), value.as_slice())
-                    .map_err(identity_error)?;
+    }
+}
+
+/// Identity records are a private, reconstructible scan cache. Keep their live
+/// transactions atomic, but do not synchronously persist every scan batch from
+/// the UI owner thread. Redb retains a consistent reader-visible state and a
+/// crashed session is discarded rather than reused.
+fn begin_ephemeral_write(database: &Database) -> Result<redb::WriteTransaction, ModelError> {
+    let mut transaction = database.begin_write().map_err(identity_error)?;
+    transaction
+        .set_durability(Durability::None)
+        .map_err(identity_error)?;
+    Ok(transaction)
+}
+
+fn read_identity_record(
+    database: &Database,
+    pending: &HashMap<Vec<u8>, IdentityRecord>,
+    file_id: &FileId,
+) -> Result<Option<IdentityRecord>, ModelError> {
+    let key = serde_json::to_vec(file_id).map_err(identity_error)?;
+    if let Some(record) = pending.get(&key) {
+        return Ok(Some(record.clone()));
+    }
+    let transaction = database.begin_read().map_err(identity_error)?;
+    let table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+    table
+        .get(key.as_slice())
+        .map_err(identity_error)?
+        .map(|value| serde_json::from_slice(value.value()).map_err(identity_error))
+        .transpose()
+}
+
+fn visit_disk_records(
+    database: &Database,
+    visitor: &mut impl FnMut(FileId, IdentityRecord) -> Result<(), ModelError>,
+) -> Result<(), ModelError> {
+    let transaction = database.begin_read().map_err(identity_error)?;
+    let table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+    for entry in table.iter().map_err(identity_error)? {
+        let (key, value) = entry.map_err(identity_error)?;
+        visitor(
+            serde_json::from_slice(key.value()).map_err(identity_error)?,
+            serde_json::from_slice(value.value()).map_err(identity_error)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn flush_pending_records(
+    database: &Database,
+    pending: &mut HashMap<Vec<u8>, IdentityRecord>,
+) -> Result<(), ModelError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let transaction = begin_ephemeral_write(database)?;
+    {
+        let mut table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+        for (key, record) in pending.iter() {
+            let value = serde_json::to_vec(record).map_err(identity_error)?;
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(identity_error)?;
+        }
+    }
+    transaction.commit().map_err(identity_error)?;
+    pending.clear();
+    Ok(())
+}
+
+fn remap_disk_records(
+    database: &Database,
+    pending: &mut HashMap<Vec<u8>, IdentityRecord>,
+    file_ids: &[FileId],
+    removed: &[NodeId],
+    replacement: NodeId,
+) -> Result<(), ModelError> {
+    let mut updates = Vec::with_capacity(file_ids.len());
+    {
+        let transaction = database.begin_read().map_err(identity_error)?;
+        let table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+        for file_id in file_ids {
+            let key = serde_json::to_vec(file_id).map_err(identity_error)?;
+            if let Some(record) = pending.get_mut(&key) {
+                remap_record_nodes(record, removed, replacement);
+                continue;
+            }
+            let Some(value) = table.get(key.as_slice()).map_err(identity_error)? else {
+                continue;
+            };
+            let mut record = serde_json::from_slice(value.value()).map_err(identity_error)?;
+            if remap_record_nodes(&mut record, removed, replacement) {
+                updates.push((key, record));
             }
         }
-        transaction.commit().map_err(identity_error)?;
-        pending.clear();
-        Ok(())
+    }
+    for (key, record) in updates {
+        pending.insert(key, record);
+        if pending.len() >= DISK_WRITE_BATCH {
+            flush_pending_records(database, pending)?;
+        }
+    }
+    Ok(())
+}
+
+fn remap_all_disk_records(
+    database: &Database,
+    removed: &[NodeId],
+    replacement: NodeId,
+) -> Result<(), ModelError> {
+    let mut resume_after = None;
+    loop {
+        let (updates, last_key, has_more) = {
+            let transaction = database.begin_read().map_err(identity_error)?;
+            let table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+            let mut entries = match resume_after.as_deref() {
+                Some(key) => table
+                    .range::<&[u8]>((Bound::Excluded(key), Bound::Unbounded))
+                    .map_err(identity_error)?,
+                None => table.iter().map_err(identity_error)?,
+            };
+            let mut updates = Vec::new();
+            let mut last_key = None;
+            for _ in 0..DISK_WRITE_BATCH {
+                let Some(entry) = entries.next() else {
+                    break;
+                };
+                let (key, value) = entry.map_err(identity_error)?;
+                let key = key.value().to_vec();
+                let mut record = serde_json::from_slice(value.value()).map_err(identity_error)?;
+                if remap_record_nodes(&mut record, removed, replacement) {
+                    updates.push((
+                        key.clone(),
+                        serde_json::to_vec(&record).map_err(identity_error)?,
+                    ));
+                }
+                last_key = Some(key);
+            }
+            let has_more = match last_key.as_deref() {
+                Some(last_key) => table
+                    .range::<&[u8]>((Bound::Excluded(last_key), Bound::Unbounded))
+                    .map_err(identity_error)?
+                    .next()
+                    .transpose()
+                    .map_err(identity_error)?
+                    .is_some(),
+                None => false,
+            };
+            (updates, last_key, has_more)
+        };
+        if !updates.is_empty() {
+            let transaction = begin_ephemeral_write(database)?;
+            {
+                let mut table = transaction.open_table(IDENTITIES).map_err(identity_error)?;
+                for (key, value) in updates {
+                    table
+                        .insert(key.as_slice(), value.as_slice())
+                        .map_err(identity_error)?;
+                }
+            }
+            transaction.commit().map_err(identity_error)?;
+        }
+        if !has_more {
+            return Ok(());
+        }
+        let Some(last_key) = last_key else {
+            return Err(ModelError::Invariant(
+                "identity store iteration advanced without a key".to_string(),
+            ));
+        };
+        resume_after = Some(last_key);
     }
 }
 
@@ -1359,6 +1625,77 @@ mod tests {
         };
         assert!(!spill_path.exists());
     }
+
+    #[test]
+    fn spill_migrates_existing_records_in_bounded_steps() {
+        const EXISTING: usize = MIGRATION_RECORDS_PER_OBSERVATION * 2 + 1;
+
+        let mut store = IdentityStore::new(usize::MAX).expect("private session should initialize");
+        for index in 0..EXISTING {
+            let index = u64::try_from(index).expect("test ID should fit");
+            store
+                .observe(
+                    &FileId::new_inode(14, index),
+                    Some(1),
+                    ByteBounds::exact(u128::from(index)),
+                    Some(NodeId(u32::try_from(index).expect("test ID should fit"))),
+                    Some(NodeId(u32::try_from(index).expect("test ID should fit"))),
+                )
+                .expect("in-memory identity should be stored");
+        }
+        store.memory_limit = 1;
+        let trigger = FileId::new_inode(14, u64::try_from(EXISTING).expect("test ID should fit"));
+        store
+            .observe(
+                &trigger,
+                Some(1),
+                ByteBounds::exact(4096),
+                Some(NodeId(u32::try_from(EXISTING).expect("test ID should fit"))),
+                Some(NodeId(u32::try_from(EXISTING).expect("test ID should fit"))),
+            )
+            .expect("spill trigger should be stored");
+
+        let Storage::Migrating { records, .. } = &store.storage else {
+            panic!("existing identities should drain incrementally");
+        };
+        assert_eq!(
+            records.len(),
+            EXISTING.saturating_sub(MIGRATION_RECORDS_PER_OBSERVATION),
+            "one observation may only migrate its bounded slice"
+        );
+        assert_eq!(store.len(), EXISTING.saturating_add(1));
+        assert_eq!(
+            store
+                .get(&FileId::new_inode(14, 0))
+                .expect("migrating identity lookup should succeed")
+                .expect("migrating identity should remain")
+                .allocated_bytes,
+            ByteBounds::exact(0)
+        );
+        let mut visited = 0;
+        store
+            .visit_records(|_, _| {
+                visited += 1;
+                Ok(())
+            })
+            .expect("migration should retain every identity for traversal");
+        assert_eq!(visited, EXISTING.saturating_add(1));
+
+        while store
+            .advance_migration(MIGRATION_RECORDS_PER_OBSERVATION)
+            .expect("bounded migration step should succeed")
+        {}
+        assert!(matches!(store.storage, Storage::Disk { .. }));
+        assert_eq!(store.len(), EXISTING.saturating_add(1));
+        assert_eq!(
+            store
+                .get(&trigger)
+                .expect("migrated trigger lookup should succeed")
+                .expect("migrated trigger should remain")
+                .allocated_bytes,
+            ByteBounds::exact(4096)
+        );
+    }
     #[test]
     fn remapping_spilled_participants_preserves_allocation_owner() {
         let file_id = FileId::new_inode(9, 9);
@@ -1482,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn keyed_remap_updates_one_spilled_identity() {
+    fn keyed_remap_stages_one_spilled_identity() {
         let file_id = FileId::new_inode(12, 34);
         let mut store = IdentityStore::new(1).expect("private session should initialize");
         store
@@ -1494,10 +1831,29 @@ mod tests {
                 Some(NodeId(4)),
             )
             .expect("identity should spill");
+        for index in 0..DISK_WRITE_BATCH.saturating_sub(1) {
+            store
+                .observe(
+                    &FileId::new_inode(13, u64::try_from(index).expect("test ID should fit")),
+                    Some(1),
+                    ByteBounds::exact(4096),
+                    Some(NodeId(u32::try_from(index).expect("test ID should fit"))),
+                    Some(NodeId(u32::try_from(index).expect("test ID should fit"))),
+                )
+                .expect("filler identity should be stored");
+        }
 
         store
             .remap_nodes_for_identity(&file_id, &[NodeId(4)], NodeId(9))
             .expect("keyed remap should succeed");
+        let Storage::Disk { pending, .. } = &store.storage else {
+            panic!("identity should spill");
+        };
+        assert_eq!(
+            pending.len(),
+            1,
+            "one keyed remap should join the regular bounded write batch"
+        );
 
         let record = store
             .get(&file_id)

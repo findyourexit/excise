@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use cap_primitives::ambient_authority;
@@ -23,8 +23,8 @@ use crate::model::UnscannedReason;
 use crate::native_path::{NativeIdentity, identity_for};
 use crate::temporary_storage::TemporaryStorage;
 
-// The owner stages each batch and applies one entry per input poll. Keep batches
-// bounded so backpressure stays small while the map is navigating.
+// The owner consumes each bounded batch before checking input again. Keep the
+// batch small so scanning never makes keyboard feedback wait indefinitely.
 const BATCH_SIZE: usize = 32;
 
 #[derive(Clone, Debug)]
@@ -40,75 +40,68 @@ pub struct ScannerOptions {
 
 const MAX_PENDING_PRIORITIES: usize = 32;
 
+struct RequestedPaths {
+    paths: VecDeque<PathBuf>,
+    generation: u64,
+}
+
 /// Allows the owner loop to promote a visible directory without exposing the
 /// scanner's bounded queue outside this module.
 pub(crate) struct ScannerControl {
-    queue: Mutex<Option<Weak<TaskQueue>>>,
-    requested: Mutex<VecDeque<PathBuf>>,
+    requested: Mutex<RequestedPaths>,
 }
 
 impl ScannerControl {
     fn new() -> Self {
         Self {
-            queue: Mutex::new(None),
-            requested: Mutex::new(VecDeque::with_capacity(MAX_PENDING_PRIORITIES)),
+            requested: Mutex::new(RequestedPaths {
+                paths: VecDeque::with_capacity(MAX_PENDING_PRIORITIES),
+                generation: 0,
+            }),
         }
     }
 
-    pub(crate) fn prioritize(&self, path: &Path) -> io::Result<()> {
-        let queue = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(Weak::upgrade);
-        {
-            let mut requested = self
-                .requested
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(index) = requested.iter().position(|requested| requested == path) {
-                let _ = requested.remove(index);
-            }
-            if requested.len() == MAX_PENDING_PRIORITIES {
-                let _ = requested.pop_front();
-            }
-            requested.push_back(path.to_path_buf());
-        }
-        if let Some(queue) = queue
-            && queue.prioritize(path)?
-        {
-            self.consume(path);
-        }
-        Ok(())
-    }
-
-    fn attach(&self, queue: &Arc<TaskQueue>) -> io::Result<()> {
-        *self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(queue));
-        let requested = self
+    /// Records a foreground directory request. Resolving it against the
+    /// resident queue or spill happens on a scanner worker, never in the TUI.
+    pub(crate) fn prioritize(&self, path: &Path) {
+        let mut requested = self
             .requested
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = requested
+            .paths
             .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        for path in requested {
-            if queue.prioritize(&path)? {
-                self.consume(&path);
-            }
+            .position(|requested| requested == path)
+        {
+            let _ = requested.paths.remove(index);
         }
-        Ok(())
+        if requested.paths.len() == MAX_PENDING_PRIORITIES {
+            let _ = requested.paths.pop_front();
+        }
+        requested.paths.push_back(path.to_path_buf());
+        requested.generation = requested.generation.wrapping_add(1);
     }
 
     fn is_requested(&self, path: &Path) -> bool {
         self.requested
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .paths
             .iter()
             .any(|requested| requested == path)
+    }
+
+    /// Takes a bounded snapshot so scanner workers can resolve one spill
+    /// promotion without holding the control lock across file I/O.
+    fn requested_snapshot(&self) -> (u64, Vec<PathBuf>) {
+        let requested = self
+            .requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            requested.generation,
+            requested.paths.iter().cloned().collect(),
+        )
     }
 
     fn consume(&self, path: &Path) {
@@ -116,8 +109,13 @@ impl ScannerControl {
             .requested
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = requested.iter().position(|requested| requested == path) {
-            let _ = requested.remove(index);
+        if let Some(index) = requested
+            .paths
+            .iter()
+            .position(|requested| requested == path)
+        {
+            let _ = requested.paths.remove(index);
+            requested.generation = requested.generation.wrapping_add(1);
         }
     }
 }
@@ -341,22 +339,6 @@ fn run_with_control(
         }
     };
     let queue = Arc::new(queue);
-    if let Err(error) = control.attach(&queue) {
-        let _ = send_event(
-            sender,
-            WorkerEvent::ScanFailed {
-                path: Some(root.clone()),
-                message: format!("could not initialize scanner priority queue: {error}"),
-            },
-            cancelled,
-        );
-        let _ = send_event(
-            sender,
-            WorkerEvent::ScanFinished { cancelled: false },
-            cancelled,
-        );
-        return;
-    }
     if let Some(task_spill_path) = task_spill_path {
         if !task_spill_path.is_absolute() {
             let _ = send_event(
