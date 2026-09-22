@@ -20,8 +20,8 @@ use crate::state::tiles::{FileType, HALF_ROWS_PER_CELL, MapOverflow, Tile};
 use crate::theme::Theme;
 use crate::ui::format::{DisplaySize, display_os_str_info, truncate_marked, truncate_middle};
 use crate::ui::palette::{
-    Emphasis, MapPalette, Oklch, TILE_BASE_DROP, TILE_CROWN_LIFT, TILE_EDGE_DROP, TileTone,
-    derived_for, size_heat,
+    ColorCycle, Emphasis, MapPalette, Oklch, TILE_BASE_DROP, TILE_CROWN_LIFT, TILE_EDGE_DROP,
+    TileTone, cycle_step, derived_for, size_heat,
 };
 
 /// Composite cell: the upper half takes the foreground colour, the lower half
@@ -75,7 +75,7 @@ pub struct MapLayout<'a> {
     pub deletion_work: Option<&'a DeletionWork>,
     /// A copied target that dissolves beneath the immediate incoming map reflow.
     pub deletion_departure: Option<&'a DeletionDeparture>,
-    /// Wall-clock frame time used for deletion visual progression.
+    /// Wall-clock frame time used for temporal map cues.
     pub now: Duration,
     /// Whether this surface can show non-essential deletion motion.
     pub animate_deletion_checker: bool,
@@ -231,6 +231,58 @@ impl<'a> DenseRectangleGrid<'a> {
         }
     }
 
+    /// Paints a travelling focus trace across the selected tile's upper
+    /// half-cell perimeter. Its static lower bevel retains the full dimensional
+    /// edge without changing terminal background colours.
+    fn draw_composited_selection_pulse(
+        &self,
+        buffer: &mut Buffer,
+        area: Rect,
+        selected_last: Option<usize>,
+    ) {
+        if self.ascii
+            || self.monochrome
+            || !ColorCycle::can_animate(self.theme.focus)
+            || self.transitioning
+        {
+            return;
+        }
+        let Some(index) = selected_last else {
+            return;
+        };
+        let Some(tile) = self.rectangles.get(index) else {
+            return;
+        };
+        if self.is_deletion_departure(tile) {
+            return;
+        }
+        let Some(outline) = visible_tile_outline(tile, area) else {
+            return;
+        };
+        let (cycle, _) = derived_for(self.theme);
+        let step = cycle_step(self.now);
+        let half_rows = u32::from(HALF_ROWS_PER_CELL);
+        walk_tile_outline(outline, |x, half, edge_index| {
+            // A changing lower half would update the terminal background SGR
+            // on every frame. Some terminal renderers expose that sequence as
+            // text during large map redraws, so the travelling trace owns only
+            // the foreground half while the fixed lower bevel completes the edge.
+            if half % half_rows != 0 {
+                return;
+            }
+            let Ok(y) = u16::try_from(half / half_rows) else {
+                return;
+            };
+            paint_half(
+                buffer,
+                x,
+                y,
+                true,
+                cycle.at(step.saturating_add(edge_index)),
+            );
+        });
+    }
+
     fn draw_composited_deletion_departure(
         &self,
         buffer: &mut Buffer,
@@ -372,6 +424,7 @@ impl<'a> DenseRectangleGrid<'a> {
         collapse_flat_cells(buffer, area, overflow_area, palette.grain(), backdrop);
         self.draw_composited_confirmation_checkers(buffer, area, palette, selected_last);
         self.draw_composited_execution_progress(buffer, area, palette, selected_last);
+        self.draw_composited_selection_pulse(buffer, area, selected_last);
 
         for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
             if self.is_deletion_departure(tile) {
@@ -1078,6 +1131,70 @@ fn shade_index(size: u128) -> usize {
         heat if heat < 0.5 => 1,
         heat if heat < 0.75 => 2,
         _ => 3,
+    }
+}
+
+/// Clipped half-row outline of one selected tile.
+#[derive(Clone, Copy)]
+struct VisibleTileOutline {
+    left: u16,
+    right: u16,
+    top: u32,
+    bottom: u32,
+}
+
+fn visible_tile_outline(tile: &Tile, area: Rect) -> Option<VisibleTileOutline> {
+    let left = tile.x.max(area.x);
+    let right = tile.x.saturating_add(tile.width).min(area.right());
+    let half_rows = u32::from(HALF_ROWS_PER_CELL);
+    let top = tile.y.max(u32::from(area.y).saturating_mul(half_rows));
+    let bottom = tile
+        .y
+        .saturating_add(tile.height)
+        .min(area_bottom_half_row(area));
+    (left < right && top < bottom).then_some(VisibleTileOutline {
+        left,
+        right,
+        top,
+        bottom,
+    })
+}
+
+/// Visits every visible outline half-cell clockwise in linear perimeter order
+/// while respecting this map's half-row geometry.
+fn walk_tile_outline(outline: VisibleTileOutline, mut visit: impl FnMut(u16, u32, usize)) {
+    let width = outline.right - outline.left;
+    let height = outline.bottom - outline.top;
+    let mut index = 0_usize;
+    if height == 1 {
+        for x in outline.left..outline.right {
+            visit(x, outline.top, index);
+            index = index.saturating_add(1);
+        }
+        return;
+    }
+    if width == 1 {
+        for half in outline.top..outline.bottom {
+            visit(outline.left, half, index);
+            index = index.saturating_add(1);
+        }
+        return;
+    }
+    for x in outline.left..outline.right {
+        visit(x, outline.top, index);
+        index = index.saturating_add(1);
+    }
+    for half in outline.top.saturating_add(1)..outline.bottom {
+        visit(outline.right.saturating_sub(1), half, index);
+        index = index.saturating_add(1);
+    }
+    for x in (outline.left..outline.right.saturating_sub(1)).rev() {
+        visit(x, outline.bottom.saturating_sub(1), index);
+        index = index.saturating_add(1);
+    }
+    for half in (outline.top.saturating_add(1)..outline.bottom.saturating_sub(1)).rev() {
+        visit(outline.left, half, index);
+        index = index.saturating_add(1);
     }
 }
 
@@ -2091,6 +2208,26 @@ mod tests {
         ascii: bool,
         monochrome: bool,
     ) -> Buffer {
+        render_presentation_at(
+            tiles,
+            area,
+            selected,
+            theme,
+            ascii,
+            monochrome,
+            Duration::ZERO,
+        )
+    }
+
+    fn render_presentation_at(
+        tiles: &[Tile],
+        area: Rect,
+        selected: Option<usize>,
+        theme: ThemeId,
+        ascii: bool,
+        monochrome: bool,
+        now: Duration,
+    ) -> Buffer {
         let mut buffer = Buffer::empty(area);
         DenseRectangleGrid::new(
             MapLayout {
@@ -2103,7 +2240,7 @@ mod tests {
                 deletion_work: None,
                 scanning: false,
                 deletion_departure: None,
-                now: Duration::ZERO,
+                now,
                 animate_deletion_checker: false,
             },
             Theme::for_id(theme),
@@ -2550,6 +2687,85 @@ mod tests {
         let edge = buffer[(7, 1)].bg;
         assert_ne!(crown, body, "the top half-row lifts out of the fill");
         assert_ne!(edge, body, "the trailing column darkens to divide entries");
+    }
+
+    #[test]
+    fn selected_tile_has_a_travelling_outline_without_flattening_depth() {
+        let selected = tile(0, 0, 12, 8, 1);
+        let area = Rect::new(0, 0, 12, 4);
+        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
+        let (cycle, _) = derived_for(theme);
+        let first = render_presentation_at(
+            std::slice::from_ref(&selected),
+            area,
+            Some(0),
+            ThemeId::CatppuccinMocha,
+            false,
+            false,
+            Duration::ZERO,
+        );
+        let later = render_presentation_at(
+            std::slice::from_ref(&selected),
+            area,
+            Some(0),
+            ThemeId::CatppuccinMocha,
+            false,
+            false,
+            Duration::from_millis(34),
+        );
+
+        assert_eq!(first[(0, 0)].fg, cycle.at(cycle_step(Duration::ZERO)));
+        assert_eq!(first[(1, 0)].fg, cycle.at(cycle_step(Duration::ZERO) + 1));
+        assert_eq!(
+            later[(0, 0)].fg,
+            cycle.at(cycle_step(Duration::from_millis(34)))
+        );
+        assert_ne!(first[(0, 0)].fg, later[(0, 0)].fg);
+        assert_eq!(
+            first[(5, 1)].bg,
+            later[(5, 1)].bg,
+            "only the selected outline should pulse; the dimensional tile body stays stable"
+        );
+        assert!(
+            first
+                .content
+                .iter()
+                .zip(later.content.iter())
+                .all(|(first, later)| first.bg == later.bg),
+            "the moving selection trace must not issue changing background colours"
+        );
+    }
+
+    #[test]
+    fn selected_tile_pulse_stays_static_without_truecolour_motion() {
+        let selected = tile(0, 0, 12, 8, 1);
+        let area = Rect::new(0, 0, 12, 4);
+        for (presentation, ascii, monochrome) in
+            [("ASCII", true, false), ("monochrome", false, true)]
+        {
+            let first = render_presentation_at(
+                std::slice::from_ref(&selected),
+                area,
+                Some(0),
+                ThemeId::CatppuccinMocha,
+                ascii,
+                monochrome,
+                Duration::ZERO,
+            );
+            let later = render_presentation_at(
+                std::slice::from_ref(&selected),
+                area,
+                Some(0),
+                ThemeId::CatppuccinMocha,
+                ascii,
+                monochrome,
+                Duration::from_millis(34),
+            );
+            assert_eq!(
+                first.content, later.content,
+                "selected {presentation} presentation must not request motion"
+            );
+        }
     }
 
     #[test]

@@ -4,8 +4,8 @@ expression: normalized
 ---
  EXCISE  /tmp/ex[...]der_name  ◆ COMPLETE         
  Used ##.#K · Reclaim ##.#K                       
-▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
-▟▐ LIST ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+Excise · REDUCED MOTION · mem 96.0M/384.0M        
+▟ LIST ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏▌  file2                      8.0K   40.0%      ▕
 ▏   file3                      8.0K   40.0%      ▕
 ▏   file1                      4.0K   20.0%      ▕
@@ -39,9 +39,10 @@ expression: normalized
 ▏                                                ▕
 ▏                                                ▕
 ▏                                                ▕
+▏                                                ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
                                                   
-▟▐ SELECTED ITEM ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▟ SELECTED ITEM ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏file2                                           ▕
 ▏◆ COMPLETE · file                               ▕
 ▏Backspace delete                                ▕
@@ -50,5 +51,4 @@ expression: normalized
 ▏Content size 8.0K · 0 items                     ▕
 ▏Scan result: included                           ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
- arrows/hjkl move  Enter open/rescan  ? help      
-Excise · REDUCED MOTION
+ arrows/hjkl move  Enter open/rescan  ? help

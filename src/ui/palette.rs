@@ -530,26 +530,15 @@ const CYCLE_LIGHTNESS_SWING: f32 = 0.16;
 const CYCLE_CHROMA_SWING: f32 = 0.22;
 const CYCLE_HUE_SWING: f32 = 0.045;
 
-/// The title chip foreground treatment paired with one animated cycle sample.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CycleInk {
-    /// Truecolour samples use a measured foreground against their fill.
-    Foreground(Color),
-    /// Palette samples and forced monochrome output use terminal reverse video.
-    Reversed,
-}
-
-/// A closed loop of accent shades that travels around a border.
+/// A repeating accent band for modal and selected-map perimeters.
 ///
-/// Modelled on exabind's `selected_category` effect, which advances an index at
-/// thirty samples per second. Each pane maps that phase evenly across its own
-/// perimeter, so its last cell joins the first even when its length differs
-/// from this cycle's sample count. The loop is generated in Oklch rather than
-/// exabind's piecewise HSL table, avoiding a travelling seam.
+/// Each successive border cell advances one sample, and the cycle repeats
+/// after one 1.47-second pulse.
+/// Samples are derived in Oklch so every built-in theme retains its own accent
+/// while avoiding a visible seam at the repeat boundary.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ColorCycle {
     samples: [Color; CYCLE_LEN],
-    chip_inks: [CycleInk; CYCLE_LEN],
 }
 
 impl ColorCycle {
@@ -586,91 +575,24 @@ impl ColorCycle {
             };
             *sample = constrained_cycle_sample(candidate, base, accent, panel);
         }
-        Some(Self {
-            samples,
-            chip_inks: [CycleInk::Reversed; CYCLE_LEN],
-        })
+        Some(Self { samples })
     }
 
     fn solid(accent: Color) -> Self {
         Self {
             samples: [accent; CYCLE_LEN],
-            chip_inks: [CycleInk::Reversed; CYCLE_LEN],
         }
     }
 
-    fn for_theme_with_monochrome(theme: &Theme, monochrome: bool) -> Self {
-        let mut cycle = match Self::from_accent_against(theme.focus, theme.surface_panel) {
-            Some(cycle) => cycle,
-            None => Self::solid(theme.focus),
-        };
-        for (sample, ink) in cycle.samples.iter().zip(&mut cycle.chip_inks) {
-            *ink = title_chip_ink(*sample, theme, monochrome);
-        }
-        cycle
+    fn for_theme(theme: &Theme) -> Self {
+        Self::from_accent_against(theme.focus, theme.surface_panel)
+            .unwrap_or_else(|| Self::solid(theme.focus))
     }
 
     #[must_use]
     pub fn at(&self, step: usize) -> Color {
         self.samples[step % CYCLE_LEN]
     }
-
-    /// Returns the sample at a border position, distributed around the full
-    /// perimeter so the final cell joins the first without a fixed-loop seam.
-    #[must_use]
-    pub(crate) fn at_perimeter(&self, step: usize, position: usize, perimeter: usize) -> Color {
-        self.samples[perimeter_phase(step, position, perimeter)]
-    }
-
-    /// Returns the precomputed title-chip treatment at a border position.
-    #[must_use]
-    pub(crate) fn chip_at_perimeter(
-        &self,
-        step: usize,
-        position: usize,
-        perimeter: usize,
-    ) -> (Color, CycleInk) {
-        let index = perimeter_phase(step, position, perimeter);
-        (self.samples[index], self.chip_inks[index])
-    }
-}
-
-fn perimeter_phase(step: usize, position: usize, perimeter: usize) -> usize {
-    if perimeter == 0 {
-        return step % CYCLE_LEN;
-    }
-    let position = position % perimeter;
-    let position = u128::try_from(position).unwrap_or(0);
-    let perimeter = u128::try_from(perimeter).unwrap_or(1);
-    let offset =
-        usize::try_from(position.saturating_mul(CYCLE_LEN as u128) / perimeter).unwrap_or(0);
-    (step % CYCLE_LEN + offset) % CYCLE_LEN
-}
-
-fn title_chip_ink(fill: Color, theme: &Theme, monochrome: bool) -> CycleInk {
-    if monochrome {
-        return CycleInk::Reversed;
-    }
-    let Color::Rgb(red, green, blue) = fill else {
-        return CycleInk::Reversed;
-    };
-    let rendered_fill = (red, green, blue);
-    let preferred = if Oklch::from_rgb(red, green, blue).lightness > 0.58 {
-        [theme.surface_base, theme.text_primary]
-    } else {
-        [theme.text_primary, theme.surface_base]
-    };
-    // Keep the existing semantic polarity when it is readable, but let a
-    // measured contrast check select the other semantic role for light themes.
-    for candidate in preferred {
-        let Color::Rgb(red, green, blue) = candidate else {
-            continue;
-        };
-        if contrast_ratio(rendered_fill, (red, green, blue)) >= LEAD_CONTRAST_FLOOR {
-            return CycleInk::Foreground(candidate);
-        }
-    }
-    CycleInk::Foreground(color_from_rgb(strongest_neutral(rendered_fill)))
 }
 
 fn constrained_cycle_sample(candidate: Oklch, base: Oklch, accent: Color, panel: Color) -> Color {
@@ -759,7 +681,6 @@ struct DerivedKey {
     panel: Color,
     surface_base: Color,
     text_primary: Color,
-    monochrome: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -770,55 +691,39 @@ struct DerivedPalette {
 }
 
 std::thread_local! {
-    static DERIVED_PALETTE: RefCell<[Option<DerivedPalette>; 2]> =
-        const { RefCell::new([None, None]) };
+    static DERIVED_PALETTE: RefCell<Option<DerivedPalette>> = const { RefCell::new(None) };
 }
 
 /// Returns the colour data whose derivation depends only on the active theme.
 ///
-/// Rendering runs on one synchronous thread, so retaining one entry per
-/// capability variant avoids rebuilding the accent loop and map band for every frame.
+/// Rendering runs on one synchronous thread, so retaining the active palette
+/// avoids rebuilding the modal and selection accent loop on every frame.
 #[must_use]
 pub(crate) fn derived_for(theme: Theme) -> (ColorCycle, Option<MapPalette>) {
-    derived_for_with_monochrome(theme, false)
-}
-
-/// Returns the colour data for a terminal with or without colour output.
-///
-/// The capability participates in the cache key because an RGB theme still
-/// needs explicit reverse-video title chips when the global monochrome pass
-/// will remove its colours.
-#[must_use]
-pub(crate) fn derived_for_with_monochrome(
-    theme: Theme,
-    monochrome: bool,
-) -> (ColorCycle, Option<MapPalette>) {
     let key = DerivedKey {
         focus: theme.focus,
         panel: theme.surface_panel,
         surface_base: theme.surface_base,
         text_primary: theme.text_primary,
-        monochrome,
     };
-    let slot = usize::from(monochrome);
     DERIVED_PALETTE.with(|memo| {
         let mut memo = memo.borrow_mut();
-        if let Some(derived) = memo[slot]
+        if let Some(derived) = *memo
             && derived.key == key
         {
             return (derived.cycle, derived.map);
         }
         let derived = DerivedPalette {
             key,
-            cycle: ColorCycle::for_theme_with_monochrome(&theme, monochrome),
+            cycle: ColorCycle::for_theme(&theme),
             map: MapPalette::for_theme(theme),
         };
-        memo[slot] = Some(derived);
+        *memo = Some(derived);
         (derived.cycle, derived.map)
     })
 }
 
-/// The cycle sample `now` lands on, advancing at exabind's cadence.
+/// The cycle sample that applies at `now`.
 #[must_use]
 pub(crate) fn cycle_step(now: Duration) -> usize {
     let steps = now.as_millis().saturating_mul(CYCLE_RATE) / MILLIS_PER_SECOND;
@@ -1221,64 +1126,6 @@ mod tests {
     }
 
     #[test]
-    fn title_chip_inks_meet_the_name_contrast_floor() {
-        for id in ThemeId::ALL {
-            let theme = Theme::for_id(id);
-            let cycle = ColorCycle::for_theme_with_monochrome(&theme, false);
-            for step in 0..CYCLE_LEN {
-                let (fill, ink) = cycle.chip_at_perimeter(0, step, CYCLE_LEN);
-                match (fill, ink) {
-                    (
-                        Color::Rgb(fill_red, fill_green, fill_blue),
-                        CycleInk::Foreground(Color::Rgb(ink_red, ink_green, ink_blue)),
-                    ) => assert!(
-                        contrast_ratio(
-                            (fill_red, fill_green, fill_blue),
-                            (ink_red, ink_green, ink_blue)
-                        ) >= LEAD_CONTRAST_FLOOR,
-                        "{id:?} title chip sample {step} has unreadable foreground"
-                    ),
-                    (Color::Rgb(..), CycleInk::Foreground(other)) => {
-                        panic!("{id:?} title chip must use a truecolour foreground, got {other:?}");
-                    }
-                    (Color::Rgb(..), CycleInk::Reversed) => {
-                        panic!("{id:?} truecolour title chip must use a measured foreground");
-                    }
-                    (_, CycleInk::Reversed) => {}
-                    (_, CycleInk::Foreground(_)) => {
-                        panic!("{id:?} palette title chip must retain terminal reverse video");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn forced_monochrome_reverses_rgb_chips_without_reusing_the_colour_cache() {
-        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
-        let (colour_cycle, _) = derived_for_with_monochrome(theme, false);
-        assert!(matches!(
-            colour_cycle.chip_at_perimeter(0, 0, CYCLE_LEN).1,
-            CycleInk::Foreground(Color::Rgb(..))
-        ));
-
-        let (monochrome_cycle, _) = derived_for_with_monochrome(theme, true);
-        for step in 0..CYCLE_LEN {
-            assert_eq!(
-                monochrome_cycle.chip_at_perimeter(0, step, CYCLE_LEN).1,
-                CycleInk::Reversed,
-                "forced monochrome must explicitly reverse RGB chip sample {step}"
-            );
-        }
-
-        let (colour_cycle_again, _) = derived_for_with_monochrome(theme, false);
-        assert!(matches!(
-            colour_cycle_again.chip_at_perimeter(0, 0, CYCLE_LEN).1,
-            CycleInk::Foreground(Color::Rgb(..))
-        ));
-    }
-
-    #[test]
     fn only_truecolour_enabled_presentations_request_cycle_activity() {
         let rgb_focus = Theme::for_id(ThemeId::ExciseLight).focus;
         assert!(ColorCycle::can_animate(rgb_focus));
@@ -1319,7 +1166,7 @@ mod tests {
     #[test]
     fn light_theme_cycle_does_not_jump_through_neutral_fallbacks() {
         let theme = Theme::for_id(ThemeId::CatppuccinLatte);
-        let cycle = ColorCycle::for_theme_with_monochrome(&theme, false);
+        let cycle = ColorCycle::for_theme(&theme);
 
         for step in 0..CYCLE_LEN {
             let current = cycle.at(step);
@@ -1349,7 +1196,7 @@ mod tests {
                 continue;
             };
             let required_contrast = base_contrast.max(MIN_FOCUS_CONTRAST);
-            let cycle = ColorCycle::for_theme_with_monochrome(&theme, false);
+            let cycle = ColorCycle::for_theme(&theme);
             for step in 0..CYCLE_LEN {
                 assert!(
                     color_contrast(cycle.at(step), theme.surface_panel)

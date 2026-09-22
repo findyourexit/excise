@@ -4,8 +4,8 @@ expression: normalized
 ---
  EXCISE  /tmp/ex[...]_as_zero  ◆ COMPLETE         
  Used #.#M · Reclaim #.#M                         
-▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
-▟▐ LIST ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+67 more entri[..]rows to scroll · mem 96.1M/384.0M
+▟ LIST ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏▌  file1                      1.0M   41.9%      ▕
 ▏   file2                      1.0M   41.9%      ▕
 ▏   small_file1                4.0K    0.2%      ▕
@@ -39,9 +39,10 @@ expression: normalized
 ▏   small_file35               4.0K    0.2%      ▕
 ▏   small_file36               4.0K    0.2%      ▕
 ▏   small_file37               4.0K    0.2%      ▕
+▏   small_file38               4.0K    0.2%      ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
                                                   
-▟▐ SELECTED ITEM ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▟ SELECTED ITEM ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏file1                                           ▕
 ▏◆ COMPLETE · file                               ▕
 ▏Backspace delete                                ▕
@@ -50,5 +51,4 @@ expression: normalized
 ▏Content size 1.0M · 0 items                     ▕
 ▏Scan result: included                           ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
- arrows/hjkl move  Enter open/rescan  ? help      
-68 more entries below · use arrows to scroll
+ arrows/hjkl move  Enter open/rescan  ? help
