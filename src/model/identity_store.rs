@@ -16,6 +16,7 @@ use redb::{
 use tempfile::{Builder as TempBuilder, TempDir};
 
 use super::{ByteBounds, ModelError, NodeId};
+use crate::file_id_codec::{decode_file_id, encode_file_id};
 use crate::temporary_storage::{BoundedFileBackend, TemporaryStorage, TemporaryStorageReservation};
 
 const IDENTITIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("identities");
@@ -33,9 +34,6 @@ const SESSION_CREATE_ATTEMPTS: usize = 32;
 const DISK_WRITE_BATCH: usize = 256;
 const MIGRATION_RECORDS_PER_OBSERVATION: usize = 8;
 
-const FILE_ID_INODE_TAG: u8 = 0;
-const FILE_ID_LOW_RES_TAG: u8 = 1;
-const FILE_ID_HIGH_RES_TAG: u8 = 2;
 const IDENTITY_RECORD_VERSION: u8 = 1;
 const IDENTITY_RECORD_HAS_DECLARED_LINKS: u8 = 1;
 const IDENTITY_RECORD_DECLARED_LINKS_ONE: u8 = 1 << 1;
@@ -953,7 +951,7 @@ fn visit_disk_records(
     for entry in table.iter().map_err(identity_error)? {
         let (key, value) = entry.map_err(identity_error)?;
         visitor(
-            decode_file_id(key.value())?,
+            decode_file_id(key.value()).map_err(identity_error)?,
             decode_identity_record(value.value())?,
         )?;
     }
@@ -1128,71 +1126,6 @@ fn estimated_identity_record_bytes(record: &IdentityRecord) -> usize {
                 .capacity()
                 .saturating_mul(size_of::<(NodeId, u64)>()),
         )
-}
-
-fn encode_file_id(file_id: &FileId) -> Vec<u8> {
-    match *file_id {
-        FileId::Inode {
-            device_id,
-            inode_number,
-        } => {
-            let mut encoded = Vec::with_capacity(1 + 2 * size_of::<u64>());
-            encoded.push(FILE_ID_INODE_TAG);
-            push_u64(&mut encoded, device_id);
-            push_u64(&mut encoded, inode_number);
-            encoded
-        }
-        FileId::LowRes {
-            volume_serial_number,
-            file_index,
-        } => {
-            let mut encoded = Vec::with_capacity(1 + size_of::<u32>() + size_of::<u64>());
-            encoded.push(FILE_ID_LOW_RES_TAG);
-            push_u32(&mut encoded, volume_serial_number);
-            push_u64(&mut encoded, file_index);
-            encoded
-        }
-        FileId::HighRes {
-            volume_serial_number,
-            file_id,
-        } => {
-            let mut encoded = Vec::with_capacity(1 + size_of::<u64>() + size_of::<u128>());
-            encoded.push(FILE_ID_HIGH_RES_TAG);
-            push_u64(&mut encoded, volume_serial_number);
-            push_u128(&mut encoded, file_id);
-            encoded
-        }
-    }
-}
-
-fn decode_file_id(encoded: &[u8]) -> Result<FileId, ModelError> {
-    let (&tag, payload) = encoded
-        .split_first()
-        .ok_or_else(|| invalid_identity_spill("key"))?;
-    match tag {
-        FILE_ID_INODE_TAG if payload.len() == 2 * size_of::<u64>() => {
-            let mut payload = payload;
-            Ok(FileId::new_inode(
-                take_u64(&mut payload, "key")?,
-                take_u64(&mut payload, "key")?,
-            ))
-        }
-        FILE_ID_LOW_RES_TAG if payload.len() == size_of::<u32>() + size_of::<u64>() => {
-            let mut payload = payload;
-            Ok(FileId::new_low_res(
-                take_u32(&mut payload, "key")?,
-                take_u64(&mut payload, "key")?,
-            ))
-        }
-        FILE_ID_HIGH_RES_TAG if payload.len() == size_of::<u64>() + size_of::<u128>() => {
-            let mut payload = payload;
-            Ok(FileId::new_high_res(
-                take_u64(&mut payload, "key")?,
-                take_u128(&mut payload, "key")?,
-            ))
-        }
-        _ => Err(invalid_identity_spill("key")),
-    }
 }
 
 fn encode_identity_record(record: &IdentityRecord) -> Result<Vec<u8>, ModelError> {
