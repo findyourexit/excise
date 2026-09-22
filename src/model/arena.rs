@@ -224,6 +224,16 @@ impl Arena {
         self.temporary_storage.clone()
     }
 
+    /// Reserves live-model headroom for a simultaneous focused scan stage.
+    /// Primary scan updates must account for that stage before it is merged.
+    pub(crate) fn reserve_staging_capacity(&mut self, bytes: usize) -> Result<(), ModelError> {
+        self.budget.reserve(bytes)
+    }
+
+    pub(crate) const fn release_staging_capacity(&mut self, bytes: usize) {
+        self.budget.release(bytes);
+    }
+
     #[must_use]
     pub fn internal_scan_paths(&self) -> Vec<PathBuf> {
         self.identities.internal_scan_paths()
@@ -1687,9 +1697,9 @@ impl Arena {
     }
 
     fn prepare_identity_metrics(&mut self) {
-        // Once identity storage is exhausted, its records cannot reconstruct the
-        // allocations already observed by the live scan. Keep those leaf metrics;
-        // rebuild_metrics will recalculate ancestor totals after removed nodes go.
+        // Capacity loss invalidates the complete physical-allocation history.
+        // The one-time reset below leaves every retained node uniformly unknown,
+        // rather than preserving a scan-order-dependent partial lower bound.
         if self.identity_accounting_exhausted {
             return;
         }
@@ -1883,12 +1893,30 @@ impl Arena {
     }
 
     fn mark_identity_accounting_uncertain(&mut self) {
+        if self.identity_accounting_exhausted {
+            return;
+        }
         self.identity_accounting_exhausted = true;
+
+        let duplicate_ids = std::mem::take(&mut self.duplicate_identities);
+        self.budget
+            .release(duplicate_ids.len().saturating_mul(DUPLICATE_ID_OVERHEAD));
+        drop(duplicate_ids);
+        let untracked_metrics = std::mem::take(&mut self.untracked_metrics);
+        self.budget.release(
+            untracked_metrics
+                .len()
+                .saturating_mul(UNTRACKED_METRICS_OVERHEAD),
+        );
+        drop(untracked_metrics);
+        self.clear_eviction_stashes();
+        for node in self.nodes.iter_mut().filter_map(Option::as_mut) {
+            node.metrics.allocated_bytes = ByteBounds::unknown();
+            node.metrics.reclaimable_bytes = ByteBounds::unknown();
+        }
         if let Some(root) = self.node_mut(self.root) {
             root.state = NodeState::Uncertain;
             root.unscanned_reason = Some(UnscannedReason::IdentityStorageCapacity);
-            root.metrics.allocated_bytes.upper = None;
-            root.metrics.reclaimable_bytes.upper = None;
         }
     }
 
@@ -5880,12 +5908,8 @@ mod tests {
             root_node.unscanned_reason,
             Some(UnscannedReason::IdentityStorageCapacity)
         );
-        assert!(
-            root_node.metrics.allocated_bytes.lower > 0
-                && root_node.metrics.allocated_bytes.upper.is_none(),
-            "observed allocation remains a lower bound after identity capacity is lost"
-        );
-        assert!(root_node.metrics.reclaimable_bytes.upper.is_none());
+        assert_eq!(root_node.metrics.allocated_bytes, ByteBounds::unknown());
+        assert_eq!(root_node.metrics.reclaimable_bytes, ByteBounds::unknown());
         assert!(!arena.identities.is_spilled());
         drop(arena);
         assert_eq!(temporary_storage.used(), 0);
@@ -5925,7 +5949,113 @@ mod tests {
     }
 
     #[test]
-    fn deletion_during_identity_capacity_uncertainty_preserves_known_live_metrics() {
+    fn identity_capacity_loss_discards_partial_lower_bounds_regardless_of_arrival_order() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let small = root.path().join("small");
+        let large = root.path().join("large");
+        fs::write(&small, b"small").expect("small fixture should be written");
+        fs::write(&large, vec![b'l'; 64 * 1024]).expect("large fixture should be written");
+
+        let scan_after_capacity_signal = |first: &Path, second: &Path| {
+            let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+            let mut arena = test_arena(root.path());
+            arena.identities = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+                .expect("bounded identity store should initialize");
+            assert!(add_path(&mut arena, first).is_some());
+            arena
+                .identities
+                .signal_database_capacity_exhaustion_for_test();
+            assert!(add_path(&mut arena, second).is_some());
+            arena
+                .complete_directory(root.path(), None)
+                .expect("root should complete");
+            arena.finalize().expect("model should finalize");
+            arena
+                .node(arena.root())
+                .expect("root should remain")
+                .metrics
+        };
+
+        let small_first = scan_after_capacity_signal(&small, &large);
+        let large_first = scan_after_capacity_signal(&large, &small);
+        assert_eq!(small_first.allocated_bytes, ByteBounds::unknown());
+        assert_eq!(small_first.reclaimable_bytes, ByteBounds::unknown());
+        assert_eq!(large_first.allocated_bytes, ByteBounds::unknown());
+        assert_eq!(large_first.reclaimable_bytes, ByteBounds::unknown());
+        assert_eq!(small_first, large_first);
+    }
+
+    #[test]
+    fn replacement_scan_continues_when_identity_rebuild_session_cannot_start() {
+        const STORAGE_LIMIT: u64 = 8 * 1024 * 1024;
+
+        let root = tempfile::tempdir().expect("model root should exist");
+        let target = root.path().join("target");
+        let after = root.path().join("after");
+        fs::write(&target, b"original payload").expect("target fixture should be written");
+
+        let temporary_storage = TemporaryStorage::with_limit_bytes(STORAGE_LIMIT);
+        let mut arena = Arena::new_with_temporary_storage(
+            root.path().to_path_buf(),
+            MemoryBudget::from_mib(MIN_PROCESS_MIB)
+                .expect("minimum model budget should be available"),
+            temporary_storage.clone(),
+        )
+        .expect("arena should be created");
+        arena.identities = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+            .expect("spilling identity store should initialize");
+        assert!(add_path(&mut arena, &target).is_some());
+        assert!(arena.identities.is_spilled());
+        arena
+            .identities
+            .visit_records(|_, _| Ok(()))
+            .expect("fixture identity record should flush before saturating storage");
+
+        let remaining = STORAGE_LIMIT
+            .checked_sub(temporary_storage.used())
+            .expect("fixture identity spill should fit its configured storage budget");
+        let _held_storage = temporary_storage
+            .reservation(remaining)
+            .expect("fixture should leave no capacity for a replacement session");
+
+        arena
+            .record_unscanned(
+                &target,
+                UnscannedReason::Replacement("fixture identity changed".to_string()),
+            )
+            .expect("a replacement scan must continue when identity rebuilding cannot start");
+        assert!(arena.identity_accounting_exhausted);
+        let replacement = arena
+            .find_child(arena.root(), OsStr::new("target"))
+            .and_then(|id| arena.node(id))
+            .expect("replacement should remain visible");
+        assert_eq!(replacement.state, NodeState::Uncertain);
+        assert_eq!(
+            replacement.unscanned_reason,
+            Some(UnscannedReason::Replacement(
+                "fixture identity changed".to_string()
+            ))
+        );
+
+        fs::write(&after, b"later payload").expect("later fixture should be written");
+        assert!(
+            add_path(&mut arena, &after).is_some(),
+            "the scanner should retain entries after identity accounting becomes untracked"
+        );
+        arena
+            .complete_directory(root.path(), None)
+            .expect("scan should complete after identity accounting becomes untracked");
+        arena
+            .finalize()
+            .expect("scan should finalize after identity accounting becomes untracked");
+        assert_eq!(
+            arena.node(arena.root()).map(|node| node.state),
+            Some(NodeState::Uncertain)
+        );
+    }
+
+    #[test]
+    fn deletion_during_identity_capacity_uncertainty_keeps_content_but_not_partial_space() {
         let root = tempfile::tempdir().expect("model root should exist");
         let target = root.path().join("target");
         let target_child = target.join("target-child");
@@ -5941,14 +6071,11 @@ mod tests {
         let target_id = add_path(&mut arena, &target).expect("target should be retained");
         assert!(add_path(&mut arena, &target_child).is_some());
         let survivor_id = add_path(&mut arena, &survivor).expect("survivor should be retained");
-        let survivor_metrics = arena
+        let survivor_apparent = arena
             .node(survivor_id)
             .expect("survivor should remain visible")
-            .metrics;
-        assert!(
-            survivor_metrics.allocated_bytes.lower > 0,
-            "fixture must have visible allocated bytes"
-        );
+            .metrics
+            .apparent_bytes;
 
         arena.identities = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
             .expect("bounded identity store should initialize");
@@ -5961,14 +6088,12 @@ mod tests {
                 .expect("deletion reconciliation should succeed")
         );
         assert!(arena.node(target_id).is_none());
-        assert_eq!(
-            arena
-                .node(survivor_id)
-                .expect("survivor should remain visible")
-                .metrics,
-            survivor_metrics,
-            "reconciliation must not erase metrics whose identity records are unavailable"
-        );
+        let survivor = arena
+            .node(survivor_id)
+            .expect("survivor should remain visible");
+        assert_eq!(survivor.metrics.apparent_bytes, survivor_apparent);
+        assert_eq!(survivor.metrics.allocated_bytes, ByteBounds::unknown());
+        assert_eq!(survivor.metrics.reclaimable_bytes, ByteBounds::unknown());
     }
 
     #[test]
@@ -6010,7 +6135,7 @@ mod tests {
     }
 
     #[test]
-    fn deletion_rebuild_keeps_metrics_when_replacement_identity_store_exhausts_capacity() {
+    fn deletion_rebuild_discards_partial_metrics_when_replacement_identity_store_exhausts() {
         const STORAGE_LIMIT: u64 = 8 * 1024 * 1024;
         const REBUILD_SESSION_HEADROOM: u64 = 256;
 
@@ -6034,10 +6159,11 @@ mod tests {
         let target_id = add_path(&mut arena, &target).expect("target should be retained");
         assert!(add_path(&mut arena, &target_child).is_some());
         let survivor_id = add_path(&mut arena, &survivor).expect("survivor should be retained");
-        let survivor_metrics = arena
+        let survivor_apparent = arena
             .node(survivor_id)
             .expect("survivor should remain visible")
-            .metrics;
+            .metrics
+            .apparent_bytes;
         assert!(arena.identities.is_spilled());
 
         let available = STORAGE_LIMIT
@@ -6055,14 +6181,12 @@ mod tests {
         );
         assert!(arena.node(target_id).is_none());
         assert!(arena.identity_accounting_exhausted);
-        assert_eq!(
-            arena
-                .node(survivor_id)
-                .expect("survivor should remain visible")
-                .metrics,
-            survivor_metrics,
-            "replacement-store exhaustion must not erase observed survivor metrics"
-        );
+        let survivor = arena
+            .node(survivor_id)
+            .expect("survivor should remain visible");
+        assert_eq!(survivor.metrics.apparent_bytes, survivor_apparent);
+        assert_eq!(survivor.metrics.allocated_bytes, ByteBounds::unknown());
+        assert_eq!(survivor.metrics.reclaimable_bytes, ByteBounds::unknown());
     }
 
     #[test]

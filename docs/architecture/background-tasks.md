@@ -22,7 +22,7 @@ A compacted aggregate directory keeps a verified concrete backing path and ident
 
 Planning, refresh, queueing, execution, and completion remain in the work rail. A ready plan becomes the normal confirmation dialog only when the foreground mode can present it. Accepted consent returns immediately to normal map navigation; the serial worker continues its final checks and mutation in the background.
 
-The primary scanner is breadth-first. Entering a visible directory promotes its queued task ahead of unrelated work; a bounded deferred request handles the small race before that task is queued. On-demand focused scans stream through separate events and staging, so they can populate a selected summarized directory without diverting primary scan results.
+The primary scanner is breadth-first. While it remains active, entering a visible directory starts a separate focused scan rather than reordering primary tasks. That scan reserves a fixed one-third share of the model budget and traverses serially; after it commits, later primary events below its target are ignored. If the live model cannot free this optional slice, the owner returns to the live map with a notice rather than terminating. An on-demand focused scan can therefore populate the selected directory without making its completed map depend on when it was opened.
 
 ## Bounds and Target Conflicts
 

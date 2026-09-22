@@ -36,7 +36,7 @@ The default process memory limit is 512 MiB. Working data may use 75 percent of 
 
 ### Space Accounting
 
-The identity table counts files with more than one name once within the scan scope. When exact identity data exceeds the memory limit, a permission-restricted store for the current session keeps the minimum records needed for accounting within the shared temporary-storage limit. If that bounded store fills, the scan continues with unknown physical-allocation and reclaimability bounds rather than guessed values or a model failure.
+The identity table counts files with more than one name once within the scan scope. When exact identity data exceeds the memory limit, a permission-restricted store for the current session keeps the minimum records needed for accounting within the shared temporary-storage limit. If that bounded store fills, the scan discards every partial physical total and continues with uniformly unknown physical-allocation and reclaimability bounds rather than a scan-order-dependent estimate or a model failure.
 
 ### Deletion
 

@@ -20,9 +20,11 @@ use file_id::FileId;
 
 struct RescanStage {
     target_id: NodeId,
+    target: PathBuf,
     arena: Arena,
     filter: Option<FilterPattern>,
     filter_root: Option<PathBuf>,
+    reserved_stage_bytes: usize,
 }
 
 /// The UI owns this while it exposes the scan field. One cold subtree is
@@ -35,8 +37,19 @@ struct RescanPreparation {
     desired_stage_bytes: usize,
     pinned: HashSet<NodeId>,
 }
+
+/// The owner either continues bounded compaction, starts the stage, or returns
+/// to the live map without treating unavailable optional capacity as a failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RescanPreparationProgress {
+    Compacting,
+    Ready,
+    InsufficientCapacity,
+}
 const MAX_STALE_SCAN_PREFIXES: usize = 32;
 const MIN_FOCUSED_SCAN_MODEL_BYTES: usize = 8 * 1024 * 1024;
+const FOCUSED_SCAN_MODEL_NUMERATOR: usize = 1;
+const FOCUSED_SCAN_MODEL_DENOMINATOR: usize = 3;
 
 pub struct FileTree {
     pub current_path: Vec<NodeId>,
@@ -50,7 +63,7 @@ pub struct FileTree {
     filter_root: Option<PathBuf>,
     rescan: Option<RescanStage>,
     rescan_preparation: Option<RescanPreparation>,
-    /// Prefixes removed while the primary scanner may still emit stale entries.
+    /// Prefixes removed or authoritatively replaced while primary events may still arrive.
     stale_scan_prefixes: Vec<PathBuf>,
 }
 
@@ -737,8 +750,21 @@ impl FileTree {
         self.begin_rescan_preparation(target, filter)?;
         loop {
             match self.advance_rescan_preparation() {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
+                Ok(RescanPreparationProgress::Ready) => return Ok(()),
+                Ok(RescanPreparationProgress::Compacting) => {}
+                Ok(RescanPreparationProgress::InsufficientCapacity) => {
+                    let preparation = self
+                        .rescan_preparation
+                        .take()
+                        .expect("rescan preparation was checked above");
+                    return Err(ModelError::MemoryExhausted {
+                        required: self
+                            .arena
+                            .memory_used()
+                            .saturating_add(preparation.desired_stage_bytes),
+                        limit: self.arena.memory_limit(),
+                    });
+                }
                 Err(error) => {
                     self.rescan_preparation = None;
                     return Err(error);
@@ -772,7 +798,8 @@ impl FileTree {
         let filter_root = filter
             .as_ref()
             .map(|_| self.filter_root.clone().unwrap_or_else(|| target.clone()));
-        let desired_stage_bytes = (self.arena.memory_limit() / 8)
+        let desired_stage_bytes = (self.arena.memory_limit() / FOCUSED_SCAN_MODEL_DENOMINATOR)
+            .saturating_mul(FOCUSED_SCAN_MODEL_NUMERATOR)
             .max(MIN_FOCUSED_SCAN_MODEL_BYTES)
             .min(self.arena.memory_limit());
         let mut pinned = self.pinned_nodes();
@@ -788,8 +815,10 @@ impl FileTree {
         Ok(())
     }
 
-    /// Compacts at most one cold subtree and reports when focused scan input may start.
-    pub(crate) fn advance_rescan_preparation(&mut self) -> Result<bool, ModelError> {
+    /// Compacts at most one cold subtree and reports whether focused input may start.
+    pub(crate) fn advance_rescan_preparation(
+        &mut self,
+    ) -> Result<RescanPreparationProgress, ModelError> {
         let preparation = self.rescan_preparation.as_ref().ok_or_else(|| {
             ModelError::Invariant("focused rescan preparation is not active".to_string())
         })?;
@@ -797,39 +826,40 @@ impl FileTree {
             .arena
             .memory_limit()
             .saturating_sub(self.arena.memory_used());
-        if remaining < preparation.desired_stage_bytes
-            && self.arena.aggregate_cold_subtree(&preparation.pinned)?
-        {
-            return Ok(false);
+        if remaining < preparation.desired_stage_bytes {
+            if self.arena.aggregate_cold_subtree(&preparation.pinned)? {
+                return Ok(RescanPreparationProgress::Compacting);
+            }
+            return Ok(RescanPreparationProgress::InsufficientCapacity);
         }
 
-        let remaining = self
-            .arena
-            .memory_limit()
-            .saturating_sub(self.arena.memory_used());
         let preparation = self
             .rescan_preparation
             .take()
             .expect("rescan preparation was checked above");
-        let stage = (|| {
-            let budget = MemoryBudget::from_model_limit(remaining)?;
-            Arena::new_with_temporary_storage(
-                preparation.target.clone(),
-                budget,
-                self.arena.temporary_storage(),
-            )
-        })();
+        let budget = MemoryBudget::from_model_limit(preparation.desired_stage_bytes)?;
+        self.arena
+            .reserve_staging_capacity(preparation.desired_stage_bytes)?;
+        let stage = Arena::new_with_temporary_storage(
+            preparation.target.clone(),
+            budget,
+            self.arena.temporary_storage(),
+        );
         match stage {
             Ok(arena) => {
                 self.rescan = Some(RescanStage {
                     target_id: preparation.target_id,
+                    target: preparation.target,
                     arena,
                     filter: preparation.filter,
                     filter_root: preparation.filter_root,
+                    reserved_stage_bytes: preparation.desired_stage_bytes,
                 });
-                Ok(true)
+                Ok(RescanPreparationProgress::Ready)
             }
             Err(error) => {
+                self.arena
+                    .release_staging_capacity(preparation.desired_stage_bytes);
                 self.rescan_preparation = Some(preparation);
                 Err(error)
             }
@@ -842,20 +872,36 @@ impl FileTree {
             .rescan
             .take()
             .ok_or_else(|| ModelError::Invariant("focused rescan is not active".to_string()))?;
-        self.arena
-            .replace_subtree_from(stage.target_id, stage.arena)?;
+        let RescanStage {
+            target_id,
+            target,
+            arena,
+            reserved_stage_bytes,
+            ..
+        } = stage;
+        self.arena.release_staging_capacity(reserved_stage_bytes);
+        self.arena.replace_subtree_from(target_id, arena)?;
+        // Primary events can still arrive after a focused result is committed.
+        // The focused traversal is authoritative for this path, so preserve it
+        // until the primary scanner sends its terminal event.
+        self.ignore_stale_scan_prefix(target);
         self.restore_navigation(&previous_path);
         self.failed_to_read = self.metadata_failure_count();
         Ok(())
     }
 
     pub fn cancel_rescan(&mut self) -> Result<(), ModelError> {
-        if self.rescan.take().is_none() && self.rescan_preparation.take().is_none() {
-            return Err(ModelError::Invariant(
-                "focused rescan is not active".to_string(),
-            ));
+        if let Some(stage) = self.rescan.take() {
+            self.arena
+                .release_staging_capacity(stage.reserved_stage_bytes);
+            return Ok(());
         }
-        Ok(())
+        if self.rescan_preparation.take().is_some() {
+            return Ok(());
+        }
+        Err(ModelError::Invariant(
+            "focused rescan is not active".to_string(),
+        ))
     }
 
     #[must_use]
@@ -1285,7 +1331,7 @@ mod tests {
         );
     }
     #[test]
-    fn focused_rescan_staging_uses_only_remaining_live_model_budget() {
+    fn focused_rescan_reports_insufficient_capacity_without_model_error() {
         let root = tempfile::tempdir().expect("rescan root should exist");
         let target = root.path().join("target");
         let old = target.join("old");
@@ -1308,18 +1354,58 @@ mod tests {
         let before = model_state(&tree);
         tree.arena
             .consume_remaining_budget_for_test()
-            .expect("fixture should consume its model budget");
+            .expect("fixture should fill its model budget");
 
-        let error = tree
-            .begin_rescan(target, None)
-            .expect_err("staging should not receive a second full model budget");
-
-        assert!(matches!(
-            error,
-            crate::model::ModelError::MemoryExhausted { .. }
-        ));
+        tree.begin_rescan_preparation(target, None)
+            .expect("focused preparation should begin");
+        assert_eq!(
+            tree.advance_rescan_preparation()
+                .expect("capacity pressure should be a recoverable preparation result"),
+            RescanPreparationProgress::InsufficientCapacity
+        );
         assert_eq!(model_state(&tree), before);
         assert!(tree.rescan.is_none());
+        assert!(tree.rescan_preparation.is_some());
+        tree.cancel_rescan()
+            .expect("unavailable focused preparation should cancel cleanly");
+    }
+
+    #[test]
+    fn focused_rescan_reserves_a_fixed_share_of_the_model_budget() {
+        let root = tempfile::tempdir().expect("rescan root should exist");
+        let target = root.path().join("target");
+        fs::create_dir(&target).expect("target should be created");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &target);
+        let before = tree.arena.memory_used();
+        let stage_bytes = tree.arena.memory_limit() / 3;
+
+        tree.begin_rescan(target, None)
+            .expect("focused stage should initialize");
+        assert_eq!(
+            tree.rescan
+                .as_ref()
+                .expect("focused stage should exist")
+                .arena
+                .memory_limit(),
+            stage_bytes,
+            "the focused map capacity must not depend on when the user opens it"
+        );
+        assert_eq!(
+            tree.arena.memory_used(),
+            before.saturating_add(stage_bytes),
+            "the primary model must reserve the focused stage capacity"
+        );
+
+        tree.cancel_rescan()
+            .expect("focused stage should cancel cleanly");
+        assert_eq!(tree.arena.memory_used(), before);
     }
 
     #[test]
@@ -1364,10 +1450,10 @@ mod tests {
         tree.begin_rescan_preparation(target, None)
             .expect("visible target should begin staging preparation");
         assert_eq!(tree.node_kind(cold_id), Some(NodeKind::Directory));
-        assert!(
-            !tree
-                .advance_rescan_preparation()
+        assert_eq!(
+            tree.advance_rescan_preparation()
                 .expect("one cold subtree should compact cleanly"),
+            RescanPreparationProgress::Compacting,
             "preparation must return to the owner loop after one compaction"
         );
         assert_eq!(
@@ -1376,10 +1462,6 @@ mod tests {
         );
         assert!(tree.rescan.is_none());
         assert!(tree.rescan_preparation.is_some());
-        while !tree
-            .advance_rescan_preparation()
-            .expect("remaining preparation should complete")
-        {}
         tree.cancel_rescan().expect("fixture stage should clean up");
     }
 
@@ -1643,6 +1725,46 @@ mod tests {
         assert_ne!(tree.path_for_id(old_id), Some(old));
         assert_eq!(tree.node_kind(target_id), Some(NodeKind::Directory));
         assert_eq!(tree.total_node().metrics.apparent_bytes, 19);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn completed_focused_rescan_ignores_late_primary_entries_below_its_target() {
+        let root = tempfile::tempdir().expect("rescan root should exist");
+        let target = root.path().join("target");
+        let focused = target.join("focused");
+        let late_primary = target.join("late-primary");
+        fs::create_dir(&target).expect("target should be created");
+        fs::write(&focused, b"focused").expect("focused fixture should be written");
+        fs::write(&late_primary, b"late").expect("late primary fixture should be written");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &target);
+        tree.begin_rescan(target.clone(), None)
+            .expect("focused rescan should stage");
+        add(&mut tree, &focused);
+        tree.complete_directory(&target, None)
+            .expect("focused target should complete");
+        tree.finish_rescan().expect("focused target should merge");
+
+        let metadata =
+            fs::symlink_metadata(&late_primary).expect("late primary metadata should be readable");
+        let identity = identity_for(&late_primary, &metadata)
+            .expect("late primary entry should be identifiable")
+            .expect("late primary entry should not be a link");
+        assert!(tree.primary_scan_path_is_stale(&late_primary));
+        assert!(
+            tree.add_primary_entry(&metadata, &late_primary, identity)
+                .expect("late primary entry should be ignored rather than overwrite focus")
+                .is_none()
+        );
+        assert!(tree.arena.path_ids(&focused).is_some());
+        assert!(tree.arena.path_ids(&late_primary).is_none());
     }
 
     #[test]
