@@ -1,7 +1,7 @@
 #[cfg(not(windows))]
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::task_queue::DirectoryTask;
 use crate::native_path::{EncodedNativePath, NativeIdentity, NativePath};
@@ -22,10 +22,6 @@ pub(super) struct TaskSpill {
     next_write: u64,
     pending: usize,
     reservation: TemporaryStorageReservation,
-    #[cfg(test)]
-    priority_scans: usize,
-    #[cfg(test)]
-    priority_records_read: usize,
 }
 
 impl TaskSpill {
@@ -48,10 +44,6 @@ impl TaskSpill {
                 next_write: 0,
                 pending: 0,
                 reservation: temporary_storage.reservation(0)?,
-                #[cfg(test)]
-                priority_scans: 0,
-                #[cfg(test)]
-                priority_records_read: 0,
             },
             spill_path,
         ))
@@ -112,27 +104,15 @@ impl TaskSpill {
         Ok(Some(task))
     }
 
-    /// Rotates the first foreground-requested task to the read head. Callers
-    /// invoke this only from scanner workers, never from terminal input.
-    pub(super) fn promote_requested(
-        &mut self,
-        requested: &[PathBuf],
-    ) -> io::Result<Option<PathBuf>> {
-        if requested.is_empty() {
-            return Ok(None);
-        }
-        #[cfg(test)]
-        {
-            self.priority_scans = self.priority_scans.saturating_add(1);
-        }
+    /// Removes one exact coordinator-selected task from the spill journal.
+    ///
+    /// The scan coordinator chooses the path before this bounded journal does
+    /// spill I/O, so terminal input never performs a linear spill search.
+    pub(super) fn take_path(&mut self, path: &Path) -> io::Result<Option<DirectoryTask>> {
         let mut offset = self.next_read;
         while offset < self.next_write {
-            #[cfg(test)]
-            {
-                self.priority_records_read = self.priority_records_read.saturating_add(1);
-            }
             let (task, record_end) = self.read_record_at(offset)?;
-            if requested.iter().any(|requested| requested == &task.path) {
+            if task.path == path {
                 if offset != self.next_read {
                     let record_len = record_end.checked_sub(offset).ok_or_else(|| {
                         io::Error::other("scanner task spill offsets are out of order")
@@ -150,7 +130,9 @@ impl TaskSpill {
                     self.file.seek(SeekFrom::Start(self.next_read))?;
                     self.file.write_all(&record)?;
                 }
-                return Ok(Some(task.path));
+                let selected = self.take()?;
+                debug_assert!(selected.as_ref().is_some_and(|task| task.path == path));
+                return Ok(selected);
             }
             offset = record_end;
         }
@@ -236,16 +218,6 @@ impl TaskSpill {
         }
 
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(super) const fn priority_scans(&self) -> usize {
-        self.priority_scans
-    }
-
-    #[cfg(test)]
-    pub(super) const fn priority_records_read(&self) -> usize {
-        self.priority_records_read
     }
 
     #[cfg(test)]

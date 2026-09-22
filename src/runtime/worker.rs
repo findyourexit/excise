@@ -1,6 +1,7 @@
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -24,7 +25,10 @@ use crate::native_path::safe_display_path_text;
 use crate::native_path::{NativeIdentity, safe_display_text};
 #[cfg(test)]
 use crate::scan_coordinator::ScanGeneration;
-use crate::scan_coordinator::{SchedulerSnapshot, WorkLease};
+use crate::scan_coordinator::{
+    CompletionOutcome, RelativePath, SchedulerSnapshot, SessionCoordinator, WorkCompletion,
+    WorkKind, WorkLease, WorkPriority,
+};
 use crate::scan_session::ScanSessionId;
 use crate::scan_store::run_file::SealedRun;
 use crate::state::deletion_work::{DeletionWorkCommand, DeletionWorkId, MAX_DELETION_WORK_ITEMS};
@@ -104,6 +108,8 @@ pub struct WorkerPool {
     deletion_soft_cancelled: Arc<AtomicBool>,
     scanner: ScannerHandle,
     scan_session: ScanSessionId,
+    coordinator: SessionCoordinator,
+    generation_rebuild_lease: Mutex<Option<WorkLease>>,
     scanner_handle: thread::JoinHandle<()>,
     planner_handle: thread::JoinHandle<()>,
     executor_handle: thread::JoinHandle<()>,
@@ -142,6 +148,7 @@ impl WorkerPool {
         let scan_root_identity = scanner_options.root_identity.clone();
         let temporary_storage = deletion_storage;
         let scan_session = scanner_options.session;
+        let coordinator = scanner_options.coordinator.clone();
 
         let (scanner_handle, scanner) = scanner::spawn(
             scanner_options,
@@ -214,6 +221,8 @@ impl WorkerPool {
             deletion_soft_cancelled,
             scanner,
             scan_session,
+            coordinator,
+            generation_rebuild_lease: Mutex::new(None),
             scanner_handle,
             planner_handle: planner,
             executor_handle: executor,
@@ -230,10 +239,10 @@ impl WorkerPool {
         self.scanner.prioritize(path);
     }
 
-    /// Returns the latest coalesced scan scheduler state without consuming a worker event.
+    /// Returns the latest coalesced session scheduler state without consuming a worker event.
     #[must_use]
     pub(crate) fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
-        self.scanner.scheduler_snapshot()
+        self.coordinator.snapshot().ok()
     }
 
     pub(crate) fn submit_deletion_work(
@@ -304,6 +313,35 @@ impl WorkerPool {
         }
     }
 
+    pub(crate) fn acquire_reducer(&self) -> Result<WorkLease, AppError> {
+        self.coordinator
+            .acquire(
+                WorkKind::ReduceRun,
+                RelativePath::root(),
+                WorkPriority::Reducer,
+            )
+            .map_err(|error| AppError::Worker(error.to_string()))?
+            .ok_or_else(|| AppError::Invariant("scan reduction work was not admitted".to_string()))
+    }
+
+    pub(crate) fn finish_coordinated_work(
+        &self,
+        lease: WorkLease,
+        completion: WorkCompletion,
+    ) -> Result<(), AppError> {
+        if self
+            .coordinator
+            .finish(lease, completion)
+            .map_err(|error| AppError::Worker(error.to_string()))?
+            != CompletionOutcome::Accepted
+        {
+            return Err(AppError::Invariant(
+                "session coordinator rejected completed work".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Stops only at an entry boundary. The executor is always joined by shutdown.
     pub fn safely_stop_deletion(&self) {
         self.deletion_soft_cancelled.store(true, Ordering::Release);
@@ -331,27 +369,59 @@ impl WorkerPool {
         pre_cancelled: bool,
     ) -> Result<(), AppError> {
         options.session = self.scan_session;
+        let coordinator = options.coordinator.clone();
+        let lease = coordinator
+            .acquire(
+                WorkKind::RefreshSubtree,
+                RelativePath::root(),
+                WorkPriority::Foreground,
+            )
+            .map_err(|error| AppError::Worker(error.to_string()))?
+            .ok_or_else(|| {
+                AppError::Invariant("generation refresh was not admitted".to_string())
+            })?;
         let request = if pre_cancelled {
             self.scanner.request_pre_cancelled_rebuild(options)
         } else {
             self.scanner.request_rebuild(options)
         };
-        request.map_err(|error| match error {
-            ScannerRequestError::Busy => {
-                AppError::Invariant("scan rebuild queue is full".to_string())
+        match request {
+            Ok(()) => {
+                *self
+                    .generation_rebuild_lease
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lease);
+                Ok(())
             }
-            ScannerRequestError::Disconnected => {
-                AppError::Worker("scanner worker disconnected".to_string())
+            Err(error) => {
+                let _ = coordinator.requeue(lease);
+                Err(match error {
+                    ScannerRequestError::Busy => {
+                        AppError::Invariant("scan rebuild queue is full".to_string())
+                    }
+                    ScannerRequestError::Disconnected => {
+                        AppError::Worker("scanner worker disconnected".to_string())
+                    }
+                })
             }
-        })
+        }
     }
 
     pub fn cancel_generation_rebuild(&self) {
         self.scanner.cancel_rebuild();
     }
 
-    pub fn finish_generation_rebuild(&self) {
+    pub fn finish_generation_rebuild(&self, completion: WorkCompletion) -> Result<(), AppError> {
         self.scanner.complete_rebuild();
+        let lease = self
+            .generation_rebuild_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                AppError::Invariant("generation rebuild had no work lease".to_string())
+            })?;
+        self.finish_coordinated_work(lease, completion)
     }
 
     pub fn shutdown(self) -> Result<(), AppError> {
@@ -364,6 +434,8 @@ impl WorkerPool {
             deletion_soft_cancelled,
             scanner,
             scan_session: _,
+            coordinator,
+            generation_rebuild_lease: _,
             scanner_handle,
             planner_handle,
             executor_handle,
@@ -376,6 +448,7 @@ impl WorkerPool {
         drop(planner_commands);
         drop(executor_commands);
         drop(scanner);
+        drop(coordinator);
         scanner_handle
             .join()
             .map_err(|_| AppError::Worker("scanner thread panicked".to_string()))?;
@@ -589,16 +662,20 @@ mod tests {
     use std::time::Duration;
 
     use crate::model::UnscannedReason;
+    use crate::scan_coordinator::SessionCoordinator;
     #[cfg(unix)]
     use crate::state::FileToDelete;
 
     use super::*;
 
     fn options(root: &std::path::Path, threads: usize) -> ScannerOptions {
+        let session = ScanSessionId::from_bytes([3; 16]);
         ScannerOptions {
             root: root.to_path_buf(),
-            session: ScanSessionId::from_bytes([3; 16]),
+            session,
             generation: ScanGeneration::initial(),
+            coordinator: SessionCoordinator::start(session, ScanGeneration::initial())
+                .expect("scanner coordinator should start"),
             root_identity: None,
             threads,
             cross_filesystems: false,
@@ -855,6 +932,11 @@ mod tests {
                 }
             }
             assert!(saw_file);
+            if pass == 1 {
+                workers
+                    .finish_generation_rebuild(WorkCompletion::Succeeded)
+                    .expect("completed rebuild lease should finish");
+            }
         }
         workers.shutdown().expect("workers should stop");
     }
@@ -908,7 +990,9 @@ mod tests {
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
-        workers.finish_generation_rebuild();
+        workers
+            .finish_generation_rebuild(WorkCompletion::Cancelled)
+            .expect("cancelled rebuild lease should finish");
 
         workers
             .request_generation_rebuild(scanner_options)
@@ -935,6 +1019,9 @@ mod tests {
             }
         }
         assert!(saw_file);
+        workers
+            .finish_generation_rebuild(WorkCompletion::Succeeded)
+            .expect("completed rebuild lease should finish");
         workers.shutdown().expect("workers should stop");
     }
 

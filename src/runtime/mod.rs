@@ -30,7 +30,10 @@ use crate::native_path::{
 };
 use crate::outcome::{OperationOutcome, RunSummary};
 use crate::report::{ScanReport, ScanReportState, canonical_scan_report_state};
-use crate::scan_coordinator::{ScanGeneration, SchedulerSnapshot, WorkCompletion, WorkLease};
+use crate::scan_coordinator::{
+    RelativePath, ScanGeneration, SchedulerSnapshot, SessionCoordinator, WorkCompletion, WorkKind,
+    WorkLease, WorkPriority,
+};
 use crate::scan_store::run_file::SealedRun;
 use crate::scan_store::session::ScanStore;
 use crate::scan_store::storage::ScanStoreStorage;
@@ -143,9 +146,9 @@ where
     scan_store_storage: TemporaryStorage,
     summary: RunSummary,
     scan_active: bool,
-    /// Latest coalesced scheduler state; never an event backlog.
+    /// Latest coalesced session scheduler state; never an event backlog.
     scheduler_snapshot: Option<SchedulerSnapshot>,
-    /// The initial breadth-first scan remains active while an on-demand scan may run.
+    /// The primary breadth-first generation remains active while a versioned refresh may run.
     primary_scan_active: bool,
     /// Scan data relevant to the displayed folder arrived since its last refresh.
     scan_view_dirty: bool,
@@ -206,6 +209,7 @@ where
         scanner::ScannerOptions {
             session: app.scan_session_id(),
             generation: input_runs.generation(),
+            coordinator: app.session_coordinator(),
             root: settings.root.clone(),
             root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
@@ -584,6 +588,7 @@ where
         let options = scanner::ScannerOptions {
             session: self.app.scan_session_id(),
             generation: input_runs.generation(),
+            coordinator: self.app.session_coordinator(),
             root: root.clone(),
             root_identity: Some(self.settings.root_identity.clone()),
             threads: self.settings.scan_threads,
@@ -662,6 +667,7 @@ where
             .and_then(WorkerPool::scheduler_snapshot);
         if snapshot != self.scheduler_snapshot {
             self.scheduler_snapshot = snapshot;
+            self.app.set_scheduler_snapshot(snapshot);
         }
     }
 
@@ -778,8 +784,7 @@ where
                 self.summary.last_worker_error = Some(safe_display_text(message));
                 self.app.increment_failed_to_read();
             }
-            crate::model::UnscannedReason::IdentityStorageCapacity
-            | crate::model::UnscannedReason::MemoryAggregation => {}
+            crate::model::UnscannedReason::IdentityStorageCapacity => {}
         }
         Ok(())
     }
@@ -812,7 +817,10 @@ where
         if cancelled {
             self.app.cancel_primary_scan()?;
         } else {
+            let reduction = self.workers()?.acquire_reducer()?;
             self.app.finalize_scan();
+            self.workers()?
+                .finish_coordinated_work(reduction, WorkCompletion::Succeeded)?;
             self.app.start_ui();
             self.animation.schedule_completion();
         }
@@ -822,12 +830,15 @@ where
         self.start_pending_generation_rebuild()?;
         Ok(())
     }
-
     fn finish_generation_rebuild(&mut self, cancelled: bool) -> Result<(), AppError> {
         self.generation_rebuild_active = false;
         self.generation_rebuild_target = None;
         if let Some(workers) = self.workers.as_ref() {
-            workers.finish_generation_rebuild();
+            workers.finish_generation_rebuild(if cancelled {
+                WorkCompletion::Cancelled
+            } else {
+                WorkCompletion::Succeeded
+            })?;
         }
         if !self.primary_scan_active {
             self.scan_active = false;
@@ -1224,11 +1235,15 @@ impl BenchmarkScan {
     const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub(crate) fn start(root: &Path, threads: usize) -> Result<Self, AppError> {
+        let session = crate::scan_session::ScanSessionId::random().map_err(|error| {
+            AppError::Worker(format!("could not create benchmark scan session: {error}"))
+        })?;
+        let coordinator = SessionCoordinator::start(session, ScanGeneration::initial())
+            .map_err(|error| AppError::Worker(error.to_string()))?;
         let options = scanner::ScannerOptions {
-            session: crate::scan_session::ScanSessionId::random().map_err(|error| {
-                AppError::Worker(format!("could not create benchmark scan session: {error}"))
-            })?,
+            session,
             generation: ScanGeneration::initial(),
+            coordinator,
             root: root.to_path_buf(),
             root_identity: None,
             threads,
@@ -1294,7 +1309,7 @@ impl BenchmarkScan {
         workers.request_pre_cancelled_generation_rebuild(self.options.clone())?;
         let started = Instant::now();
         let result = self.await_scan_finished(true).map(|_| started.elapsed());
-        workers.finish_generation_rebuild();
+        workers.finish_generation_rebuild(WorkCompletion::Cancelled)?;
         result
     }
 
@@ -1387,8 +1402,7 @@ fn display_reason(reason: &crate::model::UnscannedReason) -> String {
         }
         crate::model::UnscannedReason::SymbolicLink
         | crate::model::UnscannedReason::FilesystemBoundary
-        | crate::model::UnscannedReason::IdentityStorageCapacity
-        | crate::model::UnscannedReason::MemoryAggregation => false,
+        | crate::model::UnscannedReason::IdentityStorageCapacity => false,
     };
     let rendered = safe_display_text(&format!("{reason:?}"));
     if deceptive && !rendered.contains(DECEPTIVE_DISPLAY_MARKER) {
@@ -1453,10 +1467,13 @@ fn scan_headless_with_scan_store_session(
     let input_runs = scan_store
         .input_run_factory()
         .map_err(|error| AppError::Model(error.to_string()))?;
+    let coordinator = SessionCoordinator::start(scan_store.session(), input_runs.generation())
+        .map_err(|error| AppError::Worker(error.to_string()))?;
     let workers = WorkerPool::start_with_deletion_storage(
         scanner::ScannerOptions {
             session: scan_store.session(),
             generation: input_runs.generation(),
+            coordinator: coordinator.clone(),
             root: settings.root.clone(),
             root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
@@ -1567,8 +1584,7 @@ fn scan_headless_with_scan_store_session(
                                 .clone_from(&summary.last_unscanned_path);
                             summary.last_worker_error = Some(safe_display_text(message));
                         }
-                        crate::model::UnscannedReason::IdentityStorageCapacity
-                        | crate::model::UnscannedReason::MemoryAggregation => {}
+                        crate::model::UnscannedReason::IdentityStorageCapacity => {}
                     }
                 }
                 WorkerEvent::ScanFailed { path, message } => {
@@ -1628,9 +1644,27 @@ fn scan_headless_with_scan_store_session(
             summary,
         ));
     }
-    scan_store
-        .publish()
-        .map_err(|error| AppError::Model(error.to_string()))?;
+    let reduction = coordinator
+        .acquire(
+            WorkKind::ReduceRun,
+            RelativePath::root(),
+            WorkPriority::Reducer,
+        )
+        .map_err(|error| AppError::Worker(error.to_string()))?
+        .ok_or_else(|| AppError::Invariant("headless reduction was not admitted".to_string()))?;
+    if let Err(error) = scan_store.publish() {
+        let _ = coordinator.finish(reduction, WorkCompletion::Failed);
+        return Err(AppError::Model(error.to_string()));
+    }
+    if coordinator
+        .finish(reduction, WorkCompletion::Succeeded)
+        .map_err(|error| AppError::Worker(error.to_string()))?
+        != crate::scan_coordinator::CompletionOutcome::Accepted
+    {
+        return Err(AppError::Invariant(
+            "headless reduction lease was no longer active".to_string(),
+        ));
+    }
     let (used, limit) = scan_store.storage_stats();
     summary.scan_store_bytes = used;
     summary.scan_store_limit_bytes = limit;
@@ -1770,6 +1804,7 @@ mod tests {
             scanner::ScannerOptions {
                 session: app.scan_session_id(),
                 generation: ScanGeneration::initial(),
+                coordinator: app.session_coordinator(),
                 root: root.path().to_path_buf(),
                 root_identity: Some(root_identity.clone()),
                 threads: 1,

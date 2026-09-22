@@ -17,6 +17,7 @@ use crate::error::AppError;
 use crate::model::{ByteBounds, NodeKind, NodeState, SyntheticKind, UnscannedReason};
 use crate::native_path::SafeDisplayPath;
 use crate::os::is_user_admin;
+use crate::scan_coordinator::SchedulerSnapshot;
 use crate::state::deletion_work::{
     DeletionWork, MAX_DELETION_WORK_ITEMS, WorkRailItem, WorkRailStatus,
 };
@@ -72,7 +73,54 @@ where
             .map_err(|error| AppError::terminal("size query", error))?;
         Ok(Rect::new(0, 0, size.width, size.height))
     }
-    /// Renders the application UI based on the current mode
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        clippy::too_many_arguments,
+        reason = "test and focused callers retain a static scheduler presentation"
+    )]
+    pub(crate) fn render(
+        &mut self,
+        file_tree: &dyn TreeView,
+        board: &mut Board,
+        ui_mode: &UiMode,
+        ui_effects: &UiEffects,
+        deletion_work: &DeletionWork,
+        animation: &mut AnimationScheduler,
+        now: Duration,
+        theme_name: &str,
+        theme: Theme,
+        ascii: bool,
+        monochrome: bool,
+        keymap: KeyPreset,
+        custom_keys: Option<&CustomKeyBindings>,
+        mouse_enabled: bool,
+        reduced_guardrails: bool,
+        reduced_motion: bool,
+        animate_loading: bool,
+    ) -> Result<(), AppError> {
+        self.render_with_scheduler(
+            file_tree,
+            board,
+            ui_mode,
+            ui_effects,
+            deletion_work,
+            None,
+            animation,
+            now,
+            theme_name,
+            theme,
+            ascii,
+            monochrome,
+            keymap,
+            custom_keys,
+            mouse_enabled,
+            reduced_guardrails,
+            reduced_motion,
+            animate_loading,
+        )
+    }
+
+    /// Renders the application UI based on the current mode.
     ///
     /// # Errors
     /// Returns a terminal error if drawing fails.
@@ -82,13 +130,14 @@ where
         clippy::too_many_lines,
         reason = "rendering needs the complete runtime presentation state in one atomic frame"
     )]
-    pub(crate) fn render(
+    pub(crate) fn render_with_scheduler(
         &mut self,
         file_tree: &dyn TreeView,
         board: &mut Board,
         ui_mode: &UiMode,
         ui_effects: &UiEffects,
         deletion_work: &DeletionWork,
+        scheduler_snapshot: Option<SchedulerSnapshot>,
         animation: &mut AnimationScheduler,
         now: Duration,
         theme_name: &str,
@@ -213,6 +262,7 @@ where
                         ui_mode,
                         ui_effects,
                         deletion_work,
+                        scheduler_snapshot,
                         theme_name,
                         mouse_enabled,
                         reduced_guardrails,
@@ -368,7 +418,7 @@ where
                     Color::Gray | Color::DarkGray => theme.text_muted,
                     Color::Blue | Color::Cyan => theme.focus,
                     Color::Green => theme.state_complete,
-                    Color::Yellow => theme.state_aggregated,
+                    Color::Yellow => theme.state_attention,
                     Color::Magenta => theme.state_shared,
                     Color::Red | Color::LightRed => theme.text_danger,
                     color => color,
@@ -436,7 +486,7 @@ fn theme_requires_legacy_normalization(theme: Theme) -> bool {
         theme.text_danger,
         theme.state_scanning,
         theme.state_complete,
-        theme.state_aggregated,
+        theme.state_attention,
         theme.state_rebuilding,
         theme.state_uncertain,
         theme.state_shared,
@@ -465,7 +515,7 @@ fn is_semantic_theme_color(color: Color, theme: Theme) -> bool {
         || color == theme.text_danger
         || color == theme.state_scanning
         || color == theme.state_complete
-        || color == theme.state_aggregated
+        || color == theme.state_attention
         || color == theme.state_rebuilding
         || color == theme.state_uncertain
         || color == theme.state_shared
@@ -788,11 +838,6 @@ fn view_state(
             "COMPLETE",
             theme.state_complete,
         ),
-        NodeState::Aggregated => (
-            if ascii { "A" } else { "◇" },
-            "SUMMARIZED",
-            theme.state_aggregated,
-        ),
         NodeState::Uncertain => (
             "?",
             match reason {
@@ -802,7 +847,6 @@ fn view_state(
                 Some(UnscannedReason::Metadata(_)) => "READ ERROR",
                 Some(UnscannedReason::Replacement(_)) => "CHANGED",
                 Some(UnscannedReason::IdentityStorageCapacity) => "SPACE ESTIMATE",
-                Some(UnscannedReason::MemoryAggregation) => "SUMMARY",
                 None => "NEEDS REVIEW",
             },
             theme.state_uncertain,
@@ -916,15 +960,7 @@ fn render_list_with_work(
         }
         let marker = list_item_marker(tile, deletion_work, ascii);
         let name_width = area.width.saturating_sub(28);
-        let name = if tile.synthetic_kind == Some(SyntheticKind::Other) {
-            let grouped = tile.descendants.map_or_else(
-                || "Grouped items".to_string(),
-                |count| format!("Grouped items ({count})"),
-            );
-            truncate_middle(&grouped, name_width)
-        } else {
-            display_os_str_middle(&tile.name, name_width)
-        };
+        let name = display_os_str_middle(&tile.name, name_width);
         let size = if tile.uncertain && tile.size == 0 {
             "unknown".to_string()
         } else if tile.uncertain {
@@ -1040,18 +1076,11 @@ fn inspector_action(
     match ui_mode {
         UiMode::Normal | UiMode::Loading | UiMode::Rebuilding { .. } => match kind {
             NodeKind::Root => "Scan root · cannot delete",
-            NodeKind::Directory | NodeKind::Synthetic(SyntheticKind::Aggregate) => {
+            NodeKind::Directory => {
                 if ascii {
                     "Enter open . Backspace delete"
                 } else {
                     "Enter open · Backspace delete"
-                }
-            }
-            NodeKind::Synthetic(SyntheticKind::Other) => {
-                if ascii {
-                    "Grouped items . cannot open or delete"
-                } else {
-                    "Grouped items · cannot open or delete"
                 }
             }
             NodeKind::Synthetic(SyntheticKind::Shared) => {
@@ -1120,7 +1149,6 @@ fn inspection_reason_detail(reason: Option<&UnscannedReason>) -> SafeDisplayPath
         Some(UnscannedReason::IdentityStorageCapacity) => {
             display_text_info("Space totals are approximate; deletion still checks live files")
         }
-        Some(UnscannedReason::MemoryAggregation) => display_text_info("Scan result: summarized"),
     }
 }
 
@@ -1193,28 +1221,17 @@ fn render_inspector_with_work(
     let Some(node) = file_tree.node(tile.node_id) else {
         return;
     };
-    let grouped_summary = matches!(node.kind, NodeKind::Synthetic(SyntheticKind::Other));
-    let (marker, state, state_color) = if grouped_summary {
-        (
-            if ascii { "+" } else { "◇" },
-            "GROUPED",
-            theme.state_aggregated,
-        )
-    } else {
-        view_state(
-            &UiMode::Normal,
-            node.state,
-            node.unscanned_reason.as_ref(),
-            ascii,
-            theme,
-        )
-    };
+    let (marker, state, state_color) = view_state(
+        &UiMode::Normal,
+        node.state,
+        node.unscanned_reason.as_ref(),
+        ascii,
+        theme,
+    );
     let kind = match node.kind {
         NodeKind::Root | NodeKind::Directory => "folder",
         NodeKind::File => "file",
         NodeKind::Link => "link",
-        NodeKind::Synthetic(SyntheticKind::Other) => "grouped total",
-        NodeKind::Synthetic(SyntheticKind::Aggregate) => "summarized folder",
         NodeKind::Synthetic(SyntheticKind::Shared) => "shared item",
     };
     let separator = if ascii { "." } else { "·" };
@@ -1224,8 +1241,6 @@ fn render_inspector_with_work(
         "items"
     };
     let item_count = format!("{} {item_label}", node.metrics.descendants);
-    let folded_detail =
-        grouped_summary.then(|| format!("Contains {item_count} not shown separately"));
     let item_check = node.snapshot.identity.as_ref().map_or_else(
         || "Item check: unavailable".to_string(),
         |identity| format!("Item check: {:?}", identity.file_id),
@@ -1239,20 +1254,12 @@ fn render_inspector_with_work(
             )
         },
     );
-    let scan_detail = if grouped_summary {
-        display_text_info("Includes items not shown as individual tiles")
-    } else {
-        inspection_reason_detail(node.unscanned_reason.as_ref())
-    };
+    let scan_detail = inspection_reason_detail(node.unscanned_reason.as_ref());
     let action = inspector_action(ui_mode, node.kind, node.snapshot.identity.is_some(), ascii);
     let space_used = format_bounds(node.metrics.allocated_bytes);
     let can_reclaim = format_bounds(node.metrics.reclaimable_bytes);
     let content_size = DisplaySize(node.metrics.apparent_bytes as f64).to_string();
-    let name = if grouped_summary {
-        "Grouped items".to_string()
-    } else {
-        display_os_str_middle(&node.name, inner.width)
-    };
+    let name = display_os_str_middle(&node.name, inner.width);
     let name_line = Line::styled(
         name,
         Style::default()
@@ -1312,20 +1319,9 @@ fn render_inspector_with_work(
         .clone()
         .unwrap_or_else(|| action_line.clone());
     let details = if inner.width < 54 {
-        let compact_state_line = if folded_detail.is_some() {
-            Line::styled(
-                truncate_middle(
-                    &format!("{marker} {state} {separator} {item_count} grouped"),
-                    inner.width,
-                ),
-                Style::default().fg(state_color),
-            )
-        } else {
-            narrow_state_line
-        };
         vec![
             name_line,
-            compact_state_line,
+            narrow_state_line,
             action_or_activity.clone(),
             Line::from(truncate_middle(
                 &format!("Can reclaim {can_reclaim}"),
@@ -1341,11 +1337,7 @@ fn render_inspector_with_work(
             )),
             Line::from(truncate_marked(&scan_detail, inner.width, truncate_middle)),
         ]
-    } else if inner.height < 12 || (folded_detail.is_some() && inner.height < 13) {
-        let item_check_or_summary = folded_detail.as_ref().map_or_else(
-            || truncate_middle(&item_check, inner.width),
-            |detail| truncate_middle(detail, inner.width),
-        );
+    } else if inner.height < 12 {
         vec![
             name_line,
             state_line,
@@ -1358,24 +1350,7 @@ fn render_inspector_with_work(
                 &format!("Content size {content_size} {separator} {item_count}"),
                 inner.width,
             )),
-            Line::from(item_check_or_summary),
-            Line::from(truncate_marked(&scan_detail, inner.width, truncate_middle)),
-        ]
-    } else if grouped_summary {
-        vec![
-            name_line,
-            state_line,
-            Line::from(""),
-            action_or_activity,
-            Line::from(format!("Can reclaim {can_reclaim}")),
-            Line::from(format!("Space used {space_used}")),
-            Line::from(format!(
-                "Content size {content_size} {separator} {item_count}"
-            )),
-            Line::from(truncate_middle(
-                &format!("Contains {item_count} not shown separately"),
-                inner.width,
-            )),
+            Line::from(truncate_middle(&item_check, inner.width)),
             Line::from(truncate_marked(&scan_detail, inner.width, truncate_middle)),
         ]
     } else {
@@ -1395,9 +1370,6 @@ fn render_inspector_with_work(
         ];
         if let Some(activity_or_completion) = activity_or_completion {
             details.insert(4, activity_or_completion);
-        }
-        if let Some(folded_detail) = &folded_detail {
-            details.insert(8, Line::from(truncate_middle(folded_detail, inner.width)));
         }
         details
     };
@@ -1428,6 +1400,7 @@ fn header_status_line(
     ui_mode: &UiMode,
     ui_effects: &UiEffects,
     deletion_work: &DeletionWork,
+    scheduler_snapshot: Option<SchedulerSnapshot>,
     theme_name: &str,
     mouse_enabled: bool,
     reduced_guardrails: bool,
@@ -1468,6 +1441,8 @@ fn header_status_line(
     if ascii {
         flags.push("ASCII");
     }
+    let scheduler_status =
+        scheduler_snapshot.and_then(|snapshot| scheduler_work_status(snapshot, separator));
     let mode_status = match ui_mode {
         UiMode::FilterInput { input, error } => Some(error.as_ref().map_or_else(
             || format!("/ {}_  [Enter] apply  [Esc] cancel", display_text(input)),
@@ -1488,6 +1463,10 @@ fn header_status_line(
             |path| status_with_path("~ SCANNING ", path, "", context_width),
         )),
         _ => None,
+    };
+    let mode_status = match (mode_status, scheduler_status.as_deref()) {
+        (Some(status), Some(activity)) => Some(format!("{status} {separator} {activity}")),
+        (status, _) => status,
     };
     let deletion_status = deletion_work
         .foreground_rail_item()
@@ -1518,7 +1497,8 @@ fn header_status_line(
             .last_deletion_summary
             .map(|summary| deletion_summary_status(summary, ascii))
     })
-    .or_else(|| ui_effects.last_deletion_notice.map(str::to_owned));
+    .or_else(|| ui_effects.last_deletion_notice.map(str::to_owned))
+    .or(scheduler_status);
     let status = transient_status.map_or_else(
         || baseline_status(&flags, reduced_guardrails, elevated, context_width, ascii),
         |status| status_with_safety(status, reduced_guardrails, elevated, context_width, ascii),
@@ -1535,6 +1515,19 @@ fn header_status_line(
             theme.text_muted
         }),
     )
+}
+
+fn scheduler_work_status(snapshot: SchedulerSnapshot, separator: &str) -> Option<String> {
+    let active = snapshot.active_leases();
+    let pending = snapshot.pending().total();
+    if active == 0 && pending == 0 {
+        return None;
+    }
+    match (active, pending) {
+        (0, pending) => Some(format!("{pending} queued")),
+        (active, 0) => Some(format!("{active} working")),
+        (active, pending) => Some(format!("{active} working {separator} {pending} queued")),
+    }
 }
 
 fn header_status_context_width(capacity: &str, width: u16, ascii: bool) -> u16 {
@@ -1948,7 +1941,10 @@ mod tests {
 
     use crate::model::{ByteBounds, EntrySnapshot, NodeId, NodeKind};
     use crate::native_path::{NativeIdentity, identity_for};
-    use crate::scan_coordinator::{RelativePath, ScanGeneration};
+    use crate::scan_coordinator::{
+        RelativePath, ScanGeneration, SessionCoordinator, WorkKey, WorkKind, WorkPriority,
+    };
+    use crate::scan_session::ScanSessionId;
     use crate::scan_store::page::{PageEntryKind, ScanPage, ScanPageEntry};
     use crate::scan_store::path_reducer::{Coverage, SummaryMetrics};
     use crate::state::files::snapshot_tree::SnapshotTree;
@@ -2109,7 +2105,6 @@ mod tests {
                 "CHANGED",
             ),
             (UnscannedReason::IdentityStorageCapacity, "SPACE ESTIMATE"),
-            (UnscannedReason::MemoryAggregation, "SUMMARY"),
         ] {
             let (_, label, _) = view_state(
                 &UiMode::Normal,
@@ -2249,6 +2244,7 @@ mod tests {
             &UiMode::Normal,
             &effects,
             &deletion_work,
+            None,
             "Excise Dark",
             false,
             false,
@@ -2267,6 +2263,61 @@ mod tests {
         assert!(!status.contains("store "));
         assert!(!footer.contains("paths unreadable"));
         assert!(!footer.contains("store "));
+    }
+
+    #[test]
+    fn scheduler_status_discloses_active_and_queued_work() {
+        let session = ScanSessionId::from_bytes([7; 16]);
+        let coordinator = SessionCoordinator::start(session, ScanGeneration::initial())
+            .expect("coordinator actor should start");
+        for path in ["active", "queued"] {
+            coordinator
+                .register(
+                    WorkKey::new(
+                        session,
+                        ScanGeneration::initial(),
+                        WorkKind::EnumerateDirectory,
+                        RelativePath::from_path(Path::new(path))
+                            .expect("fixture path should be relative"),
+                    ),
+                    WorkPriority::Background,
+                )
+                .expect("work should register");
+        }
+        coordinator
+            .lease_exact(WorkKey::new(
+                session,
+                ScanGeneration::initial(),
+                WorkKind::EnumerateDirectory,
+                RelativePath::from_path(Path::new("active"))
+                    .expect("fixture path should be relative"),
+            ))
+            .expect("actor should respond")
+            .expect("active work should lease");
+        let snapshot = coordinator.snapshot().expect("actor should respond");
+        assert_eq!(
+            scheduler_work_status(snapshot, "·"),
+            Some("1 working · 1 queued".to_string())
+        );
+        let root = tempfile::tempdir().expect("header root should exist");
+        let tree = page_tree(root.path(), Vec::new(), Coverage::Complete, 0);
+        let status = header_status_line(
+            &tree,
+            &Board::new(),
+            &UiMode::Normal,
+            &UiEffects::new(),
+            &DeletionWork::new(),
+            Some(snapshot),
+            "Excise Dark",
+            false,
+            false,
+            false,
+            false,
+            false,
+            120,
+            Theme::for_id(ThemeId::ExciseDark),
+        );
+        assert!(line_text(&status).contains("1 working · 1 queued"));
     }
 
     #[test]
@@ -2375,7 +2426,7 @@ mod tests {
         buffer[(3, 0)].set_style(
             Style::default()
                 .fg(theme.surface_base)
-                .bg(theme.state_aggregated)
+                .bg(theme.state_attention)
                 .add_modifier(Modifier::BOLD),
         );
         buffer[(4, 0)].set_style(
@@ -2644,7 +2695,7 @@ mod tests {
     #[test]
     fn high_contrast_state_chip_backgrounds_survive_theme_postprocessing() {
         let theme = Theme::for_id(ThemeId::HighContrast);
-        for node_state in [NodeState::Scanning, NodeState::Aggregated] {
+        for node_state in [NodeState::Scanning, NodeState::Complete] {
             let (_, state, state_color) =
                 view_state(&UiMode::Normal, node_state, None, false, theme);
             let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
@@ -2916,20 +2967,11 @@ mod tests {
         assert_eq!(
             inspector_action(
                 &UiMode::Normal,
-                NodeKind::Synthetic(SyntheticKind::Other),
+                NodeKind::Synthetic(SyntheticKind::Shared),
                 true,
                 false,
             ),
-            "Grouped items · cannot open or delete"
-        );
-        assert_eq!(
-            inspector_action(
-                &UiMode::Loading,
-                NodeKind::Synthetic(SyntheticKind::Aggregate),
-                true,
-                false,
-            ),
-            "Enter open · Backspace delete"
+            "Virtual summary · cannot delete"
         );
         assert_eq!(
             inspector_action(
@@ -2961,15 +3003,6 @@ mod tests {
         assert_eq!(
             inspector_action(&UiMode::Loading, NodeKind::File, false, false),
             "Deletion waits for scan preview"
-        );
-        assert_eq!(
-            inspector_action(
-                &UiMode::Loading,
-                NodeKind::Synthetic(SyntheticKind::Other),
-                true,
-                false,
-            ),
-            "Grouped items · cannot open or delete"
         );
     }
 

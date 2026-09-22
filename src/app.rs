@@ -31,7 +31,9 @@ use crate::report::{
     ReportError, canonical_scan_report_state, write_canonical_scan_report_json,
     write_deletion_history_json,
 };
-use crate::scan_coordinator::{RelativePath, ScanGeneration, WorkCompletion, WorkLease};
+use crate::scan_coordinator::{
+    RelativePath, ScanGeneration, SchedulerSnapshot, SessionCoordinator, WorkCompletion, WorkLease,
+};
 #[cfg(test)]
 use crate::scan_store::identity_observation::IdentityObservation;
 use crate::scan_store::page::{PageCursor, PageRequest};
@@ -195,6 +197,7 @@ where
     page_memory_limit: usize,
     root_identity: NativeIdentity,
     scan_store: ScanStore,
+    session_coordinator: SessionCoordinator,
     snapshot_page_cache: Option<SnapshotPageCache>,
     snapshot_page_is_provisional: bool,
     snapshot_filter: Option<(FilterPattern, RelativePath)>,
@@ -204,6 +207,7 @@ where
     generation_rebuild_active: bool,
     generation_rebuild_target: Option<RelativePath>,
     snapshot_page_history: Vec<(RelativePath, Option<PageCursor>)>,
+    scheduler_snapshot: Option<SchedulerSnapshot>,
 
     display: Display<B>,
     ui_effects: UiEffects,
@@ -337,6 +341,8 @@ where
         let deletion_generation = scan_store
             .active_generation()
             .unwrap_or_else(ScanGeneration::initial);
+        let session_coordinator = SessionCoordinator::start(deletion_session, deletion_generation)
+            .map_err(|error| AppError::io("could not start scan coordinator", error))?;
         let loading_snapshot = SnapshotTree::loading(
             scan_root.clone(),
             deletion_generation,
@@ -354,6 +360,7 @@ where
             page_memory_limit,
             root_identity,
             scan_store,
+            session_coordinator: session_coordinator.clone(),
             snapshot_page_cache: Some(SnapshotPageCache::new(loading_snapshot, None)),
             snapshot_page_is_provisional: true,
             snapshot_filter: None,
@@ -363,6 +370,7 @@ where
             generation_rebuild_active: false,
             generation_rebuild_target: None,
             snapshot_page_history: Vec::with_capacity(MAX_SNAPSHOT_PAGE_HISTORY),
+            scheduler_snapshot: None,
             display,
             ui_mode: UiMode::Loading,
             suspended_ui_mode: None,
@@ -377,7 +385,7 @@ where
             deletion_history_bytes: 0,
             deletion_history_limit: process_memory_mib.saturating_mul(MIB) / 8,
             deletion_history: Vec::with_capacity(MAX_RETAINED_DELETION_REPORTS),
-            deletion_work: DeletionWork::new_for_session(deletion_session, deletion_generation),
+            deletion_work: DeletionWork::new_for_coordinator(session_coordinator),
             deletion_modal_work_id: None,
             deletion_plan_cancellation_requested: false,
         })
@@ -412,6 +420,7 @@ where
             && !monochrome
             && !reduced_motion
             && ColorCycle::can_animate(theme.focus);
+        let scheduler_snapshot = self.scheduler_snapshot;
         let (display, board, page_cache, ui_mode, ui_effects, deletion_work) = (
             &mut self.display,
             &mut self.board,
@@ -424,12 +433,13 @@ where
             .as_ref()
             .expect("every app state except the unavailable-result surface retains a page")
             .current();
-        display.render(
+        display.render_with_scheduler(
             tree,
             board,
             ui_mode,
             ui_effects,
             deletion_work,
+            scheduler_snapshot,
             animation,
             now,
             theme_name,
@@ -1031,6 +1041,14 @@ where
             self.invalidate_snapshot_view_for_live_mutation();
             return;
         }
+        if self
+            .session_coordinator
+            .advance_generation(next_generation)
+            .is_err()
+        {
+            self.invalidate_snapshot_view_for_live_mutation();
+            return;
+        }
         if self.load_snapshot_page(&desired).is_err() && self.load_snapshot_page(&fallback).is_err()
         {
             self.invalidate_snapshot_view_for_live_mutation();
@@ -1050,6 +1068,9 @@ where
         self.scan_store
             .begin_generation(next_generation)
             .map_err(scan_store_error)?;
+        self.session_coordinator
+            .advance_generation(next_generation)
+            .map_err(|error| AppError::Worker(error.to_string()))?;
         self.scan_store_available = true;
         self.scan_store_failure = None;
         self.generation_rebuild_active = true;
@@ -1149,6 +1170,18 @@ where
     #[must_use]
     pub(crate) const fn scan_session_id(&self) -> crate::scan_session::ScanSessionId {
         self.scan_store.session()
+    }
+
+    #[must_use]
+    pub(crate) fn session_coordinator(&self) -> SessionCoordinator {
+        self.session_coordinator.clone()
+    }
+
+    pub(crate) fn set_scheduler_snapshot(&mut self, snapshot: Option<SchedulerSnapshot>) {
+        if self.scheduler_snapshot != snapshot {
+            self.scheduler_snapshot = snapshot;
+            self.mark_dirty();
+        }
     }
 
     pub(crate) fn scan_input_run_factory(&self) -> Result<ScanInputRunFactory, AppError> {
@@ -1294,10 +1327,7 @@ where
         if self.deletion_target_is_busy(id) {
             return EnterAction::None;
         }
-        if matches!(
-            synthetic_kind,
-            Some(SyntheticKind::Other | SyntheticKind::Shared)
-        ) {
+        if synthetic_kind == Some(SyntheticKind::Shared) {
             return EnterAction::None;
         }
         self.enter_selected();

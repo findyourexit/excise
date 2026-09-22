@@ -9,7 +9,6 @@ use crate::native_path::NativeIdentity;
 use crate::temporary_storage::TemporaryStorage;
 
 pub(super) const TASK_QUEUE_PER_WORKER: usize = 8;
-const MAX_PENDING_PRIORITIES: usize = 32;
 
 #[derive(Clone)]
 pub(super) struct DirectoryTask {
@@ -27,12 +26,7 @@ pub(super) struct TaskQueue {
 struct QueueState {
     tasks: VecDeque<DirectoryTask>,
     spill: TaskSpill,
-    spill_is_prioritized: bool,
-    requested: VecDeque<PathBuf>,
-    /// Bumps when the actor receives a new focus request.
-    priority_epoch: u64,
-    /// Latest priority epoch resolved against this journal.
-    seen_priority_epoch: u64,
+    /// Includes resident, spilled, and currently leased task payloads.
     pending: usize,
 }
 
@@ -52,10 +46,6 @@ impl TaskQueue {
                     }]),
                     spill,
                     pending: 1,
-                    spill_is_prioritized: false,
-                    requested: VecDeque::with_capacity(MAX_PENDING_PRIORITIES),
-                    priority_epoch: 0,
-                    seen_priority_epoch: 0,
                 }),
                 capacity,
                 root,
@@ -64,25 +54,39 @@ impl TaskQueue {
         ))
     }
 
-    /// Records a bounded foreground request. Only the coordinator calls this;
-    /// a UI caller reaches it through a bounded scheduler channel.
-    pub(super) fn prioritize(&self, path: PathBuf) {
+    /// Removes exactly the task path selected by the session coordinator.
+    pub(super) fn take_path(
+        &self,
+        path: &Path,
+        cancelled: &AtomicBool,
+        failed: &AtomicBool,
+        root_invalid: &AtomicBool,
+    ) -> io::Result<Option<DirectoryTask>> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = state.requested.iter().position(|current| current == &path) {
-            let _ = state.requested.remove(index);
+        if cancelled.load(Ordering::Acquire)
+            || failed.load(Ordering::Acquire)
+            || root_invalid.load(Ordering::Acquire)
+            || state.pending == 0
+        {
+            return Ok(None);
         }
-        if state.requested.len() == MAX_PENDING_PRIORITIES {
-            let _ = state.requested.pop_front();
+        let task = if let Some(index) = state.tasks.iter().position(|task| task.path == path) {
+            state.tasks.remove(index)
+        } else {
+            state.spill.take_path(path)?
+        };
+        if let Some(task) = task {
+            validate_task_path(&self.root, &task.path)?;
+            return Ok(Some(task));
         }
-        state.requested.push_back(path);
-        state.priority_epoch = state.priority_epoch.wrapping_add(1);
+        Ok(None)
     }
 
-    /// Leases one ready directory without blocking the coordinator actor.
-    pub(super) fn try_take(
+    #[cfg(test)]
+    fn take(
         &self,
         cancelled: &AtomicBool,
         failed: &AtomicBool,
@@ -99,34 +103,15 @@ impl TaskQueue {
         {
             return Ok(None);
         }
-        Self::promote_requested_task(&mut state)?;
-        if state.spill_is_prioritized {
-            if let Some(task) = state.spill.take()? {
-                state.spill_is_prioritized = false;
-                validate_task_path(&self.root, &task.path)?;
-                return Ok(Some(task));
-            }
-            state.spill_is_prioritized = false;
-        }
-        if let Some(task) = state.tasks.pop_front() {
-            validate_task_path(&self.root, &task.path)?;
-            return Ok(Some(task));
-        }
-        if let Some(task) = state.spill.take()? {
+        let task = state
+            .tasks
+            .pop_front()
+            .map_or_else(|| state.spill.take(), |task| Ok(Some(task)))?;
+        if let Some(task) = task {
             validate_task_path(&self.root, &task.path)?;
             return Ok(Some(task));
         }
         Ok(None)
-    }
-
-    #[cfg(test)]
-    fn take(
-        &self,
-        cancelled: &AtomicBool,
-        failed: &AtomicBool,
-        root_invalid: &AtomicBool,
-    ) -> io::Result<Option<DirectoryTask>> {
-        self.try_take(cancelled, failed, root_invalid)
     }
 
     pub(super) fn schedule(&self, task: DirectoryTask) -> io::Result<()> {
@@ -139,69 +124,13 @@ impl TaskQueue {
             .pending
             .checked_add(1)
             .ok_or_else(|| io::Error::other("scanner task count overflow"))?;
-        let task_path = task.path.clone();
-        let prioritize = state
-            .requested
-            .iter()
-            .any(|requested| requested == &task_path);
-        if prioritize {
-            if state.tasks.len() == self.capacity {
-                let displaced = state
-                    .tasks
-                    .back()
-                    .cloned()
-                    .expect("a full scanner queue must have a tail task");
-                state.spill.push(displaced)?;
-                let _ = state.tasks.pop_back();
-            }
-            state.tasks.push_front(task);
-            state.spill_is_prioritized = false;
-            Self::consume_requested(&mut state, &task_path);
-        } else if state.tasks.len() < self.capacity {
+        if state.tasks.len() < self.capacity {
             state.tasks.push_back(task);
         } else {
             state.spill.push(task)?;
         }
         state.pending = pending;
         Ok(())
-    }
-
-    /// Resolves at most one new foreground request on the coordinator actor.
-    /// UI input never performs spill I/O.
-    fn promote_requested_task(state: &mut QueueState) -> io::Result<()> {
-        if state.seen_priority_epoch == state.priority_epoch {
-            return Ok(());
-        }
-        state.seen_priority_epoch = state.priority_epoch;
-        if state.requested.is_empty() {
-            return Ok(());
-        }
-        if let Some(index) = state
-            .tasks
-            .iter()
-            .position(|task| state.requested.iter().any(|path| path == &task.path))
-        {
-            let task = state
-                .tasks
-                .remove(index)
-                .expect("queued task index must remain valid while locked");
-            Self::consume_requested(state, &task.path);
-            state.tasks.push_front(task);
-            return Ok(());
-        }
-        let requested = state.requested.iter().cloned().collect::<Vec<_>>();
-        if let Some(path) = state.spill.promote_requested(&requested)? {
-            state.spill_is_prioritized = true;
-            Self::consume_requested(state, &path);
-        }
-        Ok(())
-    }
-
-    fn consume_requested(state: &mut QueueState, path: &Path) {
-        if let Some(index) = state.requested.iter().position(|current| current == path) {
-            let _ = state.requested.remove(index);
-            state.priority_epoch = state.priority_epoch.wrapping_add(1);
-        }
     }
 
     pub(super) fn complete(&self) {
@@ -219,24 +148,6 @@ impl TaskQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending
             == 0
-    }
-
-    #[cfg(test)]
-    fn priority_spill_scans(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .spill
-            .priority_scans()
-    }
-
-    #[cfg(test)]
-    fn priority_spill_records_read(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .spill
-            .priority_records_read()
     }
 }
 
@@ -412,7 +323,7 @@ mod tests {
         assert_eq!(temporary_storage.used(), 0);
     }
     #[test]
-    fn visible_spill_task_is_promoted_by_worker_without_owner_spill_io() {
+    fn coordinator_selected_spilled_task_is_loaded_lazily() {
         const SPILLED_TASKS: usize = 256;
 
         let root = PathBuf::from("/scan-root");
@@ -423,11 +334,10 @@ mod tests {
         let failed = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
 
-        let root_task = queue
+        queue
             .take(&cancelled, &failed, &root_invalid)
             .expect("root should dequeue")
             .expect("root task should exist");
-        assert_eq!(root_task.path, root);
         queue.complete();
         for index in 0..SPILLED_TASKS {
             queue
@@ -444,23 +354,19 @@ mod tests {
             })
             .expect("visible task should spill");
 
-        queue.prioritize(visible.clone());
-        assert_eq!(queue.priority_spill_scans(), 0);
-        assert_eq!(queue.priority_spill_records_read(), 0);
         let task = queue
-            .take(&cancelled, &failed, &root_invalid)
-            .expect("visible task should dequeue")
-            .expect("visible task should exist");
+            .take_path(&visible, &cancelled, &failed, &root_invalid)
+            .expect("selected task should read from spill")
+            .expect("selected task should exist");
         assert_eq!(task.path, visible);
-        assert_eq!(queue.priority_spill_scans(), 1);
-        assert_eq!(queue.priority_spill_records_read(), SPILLED_TASKS);
         queue.complete();
     }
 
     #[test]
-    fn unresolved_priority_scans_the_spill_once_until_the_request_changes() {
+    fn missing_coordinator_selection_preserves_queued_tasks() {
         let root = PathBuf::from("/scan-root");
-        let requested = root.join("not-yet-discovered");
+        let resident = root.join("resident");
+        let spilled = root.join("spilled");
         let (queue, _) = TaskQueue::new(root.clone(), 1, &TemporaryStorage::default())
             .expect("scanner task queue should open");
         let cancelled = AtomicBool::new(false);
@@ -472,71 +378,34 @@ mod tests {
             .expect("root should dequeue")
             .expect("root task should exist");
         queue.complete();
-        for name in ["resident", "spilled-first", "spilled-second"] {
+        for path in [&resident, &spilled] {
             queue
                 .schedule(DirectoryTask {
-                    path: root.join(name),
+                    path: path.clone(),
                     identity: None,
                 })
                 .expect("fixture task should queue");
         }
 
-        queue.prioritize(requested);
-        queue
-            .take(&cancelled, &failed, &root_invalid)
-            .expect("resident task should dequeue")
-            .expect("resident task should exist");
-        assert_eq!(queue.priority_spill_scans(), 1);
+        assert!(
+            queue
+                .take_path(&root.join("missing"), &cancelled, &failed, &root_invalid)
+                .expect("missing selection should not fail")
+                .is_none()
+        );
+        let task = queue
+            .take_path(&resident, &cancelled, &failed, &root_invalid)
+            .expect("resident selection should work")
+            .expect("resident task should remain");
+        assert_eq!(task.path, resident);
         queue.complete();
-        queue
-            .take(&cancelled, &failed, &root_invalid)
-            .expect("spilled task should dequeue")
-            .expect("spilled task should exist");
-        assert_eq!(queue.priority_spill_scans(), 1);
-    }
-
-    #[test]
-    fn requested_visible_task_promotes_when_it_is_discovered() {
-        let root = PathBuf::from("/scan-root");
-        let visible = root.join("visible");
-        let background = root.join("background");
-        let (queue, _) = TaskQueue::new(root.clone(), 1, &TemporaryStorage::default())
-            .expect("scanner task queue should open");
-        let cancelled = AtomicBool::new(false);
-        let failed = AtomicBool::new(false);
-        let root_invalid = AtomicBool::new(false);
-
-        queue
-            .take(&cancelled, &failed, &root_invalid)
-            .expect("root should dequeue")
-            .expect("root task should exist");
+        let task = queue
+            .take_path(&spilled, &cancelled, &failed, &root_invalid)
+            .expect("spilled selection should work")
+            .expect("spilled task should remain");
+        assert_eq!(task.path, spilled);
         queue.complete();
-        queue.prioritize(visible.clone());
-        queue
-            .schedule(DirectoryTask {
-                path: background.clone(),
-                identity: None,
-            })
-            .expect("background task should queue");
-        queue
-            .schedule(DirectoryTask {
-                path: visible.clone(),
-                identity: None,
-            })
-            .expect("visible task should queue");
-
-        let next = queue
-            .take(&cancelled, &failed, &root_invalid)
-            .expect("visible task should dequeue")
-            .expect("visible task should exist");
-        assert_eq!(next.path, visible);
-        queue.complete();
-        let next = queue
-            .take(&cancelled, &failed, &root_invalid)
-            .expect("background task should dequeue")
-            .expect("background task should exist");
-        assert_eq!(next.path, background);
-        queue.complete();
+        assert!(queue.is_idle());
     }
 
     #[test]

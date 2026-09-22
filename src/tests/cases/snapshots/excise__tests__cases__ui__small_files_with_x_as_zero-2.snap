@@ -23,14 +23,14 @@ expression: normalized
 ▏   small_file20               4.0K    0.2%      ▕
 ▏   small_file21               4.0K    0.2%      ▕
 ▏   small_file22               4.0K    0.2%      ▕
-▏ ▟ QUIT ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜ ▕
-▏ ▏                Quit Excise?                ▕ ▕
-▏ ▏                                            ▕ ▕
-▏ ▏                  [y] Quit                  ▕ ▕
-▏ ▏           [Esc/q/n] Keep working           ▕ ▕
-▏ ▏                                            ▕ ▕
-▏ ▏                                            ▕ ▕
-▏ ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ▕
+▏   small_file23               4.0K    0.2%      ▕
+▏   small_file24               4.0K    0.2%      ▕
+▏   small_file25               4.0K    0.2%      ▕
+▏   small_file26               4.0K    0.2%      ▕
+▏   small_file27               4.0K    0.2%      ▕
+▏   small_file28               4.0K    0.2%      ▕
+▏   small_file29               4.0K    0.2%      ▕
+▏   small_file3                4.0K    0.2%      ▕
 ▏   small_file30               4.0K    0.2%      ▕
 ▏   small_file31               4.0K    0.2%      ▕
 ▏   small_file32               4.0K    0.2%      ▕
@@ -45,7 +45,7 @@ expression: normalized
 ▟ SELECTED ITEM ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏file1                                           ▕
 ▏◆ COMPLETE · file                               ▕
-▏Actions unavailable                             ▕
+▏Backspace delete                                ▕
 ▏Can reclaim #.#M                                ▕
 ▏Space used #.#M                                 ▕
 ▏Content size 1.0M · 0 items                     ▕

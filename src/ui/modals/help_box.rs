@@ -119,7 +119,6 @@ impl Widget for HelpBox<'_> {
                 Line::from("  Backspace              queue permanent deletion"),
                 Line::from("  q / Ctrl-c             quit / interruption options"),
                 Line::from("  virtual summaries      cannot be deleted"),
-                Line::from("  summarized folders     open or delete directly"),
                 Line::from("  changed/new entries    skipped before deletion"),
                 Line::styled(
                     "[Esc/?/q] close help",
@@ -231,7 +230,6 @@ mod tests {
         assert!(rendered.contains("Delete safely"));
         assert!(rendered.contains("queue permanent deletion"));
         assert!(rendered.contains("virtual summaries"));
-        assert!(rendered.contains("summarized folders"));
         assert!(rendered.contains("skipped before deletion"));
         assert!(rendered.contains("[Esc/?/q] close help"));
     }
