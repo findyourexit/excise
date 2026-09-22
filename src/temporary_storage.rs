@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use redb::StorageBackend;
 
-pub(crate) const DEFAULT_TEMPORARY_STORAGE_MIB: usize = 512;
+pub(crate) const DEFAULT_TEMPORARY_STORAGE_MIB: usize = 1024;
 pub(crate) const MIN_TEMPORARY_STORAGE_MIB: usize = 2;
 const MIB: u64 = 1024 * 1024;
 
@@ -324,6 +324,21 @@ fn verify_length(file: &BoundedFile) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_temporary_storage_reserves_one_gib() {
+        let storage = TemporaryStorage::default();
+        let bytes = u64::try_from(DEFAULT_TEMPORARY_STORAGE_MIB)
+            .expect("default temporary-storage MiB should fit")
+            .saturating_mul(MIB);
+        let reservation = storage
+            .reservation(bytes)
+            .expect("the full default temporary-storage budget should fit");
+        assert_eq!(storage.used(), bytes);
+        assert!(storage.reserve(1).is_err());
+        drop(reservation);
+        assert_eq!(storage.used(), 0);
+    }
 
     #[test]
     fn bounded_backend_signals_identity_capacity_exhaustion() {

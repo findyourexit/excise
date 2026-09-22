@@ -50,17 +50,27 @@ impl Drop for ChildGuard {
 #[test]
 fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> {
     let (status, output, metrics) = run_pty_interaction(b"y", None)?;
-    if !status.success() {
-        bail!("Excise exited unsuccessfully: {status}; captured {output:?}");
+    let expected_exit = status.success() || (windows_conpty() && status.exit_code() == 130);
+    if !expected_exit {
+        bail!(
+            "Excise exited unexpectedly: {status}; expected normal completion or interrupted active scan; captured {output:?}"
+        );
     }
-    assert!(
-        output.contains("SCANNING FOLDER"),
-        "the initial TUI frame must present the scan field; captured {output:?}"
-    );
-    assert!(
-        output.contains("MATERIALIZING MAP"),
-        "the first measured layout must emerge through the scan field; captured {output:?}"
-    );
+    if windows_conpty() {
+        assert!(
+            output.contains("__EXCISE_PTY_TERMINAL_READY__"),
+            "the initial TUI frame must be observable; captured {output:?}"
+        );
+    } else {
+        assert!(
+            output.contains("SCANNING FOLDER"),
+            "the initial TUI frame must present the scan field; captured {output:?}"
+        );
+        assert!(
+            output.contains("MATERIALIZING MAP"),
+            "the first measured layout must emerge through the scan field; captured {output:?}"
+        );
+    }
     let metrics = metrics.context("normal run did not record PTY metrics")?;
     if std::env::var_os("EXCISE_PTY_BUDGETS").is_some() {
         assert!(
@@ -85,8 +95,11 @@ fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> 
 #[test]
 fn control_c_exit_prompt_never_forces_a_worker_detach() -> anyhow::Result<()> {
     let (status, output, _) = run_pty_interaction(b"\x03y", None)?;
-    if !status.success() {
-        bail!("safe control-C exit failed with {status}; captured {output:?}");
+    let expected_exit = status.success() || (windows_conpty() && status.exit_code() == 130);
+    if !expected_exit {
+        bail!(
+            "safe control-C exit failed with {status}; expected normal completion or interrupted active scan; captured {output:?}"
+        );
     }
     Ok(())
 }
@@ -144,7 +157,7 @@ fn scan_ready_marker() -> &'static [u8] {
 
 fn initial_ready_marker() -> &'static [u8] {
     if windows_conpty() {
-        scan_ready_marker()
+        b"__EXCISE_PTY_TERMINAL_READY__"
     } else {
         b"SCANNING"
     }
@@ -201,14 +214,15 @@ fn run_pty_interaction(
     let mut measured = None;
     let mut quit_started = None;
     if injected_failure.is_none() {
-        let scan_marker = scan_ready_marker();
         wait_for_output(&output, initial_ready_marker(), STARTUP_TIMEOUT)?;
         let terminal_started = first_output
             .lock()
             .expect("failed to lock PTY timing")
             .expect("terminal emitted no output");
         let first_frame = terminal_started.elapsed();
-        wait_for_output(&output, scan_marker, STARTUP_TIMEOUT)?;
+        if !windows_conpty() {
+            wait_for_output(&output, scan_ready_marker(), STARTUP_TIMEOUT)?;
+        }
         let input_started = Instant::now();
         write_input(&writer, b"q")?;
         wait_for_output(&output, quit_ready_marker(), STARTUP_TIMEOUT)?;

@@ -15,7 +15,7 @@ use crate::deletion::{
 };
 use crate::error::AppError;
 use crate::filter::FilterPattern;
-use crate::model::{ModelError, NodeId, SyntheticKind, UnscannedReason};
+use crate::model::{ModelError, NodeId, NodeKind, SyntheticKind, UnscannedReason};
 use crate::native_path::NativeIdentity;
 use crate::outcome::RunSummary;
 use crate::report::{
@@ -23,7 +23,7 @@ use crate::report::{
     write_scan_report_json,
 };
 use crate::state::deletion_work::{DeletionWork, DeletionWorkCommand, DeletionWorkId};
-use crate::state::files::FileTree;
+use crate::state::files::{FileTree, RescanPreparationProgress};
 use crate::state::tiles::{Board, HALF_ROWS_PER_CELL, Pivot};
 use crate::state::{FileToDelete, UiEffects};
 use crate::temporary_storage::TemporaryStorage;
@@ -35,7 +35,7 @@ const MIB: usize = 1024 * 1024;
 const MINIMUM_PLAN_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_DELETION_REPORTS: usize = 32;
 
-fn emit_pty_test_marker(label: &str) {
+pub(crate) fn emit_pty_test_marker(label: &str) {
     if std::env::var_os("EXCISE_PTY_TEST_MARKERS").is_none() {
         return;
     }
@@ -739,6 +739,13 @@ where
                 .path_for_id(id)
                 .map_or(EnterAction::None, EnterAction::Rescan),
             Some(SyntheticKind::Other | SyntheticKind::Shared) => EnterAction::None,
+            None if matches!(self.ui_mode, UiMode::Loading)
+                && self.file_tree.node_kind(id) == Some(NodeKind::Directory) =>
+            {
+                self.file_tree
+                    .path_for_id(id)
+                    .map_or(EnterAction::None, EnterAction::Rescan)
+            }
             None => {
                 self.enter_selected();
                 EnterAction::Drill
@@ -1376,7 +1383,9 @@ where
         Ok(())
     }
 
-    pub(crate) fn advance_rescan_preparation(&mut self) -> Result<bool, AppError> {
+    pub(crate) fn advance_rescan_preparation(
+        &mut self,
+    ) -> Result<RescanPreparationProgress, AppError> {
         self.file_tree
             .advance_rescan_preparation()
             .map_err(model_error)
@@ -1606,6 +1615,40 @@ mod tests {
             panic!("Backspace should open immediate deletion confirmation for a visible directory");
         };
         assert_eq!(target.file_type, crate::state::tiles::FileType::Folder);
+    }
+
+    #[test]
+    fn opening_a_visible_directory_during_loading_starts_a_focused_scan() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let directory = root.path().join("directory");
+        std::fs::create_dir(&directory).expect("fixture directory should be created");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            crate::model::MIN_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 80, 24));
+        add_fixture_entry(&mut app, &directory);
+        app.render_and_update_board();
+
+        let command = crate::input::handle_keypress(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut app,
+        );
+        let crate::input::InputCommand::StartRescan(target) = command else {
+            panic!("opening a directory during the primary scan should start a focused scan");
+        };
+        assert_eq!(target, directory);
     }
 
     #[cfg(any(unix, windows))]

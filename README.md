@@ -137,7 +137,7 @@ Configuration takes values in this order: command line, environment, versioned T
 |---|---|
 | Arrow keys | Move the selection |
 | `h j k l` | Use the Vim movement preset |
-| `Enter` | Open a folder; refresh a summarized folder in place |
+| `Enter` | Open a retained folder; while the initial scan runs, refresh it through the focused scan path |
 | `Esc` | Go back or cancel the current action |
 | `/` | Filter the current view |
 | `+`, `-`, `0` | Zoom in, zoom out, or reset zoom |

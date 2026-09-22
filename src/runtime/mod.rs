@@ -28,7 +28,7 @@ use crate::native_path::{
 };
 use crate::outcome::{OperationOutcome, RunSummary};
 use crate::report::{ScanReport, ScanReportState, scan_report_state};
-use crate::state::files::FileTree;
+use crate::state::files::{FileTree, RescanPreparationProgress};
 use crate::temporary_storage::TemporaryStorage;
 use crate::theme::ThemeId;
 use crate::ui::palette::ColorCycle;
@@ -46,6 +46,9 @@ const MAX_SCAN_ENTRIES_PER_SLICE: usize = 32;
 /// Disk-backed identity accounting can make one model update visibly costly.
 /// Check input after every mutation so a queued navigation key never waits
 /// behind an entire scanner batch.
+/// A focused result is authoritative for its displayed path, so serialize its
+/// traversal instead of allowing worker completion races to choose tiles.
+const FOCUSED_SCAN_THREADS: usize = 1;
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -582,12 +585,20 @@ where
         Ok(())
     }
 
-    /// Releases one bounded piece of live-model capacity before starting the
-    /// focused worker. The input path has already drawn its scan field by then.
+    /// Prepares a bounded focused stage without allowing capacity pressure to
+    /// terminate the interactive session.
     fn prepare_focused_rescan(&mut self) -> Result<bool, AppError> {
         debug_assert!(self.rescan_preparing);
-        if !self.app.advance_rescan_preparation()? {
-            return Ok(true);
+        match self.app.advance_rescan_preparation()? {
+            RescanPreparationProgress::Compacting => return Ok(true),
+            RescanPreparationProgress::InsufficientCapacity => {
+                self.cancel_rescan_preparation()?;
+                self.app.show_notice(
+                    "This folder is still building. A detailed refresh needs more room; keep browsing or try again after the main scan finishes.",
+                );
+                return Ok(true);
+            }
+            RescanPreparationProgress::Ready => {}
         }
         let target = self.rescan_target.clone().ok_or_else(|| {
             AppError::Invariant("focused rescan preparation lost its target".to_string())
@@ -595,7 +606,7 @@ where
         let options = scanner::ScannerOptions {
             root: target,
             root_identity: self.rescan_root_identity.clone(),
-            threads: self.settings.scan_threads,
+            threads: FOCUSED_SCAN_THREADS,
             cross_filesystems: self.settings.cross_filesystems,
             exclusions: self.settings.exclusions.clone(),
             internal_paths: self.app.internal_scan_paths(),
@@ -1133,6 +1144,10 @@ where
             self.settings.monochrome,
             self.settings.reduced_motion,
         );
+        if matches!(&result, Ok(true)) {
+            crate::app::emit_pty_test_marker("TERMINAL_READY");
+        }
+
         self.flush_deletion_plan_cancellation()?;
         result
     }
@@ -2105,11 +2120,12 @@ mod tests {
             .app
             .begin_rescan(root.path().to_path_buf())
             .expect("second focused scan should start");
-        assert!(
+        assert_eq!(
             owner
                 .app
                 .advance_rescan_preparation()
-                .expect("second focused scan staging should activate")
+                .expect("second focused scan staging should activate"),
+            RescanPreparationProgress::Ready
         );
         owner.rescan_active = true;
         owner.rescan_preparing = false;

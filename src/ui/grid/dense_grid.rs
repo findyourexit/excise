@@ -52,6 +52,11 @@ const SELECTED_FILL_EMPHASIS: f32 = 0.5;
 const FOCUSED_FILL_TOWARD_TILE: f32 = 0.42;
 /// Receding faces keep the travelling phase but settle close to the tile surface.
 const FOCUSED_DIM_TOWARD_TILE: f32 = 0.84;
+/// One full diagonal fill sweep takes long enough to read as a travelling sheen.
+const FOCUSED_FILL_WAVE_PERIOD_MILLIS: u64 = 3_200;
+/// A fifth of the diagonal span keeps the moving band broad without flattening the tile.
+const FOCUSED_FILL_WAVE_WIDTH_DIVISOR: u64 = 5;
+const FOCUSED_FILL_WAVE_STEPS: u16 = 256;
 /// Columns an entry needs before it is worth labelling.
 const MINIMUM_LABEL_WIDTH: u16 = 6;
 
@@ -274,16 +279,32 @@ impl<'a> DenseRectangleGrid<'a> {
         let ink = self.ink(tile, palette, Emphasis::Selected, self.work_status(tile));
         let (cycle, _) = derived_for(self.theme);
         let step = cycle_step(self.now);
-        let fill = cycle
-            .blended_toward(ink.fill, FOCUSED_FILL_TOWARD_TILE)
-            .at(step);
+        let base_fill = ink.fill;
+        let crest = cycle
+            .blended_toward(base_fill, FOCUSED_FILL_TOWARD_TILE)
+            .at(0);
+        let wave = FocusFillWave::new(outline, self.now);
+        let center_x = outline
+            .left
+            .saturating_add(outline.right.saturating_sub(outline.left) / 2);
+        let center_half = outline
+            .top
+            .saturating_add(outline.bottom.saturating_sub(outline.top) / 2);
+        let fill = focus_fill_color(
+            base_fill,
+            crest,
+            wave.intensity(outline, center_x, center_half),
+        );
         let (text, detail) = Oklch::from_color(fill).map_or((ink.text, ink.detail), Oklch::inks);
         Some(SelectionFocus {
             index,
             outline,
             cycle,
-            dim_cycle: cycle.blended_toward(ink.fill, FOCUSED_DIM_TOWARD_TILE),
+            dim_cycle: cycle.blended_toward(base_fill, FOCUSED_DIM_TOWARD_TILE),
             step,
+            base_fill,
+            crest,
+            wave,
             fill,
             text,
             detail,
@@ -296,7 +317,7 @@ impl<'a> DenseRectangleGrid<'a> {
         if focus.index >= self.rectangles.len() {
             return;
         }
-        paint_focused_tile_fill(buffer, focus.outline, focus.fill);
+        paint_focused_tile_fill(buffer, focus);
         let half_rows = u32::from(HALF_ROWS_PER_CELL);
         walk_tile_outline(focus.outline, |x, half, edge_index| {
             let bright = half == focus.outline.top
@@ -1179,9 +1200,77 @@ struct SelectionFocus {
     cycle: ColorCycle,
     dim_cycle: ColorCycle,
     step: usize,
+    base_fill: Color,
+    crest: Color,
+    wave: FocusFillWave,
+    /// The wave colour at the label's centre, shared with labels and work indicators.
     fill: Color,
     text: Color,
     detail: Color,
+}
+
+impl SelectionFocus {
+    fn fill_at(&self, x: u16, half: u32) -> Color {
+        focus_fill_color(
+            self.base_fill,
+            self.crest,
+            self.wave.intensity(self.outline, x, half),
+        )
+    }
+}
+
+/// A single broad band moves from the upper-left to lower-right diagonal.
+#[derive(Clone, Copy)]
+struct FocusFillWave {
+    front: u64,
+    half_width: u64,
+}
+
+impl FocusFillWave {
+    fn new(outline: VisibleTileOutline, now: Duration) -> Self {
+        let span = u64::from(outline.right.saturating_sub(outline.left))
+            .saturating_mul(2)
+            .saturating_add(u64::from(outline.bottom.saturating_sub(outline.top)));
+        let half_width = (span / FOCUSED_FILL_WAVE_WIDTH_DIVISOR).max(4);
+        let travel = span.saturating_add(half_width.saturating_mul(2));
+        let elapsed = now.as_millis() % u128::from(FOCUSED_FILL_WAVE_PERIOD_MILLIS);
+        let elapsed = u64::try_from(elapsed).expect("wave period bounds elapsed milliseconds");
+        Self {
+            front: elapsed.saturating_mul(travel) / FOCUSED_FILL_WAVE_PERIOD_MILLIS,
+            half_width,
+        }
+    }
+
+    fn intensity(self, outline: VisibleTileOutline, x: u16, half: u32) -> u16 {
+        let coordinate = u64::from(x.saturating_sub(outline.left))
+            .saturating_mul(2)
+            .saturating_add(u64::from(half.saturating_sub(outline.top)))
+            .saturating_add(self.half_width);
+        let distance = coordinate.abs_diff(self.front);
+        if distance >= self.half_width {
+            return 0;
+        }
+        let strength = self
+            .half_width
+            .saturating_sub(distance)
+            .saturating_mul(u64::from(FOCUSED_FILL_WAVE_STEPS))
+            / self.half_width;
+        u16::try_from(strength).expect("focused fill intensity is bounded")
+    }
+}
+
+fn focus_fill_color(base_color: Color, crest_color: Color, intensity: u16) -> Color {
+    let (Some(base), Some(crest)) = (
+        Oklch::from_color(base_color),
+        Oklch::from_color(crest_color),
+    ) else {
+        return base_color;
+    };
+    base.towards(
+        crest,
+        f32::from(intensity) / f32::from(FOCUSED_FILL_WAVE_STEPS),
+    )
+    .to_color()
 }
 
 fn focused_tile_ink(
@@ -1250,9 +1339,10 @@ fn walk_tile_outline(outline: VisibleTileOutline, mut visit: impl FnMut(u16, u32
     }
 }
 
-/// Fills only the selected tile's interior. Its outline is painted afterwards,
-/// retaining a bright leading edge and a darker receding contour.
-fn paint_focused_tile_fill(buffer: &mut Buffer, outline: VisibleTileOutline, fill: Color) {
+/// Fills only the selected tile's interior with its slower diagonal wave. Its
+/// outline is painted afterwards, retaining bright leading and dim receding faces.
+fn paint_focused_tile_fill(buffer: &mut Buffer, focus: &SelectionFocus) {
+    let outline = focus.outline;
     let left = outline.left.saturating_add(1);
     let right = outline.right.saturating_sub(1);
     let top = outline.top.saturating_add(1);
@@ -1266,7 +1356,7 @@ fn paint_focused_tile_fill(buffer: &mut Buffer, outline: VisibleTileOutline, fil
             continue;
         };
         for x in left..right {
-            paint_half(buffer, x, y, half % half_rows == 0, fill);
+            paint_half(buffer, x, y, half % half_rows == 0, focus.fill_at(x, half));
         }
     }
     let first_row = top / half_rows;
@@ -3007,36 +3097,48 @@ mod tests {
     }
 
     #[test]
-    fn selected_tile_walks_a_full_contour_with_midpoint_fill() {
-        let selected = tile(0, 0, 12, 8, 1);
-        let area = Rect::new(0, 0, 12, 4);
+    fn selected_tile_walks_a_full_contour_with_a_slower_diagonal_fill_wave() {
+        let selected = tile(0, 0, 20, 12, 1);
+        let area = Rect::new(0, 0, 20, 6);
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
         let (cycle, map) = derived_for(theme);
         let palette = map.expect("mocha should supply a truecolour map palette");
         let ink = TileInk::resolve(&selected, theme, palette, Emphasis::Selected, None);
-        let midpoint_cycle = cycle.blended_toward(ink.fill, FOCUSED_FILL_TOWARD_TILE);
+        let crest = cycle
+            .blended_toward(ink.fill, FOCUSED_FILL_TOWARD_TILE)
+            .at(0);
         let dim_cycle = cycle.blended_toward(ink.fill, FOCUSED_DIM_TOWARD_TILE);
         let outline = visible_tile_outline(&selected, area).expect("tile should be visible");
-        let first = render_presentation_at(
+        let before = render_presentation_at(
             std::slice::from_ref(&selected),
             area,
             Some(0),
             ThemeId::CatppuccinMocha,
             false,
             false,
-            Duration::ZERO,
+            Duration::from_millis(100),
         );
-        let later = render_presentation_at(
+        let early = render_presentation_at(
             std::slice::from_ref(&selected),
             area,
             Some(0),
             ThemeId::CatppuccinMocha,
             false,
             false,
-            Duration::from_millis(34),
+            Duration::from_millis(800),
+        );
+        let late = render_presentation_at(
+            std::slice::from_ref(&selected),
+            area,
+            Some(0),
+            ThemeId::CatppuccinMocha,
+            false,
+            false,
+            Duration::from_millis(2_400),
         );
 
-        let assert_outline = |buffer: &Buffer, step: usize| {
+        let assert_outline = |buffer: &Buffer, now: Duration| {
+            let step = cycle_step(now);
             walk_tile_outline(outline, |x, half, edge_index| {
                 let bright = half == outline.top
                     || (x == outline.left && half != outline.bottom.saturating_sub(1));
@@ -3055,20 +3157,38 @@ mod tests {
                 assert_eq!(actual, expected, "outline half {half} at column {x}");
             });
         };
-        let first_step = cycle_step(Duration::ZERO);
-        let later_step = cycle_step(Duration::from_millis(34));
-        assert_outline(&first, first_step);
-        assert_outline(&later, later_step);
-        assert_eq!(first[(5, 1)].bg, midpoint_cycle.at(first_step));
-        assert_eq!(later[(5, 1)].bg, midpoint_cycle.at(later_step));
-        assert_ne!(first[(5, 1)].bg, later[(5, 1)].bg);
-        assert_ne!(first[(5, 3)].bg, later[(5, 3)].bg);
-        assert_ne!(first[(11, 1)].fg, later[(11, 1)].fg);
+        assert_outline(&early, Duration::from_millis(800));
+        assert_outline(&late, Duration::from_millis(2_400));
+
+        let early_wave = FocusFillWave::new(outline, Duration::from_millis(800));
+        let late_wave = FocusFillWave::new(outline, Duration::from_millis(2_400));
+        let early_point = (3, 5, 2);
+        let late_point = (16, 9, 4);
+        assert_eq!(
+            early[(early_point.0, early_point.2)].bg,
+            focus_fill_color(
+                ink.fill,
+                crest,
+                early_wave.intensity(outline, early_point.0, early_point.1)
+            )
+        );
+        assert_eq!(
+            late[(late_point.0, late_point.2)].bg,
+            focus_fill_color(
+                ink.fill,
+                crest,
+                late_wave.intensity(outline, late_point.0, late_point.1)
+            )
+        );
+        assert_eq!(before[(early_point.0, early_point.2)].bg, ink.fill);
+        assert_ne!(early[(early_point.0, early_point.2)].bg, ink.fill);
+        assert_eq!(late[(early_point.0, early_point.2)].bg, ink.fill);
+        assert_eq!(early[(late_point.0, late_point.2)].bg, ink.fill);
+        assert_ne!(late[(late_point.0, late_point.2)].bg, ink.fill);
         assert!(
-            lightness_of(cycle.at(first_step)) > lightness_of(midpoint_cycle.at(first_step))
-                && lightness_of(midpoint_cycle.at(first_step))
-                    > lightness_of(dim_cycle.at(first_step)),
-            "the focused fill must sit between its leading and receding contour brightness"
+            lightness_of(cycle.at(0)) > lightness_of(crest)
+                && lightness_of(crest) > lightness_of(dim_cycle.at(0)),
+            "the focused fill crest must sit between its leading and receding contour brightness"
         );
     }
 
