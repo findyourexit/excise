@@ -2206,6 +2206,7 @@ mod tests {
     use crate::deletion::{PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan};
     #[cfg(unix)]
     use crate::native_path::identity_for;
+    #[cfg(unix)]
     use crate::state::tiles::FileType;
 
     use super::*;
@@ -2264,7 +2265,7 @@ mod tests {
         assert_eq!(app.current_folder_path(), root.path());
         assert_eq!(
             app.visible_tree().current_node().state,
-            crate::model::NodeState::Uncertain
+            crate::model::NodeState::Scanning
         );
         assert!(app.files_in_current_view(0).is_empty());
         let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
@@ -3839,12 +3840,8 @@ mod tests {
         let report: crate::report::ScanReportDocument =
             serde_json::from_slice(&encoded).expect("canonical report should deserialize");
         assert_eq!(report.entries.len(), 2);
-        assert!(
-            report
-                .entries
-                .iter()
-                .any(|item| item.display_path == entry.display().to_string())
-        );
+        let expected_path = crate::native_path::NativePath::new(&entry).encode();
+        assert!(report.entries.iter().any(|item| item.path == expected_path));
     }
 
     #[test]

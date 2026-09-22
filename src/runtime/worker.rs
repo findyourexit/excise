@@ -928,11 +928,14 @@ mod tests {
         let marker = deepest.join("marker");
         std::fs::write(&marker, b"x").expect("deep marker should be written");
         let workers = WorkerPool::start(options(root.path(), 1), 1).expect("workers should start");
+        // Hosted volumes can spend more than a minute opening this deep fixture.
+        // This regression checks eventual bounded completion, not I/O throughput.
+        let event_timeout = Duration::from_secs(120);
         let mut found = false;
         loop {
             match workers
                 .events()
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(event_timeout)
                 .expect("deep scan should complete")
             {
                 WorkerEvent::ScanBatch { entries, .. } => {

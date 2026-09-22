@@ -45,10 +45,10 @@ Store file paths without losing their original bytes. Show a reversible escaped 
 ### Resource Exhaustion
 
 - Limit worker counts and queues.
-- Enforce a hard memory limit for the working model and index.
-- Keep exact totals with a bounded store and focused rescans.
+- Enforce a hard memory limit for page views and a separate scan-store quota.
+- Keep exact totals in the bounded canonical store and immutable page queries.
 - Use loops for traversal, layout, and deletion.
-- Store identity data securely when it does not fit in memory.
+- Store canonical scan data in private bounded session files.
 - Replace repeated visual effects by purpose and avoid an idle animation loop.
 
 ### Misleading Output
@@ -72,7 +72,7 @@ Validate the terminal before entering raw input mode. Restore it automatically o
 | A symbolic link points outside the selected root | Display the link and never traverse or delete its target |
 | A name contains an escape sequence | Display an escaped name and leave terminal state unchanged |
 | A metadata query fails | Mark the value unknown and do not substitute file length |
-| A flat directory exceeds the memory limit | Keep the largest entries and an exact `Other` summary |
+| The scan store reaches capacity | Publish a deterministic summary-only result; do not expose a detailed map or deletion controls |
 | Focus changes repeat quickly | Replace the earlier visual effect and keep memory bounded |
 | The user quits during deletion | Cancel pending plans, safely stop after the current entry, or return to wait; never detach an active filesystem mutation |
 

@@ -71,6 +71,9 @@ Each stable release preserves the CLI, configuration, and report contract establ
 
 The candidate aliases used above in `.cargo/config.toml` map `cargo verify`, `cargo check-generated`, and `cargo dist-local` to locked `xtask` commands. `cargo package --locked --list` exposes the exact crates.io file set; `cargo publish --locked --dry-run` validates packaging without uploading. `xtask dist-local` owns the local `dist/` staging path and writes the host archive, `dist/checksums.sha256`, and `dist/homebrew/excise.rb`; it neither publishes them nor authorizes a release.
 
+`cargo verify` passes `--allow-dirty` only to its local package-content listing, so it can verify the package contents of an in-progress working tree without resolving the private workspace-only `excise-core` crate through crates.io. The explicit release-candidate `cargo package --locked --list` and `cargo publish --locked --dry-run` commands remain strict and require the reviewed checkout to be clean.
+
+
 For the hosted candidate, dispatch the workflow only from the exact protected `main` commit and pass the manifest version, reviewed commit SHA, and a unique dispatch ID explicitly:
 
 ```console
@@ -261,6 +264,8 @@ Run the same local measurements with:
 cargo +1.98.0 bench --bench tachyonfx --features internal --locked -- --noplot
 cargo +1.98.0 bench --bench core --features internal --locked -- --noplot
 ```
+
+`core` measures the flat canonical-store amplification matrix at 1,024 and 16,384 entries (`scan-store/storage-amplification/publish-flat/*`) and sparse late-page reads at each size (`scan-store/query-latency/late-page-flat/*`). `tachyonfx` measures completion-frame processing at `80x24`, `160x50`, and `200x80`; the scheduler's unit matrix verifies the corresponding small, medium, large, persistent-chrome, and geometry frame cadences.
 
 To assess a reported regression, obtain the reference and candidate run IDs from their checks, download both evidence artifacts, and inspect their contexts before comparing measurements:
 
