@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use super::FileToDelete;
 use crate::deletion::DeletionPlan;
-use crate::model::NodeId;
 use crate::native_path::safe_display_path_text;
 use crate::scan_coordinator::{
     CompletionOutcome, RelativePath, RequeueOutcome, ScanGeneration, SessionCoordinator,
@@ -678,37 +677,22 @@ impl DeletionWork {
         })
     }
 
-    /// Returns the current background state for one retained model node.
-    #[must_use]
-    pub(crate) fn status_for_node(&self, node_id: NodeId) -> Option<WorkRailStatus> {
-        self.rail_item_for_node(node_id).map(|item| item.status)
-    }
-
-    /// Returns the current background state for a concrete target path.
+    /// Returns presentation data only when the scan root and relative target path match.
     ///
-    /// Snapshot page node IDs are intentionally page-local, so foreground
-    /// availability must be keyed by the stable filesystem path instead.
+    /// Snapshot page node IDs are page-local, so they cannot identify work after navigation.
     #[must_use]
-    pub(crate) fn status_for_path(&self, path: &Path) -> Option<WorkRailStatus> {
+    pub(crate) fn rail_item_for_relative_path(
+        &self,
+        scan_root: &Path,
+        relative_path: &RelativePath,
+    ) -> Option<WorkRailItem<'_>> {
         self.items
             .iter()
             .find(|item| {
                 item.target
                     .as_ref()
-                    .is_some_and(|target| target_matches_path(target, path))
-            })
-            .map(|item| work_rail_item(item).status)
-    }
-
-    /// Returns the presentation data for work targeting one retained model node.
-    #[must_use]
-    pub(crate) fn rail_item_for_node(&self, node_id: NodeId) -> Option<WorkRailItem<'_>> {
-        self.items
-            .iter()
-            .find(|item| {
-                item.target
-                    .as_ref()
-                    .is_some_and(|target| target.node_id == node_id)
+                    .is_some_and(|target| target.path_in_filesystem.as_path() == scan_root)
+                    && item.relative_path == *relative_path
             })
             .map(work_rail_item)
     }
@@ -877,16 +861,6 @@ fn work_rail_item(item: &DeletionWorkItem) -> WorkRailItem<'_> {
     }
 }
 
-fn target_matches_path(target: &FileToDelete, path: &Path) -> bool {
-    path.strip_prefix(&target.path_in_filesystem)
-        .is_ok_and(|relative| {
-            relative.iter().eq(target
-                .path_to_file
-                .iter()
-                .map(std::ffi::OsString::as_os_str))
-        })
-}
-
 fn targets_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
@@ -906,7 +880,7 @@ fn work_rail_status(stage: &DeletionWorkStage) -> WorkRailStatus {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
@@ -934,6 +908,10 @@ mod tests {
             },
             reviewed_entries: Vec::new(),
         }
+    }
+    fn relative(path: &[&str]) -> RelativePath {
+        RelativePath::from_components(path.iter().map(OsString::from).collect())
+            .expect("test path should be relative")
     }
 
     fn coordinator_snapshot(work: &DeletionWork) -> crate::scan_coordinator::SchedulerSnapshot {
@@ -1049,13 +1027,14 @@ mod tests {
     fn confirmation_precedes_planning_and_targets_are_status_addressable() {
         let mut work = DeletionWork::new();
         let target = target(&["first"]);
-        let node_id = target.node_id;
+        let target_path = relative(&["first"]);
         let work_id = work
             .enqueue_confirmation(target, false, 1024, Duration::ZERO)
             .expect("confirmation should queue");
         assert!(work.next_planning_command().is_none());
         assert_eq!(
-            work.status_for_node(node_id),
+            work.rail_item_for_relative_path(Path::new("/scan-root"), &target_path)
+                .map(|item| item.status),
             Some(WorkRailStatus::AwaitingConfirmation)
         );
 
@@ -1065,7 +1044,8 @@ mod tests {
         assert_eq!(shown_id, work_id);
         assert!(work.queue_confirmation(work_id, target, Duration::ZERO));
         assert_eq!(
-            work.status_for_node(node_id),
+            work.rail_item_for_relative_path(Path::new("/scan-root"), &target_path)
+                .map(|item| item.status),
             Some(WorkRailStatus::Planning)
         );
         assert!(matches!(
@@ -1075,10 +1055,35 @@ mod tests {
     }
 
     #[test]
-    fn node_rail_item_exposes_execution_progress() {
+    fn page_local_node_id_does_not_mark_an_unrelated_path_as_deletion_work() {
+        let mut work = DeletionWork::new();
+        let mut target = target(&["Development", "kotlin"]);
+        target.node_id = NodeId(2);
+        work.enqueue_confirmation(target, true, 1024, Duration::ZERO)
+            .expect("target should queue");
+
+        assert!(
+            work.rail_item_for_relative_path(
+                Path::new("/scan-root"),
+                &relative(&[".cache", "unrelated"]),
+            )
+            .is_none()
+        );
+        assert_eq!(
+            work.rail_item_for_relative_path(
+                Path::new("/scan-root"),
+                &relative(&["Development", "kotlin"]),
+            )
+            .map(|item| item.status),
+            Some(WorkRailStatus::Planning)
+        );
+    }
+
+    #[test]
+    fn path_rail_item_exposes_execution_progress() {
         let mut work = DeletionWork::new();
         let target = target(&["target"]);
-        let node_id = target.node_id;
+        let target_path = relative(&["target"]);
         let work_id = work
             .enqueue_confirmation(target, true, 1024, Duration::ZERO)
             .expect("work should queue");
@@ -1097,8 +1102,8 @@ mod tests {
         };
 
         let rail = work
-            .rail_item_for_node(node_id)
-            .expect("target node should retain its execution state");
+            .rail_item_for_relative_path(Path::new("/scan-root"), &target_path)
+            .expect("target path should retain its execution state");
         assert_eq!(rail.status, WorkRailStatus::Executing);
         assert_eq!(rail.planned_entries, Some(8));
         assert_eq!(

@@ -1,9 +1,7 @@
 #[cfg(test)]
 use std::fs::Metadata;
 use std::io::{self, Write};
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -1639,13 +1637,30 @@ where
     #[must_use]
     pub(crate) fn begin_deletion_departure(
         &mut self,
-        node_id: NodeId,
+        scan_root: &Path,
+        target_relative_path: &Path,
         deleted_entries: u64,
         now: Duration,
     ) -> bool {
         if !self.ui_mode.allows_motion() || self.board.is_list_layout() {
             return false;
         }
+        let Ok(target_relative_path) = RelativePath::from_path(target_relative_path) else {
+            return false;
+        };
+        let Some(tree) = self
+            .snapshot_page_cache
+            .as_ref()
+            .map(SnapshotPageCache::current)
+        else {
+            return false;
+        };
+        if tree.scan_root() != scan_root {
+            return false;
+        }
+        let Some(node_id) = tree.id_for_relative(&target_relative_path) else {
+            return false;
+        };
         let Some(tile) = self
             .board
             .rendered_tiles()
@@ -1657,8 +1672,12 @@ where
         let tile_cells = u64::from(tile.width)
             .saturating_mul(u64::from(tile.height).div_ceil(u64::from(HALF_ROWS_PER_CELL)));
         let duration = crate::state::deletion_departure_duration(deleted_entries, tile_cells);
-        self.ui_effects
-            .begin_deletion_departure(tile.clone(), now, duration);
+        self.ui_effects.begin_deletion_departure(
+            tile.clone(),
+            tree.current_relative().clone(),
+            now,
+            duration,
+        );
         self.mark_dirty();
         true
     }
@@ -1687,10 +1706,15 @@ where
 
     #[must_use]
     fn deletion_target_is_busy(&self, node_id: NodeId) -> bool {
-        self.snapshot_page_cache
-            .as_ref()
-            .and_then(|cache| cache.current().path_for_id(node_id))
-            .is_some_and(|path| self.deletion_work.status_for_path(&path).is_some())
+        self.snapshot_page_cache.as_ref().is_some_and(|cache| {
+            let tree = cache.current();
+            tree.relative_path_for_id(node_id)
+                .is_some_and(|relative_path| {
+                    self.deletion_work
+                        .rail_item_for_relative_path(tree.scan_root(), relative_path)
+                        .is_some()
+                })
+        })
     }
 
     #[must_use]

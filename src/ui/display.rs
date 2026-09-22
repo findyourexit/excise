@@ -18,12 +18,12 @@ use crate::model::{ByteBounds, NodeKind, NodeState, SyntheticKind, UnscannedReas
 use crate::native_path::SafeDisplayPath;
 use crate::os::is_user_admin;
 use crate::scan_coordinator::SchedulerSnapshot;
+use crate::state::UiEffects;
 use crate::state::deletion_work::{
     DeletionWork, MAX_DELETION_WORK_ITEMS, WorkRailItem, WorkRailStatus,
 };
 use crate::state::files::tree_view::TreeView;
 use crate::state::tiles::{Board, FileType, Tile};
-use crate::state::{DeletionDeparture, UiEffects};
 use crate::theme::Theme;
 use crate::ui::TermTooSmall;
 use crate::ui::format::{
@@ -214,6 +214,7 @@ where
                             frame.buffer_mut(),
                             rendered_workspace,
                             board,
+                            Some(file_tree),
                             Some(deletion_work),
                             theme,
                             ascii,
@@ -225,15 +226,20 @@ where
                     } else {
                         frame.render_widget(
                             DenseRectangleGrid::new(
-                                map_layout(
-                                    board,
-                                    deletion_work,
+                                MapLayout {
+                                    rectangles: board.rendered_tiles(),
+                                    departing: board.departing_tiles(),
+                                    overflow: board.rendered_overflow(),
+                                    selected_rect_index: board.selected_index,
+                                    transitioning: board.is_transitioning(),
                                     show_empty_label,
                                     scan,
+                                    file_tree: Some(file_tree),
+                                    deletion_work: Some(deletion_work),
                                     deletion_departure,
                                     now,
                                     animate_deletion_checker,
-                                ),
+                                },
                                 theme,
                                 ascii,
                                 monochrome,
@@ -571,30 +577,6 @@ fn workspace_title(board: &Board) -> &'static str {
     }
 }
 
-fn map_layout<'a>(
-    board: &'a Board,
-    deletion_work: &'a DeletionWork,
-    show_empty_label: bool,
-    scan: Option<ScanVisual>,
-    deletion_departure: Option<&'a DeletionDeparture>,
-    now: Duration,
-    animate_deletion_checker: bool,
-) -> MapLayout<'a> {
-    MapLayout {
-        rectangles: board.rendered_tiles(),
-        departing: board.departing_tiles(),
-        overflow: board.rendered_overflow(),
-        selected_rect_index: board.selected_index,
-        transitioning: board.is_transitioning(),
-        show_empty_label,
-        scan,
-        deletion_work: Some(deletion_work),
-        deletion_departure,
-        now,
-        animate_deletion_checker,
-    }
-}
-
 fn scan_presentation(
     ui_mode: &UiMode,
     ui_effects: &UiEffects,
@@ -901,6 +883,7 @@ fn render_list(
         area,
         board,
         None,
+        None,
         theme,
         ascii,
         now,
@@ -919,6 +902,7 @@ fn render_list_with_work(
     buffer: &mut Buffer,
     area: Rect,
     board: &Board,
+    file_tree: Option<&dyn TreeView>,
     deletion_work: Option<&DeletionWork>,
     theme: Theme,
     ascii: bool,
@@ -958,7 +942,7 @@ fn render_list_with_work(
         if index >= usize::from(area.height) {
             break;
         }
-        let marker = list_item_marker(tile, deletion_work, ascii);
+        let marker = list_item_marker(tile, file_tree, deletion_work, ascii);
         let name_width = area.width.saturating_sub(28);
         let name = display_os_str_middle(&tile.name, name_width);
         let size = if tile.uncertain && tile.size == 0 {
@@ -1019,12 +1003,24 @@ fn work_status_marker(status: WorkRailStatus, ascii: bool) -> &'static str {
     }
 }
 
+fn work_item_for_tile<'a>(
+    tile: &Tile,
+    file_tree: Option<&dyn TreeView>,
+    deletion_work: Option<&'a DeletionWork>,
+) -> Option<WorkRailItem<'a>> {
+    let file_tree = file_tree?;
+    let relative_path = file_tree.relative_path_for_id(tile.node_id)?;
+    deletion_work?.rail_item_for_relative_path(file_tree.scan_root(), relative_path)
+}
+
 fn list_item_marker(
     tile: &Tile,
+    file_tree: Option<&dyn TreeView>,
     deletion_work: Option<&DeletionWork>,
     ascii: bool,
 ) -> &'static str {
-    if let Some(status) = deletion_work.and_then(|work| work.status_for_node(tile.node_id)) {
+    if let Some(status) = work_item_for_tile(tile, file_tree, deletion_work).map(|work| work.status)
+    {
         return work_status_marker(status, ascii);
     }
     match (tile.file_type, tile.synthetic_kind) {
@@ -1286,16 +1282,14 @@ fn render_inspector_with_work(
             .fg(theme.text_muted)
             .add_modifier(Modifier::BOLD),
     );
-    let activity_line = deletion_work
-        .and_then(|work| work.status_for_node(tile.node_id))
-        .map(|status| {
-            Line::styled(
-                truncate_middle(deletion_activity_label(status), inner.width),
-                Style::default()
-                    .fg(theme.focus)
-                    .add_modifier(Modifier::BOLD),
-            )
-        });
+    let activity_line = work_item_for_tile(tile, Some(file_tree), deletion_work).map(|work| {
+        Line::styled(
+            truncate_middle(deletion_activity_label(work.status), inner.width),
+            Style::default()
+                .fg(theme.focus)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
     let completion_line = ui_effects
         .and_then(|effects| effects.last_deletion_summary)
         .map(|summary| {
@@ -2132,16 +2126,22 @@ mod tests {
 
         board.change_area(Rect::new(0, 0, 72, 1));
         assert!(!board.is_transitioning());
+        let work = DeletionWork::new();
         assert_eq!(
-            map_layout(
-                &board,
-                &DeletionWork::new(),
-                true,
-                None,
-                None,
-                Duration::ZERO,
-                false,
-            )
+            MapLayout {
+                rectangles: board.rendered_tiles(),
+                departing: board.departing_tiles(),
+                overflow: board.rendered_overflow(),
+                selected_rect_index: board.selected_index,
+                transitioning: board.is_transitioning(),
+                show_empty_label: true,
+                scan: None,
+                file_tree: None,
+                deletion_work: Some(&work),
+                deletion_departure: None,
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
+            }
             .overflow,
             board.overflow()
         );

@@ -614,9 +614,19 @@ impl TreeView for SnapshotTree {
     fn get_current_path(&self) -> PathBuf {
         self.root_path.join(self.current_relative.to_path_buf())
     }
+    fn current_relative_path(&self) -> &RelativePath {
+        self.current_relative()
+    }
 
     fn node(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(id.index())
+    }
+    fn scan_root(&self) -> &Path {
+        &self.root_path
+    }
+
+    fn relative_path_for_id(&self, id: NodeId) -> Option<&RelativePath> {
+        self.relative_for_id(id)
     }
 
     fn has_filter(&self) -> bool {
