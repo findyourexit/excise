@@ -190,7 +190,7 @@ pub struct Cli {
     /// Whole-process memory envelope in MiB
     pub memory_mib: Option<usize>,
     #[arg(long, value_name = "MIB")]
-    /// Directory-plan, deletion-result, and identity-spill storage limit per session (2+)
+    /// Directory-plan and deletion-result storage limit per session (2+)
     pub temporary_storage_mib: Option<usize>,
     #[arg(long, value_name = "MIB")]
     /// Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)

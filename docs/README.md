@@ -19,6 +19,15 @@
 - [Release & Distribution Policy](releasing.md)
 - [Project Lineage](lineage.md)
 
+## Project Policies
+
+- [Contributing](../CONTRIBUTING.md)
+- [Support](../SUPPORT.md)
+- [Security](../SECURITY.md)
+- [Governance](../GOVERNANCE.md)
+- [Maintainers](../MAINTAINERS.md)
+- [Code of Conduct](../CODE_OF_CONDUCT.md)
+
 ## Published Formats
 
 - [Scan Report](schemas/scan-report.schema.json)

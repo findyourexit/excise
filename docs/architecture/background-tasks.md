@@ -1,6 +1,6 @@
 # Background Task System Decision
 
-**Status:** accepted for deletion work; future task kinds require their own review.
+**Status:** accepted. One session coordinator owns scan, reduction, refresh, and deletion leases; future task kinds require their own review.
 
 ## Problem
 
@@ -8,25 +8,24 @@ Primary scanning, canonical page queries, deletion planning, final revalidation,
 
 ## Decision
 
-The application owns a bounded `DeletionWork` rail separately from `UiMode`. Each retained item has a monotonic work identifier, a concrete componentwise path, an escaped display label, and exactly one state:
+The application owns a bounded `DeletionWork` rail separately from `UiMode`. Each retained deletion item has a monotonic work identifier, a concrete componentwise path, an escaped display label, and exactly one state:
 
-1. queued planning or planning;
-2. awaiting or foreground confirmation;
-3. queued execution or serial execution;
-4. rebuilding a generation after an invalidating mutation; or
-5. cancellation acknowledgement, rejection, or completion.
+1. awaiting confirmation or queued planning;
+2. planning;
+3. queued execution or serial execution; or
+4. cancellation acknowledgement, rejection, or completion.
 
 The planner and executor use separate bounded command lanes. At most one planner builds an identity-bound plan, while at most one executor performs final revalidation and filesystem mutation. Final revalidation and execution occur in the same executor operation, so no queue turn can open a gap between a successful revalidation and the first mutation. A planner may prepare a non-overlapping target while an executor is active; it never receives mutation authority.
 
-A compacted aggregate directory keeps a verified concrete backing path and identity, so it can enter the same live deletion planner immediately. The planner's no-follow walk, not the bounded display model, reviews a directory's descendants. `Other` and `Shared` summaries remain virtual, noninteractive totals.
+Only concrete files and directories enter deletion planning. The sole synthetic entry is the shared-allocation summary, which remains a virtual, noninteractive total. The planner's no-follow walk, not the bounded display page, reviews a directory's descendants.
 
-Planning, rebuilding, queueing, execution, and completion remain in the work rail. A ready plan becomes the normal confirmation dialog only when the foreground mode can present it. Accepted consent returns immediately to normal map navigation; the serial worker continues its final checks and mutation in the background.
+Confirmation is foreground before planning starts. Accepted consent returns immediately to normal map navigation while the planner and, later, the serial executor perform their final checks and mutation in the background.
 
-The primary scanner is breadth-first. Entering and leaving visible folders uses immutable canonical page queries and never creates a folder-scoped scan or reorders scanner work. A mutation that invalidates a published generation may schedule one root rebuild through the persistent scanner; until that rebuild publishes, the prior exact map is never mixed with live facts.
+The primary scanner is breadth-first. A single session coordinator actor owns work keys, leases, focus, and terminal outcomes; its disk-backed task journal stores only bounded scanner payloads selected by the coordinator. Entering and leaving visible folders uses immutable canonical page queries and never creates a folder-scoped scan or reorders facts. A mutation that invalidates a published generation schedules versioned refresh work through the persistent scanner; until that refresh publishes, the prior exact map is never mixed with live facts.
 
 ## Bounds and Target Conflicts
 
-- `MAX_DELETION_WORK_ITEMS` caps every retained operation, including active work, confirmations, refreshes, and planner cancellation reservations.
+- `MAX_DELETION_WORK_ITEMS` caps every retained deletion operation, including active work, confirmations, and planner-cancellation reservations.
 - Planner, executor, scanner-rebuild, and event channels have fixed capacities. Owner-loop submission is nonblocking; a rejected submission restores its item rather than dropping it.
 - A new item is rejected when its componentwise target path equals, contains, or is contained by a retained target. This prevents ancestor, descendant, and duplicate operations from racing.
 - A cancelled in-flight planner retains its reservation until its acknowledgement arrives. A generation rebuild retains its canonical session boundary until it publishes or is cancelled.

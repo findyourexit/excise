@@ -23,7 +23,7 @@ set edit:completion:arg-completer[excise] = {|@words|
             cand --event-buffer 'Bounded worker-event capacity (16-4096)'
             cand --exclude 'Ordered gitignore-style exclusion pattern'
             cand --memory-mib 'Whole-process memory envelope in MiB'
-            cand --temporary-storage-mib 'Directory-plan, deletion-result, and identity-spill storage limit per session (2+)'
+            cand --temporary-storage-mib 'Directory-plan and deletion-result storage limit per session (2+)'
             cand --scan-store-mib 'Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)'
             cand --scan-store-dir 'Parent directory for the private canonical scan-store session'
             cand --scan-store-reserve-mib 'Scratch space preserved outside scan-store files (default: 25% of free space)'

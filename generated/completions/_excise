@@ -20,7 +20,7 @@ _excise() {
 '--event-buffer=[Bounded worker-event capacity (16-4096)]:COUNT:_default' \
 '*--exclude=[Ordered gitignore-style exclusion pattern]:PATTERN:_default' \
 '--memory-mib=[Whole-process memory envelope in MiB]:MIB:_default' \
-'--temporary-storage-mib=[Directory-plan, deletion-result, and identity-spill storage limit per session (2+)]:MIB:_default' \
+'--temporary-storage-mib=[Directory-plan and deletion-result storage limit per session (2+)]:MIB:_default' \
 '--scan-store-mib=[Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)]:MIB:_default' \
 '--scan-store-dir=[Parent directory for the private canonical scan-store session]:DIR:_files' \
 '--scan-store-reserve-mib=[Scratch space preserved outside scan-store files (default\: 25% of free space)]:MIB:_default' \

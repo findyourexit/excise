@@ -1,3 +1,4 @@
+#[path = "scan_coordinator_core.rs"]
 mod scan_coordinator_core;
 pub(crate) use scan_coordinator_core::*;
 

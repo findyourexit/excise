@@ -1,6 +1,6 @@
 # Release Process
 
-This runbook records the historical early-testing releases through `0.3.0` and the procedure for the first stable `1.0.0` release and future releases. It is a procedure, not authorization.
+The current stable package version is `1.2.4`. This runbook defines the current v1 release procedure; the dated approval records below are historical evidence, not instructions for a new publication.
 
 ## The 0.1.1 Contract (Historical)
 

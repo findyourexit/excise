@@ -67,7 +67,7 @@ Validate the terminal before entering raw input mode. Restore it automatically o
 
 | Situation | Required outcome |
 |---|---|
-| A file becomes a directory after confirmation | Cancel the plan and request a new scan |
+| A file becomes a directory after confirmation | Reject the stale plan and require a fresh user request |
 | A new child appears during recursive deletion | Leave it untouched and report the changed folder |
 | A symbolic link points outside the selected root | Display the link and never traverse or delete its target |
 | A name contains an escape sequence | Display an escaped name and leave terminal state unchanged |
