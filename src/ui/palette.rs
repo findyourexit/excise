@@ -46,13 +46,10 @@ const UNSELECTED_CHROMA_SCALE: f32 = 0.62;
 /// A baseline gap keeps selection away from the canvas before rendered contrast
 /// is checked against every tone boundary.
 const MIN_SELECTION_LIGHTNESS_GAP: f32 = 0.21;
-/// Dense grid embosses a tile's top and trailing boundaries by these offsets.
-/// Keep these in lockstep with its `TileInk` derivation: selection clearance is
-/// calculated here, where the derived palette can cache both tone bands.
+/// Dense grid embosses every tile's crown, base, and trailing edge by these offsets.
+/// Selection changes a tile's placement in the palette band, never its dimensional frame.
 pub(crate) const TILE_CROWN_LIFT: f32 = 0.055;
 pub(crate) const TILE_BASE_DROP: f32 = 0.055;
-pub(crate) const TILE_SELECTED_BASE_DROP: f32 = 0.0;
-pub(crate) const TILE_SELECTED_EDGE_DROP: f32 = 0.0;
 pub(crate) const TILE_EDGE_DROP: f32 = 0.085;
 /// Selected and unselected fills need the non-text contrast floor because the
 /// map has no outline to carry the cursor when their brightness converges.
@@ -372,7 +369,7 @@ impl MapPalette {
                     SELECTION_CHROMA_SCALE,
                 );
                 let selected_boundary_offset = if direction > 0.0 {
-                    TILE_SELECTED_EDGE_DROP
+                    TILE_EDGE_DROP
                 } else {
                     TILE_CROWN_LIFT
                 };
@@ -444,7 +441,7 @@ impl MapPalette {
     }
     fn selection_contrast_is_sufficient(self, selected: Oklch, direction: f32) -> bool {
         let selected_boundary = if direction > 0.0 {
-            selected.shifted(-TILE_SELECTED_EDGE_DROP, 1.0)
+            selected.shifted(-TILE_EDGE_DROP, 1.0)
         } else {
             selected.shifted(TILE_CROWN_LIFT, 1.0)
         };
@@ -532,6 +529,19 @@ impl ColorCycle {
     #[must_use]
     pub(crate) const fn can_animate(accent: Color) -> bool {
         matches!(accent, Color::Rgb(_, _, _))
+    }
+
+    /// Returns whether a presentation can show the moving focus phase.
+    ///
+    /// Palette-only and ASCII output stay still; callers use this gate before
+    /// requesting another frame for focus chrome.
+    #[must_use]
+    pub(crate) const fn can_animate_with_capabilities(
+        accent: Color,
+        monochrome: bool,
+        ascii: bool,
+    ) -> bool {
+        !monochrome && !ascii && Self::can_animate(accent)
     }
 
     fn from_accent_against(accent: Color, panel: Color) -> Option<Self> {
@@ -1060,7 +1070,7 @@ mod tests {
         let selected = palette.emphasised(palette.tile(1.0, TileTone::Folder), Emphasis::Selected);
         let unselected =
             palette.emphasised(palette.tile(1.0, TileTone::File), Emphasis::Unselected);
-        let selected_edge = selected.shifted(-TILE_SELECTED_EDGE_DROP, 1.0).to_rgb();
+        let selected_edge = selected.shifted(-TILE_EDGE_DROP, 1.0).to_rgb();
         let unselected_crown = unselected.shifted(TILE_CROWN_LIFT, 1.0).to_rgb();
         assert!(
             contrast_ratio(selected_edge, unselected_crown) >= MIN_SELECTION_CONTRAST,
@@ -1107,7 +1117,7 @@ mod tests {
                                 unselected_boundary_name,
                             ) = if selected.lightness >= palette.backdrop.lightness {
                                 (
-                                    selected.shifted(-TILE_SELECTED_EDGE_DROP, 1.0).to_rgb(),
+                                    selected.shifted(-TILE_EDGE_DROP, 1.0).to_rgb(),
                                     unselected.shifted(TILE_CROWN_LIFT, 1.0).to_rgb(),
                                     "edge",
                                     "crown",
@@ -1225,9 +1235,17 @@ mod tests {
     }
 
     #[test]
-    fn only_truecolour_focus_cycles_request_activity() {
-        assert!(ColorCycle::can_animate(
-            Theme::for_id(ThemeId::ExciseLight).focus
+    fn only_truecolour_enabled_presentations_request_cycle_activity() {
+        let rgb_focus = Theme::for_id(ThemeId::ExciseLight).focus;
+        assert!(ColorCycle::can_animate(rgb_focus));
+        assert!(ColorCycle::can_animate_with_capabilities(
+            rgb_focus, false, false
+        ));
+        assert!(!ColorCycle::can_animate_with_capabilities(
+            rgb_focus, true, false
+        ));
+        assert!(!ColorCycle::can_animate_with_capabilities(
+            rgb_focus, false, true
         ));
         assert!(!ColorCycle::can_animate(
             Theme::for_id(ThemeId::HighContrast).focus

@@ -84,7 +84,7 @@ impl Widget for HelpBox<'_> {
         let inner = render_modal(
             buffer,
             rect,
-            "EXCISE COMMANDS",
+            "HELP",
             self.theme,
             self.theme.focus,
             self.ascii,
@@ -96,29 +96,27 @@ impl Widget for HelpBox<'_> {
             .add_modifier(Modifier::BOLD);
         let content = if full {
             let movement = match (self.keymap, self.custom_keys) {
-                (KeyPreset::Vim, _) => Line::from("  h/j/k/l                Vim preset movement"),
-                (KeyPreset::Emacs, _) => {
-                    Line::from("  Ctrl-b/n/p/f           Emacs preset movement")
-                }
+                (KeyPreset::Vim, _) => Line::from("  h/j/k/l                Vim movement"),
+                (KeyPreset::Emacs, _) => Line::from("  Ctrl-b/n/p/f           Emacs movement"),
                 (KeyPreset::Custom, Some(bindings)) => Line::from(custom_movement_line(bindings)),
-                (KeyPreset::Custom, None) => Line::from("  arrows                 movement"),
+                (KeyPreset::Custom, None) => Line::from("  arrows                 move selection"),
             };
             vec![
-                Line::styled("Explore", heading),
-                Line::from("  arrows                 move focus"),
+                Line::styled("Navigate", heading),
+                Line::from("  arrows                 move selection"),
                 movement,
-                Line::from("  Enter                  open or focused rescan"),
-                Line::from("  Esc                    parent / cancel"),
+                Line::from("  Enter                  open / rescan"),
+                Line::from("  Esc                    back / cancel"),
                 Line::from("  +  -  0                zoom in / out / reset"),
-                Line::from("  /                      exact or glob filter"),
-                Line::from("  e                      export scan report"),
-                Line::from("  t                      cycle themes"),
+                Line::from("  /                      filter items"),
+                Line::from("  e                      export report"),
+                Line::from("  t                      change theme"),
                 Line::from(""),
-                Line::styled("Safety", heading),
+                Line::styled("Delete safely", heading),
                 Line::from("  Backspace              plan permanent deletion"),
-                Line::from("  q / Ctrl-c             quit or interruption options"),
-                Line::from("  synthetic aggregates   never directly deletable"),
-                Line::from("  new/changed entries    skipped by identity plan"),
+                Line::from("  q / Ctrl-c             quit / interruption options"),
+                Line::from("  summary items          cannot be deleted"),
+                Line::from("  new/changed items      skipped before deletion"),
                 Line::styled(
                     "[Esc/?/q] close help",
                     Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)),
@@ -128,10 +126,12 @@ impl Widget for HelpBox<'_> {
             // The minimum supported viewport has six inner rows. Put required
             // movement and safety guidance first, then append less urgent rows
             // until the available height is exhausted.
-            let mut content = vec![Line::from("  arrows: move focus")];
+            let mut content = vec![Line::from("  arrows: move selection")];
             match (self.keymap, self.custom_keys) {
-                (KeyPreset::Vim, _) => content.push(Line::from("  h/j/k/l: movement")),
-                (KeyPreset::Emacs, _) => content.push(Line::from("  Ctrl-b/n/p/f: movement")),
+                (KeyPreset::Vim, _) => content.push(Line::from("  h/j/k/l: move selection")),
+                (KeyPreset::Emacs, _) => {
+                    content.push(Line::from("  Ctrl-b/n/p/f: move selection"));
+                }
                 (KeyPreset::Custom, Some(bindings)) => {
                     let movement = custom_movement_line(bindings);
                     if movement.cell_width() > inner.width {
@@ -158,10 +158,10 @@ impl Widget for HelpBox<'_> {
                     "[Esc/?/q] close help",
                     Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)),
                 ),
-                Line::from("  synthetic: never delete"),
-                Line::from("  new/changed: plan skips"),
+                Line::from("  summary: cannot delete"),
+                Line::from("  new/changed: skipped"),
                 Line::from("  Enter: open / rescan"),
-                Line::from("  Esc: parent / cancel"),
+                Line::from("  Esc: back / cancel"),
                 Line::from("  +/-/0: zoom"),
                 Line::from("  / filter; e export; t theme"),
             ]);
@@ -218,22 +218,25 @@ mod tests {
         let rendered = rendered_help(KeyPreset::Custom, Some(&bindings));
 
         assert!(rendered.contains("L:a D:s U:w R:d"));
-        assert!(rendered.contains("export scan report"));
-        assert!(rendered.contains("cycle themes"));
-        assert!(rendered.contains("[Esc/?/q] close help"));
+        assert!(rendered.contains("HELP"));
+        assert!(rendered.contains("Navigate"));
+        assert!(rendered.contains("export report"));
+        assert!(rendered.contains("change theme"));
+        assert!(rendered.contains("Delete safely"));
         assert!(rendered.contains("plan permanent deletion"));
-        assert!(rendered.contains("never directly deletable"));
-        assert!(rendered.contains("skipped by identity plan"));
-    }
+        assert!(rendered.contains("cannot be deleted"));
+        assert!(rendered.contains("skipped before deletion"));
+        assert!(rendered.contains("[Esc/?/q] close help"));
 
+    }
     #[test]
     fn narrow_help_keeps_compact_safety_text_unclipped() {
         let rendered = rendered_help_in(Rect::new(0, 0, 32, 20), KeyPreset::Vim, None);
 
         assert!(rendered.contains("Backspace: permanent delete"));
         assert!(rendered.contains("q / Ctrl-c: quit / interrupt"));
-        assert!(rendered.contains("synthetic: never delete"));
-        assert!(rendered.contains("new/changed: plan skips"));
+        assert!(rendered.contains("summary: cannot delete"));
+        assert!(rendered.contains("new/changed: skipped"));
         assert!(rendered.contains("[Esc/?/q] close help"));
     }
 
@@ -260,8 +263,8 @@ mod tests {
     fn minimum_height_help_keeps_movement_safety_and_dismissal_guidance() {
         let rendered = rendered_help_in(Rect::new(0, 0, 32, 8), KeyPreset::Vim, None);
 
-        assert!(rendered.contains("arrows: move focus"));
-        assert!(rendered.contains("h/j/k/l: movement"));
+        assert!(rendered.contains("arrows: move selection"));
+        assert!(rendered.contains("h/j/k/l: move selection"));
         assert!(rendered.contains("Backspace: permanent delete"));
         assert!(rendered.contains("q / Ctrl-c: quit / interrupt"));
         assert!(rendered.contains("[Esc/?/q] close help"));
@@ -278,7 +281,7 @@ mod tests {
         let rendered = rendered_help_in(Rect::new(0, 0, 32, 8), KeyPreset::Custom, Some(&bindings));
 
         assert!(rendered.contains("L:a D:s U:w R:d"));
-        assert!(rendered.contains("synthetic: never delete"));
+        assert!(rendered.contains("summary: cannot delete"));
     }
     #[test]
     fn preset_help_lists_preset_movement_bindings() {
