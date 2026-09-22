@@ -26,6 +26,8 @@ fn settings(root: &std::path::Path) -> RuntimeSettings {
         exclusions: Vec::new(),
         memory_mib: crate::model::DEFAULT_PROCESS_MIB,
         temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+        scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+        scan_store_dir: None,
         apparent_size: true,
         disable_delete_confirmation: false,
         reduced_motion: true,
@@ -727,14 +729,40 @@ fn headless_scan_streams_a_round_trippable_bounded_report() {
         panic!("expected exact headless report");
     };
     assert_eq!(report.summary().scanned_entries, 2);
+    assert!(report.summary().scan_store_bytes > 0);
+    assert!(
+        report.summary().scan_store_bytes <= report.summary().scan_store_limit_bytes,
+        "reported scan-store usage must stay within its session quota"
+    );
     let mut encoded = Vec::new();
     report
         .write_json(&mut encoded)
         .expect("streamed report should serialize");
     let decoded: crate::report::ScanReportDocument =
         serde_json::from_slice(&encoded).expect("streamed report should deserialize");
+    assert_eq!(
+        decoded.schema_version,
+        crate::report::SCAN_REPORT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        decoded.summary.scan_store_bytes,
+        report.summary().scan_store_bytes,
+        "serialized report must preserve scan-store usage"
+    );
     assert_eq!(decoded.document_kind, "scan-report");
     assert_eq!(decoded.entries.len(), 3);
+    let mut table = Vec::new();
+    report
+        .write_table(&mut table)
+        .expect("canonical report table should serialize");
+    assert_eq!(
+        String::from_utf8(table)
+            .expect("canonical report table should be UTF-8")
+            .lines()
+            .count(),
+        4,
+        "table should contain one header, the canonical root, and two canonical entries"
+    );
     let paths = decoded
         .entries
         .iter()
@@ -743,6 +771,34 @@ fn headless_scan_streams_a_round_trippable_bounded_report() {
     assert!(
         paths.windows(2).all(|pair| pair[0] <= pair[1]),
         "streamed report paths must be deterministic and lexical: {paths:?}"
+    );
+}
+
+#[test]
+fn headless_report_keeps_entries_beyond_the_legacy_child_bound() {
+    const ENTRIES: usize = 4_097;
+
+    let root = tempfile::tempdir().expect("headless root should exist");
+    for index in 0..ENTRIES {
+        std::fs::write(root.path().join(format!("entry-{index:04}")), b"x")
+            .expect("fixture entry should be written");
+    }
+    let mut scan_settings = settings(root.path());
+    scan_settings.memory_mib = crate::model::MIN_PROCESS_MIB;
+    let outcome = scan_headless(scan_settings).expect("headless scan should succeed");
+    let OperationOutcome::Exact(report) = outcome else {
+        panic!("canonical headless scan must remain exact");
+    };
+    let mut encoded = Vec::new();
+    report
+        .write_json(&mut encoded)
+        .expect("canonical report should serialize");
+    let report: crate::report::ScanReportDocument =
+        serde_json::from_slice(&encoded).expect("canonical report should deserialize");
+    assert_eq!(
+        report.entries.len(),
+        ENTRIES.saturating_add(1),
+        "the report must retain every concrete canonical entry plus its root"
     );
 }
 

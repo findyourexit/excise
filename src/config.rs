@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use crate::native_path::{safe_display_path_text, safe_display_text};
-use crate::temporary_storage::{DEFAULT_TEMPORARY_STORAGE_MIB, MIN_TEMPORARY_STORAGE_MIB};
+use crate::temporary_storage::{
+    DEFAULT_SCAN_STORE_MIB, DEFAULT_TEMPORARY_STORAGE_MIB, MIN_SCAN_STORE_MIB,
+    MIN_TEMPORARY_STORAGE_MIB,
+};
 use crate::theme::ThemeId;
 
 fn config_error(message: impl std::fmt::Display) -> AppError {
@@ -188,8 +191,14 @@ pub struct Cli {
     /// Whole-process memory envelope in MiB
     pub memory_mib: Option<usize>,
     #[arg(long, value_name = "MIB")]
-    /// Combined scanner-task, directory-plan/result, and identity-spill temporary storage limit per session (2+)
+    /// Directory-plan, deletion-result, and identity-spill storage limit per session (2+)
     pub temporary_storage_mib: Option<usize>,
+    #[arg(long, value_name = "MIB")]
+    /// Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)
+    pub scan_store_mib: Option<usize>,
+    #[arg(long, value_name = "DIR")]
+    /// Parent directory for the private canonical scan-store session
+    pub scan_store_dir: Option<PathBuf>,
     #[arg(long)]
     /// Disable nonessential motion
     pub reduced_motion: bool,
@@ -242,9 +251,12 @@ pub struct ScannerFileConfig {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
 pub struct ModelFileConfig {
     pub process_memory_mib: Option<usize>,
     pub temporary_storage_mib: Option<usize>,
+    pub scan_store_mib: Option<usize>,
+    pub scan_store_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -271,6 +283,8 @@ pub struct EnvironmentOverrides {
     pub exclusions: Vec<String>,
     pub memory_mib: Option<usize>,
     pub temporary_storage_mib: Option<usize>,
+    pub scan_store_mib: Option<usize>,
+    pub scan_store_dir: Option<PathBuf>,
     pub monochrome: bool,
     pub theme: Option<ThemeId>,
     pub ascii: Option<bool>,
@@ -290,6 +304,8 @@ pub struct RuntimeConfig {
     pub exclusions: Vec<String>,
     pub memory_mib: usize,
     pub temporary_storage_mib: usize,
+    pub scan_store_mib: usize,
+    pub scan_store_dir: Option<PathBuf>,
     pub apparent_size: bool,
     pub reduced_motion: bool,
     pub monochrome: bool,
@@ -376,6 +392,15 @@ impl RuntimeConfig {
             .or(environment.temporary_storage_mib)
             .or_else(|| file_model.and_then(|model| model.temporary_storage_mib))
             .unwrap_or(DEFAULT_TEMPORARY_STORAGE_MIB);
+        let scan_store_mib = cli
+            .scan_store_mib
+            .or(environment.scan_store_mib)
+            .or_else(|| file_model.and_then(|model| model.scan_store_mib))
+            .unwrap_or(DEFAULT_SCAN_STORE_MIB);
+        let scan_store_dir = cli
+            .scan_store_dir
+            .or(environment.scan_store_dir)
+            .or_else(|| file_model.and_then(|model| model.scan_store_dir.clone()));
         validate_range("scanner threads", scan_threads, 1, MAX_SCANNER_THREADS)?;
         validate_range("event buffer", event_buffer, 16, 4096)?;
         validate_range(
@@ -388,6 +413,12 @@ impl RuntimeConfig {
             "temporary storage",
             temporary_storage_mib,
             MIN_TEMPORARY_STORAGE_MIB,
+            MAX_TEMPORARY_STORAGE_MIB,
+        )?;
+        validate_range(
+            "scan store",
+            scan_store_mib,
+            MIN_SCAN_STORE_MIB,
             MAX_TEMPORARY_STORAGE_MIB,
         )?;
 
@@ -458,6 +489,8 @@ impl RuntimeConfig {
             event_buffer,
             memory_mib,
             temporary_storage_mib,
+            scan_store_mib,
+            scan_store_dir,
             apparent_size,
             cross_filesystems,
             exclusions,
@@ -508,6 +541,10 @@ impl EnvironmentOverrides {
                 .unwrap_or_default(),
             memory_mib: parse_usize_env("EXCISE_MEMORY_MIB")?,
             temporary_storage_mib: parse_usize_env("EXCISE_TEMPORARY_STORAGE_MIB")?,
+            scan_store_mib: parse_usize_env("EXCISE_SCAN_STORE_MIB")?,
+            scan_store_dir: env::var_os("EXCISE_SCAN_STORE_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         })
     }
 }

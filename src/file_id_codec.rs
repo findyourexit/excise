@@ -15,6 +15,7 @@ pub(crate) enum FileIdCodecError {
 }
 
 /// Encodes a file identity without JSON allocation or platform-dependent text.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn encode_file_id(file_id: &FileId) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(file_id_encoded_bytes(file_id));

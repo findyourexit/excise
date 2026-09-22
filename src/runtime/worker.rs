@@ -9,6 +9,7 @@ use crossbeam_channel::{
     Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
 };
 
+use super::scanner::{self, ScannerOptions, SchedulerHandle};
 use crate::deletion::{
     DeletionPlan, DeletionPlanError, DeletionReport,
     build_plan_cancellable_with_root_identity_and_temporary_storage,
@@ -21,10 +22,13 @@ use crate::native_path::DECEPTIVE_DISPLAY_MARKER;
 #[cfg(all(test, unix))]
 use crate::native_path::safe_display_path_text;
 use crate::native_path::{NativeIdentity, safe_display_text};
+#[cfg(test)]
+use crate::scan_coordinator::ScanGeneration;
+use crate::scan_coordinator::{SchedulerSnapshot, WorkLease};
+use crate::scan_session::ScanSessionId;
+use crate::scan_store::run_file::SealedRun;
 use crate::state::deletion_work::{DeletionWorkCommand, DeletionWorkId, MAX_DELETION_WORK_ITEMS};
 use crate::temporary_storage::TemporaryStorage;
-
-use super::scanner::{self, ScannerOptions};
 
 const CHANNEL_RETRY: Duration = Duration::from_millis(25);
 
@@ -36,39 +40,21 @@ pub struct ScannedEntry {
 
 pub(super) enum WorkerEvent {
     ScanBatch {
+        lease: Option<WorkLease>,
         entries: Vec<ScannedEntry>,
-    },
-    ScanDirectoryComplete {
-        path: PathBuf,
-        identity: Option<NativeIdentity>,
+        input_runs: Vec<SealedRun>,
     },
     ScanUnscanned {
+        lease: Option<WorkLease>,
         path: PathBuf,
         reason: crate::model::UnscannedReason,
+        input_runs: Vec<SealedRun>,
     },
     ScanFailed {
         path: Option<PathBuf>,
         message: String,
     },
     ScanFinished {
-        cancelled: bool,
-    },
-    FocusedScanBatch {
-        entries: Vec<ScannedEntry>,
-    },
-    FocusedScanDirectoryComplete {
-        path: PathBuf,
-        identity: Option<NativeIdentity>,
-    },
-    FocusedScanUnscanned {
-        path: PathBuf,
-        reason: crate::model::UnscannedReason,
-    },
-    FocusedScanFailed {
-        path: Option<PathBuf>,
-        message: String,
-    },
-    FocusedScanFinished {
         cancelled: bool,
     },
     DeletionPlanned {
@@ -122,7 +108,8 @@ pub struct WorkerPool {
     deletion_plan_cancelled: Arc<AtomicBool>,
     deletion_soft_cancelled: Arc<AtomicBool>,
     rescan_cancelled: Arc<AtomicBool>,
-    scanner_control: Arc<scanner::ScannerControl>,
+    scheduler: SchedulerHandle,
+    scan_session: ScanSessionId,
     scanner_handle: thread::JoinHandle<()>,
     planner_handle: thread::JoinHandle<()>,
     rescan_handle: thread::JoinHandle<()>,
@@ -130,11 +117,28 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
+    #[cfg(test)]
     #[allow(
         clippy::too_many_lines,
         reason = "each worker has an explicit startup and cleanup path to preserve bounded ownership"
     )]
     pub fn start(scanner_options: ScannerOptions, event_capacity: usize) -> Result<Self, AppError> {
+        Self::start_with_deletion_storage(
+            scanner_options,
+            TemporaryStorage::default(),
+            event_capacity,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each worker startup and failure path retains explicit bounded ownership"
+    )]
+    pub(crate) fn start_with_deletion_storage(
+        scanner_options: ScannerOptions,
+        deletion_storage: TemporaryStorage,
+        event_capacity: usize,
+    ) -> Result<Self, AppError> {
         let (event_sender, events) = bounded(event_capacity);
         let (planner_commands, planner_receiver) = bounded(MAX_DELETION_WORK_ITEMS);
         let (executor_commands, executor_receiver) = bounded(1);
@@ -145,9 +149,10 @@ impl WorkerPool {
         let rescan_cancelled = Arc::new(AtomicBool::new(false));
         let scan_root = scanner_options.root.clone();
         let scan_root_identity = scanner_options.root_identity.clone();
-        let temporary_storage = scanner_options.temporary_storage.clone();
+        let temporary_storage = deletion_storage;
+        let scan_session = scanner_options.session;
 
-        let (scanner, scanner_control) = scanner::spawn(
+        let (scanner, scheduler) = scanner::spawn(
             scanner_options,
             event_sender.clone(),
             Arc::clone(&cancelled),
@@ -183,7 +188,7 @@ impl WorkerPool {
             }
         };
         let rescanner = match thread::Builder::new()
-            .name("excise-focused-rescan".to_string())
+            .name("excise-scan-rebuild".to_string())
             .spawn({
                 let sender = event_sender.clone();
                 let cancelled = Arc::clone(&cancelled);
@@ -196,7 +201,7 @@ impl WorkerPool {
                 drop(events);
                 let _ = scanner.join();
                 let _ = planner.join();
-                return Err(AppError::io("could not spawn focused rescan worker", error));
+                return Err(AppError::io("could not spawn scan rebuild worker", error));
             }
         };
         let executor = match thread::Builder::new()
@@ -236,7 +241,8 @@ impl WorkerPool {
             deletion_plan_cancelled,
             deletion_soft_cancelled,
             rescan_cancelled,
-            scanner_control,
+            scheduler,
+            scan_session,
             scanner_handle: scanner,
             planner_handle: planner,
             rescan_handle: rescanner,
@@ -249,9 +255,15 @@ impl WorkerPool {
         &self.events
     }
 
-    /// Prioritizes a visible directory without performing queue or spill I/O on the caller.
+    /// Prioritizes a visible directory through the bounded scheduler control channel.
     pub fn prioritize_scan(&self, path: &Path) {
-        self.scanner_control.prioritize(path);
+        self.scheduler.prioritize(path);
+    }
+
+    /// Returns the latest coalesced scan scheduler state without consuming a worker event.
+    #[must_use]
+    pub(crate) fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
+        self.scheduler.snapshot()
     }
 
     pub(crate) fn submit_deletion_work(
@@ -331,16 +343,17 @@ impl WorkerPool {
         self.deletion_plan_cancelled.store(true, Ordering::Release);
     }
 
-    pub fn request_rescan(&self, options: ScannerOptions) -> Result<(), AppError> {
+    pub fn request_rescan(&self, mut options: ScannerOptions) -> Result<(), AppError> {
+        options.session = self.scan_session;
         self.rescan_cancelled.store(false, Ordering::Release);
         self.rescan_commands
             .try_send(RescanCommand::Rescan(options))
             .map_err(|error| match error {
                 TrySendError::Full(_) => {
-                    AppError::Invariant("focused rescan queue is full".to_string())
+                    AppError::Invariant("scan rebuild queue is full".to_string())
                 }
                 TrySendError::Disconnected(_) => {
-                    AppError::Worker("focused rescan worker disconnected".to_string())
+                    AppError::Worker("scan rebuild worker disconnected".to_string())
                 }
             })
     }
@@ -359,7 +372,8 @@ impl WorkerPool {
             deletion_plan_cancelled,
             deletion_soft_cancelled,
             rescan_cancelled,
-            scanner_control,
+            scheduler,
+            scan_session: _,
             scanner_handle,
             planner_handle,
             rescan_handle,
@@ -372,8 +386,8 @@ impl WorkerPool {
         drop(events);
         drop(planner_commands);
         drop(executor_commands);
+        drop(scheduler);
         drop(rescan_commands);
-        drop(scanner_control);
         scanner_handle
             .join()
             .map_err(|_| AppError::Worker("scanner thread panicked".to_string()))?;
@@ -382,7 +396,7 @@ impl WorkerPool {
             .map_err(|_| AppError::Worker("deletion planner thread panicked".to_string()))?;
         rescan_handle
             .join()
-            .map_err(|_| AppError::Worker("focused rescan thread panicked".to_string()))?;
+            .map_err(|_| AppError::Worker("scan rebuild thread panicked".to_string()))?;
         executor_handle
             .join()
             .map_err(|_| AppError::Worker("deletion executor thread panicked".to_string()))
@@ -503,59 +517,26 @@ fn rescan_worker(
             Err(RecvTimeoutError::Disconnected) => return,
         };
         let RescanCommand::Rescan(options) = command;
-        let (scan_sender, scan_events) = bounded(1);
-        let scanner_sender = scan_sender.clone();
         let root = options.root.clone();
-        thread::scope(|scope| {
-            let scanner =
-                scope.spawn(move || scanner::run(options, &scanner_sender, rescan_cancelled));
-            drop(scan_sender);
-            while let Ok(event) = scan_events.recv() {
-                let finished = matches!(event, WorkerEvent::ScanFinished { .. });
-                let event = match event {
-                    WorkerEvent::ScanBatch { entries } => WorkerEvent::FocusedScanBatch { entries },
-                    WorkerEvent::ScanDirectoryComplete { path, identity } => {
-                        WorkerEvent::FocusedScanDirectoryComplete { path, identity }
-                    }
-                    WorkerEvent::ScanUnscanned { path, reason } => {
-                        WorkerEvent::FocusedScanUnscanned { path, reason }
-                    }
-                    WorkerEvent::ScanFailed { path, message } => {
-                        WorkerEvent::FocusedScanFailed { path, message }
-                    }
-                    WorkerEvent::ScanFinished { cancelled } => {
-                        WorkerEvent::FocusedScanFinished { cancelled }
-                    }
-                    WorkerEvent::FocusedScanBatch { .. }
-                    | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                    | WorkerEvent::FocusedScanUnscanned { .. }
-                    | WorkerEvent::FocusedScanFailed { .. }
-                    | WorkerEvent::FocusedScanFinished { .. }
-                    | WorkerEvent::DeletionPlanned { .. }
-                    | WorkerEvent::DeletionExecutionRejected { .. }
-                    | WorkerEvent::DeletionFinished { .. } => {
-                        unreachable!("scanner must emit only primary scan events")
-                    }
-                };
-                if !send_event(sender, event, cancelled) {
-                    rescan_cancelled.store(true, Ordering::Release);
-                    break;
-                }
-                if finished {
-                    break;
-                }
-            }
-            if scanner.join().is_err() {
-                let _ = send_event(
-                    sender,
-                    WorkerEvent::FocusedScanFailed {
-                        path: Some(root),
-                        message: "focused scanner thread panicked".to_string(),
-                    },
-                    cancelled,
-                );
-            }
-        });
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scanner::run(options, sender, rescan_cancelled);
+        }))
+        .is_err()
+        {
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanFailed {
+                    path: Some(root),
+                    message: "scan rebuild worker panicked".to_string(),
+                },
+                cancelled,
+            );
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanFinished { cancelled: true },
+                cancelled,
+            );
+        }
     }
 }
 
@@ -604,17 +585,16 @@ fn sanitize_worker_event(event: WorkerEvent) -> WorkerEvent {
             path,
             message: safe_worker_text(&message),
         },
-        WorkerEvent::FocusedScanFailed { path, message } => WorkerEvent::FocusedScanFailed {
+        WorkerEvent::ScanUnscanned {
+            lease,
             path,
-            message: safe_worker_text(&message),
-        },
-        WorkerEvent::ScanUnscanned { path, reason } => WorkerEvent::ScanUnscanned {
-            path,
-            reason: sanitize_unscanned_reason(reason),
-        },
-        WorkerEvent::FocusedScanUnscanned { path, reason } => WorkerEvent::FocusedScanUnscanned {
+            reason,
+            input_runs,
+        } => WorkerEvent::ScanUnscanned {
+            lease,
             path,
             reason: sanitize_unscanned_reason(reason),
+            input_runs,
         },
         event => event,
     }
@@ -670,12 +650,16 @@ mod tests {
     fn options(root: &std::path::Path, threads: usize) -> ScannerOptions {
         ScannerOptions {
             root: root.to_path_buf(),
+            canonical_root: root.to_path_buf(),
+            session: ScanSessionId::from_bytes([3; 16]),
+            generation: ScanGeneration::initial(),
             root_identity: None,
             threads,
             cross_filesystems: false,
             exclusions: Vec::new(),
             internal_paths: Vec::new(),
             temporary_storage: crate::temporary_storage::TemporaryStorage::default(),
+            input_runs: None,
         }
     }
 
@@ -791,15 +775,9 @@ mod tests {
             {
                 WorkerEvent::DeletionFinished { report, .. } => break report,
                 WorkerEvent::ScanBatch { .. }
-                | WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::ScanFailed { .. }
                 | WorkerEvent::ScanFinished { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. } => {}
             }
@@ -807,6 +785,53 @@ mod tests {
         assert!(!report.soft_cancelled);
         assert_eq!(report.deleted_entries(), 1);
         assert!(!path.exists());
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[test]
+    fn scheduler_status_is_coalesced_without_consuming_scan_events() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let workers = WorkerPool::start(options(root.path(), 1), 1).expect("workers should start");
+
+        let initial = (0..100)
+            .find_map(|_| {
+                let snapshot = workers.scheduler_snapshot();
+                if snapshot.is_none() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                snapshot
+            })
+            .expect("scheduler should publish an initial status snapshot");
+        assert_eq!(initial.session(), ScanSessionId::from_bytes([3; 16]));
+        assert_eq!(initial.generation(), ScanGeneration::initial());
+
+        for _ in 0..128 {
+            let _ = workers.scheduler_snapshot();
+        }
+
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("scan should complete after status reads")
+            {
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
+                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanBatch { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+
+        let final_status = workers
+            .scheduler_snapshot()
+            .expect("completed scan should retain its last scheduler status");
+        assert_eq!(final_status.pending().total(), 0);
+        assert_eq!(final_status.active_leases(), 0);
+        assert!(final_status.terminal().succeeded() >= 1);
         workers.shutdown().expect("workers should stop");
     }
 
@@ -826,7 +851,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("scanner should produce completion")
             {
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch { entries, .. } => {
                     for entry in entries {
                         if let Some(name) = entry.path.file_name().and_then(|name| name.to_str())
                             && name.starts_with("file-")
@@ -838,15 +863,9 @@ mod tests {
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
-                WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::ScanUnscanned { .. }
+                WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -855,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_rescan_reuses_bounded_worker_channel() {
+    fn rescan_reuses_bounded_worker_channel() {
         let root = tempfile::tempdir().expect("scan root should exist");
         let file = root.path().join("file");
         std::fs::write(&file, b"x").expect("fixture should be written");
@@ -866,7 +885,7 @@ mod tests {
             if pass == 1 {
                 workers
                     .request_rescan(scanner_options.clone())
-                    .expect("focused rescan should start");
+                    .expect("scan rebuild should start");
             }
             let mut saw_file = false;
             loop {
@@ -875,34 +894,15 @@ mod tests {
                     .recv_timeout(Duration::from_secs(5))
                     .expect("scan pass should complete")
                 {
-                    WorkerEvent::ScanBatch { entries } => {
-                        assert_eq!(pass, 0, "focused scan must not leak as primary data");
+                    WorkerEvent::ScanBatch { entries, .. } => {
                         saw_file |= entries.iter().any(|entry| entry.path == file);
                     }
-                    WorkerEvent::FocusedScanBatch { entries } => {
-                        assert_eq!(pass, 1, "initial scan must not be tagged as focused");
-                        saw_file |= entries.iter().any(|entry| entry.path == file);
-                    }
-                    WorkerEvent::ScanFinished { cancelled: false } => {
-                        assert_eq!(pass, 0, "focused scan must keep its own terminal event");
-                        break;
-                    }
-                    WorkerEvent::FocusedScanFinished { cancelled: false } => {
-                        assert_eq!(pass, 1, "initial scan must keep its own terminal event");
-                        break;
-                    }
-                    WorkerEvent::ScanFinished { cancelled: true }
-                    | WorkerEvent::FocusedScanFinished { cancelled: true } => {
+                    WorkerEvent::ScanFinished { cancelled: false } => break,
+                    WorkerEvent::ScanFinished { cancelled: true } => {
                         panic!("scan pass was cancelled")
                     }
-                    WorkerEvent::ScanFailed { message, .. }
-                    | WorkerEvent::FocusedScanFailed { message, .. } => {
-                        panic!("scan failed: {message}")
-                    }
-                    WorkerEvent::ScanDirectoryComplete { .. }
-                    | WorkerEvent::ScanUnscanned { .. }
-                    | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                    | WorkerEvent::FocusedScanUnscanned { .. }
+                    WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                    WorkerEvent::ScanUnscanned { .. }
                     | WorkerEvent::DeletionPlanned { .. }
                     | WorkerEvent::DeletionExecutionRejected { .. }
                     | WorkerEvent::DeletionFinished { .. } => {}
@@ -910,59 +910,6 @@ mod tests {
             }
             assert!(saw_file);
         }
-        workers.shutdown().expect("workers should stop");
-    }
-
-    #[test]
-    fn focused_rescan_streams_while_primary_scan_is_active() {
-        let root = tempfile::tempdir().expect("scan root should exist");
-        let file = root.path().join("file");
-        std::fs::write(&file, b"payload").expect("fixture file should be written");
-        let scanner_options = options(root.path(), 1);
-        let workers = WorkerPool::start(scanner_options.clone(), 1).expect("workers should start");
-        workers
-            .request_rescan(scanner_options)
-            .expect("focused scan should queue before the primary scan completes");
-
-        let mut primary_finished = false;
-        let mut focused_finished = false;
-        let mut primary_saw_file = false;
-        let mut focused_saw_file = false;
-        while !primary_finished || !focused_finished {
-            match workers
-                .events()
-                .recv_timeout(Duration::from_secs(5))
-                .expect("both scans should make progress")
-            {
-                WorkerEvent::ScanBatch { entries } => {
-                    primary_saw_file |= entries.iter().any(|entry| entry.path == file);
-                }
-                WorkerEvent::FocusedScanBatch { entries } => {
-                    focused_saw_file |= entries.iter().any(|entry| entry.path == file);
-                }
-                WorkerEvent::ScanFinished { cancelled: false } => primary_finished = true,
-                WorkerEvent::FocusedScanFinished { cancelled: false } => focused_finished = true,
-                WorkerEvent::ScanFinished { cancelled: true }
-                | WorkerEvent::FocusedScanFinished { cancelled: true } => {
-                    panic!("scan should not be cancelled")
-                }
-                WorkerEvent::ScanFailed { message, .. }
-                | WorkerEvent::FocusedScanFailed { message, .. } => {
-                    panic!("scan failed: {message}")
-                }
-                WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::ScanUnscanned { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. } => {}
-                WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::DeletionFinished { .. } => {
-                    panic!("scan fixture must not emit deletion work")
-                }
-            }
-        }
-        assert!(primary_saw_file);
-        assert!(focused_saw_file);
         workers.shutdown().expect("workers should stop");
     }
 
@@ -988,21 +935,15 @@ mod tests {
                 .recv_timeout(Duration::from_secs(10))
                 .expect("deep scan should complete")
             {
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch { entries, .. } => {
                     found |= entries.iter().any(|entry| entry.path == marker);
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
-                WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::ScanUnscanned { .. }
+                WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1027,7 +968,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("wide scan should complete")
             {
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch { entries, .. } => {
                     for entry in entries {
                         if entry.path.file_name().is_some_and(|name| name == "file") {
                             files.insert(entry.path);
@@ -1037,15 +978,9 @@ mod tests {
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
-                WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::ScanUnscanned { .. }
+                WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1083,24 +1018,18 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("excluded scan should complete")
             {
-                WorkerEvent::ScanUnscanned { path, reason } => {
+                WorkerEvent::ScanUnscanned { path, reason, .. } => {
                     excluded_directory |= path == ignored
                         && reason == UnscannedReason::Excluded("ignored/".to_string());
                 }
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch { entries, .. } => {
                     traversed_secret |= entries.iter().any(|entry| entry.path == secret);
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
-                WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::DeletionPlanned { .. }
+                WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1134,7 +1063,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("scanner should complete")
             {
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch { entries, .. } => {
                     saw_user_directory |= entries.iter().any(|entry| entry.path == user_session);
                     saw_user_file |= entries.iter().any(|entry| entry.path == user_file);
                     saw_spill_file |= entries.iter().any(|entry| entry.path == spill_file);
@@ -1143,15 +1072,9 @@ mod tests {
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
-                WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::ScanUnscanned { .. }
+                WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1185,7 +1108,7 @@ mod tests {
                 .expect("scanner should produce completion")
             {
                 WorkerEvent::ScanUnscanned { path, .. } => skipped_link |= path == link,
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch { entries, .. } => {
                     traversed_secret |= entries
                         .iter()
                         .any(|entry| entry.path.file_name().is_some_and(|name| name == "secret"));
@@ -1193,14 +1116,8 @@ mod tests {
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
-                WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::DeletionPlanned { .. }
+                WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1250,15 +1167,9 @@ mod tests {
                     panic!("replaced root should be rejected, not cancelled")
                 }
                 WorkerEvent::ScanBatch { .. }
-                | WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1305,7 +1216,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("scanner should produce completion")
             {
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch { entries, .. } => {
                     saw_batch = true;
                     saw_replacement |= entries
                         .iter()
@@ -1325,15 +1236,9 @@ mod tests {
                 WorkerEvent::ScanFinished { cancelled: true } => {
                     panic!("root replacement should be uncertain, not cancellation")
                 }
-                WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::ScanUnscanned { .. }
+                WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1403,10 +1308,12 @@ mod tests {
         assert!(send_event(
             &sender,
             WorkerEvent::ScanUnscanned {
+                lease: None,
                 path: PathBuf::from("/scan/hostile"),
                 reason: crate::model::UnscannedReason::Metadata(
                     "metadata failed\t\u{202e}name".to_string(),
                 ),
+                input_runs: Vec::new(),
             },
             &cancelled,
         ));

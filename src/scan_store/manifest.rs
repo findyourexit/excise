@@ -3,77 +3,13 @@ use thiserror::Error;
 
 use super::run_file::{RunDescriptor, RunKind};
 use crate::scan_coordinator::ScanGeneration;
+use crate::scan_session::{ScanGenerationState, ScanSessionId};
 
 const MANIFEST_MAGIC: [u8; 4] = *b"EXSM";
-const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_VERSION: u16 = 3;
 const MANIFEST_HEADER_BYTES: usize = 36;
 const MANIFEST_ENTRY_BYTES: usize = 17;
 const MANIFEST_DIGEST_BYTES: usize = 32;
-
-/// Unpredictable identity for a private scan-store session.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ScanSessionId([u8; 16]);
-
-impl ScanSessionId {
-    /// # Errors
-    ///
-    /// Returns an error when the operating system cannot provide random bytes.
-    pub(crate) fn random() -> Result<Self, ManifestError> {
-        let mut bytes = [0_u8; 16];
-        getrandom::fill(&mut bytes).map_err(|error| ManifestError::Random(error.to_string()))?;
-        Ok(Self(bytes))
-    }
-
-    #[must_use]
-    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub(crate) const fn bytes(self) -> [u8; 16] {
-        self.0
-    }
-}
-
-/// Whole-generation publication state. These values are never inferred from
-/// partial run contents.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub(crate) enum ManifestState {
-    Scanning = 1,
-    Reducing = 2,
-    Published = 3,
-    SummaryOnly = 4,
-    Incomplete = 5,
-    Cancelled = 6,
-}
-
-impl ManifestState {
-    const fn from_byte(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(Self::Scanning),
-            2 => Some(Self::Reducing),
-            3 => Some(Self::Published),
-            4 => Some(Self::SummaryOnly),
-            5 => Some(Self::Incomplete),
-            6 => Some(Self::Cancelled),
-            _ => None,
-        }
-    }
-
-    const fn can_transition_to(self, next: Self) -> bool {
-        matches!(
-            (self, next),
-            (
-                Self::Scanning,
-                Self::Reducing | Self::SummaryOnly | Self::Incomplete | Self::Cancelled
-            ) | (
-                Self::Reducing,
-                Self::Published | Self::SummaryOnly | Self::Incomplete | Self::Cancelled
-            )
-        )
-    }
-}
 
 /// Durable metadata for one sealed run referenced by a manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,8 +20,6 @@ pub(crate) struct RunManifestEntry {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum ManifestError {
-    #[error("could not generate scan session identifier: {0}")]
-    Random(String),
     #[error("scan manifest has too many runs")]
     TooManyRuns,
     #[error("scan manifest run belongs to another generation")]
@@ -96,6 +30,8 @@ pub(crate) enum ManifestError {
     ClosedForRuns,
     #[error("scan manifest state transition is invalid")]
     InvalidTransition,
+    #[error("scan manifest does not contain an obsolete run")]
+    MissingRun,
     #[error("scan manifest is malformed")]
     Malformed,
     #[error("scan manifest checksum does not match")]
@@ -107,7 +43,7 @@ pub(crate) enum ManifestError {
 pub(crate) struct ScanManifest {
     session: ScanSessionId,
     generation: ScanGeneration,
-    state: ManifestState,
+    state: ScanGenerationState,
     runs: Vec<RunManifestEntry>,
 }
 
@@ -117,7 +53,7 @@ impl ScanManifest {
         Self {
             session,
             generation,
-            state: ManifestState::Scanning,
+            state: ScanGenerationState::Creating,
             runs: Vec::new(),
         }
     }
@@ -133,7 +69,7 @@ impl ScanManifest {
     }
 
     #[must_use]
-    pub(crate) const fn state(&self) -> ManifestState {
+    pub(crate) const fn state(&self) -> ScanGenerationState {
         self.state
     }
 
@@ -149,7 +85,7 @@ impl ScanManifest {
     pub(crate) fn add_run(&mut self, run: RunManifestEntry) -> Result<(), ManifestError> {
         if !matches!(
             self.state,
-            ManifestState::Scanning | ManifestState::Reducing
+            ScanGenerationState::Scanning | ScanGenerationState::Reducing
         ) {
             return Err(ManifestError::ClosedForRuns);
         }
@@ -166,11 +102,71 @@ impl ScanManifest {
         Ok(())
     }
 
+    /// Replaces sealed input runs with their durable successor.
+    ///
+    /// The caller persists the resulting manifest before dropping `removed`.
+    pub(crate) fn replace_runs(
+        &mut self,
+        removed: &[RunDescriptor],
+        added: RunManifestEntry,
+    ) -> Result<(), ManifestError> {
+        if !matches!(
+            self.state,
+            ScanGenerationState::Scanning | ScanGenerationState::Reducing
+        ) {
+            return Err(ManifestError::ClosedForRuns);
+        }
+        if added.descriptor.generation() != self.generation {
+            return Err(ManifestError::RunGenerationMismatch);
+        }
+        if removed
+            .iter()
+            .any(|descriptor| descriptor.generation() != self.generation)
+        {
+            return Err(ManifestError::RunGenerationMismatch);
+        }
+        if removed.iter().any(|descriptor| {
+            !self.runs.iter().any(|existing| {
+                existing.descriptor.run_id() == descriptor.run_id()
+                    && existing.descriptor.kind() == descriptor.kind()
+            })
+        }) {
+            return Err(ManifestError::MissingRun);
+        }
+        self.runs.retain(|existing| {
+            !removed.iter().any(|descriptor| {
+                existing.descriptor.run_id() == descriptor.run_id()
+                    && existing.descriptor.kind() == descriptor.kind()
+            })
+        });
+        if self.runs.iter().any(|existing| {
+            existing.descriptor.run_id() == added.descriptor.run_id()
+                && existing.descriptor.kind() == added.descriptor.kind()
+        }) {
+            return Err(ManifestError::DuplicateRun);
+        }
+        self.runs.push(added);
+        Ok(())
+    }
+
+    /// Replaces every retained run with the final published query run.
+    pub(crate) fn replace_all_runs(
+        &mut self,
+        added: RunManifestEntry,
+    ) -> Result<(), ManifestError> {
+        let removed = self
+            .runs
+            .iter()
+            .map(|entry| entry.descriptor)
+            .collect::<Vec<_>>();
+        self.replace_runs(&removed, added)
+    }
+
     /// # Errors
     ///
     /// Returns an error when a caller attempts to skip or leave a terminal
     /// manifest state.
-    pub(crate) fn transition(&mut self, next: ManifestState) -> Result<(), ManifestError> {
+    pub(crate) fn transition(&mut self, next: ScanGenerationState) -> Result<(), ManifestError> {
         if !self.state.can_transition_to(next) {
             return Err(ManifestError::InvalidTransition);
         }
@@ -199,7 +195,7 @@ impl ScanManifest {
         encoded.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
         encoded.push(self.state as u8);
         encoded.push(0);
-        encoded.extend_from_slice(&self.session.0);
+        encoded.extend_from_slice(&self.session.bytes());
         encoded.extend_from_slice(&self.generation.value().to_le_bytes());
         encoded.extend_from_slice(&run_count.to_le_bytes());
         for run in &self.runs {
@@ -233,7 +229,7 @@ impl ScanManifest {
         {
             return Err(ManifestError::Malformed);
         }
-        let Some(state) = ManifestState::from_byte(body[6]) else {
+        let Some(state) = ScanGenerationState::from_code(body[6]) else {
             return Err(ManifestError::Malformed);
         };
         let mut session = [0_u8; 16];
@@ -285,7 +281,7 @@ impl ScanManifest {
             offset = offset.saturating_add(MANIFEST_ENTRY_BYTES);
         }
         Ok(Self {
-            session: ScanSessionId(session),
+            session: ScanSessionId::from_bytes(session),
             generation,
             state,
             runs,
@@ -308,6 +304,10 @@ mod tests {
     fn manifest_round_trips_sealed_runs_and_terminal_state() {
         let generation = ScanGeneration::from_value(9);
         let mut manifest = ScanManifest::new(ScanSessionId::from_bytes([7; 16]), generation);
+        assert_eq!(manifest.state(), ScanGenerationState::Creating);
+        manifest
+            .transition(ScanGenerationState::Scanning)
+            .expect("generation should begin scanning");
         manifest
             .add_run(run(generation, 1, RunKind::PathObservation))
             .expect("path run should enter manifest");
@@ -315,23 +315,54 @@ mod tests {
             .add_run(run(generation, 2, RunKind::IdentityObservation))
             .expect("identity run should enter manifest");
         manifest
-            .transition(ManifestState::Reducing)
+            .transition(ScanGenerationState::Reducing)
             .expect("scan should begin reduction");
         manifest
-            .transition(ManifestState::Published)
+            .transition(ScanGenerationState::Published)
             .expect("reduction should publish");
 
         let encoded = manifest.encode().expect("manifest should encode");
+
         assert_eq!(
             ScanManifest::decode(&encoded).expect("manifest should decode"),
             manifest
         );
+    }
+    #[test]
+    fn manifest_replaces_consumed_runs_only_after_successor_is_known() {
+        let generation = ScanGeneration::initial();
+        let mut manifest = ScanManifest::new(ScanSessionId::from_bytes([3; 16]), generation);
+        manifest
+            .transition(ScanGenerationState::Scanning)
+            .expect("generation should scan");
+        let first = run(generation, 1, RunKind::PathObservation);
+        let second = run(generation, 2, RunKind::PathObservation);
+        manifest.add_run(first).expect("first run should enter");
+        manifest.add_run(second).expect("second run should enter");
+        let merged = run(generation, 3, RunKind::PathObservation);
+
+        manifest
+            .replace_runs(&[first.descriptor, second.descriptor], merged)
+            .expect("merged successor should replace both inputs");
+
+        assert_eq!(manifest.runs(), &[merged]);
+        assert_eq!(
+            manifest.replace_runs(
+                &[first.descriptor],
+                run(generation, 4, RunKind::PathObservation)
+            ),
+            Err(ManifestError::MissingRun)
+        );
+        assert_eq!(manifest.runs(), &[merged]);
     }
 
     #[test]
     fn manifest_rejects_invalid_run_and_state_transitions() {
         let generation = ScanGeneration::initial();
         let mut manifest = ScanManifest::new(ScanSessionId::from_bytes([1; 16]), generation);
+        manifest
+            .transition(ScanGenerationState::Scanning)
+            .expect("generation should begin scanning");
         manifest
             .add_run(run(generation, 1, RunKind::PathObservation))
             .expect("run should enter manifest");
@@ -348,11 +379,11 @@ mod tests {
             Err(ManifestError::RunGenerationMismatch)
         );
         assert_eq!(
-            manifest.transition(ManifestState::Published),
+            manifest.transition(ScanGenerationState::Published),
             Err(ManifestError::InvalidTransition)
         );
         manifest
-            .transition(ManifestState::Cancelled)
+            .transition(ScanGenerationState::Cancelled)
             .expect("scan should cancel");
         assert_eq!(
             manifest.add_run(run(generation, 3, RunKind::PathObservation)),
@@ -376,6 +407,26 @@ mod tests {
             ScanManifest::decode(&encoded[..3]),
             Err(ManifestError::Malformed)
         );
+    }
+
+    #[test]
+    fn manifest_rejects_prior_wire_versions() {
+        let manifest = ScanManifest::new(
+            ScanSessionId::from_bytes([8; 16]),
+            ScanGeneration::initial(),
+        );
+        for prior_version in [1_u16, 2] {
+            let mut encoded = manifest.encode().expect("manifest should encode");
+            encoded[4..6].copy_from_slice(&prior_version.to_le_bytes());
+            let digest_start = encoded.len().saturating_sub(MANIFEST_DIGEST_BYTES);
+            let digest = Sha256::digest(&encoded[..digest_start]);
+            encoded[digest_start..].copy_from_slice(&digest);
+
+            assert_eq!(
+                ScanManifest::decode(&encoded),
+                Err(ManifestError::Malformed)
+            );
+        }
     }
 
     #[test]

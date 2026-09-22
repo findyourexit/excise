@@ -1089,6 +1089,12 @@ fn enter_folder() {
             .expect("could not acquire lock on terminal_events"),
     );
 
+    assert!(
+        terminal_draw_events_mirror.iter().all(|frame| {
+            !frame.contains("OPENING FOLDER") && !frame.contains("Loading folder")
+        }),
+        "completed folder navigation must never draw a page-loading surface"
+    );
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
@@ -1167,6 +1173,7 @@ fn enter_folder_medium_width() {
             "medium-width selection omitted {expected}"
         );
     }
+    assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
 }
 
@@ -1229,6 +1236,7 @@ fn enter_folder_small_width() {
 
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     assert_compact_inspector(&terminal_draw_events_mirror[1]);
+    assert_snapshot!(&terminal_draw_events_mirror[1]);
     assert_snapshot!(&terminal_draw_events_mirror[2]);
 }
 
@@ -3378,6 +3386,8 @@ fn theme_picker_commit_saves_without_an_exit_preference_prompt() {
             exclusions: Vec::new(),
             memory_mib: crate::model::DEFAULT_PROCESS_MIB,
             temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+            scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+            scan_store_dir: None,
             apparent_size: SHOW_APPARENT_SIZE,
             disable_delete_confirmation: DELETE_CONFIRMATION_ENABLED,
             reduced_motion: true,

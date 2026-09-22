@@ -4,7 +4,7 @@ expression: normalized
 ---
  EXCISE  /tmp/ex[...]_as_zero  ◆ COMPLETE         
  Used #.#M · Reclaim #.#M                         
-67 more entri[..]rows to scroll · mem 96.1M/384.0M
+67 more entri[..]rows to scroll · store 33.7K/4.0G
 ▟ LIST ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏▌  file1                      1.0M   41.9%      ▕
 ▏   file2                      1.0M   41.9%      ▕

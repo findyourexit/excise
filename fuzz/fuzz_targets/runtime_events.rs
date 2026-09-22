@@ -6,9 +6,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use excise::error::AppError;
-use excise::input::{InputEvent, InputSource};
-use excise::runtime::{run, RuntimeSettings, VirtualClock};
+use excise::fuzz::error::AppError;
+use excise::fuzz::input::{InputEvent, InputSource};
+use excise::fuzz::runtime::{RuntimeSettings, VirtualClock, run};
 use libfuzzer_sys::fuzz_target;
 use ratatui::backend::TestBackend;
 
@@ -58,7 +58,7 @@ fuzz_target!(|data: &[u8]| {
     ))));
 
     let metadata = std::fs::symlink_metadata(&root).expect("fuzz root metadata should exist");
-    let root_identity = excise::native_path::identity_for(&root, &metadata)
+    let root_identity = excise::fuzz::native_path::identity_for(&root, &metadata)
         .expect("fuzz root identity should be readable")
         .expect("fuzz root should not be a symbolic link");
     let settings = RuntimeSettings {
@@ -68,15 +68,17 @@ fuzz_target!(|data: &[u8]| {
         event_capacity: 16,
         cross_filesystems: false,
         exclusions: Vec::new(),
-        memory_mib: excise::model::DEFAULT_PROCESS_MIB,
+        memory_mib: excise::fuzz::model::DEFAULT_PROCESS_MIB,
         temporary_storage_mib: 2,
+        scan_store_mib: 2,
+        scan_store_dir: None,
         apparent_size: true,
         disable_delete_confirmation: false,
         reduced_motion: true,
-        theme: excise::theme::ThemeId::ExciseDark,
+        theme: excise::fuzz::theme::ThemeId::ExciseDark,
         ascii: false,
         mouse: false,
-        keymap: excise::config::KeyPreset::Vim,
+        keymap: excise::fuzz::config::KeyPreset::Vim,
         custom_keys: None,
         monochrome: true,
         animate_loading: false,

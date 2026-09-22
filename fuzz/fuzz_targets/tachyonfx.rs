@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use excise::animation::{ACTIVE_FRAME_INTERVAL, AnimationScheduler};
+use excise::fuzz::animation::{ACTIVE_FRAME_INTERVAL, AnimationScheduler};
 use libfuzzer_sys::fuzz_target;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;

@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
 use thiserror::Error;
 
@@ -39,6 +39,60 @@ pub(crate) fn encode_path_key_into(
     append_path_key(path, encoded)
 }
 
+/// Appends one native path component in the same order-preserving encoding
+/// used by [`append_path_key`].
+///
+/// # Errors
+///
+/// Returns an error only when the component contains a native NUL code unit.
+pub(crate) fn append_path_component_key(
+    component: &OsStr,
+    encoded: &mut Vec<u8>,
+) -> Result<(), PathKeyError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let component = component.as_bytes();
+        if component.contains(&0) {
+            return Err(PathKeyError::NulComponent);
+        }
+        encoded.reserve(component.len().saturating_add(1));
+        encoded.extend_from_slice(component);
+        encoded.push(0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let mut units = component.encode_wide();
+        let length = units.clone().count();
+        if units.any(|unit| unit == 0) {
+            return Err(PathKeyError::NulComponent);
+        }
+        encoded.reserve(length.saturating_mul(2).saturating_add(2));
+        for unit in component.encode_wide() {
+            encoded.extend_from_slice(&unit.to_be_bytes());
+        }
+        encoded.extend_from_slice(&0_u16.to_be_bytes());
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let component = component.to_str().ok_or(PathKeyError::WrongPlatform)?;
+        if component.as_bytes().contains(&0) {
+            return Err(PathKeyError::NulComponent);
+        }
+        encoded.reserve(component.len().saturating_add(1));
+        encoded.extend_from_slice(component.as_bytes());
+        encoded.push(0);
+        Ok(())
+    }
+}
+
 /// Appends one component-delimited canonical path key to an existing record.
 ///
 /// # Errors
@@ -48,78 +102,10 @@ pub(crate) fn append_path_key(
     path: &RelativePath,
     encoded: &mut Vec<u8>,
 ) -> Result<(), PathKeyError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let required = path.components().iter().fold(0_usize, |total, component| {
-            total
-                .saturating_add(component.as_bytes().len())
-                .saturating_add(1)
-        });
-        let available = encoded.capacity().saturating_sub(encoded.len());
-        if available < required {
-            encoded.reserve(required.saturating_sub(available));
-        }
-        for component in path.components() {
-            let component = component.as_bytes();
-            if component.contains(&0) {
-                return Err(PathKeyError::NulComponent);
-            }
-            encoded.extend_from_slice(component);
-            encoded.push(0);
-        }
-        Ok(())
+    for component in path.components() {
+        append_path_component_key(component, encoded)?;
     }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt as _;
-
-        let required = path.components().iter().fold(0_usize, |total, component| {
-            total
-                .saturating_add(component.encode_wide().count().saturating_mul(2))
-                .saturating_add(2)
-        });
-        let available = encoded.capacity().saturating_sub(encoded.len());
-        if available < required {
-            encoded.reserve(required.saturating_sub(available));
-        }
-        for component in path.components() {
-            for unit in component.encode_wide() {
-                if unit == 0 {
-                    return Err(PathKeyError::NulComponent);
-                }
-                encoded.extend_from_slice(&unit.to_be_bytes());
-            }
-            encoded.extend_from_slice(&0_u16.to_be_bytes());
-        }
-        Ok(())
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let required = path.components().iter().fold(0_usize, |total, component| {
-            total
-                .saturating_add(component.as_encoded_bytes().len())
-                .saturating_add(1)
-        });
-        let available = encoded.capacity().saturating_sub(encoded.len());
-        if available < required {
-            encoded.reserve(required.saturating_sub(available));
-        }
-        for component in path.components() {
-            let Some(component) = component.to_str() else {
-                return Err(PathKeyError::WrongPlatform);
-            };
-            if component.as_bytes().contains(&0) {
-                return Err(PathKeyError::NulComponent);
-            }
-            encoded.extend_from_slice(component.as_bytes());
-            encoded.push(0);
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Decodes a key written by [`encode_path_key`].

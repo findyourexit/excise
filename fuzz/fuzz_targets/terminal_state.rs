@@ -1,6 +1,6 @@
 #![no_main]
 
-use excise::{TerminalState, TerminalTransition};
+use excise::fuzz::{TerminalState, TerminalTransition};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

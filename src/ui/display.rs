@@ -29,7 +29,7 @@ use crate::ui::format::{
     DECEPTIVE_DISPLAY_MARKER, DisplaySize, display_os_str_middle, display_path_info,
     display_path_middle, display_text, display_text_info, truncate_marked, truncate_middle,
 };
-use crate::ui::grid::{DenseRectangleGrid, MapLayout, ScanVisual};
+use crate::ui::grid::{DenseRectangleGrid, MapLayout, ScanActivity, ScanVisual};
 use crate::ui::modals::{
     ConfirmBox, DeletionSafety, ErrorBox, HelpBox, MessageBox, NoticeBox, ThemePicker, WarningBox,
 };
@@ -121,6 +121,9 @@ where
                         elevated,
                         ascii,
                     );
+                } else if matches!(ui_mode, UiMode::ScanResultsUnavailable(_)) {
+                    board.settle_geometry();
+                    clear_scan_results_surface(frame.buffer_mut(), theme);
                 } else {
                     let shell = Layout::default()
                         .direction(Direction::Vertical)
@@ -293,6 +296,18 @@ where
                             full_screen,
                         );
                     }
+                    UiMode::ScanResultsUnavailable(message) => {
+                        frame.render_widget(
+                            ErrorBox::with_chrome_and_hint(
+                                message,
+                                theme,
+                                ascii,
+                                chrome,
+                                "[q/Ctrl-C] exit",
+                            ),
+                            full_screen,
+                        );
+                    }
                     UiMode::Notice(message) => {
                         frame.render_widget(
                             NoticeBox::with_chrome(message, theme, ascii, chrome),
@@ -394,6 +409,16 @@ fn prepare_truecolor_canvas(buffer: &mut Buffer, theme: Theme) {
     for cell in &mut buffer.content {
         cell.fg = theme.text_primary;
         cell.bg = theme.surface_base;
+    }
+}
+
+fn clear_scan_results_surface(buffer: &mut Buffer, theme: Theme) {
+    for cell in &mut buffer.content {
+        cell.set_symbol(" ").set_style(
+            Style::default()
+                .fg(theme.text_primary)
+                .bg(theme.surface_base),
+        );
     }
 }
 
@@ -529,9 +554,13 @@ fn scan_presentation(
 ) -> Option<ScanVisual> {
     let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. });
     let reveal_progress = board.scan_reveal_progress(now);
+    let activity = if matches!(ui_mode, UiMode::Rescanning { .. }) {
+        ScanActivity::Rescanning
+    } else {
+        ScanActivity::Scanning
+    };
     (scanning || reveal_progress.is_some()).then_some(ScanVisual {
-        scanning,
-        rescanning: matches!(ui_mode, UiMode::Rescanning { .. }),
+        activity,
         entries_indexed: ui_effects.loading_entries_indexed,
         animated,
         reveal_progress,
@@ -989,7 +1018,25 @@ fn list_item_marker(
     }
 }
 
-fn inspector_action(ui_mode: &UiMode, kind: NodeKind, ascii: bool) -> &'static str {
+fn inspector_action(
+    ui_mode: &UiMode,
+    kind: NodeKind,
+    has_verified_preview: bool,
+    ascii: bool,
+) -> &'static str {
+    if matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. }) && !has_verified_preview {
+        return match kind {
+            NodeKind::Directory => {
+                if ascii {
+                    "Enter open . deletion waits for scan preview"
+                } else {
+                    "Enter open · deletion waits for scan preview"
+                }
+            }
+            NodeKind::File | NodeKind::Link => "Deletion waits for scan preview",
+            NodeKind::Root | NodeKind::Synthetic(_) => "Actions unavailable",
+        };
+    }
     match ui_mode {
         UiMode::Normal | UiMode::Loading | UiMode::Rescanning { .. } => match kind {
             NodeKind::Root => "Scan root · cannot delete",
@@ -1197,7 +1244,7 @@ fn render_inspector_with_work(
     } else {
         inspection_reason_detail(node.unscanned_reason.as_ref())
     };
-    let action = inspector_action(ui_mode, node.kind, ascii);
+    let action = inspector_action(ui_mode, node.kind, node.snapshot.identity.is_some(), ascii);
     let space_used = format_bounds(node.metrics.allocated_bytes);
     let can_reclaim = format_bounds(node.metrics.reclaimable_bytes);
     let content_size = DisplaySize(node.metrics.apparent_bytes as f64).to_string();
@@ -1360,6 +1407,15 @@ fn render_inspector_with_work(
         .render(inner, buffer);
 }
 
+fn scan_gap_status(unreadable_path_count: u64, separator: &str) -> String {
+    let noun = if unreadable_path_count == 1 {
+        "path"
+    } else {
+        "paths"
+    };
+    format!("Scan complete {separator} {unreadable_path_count} {noun} unreadable")
+}
+
 #[allow(
     clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
@@ -1382,13 +1438,20 @@ fn header_status_line(
     theme: Theme,
 ) -> Line<'static> {
     let separator = if ascii { "." } else { "·" };
-    let (used, limit, spilled) = file_tree.model_stats();
-    let memory = format!(
-        "mem {}/{}",
-        DisplaySize(used as f64),
-        DisplaySize(limit as f64)
-    );
-    let context_width = header_status_context_width(&memory, width, ascii);
+    let storage = file_tree
+        .storage_stats()
+        .filter(|(_, limit)| *limit > 0)
+        .map(|(used, limit)| {
+            format!(
+                "store {}/{}",
+                DisplaySize(used as f64),
+                DisplaySize(limit as f64)
+            )
+        });
+    let context_width = storage.as_deref().map_or(width, |storage| {
+        header_status_context_width(storage, width, ascii)
+    });
+    let unreadable_path_count = file_tree.unreadable_path_count();
     let mut flags = vec![theme_name];
     if reduced_guardrails {
         flags.push("! REDUCED DELETE GUARD");
@@ -1404,9 +1467,6 @@ fn header_status_line(
     }
     if ascii {
         flags.push("ASCII");
-    }
-    if spilled {
-        flags.push("IDENTITY SPILL");
     }
     let mode_status = match ui_mode {
         UiMode::FilterInput { input, error } => Some(error.as_ref().map_or_else(
@@ -1438,8 +1498,7 @@ fn header_status_line(
         mode_status.or(deletion_status)
     })
     .or_else(|| {
-        (file_tree.failed_to_read() > 0)
-            .then(|| format!("? {} entries could not be read", file_tree.failed_to_read()))
+        (unreadable_path_count > 0).then(|| scan_gap_status(unreadable_path_count, separator))
     })
     .or_else(|| {
         board.overflow().is_some().then(|| {
@@ -1464,8 +1523,10 @@ fn header_status_line(
         || baseline_status(&flags, reduced_guardrails, elevated, context_width, ascii),
         |status| status_with_safety(status, reduced_guardrails, elevated, context_width, ascii),
     );
-    let status = append_header_memory(&status, &memory, width, ascii);
-
+    let status = match storage.as_deref() {
+        Some(storage) => append_header_capacity(&status, storage, width, ascii),
+        None => status,
+    };
     Line::styled(
         status,
         Style::default().fg(if reduced_guardrails || elevated {
@@ -1476,30 +1537,30 @@ fn header_status_line(
     )
 }
 
-fn header_status_context_width(memory: &str, width: u16, ascii: bool) -> u16 {
+fn header_status_context_width(capacity: &str, width: u16, ascii: bool) -> u16 {
     let separator = if ascii { " . " } else { " · " };
     let available =
-        usize::from(width).saturating_sub(memory.width().saturating_add(separator.width()));
+        usize::from(width).saturating_sub(capacity.width().saturating_add(separator.width()));
     u16::try_from(available).unwrap_or(u16::MAX)
 }
 
-fn append_header_memory(status: &str, memory: &str, width: u16, ascii: bool) -> String {
+fn append_header_capacity(status: &str, capacity: &str, width: u16, ascii: bool) -> String {
     let available = usize::from(width);
     if available == 0 {
         return String::new();
     }
     let separator = if ascii { " . " } else { " · " };
-    let reserved = memory.width().saturating_add(separator.width());
+    let reserved = capacity.width().saturating_add(separator.width());
     if reserved >= available {
-        return truncate_middle(memory, width);
+        return truncate_middle(capacity, width);
     }
     let context_width = u16::try_from(available.saturating_sub(reserved)).unwrap_or(u16::MAX);
     let status = truncate_middle(status, context_width);
 
     if status.is_empty() {
-        return truncate_middle(memory, width);
+        return truncate_middle(capacity, width);
     }
-    format!("{status}{separator}{memory}")
+    format!("{status}{separator}{capacity}")
 }
 
 fn render_control_hints(
@@ -1879,14 +1940,18 @@ fn is_monochrome_emphasis_surface(color: Color, theme: Theme) -> bool {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
+    use std::path::Path;
 
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Cell;
     use ratatui::style::Style;
 
-    use crate::model::{MIN_PROCESS_MIB, NodeId};
-    use crate::native_path::identity_for;
-    use crate::state::files::FileTree;
+    use crate::model::{ByteBounds, EntrySnapshot, NodeId, NodeKind};
+    use crate::native_path::{NativeIdentity, identity_for};
+    use crate::scan_coordinator::{RelativePath, ScanGeneration};
+    use crate::scan_store::page::{PageEntryKind, ScanPage, ScanPageEntry};
+    use crate::scan_store::path_reducer::{Coverage, SummaryMetrics};
+    use crate::state::files::snapshot_tree::SnapshotTree;
     use crate::theme::ThemeId;
 
     use super::*;
@@ -1912,11 +1977,85 @@ mod tests {
         }
     }
 
+    fn page_tree(
+        root: &Path,
+        entries: Vec<ScanPageEntry>,
+        root_coverage: Coverage,
+        unrecorded_path_count: u64,
+    ) -> SnapshotTree {
+        SnapshotTree::from_page(
+            root.to_path_buf(),
+            ScanPage {
+                generation: ScanGeneration::initial(),
+                folder: RelativePath::root(),
+                folder_metrics: SummaryMetrics::default(),
+                folder_coverage: root_coverage,
+                root_metrics: SummaryMetrics::default(),
+                root_coverage,
+                entries,
+                next_after: None,
+                shared_allocation: None,
+                unrecorded_path_count,
+            },
+            4 * 1024 * 1024,
+            (0, 0),
+        )
+        .expect("bounded snapshot fixture should fit")
+    }
+
+    fn loading_tree(root: &Path) -> SnapshotTree {
+        SnapshotTree::loading(
+            root.to_path_buf(),
+            ScanGeneration::initial(),
+            4 * 1024 * 1024,
+            (0, 0),
+        )
+        .expect("loading snapshot fixture should fit")
+    }
+
+    fn concrete_file_tree(
+        root: &Path,
+        path: &Path,
+        metadata: &fs::Metadata,
+        identity: &NativeIdentity,
+    ) -> (SnapshotTree, ScanPageEntry) {
+        let relative = RelativePath::from_path(
+            path.strip_prefix(root)
+                .expect("fixture entry should be below root"),
+        )
+        .expect("fixture path should be canonical");
+        let bytes = u128::from(metadata.len());
+        let entry = ScanPageEntry {
+            path: relative,
+            kind: PageEntryKind::File,
+            metrics: SummaryMetrics::leaf(
+                bytes,
+                ByteBounds::exact(bytes),
+                ByteBounds::exact(bytes),
+            ),
+            coverage: Coverage::Complete,
+            snapshot: Some(EntrySnapshot {
+                identity: Some(identity.clone()),
+                kind: NodeKind::File,
+                apparent_bytes: bytes,
+                allocated_bytes: Some(bytes),
+                modified_nanos: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos()),
+            }),
+        };
+        (
+            page_tree(root, vec![entry.clone()], Coverage::Complete, 0),
+            entry,
+        )
+    }
+
     #[test]
     fn display_uses_the_full_surface_for_animation_cadence() {
         let root = tempfile::tempdir().expect("animation root should exist");
-        let file_tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
-            .expect("file tree should be created");
+        let file_tree = loading_tree(root.path());
         let mut display =
             Display::new(TestBackend::new(200, 100)).expect("display should be created");
         let mut board = Board::new();
@@ -2072,7 +2211,7 @@ mod tests {
         assert!(enter.style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(action.style.fg, Some(theme.text_secondary));
         assert!(!action.style.add_modifier.contains(Modifier::BOLD));
-        assert!(!line_text(&command).contains("mem "));
+        assert!(!line_text(&command).contains("store "));
     }
 
     #[test]
@@ -2082,7 +2221,7 @@ mod tests {
         let footer_text = line_text(&footer);
 
         assert_eq!(footer_text, " Enter apply  Esc cancel");
-        assert!(!footer_text.contains("mem "));
+        assert!(!footer_text.contains("store "));
         assert!(!footer_text.contains("open/rescan"));
         for key in ["Enter", "Esc"] {
             let span = footer
@@ -2096,12 +2235,9 @@ mod tests {
     }
 
     #[test]
-    fn header_status_holds_memory_and_read_failures_above_controls() {
+    fn header_status_holds_read_failures_above_controls() {
         let root = tempfile::tempdir().expect("status root should exist");
-        let mut tree = FileTree::new(root.path().to_path_buf(), false, MIN_PROCESS_MIB)
-            .expect("status tree should initialize");
-        tree.increment_failed_to_read();
-        tree.increment_failed_to_read();
+        let tree = page_tree(root.path(), Vec::new(), Coverage::Complete, 2);
         let board = Board::new();
         let effects = UiEffects::new();
         let deletion_work = DeletionWork::new();
@@ -2126,17 +2262,17 @@ mod tests {
         let status = line_text(&status);
         let footer = line_text(&footer);
 
-        assert!(status.contains("2 entries could not be read"));
-        assert!(status.contains("mem "));
-        assert!(!footer.contains("entries could not be read"));
-        assert!(!footer.contains("mem "));
+        assert_eq!(scan_gap_status(1, "·"), "Scan complete · 1 path unreadable");
+        assert!(status.contains("Scan complete · 2 paths unreadable"));
+        assert!(!status.contains("store "));
+        assert!(!footer.contains("paths unreadable"));
+        assert!(!footer.contains("store "));
     }
 
     #[test]
     fn instrument_header_renders_status_on_its_third_row() {
         let root = tempfile::tempdir().expect("header root should exist");
-        let tree = FileTree::new(root.path().to_path_buf(), false, MIN_PROCESS_MIB)
-            .expect("header tree should initialize");
+        let tree = page_tree(root.path(), Vec::new(), Coverage::Complete, 0);
         let theme = Theme::for_id(ThemeId::ExciseDark);
         let area = Rect::new(0, 0, 80, 3);
         let mut buffer = Buffer::empty(area);
@@ -2150,7 +2286,7 @@ mod tests {
                 theme,
                 ascii: false,
                 monochrome: false,
-                status: Line::from("STATUS · mem 0B/384.0M"),
+                status: Line::from("STATUS · store 0B/4.0G"),
             },
         );
 
@@ -2158,7 +2294,7 @@ mod tests {
             row.push_str(buffer[(x, area.y + 2)].symbol());
             row
         });
-        assert!(status.contains("STATUS · mem"));
+        assert!(status.contains("STATUS · store"));
     }
 
     #[test]
@@ -2530,8 +2666,7 @@ mod tests {
     #[test]
     fn high_contrast_scrim_stays_separate_from_the_modal_surface() {
         let root = tempfile::tempdir().expect("modal root should exist");
-        let file_tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
-            .expect("file tree should be created");
+        let file_tree = loading_tree(root.path());
         let mut display =
             Display::new(TestBackend::new(80, 24)).expect("display should be created");
         let mut board = Board::new();
@@ -2576,11 +2711,59 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_scan_dialog_hides_the_compacted_live_map() {
+        let root = tempfile::tempdir().expect("modal root should exist");
+        let file_tree = loading_tree(root.path());
+        let mut display =
+            Display::new(TestBackend::new(80, 24)).expect("display should be created");
+        let mut board = Board::new();
+        let mut summarized = map_file(1, 8, 1.0);
+        summarized.name = OsString::from("SUMMARIZED");
+        board.change_files(vec![summarized]);
+        let effects = UiEffects::new();
+        let deletion_work = DeletionWork::new();
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        let message = "Excise could not build a complete folder map.";
+
+        display
+            .render(
+                &file_tree,
+                &mut board,
+                &UiMode::ScanResultsUnavailable(message.to_string()),
+                &effects,
+                &deletion_work,
+                &mut animation,
+                Duration::ZERO,
+                "test",
+                Theme::for_id(ThemeId::ExciseDark),
+                false,
+                false,
+                KeyPreset::Vim,
+                None,
+                false,
+                false,
+                false,
+                false,
+            )
+            .expect("unavailable dialog should render");
+
+        let text = display.terminal.backend().buffer().content.iter().fold(
+            String::new(),
+            |mut text, cell| {
+                text.push_str(cell.symbol());
+                text
+            },
+        );
+        assert!(text.contains("ERROR"));
+        assert!(text.contains("complete folder map"));
+        assert!(!text.contains("SUMMARIZED"));
+    }
+
+    #[test]
     fn scheduled_header_effect_cannot_repaint_compact_error_modal() {
         let area = Rect::new(0, 0, 30, 7);
         let root = tempfile::tempdir().expect("modal root should exist");
-        let file_tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
-            .expect("file tree should be created");
+        let file_tree = loading_tree(root.path());
         let mut display = Display::new(TestBackend::new(area.width, area.height))
             .expect("display should be created");
         let mut board = Board::new();
@@ -2718,21 +2901,22 @@ mod tests {
     #[test]
     fn inspector_actions_remain_accurate_across_modes() {
         assert_eq!(
-            inspector_action(&UiMode::Normal, NodeKind::Directory, false),
+            inspector_action(&UiMode::Normal, NodeKind::Directory, true, false),
             "Enter open · Backspace delete"
         );
         assert_eq!(
-            inspector_action(&UiMode::Normal, NodeKind::Directory, true),
+            inspector_action(&UiMode::Normal, NodeKind::Directory, true, true),
             "Enter open . Backspace delete"
         );
         assert_eq!(
-            inspector_action(&UiMode::Normal, NodeKind::File, false),
+            inspector_action(&UiMode::Normal, NodeKind::File, true, false),
             "Backspace delete"
         );
         assert_eq!(
             inspector_action(
                 &UiMode::Normal,
                 NodeKind::Synthetic(SyntheticKind::Other),
+                true,
                 false,
             ),
             "Grouped items · cannot open or delete"
@@ -2741,6 +2925,7 @@ mod tests {
             inspector_action(
                 &UiMode::Loading,
                 NodeKind::Synthetic(SyntheticKind::Aggregate),
+                true,
                 false,
             ),
             "Enter open · Backspace delete"
@@ -2752,6 +2937,7 @@ mod tests {
                     error: None,
                 },
                 NodeKind::File,
+                true,
                 false,
             ),
             "Filtering · Enter apply · Esc cancel"
@@ -2762,18 +2948,24 @@ mod tests {
                     target: std::path::PathBuf::new(),
                 },
                 NodeKind::File,
+                true,
                 false,
             ),
             "Backspace delete"
         );
         assert_eq!(
-            inspector_action(&UiMode::Loading, NodeKind::File, false),
+            inspector_action(&UiMode::Loading, NodeKind::File, true, false),
             "Backspace delete"
+        );
+        assert_eq!(
+            inspector_action(&UiMode::Loading, NodeKind::File, false, false),
+            "Deletion waits for scan preview"
         );
         assert_eq!(
             inspector_action(
                 &UiMode::Loading,
                 NodeKind::Synthetic(SyntheticKind::Other),
+                true,
                 false,
             ),
             "Grouped items · cannot open or delete"
@@ -2789,18 +2981,11 @@ mod tests {
         let identity = identity_for(&path, &metadata)
             .expect("fixture identity should be readable")
             .expect("fixture should not be a link");
-        let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
-            .expect("file tree should be created");
-        tree.add_entry(&metadata, &path, &identity)
-            .expect("fixture should be added")
-            .expect("fixture should remain materialized");
-        tree.complete_directory(root.path(), None)
-            .expect("fixture root should complete");
-        tree.finalize().expect("fixture tree should finalize");
+        let (tree, entry) = concrete_file_tree(root.path(), &path, &metadata, &identity);
 
         let mut board = Board::new();
         board.change_area(Rect::new(0, 0, 78, 10));
-        board.change_files(tree.files_in_current_folder(0));
+        board.change_files(tree.files_in_current_folder(0, true));
         board.set_selected_index(0);
         let area = Rect::new(0, 0, 80, INSPECTOR_HEIGHT);
         let mut buffer = Buffer::empty(area);
@@ -2848,9 +3033,15 @@ mod tests {
             );
         }
 
-        let target = tree
-            .deletion_target_for_path(&path)
-            .expect("selected file should retain a deletion target");
+        let relative = entry.path.clone();
+        let target = SnapshotTree::deletion_target_from_entry(
+            root.path().to_path_buf(),
+            NodeId(1),
+            &relative,
+            entry,
+            true,
+        )
+        .expect("selected file should retain a deletion target");
         let mut work = DeletionWork::new();
         work.enqueue_confirmation(target, true, 1024, Duration::ZERO)
             .expect("background deletion should retain the selected target");
@@ -2878,181 +3069,67 @@ mod tests {
     }
 
     #[test]
-    fn grouped_summary_inspector_explains_combined_items_without_fake_identity() {
-        let root = tempfile::tempdir().expect("inspector root should exist");
-        let matched = root.path().join("visible.log");
-        let grouped = root.path().join("hidden.tmp");
-        fs::write(&matched, b"visible").expect("visible fixture should exist");
-        fs::write(&grouped, b"grouped").expect("grouped fixture should exist");
-        let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
-            .expect("file tree should be created");
-        tree.begin_rescan(
+    fn provisional_directory_inspector_names_scanning_not_read_error() {
+        let root = tempfile::tempdir().expect("snapshot root should exist");
+        let folder = root.path().join("Library");
+        fs::create_dir(&folder).expect("fixture directory should exist");
+        let metadata = fs::symlink_metadata(&folder).expect("fixture metadata should exist");
+        let identity = identity_for(&folder, &metadata)
+            .expect("fixture identity should resolve")
+            .expect("fixture should be concrete");
+        let relative =
+            RelativePath::from_path(Path::new("Library")).expect("fixture path should be relative");
+        let metrics = SummaryMetrics::leaf(0, ByteBounds::exact(0), ByteBounds::exact(0));
+        let tree = SnapshotTree::from_provisional_page(
             root.path().to_path_buf(),
-            Some(crate::filter::FilterPattern::new("*.log").expect("filter should compile")),
+            ScanPage {
+                generation: ScanGeneration::initial(),
+                folder: RelativePath::root(),
+                folder_metrics: metrics,
+                folder_coverage: Coverage::Uncertain,
+                root_metrics: metrics,
+                root_coverage: Coverage::Uncertain,
+                entries: vec![ScanPageEntry {
+                    path: relative,
+                    kind: PageEntryKind::Directory,
+                    metrics,
+                    coverage: Coverage::Uncertain,
+                    snapshot: Some(EntrySnapshot {
+                        identity: Some(identity),
+                        kind: NodeKind::Directory,
+                        apparent_bytes: 0,
+                        allocated_bytes: None,
+                        modified_nanos: None,
+                    }),
+                }],
+                next_after: None,
+                shared_allocation: None,
+                unrecorded_path_count: 0,
+            },
+            4 * 1024 * 1024,
+            (0, 0),
         )
-        .expect("filtered rescan should begin");
-        for path in [&matched, &grouped] {
-            let metadata = fs::symlink_metadata(path).expect("fixture metadata should exist");
-            let identity = identity_for(path, &metadata)
-                .expect("fixture identity should be readable")
-                .expect("fixture should not be a link");
-            tree.add_entry(&metadata, path, &identity)
-                .expect("fixture should be accepted");
-        }
-        tree.finish_rescan().expect("filtered rescan should finish");
-        let files = tree.files_in_current_folder(0);
-        let grouped_id = files
-            .iter()
-            .find(|file| file.synthetic_kind == Some(SyntheticKind::Other))
-            .map(|file| file.node_id)
-            .expect("grouped total should be visible");
+        .expect("provisional snapshot should fit");
         let mut board = Board::new();
-        board.change_area(Rect::new(0, 0, 78, 12));
-        board.change_files(files);
-        assert!(board.select_node(grouped_id));
-
-        let area = Rect::new(0, 0, 80, 18);
-        let mut buffer = Buffer::empty(area);
+        board.change_area(Rect::new(0, 0, 78, 10));
+        board.change_files(tree.files_in_current_folder(0, true));
+        board.set_selected_index(0);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, INSPECTOR_HEIGHT));
         render_inspector(
             &mut buffer,
-            area,
+            Rect::new(0, 0, 80, INSPECTOR_HEIGHT),
             &tree,
             &board,
-            &UiMode::Normal,
+            &UiMode::Loading,
             Theme::for_id(ThemeId::ExciseDark),
             false,
             false,
             Duration::ZERO,
         );
         let text = buffer.content.iter().map(Cell::symbol).collect::<String>();
-        for expected in [
-            "Grouped items",
-            "GROUPED",
-            "grouped total",
-            "Grouped items · cannot open or delete",
-            "Contains 1 item not shown separately",
-            "Includes items not shown as individual tiles",
-        ] {
-            assert!(
-                text.contains(expected),
-                "missing grouped explanation: {expected}"
-            );
-        }
-        for absent in ["Item check:", "Known names:"] {
-            assert!(
-                !text.contains(absent),
-                "grouped totals must not present inapplicable identity detail: {absent}"
-            );
-        }
-    }
-
-    #[test]
-    fn deceptive_inspector_reason_marker_stays_visible_when_narrow() {
-        let root = tempfile::tempdir().expect("inspector root should exist");
-        let path = root.path().join("selected-entry");
-        fs::write(&path, b"selected contents").expect("fixture should be written");
-        let metadata = fs::symlink_metadata(&path).expect("fixture metadata should exist");
-        let identity = identity_for(&path, &metadata)
-            .expect("fixture identity should be readable")
-            .expect("fixture should not be a link");
-        let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
-            .expect("file tree should be created");
-        tree.add_entry(&metadata, &path, &identity)
-            .expect("fixture should be added")
-            .expect("fixture should remain materialized");
-        tree.record_unscanned(
-            &path,
-            UnscannedReason::Metadata("metadata failed\t\u{202e}name\u{1b}[31m".to_string()),
-        )
-        .expect("hostile reason should be recorded");
-        tree.complete_directory(root.path(), None)
-            .expect("fixture root should complete");
-        tree.finalize().expect("fixture tree should finalize");
-
-        let mut board = Board::new();
-        board.change_area(Rect::new(0, 0, 78, 10));
-        board.change_files(tree.files_in_current_folder(0));
-        board.set_selected_index(0);
-
-        for (width, height) in [(4, 64), (12, 40), (24, 24), (52, 10), (80, 10), (80, 14)] {
-            let area = Rect::new(0, 0, width, height);
-            let mut buffer = Buffer::empty(area);
-            render_inspector(
-                &mut buffer,
-                area,
-                &tree,
-                &board,
-                &UiMode::Normal,
-                Theme::for_id(ThemeId::ExciseDark),
-                false,
-                false,
-                Duration::ZERO,
-            );
-            let rendered = buffer.content.iter().fold(String::new(), |mut text, cell| {
-                text.push_str(cell.symbol());
-                text
-            });
-            assert!(!rendered.chars().any(char::is_control));
-            assert!(!rendered.contains('\u{202e}'));
-            assert!(
-                rendered.contains(DECEPTIVE_DISPLAY_MARKER) || rendered.contains('!'),
-                "deception marker lost at inspector size {width}x{height}: {rendered:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn premarked_inspector_reason_marker_stays_visible_when_narrow() {
-        let root = tempfile::tempdir().expect("inspector root should exist");
-        let path = root.path().join("selected-entry");
-        fs::write(&path, b"selected contents").expect("fixture should be written");
-        let metadata = fs::symlink_metadata(&path).expect("fixture metadata should exist");
-        let identity = identity_for(&path, &metadata)
-            .expect("fixture identity should be readable")
-            .expect("fixture should not be a link");
-        let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
-            .expect("file tree should be created");
-        tree.add_entry(&metadata, &path, &identity)
-            .expect("fixture should be added")
-            .expect("fixture should remain materialized");
-        tree.record_unscanned(
-            &path,
-            UnscannedReason::Metadata(format!("{DECEPTIVE_DISPLAY_MARKER} metadata failed")),
-        )
-        .expect("premarked reason should be recorded");
-        tree.complete_directory(root.path(), None)
-            .expect("fixture root should complete");
-        tree.finalize().expect("fixture tree should finalize");
-
-        let mut board = Board::new();
-        board.change_area(Rect::new(0, 0, 78, 10));
-        board.change_files(tree.files_in_current_folder(0));
-        board.set_selected_index(0);
-
-        for (width, height) in [(4, 64), (12, 40), (24, 24), (52, 10), (80, 10), (80, 14)] {
-            let area = Rect::new(0, 0, width, height);
-            let mut buffer = Buffer::empty(area);
-            render_inspector(
-                &mut buffer,
-                area,
-                &tree,
-                &board,
-                &UiMode::Normal,
-                Theme::for_id(ThemeId::ExciseDark),
-                false,
-                false,
-                Duration::ZERO,
-            );
-            let rendered = buffer.content.iter().fold(String::new(), |mut text, cell| {
-                text.push_str(cell.symbol());
-                text
-            });
-            assert!(!rendered.chars().any(char::is_control));
-            assert!(
-                rendered.contains(DECEPTIVE_DISPLAY_MARKER) || rendered.contains('!'),
-                "premarked deception marker lost at inspector size {width}x{height}: {rendered:?}"
-            );
-        }
+        assert!(text.contains("SCANNING"));
+        assert!(!text.contains("READ ERROR"));
+        assert!(!text.contains("could not read"));
     }
 
     #[test]

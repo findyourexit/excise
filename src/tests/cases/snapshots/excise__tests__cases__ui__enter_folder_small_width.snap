@@ -4,7 +4,7 @@ expression: normalized
 ---
  EXCISE  /tmp/excise_[...]r_small_width  ◆ COMPLETE         
  Used ##.#K · Can reclaim ##.#K · Content 16.0K · 4 items   
-Excise · REDUCED MOTION · mem 96.0M/384.0M                  
+Excise · REDUCED MOTION · store 2.3K/4.0G                   
 ▟ LIST ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏▌▸ subfolder_wi[...]e_a_long_name       8.0K   50.0%      ▕
 ▏   file2                                4.0K   25.0%      ▕

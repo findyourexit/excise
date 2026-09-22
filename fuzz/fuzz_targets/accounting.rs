@@ -1,6 +1,6 @@
 #![no_main]
 
-use excise::model::{ByteBounds, IdentityStore, NodeId};
+use excise::fuzz::model::{ByteBounds, IdentityStore, NodeId};
 use file_id::FileId;
 use libfuzzer_sys::fuzz_target;
 

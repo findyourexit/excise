@@ -7,6 +7,11 @@ use std::time::Duration;
 use crate::deletion::DeletionPlan;
 use crate::model::NodeId;
 use crate::native_path::safe_display_path_text;
+use crate::scan_coordinator::{
+    CompletionOutcome, RelativePath, RequeueOutcome, ScanCoordinator, ScanGeneration,
+    WorkCompletion, WorkKey, WorkKind, WorkLease, WorkPriority,
+};
+use crate::scan_session::ScanSessionId;
 
 use super::FileToDelete;
 
@@ -124,6 +129,7 @@ pub(crate) struct WorkRailItem<'a> {
 struct DeletionWorkItem {
     id: DeletionWorkId,
     path: PathBuf,
+    relative_path: RelativePath,
     label: Box<str>,
     /// A lightweight stale-refresh seed; planner input itself is moved to the worker.
     target: Option<FileToDelete>,
@@ -156,12 +162,12 @@ enum DeletionWorkStage {
     CancellingPlanning,
 }
 
-/// Owner-loop deletion state. A single planner and a single executor have independent
-/// reservations, while every retained target stays bounded and non-overlapping.
+/// Owner-loop deletion state. The coordinator ledger owns every active plan
+/// and mutation lease, while this bounded rail retains only user-facing work.
 pub(crate) struct DeletionWork {
     items: VecDeque<DeletionWorkItem>,
-    planner_in_flight: Option<DeletionWorkId>,
-    executor_in_flight: Option<DeletionWorkId>,
+    coordinator: ScanCoordinator,
+    leases: Vec<(DeletionWorkId, WorkLease)>,
     next_id: u64,
 }
 
@@ -174,10 +180,18 @@ impl Default for DeletionWork {
 impl DeletionWork {
     #[must_use]
     pub(crate) fn new() -> Self {
+        Self::new_for_session(
+            ScanSessionId::from_bytes([0; 16]),
+            ScanGeneration::initial(),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn new_for_session(session: ScanSessionId, generation: ScanGeneration) -> Self {
         Self {
             items: VecDeque::with_capacity(MAX_DELETION_WORK_ITEMS),
-            planner_in_flight: None,
-            executor_in_flight: None,
+            coordinator: ScanCoordinator::new(session, generation),
+            leases: Vec::with_capacity(MAX_DELETION_WORK_ITEMS),
             next_id: 0,
         }
     }
@@ -230,11 +244,16 @@ impl DeletionWork {
         {
             return Err(DeletionWorkError::OverlappingTarget);
         }
+        let relative_path = target.as_ref().map_or_else(RelativePath::root, |target| {
+            RelativePath::from_components(target.path_to_file.clone())
+                .expect("deletion targets must contain normalized relative components")
+        });
         let id = self.next_work_id();
         self.items.push_back(DeletionWorkItem {
             id,
             label: safe_display_path_text(&path).into_boxed_str(),
             path,
+            relative_path,
             target,
             plan: None,
             stage,
@@ -246,24 +265,34 @@ impl DeletionWork {
     /// Starts at most one identity-planning request without blocking the executor lane.
     #[must_use]
     pub(crate) fn next_planning_command(&mut self) -> Option<DeletionWorkCommand> {
-        if self.planner_in_flight.is_some() {
+        if self.items.iter().any(|item| {
+            matches!(
+                item.stage,
+                DeletionWorkStage::Planning | DeletionWorkStage::CancellingPlanning
+            )
+        }) {
             return None;
         }
-        let item = self
+        let index = self
             .items
-            .iter_mut()
-            .find(|item| matches!(item.stage, DeletionWorkStage::QueuedPlanning { .. }))?;
-        let work_id = item.id;
+            .iter()
+            .position(|item| matches!(item.stage, DeletionWorkStage::QueuedPlanning { .. }))?;
+        let work_id = self.items[index].id;
+        let lease = self.acquire_lease(
+            WorkKind::PlanDeletion,
+            self.items[index].relative_path.clone(),
+            WorkPriority::Foreground,
+        )?;
         let DeletionWorkStage::QueuedPlanning {
             target,
             reduced_guardrails,
             maximum_bytes,
-        } = std::mem::replace(&mut item.stage, DeletionWorkStage::Planning)
+        } = std::mem::replace(&mut self.items[index].stage, DeletionWorkStage::Planning)
         else {
             unreachable!("queued planning stage must remain queued planning")
         };
-        item.target = Some(target.display_copy());
-        self.planner_in_flight = Some(work_id);
+        self.items[index].target = Some(target.display_copy());
+        self.remember_lease(work_id, lease);
         Some(DeletionWorkCommand::Plan {
             work_id,
             target,
@@ -276,7 +305,11 @@ impl DeletionWork {
     /// adjacent, so a successful revalidation cannot race a later command queue turn.
     #[must_use]
     pub(crate) fn next_execution_command(&mut self) -> Option<DeletionWorkCommand> {
-        if self.executor_in_flight.is_some() {
+        if self
+            .items
+            .iter()
+            .any(|item| matches!(item.stage, DeletionWorkStage::Executing { .. }))
+        {
             return None;
         }
         let index = self
@@ -284,8 +317,18 @@ impl DeletionWork {
             .iter()
             .position(|item| matches!(item.stage, DeletionWorkStage::QueuedExecution))?;
         let work_id = self.items[index].id;
-        let plan = self.items[index].plan.take()?;
+        let lease = self.acquire_lease(
+            WorkKind::ExecuteDeletion,
+            self.items[index].relative_path.clone(),
+            WorkPriority::Safety,
+        )?;
+        self.remember_lease(work_id, lease);
+        let Some(plan) = self.items[index].plan.take() else {
+            let _ = self.finish_lease(work_id, WorkCompletion::Failed);
+            return None;
+        };
         if self.items[index].path != plan.target.full_path() {
+            let _ = self.finish_lease(work_id, WorkCompletion::Invalidated);
             let _ = self.items.remove(index);
             return None;
         }
@@ -295,7 +338,6 @@ impl DeletionWork {
             planned_entries,
             progress: Arc::clone(&progress),
         };
-        self.executor_in_flight = Some(work_id);
         Some(DeletionWorkCommand::Execute {
             work_id,
             plan,
@@ -306,10 +348,38 @@ impl DeletionWork {
     /// Restores a command only when its worker lane did not accept it.
     pub(crate) fn restore_unsubmitted(&mut self, command: DeletionWorkCommand) {
         let work_id = command.work_id();
-        let Some(item) = self.items.iter_mut().find(|item| item.id == work_id) else {
-            self.clear_lane(work_id);
+        if !self.items.iter().any(|item| item.id == work_id) {
+            let _ = self.finish_lease(work_id, WorkCompletion::Cancelled);
             return;
-        };
+        }
+        let restoreable = self
+            .items
+            .iter()
+            .find(|item| item.id == work_id)
+            .is_some_and(|item| {
+                matches!(
+                    (&command, &item.stage),
+                    (
+                        DeletionWorkCommand::Plan { .. },
+                        DeletionWorkStage::Planning
+                    ) | (
+                        DeletionWorkCommand::Execute { .. },
+                        DeletionWorkStage::Executing { .. }
+                    )
+                )
+            });
+        if !restoreable {
+            let _ = self.finish_lease(work_id, WorkCompletion::Cancelled);
+            return;
+        }
+        if !self.requeue_lease(work_id) {
+            return;
+        }
+        let item = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == work_id)
+            .expect("retained deletion work should remain addressable");
         match (command, &mut item.stage) {
             (
                 DeletionWorkCommand::Plan {
@@ -334,9 +404,8 @@ impl DeletionWork {
                 item.stage = DeletionWorkStage::QueuedExecution;
                 let _ = progress;
             }
-            _ => return,
+            _ => {}
         }
-        self.clear_lane(work_id);
     }
 
     pub(crate) fn planning_succeeded(
@@ -344,10 +413,6 @@ impl DeletionWork {
         work_id: DeletionWorkId,
         plan: Box<DeletionPlan>,
     ) -> bool {
-        if self.planner_in_flight != Some(work_id) {
-            return false;
-        }
-        self.planner_in_flight = None;
         let Some(index) = self.items.iter().position(|item| item.id == work_id) else {
             return false;
         };
@@ -355,41 +420,37 @@ impl DeletionWork {
             self.items[index].stage,
             DeletionWorkStage::CancellingPlanning
         ) {
+            let _ = self.finish_lease(work_id, WorkCompletion::Cancelled);
             let _ = self.items.remove(index);
             return false;
         }
-        let item = &mut self.items[index];
-        if !matches!(item.stage, DeletionWorkStage::Planning)
-            || item.path != plan.target.full_path()
+        if !matches!(self.items[index].stage, DeletionWorkStage::Planning)
+            || self.items[index].path != plan.target.full_path()
         {
+            let _ = self.finish_lease(work_id, WorkCompletion::Failed);
             let _ = self.items.remove(index);
             return false;
         }
-        item.plan = Some(plan);
-        item.stage = DeletionWorkStage::QueuedExecution;
+        if !self.finish_lease(work_id, WorkCompletion::Succeeded) {
+            let _ = self.items.remove(index);
+            return false;
+        }
+        self.items[index].plan = Some(plan);
+        self.items[index].stage = DeletionWorkStage::QueuedExecution;
         true
     }
 
     pub(crate) fn planning_cancelled(&mut self, work_id: DeletionWorkId) -> bool {
-        self.planning_failed(work_id)
+        self.finish_planning(work_id, WorkCompletion::Cancelled)
     }
 
     pub(crate) fn planning_failed(&mut self, work_id: DeletionWorkId) -> bool {
-        if self.planner_in_flight != Some(work_id) {
-            return false;
-        }
-        self.planner_in_flight = None;
-        self.remove_if(work_id, |stage| {
-            matches!(
-                stage,
-                DeletionWorkStage::Planning | DeletionWorkStage::CancellingPlanning
-            )
-        })
+        self.finish_planning(work_id, WorkCompletion::Failed)
     }
 
     /// A changed or missing target is never retried from prior consent.
     pub(crate) fn planning_stale(&mut self, work_id: DeletionWorkId) -> bool {
-        self.planning_failed(work_id)
+        self.finish_planning(work_id, WorkCompletion::Invalidated)
     }
 
     #[must_use]
@@ -481,7 +542,7 @@ impl DeletionWork {
         };
         if matches!(self.items[index].stage, DeletionWorkStage::Planning) {
             self.items[index].stage = DeletionWorkStage::CancellingPlanning;
-            return self.planner_in_flight == Some(work_id);
+            return self.has_lease(work_id);
         }
         if matches!(
             self.items[index].stage,
@@ -496,15 +557,23 @@ impl DeletionWork {
     }
 
     /// Cancels every non-mutating operation. An in-flight planner remains
-    /// reserved until it acknowledges cancellation.
+    /// leased until its worker acknowledges the cancellation.
     pub(crate) fn cancel_pending(&mut self) -> bool {
-        let mut planner_cancelled = false;
-        for item in &mut self.items {
-            if matches!(item.stage, DeletionWorkStage::Planning) {
-                item.stage = DeletionWorkStage::CancellingPlanning;
-                planner_cancelled |= self.planner_in_flight == Some(item.id);
-            }
+        let planning = self
+            .items
+            .iter()
+            .filter(|item| matches!(item.stage, DeletionWorkStage::Planning))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        for work_id in &planning {
+            let item = self
+                .items
+                .iter_mut()
+                .find(|item| item.id == *work_id)
+                .expect("retained planning work should remain addressable");
+            item.stage = DeletionWorkStage::CancellingPlanning;
         }
+        let planner_cancelled = planning.iter().any(|work_id| self.has_lease(*work_id));
         self.items.retain(|item| {
             matches!(
                 item.stage,
@@ -514,39 +583,32 @@ impl DeletionWork {
         planner_cancelled
     }
 
-    /// A changed target is never retried from the earlier confirmation.
-    pub(crate) fn execution_stale(&mut self, work_id: DeletionWorkId) -> bool {
-        if self.executor_in_flight != Some(work_id) {
-            return false;
-        }
-        self.executor_in_flight = None;
-        self.remove_if(work_id, |stage| {
-            matches!(stage, DeletionWorkStage::Executing { .. })
-        })
+    pub(crate) fn execution_failed(&mut self, work_id: DeletionWorkId) -> bool {
+        self.finish_execution(work_id, WorkCompletion::Failed)
     }
 
-    pub(crate) fn execution_finished(&mut self, work_id: DeletionWorkId) -> bool {
-        if self.executor_in_flight != Some(work_id) {
-            return false;
-        }
-        self.executor_in_flight = None;
-        self.remove_if(work_id, |stage| {
-            matches!(stage, DeletionWorkStage::Executing { .. })
-        })
+    /// A changed or missing target is never retried from the earlier consent.
+    pub(crate) fn execution_stale(&mut self, work_id: DeletionWorkId) -> bool {
+        self.finish_execution(work_id, WorkCompletion::Invalidated)
+    }
+
+    pub(crate) fn execution_finished(
+        &mut self,
+        work_id: DeletionWorkId,
+        completion: WorkCompletion,
+    ) -> bool {
+        self.finish_execution(work_id, completion)
     }
 
     pub(crate) fn discard(&mut self, work_id: DeletionWorkId) -> bool {
-        let removed = self.remove_if(work_id, |_| true);
-        if removed {
-            self.clear_lane(work_id);
-        }
-        removed
+        let _ = self.finish_lease(work_id, WorkCompletion::Cancelled);
+        self.remove_if(work_id, |_| true)
     }
 
-    /// Clears a planner reservation after a late cancellation event whose item was removed.
+    /// Resolves a late cancellation after its item was already removed.
     pub(crate) fn discard_cancelled_event(&mut self, work_id: DeletionWorkId) {
         if !self.items.iter().any(|item| item.id == work_id) {
-            self.clear_lane(work_id);
+            let _ = self.finish_lease(work_id, WorkCompletion::Cancelled);
         }
     }
 
@@ -566,12 +628,12 @@ impl DeletionWork {
                     | DeletionWorkStage::Executing { .. }
                     | DeletionWorkStage::CancellingPlanning
             )
-        }) || self.planner_in_flight.is_some()
+        })
     }
 
     #[must_use]
     pub(crate) fn has_active_mutation(&self) -> bool {
-        self.executor_in_flight.is_some()
+        self.coordinator.snapshot().active_deletion_execution()
             && self
                 .items
                 .iter()
@@ -685,11 +747,6 @@ impl DeletionWork {
                 }
             }
         }
-        if let Some(work_id) = self.planner_in_flight
-            && !self.items.iter().any(|item| item.id == work_id)
-        {
-            summary.pending_operations = summary.pending_operations.saturating_add(1);
-        }
         summary
     }
 
@@ -701,13 +758,95 @@ impl DeletionWork {
         DeletionWorkId(self.next_id)
     }
 
-    fn clear_lane(&mut self, work_id: DeletionWorkId) {
-        if self.planner_in_flight == Some(work_id) {
-            self.planner_in_flight = None;
+    fn acquire_lease(
+        &mut self,
+        kind: WorkKind,
+        relative_path: RelativePath,
+        priority: WorkPriority,
+    ) -> Option<WorkLease> {
+        let key = WorkKey::new(
+            self.coordinator.session(),
+            self.coordinator.generation(),
+            kind,
+            relative_path,
+        );
+        if !matches!(
+            self.coordinator.schedule(key.clone(), priority),
+            crate::scan_coordinator::ScheduleOutcome::Enqueued
+                | crate::scan_coordinator::ScheduleOutcome::PriorityRaised
+                | crate::scan_coordinator::ScheduleOutcome::AlreadyPending
+        ) {
+            return None;
         }
-        if self.executor_in_flight == Some(work_id) {
-            self.executor_in_flight = None;
+        let lease = self.coordinator.lease_next()?;
+        if lease.key() == &key {
+            return Some(lease);
         }
+        let _ = self.coordinator.requeue(&lease);
+        None
+    }
+
+    fn remember_lease(&mut self, work_id: DeletionWorkId, lease: WorkLease) {
+        if let Some((_, current)) = self.leases.iter_mut().find(|(id, _)| *id == work_id) {
+            *current = lease;
+        } else {
+            debug_assert!(self.leases.len() < MAX_DELETION_WORK_ITEMS);
+            self.leases.push((work_id, lease));
+        }
+    }
+
+    fn has_lease(&self, work_id: DeletionWorkId) -> bool {
+        self.leases.iter().any(|(id, _)| *id == work_id)
+    }
+
+    fn take_lease(&mut self, work_id: DeletionWorkId) -> Option<WorkLease> {
+        let index = self.leases.iter().position(|(id, _)| *id == work_id)?;
+        Some(self.leases.swap_remove(index).1)
+    }
+
+    fn finish_lease(&mut self, work_id: DeletionWorkId, completion: WorkCompletion) -> bool {
+        let Some(lease) = self.take_lease(work_id) else {
+            return false;
+        };
+        self.coordinator.finish(&lease, completion) == CompletionOutcome::Accepted
+    }
+
+    fn requeue_lease(&mut self, work_id: DeletionWorkId) -> bool {
+        let Some(lease) = self.take_lease(work_id) else {
+            return false;
+        };
+        self.coordinator.requeue(&lease) == RequeueOutcome::Requeued
+    }
+
+    fn finish_planning(&mut self, work_id: DeletionWorkId, completion: WorkCompletion) -> bool {
+        let Some(index) = self.items.iter().position(|item| item.id == work_id) else {
+            return false;
+        };
+        if !matches!(
+            self.items[index].stage,
+            DeletionWorkStage::Planning | DeletionWorkStage::CancellingPlanning
+        ) {
+            return false;
+        }
+        let accepted = self.finish_lease(work_id, completion);
+        if accepted {
+            let _ = self.items.remove(index);
+        }
+        accepted
+    }
+
+    fn finish_execution(&mut self, work_id: DeletionWorkId, completion: WorkCompletion) -> bool {
+        let Some(index) = self.items.iter().position(|item| item.id == work_id) else {
+            return false;
+        };
+        if !matches!(self.items[index].stage, DeletionWorkStage::Executing { .. }) {
+            return false;
+        }
+        let accepted = self.finish_lease(work_id, completion);
+        if accepted {
+            let _ = self.items.remove(index);
+        }
+        accepted
     }
 
     fn remove_if(
@@ -846,6 +985,38 @@ mod tests {
     }
 
     #[test]
+    fn planner_work_is_requeued_and_resolved_through_the_coordinator_ledger() {
+        let mut work = DeletionWork::new();
+        let work_id = work
+            .enqueue_confirmation(target(&["first"]), true, 1024, Duration::ZERO)
+            .expect("target should queue");
+        let command = work
+            .next_planning_command()
+            .expect("planner should receive a leased command");
+        assert!(matches!(command, DeletionWorkCommand::Plan { .. }));
+        let lease = work
+            .leases
+            .iter()
+            .find(|(id, _)| *id == work_id)
+            .map(|(_, lease)| lease)
+            .expect("planning work should retain its coordinator lease");
+        assert_eq!(lease.key().kind(), WorkKind::PlanDeletion);
+        assert_eq!(work.coordinator.snapshot().active_leases(), 1);
+
+        work.restore_unsubmitted(command);
+        assert_eq!(work.coordinator.snapshot().active_leases(), 0);
+        assert_eq!(work.coordinator.snapshot().pending().foreground(), 1);
+
+        let _ = work
+            .next_planning_command()
+            .expect("requeued planning work should lease again");
+        assert!(work.planning_failed(work_id));
+        let snapshot = work.coordinator.snapshot();
+        assert_eq!(snapshot.active_leases(), 0);
+        assert_eq!(snapshot.terminal().failed(), 1);
+    }
+
+    #[test]
     fn planner_lane_can_start_a_later_nonoverlapping_request_while_execution_runs() {
         let mut work = DeletionWork::new();
         let first = work
@@ -869,8 +1040,6 @@ mod tests {
             planned_entries: 1,
             progress: Arc::new(AtomicU64::new(0)),
         };
-        work.planner_in_flight = None;
-        work.executor_in_flight = Some(first);
 
         assert_eq!(target.full_path(), PathBuf::from("/scan-root/first"));
         let later = work
@@ -929,8 +1098,6 @@ mod tests {
             planned_entries: 8,
             progress: Arc::clone(&progress),
         };
-        work.planner_in_flight = None;
-        work.executor_in_flight = Some(work_id);
 
         let rail = work
             .rail_item_for_node(node_id)

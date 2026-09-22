@@ -60,13 +60,17 @@ const FOCUSED_FILL_WAVE_STEPS: u16 = 256;
 /// Columns an entry needs before it is worth labelling.
 const MINIMUM_LABEL_WIDTH: u16 = 6;
 
+/// Kind of activity currently occupying the map's loading field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanActivity {
+    Scanning,
+    Rescanning,
+}
+
 /// Live scan state that owns the empty-map field and its one-shot reveal.
 #[derive(Clone, Copy, Debug)]
 pub struct ScanVisual {
-    /// The scanner is still discovering the map rather than just revealing it.
-    pub scanning: bool,
-    /// A focused rescan uses its own semantic accent and copy.
-    pub rescanning: bool,
+    pub activity: ScanActivity,
     /// Entries that have actually reached the model; this intentionally has no denominator.
     pub entries_indexed: u64,
     /// Accessibility and presentation capability allow motion for this field.
@@ -2268,7 +2272,7 @@ const INDEXED_ENTRIES_SUFFIX: &str = " entries indexed";
 impl DenseRectangleGrid<'_> {
     fn draw_empty_surface(&self, buffer: &mut Buffer, area: Rect, palette: Option<MapPalette>) {
         let backdrop = palette.map_or_else(|| self.theme.map_surface(), MapPalette::backdrop);
-        if let Some(scan) = self.scan.filter(|scan| scan.scanning) {
+        if let Some(scan) = self.scan {
             let mut field = ScanField {
                 buffer,
                 area,
@@ -2277,7 +2281,7 @@ impl DenseRectangleGrid<'_> {
                 ascii: self.ascii,
                 scan,
                 phase: scan_field_phase(self.now, scan.animated),
-                accent: if scan.rescanning {
+                accent: if scan.activity == ScanActivity::Rescanning {
                     self.theme.state_rescanning
                 } else {
                     self.theme.state_scanning
@@ -2328,7 +2332,7 @@ impl DenseRectangleGrid<'_> {
             ascii: self.ascii,
             scan,
             phase: scan_field_phase(self.now, scan.animated),
-            accent: if scan.rescanning {
+            accent: if scan.activity == ScanActivity::Rescanning {
                 self.theme.state_rescanning
             } else {
                 self.theme.state_scanning
@@ -2366,10 +2370,11 @@ impl ScanField<'_> {
         }
         let title = if reveal_progress.is_some() {
             "MATERIALIZING MAP"
-        } else if self.scan.rescanning {
-            "REFRESHING FOLDER"
         } else {
-            "SCANNING FOLDER"
+            match self.scan.activity {
+                ScanActivity::Scanning => "SCANNING FOLDER",
+                ScanActivity::Rescanning => "REFRESHING FOLDER",
+            }
         };
         if reveal_progress.is_none_or(|progress| progress < 0.58) {
             self.draw_copy(title);
@@ -2399,8 +2404,9 @@ impl ScanField<'_> {
 
     fn draw_copy(&mut self, title: &str) {
         let title_width = u16::try_from(title.width()).unwrap_or(u16::MAX);
+        let initial_detail = "Measuring directory";
         let detail_width = if self.scan.entries_indexed == 0 {
-            u16::try_from("Measuring directory".width()).unwrap_or(u16::MAX)
+            u16::try_from(initial_detail.width()).unwrap_or(u16::MAX)
         } else {
             decimal_width(self.scan.entries_indexed)
                 .saturating_add(u16::try_from(INDEXED_ENTRIES_SUFFIX.width()).unwrap_or(u16::MAX))
@@ -2427,9 +2433,9 @@ impl ScanField<'_> {
             .fg(self.theme.text_secondary)
             .bg(self.backdrop);
         if self.scan.entries_indexed == 0 {
-            let detail = "Measuring directory";
             if let Some(x) = centered_x(self.area, detail_width) {
-                self.buffer.set_string(x, detail_y, detail, detail_style);
+                self.buffer
+                    .set_string(x, detail_y, initial_detail, detail_style);
             }
             return;
         }
@@ -4213,8 +4219,7 @@ mod tests {
             &[],
             area,
             Some(ScanVisual {
-                scanning: true,
-                rescanning: false,
+                activity: ScanActivity::Scanning,
                 entries_indexed: 42,
                 animated: false,
                 reveal_progress: None,
@@ -4234,8 +4239,7 @@ mod tests {
             &[],
             Rect::new(0, 0, 32, 4),
             Some(ScanVisual {
-                scanning: true,
-                rescanning: true,
+                activity: ScanActivity::Rescanning,
                 entries_indexed: 356_299,
                 animated: false,
                 reveal_progress: None,
@@ -4252,8 +4256,7 @@ mod tests {
     fn scan_field_moves_without_repainting_its_background() {
         let area = Rect::new(0, 0, 32, 8);
         let scan = Some(ScanVisual {
-            scanning: true,
-            rescanning: false,
+            activity: ScanActivity::Scanning,
             entries_indexed: 0,
             animated: true,
             reveal_progress: None,
@@ -4283,8 +4286,7 @@ mod tests {
     fn static_scan_field_respects_reduced_motion() {
         let area = Rect::new(0, 0, 32, 8);
         let scan = Some(ScanVisual {
-            scanning: true,
-            rescanning: false,
+            activity: ScanActivity::Scanning,
             entries_indexed: 0,
             animated: false,
             reveal_progress: None,
@@ -4311,8 +4313,7 @@ mod tests {
             tiles,
             area,
             Some(ScanVisual {
-                scanning: true,
-                rescanning: false,
+                activity: ScanActivity::Scanning,
                 entries_indexed: 8,
                 animated: true,
                 reveal_progress: Some(0.0),
@@ -4323,8 +4324,7 @@ mod tests {
             tiles,
             area,
             Some(ScanVisual {
-                scanning: true,
-                rescanning: false,
+                activity: ScanActivity::Scanning,
                 entries_indexed: 8,
                 animated: true,
                 reveal_progress: Some(0.5),
@@ -4335,8 +4335,7 @@ mod tests {
             tiles,
             area,
             Some(ScanVisual {
-                scanning: true,
-                rescanning: false,
+                activity: ScanActivity::Scanning,
                 entries_indexed: 8,
                 animated: true,
                 reveal_progress: Some(1.0),

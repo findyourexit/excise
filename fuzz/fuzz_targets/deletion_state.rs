@@ -3,13 +3,14 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use excise::deletion::{
+use excise::fuzz::deletion::{
     DeletionEntryOutcome, DeletionEntryResult, DeletionReport, PlannedEntry, PlannedKind,
     PlannedSnapshot,
 };
-use excise::model::{EntrySnapshot, NodeId, NodeKind};
-use excise::native_path::NativeIdentity;
-use excise::{geometry::FileType, FileToDelete};
+use excise::fuzz::geometry::FileType;
+use excise::fuzz::model::{EntrySnapshot, NodeId, NodeKind};
+use excise::fuzz::native_path::NativeIdentity;
+use excise::fuzz::FileToDelete;
 use file_id::FileId;
 use libfuzzer_sys::fuzz_target;
 

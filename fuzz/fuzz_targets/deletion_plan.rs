@@ -10,13 +10,14 @@ use std::time::UNIX_EPOCH;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt as _;
 
-use excise::deletion::{
-    build_plan_cancellable, execute_plan, DeletionPlanError, PlannedKind, PlannedSnapshot,
-    ReviewedEntry,
+use excise::fuzz::deletion::{
+    DeletionPlanError, PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan_cancellable,
+    execute_plan,
 };
-use excise::model::{EntrySnapshot, NodeId, NodeKind};
-use excise::native_path::identity_for;
-use excise::{geometry::FileType, FileToDelete};
+use excise::fuzz::geometry::FileType;
+use excise::fuzz::model::{EntrySnapshot, NodeId, NodeKind};
+use excise::fuzz::native_path::identity_for;
+use excise::fuzz::FileToDelete;
 use libfuzzer_sys::fuzz_target;
 
 const FULL_PLAN_LIMIT_BYTES: usize = 4 * 1024 * 1024;

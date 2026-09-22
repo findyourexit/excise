@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,9 +15,13 @@ use crate::native_path::{
     EncodedNativePath, NativeIdentity, NativePath, safe_display_path_text, safe_display_text,
 };
 use crate::outcome::RunSummary;
-use crate::state::files::FileTree;
+use crate::scan_store::page::{PageEntryKind, PageIndexError, ScanPageEntry};
+use crate::scan_store::path_reducer::{Coverage, SummaryMetrics};
+use crate::scan_store::run_file::RunError;
+use crate::scan_store::session::PublishedGeneration;
 
-pub const REPORT_SCHEMA_VERSION: u16 = 1;
+pub const SCAN_REPORT_SCHEMA_VERSION: u16 = 3;
+pub const DELETION_HISTORY_SCHEMA_VERSION: u16 = 1;
 #[cfg(test)]
 const NATIVE_PATH_SCHEMA_ID: &str =
     "https://github.com/findyourexit/excise/schemas/native-path-v1.json";
@@ -25,6 +31,7 @@ const NATIVE_PATH_SCHEMA_ID: &str =
 pub enum ScanReportState {
     Exact,
     Uncertain,
+    SummaryOnly,
     Cancelled,
 }
 
@@ -65,8 +72,8 @@ pub struct ScanReportEntry {
 
 /// The owned, serializable scan-report document used for decoding and contract validation.
 ///
-/// Production export deliberately uses [`ScanReport`] instead: it walks the bounded model and
-/// serializes each entry as it is encountered rather than cloning every entry into this document.
+/// Production export deliberately uses [`ScanReport`] instead: it streams the immutable
+/// canonical generation instead of cloning every entry into this document.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanReportDocument {
@@ -80,27 +87,86 @@ pub struct ScanReportDocument {
     pub entries: Vec<ScanReportEntry>,
 }
 
-/// An owned completed scan whose model is serialized directly to its output sink.
+/// An owned canonical generation serialized directly to its output sink.
 ///
-/// Keeping the model here avoids constructing a second, full report-sized allocation after a
-/// near-budget scan has completed.
+/// The report retains the published scan facts, not the bounded live model, so
+/// noninteractive output cannot silently diverge from the tree-map source.
 pub struct ScanReport {
-    tree: FileTree,
+    root: PathBuf,
+    root_identity: Option<NativeIdentity>,
+    published: Option<RefCell<PublishedGeneration>>,
+    summary_root: Option<(SummaryMetrics, Coverage)>,
     summary: RunSummary,
     state: ScanReportState,
 }
 
 impl ScanReport {
     #[must_use]
-    pub(crate) fn from_completed_tree(
-        tree: FileTree,
+    pub(crate) fn from_published_generation(
+        root: PathBuf,
+        root_identity: Option<NativeIdentity>,
+        published: PublishedGeneration,
         summary: RunSummary,
         state: ScanReportState,
     ) -> Self {
         Self {
-            tree,
+            root,
+            root_identity,
+            published: Some(RefCell::new(published)),
+            summary_root: None,
             summary,
             state,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn cancelled(
+        root: PathBuf,
+        root_identity: Option<NativeIdentity>,
+        summary: RunSummary,
+    ) -> Self {
+        Self {
+            root,
+            root_identity,
+            published: None,
+            summary_root: None,
+            summary,
+            state: ScanReportState::Cancelled,
+        }
+    }
+
+    /// Creates a terminal report when capacity prevented retaining a navigable map.
+    #[must_use]
+    pub(crate) fn summary_only(
+        root: PathBuf,
+        root_identity: Option<NativeIdentity>,
+        summary: RunSummary,
+    ) -> Self {
+        Self::summary_only_with_root(
+            root,
+            root_identity,
+            SummaryMetrics::default(),
+            Coverage::Uncertain,
+            summary,
+        )
+    }
+
+    /// Creates a deterministic directory-summary report without a child map.
+    #[must_use]
+    pub(crate) fn summary_only_with_root(
+        root: PathBuf,
+        root_identity: Option<NativeIdentity>,
+        root_metrics: SummaryMetrics,
+        root_coverage: Coverage,
+        summary: RunSummary,
+    ) -> Self {
+        Self {
+            root,
+            root_identity,
+            published: None,
+            summary_root: Some((root_metrics, root_coverage)),
+            summary,
+            state: ScanReportState::SummaryOnly,
         }
     }
 
@@ -120,13 +186,28 @@ impl ScanReport {
     ///
     /// Returns [`ReportError`] when JSON serialization or output fails.
     pub fn write_json(&self, writer: impl Write) -> Result<(), ReportError> {
-        write_scan_report_json(
-            &self.tree.path_in_filesystem,
-            &self.tree,
-            &self.summary,
-            self.state,
-            writer,
-        )
+        if let Some(published) = self.published.as_ref() {
+            let mut published = published.try_borrow_mut().map_err(|_| {
+                ReportError::Invariant("canonical report is already being serialized".to_string())
+            })?;
+            write_canonical_scan_report_json(
+                &self.root,
+                self.root_identity.as_ref(),
+                &mut published,
+                &self.summary,
+                self.state,
+                writer,
+            )
+        } else {
+            write_empty_scan_report_json(
+                &self.root,
+                self.root_identity.as_ref(),
+                self.summary_root,
+                &self.summary,
+                self.state,
+                writer,
+            )
+        }
     }
 
     /// Writes this scan report as a tab-separated table without materializing its entries.
@@ -135,29 +216,40 @@ impl ScanReport {
     ///
     /// Returns [`ReportError`] when table output fails.
     pub fn write_table(&self, writer: impl Write) -> Result<(), ReportError> {
-        write_scan_report_table(&self.tree, writer)
+        if let Some(published) = self.published.as_ref() {
+            let mut published = published.try_borrow_mut().map_err(|_| {
+                ReportError::Invariant("canonical report is already being serialized".to_string())
+            })?;
+            write_canonical_scan_report_table(
+                &self.root,
+                self.root_identity.as_ref(),
+                &mut published,
+                writer,
+            )
+        } else {
+            write_empty_scan_report_table(
+                &self.root,
+                self.root_identity.as_ref(),
+                self.summary_root,
+                writer,
+            )
+        }
     }
 }
 
-/// Returns reporting state from retained model uncertainty and unresolved worker failures.
-///
-/// Explicitly uncertain nodes and either unknown allocated or reclaimable bounds make the scan
-/// inexact even when no worker reported an unreadable entry. A worker failure without a retained
-/// path remains inexact through the summary fallback rather than being misreported as exact.
 #[must_use]
-pub(crate) fn scan_report_state(
-    tree: &FileTree,
+pub(crate) fn canonical_scan_report_state(
+    published: &PublishedGeneration,
     summary: &RunSummary,
     cancelled: bool,
 ) -> ScanReportState {
     if cancelled {
-        ScanReportState::Cancelled
-    } else if summary.unreadable_entries > 0
-        || tree.nodes().any(|node| {
-            node.state == NodeState::Uncertain
-                || node.metrics.allocated_bytes.upper.is_none()
-                || node.metrics.reclaimable_bytes.upper.is_none()
-        })
+        return ScanReportState::Cancelled;
+    }
+    let metrics = published.root_page_metrics();
+    if summary.unreadable_entries > 0
+        || published.unrecorded_path_count() > 0
+        || canonical_node_state(published.root_page_coverage(), metrics) == NodeState::Uncertain
     {
         ScanReportState::Uncertain
     } else {
@@ -165,23 +257,21 @@ pub(crate) fn scan_report_state(
     }
 }
 
-#[must_use]
-pub(crate) fn scan_is_uncertain(tree: &FileTree, summary: &RunSummary) -> bool {
-    scan_report_state(tree, summary, false) == ScanReportState::Uncertain
-}
-
-pub(crate) fn write_scan_report_json(
+pub(crate) fn write_canonical_scan_report_json(
     root: &Path,
-    tree: &FileTree,
+    root_identity: Option<&NativeIdentity>,
+    published: &mut PublishedGeneration,
     summary: &RunSummary,
     state: ScanReportState,
     mut writer: impl Write,
 ) -> Result<(), ReportError> {
+    let published = RefCell::new(published);
     serde_json::to_writer_pretty(
         &mut writer,
-        &StreamingScanReport {
+        &StreamingCanonicalScanReport {
             root,
-            tree,
+            root_identity,
+            published: &published,
             summary,
             state,
         },
@@ -190,25 +280,92 @@ pub(crate) fn write_scan_report_json(
     Ok(())
 }
 
-pub(crate) fn write_scan_report_table(
-    tree: &FileTree,
+pub(crate) fn write_canonical_scan_report_table(
+    root: &Path,
+    _root_identity: Option<&NativeIdentity>,
+    published: &mut PublishedGeneration,
     mut writer: impl Write,
 ) -> Result<(), ReportError> {
     writeln!(
         writer,
         "STATE\tALLOCATED\tRECLAIMABLE\tAPPARENT\tKIND\tPATH"
     )?;
-    write_scan_table_entries(tree, &mut writer)
+    let root_metrics = published.root_page_metrics();
+    write_canonical_table_row(
+        &mut writer,
+        root,
+        NodeKind::Root,
+        canonical_node_state(published.root_page_coverage(), root_metrics),
+        root_metrics,
+    )?;
+    published
+        .visit_page_entries(|entry| {
+            let path = root.join(entry.path.to_path_buf());
+            write_canonical_table_row(
+                &mut writer,
+                &path,
+                canonical_node_kind(entry.kind),
+                canonical_node_state(entry.coverage, entry.metrics),
+                entry.metrics,
+            )
+            .map_err(CanonicalReportVisitError::from)
+        })
+        .map_err(|error| ReportError::Invariant(error.to_string()))
 }
 
-struct StreamingScanReport<'a> {
+fn write_empty_scan_report_json(
+    root: &Path,
+    root_identity: Option<&NativeIdentity>,
+    summary_root: Option<(SummaryMetrics, Coverage)>,
+    summary: &RunSummary,
+    state: ScanReportState,
+    mut writer: impl Write,
+) -> Result<(), ReportError> {
+    serde_json::to_writer_pretty(
+        &mut writer,
+        &StreamingEmptyScanReport {
+            root,
+            root_identity,
+            summary_root,
+            summary,
+            state,
+        },
+    )?;
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
+fn write_empty_scan_report_table(
+    root: &Path,
+    _root_identity: Option<&NativeIdentity>,
+    summary_root: Option<(SummaryMetrics, Coverage)>,
+    mut writer: impl Write,
+) -> Result<(), ReportError> {
+    writeln!(
+        writer,
+        "STATE\tALLOCATED\tRECLAIMABLE\tAPPARENT\tKIND\tPATH"
+    )?;
+    let (metrics, coverage) =
+        summary_root.unwrap_or((SummaryMetrics::default(), Coverage::Uncertain));
+    write_canonical_table_row(
+        &mut writer,
+        root,
+        NodeKind::Root,
+        canonical_node_state(coverage, metrics),
+        metrics,
+    )?;
+    Ok(())
+}
+
+struct StreamingEmptyScanReport<'a> {
     root: &'a Path,
-    tree: &'a FileTree,
+    root_identity: Option<&'a NativeIdentity>,
+    summary_root: Option<(SummaryMetrics, Coverage)>,
     summary: &'a RunSummary,
     state: ScanReportState,
 }
 
-impl Serialize for StreamingScanReport<'_> {
+impl Serialize for StreamingEmptyScanReport<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -217,106 +374,276 @@ impl Serialize for StreamingScanReport<'_> {
         let root = NativePath::new(self.root).encode();
         let display_root = safe_display_path_text(self.root);
         document.serialize_entry("document_kind", "scan-report")?;
-        document.serialize_entry("schema_version", &REPORT_SCHEMA_VERSION)?;
+        document.serialize_entry("schema_version", &SCAN_REPORT_SCHEMA_VERSION)?;
         document.serialize_entry("root", &root)?;
         document.serialize_entry("display_root", &display_root)?;
         document.serialize_entry("state", &self.state)?;
         document.serialize_entry("accounting", &AccountingDefinition::default())?;
         document.serialize_entry("summary", self.summary)?;
-        document.serialize_entry("entries", &StreamingScanEntries { tree: self.tree })?;
+        document.serialize_entry(
+            "entries",
+            &StreamingEmptyScanEntries {
+                root: self.root,
+                identity: self.root_identity,
+                summary_root: self.summary_root,
+            },
+        )?;
         document.end()
     }
 }
 
-struct StreamingScanEntries<'a> {
-    tree: &'a FileTree,
+struct StreamingEmptyScanEntries<'a> {
+    root: &'a Path,
+    identity: Option<&'a NativeIdentity>,
+    summary_root: Option<(SummaryMetrics, Coverage)>,
 }
 
-impl Serialize for StreamingScanEntries<'_> {
+impl Serialize for StreamingEmptyScanEntries<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut entries = serializer.serialize_seq(Some(1))?;
+        let (metrics, coverage) = self
+            .summary_root
+            .unwrap_or((SummaryMetrics::default(), Coverage::Uncertain));
+        entries.serialize_element(&CanonicalRootEntryRef {
+            root: self.root,
+            identity: self.identity,
+            metrics,
+            coverage,
+        })?;
+        entries.end()
+    }
+}
+
+struct StreamingCanonicalScanReport<'a> {
+    root: &'a Path,
+    root_identity: Option<&'a NativeIdentity>,
+    published: &'a RefCell<&'a mut PublishedGeneration>,
+    summary: &'a RunSummary,
+    state: ScanReportState,
+}
+
+impl Serialize for StreamingCanonicalScanReport<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut document = serializer.serialize_map(Some(8))?;
+        let root = NativePath::new(self.root).encode();
+        let display_root = safe_display_path_text(self.root);
+        document.serialize_entry("document_kind", "scan-report")?;
+        document.serialize_entry("schema_version", &SCAN_REPORT_SCHEMA_VERSION)?;
+        document.serialize_entry("root", &root)?;
+        document.serialize_entry("display_root", &display_root)?;
+        document.serialize_entry("state", &self.state)?;
+        document.serialize_entry("accounting", &AccountingDefinition::default())?;
+        document.serialize_entry("summary", self.summary)?;
+        document.serialize_entry(
+            "entries",
+            &StreamingCanonicalScanEntries {
+                root: self.root,
+                root_identity: self.root_identity,
+                published: self.published,
+            },
+        )?;
+        document.end()
+    }
+}
+
+struct StreamingCanonicalScanEntries<'a> {
+    root: &'a Path,
+    root_identity: Option<&'a NativeIdentity>,
+    published: &'a RefCell<&'a mut PublishedGeneration>,
+}
+
+impl Serialize for StreamingCanonicalScanEntries<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         let mut entries = serializer.serialize_seq(None)?;
-        serialize_scan_entries(self.tree, &mut entries)?;
+        let mut published = self
+            .published
+            .try_borrow_mut()
+            .map_err(|_| S::Error::custom("canonical report is already being serialized"))?;
+        let root_metrics = published.root_page_metrics();
+        entries.serialize_element(&CanonicalRootEntryRef {
+            root: self.root,
+            identity: self.root_identity,
+            metrics: root_metrics,
+            coverage: published.root_page_coverage(),
+        })?;
+        (*published)
+            .visit_page_entries(|entry| {
+                entries
+                    .serialize_element(&CanonicalScanEntryRef {
+                        root: self.root,
+                        entry: &entry,
+                    })
+                    .map_err(|error| CanonicalReportVisitError::Serialization(error.to_string()))
+            })
+            .map_err(|error| S::Error::custom(error.to_string()))?;
         entries.end()
     }
 }
 
-fn serialize_scan_entries<S>(tree: &FileTree, entries: &mut S) -> Result<(), S::Error>
-where
-    S: serde::ser::SerializeSeq,
-{
-    let mut stack = vec![tree.total_node().id];
-    while let Some(id) = stack.pop() {
-        let node = tree
-            .node(id)
-            .ok_or_else(|| S::Error::custom("report node disappeared during serialization"))?;
-        let path = tree
-            .path_for_id(id)
-            .ok_or_else(|| S::Error::custom("report path disappeared during serialization"))?;
-        entries.serialize_element(&ScanReportEntryRef { path, node })?;
-        // Children are lexically ordered. Reverse-push preserves that order when popped.
-        stack.extend(node.children.iter().rev().copied());
-    }
-    Ok(())
+struct CanonicalRootEntryRef<'a> {
+    root: &'a Path,
+    identity: Option<&'a NativeIdentity>,
+    metrics: SummaryMetrics,
+    coverage: Coverage,
 }
 
-struct ScanReportEntryRef<'a> {
-    path: PathBuf,
-    node: &'a crate::model::Node,
-}
-
-impl Serialize for ScanReportEntryRef<'_> {
+impl Serialize for CanonicalRootEntryRef<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut entry = serializer.serialize_map(Some(10))?;
-        let path = NativePath::new(&self.path).encode();
-        let display_path = safe_display_path_text(&self.path);
-        let unscanned_reason = self
-            .node
-            .unscanned_reason
-            .as_ref()
-            .map(|reason| safe_display_text(&format!("{reason:?}")));
-        entry.serialize_entry("path", &path)?;
-        entry.serialize_entry("display_path", &display_path)?;
-        entry.serialize_entry("kind", &self.node.kind)?;
-        entry.serialize_entry("state", &self.node.state)?;
-        entry.serialize_entry("identity", &self.node.snapshot.identity)?;
-        entry.serialize_entry("allocated_bytes", &self.node.metrics.allocated_bytes)?;
-        entry.serialize_entry("reclaimable_bytes", &self.node.metrics.reclaimable_bytes)?;
-        entry.serialize_entry("apparent_bytes", &self.node.metrics.apparent_bytes)?;
-        entry.serialize_entry("descendants", &self.node.metrics.descendants)?;
-        entry.serialize_entry("unscanned_reason", &unscanned_reason)?;
-        entry.end()
+        serialize_canonical_entry(
+            serializer,
+            self.root,
+            NodeKind::Root,
+            self.identity,
+            self.metrics,
+            self.coverage,
+        )
     }
 }
 
-fn write_scan_table_entries(tree: &FileTree, writer: &mut impl Write) -> Result<(), ReportError> {
-    let mut stack = vec![tree.total_node().id];
-    while let Some(id) = stack.pop() {
-        let node = tree.node(id).ok_or_else(|| {
-            ReportError::Invariant("report node disappeared during table export".into())
-        })?;
-        let path = tree.path_for_id(id).ok_or_else(|| {
-            ReportError::Invariant("report path disappeared during table export".into())
-        })?;
-        writeln!(
-            writer,
-            "{:?}\t{}\t{}\t{}\t{:?}\t{}",
-            node.state,
-            display_bounds(node.metrics.allocated_bytes),
-            display_bounds(node.metrics.reclaimable_bytes),
-            node.metrics.apparent_bytes,
-            node.kind,
-            safe_display_path_text(&path),
-        )?;
-        stack.extend(node.children.iter().rev().copied());
-    }
-    Ok(())
+struct CanonicalScanEntryRef<'a> {
+    root: &'a Path,
+    entry: &'a ScanPageEntry,
 }
+
+impl Serialize for CanonicalScanEntryRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let path = self.root.join(self.entry.path.to_path_buf());
+        let identity = self
+            .entry
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.identity.as_ref());
+        serialize_canonical_entry(
+            serializer,
+            &path,
+            canonical_node_kind(self.entry.kind),
+            identity,
+            self.entry.metrics,
+            self.entry.coverage,
+        )
+    }
+}
+
+fn serialize_canonical_entry<S>(
+    serializer: S,
+    path: &Path,
+    kind: NodeKind,
+    identity: Option<&NativeIdentity>,
+    metrics: SummaryMetrics,
+    coverage: Coverage,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let state = canonical_node_state(coverage, metrics);
+    let mut entry = serializer.serialize_map(Some(10))?;
+    entry.serialize_entry("path", &NativePath::new(path).encode())?;
+    entry.serialize_entry("display_path", &safe_display_path_text(path))?;
+    entry.serialize_entry("kind", &kind)?;
+    entry.serialize_entry("state", &state)?;
+    entry.serialize_entry("identity", &identity)?;
+    entry.serialize_entry("allocated_bytes", &metrics.allocated_bytes)?;
+    entry.serialize_entry("reclaimable_bytes", &metrics.reclaimable_bytes)?;
+    entry.serialize_entry("apparent_bytes", &metrics.apparent_bytes)?;
+    entry.serialize_entry("descendants", &metrics.descendants)?;
+    let unscanned_reason = (state == NodeState::Uncertain).then_some("scan coverage is uncertain");
+    entry.serialize_entry("unscanned_reason", &unscanned_reason)?;
+    entry.end()
+}
+
+fn write_canonical_table_row(
+    writer: &mut impl Write,
+    path: &Path,
+    kind: NodeKind,
+    state: NodeState,
+    metrics: SummaryMetrics,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "{state:?}\t{}\t{}\t{}\t{kind:?}\t{}",
+        display_bounds(metrics.allocated_bytes),
+        display_bounds(metrics.reclaimable_bytes),
+        metrics.apparent_bytes,
+        safe_display_path_text(path),
+    )
+}
+
+fn canonical_node_kind(kind: PageEntryKind) -> NodeKind {
+    match kind {
+        PageEntryKind::Directory => NodeKind::Directory,
+        PageEntryKind::File => NodeKind::File,
+        PageEntryKind::Link => NodeKind::Link,
+    }
+}
+
+fn canonical_node_state(coverage: Coverage, metrics: SummaryMetrics) -> NodeState {
+    if coverage == Coverage::Uncertain
+        || metrics.allocated_bytes.upper.is_none()
+        || metrics.reclaimable_bytes.upper.is_none()
+    {
+        NodeState::Uncertain
+    } else {
+        NodeState::Complete
+    }
+}
+
+#[derive(Debug)]
+enum CanonicalReportVisitError {
+    Run(RunError),
+    Page(PageIndexError),
+    Io(io::Error),
+    Serialization(String),
+}
+
+impl From<RunError> for CanonicalReportVisitError {
+    fn from(error: RunError) -> Self {
+        Self::Run(error)
+    }
+}
+
+impl From<PageIndexError> for CanonicalReportVisitError {
+    fn from(error: PageIndexError) -> Self {
+        Self::Page(error)
+    }
+}
+
+impl From<io::Error> for CanonicalReportVisitError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl fmt::Display for CanonicalReportVisitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Run(error) => error.fmt(formatter),
+            Self::Page(error) => error.fmt(formatter),
+            Self::Io(error) => error.fmt(formatter),
+            Self::Serialization(error) => formatter.write_str(error),
+        }
+    }
+}
+
+/// Returns reporting state from retained model uncertainty and unresolved worker failures.
+///
+/// Explicitly uncertain nodes and either unknown allocated or reclaimable bounds make the scan
+/// inexact even when no worker reported an unreadable entry. A worker failure without a retained
+/// path remains inexact through the summary fallback rather than being misreported as exact.
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "status", content = "detail")]
@@ -393,7 +720,7 @@ impl Serialize for StreamingDeletionHistory<'_> {
     {
         let mut document = serializer.serialize_map(Some(3))?;
         document.serialize_entry("document_kind", "deletion-history")?;
-        document.serialize_entry("schema_version", &REPORT_SCHEMA_VERSION)?;
+        document.serialize_entry("schema_version", &DELETION_HISTORY_SCHEMA_VERSION)?;
         document.serialize_entry(
             "operations",
             &StreamingDeletionOperations {
@@ -596,7 +923,7 @@ mod tests {
     fn scan_document() -> ScanReportDocument {
         ScanReportDocument {
             document_kind: "scan-report".to_string(),
-            schema_version: REPORT_SCHEMA_VERSION,
+            schema_version: SCAN_REPORT_SCHEMA_VERSION,
             root: EncodedNativePath::Utf8("/scan".to_string()),
             display_root: "/scan".to_string(),
             state: ScanReportState::Exact,
@@ -609,7 +936,7 @@ mod tests {
     fn deletion_document() -> DeletionHistoryDocument {
         DeletionHistoryDocument {
             document_kind: "deletion-history".to_string(),
-            schema_version: REPORT_SCHEMA_VERSION,
+            schema_version: DELETION_HISTORY_SCHEMA_VERSION,
             operations: vec![DeletionHistoryOperation {
                 root: EncodedNativePath::Utf8("/scan".to_string()),
                 display_root: "/scan".to_string(),
@@ -714,28 +1041,6 @@ mod tests {
         scan_validator
             .validate(&scan_document)
             .expect("serialized scan report should satisfy its schema");
-        let root = tempfile::tempdir().expect("streamed report root should exist");
-        let tree = FileTree::new(
-            root.path().to_path_buf(),
-            false,
-            crate::model::DEFAULT_PROCESS_MIB,
-        )
-        .expect("streamed report model should fit its process budget");
-        let summary = RunSummary::default();
-        let mut streamed = Vec::new();
-        write_scan_report_json(
-            root.path(),
-            &tree,
-            &summary,
-            scan_report_state(&tree, &summary, false),
-            &mut streamed,
-        )
-        .expect("streamed scan report should serialize");
-        let streamed_document: Value =
-            serde_json::from_slice(&streamed).expect("streamed scan report should parse");
-        scan_validator
-            .validate(&streamed_document)
-            .expect("streamed scan report should satisfy its schema");
 
         let mut scan_drift = scan_document;
         scan_drift["summary"]["unexpected"] = json!(true);
@@ -804,72 +1109,48 @@ mod tests {
     }
 
     #[test]
-    fn iterative_exports_handle_a_deep_model_chain() {
-        const DEPTH: usize = 4_096;
-
-        let root = tempfile::tempdir().expect("deep model root should exist");
-        let source = root.path().join("source");
-        std::fs::write(&source, b"x").expect("source fixture should be written");
-        let metadata =
-            std::fs::symlink_metadata(&source).expect("source metadata should be readable");
-        let identity = crate::native_path::identity_for(&source, &metadata)
-            .expect("source identity should be readable")
-            .expect("source fixture should not be a symbolic link");
-        let mut tree = FileTree::new(
-            root.path().to_path_buf(),
-            false,
-            crate::model::DEFAULT_PROCESS_MIB,
-        )
-        .expect("deep model should fit its process budget");
-        let mut deep_path = root.path().to_path_buf();
-        for _ in 0..DEPTH {
-            deep_path.push("d");
-        }
-        deep_path.push("leaf");
-        tree.add_entry(&metadata, &deep_path, &identity)
-            .expect("deep model entry should be retained");
-
-        let summary = RunSummary::default();
-        let state = scan_report_state(&tree, &summary, false);
-        let mut json = Vec::new();
-        write_scan_report_json(root.path(), &tree, &summary, state, &mut json)
-            .expect("deep JSON export should complete iteratively");
-        assert!(!json.is_empty());
-        let mut table = Vec::new();
-        write_scan_report_table(&tree, &mut table)
-            .expect("deep table export should complete iteratively");
-        let table = String::from_utf8(table).expect("table export should be UTF-8");
-        assert_eq!(table.lines().count(), DEPTH + 3);
-    }
-
-    #[test]
-    fn unknown_model_bounds_are_uncertain_without_summary_counters() {
-        let root = tempfile::tempdir().expect("model root should exist");
-        let mut tree = FileTree::new(
-            root.path().to_path_buf(),
-            false,
-            crate::model::DEFAULT_PROCESS_MIB,
-        )
-        .expect("model should fit its process budget");
-        tree.record_unscanned(
-            &root.path().join("unreadable"),
-            crate::model::UnscannedReason::Metadata("fixture metadata failure".to_string()),
-        )
-        .expect("unknown entry should be retained");
-
-        assert!(tree.total_node().metrics.allocated_bytes.upper.is_none());
-        assert_eq!(
-            scan_report_state(&tree, &RunSummary::default(), false),
-            ScanReportState::Uncertain,
-            "unknown model bounds must not depend on transport counters"
+    fn summary_only_report_declares_a_partial_inventory() {
+        let summary = RunSummary {
+            scanned_entries: 17,
+            unscanned_entries: 1,
+            last_worker_error: Some("scan store capacity exhausted".to_string()),
+            ..RunSummary::default()
+        };
+        let report = ScanReport::summary_only_with_root(
+            PathBuf::from("/scan"),
+            None,
+            SummaryMetrics::leaf(99, ByteBounds::exact(50), ByteBounds::exact(40)),
+            Coverage::Complete,
+            summary,
         );
+
+        assert_eq!(report.state(), ScanReportState::SummaryOnly);
+        let mut encoded = Vec::new();
+        report
+            .write_json(&mut encoded)
+            .expect("summary-only report should serialize");
+        let document: Value =
+            serde_json::from_slice(&encoded).expect("summary-only report should parse");
+        let native_path_schema = schema("native-path.schema.json");
+        let scan_schema = schema("scan-report.schema.json");
+        validator_for(&scan_schema, &native_path_schema)
+            .validate(&document)
+            .expect("summary-only report should satisfy its schema");
+        let decoded: ScanReportDocument =
+            serde_json::from_value(document).expect("summary-only report should deserialize");
+        assert_eq!(decoded.state, ScanReportState::SummaryOnly);
+        assert_eq!(decoded.entries.len(), 1, "only the root is retained");
+        assert_eq!(decoded.entries[0].apparent_bytes, 99);
+        assert_eq!(decoded.entries[0].allocated_bytes, ByteBounds::exact(50));
+        assert_eq!(decoded.entries[0].reclaimable_bytes, ByteBounds::exact(40));
+        assert_eq!(decoded.entries[0].state, NodeState::Complete);
     }
+
     #[test]
-    fn hostile_paths_in_exports_are_marked_and_escaped() {
+    fn hostile_deletion_history_paths_are_marked_and_escaped() {
         let parent = tempfile::tempdir().expect("report parent should exist");
         let root = parent.path().join("scan-\u{202e}-root");
         std::fs::create_dir(&root).expect("report root should be created");
-        // Keep the hostile path synthetic: Windows rejects ESC in filesystem names.
         let fixture_path = root.join("entry-fixture");
         std::fs::write(&fixture_path, b"payload").expect("report entry should be written");
         let metadata =
@@ -877,54 +1158,6 @@ mod tests {
         let entry_identity = crate::native_path::identity_for(&fixture_path, &metadata)
             .expect("report identity should be readable")
             .expect("report entry should not be a link");
-        let hostile_path = root.join("entry-\u{1b}[31m");
-        let mut tree = FileTree::new(root.clone(), false, crate::model::DEFAULT_PROCESS_MIB)
-            .expect("report model should be created");
-        tree.add_entry(&metadata, &hostile_path, &entry_identity)
-            .expect("hostile report entry should be added");
-        tree.complete_directory(&root, None)
-            .expect("report root should complete");
-        tree.finalize().expect("report model should finalize");
-
-        let summary = RunSummary::default();
-        let mut encoded = Vec::new();
-        write_scan_report_json(
-            &root,
-            &tree,
-            &summary,
-            scan_report_state(&tree, &summary, false),
-            &mut encoded,
-        )
-        .expect("hostile scan report should serialize");
-        let document: Value = serde_json::from_slice(&encoded).expect("scan report should parse");
-        let display_root = document["display_root"]
-            .as_str()
-            .expect("scan display root should be a string");
-        assert!(
-            display_root.contains(DECEPTIVE_DISPLAY_MARKER) && display_root.contains("\\u{202e}"),
-        );
-        let entry = document["entries"]
-            .as_array()
-            .and_then(|entries| {
-                entries.iter().find(|entry| {
-                    entry["display_path"]
-                        .as_str()
-                        .is_some_and(|path| path.contains("entry-"))
-                })
-            })
-            .expect("hostile scan entry should be reported");
-        let display_path = entry["display_path"]
-            .as_str()
-            .expect("scan display path should be a string");
-        assert!(
-            display_path.contains(DECEPTIVE_DISPLAY_MARKER)
-                && display_path.contains("\\x1b")
-                && !display_path.contains('\u{1b}'),
-        );
-        let mut table = Vec::new();
-        write_scan_report_table(&tree, &mut table).expect("hostile scan table should serialize");
-        let table = String::from_utf8(table).expect("table export should be UTF-8");
-        assert!(table.contains(DECEPTIVE_DISPLAY_MARKER) && table.contains("\\x1b"));
 
         assert_hostile_deletion_history(root, entry_identity);
     }

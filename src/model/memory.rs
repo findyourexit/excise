@@ -37,25 +37,6 @@ impl MemoryBudget {
         })
     }
 
-    /// # Errors
-    ///
-    /// Returns [`ModelError::MemoryExhausted`] when no model memory is
-    /// available for a staging budget.
-    pub(crate) fn from_model_limit(model_limit: usize) -> Result<Self, ModelError> {
-        if model_limit == 0 {
-            return Err(ModelError::MemoryExhausted {
-                required: 1,
-                limit: 0,
-            });
-        }
-        Ok(Self {
-            process_limit: model_limit,
-            model_limit,
-            headroom: 0,
-            used: 0,
-        })
-    }
-
     #[must_use]
     pub const fn process_limit(&self) -> usize {
         self.process_limit

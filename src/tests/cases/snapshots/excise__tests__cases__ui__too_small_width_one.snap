@@ -4,7 +4,7 @@ expression: normalized
 ---
  EXCISE  /tmp/ex[..]idth_one  ◆ COMPLETE         
  Used ##.#K · Reclaim ##.#K                      
-Excise · REDUCED MOTION · mem 96.0M/384.0M       
+Excise · REDUCED MOTION · store 1.6K/4.0G        
 ▟ LIST ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏▌  file2                     8.0K   40.0%      ▕
 ▏   file3                     8.0K   40.0%      ▕

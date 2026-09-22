@@ -27,8 +27,11 @@ use crate::native_path::{
     DECEPTIVE_DISPLAY_MARKER, NativeIdentity, safe_display_path_text, safe_display_text,
 };
 use crate::outcome::{OperationOutcome, RunSummary};
-use crate::report::{ScanReport, ScanReportState, scan_report_state};
-use crate::state::files::{FileTree, RescanPreparationProgress};
+use crate::report::{ScanReport, ScanReportState, canonical_scan_report_state};
+use crate::scan_coordinator::{ScanGeneration, SchedulerSnapshot, WorkCompletion, WorkLease};
+use crate::scan_store::run_file::SealedRun;
+use crate::scan_store::session::ScanStore;
+use crate::scan_store::storage::ScanStoreStorage;
 use crate::temporary_storage::TemporaryStorage;
 use crate::theme::ThemeId;
 use crate::ui::palette::ColorCycle;
@@ -43,12 +46,6 @@ const MAX_INPUT_BATCH: usize = 32;
 /// A scanner event is capped at 32 entries. Keep one owner slice bounded so
 /// scanning can never monopolize the UI loop.
 const MAX_SCAN_ENTRIES_PER_SLICE: usize = 32;
-/// Disk-backed identity accounting can make one model update visibly costly.
-/// Check input after every mutation so a queued navigation key never waits
-/// behind an entire scanner batch.
-/// A focused result is authoritative for its displayed path, so serialize its
-/// traversal instead of allowing worker completion races to choose tiles.
-const FOCUSED_SCAN_THREADS: usize = 1;
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -61,6 +58,8 @@ pub struct RuntimeSettings {
     pub exclusions: Vec<String>,
     pub memory_mib: usize,
     pub temporary_storage_mib: usize,
+    pub scan_store_mib: usize,
+    pub scan_store_dir: Option<PathBuf>,
     pub apparent_size: bool,
     pub disable_delete_confirmation: bool,
     pub reduced_motion: bool,
@@ -138,9 +137,11 @@ where
     clock: Box<dyn Clock>,
     animation: AnimationScheduler,
     settings: RuntimeSettings,
-    temporary_storage: TemporaryStorage,
+    scan_store_storage: TemporaryStorage,
     summary: RunSummary,
     scan_active: bool,
+    /// Latest coalesced scheduler state; never an event backlog.
+    scheduler_snapshot: Option<SchedulerSnapshot>,
     /// The initial breadth-first scan remains active while an on-demand scan may run.
     primary_scan_active: bool,
     /// Scan data relevant to the displayed folder arrived since its last refresh.
@@ -149,15 +150,9 @@ where
     scan_view_root: PathBuf,
     /// Scanner entries queued for one bounded owner scheduling slice.
     pending_scan_entries: VecDeque<ScannedEntry>,
-    /// Focused entries take priority within the next bounded scheduling slice.
-    pending_focused_scan_entries: VecDeque<ScannedEntry>,
     scan_cancelled: bool,
     rescan_active: bool,
-    /// Staging capacity is being released incrementally before scanner work starts.
-    rescan_preparing: bool,
-    /// Captured before compaction can replace an aggregate's live identity record.
-    rescan_root_identity: Option<NativeIdentity>,
-    /// Root currently owned by the focused scanner, if any.
+    /// Root currently owned by the scan rebuild, if any.
     rescan_target: Option<PathBuf>,
     cancelled_while_scanning: bool,
     exit_after_work: bool,
@@ -183,7 +178,13 @@ where
     let now = clock.now();
     let temporary_storage = TemporaryStorage::from_mib(settings.temporary_storage_mib)
         .map_err(|error| AppError::Config(error.to_string()))?;
-    let mut app = App::new_with_root_identity_and_temporary_storage(
+    let scan_store_session = ScanStoreStorage::new_for_scan_store_mib(
+        settings.scan_store_mib,
+        settings.scan_store_dir.as_deref(),
+    )
+    .map_err(|error| AppError::Config(error.to_string()))?;
+    let scan_store_storage = scan_store_session.quota();
+    let mut app = App::new_with_root_identity_and_scan_store(
         terminal_backend,
         settings.root.clone(),
         settings.root_identity.clone(),
@@ -193,19 +194,25 @@ where
         settings.keymap,
         settings.custom_keys.clone(),
         settings.mouse,
-        temporary_storage.clone(),
+        scan_store_session,
     )?;
     app.set_loading_animation_enabled(settings.animate_loading);
-    let workers = WorkerPool::start(
+    let input_runs = app.scan_input_run_factory()?;
+    let workers = WorkerPool::start_with_deletion_storage(
         scanner::ScannerOptions {
+            session: app.scan_session_id(),
+            generation: input_runs.generation(),
             root: settings.root.clone(),
+            canonical_root: settings.root.clone(),
             root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
             cross_filesystems: settings.cross_filesystems,
             exclusions: settings.exclusions.clone(),
             internal_paths: app.internal_scan_paths(),
-            temporary_storage: temporary_storage.clone(),
+            temporary_storage: scan_store_storage.clone(),
+            input_runs: Some(input_runs),
         },
+        temporary_storage.clone(),
         settings.event_capacity,
     )?;
     let scan_view_root = app.current_folder_path();
@@ -217,18 +224,16 @@ where
         clock,
         animation,
         settings,
-        temporary_storage,
+        scan_store_storage,
         summary: RunSummary::default(),
         scan_active: true,
+        scheduler_snapshot: None,
         primary_scan_active: true,
         scan_view_dirty: false,
         scan_view_root,
         pending_scan_entries: VecDeque::new(),
-        pending_focused_scan_entries: VecDeque::new(),
         scan_cancelled: false,
         rescan_active: false,
-        rescan_preparing: false,
-        rescan_root_identity: None,
         rescan_target: None,
         cancelled_while_scanning: false,
         exit_after_work: false,
@@ -274,7 +279,7 @@ where
             }
             did_work |= self.process_worker_batch()?;
             did_work |= self.process_deletion_departure(false)?;
-            did_work |= self.process_deadlines();
+            did_work |= self.process_deadlines()?;
             // Scanner batches can keep the loop busy indefinitely. Service a due
             // visual frame before rendering so the map's scan field never waits
             // for the input-poll sleep path to run.
@@ -292,7 +297,7 @@ where
                 // deadlines become due. Service them even when no key woke us, or
                 // a finished scan leaves the map frozen until the next input.
                 self.process_deletion_departure(false)?;
-                self.process_deadlines();
+                self.process_deadlines()?;
                 self.render_due_frame()?;
             }
         }
@@ -390,19 +395,9 @@ where
                 self.app.set_path_to_red();
                 self.schedule(now, TimedAction::ResetPathColor, TRANSIENT_STATUS_DURATION);
             }
-            InputCommand::StartRescan(target) => {
-                if self.rescan_active {
-                    return Ok(());
-                }
-                self.start_manual_rescan(target)?;
-            }
             InputCommand::CancelRescan => {
                 if self.rescan_active {
-                    if self.rescan_preparing {
-                        self.cancel_rescan_preparation()?;
-                    } else {
-                        self.workers()?.cancel_rescan();
-                    }
+                    self.workers()?.cancel_rescan();
                 }
             }
             InputCommand::RequestDeletion(target) => {
@@ -422,11 +417,11 @@ where
             }
             InputCommand::ConfirmDeletion { work_id, target } => {
                 let target_path = target.full_path();
-                let overlaps_focused_scan = self.rescan_target.as_ref().is_some_and(|root| {
+                let overlaps_scan_rebuild = self.rescan_target.as_ref().is_some_and(|root| {
                     target_path.starts_with(root) || root.starts_with(&target_path)
                 });
                 if self.app.queue_confirmed_deletion(work_id, target, now) {
-                    if overlaps_focused_scan {
+                    if overlaps_scan_rebuild {
                         self.workers()?.cancel_rescan();
                     }
                     self.start_next_deletion_planning()?;
@@ -571,67 +566,40 @@ where
         Ok(())
     }
 
-    fn start_manual_rescan(&mut self, target: PathBuf) -> Result<(), AppError> {
-        let root_identity = self.app.identity_for_path(&target);
-        let focus_target = target.clone();
-        self.app.begin_rescan(target)?;
-        self.scan_view_root = self.app.current_folder_path();
-        self.scan_active = true;
-        self.rescan_active = true;
-        self.rescan_preparing = true;
-        self.rescan_root_identity = root_identity;
-        self.rescan_target = Some(focus_target);
-        self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
-        Ok(())
-    }
-
-    /// Prepares a bounded focused stage without allowing capacity pressure to
-    /// terminate the interactive session.
-    fn prepare_focused_rescan(&mut self) -> Result<bool, AppError> {
-        debug_assert!(self.rescan_preparing);
-        match self.app.advance_rescan_preparation()? {
-            RescanPreparationProgress::Compacting => return Ok(true),
-            RescanPreparationProgress::InsufficientCapacity => {
-                self.cancel_rescan_preparation()?;
-                self.app.show_notice(
-                    "This folder is still building. A detailed refresh needs more room; keep browsing or try again after the main scan finishes.",
-                );
-                return Ok(true);
-            }
-            RescanPreparationProgress::Ready => {}
+    /// Rebuilds an invalidated canonical generation once no scan scope owns
+    /// the scanner. Primary scan outputs remain isolated from this new factory.
+    fn start_pending_generation_rebuild(&mut self) -> Result<bool, AppError> {
+        if self.primary_scan_active || self.rescan_active || self.workers.is_none() {
+            return Ok(false);
         }
-        let target = self.rescan_target.clone().ok_or_else(|| {
-            AppError::Invariant("focused rescan preparation lost its target".to_string())
-        })?;
+        if !self.app.begin_generation_rebuild()? {
+            return Ok(false);
+        }
+        let input_runs = self.app.scan_input_run_factory()?;
+        let root = self.settings.root.clone();
         let options = scanner::ScannerOptions {
-            root: target,
-            root_identity: self.rescan_root_identity.clone(),
-            threads: FOCUSED_SCAN_THREADS,
+            session: self.app.scan_session_id(),
+            generation: input_runs.generation(),
+            root: root.clone(),
+            canonical_root: root.clone(),
+            root_identity: Some(self.settings.root_identity.clone()),
+            threads: self.settings.scan_threads,
             cross_filesystems: self.settings.cross_filesystems,
             exclusions: self.settings.exclusions.clone(),
             internal_paths: self.app.internal_scan_paths(),
-            temporary_storage: self.temporary_storage.clone(),
+            temporary_storage: self.scan_store_storage.clone(),
+            input_runs: Some(input_runs),
         };
-        let request = self.workers()?.request_rescan(options);
-        if let Err(error) = request {
-            self.cancel_rescan_preparation()?;
+        if let Err(error) = self.workers()?.request_rescan(options) {
+            self.app.cancel_rescan()?;
             return Err(error);
         }
-        self.rescan_preparing = false;
-        self.rescan_root_identity = None;
+        self.scan_view_root.clone_from(&root);
+        self.scan_active = true;
+        self.rescan_active = true;
+        self.rescan_target = Some(root);
+        self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
         Ok(true)
-    }
-
-    fn cancel_rescan_preparation(&mut self) -> Result<(), AppError> {
-        self.app.cancel_rescan()?;
-        self.rescan_preparing = false;
-        self.rescan_root_identity = None;
-        self.rescan_active = false;
-        self.rescan_target = None;
-        if !self.primary_scan_active {
-            self.scan_active = false;
-        }
-        Ok(())
     }
 
     fn start_next_deletion_planning(&mut self) -> Result<(), AppError> {
@@ -684,12 +652,20 @@ where
         self.app.exit();
     }
 
+    fn refresh_scheduler_snapshot(&mut self) {
+        let snapshot = self
+            .workers
+            .as_ref()
+            .and_then(WorkerPool::scheduler_snapshot);
+        if snapshot != self.scheduler_snapshot {
+            self.scheduler_snapshot = snapshot;
+        }
+    }
+
     fn process_worker_batch(&mut self) -> Result<bool, AppError> {
+        self.refresh_scheduler_snapshot();
         if self.app.map_is_transitioning() || self.input.poll(Duration::ZERO)? {
             return Ok(false);
-        }
-        if self.rescan_preparing {
-            return self.prepare_focused_rescan();
         }
         if self.process_pending_scan_entries()? {
             return Ok(true);
@@ -714,7 +690,7 @@ where
     fn process_pending_scan_entries(&mut self) -> Result<bool, AppError> {
         let mut processed = false;
         for _ in 0..MAX_SCAN_ENTRIES_PER_SLICE {
-            if !self.process_pending_scan_entry()? {
+            if !self.process_pending_scan_entry() {
                 break;
             }
             processed = true;
@@ -734,49 +710,54 @@ where
         Ok(processed)
     }
 
-    fn process_pending_scan_entry(&mut self) -> Result<bool, AppError> {
-        if let Some(entry) = self.pending_focused_scan_entries.pop_front() {
-            self.handle_focused_scan_entry(entry)?;
-            return Ok(true);
-        }
+    fn process_pending_scan_entry(&mut self) -> bool {
         let Some(entry) = self.pending_scan_entries.pop_front() else {
-            return Ok(false);
+            return false;
         };
-        self.handle_primary_scan_entry(entry)?;
-        Ok(true)
+        self.handle_scan_entry(entry);
+        true
     }
 
-    fn handle_primary_scan_entry(&mut self, entry: ScannedEntry) -> Result<(), AppError> {
-        if self.app.primary_scan_path_is_stale(&entry.path) {
+    fn handle_scan_entry(&mut self, entry: ScannedEntry) {
+        self.scan_view_dirty |= entry.path.starts_with(&self.scan_view_root);
+        if self.primary_scan_active {
+            self.summary.scanned_entries = self.summary.scanned_entries.saturating_add(1);
+        }
+        self.app.record_loading_entry(entry.path);
+    }
+
+    fn admit_coverage_runs(
+        &mut self,
+        lease: Option<&WorkLease>,
+        input_runs: Vec<SealedRun>,
+    ) -> Result<(), AppError> {
+        if input_runs.is_empty() {
+            self.app.record_scan_store_unrecorded_path();
             return Ok(());
         }
-        self.scan_view_dirty |= entry.path.starts_with(&self.scan_view_root);
-        self.summary.scanned_entries = self.summary.scanned_entries.saturating_add(1);
-        self.app
-            .add_entry_to_base_folder(&entry.metadata, entry.path, &entry.identity)?;
-        self.summary.identified_entries =
-            u64::try_from(self.app.identity_count()).unwrap_or(u64::MAX);
+        let lease = lease.ok_or_else(|| {
+            AppError::Invariant("scanner emitted an unleased sealed coverage result".to_string())
+        })?;
+        self.app.admit_scan_input_runs(lease, input_runs);
         Ok(())
-    }
-
-    fn handle_focused_scan_entry(&mut self, entry: ScannedEntry) -> Result<(), AppError> {
-        self.app
-            .add_entry_to_focused_folder(&entry.metadata, entry.path, &entry.identity)
     }
 
     fn handle_primary_unscanned(
         &mut self,
+        lease: Option<&WorkLease>,
+        input_runs: Vec<SealedRun>,
         path: &Path,
-        reason: crate::model::UnscannedReason,
+        reason: &crate::model::UnscannedReason,
     ) -> Result<(), AppError> {
-        if self.app.primary_scan_path_is_stale(path) {
+        self.admit_coverage_runs(lease, input_runs)?;
+        self.scan_view_dirty |= path.starts_with(&self.scan_view_root);
+        if self.rescan_active {
             return Ok(());
         }
-        self.scan_view_dirty |= path.starts_with(&self.scan_view_root);
         self.summary.unscanned_entries = self.summary.unscanned_entries.saturating_add(1);
         self.summary.last_unscanned_path = Some(safe_display_path_text(path));
-        self.summary.last_unscanned_reason = Some(display_reason(&reason));
-        match &reason {
+        self.summary.last_unscanned_reason = Some(display_reason(reason));
+        match reason {
             crate::model::UnscannedReason::Excluded(_) => {
                 self.summary.excluded_entries = self.summary.excluded_entries.saturating_add(1);
             }
@@ -797,49 +778,25 @@ where
             crate::model::UnscannedReason::IdentityStorageCapacity
             | crate::model::UnscannedReason::MemoryAggregation => {}
         }
-        self.app.record_unscanned(path, reason)
-    }
-    fn handle_focused_unscanned(
-        &mut self,
-        path: &Path,
-        reason: crate::model::UnscannedReason,
-    ) -> Result<(), AppError> {
-        self.app.record_focused_unscanned(path, reason)
+        Ok(())
     }
 
-    fn handle_scan_failure(
-        &mut self,
-        path: Option<&Path>,
-        message: &str,
-        focused: bool,
-    ) -> Result<(), AppError> {
-        if !focused && path.is_some_and(|path| self.app.primary_scan_path_is_stale(path)) {
-            return Ok(());
-        }
-        if !focused {
+    fn handle_scan_failure(&mut self, path: Option<&Path>, message: &str, rescan: bool) {
+        if !rescan {
             self.scan_view_dirty |= path.is_some_and(|path| path.starts_with(&self.scan_view_root));
         }
-        self.app.record_scan_store_failure();
+        self.app.record_scan_store_unrecorded_path();
         let message = safe_display_text(message);
         self.summary.unscanned_entries = self.summary.unscanned_entries.saturating_add(1);
         self.summary.unreadable_entries = self.summary.unreadable_entries.saturating_add(1);
         self.summary.last_unscanned_path = path.map(safe_display_path_text);
         self.summary.last_unreadable_path = self.summary.last_unscanned_path.clone();
         self.summary.last_unscanned_reason = Some(message.clone());
-        self.summary.last_worker_error = Some(message.clone());
-        if let Some(path) = path {
-            let reason = crate::model::UnscannedReason::Metadata(message);
-            if focused {
-                self.app.record_focused_unscanned(path, reason)?;
-            } else {
-                self.app.record_unscanned(path, reason)?;
-            }
-        }
-        if !focused {
+        self.summary.last_worker_error = Some(message);
+        if !rescan {
             self.app.increment_failed_to_read();
         }
         self.animation.schedule_error();
-        Ok(())
     }
 
     fn finish_primary_scan(&mut self, cancelled: bool) -> Result<(), AppError> {
@@ -849,22 +806,22 @@ where
             self.scan_active = false;
         }
         self.scan_cancelled = cancelled;
-        if !cancelled {
-            self.app.finalize_scan()?;
-            let (used, limit, spilled) = self.app.model_stats();
-            self.summary.model_bytes = used;
-            self.summary.model_limit_bytes = limit;
-            self.summary.identity_spilled = spilled;
+        if cancelled {
+            self.app.cancel_primary_scan()?;
+        } else {
+            self.app.finalize_scan();
             self.app.start_ui();
             self.animation.schedule_completion();
         }
+        let (used, limit) = self.app.scan_store_stats();
+        self.summary.scan_store_bytes = used;
+        self.summary.scan_store_limit_bytes = limit;
+        self.start_pending_generation_rebuild()?;
         Ok(())
     }
 
-    fn finish_focused_scan(&mut self, cancelled: bool) -> Result<(), AppError> {
+    fn finish_rescan(&mut self, cancelled: bool) -> Result<(), AppError> {
         self.rescan_active = false;
-        self.rescan_preparing = false;
-        self.rescan_root_identity = None;
         self.rescan_target = None;
         if !self.primary_scan_active {
             self.scan_active = false;
@@ -874,10 +831,10 @@ where
         } else {
             self.app.finish_rescan()?;
         }
-        let (used, limit, spilled) = self.app.model_stats();
-        self.summary.model_bytes = used;
-        self.summary.model_limit_bytes = limit;
-        self.summary.identity_spilled = spilled;
+        let (used, limit) = self.app.scan_store_stats();
+        self.summary.scan_store_bytes = used;
+        self.summary.scan_store_limit_bytes = limit;
+        self.start_pending_generation_rebuild()?;
         Ok(())
     }
 
@@ -889,44 +846,39 @@ where
                 | WorkerEvent::DeletionExecutionRejected { .. }
                 | WorkerEvent::DeletionFinished { .. }
                 | WorkerEvent::ScanFinished { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
         );
         match event {
-            WorkerEvent::ScanBatch { entries } => {
+            WorkerEvent::ScanBatch {
+                lease,
+                entries,
+                input_runs,
+            } => {
+                if !input_runs.is_empty() {
+                    let lease = lease.as_ref().ok_or_else(|| {
+                        AppError::Invariant("scanner emitted an unleased sealed batch".to_string())
+                    })?;
+                    self.app.admit_scan_input_runs(lease, input_runs);
+                }
                 debug_assert!(self.pending_scan_entries.is_empty());
                 self.pending_scan_entries.extend(entries);
             }
-            WorkerEvent::FocusedScanBatch { entries } => {
-                debug_assert!(self.pending_focused_scan_entries.is_empty());
-                self.pending_focused_scan_entries.extend(entries);
-            }
-            WorkerEvent::ScanDirectoryComplete { path, identity } => {
-                if !self.app.primary_scan_path_is_stale(&path) {
-                    // Completion changes scan state, not a tile's displayed size,
-                    // descendants, or interactivity. The next loading frame draws
-                    // that status without rebuilding the entire visible map.
-                    self.app.complete_directory(&path, identity.as_ref())?;
-                }
-            }
-            WorkerEvent::FocusedScanDirectoryComplete { path, identity } => {
-                self.app
-                    .complete_focused_directory(&path, identity.as_ref())?;
-            }
-            WorkerEvent::ScanUnscanned { path, reason } => {
-                self.handle_primary_unscanned(&path, reason)?;
-            }
-            WorkerEvent::FocusedScanUnscanned { path, reason } => {
-                self.handle_focused_unscanned(&path, reason)?;
+            WorkerEvent::ScanUnscanned {
+                lease,
+                path,
+                reason,
+                input_runs,
+            } => {
+                self.handle_primary_unscanned(lease.as_ref(), input_runs, &path, &reason)?;
             }
             WorkerEvent::ScanFailed { path, message } => {
-                self.handle_scan_failure(path.as_deref(), &message, false)?;
+                self.handle_scan_failure(path.as_deref(), &message, self.rescan_active);
             }
-            WorkerEvent::FocusedScanFailed { path, message } => {
-                self.handle_scan_failure(path.as_deref(), &message, true)?;
-            }
-            WorkerEvent::ScanFinished { cancelled } => self.finish_primary_scan(cancelled)?,
-            WorkerEvent::FocusedScanFinished { cancelled } => {
-                self.finish_focused_scan(cancelled)?;
+            WorkerEvent::ScanFinished { cancelled } => {
+                if self.rescan_active {
+                    self.finish_rescan(cancelled)?;
+                } else {
+                    self.finish_primary_scan(cancelled)?;
+                }
             }
             WorkerEvent::DeletionPlanned { work_id, result } => match result {
                 Ok(plan) => {
@@ -963,15 +915,22 @@ where
             },
             WorkerEvent::DeletionExecutionRejected { work_id, error } => {
                 if error.is_cancelled() {
-                    self.app.deletion_execution_finished(work_id);
+                    self.app
+                        .deletion_execution_finished(work_id, WorkCompletion::Cancelled);
                     self.app.mark_dirty();
                 } else {
-                    let notice = if error.is_missing() || error.is_stale() {
+                    let invalidated = error.is_missing() || error.is_stale();
+                    let notice = if invalidated {
                         "Deletion skipped: files changed or disappeared"
                     } else {
                         "Deletion stopped: a final safety check failed"
                     };
-                    if self.app.deletion_execution_stale(work_id) {
+                    let resolved = if invalidated {
+                        self.app.deletion_execution_stale(work_id)
+                    } else {
+                        self.app.deletion_execution_failed(work_id)
+                    };
+                    if resolved {
                         if error.is_missing() {
                             self.summary.deletion_missing_entries =
                                 self.summary.deletion_missing_entries.saturating_add(1);
@@ -987,7 +946,12 @@ where
                 }
             }
             WorkerEvent::DeletionFinished { work_id, report } => {
-                if self.app.deletion_execution_finished(work_id) {
+                let completion = if report.soft_cancelled {
+                    WorkCompletion::Cancelled
+                } else {
+                    WorkCompletion::Succeeded
+                };
+                if self.app.deletion_execution_finished(work_id, completion) {
                     self.summary.deleted_entries = self
                         .summary
                         .deleted_entries
@@ -1021,7 +985,7 @@ where
                             self.clock.now(),
                         );
                     }
-                    self.reconcile_deletion_report(report);
+                    self.reconcile_deletion_report(report)?;
                 }
             }
         }
@@ -1039,24 +1003,20 @@ where
         Ok(())
     }
 
-    fn reconcile_deletion_report(&mut self, report: DeletionReport) {
-        match self.app.try_complete_deletion(report) {
-            Ok(true) => {
-                self.animation.schedule_deletion_result();
-                self.app.flash_space_freed();
-                self.schedule(
-                    self.clock.now(),
-                    TimedAction::UnflashSpace,
-                    TRANSIENT_STATUS_DURATION,
-                );
-            }
-            Ok(false) => self.animation.schedule_deletion_result(),
-            Err(error) => {
-                self.summary.unreadable_entries = self.summary.unreadable_entries.saturating_add(1);
-                self.summary.last_worker_error = Some(error.to_string());
-                self.animation.schedule_error();
-            }
+    fn reconcile_deletion_report(&mut self, report: DeletionReport) -> Result<(), AppError> {
+        if self.app.complete_deletion(report) {
+            self.animation.schedule_deletion_result();
+            self.app.flash_space_freed();
+            self.schedule(
+                self.clock.now(),
+                TimedAction::UnflashSpace,
+                TRANSIENT_STATUS_DURATION,
+            );
+        } else {
+            self.animation.schedule_deletion_result();
         }
+        self.start_pending_generation_rebuild()?;
+        Ok(())
     }
 
     /// Clears a copied departure after it finishes dissolving during the reflow.
@@ -1076,7 +1036,7 @@ where
         Ok(true)
     }
 
-    fn process_deadlines(&mut self) -> bool {
+    fn process_deadlines(&mut self) -> Result<bool, AppError> {
         let now = self.clock.now();
         let mut processed = false;
         let mut pending = Vec::with_capacity(self.timed_actions.len());
@@ -1093,8 +1053,8 @@ where
         }
         self.timed_actions = pending;
 
-        if self.settings.animate_loading && self.scan_active && now >= self.next_loading_frame {
-            if self.scan_view_dirty && self.app.refresh_board_from_scan() {
+        if self.scan_active && now >= self.next_loading_frame {
+            if self.scan_view_dirty && self.app.refresh_board_from_scan()? {
                 self.scan_view_dirty = false;
             }
             self.next_loading_frame = now.saturating_add(LOADING_FRAME_INTERVAL);
@@ -1116,7 +1076,7 @@ where
             self.last_deletion_progress = None;
             self.next_deletion_progress_frame = now.saturating_add(DELETION_PROGRESS_INTERVAL);
         }
-        processed
+        Ok(processed)
     }
 
     fn update_animation_frame(&mut self) {
@@ -1190,7 +1150,7 @@ where
     fn wait_for_quiescence(&mut self) -> Result<(), AppError> {
         'quiescence: loop {
             while self.scan_active || self.app.deletion_work.has_background_activity() {
-                if self.process_pending_scan_entry()? {
+                if self.process_pending_scan_entry() {
                     self.render_due_frame()?;
                     continue;
                 }
@@ -1230,7 +1190,7 @@ where
                     break;
                 }
                 self.process_deletion_departure(false)?;
-                self.process_deadlines();
+                self.process_deadlines()?;
                 self.render_due_frame()?;
             }
             break;
@@ -1268,35 +1228,79 @@ fn display_reason(reason: &crate::model::UnscannedReason) -> String {
     }
 }
 
-/// Runs the production scanner and bounded model without acquiring a terminal.
+fn is_scan_store_capacity_failure(message: &str) -> bool {
+    message.contains("scan store capacity exhausted") && message.contains("--scan-store-mib")
+}
+
+fn summary_only_scan_outcome(
+    root: PathBuf,
+    root_identity: NativeIdentity,
+    summary: RunSummary,
+) -> OperationOutcome<ScanReport> {
+    OperationOutcome::Partial {
+        completed_entries: summary.scanned_entries,
+        failed_entries: summary.unscanned_entries,
+        value: ScanReport::summary_only(root, Some(root_identity), summary),
+    }
+}
+
+/// Runs the production scanner and canonical store without acquiring a terminal.
 ///
 /// # Errors
 /// Returns a scanner, model, or worker error after all owned workers stop.
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value)]
 pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanReport>, AppError> {
+    let scan_store_session = ScanStoreStorage::new_for_scan_store_mib(
+        settings.scan_store_mib,
+        settings.scan_store_dir.as_deref(),
+    )
+    .map_err(|error| AppError::Config(error.to_string()))?;
+    scan_headless_with_scan_store_session(settings, scan_store_session)
+}
+
+#[cfg(test)]
+fn scan_headless_with_scan_store_storage(
+    settings: RuntimeSettings,
+    scan_store_storage: TemporaryStorage,
+) -> Result<OperationOutcome<ScanReport>, AppError> {
+    let scan_store_session =
+        ScanStoreStorage::new(scan_store_storage, settings.scan_store_dir.as_deref())
+            .map_err(|error| AppError::Config(error.to_string()))?;
+    scan_headless_with_scan_store_session(settings, scan_store_session)
+}
+
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+fn scan_headless_with_scan_store_session(
+    settings: RuntimeSettings,
+    scan_store_session: ScanStoreStorage,
+) -> Result<OperationOutcome<ScanReport>, AppError> {
+    let scan_store_storage = scan_store_session.quota();
     let temporary_storage = TemporaryStorage::from_mib(settings.temporary_storage_mib)
         .map_err(|error| AppError::Config(error.to_string()))?;
-    let mut tree = FileTree::new_with_root_identity_and_temporary_storage(
-        settings.root.clone(),
-        settings.root_identity.clone(),
-        settings.apparent_size,
-        settings.memory_mib,
-        temporary_storage.clone(),
-    )
-    .map_err(|error| AppError::Model(error.to_string()))?;
-    let workers = WorkerPool::start(
+    let mut scan_store = ScanStore::new_with_storage(ScanGeneration::initial(), scan_store_session)
+        .map_err(|error| AppError::Model(error.to_string()))?;
+    let input_runs = scan_store
+        .input_run_factory()
+        .map_err(|error| AppError::Model(error.to_string()))?;
+    let workers = WorkerPool::start_with_deletion_storage(
         scanner::ScannerOptions {
+            session: scan_store.session(),
+            generation: input_runs.generation(),
             root: settings.root.clone(),
+            canonical_root: settings.root.clone(),
             root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
             cross_filesystems: settings.cross_filesystems,
             exclusions: settings.exclusions.clone(),
-            internal_paths: tree.internal_scan_paths(),
-            temporary_storage,
+            internal_paths: Vec::new(),
+            temporary_storage: scan_store_storage,
+            input_runs: Some(input_runs),
         },
+        temporary_storage,
         settings.event_capacity,
     )?;
     let mut summary = RunSummary::default();
+    let mut scan_store_capacity_exhausted = false;
     let scan_result = (|| -> Result<bool, AppError> {
         loop {
             let event = workers
@@ -1304,20 +1308,72 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                 .recv()
                 .map_err(|_| AppError::Worker("scanner event channel disconnected".to_string()))?;
             match event {
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch {
+                    lease,
+                    entries,
+                    input_runs,
+                } => {
+                    if !scan_store_capacity_exhausted && !input_runs.is_empty() {
+                        let lease = lease.as_ref().ok_or_else(|| {
+                            AppError::Invariant(
+                                "scanner emitted an unleased sealed batch".to_string(),
+                            )
+                        })?;
+                        for run in input_runs {
+                            if let Err(error) = scan_store.accept_leased_input_run(lease, run) {
+                                let message = error.to_string();
+                                if !is_scan_store_capacity_failure(&message) {
+                                    return Err(AppError::Model(message));
+                                }
+                                scan_store_capacity_exhausted = true;
+                                scan_store
+                                    .discard_active()
+                                    .map_err(|error| AppError::Model(error.to_string()))?;
+                                summary.unscanned_entries =
+                                    summary.unscanned_entries.saturating_add(1);
+                                summary.last_unscanned_reason = Some(message.clone());
+                                summary.last_worker_error = Some(message);
+                                break;
+                            }
+                        }
+                    }
                     summary.scanned_entries =
                         summary.scanned_entries.saturating_add(entries.len() as u64);
-                    for entry in entries {
-                        tree.add_entry(&entry.metadata, &entry.path, &entry.identity)
-                            .map_err(|error| AppError::Model(error.to_string()))?;
-                    }
-                    summary.identified_entries =
-                        u64::try_from(tree.identity_count()).unwrap_or(u64::MAX);
                 }
-                WorkerEvent::ScanDirectoryComplete { path, identity } => tree
-                    .complete_directory(&path, identity.as_ref())
-                    .map_err(|error| AppError::Model(error.to_string()))?,
-                WorkerEvent::ScanUnscanned { path, reason } => {
+                WorkerEvent::ScanUnscanned {
+                    lease,
+                    path,
+                    reason,
+                    input_runs,
+                } => {
+                    let represented = !input_runs.is_empty();
+                    if !scan_store_capacity_exhausted && represented {
+                        let lease = lease.as_ref().ok_or_else(|| {
+                            AppError::Invariant(
+                                "scanner emitted an unleased sealed coverage result".to_string(),
+                            )
+                        })?;
+                        for run in input_runs {
+                            if let Err(error) = scan_store.accept_leased_input_run(lease, run) {
+                                let message = error.to_string();
+                                if !is_scan_store_capacity_failure(&message) {
+                                    return Err(AppError::Model(message));
+                                }
+                                scan_store_capacity_exhausted = true;
+                                scan_store
+                                    .discard_active()
+                                    .map_err(|error| AppError::Model(error.to_string()))?;
+                                summary.unscanned_entries =
+                                    summary.unscanned_entries.saturating_add(1);
+                                summary.last_unscanned_reason = Some(message.clone());
+                                summary.last_worker_error = Some(message);
+                                break;
+                            }
+                        }
+                    }
+                    if !represented {
+                        scan_store.record_unrecorded_path();
+                    }
                     summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
                     summary.last_unscanned_path = Some(safe_display_path_text(&path));
                     summary.last_unscanned_reason = Some(display_reason(&reason));
@@ -1340,43 +1396,39 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                                 .last_unreadable_path
                                 .clone_from(&summary.last_unscanned_path);
                             summary.last_worker_error = Some(safe_display_text(message));
-                            tree.failed_to_read = tree.failed_to_read.saturating_add(1);
                         }
                         crate::model::UnscannedReason::IdentityStorageCapacity
                         | crate::model::UnscannedReason::MemoryAggregation => {}
                     }
-                    tree.record_unscanned(&path, reason)
-                        .map_err(|error| AppError::Model(error.to_string()))?;
                 }
                 WorkerEvent::ScanFailed { path, message } => {
+                    let capacity_exhausted = is_scan_store_capacity_failure(&message);
                     let message = safe_display_text(&message);
-                    summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
-                    summary.unreadable_entries = summary.unreadable_entries.saturating_add(1);
-                    summary.last_unscanned_path = path.as_deref().map(safe_display_path_text);
-                    summary
-                        .last_unreadable_path
-                        .clone_from(&summary.last_unscanned_path);
-                    summary.last_unscanned_reason = Some(message.clone());
-                    summary.last_worker_error = Some(message.clone());
-                    if let Some(path) = path {
-                        tree.record_unscanned(
-                            &path,
-                            crate::model::UnscannedReason::Metadata(message),
-                        )
-                        .map_err(|error| AppError::Model(error.to_string()))?;
+                    if capacity_exhausted {
+                        if !scan_store_capacity_exhausted {
+                            scan_store_capacity_exhausted = true;
+                            scan_store
+                                .discard_active()
+                                .map_err(|error| AppError::Model(error.to_string()))?;
+                            summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
+                            summary.last_unscanned_path =
+                                path.as_deref().map(safe_display_path_text);
+                            summary.last_unscanned_reason = Some(message.clone());
+                            summary.last_worker_error = Some(message);
+                        }
+                    } else {
+                        scan_store.record_unrecorded_path();
+                        summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
+                        summary.unreadable_entries = summary.unreadable_entries.saturating_add(1);
+                        summary.last_unscanned_path = path.as_deref().map(safe_display_path_text);
+                        summary
+                            .last_unreadable_path
+                            .clone_from(&summary.last_unscanned_path);
+                        summary.last_unscanned_reason = Some(message.clone());
+                        summary.last_worker_error = Some(message);
                     }
-                    tree.failed_to_read = tree.failed_to_read.saturating_add(1);
                 }
                 WorkerEvent::ScanFinished { cancelled } => return Ok(cancelled),
-                WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. } => {
-                    return Err(AppError::Invariant(
-                        "headless scan received an unexpected focused scan event".to_string(),
-                    ));
-                }
                 WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
@@ -1386,23 +1438,62 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
     let shutdown_result = workers.shutdown();
     let cancelled = scan_result?;
     shutdown_result?;
-    if !cancelled {
-        tree.finalize()
-            .map_err(|error| AppError::Model(error.to_string()))?;
-    }
-    let (used, limit, spilled) = tree.model_stats();
-    summary.model_bytes = used;
-    summary.model_limit_bytes = limit;
-    summary.identity_spilled = spilled;
-    let state = scan_report_state(&tree, &summary, cancelled);
-    let uncertain = state == ScanReportState::Uncertain;
-    let report = ScanReport::from_completed_tree(tree, summary.clone(), state);
     if cancelled {
-        Ok(OperationOutcome::Cancelled {
-            value: Some(report),
+        return Ok(OperationOutcome::Cancelled {
+            value: Some(ScanReport::cancelled(
+                settings.root,
+                Some(settings.root_identity),
+                summary,
+            )),
             precise: true,
-        })
-    } else if uncertain {
+        });
+    }
+    let (used, limit) = scan_store.storage_stats();
+    summary.scan_store_bytes = used;
+    summary.scan_store_limit_bytes = limit;
+    if scan_store_capacity_exhausted {
+        return Ok(summary_only_scan_outcome(
+            settings.root,
+            settings.root_identity,
+            summary,
+        ));
+    }
+    scan_store
+        .publish()
+        .map_err(|error| AppError::Model(error.to_string()))?;
+    let (used, limit) = scan_store.storage_stats();
+    summary.scan_store_bytes = used;
+    summary.scan_store_limit_bytes = limit;
+    if scan_store.is_summary_only() {
+        let summary_generation = scan_store
+            .into_summary_only()
+            .map_err(|error| AppError::Model(error.to_string()))?;
+        let report = ScanReport::summary_only_with_root(
+            settings.root,
+            Some(settings.root_identity),
+            summary_generation.root_metrics(),
+            summary_generation.root_coverage(),
+            summary.clone(),
+        );
+        return Ok(OperationOutcome::Partial {
+            completed_entries: summary.scanned_entries,
+            failed_entries: summary.unscanned_entries,
+            value: report,
+        });
+    }
+    let published = scan_store
+        .into_published()
+        .map_err(|error| AppError::Model(error.to_string()))?;
+    let state = canonical_scan_report_state(&published, &summary, false);
+    let uncertain = state == ScanReportState::Uncertain;
+    let report = ScanReport::from_published_generation(
+        settings.root,
+        Some(settings.root_identity),
+        published,
+        summary.clone(),
+        state,
+    );
+    if uncertain {
         Ok(OperationOutcome::Uncertain {
             unreadable_entries: summary.unreadable_entries,
             value: report,
@@ -1507,13 +1598,17 @@ mod tests {
         let scan_view_root = app.current_folder_path();
         let workers = WorkerPool::start(
             scanner::ScannerOptions {
+                session: app.scan_session_id(),
+                generation: ScanGeneration::initial(),
                 root: root.path().to_path_buf(),
+                canonical_root: root.path().to_path_buf(),
                 root_identity: Some(root_identity.clone()),
                 threads: 1,
                 cross_filesystems: false,
                 exclusions: Vec::new(),
                 internal_paths: app.internal_scan_paths(),
                 temporary_storage: TemporaryStorage::default(),
+                input_runs: None,
             },
             1,
         )
@@ -1533,6 +1628,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
                 reduced_motion: true,
@@ -1546,18 +1643,19 @@ mod tests {
                 config_path: None,
                 monochrome_locked: true,
             },
-            temporary_storage: TemporaryStorage::default(),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(
+                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+            )
+            .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: true,
+            scheduler_snapshot: None,
             primary_scan_active: true,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
-            pending_focused_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             rescan_active: false,
-            rescan_preparing: false,
-            rescan_root_identity: None,
             rescan_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
@@ -1641,6 +1739,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
                 reduced_motion: true,
@@ -1654,18 +1754,19 @@ mod tests {
                 config_path: None,
                 monochrome_locked: true,
             },
-            temporary_storage: TemporaryStorage::default(),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(
+                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+            )
+            .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: true,
+            scheduler_snapshot: None,
             primary_scan_active: true,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
-            pending_focused_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             rescan_active: false,
-            rescan_preparing: false,
-            rescan_root_identity: None,
             rescan_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
@@ -1677,6 +1778,7 @@ mod tests {
 
         owner
             .handle_worker_event(WorkerEvent::ScanBatch {
+                lease: None,
                 entries: (0..=MAX_SCAN_ENTRIES_PER_SLICE)
                     .map(|index| ScannedEntry {
                         metadata: first_metadata.clone(),
@@ -1684,6 +1786,7 @@ mod tests {
                         identity: first_identity.clone(),
                     })
                     .collect(),
+                input_runs: Vec::new(),
             })
             .expect("scan batch should be staged");
         assert_eq!(owner.summary.scanned_entries, 0);
@@ -1715,7 +1818,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the regression constructs a complete active scan frame without a worker thread"
     )]
-    fn busy_scan_work_keeps_animation_and_focused_startup_responsive() {
+    fn busy_scan_work_keeps_animation_and_rebuild_startup_responsive() {
         let root = tempfile::tempdir().expect("test root should be created");
         let entry = root.path().join("entry");
         std::fs::create_dir(&entry).expect("test directory should be created");
@@ -1781,6 +1884,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
                 reduced_motion: false,
@@ -1794,18 +1899,19 @@ mod tests {
                 config_path: None,
                 monochrome_locked: false,
             },
-            temporary_storage: TemporaryStorage::default(),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(
+                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+            )
+            .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: true,
+            scheduler_snapshot: None,
             primary_scan_active: true,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries,
-            pending_focused_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             rescan_active: false,
-            rescan_preparing: false,
-            rescan_root_identity: None,
             rescan_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
@@ -1827,20 +1933,6 @@ mod tests {
                 .next_frame_at()
                 .is_some_and(|next| next > due_frame),
             "a due scan field frame must be rendered before the busy scan batch returns"
-        );
-        owner
-            .start_manual_rescan(entry)
-            .expect("focused scan preparation must not require its worker on the input path");
-        assert!(owner.rescan_preparing);
-        assert!(matches!(
-            owner.app.ui_mode,
-            crate::UiMode::Rescanning { .. }
-        ));
-        assert!(
-            owner
-                .render()
-                .expect("the focused scan field should render before staging completes"),
-            "the requested directory must hand off to its scan field immediately"
         );
     }
     #[cfg(any(unix, windows))]
@@ -1902,6 +1994,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::MIN_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
                 reduced_motion: false,
@@ -1915,18 +2009,19 @@ mod tests {
                 config_path: None,
                 monochrome_locked: false,
             },
-            temporary_storage: TemporaryStorage::default(),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(
+                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+            )
+            .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: false,
+            scheduler_snapshot: None,
             primary_scan_active: false,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
-            pending_focused_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             rescan_active: false,
-            rescan_preparing: false,
-            rescan_root_identity: None,
             rescan_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
@@ -1973,17 +2068,13 @@ mod tests {
             false,
         )
         .expect("app should initialize");
-        app.add_entry_to_base_folder(&target_metadata, target_path.clone(), &target_identity)
-            .expect("target should enter the model");
-        app.add_entry_to_base_folder(
+        app.append_scan_store_entry_for_test(&target_metadata, &target_path, &target_identity);
+        app.append_scan_store_entry_for_test(
             &survivor_metadata,
-            survivor_path.clone(),
+            &survivor_path,
             &survivor_identity,
-        )
-        .expect("survivor should enter the model");
-        app.complete_directory(root.path(), None)
-            .expect("root should complete");
-        app.finalize_scan().expect("scan should finalize");
+        );
+        app.finalize_scan();
         app.start_ui();
         let mut initial_animation = AnimationScheduler::new(true, false, Duration::ZERO);
         app.render_if_dirty(
@@ -2033,14 +2124,15 @@ mod tests {
         assert_eq!(next_target.full_path(), survivor_path);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
-    fn focused_scan_lifecycle_does_not_schedule_header_completion() {
-        let root = tempfile::tempdir().expect("focused scan root should exist");
+    fn generation_rebuild_lifecycle_does_not_schedule_header_completion() {
+        let root = tempfile::tempdir().expect("scan rebuild root should exist");
         let root_metadata = std::fs::symlink_metadata(root.path())
-            .expect("focused scan root metadata should exist");
+            .expect("scan rebuild root metadata should exist");
         let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
-            .expect("focused scan root identity should be readable")
-            .expect("focused scan root should not be a link");
+            .expect("scan rebuild root identity should be readable")
+            .expect("scan rebuild root should not be a link");
         let mut app = App::new_with_root_identity(
             TestBackend::new(80, 24),
             root.path().to_path_buf(),
@@ -2052,9 +2144,14 @@ mod tests {
             None,
             false,
         )
-        .expect("focused scan app should initialize");
-        app.begin_rescan(root.path().to_path_buf())
-            .expect("focused scan should start");
+        .expect("scan rebuild app should initialize");
+        app.finalize_scan();
+        app.start_ui();
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("rebuild should begin")
+        );
         let scan_view_root = app.current_folder_path();
         let mut owner = OwnerLoop {
             app,
@@ -2071,6 +2168,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
                 reduced_motion: false,
@@ -2084,18 +2183,19 @@ mod tests {
                 config_path: None,
                 monochrome_locked: false,
             },
-            temporary_storage: TemporaryStorage::default(),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(
+                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+            )
+            .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: true,
+            scheduler_snapshot: None,
             primary_scan_active: false,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
-            pending_focused_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             rescan_active: true,
-            rescan_preparing: true,
-            rescan_root_identity: None,
             rescan_target: Some(root.path().to_path_buf()),
             cancelled_while_scanning: false,
             exit_after_work: false,
@@ -2106,38 +2206,134 @@ mod tests {
         };
 
         owner
-            .finish_focused_scan(true)
-            .expect("cancelled focused scan should settle");
+            .handle_worker_event(WorkerEvent::ScanFinished { cancelled: true })
+            .expect("cancelled scan rebuild should settle");
         assert_eq!(
             owner.animation.pending_slots(),
             0,
-            "cancelling a focused scan must not flash completion through the header"
+            "cancelling a scan rebuild must not flash completion through the header"
         );
 
-        owner
-            .app
-            .begin_rescan(root.path().to_path_buf())
-            .expect("second focused scan should start");
-        assert_eq!(
+        owner.app.require_generation_rebuild_for_test();
+        assert!(
             owner
                 .app
-                .advance_rescan_preparation()
-                .expect("second focused scan staging should activate"),
-            RescanPreparationProgress::Ready
+                .begin_generation_rebuild()
+                .expect("rebuild should restart")
         );
         owner.rescan_active = true;
-        owner.rescan_preparing = false;
         owner.rescan_target = Some(root.path().to_path_buf());
         owner.scan_active = true;
         owner
-            .finish_focused_scan(false)
-            .expect("completed focused scan should settle");
+            .handle_worker_event(WorkerEvent::ScanFinished { cancelled: false })
+            .expect("completed generation rebuild should settle");
         assert_eq!(
             owner.animation.pending_slots(),
             0,
-            "finishing navigation work must not flash completion through the header"
+            "finishing generation work must not flash completion through the header"
         );
     }
+    #[test]
+    fn scan_store_capacity_returns_a_summary_only_partial_outcome() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let metadata = std::fs::symlink_metadata(root.path()).expect("root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &metadata)
+            .expect("root identity should be readable")
+            .expect("root should not be a link");
+        let summary = RunSummary {
+            scanned_entries: 17,
+            unscanned_entries: 1,
+            ..RunSummary::default()
+        };
+
+        let outcome = summary_only_scan_outcome(root.path().to_path_buf(), root_identity, summary);
+
+        let OperationOutcome::Partial {
+            value,
+            completed_entries,
+            failed_entries,
+        } = outcome
+        else {
+            panic!("scan-store capacity must retain a summary-only partial outcome");
+        };
+        assert_eq!(completed_entries, 17);
+        assert_eq!(failed_entries, 1);
+        assert_eq!(value.state(), ScanReportState::SummaryOnly);
+        assert!(is_scan_store_capacity_failure(
+            "scan store capacity exhausted; increase --scan-store-mib"
+        ));
+        assert!(!is_scan_store_capacity_failure(
+            "temporary storage capacity exhausted; increase --temporary-storage-mib"
+        ));
+    }
+
+    #[test]
+    fn exhausted_scan_store_returns_a_summary_only_report() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        for index in 0..32 {
+            std::fs::write(root.path().join(format!("entry-{index:02}")), b"payload")
+                .expect("fixture entry should be written");
+        }
+        let metadata = std::fs::symlink_metadata(root.path()).expect("root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &metadata)
+            .expect("root identity should be readable")
+            .expect("root should not be a link");
+        let settings = RuntimeSettings {
+            root: root.path().to_path_buf(),
+            root_identity,
+            scan_threads: 1,
+            event_capacity: 8,
+            cross_filesystems: false,
+            exclusions: Vec::new(),
+            memory_mib: crate::model::MIN_PROCESS_MIB,
+            temporary_storage_mib: crate::temporary_storage::MIN_TEMPORARY_STORAGE_MIB,
+            scan_store_mib: crate::temporary_storage::MIN_SCAN_STORE_MIB,
+            scan_store_dir: None,
+            apparent_size: false,
+            disable_delete_confirmation: false,
+            reduced_motion: true,
+            monochrome: true,
+            animate_loading: false,
+            theme: ThemeId::ExciseDark,
+            ascii: false,
+            mouse: false,
+            keymap: KeyPreset::Vim,
+            custom_keys: None,
+            config_path: None,
+            monochrome_locked: true,
+        };
+
+        let outcome = scan_headless_with_scan_store_storage(
+            settings,
+            TemporaryStorage::scan_store_with_limit_bytes(512),
+        )
+        .expect("capacity exhaustion should produce a terminal summary");
+
+        let OperationOutcome::Partial {
+            value,
+            failed_entries,
+            ..
+        } = outcome
+        else {
+            panic!("exhausted scan storage must not become a runtime failure");
+        };
+        assert_eq!(value.state(), ScanReportState::SummaryOnly);
+        assert_eq!(failed_entries, 1);
+        assert_eq!(value.summary().scan_store_limit_bytes, 512);
+        assert!(
+            value.summary().scan_store_bytes <= value.summary().scan_store_limit_bytes,
+            "summary-only report must preserve a bounded scan-store capacity state"
+        );
+        assert!(
+            value
+                .summary()
+                .last_worker_error
+                .as_deref()
+                .is_some_and(is_scan_store_capacity_failure),
+            "the retained summary should explain the capacity terminal state"
+        );
+    }
+
     #[test]
     fn unchanged_deletion_progress_does_not_request_another_map_frame() {
         let mut previous = None;
