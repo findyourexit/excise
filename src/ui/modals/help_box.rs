@@ -114,7 +114,7 @@ impl Widget for HelpBox<'_> {
                 Line::from("  +  -  0                zoom in / out / reset"),
                 Line::from("  /                      filter items"),
                 Line::from("  e                      export report"),
-                Line::from("  t                      preview themes"),
+                Line::from("  t                      preview and save themes"),
                 Line::styled("Delete safely", heading),
                 Line::from("  Backspace              queue permanent deletion"),
                 Line::from("  q / Ctrl-c             quit / interruption options"),
@@ -168,7 +168,7 @@ impl Widget for HelpBox<'_> {
                 Line::from("  Enter: open / rescan"),
                 Line::from("  Esc: back / cancel"),
                 Line::from("  +/-/0: zoom"),
-                Line::from("  / filter; e scan; E history; t themes"),
+                Line::from("  / filter; e scan; E history; t saves theme"),
             ]);
             content.truncate(usize::from(inner.height));
             content
@@ -227,7 +227,7 @@ mod tests {
         assert!(rendered.contains("HELP"));
         assert!(rendered.contains("Navigate"));
         assert!(rendered.contains("export report"));
-        assert!(rendered.contains("preview themes"));
+        assert!(rendered.contains("preview and save themes"));
         assert!(rendered.contains("Delete safely"));
         assert!(rendered.contains("queue permanent deletion"));
         assert!(rendered.contains("virtual summaries"));

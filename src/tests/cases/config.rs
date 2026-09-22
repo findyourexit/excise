@@ -4,8 +4,8 @@ use clap::Parser;
 
 use crate::config::{
     Cli, CustomKeyBindings, EnvironmentOverrides, FileConfig, KeyPreset, ModelFileConfig,
-    NORMAL_MODE_RESERVED_CUSTOM_MOVEMENT_KEYS, RuntimeConfig, RuntimeFileConfig, SafePreferences,
-    ScannerFileConfig, parse_file_config, save_safe_preferences,
+    NORMAL_MODE_RESERVED_CUSTOM_MOVEMENT_KEYS, RuntimeConfig, RuntimeFileConfig, ScannerFileConfig,
+    parse_file_config, save_theme_preference,
 };
 use crate::error::AppError;
 use crate::theme::ThemeId;
@@ -179,27 +179,16 @@ fn explicit_false_environment_value_overrides_file_true() {
 }
 
 #[test]
-fn saved_preferences_preserve_scanner_config_and_exclude_delete_guardrails() {
+fn saved_theme_preference_preserves_existing_runtime_and_scanner_config() {
     let directory = tempfile::tempdir().expect("config directory should exist");
     let path = directory.path().join("config.toml");
     std::fs::write(
         &path,
-        "version = 1\n[scanner]\nthreads = 3\n[runtime]\nreduced_motion = false\n",
+        "version = 1\n[scanner]\nthreads = 3\n[runtime]\nascii = true\nmouse = true\nkeymap = \"emacs\"\nreduced_motion = false\n",
     )
     .expect("initial config should be written");
 
-    save_safe_preferences(
-        &path,
-        SafePreferences {
-            theme: ThemeId::Nord,
-            ascii: true,
-            mouse: true,
-            keymap: KeyPreset::Emacs,
-            custom_keys: None,
-            reduced_motion: true,
-        },
-    )
-    .expect("safe preferences should save");
+    save_theme_preference(&path, ThemeId::Nord).expect("theme preference should save");
 
     let saved = std::fs::read_to_string(&path).expect("saved config should be readable");
     let parsed = parse_file_config(&saved).expect("saved config should parse");
@@ -208,51 +197,36 @@ fn saved_preferences_preserve_scanner_config_and_exclude_delete_guardrails() {
     assert_eq!(parsed.runtime.ascii, Some(true));
     assert_eq!(parsed.runtime.mouse, Some(true));
     assert_eq!(parsed.runtime.keymap, Some(KeyPreset::Emacs));
-    assert_eq!(parsed.runtime.reduced_motion, Some(true));
+    assert_eq!(parsed.runtime.reduced_motion, Some(false));
     assert!(!saved.contains("delete"));
+
+    let reloaded = RuntimeConfig::from_layers(
+        cli(&["excise"]),
+        Some(&parsed),
+        EnvironmentOverrides::default(),
+        PathBuf::from("cwd"),
+        Some(path),
+    )
+    .expect("saved theme should load for the next session");
+    assert_eq!(reloaded.theme, ThemeId::Nord);
 }
 
 #[test]
-fn safe_preferences_validate_custom_keymaps_before_writing() {
+fn saved_theme_preference_creates_a_config_when_none_exists() {
     let directory = tempfile::tempdir().expect("config directory should exist");
-    let path = directory.path().join("config.toml");
+    let path = directory.path().join("nested/config.toml");
 
-    let error = save_safe_preferences(
-        &path,
-        SafePreferences {
-            theme: ThemeId::Nord,
-            ascii: true,
-            mouse: true,
-            keymap: KeyPreset::Custom,
-            custom_keys: None,
-            reduced_motion: true,
-        },
-    )
-    .expect_err("custom preferences without bindings should not save");
-    assert!(matches!(error, AppError::Config(_)));
-    assert!(error.to_string().contains("requires [runtime.custom_keys]"));
-    assert!(!path.exists());
+    save_theme_preference(&path, ThemeId::TokyoNight)
+        .expect("theme preference should create its config");
 
-    let error = save_safe_preferences(
-        &path,
-        SafePreferences {
-            theme: ThemeId::Nord,
-            ascii: true,
-            mouse: true,
-            keymap: KeyPreset::Vim,
-            custom_keys: Some(CustomKeyBindings {
-                left: 'e',
-                down: 's',
-                up: 'w',
-                right: 'd',
-            }),
-            reduced_motion: true,
-        },
-    )
-    .expect_err("invalid inactive custom bindings should not save");
-    assert!(matches!(error, AppError::Config(_)));
-    assert!(error.to_string().contains("export"));
-    assert!(!path.exists());
+    let saved = std::fs::read_to_string(path).expect("created config should be readable");
+    let parsed = parse_file_config(&saved).expect("created config should parse");
+    assert_eq!(parsed.version, 1);
+    assert_eq!(parsed.runtime.theme, Some(ThemeId::TokyoNight));
+    assert_eq!(parsed.runtime.ascii, None);
+    assert_eq!(parsed.runtime.mouse, None);
+    assert_eq!(parsed.runtime.keymap, None);
+    assert_eq!(parsed.runtime.reduced_motion, None);
 }
 
 #[test]

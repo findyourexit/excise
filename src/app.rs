@@ -71,7 +71,6 @@ pub enum UiMode {
     ErrorMessage(String),
     Notice(String),
     Exiting {
-        save_preferences: bool,
         work: ExitWork,
         return_to: ThemePickerReturn,
     },
@@ -171,7 +170,6 @@ where
     deletion_history: Vec<Arc<DeletionReport>>,
     deletion_history_bytes: usize,
     deletion_history_limit: usize,
-    preferences_dirty: bool,
     keymap: KeyPreset,
     custom_keys: Option<CustomKeyBindings>,
     mouse_enabled: bool,
@@ -293,7 +291,6 @@ where
             keymap,
             custom_keys,
             mouse_enabled,
-            preferences_dirty: false,
             dirty: true,
             deletion_history_bytes: 0,
             deletion_history_limit: process_memory_mib.saturating_mul(MIB) / 8,
@@ -669,11 +666,7 @@ where
                     self.deletion_work.cancel_modal(work_id);
             }
         }
-        self.ui_mode = UiMode::Exiting {
-            save_preferences: self.preferences_dirty,
-            work,
-            return_to,
-        };
+        self.ui_mode = UiMode::Exiting { work, return_to };
         self.sync_deletion_work_summary();
         emit_pty_test_marker("QUIT_PROMPT");
         self.mark_dirty();
@@ -1253,25 +1246,9 @@ where
         self.mark_dirty();
     }
 
-    pub fn preferences_changed(&mut self) {
-        self.preferences_dirty = true;
-        self.mark_dirty();
-    }
-
-    pub fn preferences_saved(&mut self) {
-        self.preferences_dirty = false;
-    }
-
-    #[must_use]
-    pub const fn preferences_dirty(&self) -> bool {
-        self.preferences_dirty
-    }
-
     #[must_use]
     pub(crate) fn can_exit_immediately(&self) -> bool {
-        !self.preferences_dirty
-            && !self.deletion_work.has_work()
-            && !self.ui_effects.has_deletion_departure()
+        !self.deletion_work.has_work() && !self.ui_effects.has_deletion_departure()
     }
 
     #[must_use]

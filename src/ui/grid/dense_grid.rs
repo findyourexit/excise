@@ -53,6 +53,10 @@ const MINIMUM_LABEL_WIDTH: u16 = 6;
 ///
 /// Every field arrives from the same layout pass, so they travel together
 /// rather than as loose arguments that could disagree with each other.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "layout flags are independent observations from the board, scanner, and presentation"
+)]
 #[derive(Clone, Copy)]
 pub struct MapLayout<'a> {
     pub rectangles: &'a [Tile],

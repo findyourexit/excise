@@ -799,6 +799,7 @@ impl Arena {
             Ok(())
         })();
         self.budget.release(duplicate_memory);
+        self.sync_identity_accounting_uncertainty();
         finalization_result?;
         self.rebuild_metrics();
         if let Some(root) = self.node_mut(self.root)
@@ -1610,6 +1611,7 @@ impl Arena {
             }
             Ok(())
         })?;
+        self.sync_identity_accounting_uncertainty();
         Ok(rebuilt)
     }
     fn rebuild_identities_without(
@@ -1629,6 +1631,7 @@ impl Arena {
             }
             Ok(())
         })?;
+        self.sync_identity_accounting_uncertainty();
         Ok(rebuilt)
     }
 
@@ -1679,6 +1682,7 @@ impl Arena {
             self.identities
                 .refresh_declared_links(&file_id, link_count)?;
         }
+        self.sync_identity_accounting_uncertainty();
         Ok(())
     }
 
@@ -1761,6 +1765,7 @@ impl Arena {
             Ok(())
         });
         self.identities = identities;
+        self.sync_identity_accounting_uncertainty();
         result?;
         self.rebuild_metrics();
         self.finalize()?;
@@ -1815,7 +1820,7 @@ impl Arena {
     }
 
     fn preview_leaf_metrics(
-        &self,
+        &mut self,
         kind: NodeKind,
         apparent: u128,
         allocated: ByteBounds,
@@ -1829,6 +1834,10 @@ impl Arena {
         }
         let duplicate =
             identity.link_count != Some(1) && self.identities.get(&identity.file_id)?.is_some();
+        if self.identities.capacity_exhausted() {
+            self.mark_identity_accounting_uncertain();
+            return Ok(leaf_metrics(apparent, ByteBounds::unknown(), None));
+        }
         Ok(if duplicate {
             leaf_metrics(apparent, ByteBounds::exact(0), identity.link_count)
         } else {
@@ -3079,6 +3088,25 @@ mod tests {
         metrics
     }
 
+    #[cfg(unix)]
+    fn assert_spilled_identity(
+        arena: &mut Arena,
+
+        file_id: &FileId,
+        observed_links: u64,
+        nodes: &[(NodeId, u64)],
+        allocation_node: NodeId,
+    ) {
+        let record = arena
+            .identities
+            .get(file_id)
+            .expect("identity lookup should succeed")
+            .expect("identity should remain");
+        assert_eq!(record.observed_links, observed_links);
+        assert_eq!(record.nodes, nodes);
+        assert_eq!(record.allocation_node, Some(allocation_node));
+    }
+
     #[test]
     fn directory_remains_scanning_until_directories_below_it_settle() {
         let root = tempfile::tempdir().expect("model root should exist");
@@ -3830,14 +3858,13 @@ mod tests {
             "compacting known leaf identities must not scan every spilled identity"
         );
 
-        let record = arena
-            .identities
-            .get(&file_id)
-            .expect("identity lookup should succeed")
-            .expect("identity should remain");
-        assert_eq!(record.observed_links, COLD_LINKS + 1);
-        assert_eq!(record.nodes, vec![(cold_id, COLD_LINKS), (survivor_id, 1)]);
-        assert_eq!(record.allocation_node, Some(cold_id));
+        assert_spilled_identity(
+            &mut arena,
+            &file_id,
+            COLD_LINKS + 1,
+            &[(cold_id, COLD_LINKS), (survivor_id, 1)],
+            cold_id,
+        );
 
         arena
             .finalize()
@@ -3868,14 +3895,7 @@ mod tests {
         );
 
         assert!(arena.remove_path(&cold));
-        let record = arena
-            .identities
-            .get(&file_id)
-            .expect("identity lookup should succeed")
-            .expect("surviving identity should remain");
-        assert_eq!(record.observed_links, 1);
-        assert_eq!(record.nodes, vec![(survivor_id, 1)]);
-        assert_eq!(record.allocation_node, Some(survivor_id));
+        assert_spilled_identity(&mut arena, &file_id, 1, &[(survivor_id, 1)], survivor_id);
         assert_eq!(
             arena
                 .node(survivor_id)
@@ -5819,6 +5839,58 @@ mod tests {
             before
         );
     }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn late_identity_capacity_signal_keeps_finalization_uncertain() {
+        const TEMPORARY_STORAGE_LIMIT: u64 = 2 * 1024 * 1024;
+
+        let root = tempfile::tempdir().expect("model root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"shared payload").expect("first fixture should be written");
+        fs::hard_link(&first, &second).expect("second fixture should share the first identity");
+        let temporary_storage = TemporaryStorage::with_limit_bytes(TEMPORARY_STORAGE_LIMIT);
+        let mut arena = Arena::new_with_temporary_storage(
+            root.path().to_path_buf(),
+            MemoryBudget::from_mib(MIN_PROCESS_MIB)
+                .expect("minimum model budget should be available"),
+            temporary_storage.clone(),
+        )
+        .expect("arena should be created");
+        arena.identities = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+            .expect("bounded identity store should initialize");
+
+        assert!(add_path(&mut arena, &first).is_some());
+        assert!(add_path(&mut arena, &second).is_some());
+        assert!(arena.identities.is_spilled());
+        arena
+            .identities
+            .signal_database_capacity_exhaustion_for_test();
+        arena
+            .complete_directory(root.path(), None)
+            .expect("root should complete before identity finalization");
+
+        arena
+            .finalize()
+            .expect("a delayed identity capacity signal must not abort the scan");
+        let root_node = arena.node(arena.root()).expect("root should remain");
+        assert!(arena.identity_accounting_exhausted);
+        assert_eq!(root_node.state, NodeState::Uncertain);
+        assert_eq!(
+            root_node.unscanned_reason,
+            Some(UnscannedReason::IdentityStorageCapacity)
+        );
+        assert!(
+            root_node.metrics.allocated_bytes.lower > 0
+                && root_node.metrics.allocated_bytes.upper.is_none(),
+            "observed allocation remains a lower bound after identity capacity is lost"
+        );
+        assert!(root_node.metrics.reclaimable_bytes.upper.is_none());
+        assert!(!arena.identities.is_spilled());
+        drop(arena);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
     #[test]
     fn identity_capacity_exhaustion_keeps_scanning_with_unknown_metrics() {
         let root = tempfile::tempdir().expect("model root should exist");

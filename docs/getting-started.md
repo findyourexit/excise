@@ -102,7 +102,7 @@ The interactive interface requires standard input and output connected to a term
 
 The interactive view uses a dense map, animated focus border, and animated modal chrome on capable terminals. Modal content stays still while only its border and title chip move. `--ascii`, monochrome mode, high-contrast themes, and reduced motion preserve the same selection, scope, and deletion information with static output.
 
-Press `t` in the normal view, while scanning, or during a focused refresh to preview the theme list. Arrow keys or `j`/`k` move the preview; `Enter` keeps it for the session and `Esc` restores the prior theme.
+Press `t` in the normal view, while scanning, or during a focused refresh to preview the theme list. Arrow keys or `j`/`k` move the preview; `Enter` immediately saves the selected theme for later TUI sessions, while `Esc` restores the prior theme.
 
 In a color-capable map, ordinary entry color carries the current space measure on one fixed absolute scale: 4 KiB and below are blue, 16 MiB is midpoint green, 1 GiB is yellow, and 64 GiB and above are red. The default measure is allocated space; `--apparent-size` uses logical file length instead. Unreadable entries and summarized directories retain distinct state colors; virtual summaries stay subdued and do not affect the size scale.
 

@@ -22,7 +22,7 @@ pub const ROUTINE_MOTION: Duration = Duration::from_millis(160);
 /// its contents, or back out of them.
 pub const NAVIGATION_MOTION: Duration = Duration::from_millis(260);
 /// Stable seed keeps the target's checkerboard departure coherent between redraws.
-const DELETION_DISSOLVE_SEED: u32 = 0xD3E1_E7E;
+const DELETION_DISSOLVE_SEED: u32 = 0x0D3E_1E7E;
 
 /// Applies the deterministic departure dissolve to a freshly painted map layer.
 pub(crate) fn dissolve_deletion_departure(

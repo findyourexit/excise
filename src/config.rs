@@ -304,16 +304,6 @@ pub struct RuntimeConfig {
     pub config_path: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SafePreferences {
-    pub theme: ThemeId,
-    pub ascii: bool,
-    pub mouse: bool,
-    pub keymap: KeyPreset,
-    pub custom_keys: Option<CustomKeyBindings>,
-    pub reduced_motion: bool,
-}
-
 impl RuntimeConfig {
     /// # Errors
     /// Returns an invalid-configuration or filesystem error when a selected layer cannot load.
@@ -522,25 +512,23 @@ impl EnvironmentOverrides {
     }
 }
 
-/// Atomically persists only non-destructive UI preferences.
+/// Atomically persists a committed theme without changing other runtime settings.
 ///
 /// # Errors
-/// Returns a configuration or filesystem error without weakening deletion guardrails.
-pub fn save_safe_preferences(path: &Path, preferences: SafePreferences) -> Result<(), AppError> {
-    validate_custom_keymap(preferences.keymap, preferences.custom_keys.as_ref())?;
+/// Returns a configuration or filesystem error if the preference cannot be saved.
+pub(crate) fn save_theme_preference(path: &Path, theme: ThemeId) -> Result<(), AppError> {
     let mut config = if path.is_file() {
         load_file(path)?
     } else {
         FileConfig::default()
     };
     config.version = CONFIG_VERSION;
-    config.runtime.theme = Some(preferences.theme);
-    config.runtime.ascii = Some(preferences.ascii);
-    config.runtime.mouse = Some(preferences.mouse);
-    config.runtime.keymap = Some(preferences.keymap);
-    config.runtime.reduced_motion = Some(preferences.reduced_motion);
-    config.runtime.custom_keys = preferences.custom_keys;
-    let serialized = toml::to_string_pretty(&config)
+    config.runtime.theme = Some(theme);
+    write_file_config(path, &config)
+}
+
+fn write_file_config(path: &Path, config: &FileConfig) -> Result<(), AppError> {
+    let serialized = toml::to_string_pretty(config)
         .map_err(|error| config_error(format!("could not serialize config: {error}")))?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
