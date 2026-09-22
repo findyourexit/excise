@@ -1,9 +1,12 @@
 use ::std::path::PathBuf;
 
+use super::deletion_work::DeletionWorkSummary;
+
 pub struct UiEffects {
     pub flash_space_freed: bool,
     pub current_path_is_red: bool,
     pub deletion_in_progress: bool,
+    pub deletion_work: DeletionWorkSummary,
     pub loading_progress_indicator: u64,
     pub last_read_path: Option<PathBuf>,
 }
@@ -16,6 +19,7 @@ impl UiEffects {
             deletion_in_progress: false,
             loading_progress_indicator: 0,
             last_read_path: None,
+            deletion_work: DeletionWorkSummary::new(),
         }
     }
     pub const fn increment_loading_progress_indicator(&mut self) {

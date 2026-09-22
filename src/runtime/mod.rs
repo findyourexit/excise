@@ -14,7 +14,7 @@ use ratatui::backend::Backend;
 #[cfg(any(test, feature = "fuzzing", feature = "internal"))]
 pub use clock::VirtualClock;
 pub(crate) use clock::{Clock, SystemClock};
-use worker::{ScannedEntry, WorkerEvent, WorkerPool};
+use worker::{DeletionWorkSubmissionError, ScannedEntry, WorkerEvent, WorkerPool};
 
 use crate::App;
 use crate::animation::AnimationScheduler;
@@ -270,7 +270,7 @@ where
     }
 
     fn process_one_input(&mut self) -> Result<bool, AppError> {
-        match self.input.read()? {
+        let result = match self.input.read()? {
             InputEvent::Barrier => {
                 self.animation.set_activity_suspended(true);
                 let result = (|| {
@@ -278,8 +278,7 @@ where
                     self.wait_for_quiescence()
                 })();
                 self.animation.set_activity_suspended(false);
-                result?;
-                Ok(true)
+                result.map(|()| true)
             }
             InputEvent::Terminal(Event::Resize(_, _)) => {
                 self.app.reset_ui_mode();
@@ -289,10 +288,18 @@ where
             InputEvent::Terminal(event) => {
                 let command = handle_keypress(&event, &mut self.app);
                 let is_drill = matches!(command, InputCommand::Drill);
-                self.handle_input_command(command)?;
-                Ok(is_drill)
+                self.handle_input_command(command).map(|()| is_drill)
             }
+        };
+        self.flush_deletion_plan_cancellation()?;
+        result
+    }
+
+    fn flush_deletion_plan_cancellation(&mut self) -> Result<(), AppError> {
+        if self.app.take_deletion_plan_cancellation() {
+            self.workers()?.cancel_deletion_plan();
         }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -336,34 +343,36 @@ where
                 }
             }
             InputCommand::PlanDeletion(target) => {
-                // Allow planning during the initial scan (rescan_active=false);
-                // block during rescans since the deletion worker is busy there.
-                if self.rescan_active || self.deletion_active {
-                    // prompt_file_deletion already moved the app to PlanningDeletion;
-                    // undo that so the user is not left in a planning screen with
-                    // no worker request behind it (e.g. a fast Esc+Backspace sequence
-                    // during loading where the cancelled worker has not yet replied).
+                // Initial scan events are untagged, so planning cannot safely overlap them.
+                if self.scan_active {
+                    self.app
+                        .show_error("Wait for the scan to finish before deleting");
+                    return Ok(());
+                }
+                // Keep the current interaction contract while the operation state owns the
+                // bounded worker sequence. A later UI integration may enqueue while a prior
+                // operation runs; the state queue still rejects unsafe overlap.
+                if self.deletion_active {
                     self.app.normal_mode();
                     return Ok(());
                 }
                 let reduced_guardrails = self.app.reduced_deletion_guardrails();
-                // File and link plans remain resident. Directory planners spill identities after
-                // this same budget into the shared, bounded temporary-storage reservation.
                 let maximum_bytes = self.app.maximum_deletion_plan_bytes();
-                self.workers()?.request_deletion_plan(
-                    *target,
-                    reduced_guardrails,
-                    maximum_bytes,
-                )?;
-                self.deletion_active = true;
+                if self
+                    .app
+                    .queue_deletion_plan(*target, reduced_guardrails, maximum_bytes)
+                {
+                    self.dispatch_next_deletion_work()?;
+                }
             }
-            InputCommand::CancelDeletionPlan => self.workers()?.cancel_deletion_plan(),
+            InputCommand::CancelDeletionPlan => self.app.cancel_foreground_deletion_modal(),
             InputCommand::RevalidateDeletion(plan) => {
                 if self.deletion_active {
                     return Ok(());
                 }
-                self.workers()?.revalidate_deletion(*plan)?;
-                self.deletion_active = true;
+                if self.app.confirm_deletion_work(*plan) {
+                    self.dispatch_next_deletion_work()?;
+                }
             }
             InputCommand::ExportScan => {
                 let result = next_export_path("scan-report").and_then(|path| {
@@ -486,7 +495,9 @@ where
                 return Ok(false);
             }
         };
-        self.handle_worker_event(event)?;
+        let result = self.handle_worker_event(event);
+        self.flush_deletion_plan_cancellation()?;
+        result?;
         Ok(true)
     }
 
@@ -583,12 +594,13 @@ where
                             Some(crate::app::DeletionReplanResult::Ready(target)) => {
                                 let reduced_guardrails = self.app.reduced_deletion_guardrails();
                                 let maximum_bytes = self.app.maximum_deletion_plan_bytes();
-                                self.workers()?.request_deletion_plan(
+                                if self.app.queue_deletion_plan(
                                     *target,
                                     reduced_guardrails,
                                     maximum_bytes,
-                                )?;
-                                self.deletion_active = true;
+                                ) {
+                                    self.dispatch_next_deletion_work()?;
+                                }
                             }
                             Some(crate::app::DeletionReplanResult::Missing) => {
                                 self.summary.deletion_missing_entries =
@@ -618,12 +630,13 @@ where
                             Some(crate::app::DeletionReplanResult::Ready(target)) => {
                                 let reduced_guardrails = self.app.reduced_deletion_guardrails();
                                 let maximum_bytes = self.app.maximum_deletion_plan_bytes();
-                                self.workers()?.request_deletion_plan(
+                                if self.app.queue_deletion_plan(
                                     *target,
                                     reduced_guardrails,
                                     maximum_bytes,
-                                )?;
-                                self.deletion_active = true;
+                                ) {
+                                    self.dispatch_next_deletion_work()?;
+                                }
                             }
                             Some(crate::app::DeletionReplanResult::Missing) => {
                                 self.summary.deletion_missing_entries =
@@ -636,86 +649,106 @@ where
                     }
                 }
             }
-            WorkerEvent::DeletionPlanned {
-                target_node_id,
-                result,
-            } => {
+            WorkerEvent::DeletionPlanned { work_id, result } => {
                 self.deletion_active = false;
                 match result {
                     Ok(plan) => {
-                        if let Some(auto_confirmed) =
-                            self.app.deletion_plan_ready(target_node_id, Ok(plan))
-                        {
-                            // Enter was pre-armed; skip the confirm dialog and
-                            // jump straight to revalidation.
-                            self.workers()?.revalidate_deletion(*auto_confirmed)?;
-                            self.deletion_active = true;
+                        if let Some(auto_confirmed) = self.app.deletion_plan_ready(work_id, plan) {
+                            let _ = self.app.confirm_deletion_work(*auto_confirmed);
                         }
+                        self.dispatch_next_deletion_work()?;
                     }
                     Err(error) if error.is_stale() => {
-                        if self.scan_active && !self.rescan_active {
-                            // Initial scan still running; starting a competing deletion
-                            // rescan would corrupt untagged scan-event routing. Store
-                            // the replan target and let ScanFinished pick it up.
-                            self.app.defer_pending_deletion_replan(target_node_id);
-                        } else if let Some(target) =
-                            self.app.begin_pending_deletion_replan(target_node_id)?
-                        {
-                            self.start_deletion_rescan(target)?;
+                        let mut replan_started = false;
+                        if let Some(target_node_id) = self.app.deletion_plan_failed(work_id) {
+                            if self.scan_active && !self.rescan_active {
+                                // Initial scan events are untagged, so defer this replan until
+                                // ScanFinished instead of starting a competing rescan.
+                                self.app.defer_pending_deletion_replan(target_node_id);
+                                replan_started = true;
+                            } else if let Some(target) =
+                                self.app.begin_pending_deletion_replan(target_node_id)?
+                            {
+                                self.start_deletion_rescan(target)?;
+                                replan_started = true;
+                            }
+                        }
+                        if !replan_started {
+                            self.dispatch_next_deletion_work()?;
                         }
                     }
                     Err(error) if error.is_missing() => {
-                        self.summary.deletion_missing_entries =
-                            self.summary.deletion_missing_entries.saturating_add(1);
-                        self.app.complete_missing_deletion();
+                        if self.app.deletion_plan_failed(work_id).is_some() {
+                            self.summary.deletion_missing_entries =
+                                self.summary.deletion_missing_entries.saturating_add(1);
+                            self.app.complete_missing_deletion();
+                        }
+                        self.dispatch_next_deletion_work()?;
                     }
                     Err(error) => {
-                        self.animation.schedule_error();
-                        let _ = self
-                            .app
-                            .deletion_plan_ready(target_node_id, Err(error.to_string()));
+                        if self.app.deletion_plan_failed(work_id).is_some() {
+                            self.animation.schedule_error();
+                            self.app.show_error(error.to_string());
+                        }
+                        self.dispatch_next_deletion_work()?;
                     }
                 }
             }
-            WorkerEvent::DeletionRevalidated {
-                target_node_id,
-                result,
-            } => {
+            WorkerEvent::DeletionRevalidated { work_id, result } => {
                 self.deletion_active = false;
                 match result {
                     Ok(plan) => {
-                        let progress = self.app.deletion_progress_counter().unwrap_or_else(|| {
-                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))
-                        });
-                        self.workers()?.execute_deletion(*plan, progress)?;
-                        self.deletion_active = true;
+                        // The queue keeps this operation at its head: execution follows
+                        // successful identity revalidation before later work is dispatched.
+                        let _ = self.app.deletion_revalidation_succeeded(work_id, plan);
+                        self.dispatch_next_deletion_work()?;
                     }
                     Err((_plan, error)) if error.is_cancelled() => {
-                        self.app.normal_mode();
+                        if self.app.deletion_revalidation_failed(work_id) {
+                            self.app.normal_mode();
+                        }
+                        self.dispatch_next_deletion_work()?;
                     }
                     Err((plan, error)) if error.is_missing_target(&plan) => {
-                        self.summary.deletion_missing_entries =
-                            self.summary.deletion_missing_entries.saturating_add(1);
-                        self.app.complete_missing_deletion();
+                        if self.app.deletion_revalidation_failed(work_id) {
+                            self.summary.deletion_missing_entries =
+                                self.summary.deletion_missing_entries.saturating_add(1);
+                            self.app.complete_missing_deletion();
+                        }
+                        self.dispatch_next_deletion_work()?;
                     }
                     Err((plan, _error)) => {
-                        if self.scan_active && !self.rescan_active {
-                            // Initial scan still running; defer without a competing rescan.
-                            self.app
-                                .defer_deletion_replan_from_plan(target_node_id, *plan);
-                        } else {
-                            let Some(target) =
+                        let replan_started = if self.app.deletion_revalidation_failed(work_id) {
+                            let target_node_id = plan.target.node_id;
+                            if self.scan_active && !self.rescan_active {
+                                // Initial scan events are untagged, so defer without a
+                                // concurrent rescan.
+                                self.app
+                                    .defer_deletion_replan_from_plan(target_node_id, *plan);
+                                true
+                            } else if let Some(target) =
                                 self.app.begin_deletion_replan(target_node_id, *plan)?
-                            else {
-                                return Ok(());
-                            };
-                            self.start_deletion_rescan(target)?;
+                            {
+                                self.start_deletion_rescan(target)?;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !replan_started {
+                            self.dispatch_next_deletion_work()?;
                         }
                     }
                 }
             }
-            WorkerEvent::DeletionFinished { report } => {
+            WorkerEvent::DeletionFinished { work_id, report } => {
                 self.deletion_active = false;
+                if !self.app.deletion_execution_finished(work_id) {
+                    self.dispatch_next_deletion_work()?;
+                    return Ok(());
+                }
                 let deleted = report.deleted_entries();
                 self.summary.deleted_entries = self.summary.deleted_entries.saturating_add(deleted);
                 self.summary.deletion_changed_entries = self
@@ -752,6 +785,7 @@ where
                         self.animation.schedule_error();
                     }
                 }
+                self.dispatch_next_deletion_work()?;
             }
         }
         Ok(())
@@ -774,6 +808,31 @@ where
         self.scan_view_dirty = false;
         self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
         Ok(())
+    }
+
+    fn dispatch_next_deletion_work(&mut self) -> Result<(), AppError> {
+        if self.deletion_active {
+            return Ok(());
+        }
+        let Some(command) = self.app.next_deletion_work() else {
+            return Ok(());
+        };
+        let submission = self.workers()?.submit_deletion_work(command);
+        match submission {
+            Ok(()) => {
+                self.deletion_active = true;
+                Ok(())
+            }
+            Err(DeletionWorkSubmissionError::Busy(command)) => {
+                self.app.restore_deletion_work(*command);
+                Err(AppError::Invariant(
+                    "deletion work dispatcher found an occupied worker queue".to_string(),
+                ))
+            }
+            Err(DeletionWorkSubmissionError::Disconnected) => {
+                Err(AppError::Worker("deletion worker disconnected".to_string()))
+            }
+        }
     }
 
     fn process_deadlines(&mut self) -> bool {
@@ -832,7 +891,7 @@ where
     }
 
     fn render(&mut self) -> Result<bool, AppError> {
-        self.app.render_if_dirty(
+        let result = self.app.render_if_dirty(
             &mut self.animation,
             self.clock.now(),
             self.settings.theme.attribution().name,
@@ -840,7 +899,9 @@ where
             self.settings.ascii,
             self.settings.monochrome,
             self.settings.reduced_motion,
-        )
+        );
+        self.flush_deletion_plan_cancellation()?;
+        result
     }
 
     fn schedule(&mut self, now: Duration, action: TimedAction, delay: Duration) {
@@ -1348,6 +1409,122 @@ mod tests {
         );
         assert_eq!(owner.summary.scanned_entries, 1);
         assert_eq!(owner.pending_scan_entries.len(), 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The admission regression stages an initial scan batch and its owner loop."
+    )]
+    fn initial_scan_blocks_deletion_before_untagged_batch_drains() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let entry = root.path().join("entry");
+        std::fs::write(&entry, b"x").expect("test entry should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let scan_view_root = app.current_folder_path();
+        let entry_metadata =
+            std::fs::symlink_metadata(&entry).expect("test entry metadata should exist");
+        let entry_identity = crate::native_path::identity_for(&entry, &entry_metadata)
+            .expect("test entry identity should be readable")
+            .expect("test entry should not be a link");
+        let target = crate::state::FileToDelete {
+            node_id: crate::model::NodeId(1),
+            synthetic: false,
+            path_in_filesystem: root.path().to_path_buf(),
+            path_to_file: vec![std::ffi::OsString::from("entry")],
+            file_type: crate::state::tiles::FileType::File,
+            num_descendants: None,
+            size: 1,
+            expected_snapshot: crate::model::EntrySnapshot {
+                identity: None,
+                kind: crate::model::NodeKind::File,
+                apparent_bytes: 1,
+                allocated_bytes: None,
+                modified_nanos: None,
+            },
+            reviewed_entries: Vec::new(),
+        };
+        let mut owner = OwnerLoop {
+            app,
+            input: Box::new(PendingInput),
+            workers: None,
+            clock: Box::new(VirtualClock::new()),
+            animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            settings: RuntimeSettings {
+                root: root.path().to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: true,
+                monochrome: true,
+                animate_loading: false,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: true,
+            },
+            temporary_storage: TemporaryStorage::default(),
+            summary: RunSummary::default(),
+            scan_active: true,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            rescan_active: false,
+            cancelled_while_scanning: false,
+            hard_cancelled: false,
+            deletion_active: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: Duration::ZERO,
+        };
+        owner
+            .handle_worker_event(WorkerEvent::ScanBatch {
+                entries: vec![ScannedEntry {
+                    metadata: entry_metadata,
+                    path: entry,
+                    identity: entry_identity,
+                }],
+            })
+            .expect("scan batch should be staged");
+        owner.app.ui_mode = crate::UiMode::PlanningDeletion(Box::new(target.display_copy()));
+
+        owner
+            .handle_input_command(InputCommand::PlanDeletion(Box::new(target)))
+            .expect("initial scan should reject deletion planning");
+
+        assert_eq!(owner.pending_scan_entries.len(), 1);
+        assert_eq!(owner.summary.scanned_entries, 0);
+        assert!(!owner.app.deletion_work_summary().has_work());
+        assert!(matches!(
+            &owner.app.ui_mode,
+            crate::UiMode::ErrorMessage(message)
+                if message == "Wait for the scan to finish before deleting"
+        ));
     }
 
     #[test]

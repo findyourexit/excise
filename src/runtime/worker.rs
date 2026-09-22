@@ -3,11 +3,15 @@ use std::fs::Metadata;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(all(test, unix))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
+};
 
 use crate::deletion::{
     DeletionPlan, DeletionPlanError, DeletionReport,
@@ -21,12 +25,13 @@ use crate::native_path::DECEPTIVE_DISPLAY_MARKER;
 #[cfg(all(test, unix))]
 use crate::native_path::safe_display_path_text;
 use crate::native_path::{NativeIdentity, safe_display_text};
-use crate::state::FileToDelete;
+use crate::state::deletion_work::{DeletionWorkCommand, DeletionWorkId};
 use crate::temporary_storage::TemporaryStorage;
 
 use super::scanner::{self, ScannerOptions};
 
 const CHANNEL_RETRY: Duration = Duration::from_millis(25);
+const WORKER_COMMAND_CAPACITY: usize = 1;
 
 pub struct ScannedEntry {
     pub metadata: Metadata,
@@ -54,30 +59,27 @@ pub(super) enum WorkerEvent {
         cancelled: bool,
     },
     DeletionPlanned {
-        target_node_id: crate::model::NodeId,
+        work_id: DeletionWorkId,
         result: Result<Box<DeletionPlan>, DeletionPlanError>,
     },
     DeletionRevalidated {
-        target_node_id: crate::model::NodeId,
+        work_id: DeletionWorkId,
         result: Result<Box<DeletionPlan>, (Box<DeletionPlan>, DeletionPlanError)>,
     },
     DeletionFinished {
+        work_id: DeletionWorkId,
         report: DeletionReport,
     },
 }
 
 enum WorkerCommand {
-    PlanDeletion {
-        maximum_bytes: usize,
-        target: FileToDelete,
-        reduced_guardrails: bool,
-    },
-    RevalidateDeletion(DeletionPlan),
+    Deletion(DeletionWorkCommand),
     Rescan(ScannerOptions),
-    ExecuteDeletion {
-        plan: DeletionPlan,
-        progress: Arc<AtomicU64>,
-    },
+}
+
+pub(crate) enum DeletionWorkSubmissionError {
+    Busy(Box<DeletionWorkCommand>),
+    Disconnected,
 }
 
 pub struct WorkerPool {
@@ -94,7 +96,7 @@ pub struct WorkerPool {
 impl WorkerPool {
     pub fn start(scanner_options: ScannerOptions, event_capacity: usize) -> Result<Self, AppError> {
         let (event_sender, events) = bounded(event_capacity);
-        let (commands, command_receiver) = bounded(1);
+        let (commands, command_receiver) = bounded(WORKER_COMMAND_CAPACITY);
         let cancelled = Arc::new(AtomicBool::new(false));
         let deletion_plan_cancelled = Arc::new(AtomicBool::new(false));
         let rescan_cancelled = Arc::new(AtomicBool::new(false));
@@ -153,45 +155,45 @@ impl WorkerPool {
         &self.events
     }
 
-    pub fn request_deletion_plan(
+    pub(crate) fn submit_deletion_work(
         &self,
-        target: FileToDelete,
-        reduced_guardrails: bool,
-        maximum_bytes: usize,
-    ) -> Result<(), AppError> {
-        self.deletion_plan_cancelled.store(false, Ordering::Release);
-        self.commands
-            .send(WorkerCommand::PlanDeletion {
-                target,
-                maximum_bytes,
-                reduced_guardrails,
-            })
-            .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
-    }
+        command: DeletionWorkCommand,
+    ) -> Result<(), DeletionWorkSubmissionError> {
+        match &command {
+            DeletionWorkCommand::Plan { .. } => {
+                self.deletion_plan_cancelled.store(false, Ordering::Release);
+            }
+            DeletionWorkCommand::Revalidate { .. } => {
+                self.deletion_soft_cancelled.store(false, Ordering::Release);
+            }
+            DeletionWorkCommand::Execute { .. } => {}
+        }
+        match self.commands.try_send(WorkerCommand::Deletion(command)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(WorkerCommand::Deletion(command))) => {
+                Err(DeletionWorkSubmissionError::Busy(Box::new(command)))
+            }
 
-    pub fn execute_deletion(
-        &self,
-        plan: DeletionPlan,
-        progress: Arc<AtomicU64>,
-    ) -> Result<(), AppError> {
-        self.commands
-            .send(WorkerCommand::ExecuteDeletion { plan, progress })
-            .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
-    }
-
-    pub fn revalidate_deletion(&self, plan: DeletionPlan) -> Result<(), AppError> {
-        self.deletion_soft_cancelled.store(false, Ordering::Release);
-        self.commands
-            .send(WorkerCommand::RevalidateDeletion(plan))
-            .map_err(|_| AppError::Worker("deletion worker disconnected".to_string()))
+            Err(TrySendError::Disconnected(WorkerCommand::Deletion(_))) => {
+                Err(DeletionWorkSubmissionError::Disconnected)
+            }
+            Err(
+                TrySendError::Full(WorkerCommand::Rescan(_))
+                | TrySendError::Disconnected(WorkerCommand::Rescan(_)),
+            ) => {
+                unreachable!("only deletion commands are submitted through this method")
+            }
+        }
     }
 
     pub fn soft_cancel_deletion(&self) {
         self.deletion_soft_cancelled.store(true, Ordering::Release);
     }
+
     pub fn cancel_deletion_plan(&self) {
         self.deletion_plan_cancelled.store(true, Ordering::Release);
     }
+
     pub fn resume_deletion(&self) {
         self.deletion_soft_cancelled.store(false, Ordering::Release);
     }
@@ -199,8 +201,15 @@ impl WorkerPool {
     pub fn request_rescan(&self, options: ScannerOptions) -> Result<(), AppError> {
         self.rescan_cancelled.store(false, Ordering::Release);
         self.commands
-            .send(WorkerCommand::Rescan(options))
-            .map_err(|_| AppError::Worker("rescan worker disconnected".to_string()))
+            .try_send(WorkerCommand::Rescan(options))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    AppError::Invariant("worker command queue is full".to_string())
+                }
+                TrySendError::Disconnected(_) => {
+                    AppError::Worker("deletion worker disconnected".to_string())
+                }
+            })
     }
 
     pub fn cancel_rescan(&self) {
@@ -260,17 +269,17 @@ fn deletion_worker(
             Err(RecvTimeoutError::Disconnected) => return,
         };
         let event = match command {
-            WorkerCommand::PlanDeletion {
+            WorkerCommand::Deletion(DeletionWorkCommand::Plan {
+                work_id,
                 target,
                 reduced_guardrails,
                 maximum_bytes,
-            } => {
-                let target_node_id = target.node_id;
+            }) => {
                 let result = if let Some(identity) = scan_root_identity {
                     build_plan_cancellable_with_root_identity_and_temporary_storage(
                         scan_root,
                         identity.clone(),
-                        target,
+                        *target,
                         reduced_guardrails,
                         plan_cancelled,
                         maximum_bytes,
@@ -279,7 +288,7 @@ fn deletion_worker(
                 } else {
                     build_plan_cancellable_with_temporary_storage(
                         scan_root,
-                        target,
+                        *target,
                         reduced_guardrails,
                         plan_cancelled,
                         maximum_bytes,
@@ -287,29 +296,33 @@ fn deletion_worker(
                     )
                 }
                 .map(Box::new);
-                WorkerEvent::DeletionPlanned {
-                    target_node_id,
-                    result,
-                }
+                WorkerEvent::DeletionPlanned { work_id, result }
             }
-            WorkerCommand::RevalidateDeletion(plan) => {
-                let target_node_id = plan.target.node_id;
+            WorkerCommand::Deletion(DeletionWorkCommand::Revalidate { work_id, plan }) => {
                 let result = match revalidate_plan_cancellable(scan_root, &plan, soft_cancelled) {
-                    Ok(()) => Ok(Box::new(plan)),
-                    Err(error) => Err((Box::new(plan), error)),
+                    Ok(()) => Ok(plan),
+                    Err(error) => Err((plan, error)),
                 };
-                WorkerEvent::DeletionRevalidated {
-                    target_node_id,
-                    result,
-                }
+                WorkerEvent::DeletionRevalidated { work_id, result }
             }
+            WorkerCommand::Deletion(DeletionWorkCommand::Execute {
+                work_id,
+                plan,
+                progress,
+            }) => WorkerEvent::DeletionFinished {
+                work_id,
+                report: execute_plan_counted(
+                    scan_root,
+                    *plan,
+                    soft_cancelled,
+                    cancelled,
+                    &progress,
+                ),
+            },
             WorkerCommand::Rescan(options) => {
                 scanner::run(options, sender, rescan_cancelled.as_ref());
                 continue;
             }
-            WorkerCommand::ExecuteDeletion { plan, progress } => WorkerEvent::DeletionFinished {
-                report: execute_plan_counted(scan_root, plan, soft_cancelled, cancelled, &progress),
-            },
         };
         if !send_event(sender, event, cancelled) {
             return;
@@ -406,6 +419,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::model::UnscannedReason;
+    #[cfg(unix)]
+    use crate::state::FileToDelete;
 
     use super::*;
 
@@ -477,9 +492,15 @@ mod tests {
         let root = tempfile::tempdir().expect("deletion root should exist");
         let (path, plan) = single_file_plan(root.path());
         let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
-        workers
-            .revalidate_deletion(plan)
-            .expect("revalidation should be queued");
+        assert!(
+            workers
+                .submit_deletion_work(DeletionWorkCommand::Revalidate {
+                    work_id: DeletionWorkId(1),
+                    plan: Box::new(plan),
+                })
+                .is_ok(),
+            "revalidation should be queued"
+        );
 
         let plan = loop {
             match workers
@@ -498,16 +519,23 @@ mod tests {
         };
 
         workers.soft_cancel_deletion();
-        workers
-            .execute_deletion(plan, Arc::new(AtomicU64::new(0)))
-            .expect("execution should be queued after cancellation");
+        assert!(
+            workers
+                .submit_deletion_work(DeletionWorkCommand::Execute {
+                    work_id: DeletionWorkId(1),
+                    plan: Box::new(plan),
+                    progress: Arc::new(AtomicU64::new(0)),
+                })
+                .is_ok(),
+            "execution should be queued after cancellation"
+        );
         let report = loop {
             match workers
                 .events()
                 .recv_timeout(Duration::from_secs(5))
                 .expect("worker should report deletion")
             {
-                WorkerEvent::DeletionFinished { report } => break report,
+                WorkerEvent::DeletionFinished { report, .. } => break report,
                 WorkerEvent::ScanBatch { .. }
                 | WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
@@ -531,9 +559,16 @@ mod tests {
         let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
         workers.soft_cancel_deletion();
         workers.resume_deletion();
-        workers
-            .execute_deletion(plan, Arc::new(AtomicU64::new(0)))
-            .expect("execution should be queued after resuming");
+        assert!(
+            workers
+                .submit_deletion_work(DeletionWorkCommand::Execute {
+                    work_id: DeletionWorkId(2),
+                    plan: Box::new(plan),
+                    progress: Arc::new(AtomicU64::new(0)),
+                })
+                .is_ok(),
+            "execution should be queued after resuming"
+        );
 
         let report = loop {
             match workers
@@ -541,7 +576,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("worker should report deletion")
             {
-                WorkerEvent::DeletionFinished { report } => break report,
+                WorkerEvent::DeletionFinished { report, .. } => break report,
                 WorkerEvent::ScanBatch { .. }
                 | WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
@@ -1036,9 +1071,15 @@ mod tests {
         let workers = WorkerPool::start(scanner_options, 16).expect("workers should start");
         std::fs::write(&path, b"replacement-after-confirmation")
             .expect("replacement should be written");
-        workers
-            .revalidate_deletion(plan)
-            .expect("revalidation should be queued");
+        assert!(
+            workers
+                .submit_deletion_work(DeletionWorkCommand::Revalidate {
+                    work_id: DeletionWorkId(3),
+                    plan: Box::new(plan),
+                })
+                .is_ok(),
+            "revalidation should be queued"
+        );
 
         let result = loop {
             match workers
@@ -1170,7 +1211,7 @@ mod tests {
         assert!(send_event(
             &sender,
             WorkerEvent::DeletionPlanned {
-                target_node_id: crate::model::NodeId(1),
+                work_id: DeletionWorkId(1),
                 result: Err(DeletionPlanError::Io {
                     path: "bad\u{202e}name".to_string(),
                     message: "permission denied\n\u{202e}name\u{1b}[31m".to_string(),
