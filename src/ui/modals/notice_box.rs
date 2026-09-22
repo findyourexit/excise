@@ -6,20 +6,27 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::theme::Theme;
 use crate::ui::format::display_text;
-use crate::ui::pane::{readable_text_on, render_modal};
+use crate::ui::pane::{ModalChrome, readable_text_on, render_modal};
 
 pub struct NoticeBox<'a> {
     message: &'a str,
     theme: Theme,
     ascii: bool,
+    chrome: ModalChrome,
 }
 
 impl<'a> NoticeBox<'a> {
-    pub const fn new(message: &'a str, theme: Theme, ascii: bool) -> Self {
+    pub(crate) const fn with_chrome(
+        message: &'a str,
+        theme: Theme,
+        ascii: bool,
+        chrome: ModalChrome,
+    ) -> Self {
         Self {
             message,
             theme,
             ascii,
+            chrome,
         }
     }
 }
@@ -41,6 +48,7 @@ impl Widget for NoticeBox<'_> {
             self.theme,
             self.theme.state_complete,
             self.ascii,
+            self.chrome,
         );
         Paragraph::new(vec![
             Line::from(display_text(self.message)),
@@ -69,10 +77,11 @@ mod tests {
     fn hostile_notice_text_is_escaped_and_marked() {
         let area = Rect::new(0, 0, 40, 9);
         let mut buffer = Buffer::empty(area);
-        NoticeBox::new(
+        NoticeBox::with_chrome(
             "complete: bad\n\u{202e}name\u{1b}[31m",
             Theme::for_id(ThemeId::ExciseDark),
             false,
+            ModalChrome::new(std::time::Duration::ZERO, false, false),
         )
         .render(area, &mut buffer);
         let text = buffer.content.iter().fold(String::new(), |mut text, cell| {

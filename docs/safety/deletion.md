@@ -8,20 +8,22 @@ Excise permanently removes the confirmed file identities. It does not use a tras
 
 Deletion can be prepared only when all of these conditions hold:
 
-- The selected entry is real and is not `Other` or `Shared`.
-- Excise has fully examined the selected folder and its descendants.
-- The entry is not the scan root, a file system root, or a drive root.
+- The selected entry is real, retained in the map, and is not a virtual `Other` or `Shared` summary.
+- Its model snapshot has a verified concrete backing identity. The display subtree may still be incomplete or summarized.
+- The entry is not the scan root, a filesystem, drive, or mount root.
 - The platform has a reviewed method for deleting the entry without following links.
-- No unresolved scan or identity problem makes the plan untrustworthy.
+
+The display model only selects the target. The planner creates the authoritative no-follow live review, so approximate hard-link accounting or a partial scan neither authorizes an unsafe deletion nor blocks a valid one.
 
 ## Plan Construction
 
-1. List the current contents of the live folder. Record every relative path, identity, type, size, allocation, modification state, and required deletion order.
-2. Keep directory-plan records in bounded resident memory, spilling overflow plan and outcome records under the configured temporary-storage limit. Unix uses anonymous files; Windows atomically creates a current-user-only, exclusive, delete-on-close file in the selected target's parent, outside the target.
-3. Authenticate every spilled record with a process-private key. Every decoded path must have safe components whose prefix is the selected target before revalidation or execution.
-4. Reserve resident and temporary capacity for every planned identity and outcome before confirmation. If either complete plan or report cannot be retained, discard it before confirmation and delete nothing.
-5. Require the live list and the reviewed list to match exactly. Check them again immediately before confirmation.
-6. If anything changed, discard the plan, scan again, and ask for confirmation again.
+1. Inspect the selected target from the live filesystem and bind its identity, type, size, allocation, and modification state to the displayed target snapshot.
+2. For a directory, list its current contents without following links. Record every relative path, identity, type, size, allocation, modification state, and required deletion order.
+3. Keep directory-plan records in bounded resident memory, spilling overflow plan and outcome records under the configured temporary-storage limit. Unix uses anonymous files; Windows atomically creates a current-user-only, exclusive, delete-on-close file in the selected target's parent, outside the target.
+4. Authenticate every spilled record with a process-private key. Every decoded path must have safe components whose prefix is the selected target before revalidation or execution.
+5. Reserve resident and temporary capacity for every planned identity and outcome before confirmation. If either complete plan or report cannot be retained, discard it before confirmation and delete nothing.
+6. Check every planned entry again immediately before deletion; reject a directory plan that targets or contains a filesystem or mount root.
+7. If anything changed, discard the plan, scan again, and ask for confirmation again.
 
 ## Confirmation
 
@@ -31,11 +33,11 @@ Deletion can be prepared only when all of these conditions hold:
 - Reduced mode is visible and is never saved.
 - Root and Administrator accounts receive a visible warning. The identity checks remain unchanged.
 
-While the identity plan is being built, pressing `Enter` pre-arms confirmation for single-key challenges (files, safe printable directories, and reduced-guardrail entries). When the plan completes with a single-key challenge, execution begins immediately without showing the separate confirm dialog. The irreversible action does not start until the plan is complete and the pre-arming key has been given. For generated challenges, the confirm dialog is always shown and the user must type the required input before execution begins.
+The planner runs in the background and retains at most four non-overlapping targets. When a plan is ready, its confirmation remains foreground; accepted confirmation returns immediately to map navigation. A single executor serializes final full-plan revalidation and filesystem mutation; every Unix entry is checked again after isolation and immediately before its removal.
 
 ## Execution
 
-The deletion worker uses platform file operations that do not follow links. Linux and Apple systems temporarily exchange one directory entry with an unpredictable name in the same parent before checking and removing the isolated entry. A replacement at the original path is never removed. Windows opens the confirmed entry without following a reparse point and applies deletion to that verified handle.
+The deletion worker uses platform file operations that do not follow links. Linux and Apple systems temporarily exchange one directory entry with an unpredictable name in the same parent, verify the isolated entry again immediately before removal, and restore it when its identity changed. A replacement at the original path is never removed. Windows opens the confirmed entry without following a reparse point and applies deletion to that verified handle.
 
 For every planned entry, Excise does the following:
 
@@ -50,13 +52,13 @@ The working model changes only from confirmed deletion results.
 
 ## Interruption
 
-Quitting during deletion offers these choices:
+Quitting distinguishes the work that can be discarded from an active filesystem mutation:
 
-- **Soft cancel:** Stop between entries and return a precise partial report. The noninteractive exit code is 3.
-- **Forced cancel:** From the interruption prompt or a pending soft stop, release blocked operations, restore the terminal immediately, and return an imprecise exit code of 130. The worker starts no new entry after the active operation returns.
-- **Back:** Continue the deletion before a soft stop is committed.
+- **No work:** Exit through the ordinary preference prompt.
+- **Pending plans:** Cancel the bounded pending set and quit, or return to the map and wait.
+- **Active deletion:** Stop only after the current entry finishes and record the bounded result, or return to the map and wait.
 
-The first supported interrupt opens the precise soft-cancel choice. Pressing `h` or pressing `Ctrl-C` again remains an explicit forced escape while a file system call is pending.
+No key silently detaches a mutation worker or claims that a blocked filesystem operation has stopped.
 
 ## Result
 
@@ -71,7 +73,6 @@ Normal completion and soft cancellation report every planned identity as deleted
 - Deterministic Windows sharing-violation behavior
 - Partial continuation when some entries cannot be deleted
 - Elevated and reduced-safeguard modes
-- Hostile-name confirmation
-- Soft and forced cancellation with terminal restoration
+- Safe-stop and wait choices with terminal restoration
 - Tests of each supported platform deletion method
 - Randomized tests for deletion-plan construction

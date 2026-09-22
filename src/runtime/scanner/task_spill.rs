@@ -1,7 +1,7 @@
 #[cfg(not(windows))]
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::task_queue::DirectoryTask;
 use crate::native_path::{EncodedNativePath, NativeIdentity, NativePath};
@@ -87,8 +87,65 @@ impl TaskSpill {
         if self.pending == 0 {
             return Ok(None);
         }
+        let (task, next_read) = self.read_record_at(self.next_read)?;
+        self.next_read = next_read;
+        self.pending = self
+            .pending
+            .checked_sub(1)
+            .ok_or_else(|| io::Error::other("scanner task spill count underflow"))?;
+        if self.pending == 0 {
+            self.next_read = 0;
+            self.next_write = 0;
+            self.truncate(0)?;
+            self.reservation.shrink_to(0);
+        } else {
+            self.compact_after_read()?;
+        }
+        Ok(Some(task))
+    }
 
-        self.file.seek(SeekFrom::Start(self.next_read))?;
+    /// Rotates one queued task to the read head without materializing the rest
+    /// of the bounded spill file in memory.
+    pub(super) fn promote_matching(&mut self, path: &Path) -> io::Result<bool> {
+        let mut offset = self.next_read;
+        while offset < self.next_write {
+            let (task, record_end) = self.read_record_at(offset)?;
+            if task.path == path {
+                if offset != self.next_read {
+                    let record_len = record_end.checked_sub(offset).ok_or_else(|| {
+                        io::Error::other("scanner task spill offsets are out of order")
+                    })?;
+                    let raw_len = usize::try_from(record_len).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "scanner task spill record length does not fit in memory",
+                        )
+                    })?;
+                    let mut record = vec![0_u8; raw_len];
+                    self.file.seek(SeekFrom::Start(offset))?;
+                    self.file.read_exact(&mut record)?;
+                    self.shift_range_right(self.next_read, offset, record_len)?;
+                    self.file.seek(SeekFrom::Start(self.next_read))?;
+                    self.file.write_all(&record)?;
+                }
+                return Ok(true);
+            }
+            offset = record_end;
+        }
+        Ok(false)
+    }
+
+    fn read_record_at(&mut self, offset: u64) -> io::Result<(DirectoryTask, u64)> {
+        let header_end = offset
+            .checked_add(SPILL_LENGTH_BYTES)
+            .ok_or_else(|| io::Error::other("scanner task spill offset overflow"))?;
+        if header_end > self.next_write {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scanner task spill record is truncated",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(offset))?;
         let mut length = [0_u8; std::mem::size_of::<u64>()];
         self.file.read_exact(&mut length)?;
         let payload_len = usize::try_from(u64::from_le_bytes(length)).map_err(|_| {
@@ -103,6 +160,17 @@ impl TaskSpill {
                 "scanner task spill record exceeds the configured limit",
             ));
         }
+        let payload_len_u64 = u64::try_from(payload_len)
+            .map_err(|_| io::Error::other("scanner task spill record length overflow"))?;
+        let record_end = header_end
+            .checked_add(payload_len_u64)
+            .ok_or_else(|| io::Error::other("scanner task spill offset overflow"))?;
+        if record_end > self.next_write {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scanner task spill record is truncated",
+            ));
+        }
         let mut payload = vec![0_u8; payload_len];
         self.file.read_exact(&mut payload)?;
         let (encoded, identity): (EncodedNativePath, Option<NativeIdentity>) =
@@ -111,26 +179,40 @@ impl TaskSpill {
             .map_err(io::Error::other)?
             .as_path()
             .to_path_buf();
-        let record_len = u64::try_from(payload_len)
-            .map_err(|_| io::Error::other("scanner task spill record length overflow"))?;
-        self.next_read = self
-            .next_read
-            .checked_add(SPILL_LENGTH_BYTES)
-            .and_then(|offset| offset.checked_add(record_len))
-            .ok_or_else(|| io::Error::other("scanner task spill offset overflow"))?;
-        self.pending = self
-            .pending
-            .checked_sub(1)
-            .ok_or_else(|| io::Error::other("scanner task spill count underflow"))?;
-        if self.pending == 0 {
-            self.next_read = 0;
-            self.next_write = 0;
-            self.truncate(0)?;
-            self.reservation.shrink_to(0);
-        } else {
-            self.compact_after_read()?;
+        Ok((DirectoryTask { path, identity }, record_end))
+    }
+
+    fn shift_range_right(&mut self, start: u64, end: u64, by: u64) -> io::Result<()> {
+        let mut remaining = end
+            .checked_sub(start)
+            .ok_or_else(|| io::Error::other("scanner task spill offsets are out of order"))?;
+        if remaining == 0 {
+            return Ok(());
         }
-        Ok(Some(DirectoryTask { path, identity }))
+        let buffer_len = usize::try_from(remaining.min(TASK_SPILL_COMPACTION_BYTES))
+            .map_err(|_| io::Error::other("scanner task spill shift buffer is too large"))?;
+        let mut buffer = vec![0_u8; buffer_len];
+        while remaining > 0 {
+            let chunk = usize::try_from(remaining.min(TASK_SPILL_COMPACTION_BYTES))
+                .map_err(|_| io::Error::other("scanner task spill shift chunk is too large"))?;
+            let chunk_u64 = u64::try_from(chunk)
+                .map_err(|_| io::Error::other("scanner task spill shift chunk overflow"))?;
+            let source = start
+                .checked_add(remaining)
+                .and_then(|offset| offset.checked_sub(chunk_u64))
+                .ok_or_else(|| io::Error::other("scanner task spill offset overflow"))?;
+            self.file.seek(SeekFrom::Start(source))?;
+            self.file.read_exact(&mut buffer[..chunk])?;
+            self.file
+                .seek(SeekFrom::Start(source.checked_add(by).ok_or_else(
+                    || io::Error::other("scanner task spill offset overflow"),
+                )?))?;
+            self.file.write_all(&buffer[..chunk])?;
+            remaining = remaining
+                .checked_sub(chunk_u64)
+                .ok_or_else(|| io::Error::other("scanner task spill shift underflow"))?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]

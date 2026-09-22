@@ -5,16 +5,21 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::theme::Theme;
-use crate::ui::pane::{readable_text_on, render_modal};
+use crate::ui::pane::{ModalChrome, readable_text_on, render_modal};
 
 pub struct WarningBox {
     theme: Theme,
     ascii: bool,
+    chrome: ModalChrome,
 }
 
 impl WarningBox {
-    pub const fn new(theme: Theme, ascii: bool) -> Self {
-        Self { theme, ascii }
+    pub(crate) const fn with_chrome(theme: Theme, ascii: bool, chrome: ModalChrome) -> Self {
+        Self {
+            theme,
+            ascii,
+            chrome,
+        }
     }
 }
 
@@ -35,6 +40,7 @@ impl Widget for WarningBox {
             self.theme,
             self.theme.state_rescanning,
             self.ascii,
+            self.chrome,
         );
         Paragraph::new(vec![
             Line::from("Scanning is still in progress."),
@@ -64,7 +70,12 @@ mod tests {
     fn rescan_warning_explains_that_deletion_is_unavailable() {
         let area = Rect::new(0, 0, 48, 9);
         let mut buffer = Buffer::empty(area);
-        WarningBox::new(Theme::for_id(ThemeId::ExciseDark), false).render(area, &mut buffer);
+        WarningBox::with_chrome(
+            Theme::for_id(ThemeId::ExciseDark),
+            false,
+            ModalChrome::new(std::time::Duration::ZERO, false, false),
+        )
+        .render(area, &mut buffer);
         let text = buffer.content.iter().fold(String::new(), |mut text, cell| {
             text.push_str(cell.symbol());
             text

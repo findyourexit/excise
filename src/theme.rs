@@ -43,13 +43,46 @@ impl ThemeId {
         Self::Monokai,
     ];
 
+    /// Human-readable name used by the interactive picker.
     #[must_use]
-    pub fn next(self) -> Self {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ExciseDark => "Excise Dark",
+            Self::ExciseLight => "Excise Light",
+            Self::HighContrast => "High Contrast",
+            Self::Monochrome => "Monochrome",
+            Self::Dracula => "Dracula",
+            Self::TokyoNight => "Tokyo Night",
+            Self::CatppuccinMocha => "Catppuccin Mocha",
+            Self::CatppuccinLatte => "Catppuccin Latte",
+            Self::GruvboxDark => "Gruvbox Dark",
+            Self::GruvboxLight => "Gruvbox Light",
+            Self::Nord => "Nord",
+            Self::SolarizedDark => "Solarized Dark",
+            Self::SolarizedLight => "Solarized Light",
+            Self::OneDark => "One Dark",
+            Self::Monokai => "Monokai",
+        }
+    }
+
+    /// Advances one row in the theme picker, wrapping at the final row.
+    #[must_use]
+    pub fn next_picker_item(self) -> Self {
         let index = Self::ALL
             .iter()
             .position(|candidate| *candidate == self)
             .unwrap_or_default();
         Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    /// Moves one row up in the theme picker, wrapping at the first row.
+    #[must_use]
+    pub fn previous_picker_item(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or_default();
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 
     #[must_use]
@@ -431,14 +464,16 @@ mod tests {
         }
     }
     #[test]
-    fn theme_cycle_visits_all_built_ins() {
+    fn picker_navigation_wraps_every_built_in() {
         let mut current = ThemeId::ExciseDark;
         let mut visited = Vec::new();
         for _ in 0..ThemeId::ALL.len() {
             visited.push(current);
-            current = current.next();
+            current = current.next_picker_item();
         }
         assert_eq!(visited, ThemeId::ALL);
         assert_eq!(current, ThemeId::ExciseDark);
+        assert_eq!(ThemeId::ExciseDark.previous_picker_item(), ThemeId::Monokai);
+        assert_eq!(ThemeId::TokyoNight.label(), "Tokyo Night");
     }
 }

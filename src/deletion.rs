@@ -1278,7 +1278,9 @@ impl fmt::Display for DeletionPlanError {
             Self::Synthetic => {
                 formatter.write_str("aggregate and synthetic nodes cannot be deleted")
             }
-            Self::Root => formatter.write_str("scan roots and filesystem roots cannot be deleted"),
+            Self::Root => {
+                formatter.write_str("scan, filesystem, and mount roots cannot be deleted")
+            }
             Self::InvalidRelativePath => {
                 formatter.write_str("deletion target is not a safe relative path")
             }
@@ -1328,11 +1330,6 @@ impl DeletionPlanError {
     #[must_use]
     pub(crate) const fn is_missing(&self) -> bool {
         matches!(self, Self::Missing(_))
-    }
-
-    #[must_use]
-    pub(crate) fn is_missing_target(&self, plan: &DeletionPlan) -> bool {
-        matches!(self, Self::Missing(path) if path == &plan.root_relative_path)
     }
 }
 
@@ -1489,6 +1486,13 @@ pub(crate) fn build_plan_cancellable_with_root_identity_and_temporary_storage(
                 }
                 let relative_path = directory.relative_path;
                 let expected = directory.snapshot;
+                if relative_path != relative {
+                    let mounted = is_mount_root(&scan_root.join(&relative_path))
+                        .map_err(|error| plan_io(&relative_path, error))?;
+                    if mounted {
+                        return Err(DeletionPlanError::Root);
+                    }
+                }
                 let (actual, handle) = match inspect_relative(&root, &relative_path) {
                     Err(DeletionPlanError::Missing(_)) => return Err(DeletionPlanError::Changed),
                     result => result?,
@@ -1890,6 +1894,44 @@ where
             )),
         };
     }
+    // The detached name lives in a parent that other processes may still write.
+    // Revalidate it at the last practical point before naming it for deletion.
+    after_inspection(&detached_name);
+    let revalidated = match inspect_child(&parent, &detached_name, &entry.relative_path) {
+        Ok((snapshot, handle)) => {
+            drop(handle);
+            snapshot
+        }
+        Err(DeletionPlanError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => {
+            return match finalize_placeholder(&parent, &original_name, &detached_name, &placeholder)
+            {
+                Ok(()) => DeletionEntryOutcome::Missing,
+                Err(error) => DeletionEntryOutcome::Failed(format!(
+                    "isolated entry disappeared; namespace cleanup failed: {error}"
+                )),
+            };
+        }
+        Err(error) => {
+            let restore = restore_detached(&parent, &original_name, &detached_name, &placeholder);
+            return DeletionEntryOutcome::Failed(restore.map_or_else(
+                |restore_error| format!("{error}; namespace recovery failed: {restore_error}"),
+                |()| error.to_string(),
+            ));
+        }
+    };
+    if !matches_for_execution(&entry.snapshot, &revalidated) {
+        return match restore_detached(&parent, &original_name, &detached_name, &placeholder) {
+            Ok(()) => DeletionEntryOutcome::Changed(
+                "identity, type, size, allocation, or modification changed".to_string(),
+            ),
+            Err(error) => DeletionEntryOutcome::Failed(format!(
+                "entry changed; namespace recovery failed: {error}"
+            )),
+        };
+    }
 
     let link_hold = if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link) {
         if actual.identity.link_count.is_some() {
@@ -1906,7 +1948,6 @@ where
     } else {
         None
     };
-    after_inspection(&detached_name);
 
     let removal = match entry.snapshot.kind {
         PlannedKind::Directory => cap_fs::remove_dir(&parent, Path::new(&detached_name)),
@@ -2569,9 +2610,14 @@ fn is_mount_root(path: &Path) -> io::Result<bool> {
     if canonical.parent().is_none_or(|parent| parent == canonical) {
         return Ok(true);
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        linux_mount_root(&canonical)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         use std::os::unix::fs::MetadataExt as _;
+
         let path_dev = std::fs::symlink_metadata(&canonical)?.dev();
         let parent = canonical.parent().expect("non-root path has a parent");
         let parent_dev = std::fs::symlink_metadata(parent)?.dev();
@@ -2584,6 +2630,90 @@ fn is_mount_root(path: &Path) -> io::Result<bool> {
             std::fs::canonicalize(disk.mount_point()).is_ok_and(|mount| mount == canonical)
         }))
     }
+}
+
+/// Recognises Linux bind mounts as well as mounts that change device ID.
+///
+/// `STATX_ATTR_MOUNT_ROOT` is an authoritative kernel answer where available.
+/// Older kernels omit it, so `/proc/self/mountinfo` remains a fail-closed fallback.
+#[cfg(target_os = "linux")]
+fn linux_mount_root(canonical: &Path) -> io::Result<bool> {
+    match rustix::fs::statx(
+        rustix::fs::CWD,
+        canonical,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        rustix::fs::StatxFlags::empty(),
+    ) {
+        Ok(status)
+            if status
+                .stx_attributes_mask
+                .contains(rustix::fs::StatxAttributes::MOUNT_ROOT) =>
+        {
+            Ok(status
+                .stx_attributes
+                .contains(rustix::fs::StatxAttributes::MOUNT_ROOT))
+        }
+        Ok(_) | Err(rustix::io::Errno::NOSYS) => linux_mountinfo_contains(canonical),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mountinfo_contains(path: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mountinfo = std::fs::read("/proc/self/mountinfo")?;
+    for line in mountinfo.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(mountpoint) = line.split(|byte| *byte == b' ').nth(4) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed Linux mountinfo entry",
+            ));
+        };
+        if decode_linux_mountinfo_path(mountpoint)? == path.as_os_str().as_bytes() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn decode_linux_mountinfo_path(encoded: &[u8]) -> io::Result<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut index = 0;
+    while index < encoded.len() {
+        let byte = encoded[index];
+        if byte != b'\\' {
+            decoded.push(byte);
+            index += 1;
+            continue;
+        }
+        let Some(escape) = encoded.get(index + 1..index + 4) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated Linux mountinfo escape",
+            ));
+        };
+        if !escape.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Linux mountinfo escape",
+            ));
+        }
+        let value = (escape[0] - b'0') * 64 + (escape[1] - b'0') * 8 + (escape[2] - b'0');
+        if value == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Linux mountinfo path contains a NUL escape",
+            ));
+        }
+        decoded.push(value);
+        index += 4;
+    }
+    Ok(decoded)
 }
 
 fn relative_target(target: &FileToDelete) -> Result<PathBuf, DeletionPlanError> {
@@ -2674,9 +2804,35 @@ fn validate_component(name: &OsStr) -> Result<(), DeletionPlanError> {
     }
 }
 
+/// Builds a confirmation challenge from the displayed identity before background
+/// planning starts. Planning still revalidates that identity before mutation.
+pub(crate) fn confirmation_challenge_for_target(
+    target: &FileToDelete,
+    reduced_guardrails: bool,
+) -> Result<ConfirmationChallenge, DeletionPlanError> {
+    let identity = target
+        .expected_snapshot
+        .identity
+        .as_ref()
+        .ok_or(DeletionPlanError::Changed)?;
+    Ok(challenge_for_identity(
+        target,
+        &identity.file_id,
+        reduced_guardrails,
+    ))
+}
+
 fn challenge_for(
     target: &FileToDelete,
     snapshot: &PlannedSnapshot,
+    reduced_guardrails: bool,
+) -> ConfirmationChallenge {
+    challenge_for_identity(target, &snapshot.identity.file_id, reduced_guardrails)
+}
+
+fn challenge_for_identity(
+    target: &FileToDelete,
+    file_id: &FileId,
     reduced_guardrails: bool,
 ) -> ConfirmationChallenge {
     let name = target.path_to_file.last().map_or_else(
@@ -2684,10 +2840,7 @@ fn challenge_for(
         |name| safe_display_os_str(name),
     );
     if name.deceptive {
-        return ConfirmationChallenge::TypePhrase(format!(
-            "DELETE {}",
-            challenge_code(&snapshot.identity.file_id)
-        ));
+        return ConfirmationChallenge::TypePhrase(format!("DELETE {}", challenge_code(file_id)));
     }
     if reduced_guardrails {
         return ConfirmationChallenge::ReducedGuard;
@@ -3247,6 +3400,47 @@ mod tests {
         );
         assert_eq!(report.failed_entries(), 1);
         assert!(report.precise);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_after_final_isolation_check_is_never_deleted() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        let displaced = root.path().join("reviewed");
+        std::fs::write(&path, b"reviewed").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+
+        let report = execute_plan_unix_with_hooks(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            || {},
+            |detached| {
+                let detached = root.path().join(detached);
+                std::fs::rename(&detached, &displaced)
+                    .expect("reviewed target should be displaced after isolation");
+                std::fs::write(&detached, b"replacement")
+                    .expect("replacement should occupy the detached name");
+            },
+        );
+
+        assert_eq!(
+            std::fs::read(&path).expect("replacement should return to its original name"),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("reviewed target should remain available"),
+            b"reviewed"
+        );
+        assert_eq!(report.changed_entries(), 1);
+        assert_eq!(report.deleted_entries(), 0);
     }
 
     #[test]
@@ -4357,6 +4551,14 @@ mod tests {
         )
         .expect("a link to a mount root should not follow its target");
         assert_eq!(plan.root_snapshot().kind, PlannedKind::Link);
+    }
+
+    #[test]
+    fn linux_mountinfo_decoder_preserves_escaped_mount_paths() {
+        let decoded = decode_linux_mountinfo_path(br"/mnt/a\040b\011c\012d\134e")
+            .expect("mountinfo escape sequence should decode");
+        assert_eq!(decoded, b"/mnt/a b\tc\nd\\e");
+        assert!(decode_linux_mountinfo_path(br"/mnt/bad\x00").is_err());
     }
 
     #[cfg(windows)]

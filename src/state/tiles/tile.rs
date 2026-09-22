@@ -80,6 +80,16 @@ impl Tile {
         }
     }
 
+    /// Virtual totals have no stable filesystem object to open, refresh, or
+    /// delete. A materializable aggregate remains interactive.
+    #[must_use]
+    pub const fn is_interactive(&self) -> bool {
+        !matches!(
+            self.synthetic_kind,
+            Some(SyntheticKind::Other | SyntheticKind::Shared)
+        )
+    }
+
     /// First terminal row the entry paints into.
     #[must_use]
     pub const fn top_row(&self) -> u32 {

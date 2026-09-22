@@ -22,6 +22,25 @@ pub(crate) const PANE_GAP: u16 = 1;
 /// interrupts: the map stays legible as context for the decision.
 pub(crate) const SCRIM_SINK: f32 = 0.62;
 
+/// Frame-only timing and accessibility state for a modal. Content widgets do
+/// not receive it, so modal text never animates with its attention border.
+#[derive(Clone, Copy)]
+pub(crate) struct ModalChrome {
+    now: Duration,
+    animate: bool,
+    monochrome: bool,
+}
+
+impl ModalChrome {
+    #[must_use]
+    pub(crate) const fn new(now: Duration, animate: bool, monochrome: bool) -> Self {
+        Self {
+            now,
+            animate,
+            monochrome,
+        }
+    }
+}
 /// exabind's low-ink frame: eighth-block edges that read as a hairline rule,
 /// anchored by quadrant corners instead of a heavy box outline.
 pub(crate) const PANE_BORDER_SET: Set = Set {
@@ -207,7 +226,7 @@ fn draw_title_chip(
         return;
     }
     let static_style = if cycle.is_none() {
-        static_chip_style(accent, theme, monochrome, active)
+        static_chip_style(accent, theme, active, monochrome)
     } else {
         Style::default()
     };
@@ -298,10 +317,10 @@ const TITLE_CHIP_CONTRAST_FLOOR: f32 = 4.5;
 
 /// Applies the strongest semantic contrast once for a chip that does not travel
 /// with the focus cycle, falling back to the animated chip's neutral polarity.
-fn static_chip_style(lead: Color, theme: Theme, monochrome: bool, active: bool) -> Style {
+fn static_chip_style(lead: Color, theme: Theme, active: bool, monochrome: bool) -> Style {
     if lead == Color::Reset && theme.surface_base == Color::Reset {
-        // The monochrome theme has no colour channel. Reverse the active chip
-        // so it remains distinct from its inactive counterpart.
+        // The monochrome theme has no colour channel. Leave inactive chips
+        // plain so an active chip can remain the sole reverse-video signal.
         let style = Style::default()
             .fg(lead)
             .bg(theme.surface_panel)
@@ -313,17 +332,12 @@ fn static_chip_style(lead: Color, theme: Theme, monochrome: bool, active: bool) 
         };
     }
     if monochrome && !matches!(lead, Color::Rgb(..)) {
-        // ANSI colours cannot be measured for contrast. Reverse the active
-        // chip so palette terminals retain a visible focus cue.
-        let style = Style::default()
+        // ANSI colours cannot be measured, and the active chip already carries
+        // reverse video in forced monochrome. Keep this inactive chip plain.
+        return Style::default()
             .fg(lead)
             .bg(theme.surface_panel)
             .add_modifier(Modifier::BOLD);
-        return if active {
-            style.add_modifier(Modifier::REVERSED)
-        } else {
-            style
-        };
     }
     match strongest_static_ink(lead, [theme.text_primary, theme.surface_base]) {
         Some(ink) => Style::default()
@@ -506,9 +520,10 @@ fn contrast_safe_accent(theme: Theme, surface: Color, accent: Color) -> Color {
 
 /// Draws a modal panel and returns its content area.
 ///
-/// Same frame and chip as a pane, raised one surface step off the interface it
-/// interrupts, and deliberately still: a dialog that pulses competes with the
-/// decision it is asking for.
+/// The frame and title chip can carry the same travelling attention cycle as a
+/// focused pane. The content is drawn later by each modal widget and therefore
+/// remains completely still. ASCII, monochrome, reduced-motion, and ANSI-only
+/// themes retain the static high-contrast frame.
 pub(crate) fn render_modal(
     buffer: &mut Buffer,
     area: Rect,
@@ -516,6 +531,7 @@ pub(crate) fn render_modal(
     theme: Theme,
     accent: Color,
     ascii: bool,
+    chrome: ModalChrome,
 ) -> Rect {
     Clear.render(area, buffer);
     // Reset-valued surface roles cannot express elevation, so retain it as an
@@ -527,6 +543,15 @@ pub(crate) fn render_modal(
         modal_style
     };
     let accent = contrast_safe_accent(theme, theme.surface_raised, accent);
+    let cycle =
+        (chrome.animate && !ascii && !chrome.monochrome && ColorCycle::can_animate(theme.focus))
+            .then(|| {
+                let (cycle, _) = derived_for(theme);
+                (cycle, cycle_step(chrome.now), border_len(area))
+            });
+    let border_accent = cycle.as_ref().map_or(accent, |(cycle, step, perimeter)| {
+        cycle.at_perimeter(*step, 0, *perimeter)
+    });
     let border_set = if ascii {
         ASCII_PANE_BORDER_SET
     } else {
@@ -535,20 +560,29 @@ pub(crate) fn render_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border_set)
-        .border_style(Style::default().fg(accent))
+        .border_style(Style::default().fg(border_accent))
         .style(modal_style);
     let inner = block.inner(area);
     block.render(area, buffer);
+    if let Some((cycle, step, perimeter)) = cycle.as_ref() {
+        walk_border(area, |x, y, index| {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.fg = cycle.at_perimeter(*step, index, *perimeter);
+            }
+        });
+    }
     draw_title_chip(
         buffer,
         area,
         title,
         theme,
         theme.surface_raised,
-        accent,
+        border_accent,
         true,
-        None,
-        false,
+        cycle
+            .as_ref()
+            .map(|(cycle, step, perimeter)| (cycle, *step, *perimeter)),
+        chrome.monochrome,
         ascii,
     );
     inner
@@ -625,7 +659,6 @@ mod tests {
             PanePresentation::Monochrome => (true, false),
             PanePresentation::Ascii => (false, true),
         };
-
         let mut buffer = Buffer::empty(area);
         render_pane(
             &mut buffer,
@@ -1081,7 +1114,15 @@ mod tests {
         let modal_area = Rect::new(3, 2, 14, 3);
         let mut buffer = Buffer::empty(full_area);
         fill_pane(&mut buffer, full_area, theme);
-        render_modal(&mut buffer, modal_area, "DIALOG", theme, theme.focus, false);
+        render_modal(
+            &mut buffer,
+            modal_area,
+            "DIALOG",
+            theme,
+            theme.focus,
+            false,
+            ModalChrome::new(Duration::ZERO, false, false),
+        );
 
         let background = &buffer[(0, 0)];
         let modal_surface = &buffer[(10, 3)];
@@ -1108,7 +1149,15 @@ mod tests {
             ] {
                 let area = Rect::new(0, 0, 30, 8);
                 let mut buffer = Buffer::empty(area);
-                render_modal(&mut buffer, area, "DIALOG", theme, accent, false);
+                render_modal(
+                    &mut buffer,
+                    area,
+                    "DIALOG",
+                    theme,
+                    accent,
+                    false,
+                    ModalChrome::new(Duration::ZERO, false, false),
+                );
                 assert!(
                     contrast_ratio(buffer[(0, 0)].fg, theme.surface_raised)
                         .is_some_and(|ratio| ratio >= MIN_FOCUS_CONTRAST),
@@ -1116,6 +1165,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn modal_attention_moves_only_the_chrome() {
+        let area = Rect::new(0, 0, 24, 7);
+        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
+        let body_style = Style::default()
+            .fg(theme.text_primary)
+            .bg(theme.surface_raised);
+        let mut first = Buffer::empty(area);
+        render_modal(
+            &mut first,
+            area,
+            "DIALOG",
+            theme,
+            theme.focus,
+            false,
+            ModalChrome::new(Duration::ZERO, true, false),
+        );
+        first.set_string(4, 3, "DECIDE", body_style);
+        let mut later = Buffer::empty(area);
+        render_modal(
+            &mut later,
+            area,
+            "DIALOG",
+            theme,
+            theme.focus,
+            false,
+            ModalChrome::new(Duration::from_millis(533), true, false),
+        );
+        later.set_string(4, 3, "DECIDE", body_style);
+
+        assert_ne!(first[(0, 0)].fg, later[(0, 0)].fg);
+        for x in 4..10 {
+            assert_eq!(first[(x, 3)].symbol(), later[(x, 3)].symbol());
+            assert_eq!(first[(x, 3)].style(), later[(x, 3)].style());
+        }
+
+        for (ascii, monochrome) in [(true, false), (false, true)] {
+            let mut static_first = Buffer::empty(area);
+            let mut static_later = Buffer::empty(area);
+            render_modal(
+                &mut static_first,
+                area,
+                "DIALOG",
+                theme,
+                theme.focus,
+                ascii,
+                ModalChrome::new(Duration::ZERO, true, monochrome),
+            );
+            render_modal(
+                &mut static_later,
+                area,
+                "DIALOG",
+                theme,
+                theme.focus,
+                ascii,
+                ModalChrome::new(Duration::from_millis(533), true, monochrome),
+            );
+            assert_eq!(static_first[(0, 0)].style(), static_later[(0, 0)].style());
+        }
+
+        let high_contrast = Theme::for_id(ThemeId::HighContrast);
+        let mut contrast_first = Buffer::empty(area);
+        let mut contrast_later = Buffer::empty(area);
+        render_modal(
+            &mut contrast_first,
+            area,
+            "DIALOG",
+            high_contrast,
+            high_contrast.focus,
+            false,
+            ModalChrome::new(Duration::ZERO, true, false),
+        );
+        render_modal(
+            &mut contrast_later,
+            area,
+            "DIALOG",
+            high_contrast,
+            high_contrast.focus,
+            false,
+            ModalChrome::new(Duration::from_millis(533), true, false),
+        );
+        assert_eq!(
+            contrast_first[(0, 0)].style(),
+            contrast_later[(0, 0)].style(),
+            "ANSI high-contrast output must not animate"
+        );
     }
 
     #[test]
@@ -1186,7 +1323,15 @@ mod tests {
         assert_eq!(pane[(8, 0)].bg, theme.surface_panel);
 
         let mut modal = Buffer::empty(area);
-        render_modal(&mut modal, area, "MODAL", theme, theme.focus, false);
+        render_modal(
+            &mut modal,
+            area,
+            "MODAL",
+            theme,
+            theme.focus,
+            false,
+            ModalChrome::new(Duration::ZERO, false, false),
+        );
         assert_eq!(modal[(1, 0)].bg, theme.surface_raised);
         assert_eq!(modal[(9, 0)].bg, theme.surface_raised);
     }

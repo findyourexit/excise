@@ -23,6 +23,17 @@ pub struct FileMetadata {
     pub uncertain: bool,
 }
 
+impl FileMetadata {
+    /// `Other` and `Shared` describe virtual totals rather than a backing path.
+    #[must_use]
+    pub const fn is_interactive(&self) -> bool {
+        !matches!(
+            self.synthetic_kind,
+            Some(SyntheticKind::Other | SyntheticKind::Shared)
+        )
+    }
+}
+
 fn subtree_matches_filter(
     arena: &Arena,
     root: NodeId,
@@ -82,7 +93,16 @@ pub fn files_in_folder(
                     (Some(node.metrics.descendants), FileType::Folder, None)
                 }
                 NodeKind::File | NodeKind::Link => (None, FileType::File, None),
-                NodeKind::Synthetic(kind) => (
+                // A cold aggregate is always a collapsed directory. It can be
+                // refreshed into a verified concrete subtree before deletion.
+                NodeKind::Synthetic(SyntheticKind::Aggregate) => (
+                    Some(node.metrics.descendants),
+                    FileType::Folder,
+                    Some(SyntheticKind::Aggregate),
+                ),
+                // `Other` and `Shared` are totals with no single filesystem
+                // object. Leave them visibly present but noninteractive.
+                NodeKind::Synthetic(kind @ (SyntheticKind::Other | SyntheticKind::Shared)) => (
                     Some(node.metrics.descendants),
                     FileType::Synthetic,
                     Some(kind),

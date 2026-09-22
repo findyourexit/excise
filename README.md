@@ -124,9 +124,9 @@ Configuration takes values in this order: command line, environment, versioned T
 ## What Excise Does
 
 - **Careful space accounting:** Excise keeps the disk space assigned to files separate from their file length. It counts files with more than one name once and keeps unknown values unknown.
-- **Clear limits:** Scan queues, worker counts, memory use, per-session temporary storage, reports, and interface history have explicit limits.
+- **Clear limits:** Scan queues, worker counts, memory use, per-session temporary storage, reports, interface history, and the four-slot interactive deletion rail have explicit limits.
 - **Safe review before deletion:** Deletion plans record the files and folders that were reviewed. Excise does not follow links, checks for changes before deletion, and never includes new entries silently.
-- **Reliable terminal behavior:** The terminal is restored after normal exit, errors, panics, cancellation, and forced interruption.
+- **Reliable terminal behavior:** The terminal is restored after normal exit, errors, panics, and boundary-safe cancellation; active filesystem work is never detached silently.
 - **Accessible interaction:** Keyboard controls, narrow layouts, plain ASCII output, monochrome output, and reduced motion preserve the important safety information.
 - **Useful reports:** Table output is intended for people to read. JSON output uses stable, versioned formats for scan results, deletion history, and file paths.
 - **Readable maps:** The interface uses allocated space by default. Ordinary entries receive colours based on their relative size in the visible folder. Uncertain, shared, and summary entries keep their own meaning. Entries that do not fit remain visible as an overflow summary instead of making a folder look empty.
@@ -137,23 +137,24 @@ Configuration takes values in this order: command line, environment, versioned T
 |---|---|
 | Arrow keys | Move the selection |
 | `h j k l` | Use the Vim movement preset |
-| `Enter` | Open a folder or rescan it |
+| `Enter` | Open a folder; refresh a summarized folder in place |
 | `Esc` | Go back or cancel the current action |
 | `/` | Filter the current view |
 | `+`, `-`, `0` | Zoom in, zoom out, or reset zoom |
-| `e` | Export the current scan or deletion history |
-| `t` | Cycle themes |
+| `e` | Export the current scan report |
+| `E` | Export bounded deletion history |
+| `t` | Preview and choose a theme |
 | `?` | Open the built-in help |
 | `Backspace` | Begin a permanent deletion plan |
-| `q`, `Ctrl-C` | Exit or interrupt safely |
+| `q`, `Ctrl-C` | Exit safely; pending and active work have explicit choices |
 
 The interactive interface needs standard input and output connected to a terminal, terminal color and control support, a separate screen for the interface, and a window at least `32 x 8`. Use table or JSON mode for redirection, pipelines, continuous integration, and terminals without those capabilities. `--output FILE` works only with table or JSON mode.
 
 ## Safety Model
 
-Excise offers deletion only for complete entries that it has fully examined on a platform with tested deletion support. Fully examined entries are deletable while the initial scan is still running; you do not need to wait for the full scan to finish. Deletion is locked during focused rescanning. It refuses filesystem roots and summary entries. Before execution, it compares the live files and folders with the reviewed plan. It checks every planned entry again immediately before deletion.
+Excise offers deletion as soon as a real item appears in the map, including while the initial scan continues, on a platform with tested deletion support. A backed summarized folder can be opened with an on-demand scan or planned for deletion immediately; incomplete real entries use the same flow. Virtual summaries and filesystem roots remain noninteractive. The background planner independently makes the authoritative no-follow live review, binds it to the selected identity, and checks every planned entry again immediately before deletion.
 
-Changed, replaced, missing, newly created, permission-blocked, and uncertain entries are never silently deleted. A soft cancellation reports the work completed so far. A forced cancellation restores the terminal immediately and reports that the final filesystem state may be uncertain. There is no recovery or undo mechanism.
+Changed, replaced, missing, newly created, permission-blocked, and uncertain entries are never silently deleted. Accepted plans return to the map while a bounded named work rail shows planning, queueing, and deletion progress; one executor mutates entries serially. Quitting can cancel pending plans or wait, and an active mutation can only stop at an entry boundary or be awaited. There is no recovery or undo mechanism.
 
 Read the [permanent deletion contract](docs/safety/deletion.md), [space accounting contract](docs/safety/accounting.md), and [threat model](docs/architecture/threat-model.md) before relying on destructive behavior.
 

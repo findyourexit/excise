@@ -86,11 +86,11 @@ excise /tmp/excise-demo
 
 Use a temporary directory appropriate to your platform on Windows.
 
-Keep the default confirmation enabled for first use. Select a real file or directory and press `Backspace` to begin a permanent deletion plan. You do not need to wait for the full scan to finish; entries that have been fully examined are already deletable while scanning continues. Review the escaped path, file identity, and number of planned entries. The scan root, a file system or drive root, synthetic `Shared` and `Other` entries, aggregate entries, and incomplete or uncertain subtrees are not deletion targets. Press `Esc` to cancel.
+Keep the default confirmation enabled for first use. As soon as a real file or directory appears in the map, including while the initial scan continues, select it and press `Backspace` to begin a permanent deletion plan. For a summarized directory, `Enter` opens a focused scan and `Backspace` starts the same live review directly. The scan root, a file system or drive root, and virtual `Shared` and `Other` summaries cannot be deletion targets. An incomplete map or approximate space estimate does not weaken or block the planner's live identity checks.
 
-Files and safe printable directories confirm with `Enter` or `y`. While the identity plan is still being built, pressing `Enter` pre-arms confirmation for those entries and reduced-guardrail entries; the deletion starts as soon as the plan is ready without a separate confirm step. Hostile or untypeable names require a generated challenge. `--disable-delete-confirmation` enables a visible, session-only reduced confirmation mode that accepts `Enter` or `y` for all entries except hostile names. It does not remove the other safeguards and is not saved. Prefer an ordinary user for first use. Root and Administrator accounts receive a warning and do not change the identity checks.
+Files and safe printable directories confirm with `Enter` or `y`. Planning happens in a bounded background rail, and confirmation stays in front of the map until you accept or cancel it. After acceptance the map remains available while the serial worker immediately revalidates then deletes each reviewed entry. Hostile or untypeable names require a generated challenge. `--disable-delete-confirmation` enables a visible, session-only reduced confirmation mode that accepts `Enter` or `y` for all entries except hostile names.
 
-Every planned entry is listed independently and checked again immediately before deletion. Changed, replaced, missing, or newly created entries are never silently deleted. A run can therefore be partial. There is no trash or undo.
+Every planned entry is listed independently and checked again immediately before deletion. Changed, replaced, missing, or newly created entries are never silently deleted. The exit prompt lets pending plans be cancelled or awaited; an active deletion can only stop at an entry boundary or be awaited. A run can therefore be partial. There is no trash or undo.
 
 The default view uses allocated space. Pass `--apparent-size` when logical file length is the intended comparison.
 
@@ -100,11 +100,11 @@ The interactive interface requires standard input and output connected to a term
 
 ### Current Map Behavior
 
-The dense half-block map, animated focus border, heat ramp, overflow summary, and directed map transitions are included in the stable release. Build the current source or install `1.2.4` to use them.
+The interactive view uses a dense map, animated focus border, and animated modal chrome on capable terminals. Modal content stays still while only its border and title chip move. `--ascii`, monochrome mode, high-contrast themes, and reduced motion preserve the same selection, scope, and deletion information with static output.
 
-The interactive view uses a dense map and animated focus border on capable terminals. `--ascii`, monochrome mode, and reduced motion preserve the same selection, scope, and deletion information when visual effects are unavailable or undesirable.
+Press `t` in the normal view, while scanning, or during a focused refresh to preview the theme list. Arrow keys or `j`/`k` move the preview; `Enter` keeps it for the session and `Esc` restores the prior theme.
 
-In a color-capable map, ordinary entry color carries size. The map compares ordinary entries in the folder currently on screen and uses a blue-to-red scale. Uncertain, shared, and aggregate entries keep their own colors and do not affect that scale.
+In a color-capable map, ordinary entry color carries size. Unreadable entries and summarized directories retain distinct state colors; virtual summaries stay subdued and do not affect the size scale.
 
 Entries that do not fit in the final map view are collected into one `MapOverflow` summary. When there is enough room, the renderer shows that summary as a textured region with count and weight labels. When there is not enough room, the summary remains available in the report without drawing a misleading region.
 

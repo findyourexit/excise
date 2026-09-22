@@ -27,7 +27,7 @@ An unknown upper bound is `null`. Excise never replaces it with an apparent file
 
 ## Interactive Exports
 
-Press `e` in the normal view to export the current scan. Press `e` from deletion results to export deletion history. Excise writes the first available filename in the current directory:
+Press `e` in the normal view to export the current scan. Press `E` in the normal view to export the bounded deletion history; no result modal is required. Excise writes the first available filename in the current directory:
 
 - `excise-scan-report.json`, then `excise-scan-report-1.json`, and so on
 - `excise-deletion-history.json`, then `excise-deletion-history-1.json`, and so on
@@ -45,7 +45,7 @@ Automatic export naming never overwrites an existing file.
 | `70` | Runtime failure |
 | `74` | Input or output failure |
 | `78` | Configuration failure |
-| `130` | Interrupted or forced-cancelled operation |
+| `130` | Interrupted operation |
 
 An uncertain or partial exit can still include a useful report. Consumers should inspect both the exit code and the document state.
 

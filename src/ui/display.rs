@@ -15,11 +15,14 @@ use crate::animation::AnimationScheduler;
 use crate::config::{CustomKeyBindings, KeyPreset};
 use crate::error::AppError;
 use crate::model::{ByteBounds, NodeKind, NodeState, SyntheticKind, UnscannedReason};
-use crate::native_path::{SafeDisplayPath, safe_display_os_str};
+use crate::native_path::SafeDisplayPath;
 use crate::os::is_user_admin;
 use crate::state::UiEffects;
+use crate::state::deletion_work::{
+    DeletionWork, MAX_DELETION_WORK_ITEMS, WorkRailItem, WorkRailStatus,
+};
 use crate::state::files::FileTree;
-use crate::state::tiles::{Board, FileType};
+use crate::state::tiles::{Board, FileType, Tile};
 use crate::theme::Theme;
 use crate::ui::TermTooSmall;
 use crate::ui::format::{
@@ -27,9 +30,11 @@ use crate::ui::format::{
     display_path_middle, display_text, display_text_info, truncate_marked, truncate_middle,
 };
 use crate::ui::grid::{DenseRectangleGrid, MapLayout};
-use crate::ui::modals::{ConfirmBox, ErrorBox, HelpBox, MessageBox, NoticeBox, WarningBox};
+use crate::ui::modals::{
+    ConfirmBox, DeletionSafety, ErrorBox, HelpBox, MessageBox, NoticeBox, ThemePicker, WarningBox,
+};
 use crate::ui::pane::{
-    PANE_GAP, accent_at, contrast_ratio, fill_pane, readable_text_on, render_pane,
+    ModalChrome, PANE_GAP, accent_at, contrast_ratio, fill_pane, readable_text_on, render_pane,
 };
 
 pub struct Display<B>
@@ -82,6 +87,7 @@ where
         board: &mut Board,
         ui_mode: &UiMode,
         ui_effects: &UiEffects,
+        deletion_work: &DeletionWork,
         animation: &mut AnimationScheduler,
         now: Duration,
         theme_name: &str,
@@ -92,7 +98,6 @@ where
         custom_keys: Option<&CustomKeyBindings>,
         mouse_enabled: bool,
         reduced_guardrails: bool,
-        deletion_enter_armed: bool,
         reduced_motion: bool,
     ) -> Result<(), AppError> {
         self.terminal
@@ -130,7 +135,7 @@ where
                     );
 
                     let has_selection =
-                        matches!(ui_mode, UiMode::Normal) && board.currently_selected().is_some();
+                        ui_mode.allows_motion() && board.currently_selected().is_some();
                     let (workspace_area, inspector_area) = body_areas(shell[1]);
                     let workspace = workspace_content_area(workspace_area);
                     board.change_area(workspace);
@@ -149,22 +154,24 @@ where
                     debug_assert_eq!(workspace, rendered_workspace);
                     let show_empty_label = file_tree.current_node().state == NodeState::Complete
                         && file_tree.filter().is_none();
+                    let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. });
                     if board.is_list_layout() {
-                        render_list(
+                        render_list_with_work(
                             frame.buffer_mut(),
                             rendered_workspace,
                             board,
+                            Some(deletion_work),
                             theme,
                             ascii,
                             now,
                             reduced_motion,
-                            matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. }),
+                            scanning,
                             show_empty_label,
                         );
                     } else {
                         frame.render_widget(
                             DenseRectangleGrid::new(
-                                map_layout(board, show_empty_label),
+                                map_layout(board, deletion_work, show_empty_label, scanning),
                                 theme,
                                 ascii,
                                 monochrome,
@@ -173,11 +180,13 @@ where
                         );
                     }
                     if let Some(inspector_area) = inspector_area {
-                        render_inspector(
+                        render_inspector_with_work(
                             frame.buffer_mut(),
                             inspector_area,
                             file_tree,
                             board,
+                            Some(deletion_work),
+                            Some(ui_effects),
                             ui_mode,
                             theme,
                             ascii,
@@ -192,6 +201,7 @@ where
                         board,
                         ui_mode,
                         ui_effects,
+                        deletion_work,
                         theme,
                         theme_name,
                         keymap,
@@ -216,91 +226,68 @@ where
                 if shows_modal(ui_mode) {
                     crate::ui::pane::draw_scrim(frame.buffer_mut(), full_screen, theme, monochrome);
                 }
-
+                let chrome =
+                    ModalChrome::new(now, !ascii && !monochrome && !reduced_motion, monochrome);
                 match ui_mode {
-                    UiMode::PlanningDeletion(target) => {
-                        // Mirror the challenge_for() deceptive-name check: a deceptive
-                        // leaf always produces a TypePhrase challenge so arming is
-                        // meaningless; non-folder entries (or any entry under reduced
-                        // guardrails) with safe names produce a single-key challenge.
-                        let leaf_deceptive = target
-                            .path_to_file
-                            .last()
-                            .is_some_and(|n| safe_display_os_str(n).deceptive);
-                        let armable = !leaf_deceptive
-                            && (reduced_guardrails || target.file_type != FileType::Folder);
+                    UiMode::ThemePicker { selected, .. } => {
                         frame.render_widget(
-                            MessageBox::planning(
-                                target,
-                                deletion_enter_armed,
-                                armable,
-                                theme,
-                                ascii,
-                            ),
+                            ThemePicker::new(*selected, theme, ascii, chrome),
                             full_screen,
                         );
                     }
                     UiMode::DeleteConfirm {
-                        plan: Some(plan),
+                        target,
+                        challenge,
                         input,
+                        ..
                     } => {
                         frame.render_widget(
-                            MessageBox::confirm(
-                                plan,
+                            MessageBox::with_chrome(
+                                target,
+                                challenge,
                                 input,
-                                elevated,
-                                reduced_guardrails,
+                                DeletionSafety {
+                                    elevated,
+                                    reduced_guardrails,
+                                },
                                 theme,
                                 ascii,
+                                chrome,
                             ),
                             full_screen,
                         );
-                    }
-                    UiMode::Deleting {
-                        planned_entries,
-                        completed,
-                        stopping,
-                    } => {
-                        frame.render_widget(
-                            MessageBox::deleting(
-                                *planned_entries,
-                                completed.load(std::sync::atomic::Ordering::Relaxed),
-                                *stopping,
-                                theme,
-                                ascii,
-                            ),
-                            full_screen,
-                        );
-                    }
-                    UiMode::DeletionCancel {
-                        planned_entries, ..
-                    } => {
-                        frame.render_widget(
-                            MessageBox::cancel(*planned_entries, theme, ascii),
-                            full_screen,
-                        );
-                    }
-                    UiMode::DeletionResult { report } => {
-                        frame.render_widget(MessageBox::result(report, theme, ascii), full_screen);
                     }
                     UiMode::ErrorMessage(message) => {
-                        frame.render_widget(ErrorBox::new(message, theme, ascii), full_screen);
+                        frame.render_widget(
+                            ErrorBox::with_chrome(message, theme, ascii, chrome),
+                            full_screen,
+                        );
                     }
                     UiMode::Notice(message) => {
-                        frame.render_widget(NoticeBox::new(message, theme, ascii), full_screen);
-                    }
-                    UiMode::Exiting { save_preferences } => {
                         frame.render_widget(
-                            ConfirmBox::new(*save_preferences, theme, ascii),
+                            NoticeBox::with_chrome(message, theme, ascii, chrome),
+                            full_screen,
+                        );
+                    }
+                    UiMode::Exiting {
+                        save_preferences,
+                        work,
+                        ..
+                    } => {
+                        frame.render_widget(
+                            ConfirmBox::with_chrome(*save_preferences, work, theme, ascii, chrome),
                             full_screen,
                         );
                     }
                     UiMode::WarningMessage => {
-                        frame.render_widget(WarningBox::new(theme, ascii), full_screen);
+                        frame.render_widget(
+                            WarningBox::with_chrome(theme, ascii, chrome),
+                            full_screen,
+                        );
                     }
                     UiMode::Help => {
                         frame.render_widget(
-                            HelpBox::new(keymap, custom_keys, theme, ascii),
+                            HelpBox::with_chrome(keymap, custom_keys, theme, ascii, chrome),
                             full_screen,
                         );
                     }
@@ -308,8 +295,7 @@ where
                     | UiMode::Normal
                     | UiMode::Rescanning { .. }
                     | UiMode::FilterInput { .. }
-                    | UiMode::ScreenTooSmall
-                    | UiMode::DeleteConfirm { plan: None, .. } => {}
+                    | UiMode::ScreenTooSmall => {}
                 }
                 if monochrome {
                     apply_monochrome(frame.buffer_mut(), theme);
@@ -404,20 +390,10 @@ fn is_semantic_theme_color(color: Color, theme: Theme) -> bool {
 
 /// Whether a dialog is layered over the interface this frame.
 ///
-/// The exhaustive match in [`Display::render`] keeps this honest: a new mode
-/// has to be classified there, and an unclassified one scrims a dialog that
-/// is too separated costs nothing, one that dissolves into the map costs a
-/// misread deletion.
+/// `UiMode` owns the exhaustive classification so drawing and frame cadence
+/// cannot disagree about which decision surface needs attention.
 const fn shows_modal(ui_mode: &UiMode) -> bool {
-    !matches!(
-        ui_mode,
-        UiMode::Loading
-            | UiMode::Normal
-            | UiMode::Rescanning { .. }
-            | UiMode::FilterInput { .. }
-            | UiMode::ScreenTooSmall
-            | UiMode::DeleteConfirm { plan: None, .. }
-    )
+    ui_mode.has_modal_attention()
 }
 
 const INSPECTOR_HEIGHT: u16 = 9;
@@ -459,8 +435,12 @@ fn workspace_title(board: &Board) -> &'static str {
     }
 }
 
-/// Collects the board state that belongs to the geometry currently on screen.
-fn map_layout(board: &Board, show_empty_label: bool) -> MapLayout<'_> {
+fn map_layout<'a>(
+    board: &'a Board,
+    deletion_work: &'a DeletionWork,
+    show_empty_label: bool,
+    scanning: bool,
+) -> MapLayout<'a> {
     MapLayout {
         rectangles: board.rendered_tiles(),
         departing: board.departing_tiles(),
@@ -468,6 +448,8 @@ fn map_layout(board: &Board, show_empty_label: bool) -> MapLayout<'_> {
         selected_rect_index: board.selected_index,
         transitioning: board.is_transitioning(),
         show_empty_label,
+        scanning,
+        deletion_work: Some(deletion_work),
     }
 }
 
@@ -514,7 +496,13 @@ fn render_instrument_header(
     fill_pane(buffer, area, theme);
     let current = file_tree.current_node();
     let total = file_tree.total_node();
-    let (marker, state, state_color) = view_state(ui_mode, current.state, ascii, theme);
+    let (marker, state, state_color) = view_state(
+        ui_mode,
+        current.state,
+        current.unscanned_reason.as_ref(),
+        ascii,
+        theme,
+    );
     let state_background = if monochrome {
         theme.surface_panel
     } else {
@@ -654,6 +642,7 @@ fn storage_summary(
 fn view_state(
     ui_mode: &UiMode,
     node_state: NodeState,
+    reason: Option<&UnscannedReason>,
     ascii: bool,
     theme: Theme,
 ) -> (&'static str, &'static str, Color) {
@@ -684,10 +673,23 @@ fn view_state(
         ),
         NodeState::Aggregated => (
             if ascii { "A" } else { "◇" },
-            "AGGREGATED",
+            "SUMMARIZED",
             theme.state_aggregated,
         ),
-        NodeState::Uncertain => ("?", "UNCERTAIN", theme.state_uncertain),
+        NodeState::Uncertain => (
+            "?",
+            match reason {
+                Some(UnscannedReason::Excluded(_)) => "EXCLUDED",
+                Some(UnscannedReason::FilesystemBoundary) => "OTHER DEVICE",
+                Some(UnscannedReason::SymbolicLink) => "LINK SKIPPED",
+                Some(UnscannedReason::Metadata(_)) => "READ ERROR",
+                Some(UnscannedReason::Replacement(_)) => "CHANGED",
+                Some(UnscannedReason::IdentityStorageCapacity) => "SPACE ESTIMATE",
+                Some(UnscannedReason::MemoryAggregation) => "SUMMARY",
+                None => "NEEDS REVIEW",
+            },
+            theme.state_uncertain,
+        ),
     }
 }
 
@@ -733,13 +735,51 @@ fn render_list(
     scanning: bool,
     show_empty_label: bool,
 ) {
+    render_list_with_work(
+        buffer,
+        area,
+        board,
+        None,
+        theme,
+        ascii,
+        now,
+        reduced_motion,
+        scanning,
+        show_empty_label,
+    );
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    reason = "list rendering keeps presentation, scan state, and empty-state confirmation explicit"
+)]
+fn render_list_with_work(
+    buffer: &mut Buffer,
+    area: Rect,
+    board: &Board,
+    deletion_work: Option<&DeletionWork>,
+    theme: Theme,
+    ascii: bool,
+    now: Duration,
+    reduced_motion: bool,
+    scanning: bool,
+    show_empty_label: bool,
+) {
     if board.tiles.is_empty() {
-        // An empty model is also the initial loading state. Do not call a
-        // directory empty until the scan (or focused rescan) has settled.
-        if scanning || !show_empty_label {
+        // An empty model is also the initial loading state. Name that state
+        // directly instead of implying that the folder has no contents.
+        let label = if scanning {
+            if ascii {
+                "Scanning folder..."
+            } else {
+                "Scanning folder…"
+            }
+        } else if show_empty_label {
+            "Folder is empty"
+        } else {
             return;
-        }
-        let label = "Folder is empty";
+        };
         let width = u16::try_from(label.len()).unwrap_or(u16::MAX);
         if area.width >= width && area.height > 0 {
             buffer.set_string(
@@ -757,31 +797,7 @@ fn render_list(
         if index >= usize::from(area.height) {
             break;
         }
-        let marker = match (tile.file_type, tile.synthetic_kind) {
-            (FileType::Folder, _) => {
-                if ascii {
-                    ">"
-                } else {
-                    "▸"
-                }
-            }
-            (FileType::Synthetic, Some(SyntheticKind::Shared)) => {
-                if ascii {
-                    "S"
-                } else {
-                    "◫"
-                }
-            }
-            (FileType::Synthetic, _) => {
-                if ascii {
-                    "A"
-                } else {
-                    "◇"
-                }
-            }
-            (FileType::File, _) if tile.uncertain => "?",
-            _ => " ",
-        };
+        let marker = list_item_marker(tile, deletion_work, ascii);
         let name_width = area.width.saturating_sub(28);
         let name = display_os_str_middle(&tile.name, name_width);
         let size = if tile.uncertain && tile.size == 0 {
@@ -799,6 +815,8 @@ fn render_list(
         let selected = board.selected_index == Some(index);
         let style = if selected {
             selected_list_style(theme, theme.text_inverse).add_modifier(Modifier::BOLD)
+        } else if !tile.is_interactive() {
+            Style::default().fg(theme.text_muted)
         } else if tile.uncertain {
             Style::default().fg(theme.state_uncertain)
         } else {
@@ -828,32 +846,73 @@ fn render_list(
     }
 }
 
-fn inspector_action(
-    ui_mode: &UiMode,
-    synthetic: bool,
-    complete: bool,
+fn work_status_marker(status: WorkRailStatus, ascii: bool) -> &'static str {
+    match (status, ascii) {
+        (WorkRailStatus::AwaitingConfirmation, _) => "!",
+        (WorkRailStatus::Planning, true) => "~",
+        (WorkRailStatus::Planning, false) => "◌",
+        (WorkRailStatus::Queued, true) => "+",
+        (WorkRailStatus::Queued, false) => "◍",
+        (WorkRailStatus::Executing, true) => "*",
+        (WorkRailStatus::Executing, false) => "◉",
+    }
+}
+
+fn list_item_marker(
+    tile: &Tile,
+    deletion_work: Option<&DeletionWork>,
     ascii: bool,
 ) -> &'static str {
+    if let Some(status) = deletion_work.and_then(|work| work.status_for_node(tile.node_id)) {
+        return work_status_marker(status, ascii);
+    }
+    match (tile.file_type, tile.synthetic_kind) {
+        (FileType::Folder, _) => {
+            if ascii {
+                ">"
+            } else {
+                "▸"
+            }
+        }
+        (FileType::Synthetic, Some(SyntheticKind::Shared)) => {
+            if ascii {
+                "S"
+            } else {
+                "◫"
+            }
+        }
+        (FileType::Synthetic, _) => {
+            if ascii {
+                "A"
+            } else {
+                "◇"
+            }
+        }
+        (FileType::File, _) if tile.uncertain => "?",
+        _ => " ",
+    }
+}
+
+fn inspector_action(ui_mode: &UiMode, kind: NodeKind, ascii: bool) -> &'static str {
     match ui_mode {
-        UiMode::Normal => {
-            if synthetic {
-                if ascii {
-                    "Enter rescan . cannot delete"
-                } else {
-                    "Enter rescan · cannot delete"
-                }
-            } else if complete {
+        UiMode::Normal | UiMode::Loading | UiMode::Rescanning { .. } => match kind {
+            NodeKind::Root => "Scan root · cannot delete",
+            NodeKind::Directory | NodeKind::Synthetic(SyntheticKind::Aggregate) => {
                 if ascii {
                     "Enter open . Backspace delete"
                 } else {
                     "Enter open · Backspace delete"
                 }
-            } else if ascii {
-                "Scan incomplete . cannot delete"
-            } else {
-                "Scan incomplete · cannot delete"
             }
-        }
+            NodeKind::Synthetic(SyntheticKind::Other | SyntheticKind::Shared) => {
+                if ascii {
+                    "Virtual summary . cannot delete"
+                } else {
+                    "Virtual summary · cannot delete"
+                }
+            }
+            NodeKind::File | NodeKind::Link => "Backspace delete",
+        },
         UiMode::FilterInput { .. } => {
             if ascii {
                 "Filtering . Enter apply . Esc cancel"
@@ -861,28 +920,32 @@ fn inspector_action(
                 "Filtering · Enter apply · Esc cancel"
             }
         }
-        UiMode::Loading => {
-            // Deletion remains available during the initial scan for complete entries.
-            if !synthetic && complete {
-                if ascii {
-                    "Scanning . Backspace delete"
-                } else {
-                    "Scanning · Backspace delete"
-                }
-            } else if ascii {
-                "Scanning . cannot delete"
-            } else {
-                "Scanning · cannot delete"
-            }
-        }
-        UiMode::Rescanning { .. } => {
-            if ascii {
-                "Scanning . cannot delete"
-            } else {
-                "Scanning · cannot delete"
-            }
-        }
         _ => "Actions unavailable",
+    }
+}
+
+fn deletion_completion_label(summary: crate::state::DeletionSummary) -> String {
+    let skipped = summary
+        .changed
+        .saturating_add(summary.missing)
+        .saturating_add(summary.failed)
+        .saturating_add(summary.unattempted);
+    if skipped == 0 {
+        format!("Last deletion: {} removed", summary.deleted)
+    } else {
+        format!(
+            "Last deletion: {} removed, {skipped} skipped",
+            summary.deleted
+        )
+    }
+}
+
+fn deletion_activity_label(status: WorkRailStatus) -> &'static str {
+    match status {
+        WorkRailStatus::Planning => "Deletion: checking current files in background",
+        WorkRailStatus::AwaitingConfirmation => "Deletion: waiting for confirmation",
+        WorkRailStatus::Queued => "Deletion: queued behind active work",
+        WorkRailStatus::Executing => "Deletion: running in background",
     }
 }
 
@@ -905,7 +968,7 @@ fn inspection_reason_detail(reason: Option<&UnscannedReason>) -> SafeDisplayPath
             display_text_info("Scan result: outside this file system")
         }
         Some(UnscannedReason::IdentityStorageCapacity) => {
-            display_text_info("Scan result: some space totals are unknown")
+            display_text_info("Space totals are approximate; deletion still checks live files")
         }
         Some(UnscannedReason::MemoryAggregation) => display_text_info("Scan result: summarized"),
     }
@@ -929,6 +992,29 @@ fn render_inspector(
     area: Rect,
     file_tree: &FileTree,
     board: &Board,
+    ui_mode: &UiMode,
+    theme: Theme,
+    ascii: bool,
+    monochrome: bool,
+    now: Duration,
+) {
+    render_inspector_with_work(
+        buffer, area, file_tree, board, None, None, ui_mode, theme, ascii, monochrome, now,
+    );
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the inspector keeps its responsive variants and animation context together"
+)]
+fn render_inspector_with_work(
+    buffer: &mut Buffer,
+    area: Rect,
+    file_tree: &FileTree,
+    board: &Board,
+    deletion_work: Option<&DeletionWork>,
+    ui_effects: Option<&UiEffects>,
     ui_mode: &UiMode,
     theme: Theme,
     ascii: bool,
@@ -959,12 +1045,19 @@ fn render_inspector(
     let Some(node) = file_tree.node(tile.node_id) else {
         return;
     };
-    let (marker, state, state_color) = view_state(&UiMode::Normal, node.state, ascii, theme);
+    let (marker, state, state_color) = view_state(
+        &UiMode::Normal,
+        node.state,
+        node.unscanned_reason.as_ref(),
+        ascii,
+        theme,
+    );
     let kind = match node.kind {
         NodeKind::Root | NodeKind::Directory => "folder",
         NodeKind::File => "file",
         NodeKind::Link => "link",
-        NodeKind::Synthetic(SyntheticKind::Other | SyntheticKind::Aggregate) => "summary",
+        NodeKind::Synthetic(SyntheticKind::Other) => "virtual summary",
+        NodeKind::Synthetic(SyntheticKind::Aggregate) => "summarized folder",
         NodeKind::Synthetic(SyntheticKind::Shared) => "shared item",
     };
     let separator = if ascii { "." } else { "·" };
@@ -996,12 +1089,7 @@ fn render_inspector(
     } else {
         inspection_reason_detail(node.unscanned_reason.as_ref())
     };
-    let action = inspector_action(
-        ui_mode,
-        node.kind.is_synthetic(),
-        node.state == NodeState::Complete,
-        ascii,
-    );
+    let action = inspector_action(ui_mode, node.kind, ascii);
     let space_used = format_bounds(node.metrics.allocated_bytes);
     let can_reclaim = format_bounds(node.metrics.reclaimable_bytes);
     let content_size = DisplaySize(node.metrics.apparent_bytes as f64).to_string();
@@ -1031,6 +1119,38 @@ fn render_inspector(
             .fg(theme.text_muted)
             .add_modifier(Modifier::BOLD),
     );
+    let activity_line = deletion_work
+        .and_then(|work| work.status_for_node(tile.node_id))
+        .map(|status| {
+            Line::styled(
+                truncate_middle(deletion_activity_label(status), inner.width),
+                Style::default()
+                    .fg(theme.focus)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
+    let completion_line = ui_effects
+        .and_then(|effects| effects.last_deletion_summary)
+        .map(|summary| {
+            Line::styled(
+                truncate_middle(&deletion_completion_label(summary), inner.width),
+                Style::default().fg(theme.text_secondary),
+            )
+        })
+        .or_else(|| {
+            ui_effects
+                .and_then(|effects| effects.last_deletion_notice)
+                .map(|notice| {
+                    Line::styled(
+                        truncate_middle(notice, inner.width),
+                        Style::default().fg(theme.text_danger),
+                    )
+                })
+        });
+    let activity_or_completion = activity_line.or(completion_line);
+    let action_or_activity = activity_or_completion
+        .clone()
+        .unwrap_or_else(|| action_line.clone());
     let details = if inner.width < 54 {
         let compact_state_line = if folded_detail.is_some() {
             Line::styled(
@@ -1046,7 +1166,7 @@ fn render_inspector(
         vec![
             name_line,
             compact_state_line,
-            action_line,
+            action_or_activity.clone(),
             Line::from(truncate_middle(
                 &format!("Can reclaim {can_reclaim}"),
                 inner.width,
@@ -1069,7 +1189,7 @@ fn render_inspector(
         vec![
             name_line,
             state_line,
-            action_line,
+            action_or_activity,
             Line::from(truncate_middle(
                 &format!("Can reclaim {can_reclaim} {separator} Space used {space_used}"),
                 inner.width,
@@ -1096,6 +1216,9 @@ fn render_inspector(
             Line::from(known_names),
             Line::from(truncate_marked(&scan_detail, inner.width, truncate_middle)),
         ];
+        if let Some(activity_or_completion) = activity_or_completion {
+            details.insert(4, activity_or_completion);
+        }
         if let Some(folded_detail) = &folded_detail {
             details.insert(8, Line::from(truncate_middle(folded_detail, inner.width)));
         }
@@ -1120,6 +1243,7 @@ fn render_status(
     board: &Board,
     ui_mode: &UiMode,
     ui_effects: &UiEffects,
+    deletion_work: &DeletionWork,
     theme: Theme,
     theme_name: &str,
     keymap: KeyPreset,
@@ -1153,7 +1277,7 @@ fn render_status(
     }
     let movement = movement_hint(keymap, custom_keys);
     let command = command_hint(&movement, used, limit, area.width);
-    let transient_status = match ui_mode {
+    let mode_status = match ui_mode {
         UiMode::FilterInput { input, error } => Some(error.as_ref().map_or_else(
             || format!("/ {}_  [Enter] apply  [Esc] cancel", display_text(input)),
             |error| format!("/ {}_  ERROR: {}", display_text(input), display_text(error)),
@@ -1162,9 +1286,9 @@ fn render_status(
             "~ RESCANNING ",
             target,
             if ascii {
-                " . deletion locked . [Esc] cancel"
+                " . [Esc] cancel"
             } else {
-                " · deletion locked · [Esc] cancel"
+                " · [Esc] cancel"
             },
             area.width,
         )),
@@ -1172,18 +1296,39 @@ fn render_status(
             || "~ SCANNING".to_string(),
             |path| status_with_path("~ SCANNING ", path, "", area.width),
         )),
-        _ if file_tree.failed_to_read > 0 => {
-            Some(format!("? {} unreadable entries", file_tree.failed_to_read))
-        }
-        _ if board.overflow().is_some() => Some(format!(
-            "Small entries are a viewport summary {separator} use / filter or zoom"
-        )),
-        _ if board.is_list_layout() && board.hidden_list_entries() > 0 => Some(format!(
-            "{} more entries below {separator} use arrows to scroll",
-            board.hidden_list_entries()
-        )),
         _ => None,
     };
+    let deletion_status = deletion_work
+        .foreground_rail_item()
+        .map(|item| deletion_work_status(item, deletion_work.len(), ascii));
+    let transient_status = (if matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. }) {
+        deletion_status.or(mode_status)
+    } else {
+        mode_status.or(deletion_status)
+    })
+    .or_else(|| {
+        (file_tree.failed_to_read > 0)
+            .then(|| format!("? {} entries could not be read", file_tree.failed_to_read))
+    })
+    .or_else(|| {
+        board.overflow().is_some().then(|| {
+            format!("Small entries are a viewport summary {separator} use / filter or zoom")
+        })
+    })
+    .or_else(|| {
+        (board.is_list_layout() && board.hidden_list_entries() > 0).then(|| {
+            format!(
+                "{} more entries below {separator} use arrows to scroll",
+                board.hidden_list_entries()
+            )
+        })
+    })
+    .or_else(|| {
+        ui_effects
+            .last_deletion_summary
+            .map(|summary| deletion_summary_status(summary, ascii))
+    })
+    .or_else(|| ui_effects.last_deletion_notice.map(str::to_owned));
     let status = transient_status.map_or_else(
         || baseline_status(&flags, reduced_guardrails, elevated, area.width, ascii),
         |status| status_with_safety(status, reduced_guardrails, elevated, area.width, ascii),
@@ -1201,6 +1346,57 @@ fn render_status(
     ])
     .alignment(Alignment::Left)
     .render(area, buffer);
+}
+
+fn deletion_work_status(item: WorkRailItem<'_>, total: usize, ascii: bool) -> String {
+    let separator = if ascii { "." } else { "·" };
+    let waiting = total.saturating_sub(1);
+    match item.status {
+        WorkRailStatus::Planning => format!(
+            "Checking deletion: {} {separator} {total}/{} work slots",
+            item.path, MAX_DELETION_WORK_ITEMS
+        ),
+        WorkRailStatus::AwaitingConfirmation => {
+            format!(
+                "Waiting for confirmation: {} {separator} {waiting} waiting",
+                item.path
+            )
+        }
+        WorkRailStatus::Queued => {
+            format!(
+                "Deletion queued: {} {separator} {waiting} waiting",
+                item.path
+            )
+        }
+        WorkRailStatus::Executing => {
+            let completed = item.completed.map_or(0, |progress| {
+                progress.load(std::sync::atomic::Ordering::Relaxed)
+            });
+            let planned = item.planned_entries.unwrap_or_default();
+            format!(
+                "Deleting in background: {} {completed}/{planned} {separator} {waiting} waiting",
+                item.path
+            )
+        }
+    }
+}
+
+fn deletion_summary_status(summary: crate::state::DeletionSummary, ascii: bool) -> String {
+    let separator = if ascii { "." } else { "·" };
+    if !summary.reporting_complete {
+        return format!(
+            "Deletion report incomplete {separator} refresh the affected folder before another deletion"
+        );
+    }
+    if !summary.precise {
+        return format!(
+            "Deletion result needs a refresh {separator} final filesystem state may be unknown"
+        );
+    }
+    format!(
+        "Last deletion: {} deleted {separator} {} changed {separator} {} missing {separator} {} failed {separator} {} not run",
+        summary.deleted, summary.changed, summary.missing, summary.failed, summary.unattempted,
+    )
 }
 fn command_hint(movement: &str, used: usize, limit: usize, width: u16) -> String {
     const MOVE: &str = " move";
@@ -1445,7 +1641,6 @@ mod tests {
     use ratatui::buffer::Cell;
     use ratatui::style::Style;
 
-    use crate::filter::FilterPattern;
     use crate::model::{MIN_PROCESS_MIB, NodeId};
     use crate::native_path::identity_for;
     use crate::theme::ThemeId;
@@ -1482,6 +1677,7 @@ mod tests {
             Display::new(TestBackend::new(200, 100)).expect("display should be created");
         let mut board = Board::new();
         let effects = UiEffects::new();
+        let deletion_work = DeletionWork::new();
         let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
         animation.set_activity(true);
 
@@ -1491,6 +1687,7 @@ mod tests {
                 &mut board,
                 &UiMode::Normal,
                 &effects,
+                &deletion_work,
                 &mut animation,
                 Duration::ZERO,
                 "test",
@@ -1502,7 +1699,6 @@ mod tests {
                 false,
                 false,
                 false,
-                false,
             )
             .expect("display should render");
 
@@ -1511,6 +1707,36 @@ mod tests {
             Some(Duration::from_millis(66)),
             "the header paint target must not select the surface cadence"
         );
+    }
+
+    #[test]
+    fn uncertainty_labels_name_the_reason_not_the_internal_state() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+        for (reason, expected) in [
+            (UnscannedReason::Excluded("*.tmp".to_string()), "EXCLUDED"),
+            (UnscannedReason::FilesystemBoundary, "OTHER DEVICE"),
+            (UnscannedReason::SymbolicLink, "LINK SKIPPED"),
+            (
+                UnscannedReason::Metadata("denied".to_string()),
+                "READ ERROR",
+            ),
+            (
+                UnscannedReason::Replacement("changed".to_string()),
+                "CHANGED",
+            ),
+            (UnscannedReason::IdentityStorageCapacity, "SPACE ESTIMATE"),
+            (UnscannedReason::MemoryAggregation, "SUMMARY"),
+        ] {
+            let (_, label, _) = view_state(
+                &UiMode::Normal,
+                NodeState::Uncertain,
+                Some(&reason),
+                false,
+                theme,
+            );
+            assert_eq!(label, expected);
+            assert_ne!(label, "UNCERTAIN");
+        }
     }
 
     #[test]
@@ -1527,7 +1753,10 @@ mod tests {
 
         board.change_area(Rect::new(0, 0, 72, 1));
         assert!(!board.is_transitioning());
-        assert_eq!(map_layout(&board, true).overflow, board.overflow());
+        assert_eq!(
+            map_layout(&board, &DeletionWork::new(), true, false).overflow,
+            board.overflow()
+        );
     }
 
     #[test]
@@ -1535,10 +1764,7 @@ mod tests {
         for movement in ["arrows/hjkl", "arrows/Ctrl-b/n/p/f"] {
             for width in [49, 50, 71, 72, 111, 112] {
                 let command = command_hint(movement, 0, 0, width);
-                assert!(
-                    command.width() <= usize::from(width),
-                    "command exceeded width {width}: {command:?}"
-                );
+                assert!(command.width() <= usize::from(width),);
                 assert!(
                     !command.contains("[.."),
                     "command was truncated at width {width}: {command:?}"
@@ -1607,12 +1833,8 @@ mod tests {
         assert!(!command.contains(" mem "));
     }
 
-    #[test]
-    fn medium_width_command_hints_keep_the_synthetic_rescan_action() {
+    fn medium_width_command_hints_keep_theme_picker_command() {
         let movement = "arrows/hjkl";
-        let expected = " arrows/hjkl move  Enter open/rescan  / filter  e export  t theme  ? help";
-
-        assert_eq!(command_hint(movement, 0, 0, 80), expected);
         for width in [44, 54, 64, 73, 80, 90] {
             let command = command_hint(movement, 0, 0, width);
             assert!(
@@ -1621,6 +1843,7 @@ mod tests {
             );
             assert!(command.width() <= usize::from(width));
         }
+        assert!(command_hint(movement, 112, 256, 120).contains("t theme"));
     }
 
     #[test]
@@ -1710,6 +1933,7 @@ mod tests {
             false,
         );
         let loading_text = loading.content.iter().map(Cell::symbol).collect::<String>();
+        assert!(loading_text.contains("Scanning folder…"));
         assert!(!loading_text.contains("Folder is empty"));
 
         let mut settled = Buffer::empty(area);
@@ -1896,7 +2120,8 @@ mod tests {
     fn high_contrast_state_chip_backgrounds_survive_theme_postprocessing() {
         let theme = Theme::for_id(ThemeId::HighContrast);
         for node_state in [NodeState::Scanning, NodeState::Aggregated] {
-            let (_, state, state_color) = view_state(&UiMode::Normal, node_state, false, theme);
+            let (_, state, state_color) =
+                view_state(&UiMode::Normal, node_state, None, false, theme);
             let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
             buffer.set_string(
                 0,
@@ -1923,6 +2148,7 @@ mod tests {
             Display::new(TestBackend::new(80, 24)).expect("display should be created");
         let mut board = Board::new();
         let effects = UiEffects::new();
+        let deletion_work = DeletionWork::new();
         let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
         let theme = Theme::for_id(ThemeId::HighContrast);
 
@@ -1932,6 +2158,7 @@ mod tests {
                 &mut board,
                 &UiMode::Help,
                 &effects,
+                &deletion_work,
                 &mut animation,
                 Duration::ZERO,
                 "High Contrast",
@@ -1940,7 +2167,6 @@ mod tests {
                 false,
                 KeyPreset::Vim,
                 None,
-                false,
                 false,
                 false,
                 false,
@@ -1970,6 +2196,7 @@ mod tests {
             .expect("display should be created");
         let mut board = Board::new();
         let effects = UiEffects::new();
+        let deletion_work = DeletionWork::new();
         let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
         let theme = Theme::for_id(ThemeId::ExciseDark);
         let message = "X";
@@ -1985,6 +2212,7 @@ mod tests {
                 &mut board,
                 &UiMode::ErrorMessage(message.to_string()),
                 &effects,
+                &deletion_work,
                 &mut animation,
                 Duration::ZERO,
                 "test",
@@ -1996,12 +2224,20 @@ mod tests {
                 false,
                 false,
                 false,
-                false,
             )
             .expect("display should render");
 
         let mut expected = Buffer::empty(area);
-        ratatui::widgets::Widget::render(ErrorBox::new(message, theme, false), area, &mut expected);
+        ratatui::widgets::Widget::render(
+            ErrorBox::with_chrome(
+                message,
+                theme,
+                false,
+                ModalChrome::new(Duration::ZERO, true, false),
+            ),
+            area,
+            &mut expected,
+        );
         assert_eq!(
             &display.terminal.backend().buffer().content,
             &expected.content,
@@ -2092,16 +2328,32 @@ mod tests {
     #[test]
     fn inspector_actions_remain_accurate_across_modes() {
         assert_eq!(
-            inspector_action(&UiMode::Normal, false, true, false),
+            inspector_action(&UiMode::Normal, NodeKind::Directory, false),
             "Enter open · Backspace delete"
         );
         assert_eq!(
-            inspector_action(&UiMode::Normal, false, true, true),
+            inspector_action(&UiMode::Normal, NodeKind::Directory, true),
             "Enter open . Backspace delete"
         );
         assert_eq!(
-            inspector_action(&UiMode::Normal, true, true, false),
-            "Enter rescan · cannot delete"
+            inspector_action(&UiMode::Normal, NodeKind::File, false),
+            "Backspace delete"
+        );
+        assert_eq!(
+            inspector_action(
+                &UiMode::Normal,
+                NodeKind::Synthetic(SyntheticKind::Other),
+                false,
+            ),
+            "Virtual summary · cannot delete"
+        );
+        assert_eq!(
+            inspector_action(
+                &UiMode::Loading,
+                NodeKind::Synthetic(SyntheticKind::Aggregate),
+                false,
+            ),
+            "Enter open · Backspace delete"
         );
         assert_eq!(
             inspector_action(
@@ -2109,8 +2361,7 @@ mod tests {
                     input: String::new(),
                     error: None,
                 },
-                false,
-                true,
+                NodeKind::File,
                 false,
             ),
             "Filtering · Enter apply · Esc cancel"
@@ -2118,25 +2369,24 @@ mod tests {
         assert_eq!(
             inspector_action(
                 &UiMode::Rescanning {
-                    target: std::path::PathBuf::new()
+                    target: std::path::PathBuf::new(),
                 },
-                false,
-                true,
+                NodeKind::File,
                 false,
             ),
-            "Scanning · cannot delete"
+            "Backspace delete"
         );
         assert_eq!(
-            inspector_action(&UiMode::Loading, false, true, false),
-            "Scanning · Backspace delete"
+            inspector_action(&UiMode::Loading, NodeKind::File, false),
+            "Backspace delete"
         );
         assert_eq!(
-            inspector_action(&UiMode::Loading, false, false, false),
-            "Scanning · cannot delete"
-        );
-        assert_eq!(
-            inspector_action(&UiMode::Loading, true, true, false),
-            "Scanning · cannot delete"
+            inspector_action(
+                &UiMode::Loading,
+                NodeKind::Synthetic(SyntheticKind::Other),
+                false,
+            ),
+            "Virtual summary · cannot delete"
         );
     }
 
@@ -2182,7 +2432,7 @@ mod tests {
         for expected in [
             "selected-entry",
             "COMPLETE",
-            "Enter open · Backspace delete",
+            "Backspace delete",
             "Can reclaim",
             "Space used",
             "Content size",
@@ -2195,7 +2445,7 @@ mod tests {
             );
         }
         assert!(
-            text.find("Enter open").expect("action should render")
+            text.find("Backspace delete").expect("action should render")
                 < text
                     .find("Can reclaim")
                     .expect("reclaim estimate should render"),
@@ -2207,105 +2457,34 @@ mod tests {
                 "implementation label leaked into the selected-item surface: {jargon}"
             );
         }
-    }
 
-    #[test]
-    fn summary_item_explains_scan_coverage_without_model_jargon() {
-        let root = tempfile::tempdir().expect("inspector root should exist");
-        let matched = root.path().join("matched.log");
-        let omitted = root.path().join("omitted.tmp");
-        fs::write(&matched, b"abc").expect("matched fixture should be written");
-        fs::write(&omitted, b"defgh").expect("omitted fixture should be written");
-        let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
-            .expect("file tree should be created");
-        tree.begin_rescan(
-            root.path().to_path_buf(),
-            Some(FilterPattern::new("*.log").expect("filter should compile")),
-        )
-        .expect("focused rescan should begin");
-        for path in [&matched, &omitted] {
-            let metadata = fs::symlink_metadata(path).expect("fixture metadata should exist");
-            let identity = identity_for(path, &metadata)
-                .expect("fixture identity should be readable")
-                .expect("fixture should not be a link");
-            tree.add_entry(&metadata, path, identity)
-                .expect("fixture should be recorded");
-        }
-        tree.finish_rescan()
-            .expect("focused rescan should finalize");
-
-        let files = tree.files_in_current_folder(0);
-        let other = files
-            .iter()
-            .find(|file| file.synthetic_kind == Some(SyntheticKind::Other))
-            .map(|file| file.node_id)
-            .expect("filtered entry should be represented by Other");
-        let mut board = Board::new();
-        board.change_area(Rect::new(0, 0, 120, 24));
-        board.change_files(files);
-        assert!(board.select_node(other));
-
-        let area = Rect::new(0, 0, 120, 24);
-        let mut buffer = Buffer::empty(area);
-        render_inspector(
-            &mut buffer,
+        let target = tree
+            .deletion_target_for_path(&path)
+            .expect("selected file should retain a deletion target");
+        let mut work = DeletionWork::new();
+        work.enqueue_confirmation(target, true, 1024)
+            .expect("background deletion should retain the selected target");
+        let effects = UiEffects::new();
+        let mut active_buffer = Buffer::empty(area);
+        render_inspector_with_work(
+            &mut active_buffer,
             area,
             &tree,
             &board,
+            Some(&work),
+            Some(&effects),
             &UiMode::Normal,
             Theme::for_id(ThemeId::ExciseDark),
             false,
             false,
             Duration::ZERO,
         );
-        let text = buffer.content.iter().fold(String::new(), |mut text, cell| {
-            text.push_str(cell.symbol());
-            text
-        });
-        assert!(text.contains("1 item summarized here"));
-        assert!(text.contains("Scan result: summary"));
-        for jargon in [
-            "retained-entry cap",
-            "memory budget",
-            "MemoryAggregation",
-            "scope",
-        ] {
-            assert!(
-                !text.contains(jargon),
-                "model detail leaked into summary presentation: {jargon}"
-            );
-        }
-
-        let compact_area = Rect::new(0, 0, 52, INSPECTOR_HEIGHT);
-        let mut compact_buffer = Buffer::empty(compact_area);
-        render_inspector(
-            &mut compact_buffer,
-            compact_area,
-            &tree,
-            &board,
-            &UiMode::Normal,
-            Theme::for_id(ThemeId::ExciseDark),
-            false,
-            false,
-            Duration::ZERO,
-        );
-        let compact_text = compact_buffer
+        let active_text = active_buffer
             .content
             .iter()
-            .fold(String::new(), |mut text, cell| {
-                text.push_str(cell.symbol());
-                text
-            });
-        for expected in [
-            "1 item summarized",
-            "Enter rescan · cannot delete",
-            "Scan result: summary",
-        ] {
-            assert!(
-                compact_text.contains(expected),
-                "missing compact summary detail: {expected}"
-            );
-        }
+            .map(Cell::symbol)
+            .collect::<String>();
+        assert!(active_text.contains("Deletion: checking current files in background"));
     }
 
     #[test]
@@ -2468,5 +2647,23 @@ mod tests {
         let compact = status_with_path("~ RESCANNING ", path, "", 5);
         let compact_with_safety = status_with_safety(compact, true, true, 5, false);
         assert!(compact_with_safety.starts_with('!'));
+    }
+
+    #[test]
+    fn imprecise_deletion_status_requests_a_refresh() {
+        let status = deletion_summary_status(
+            crate::state::DeletionSummary {
+                deleted: 2,
+                changed: 0,
+                missing: 0,
+                failed: 0,
+                unattempted: 0,
+                precise: false,
+                reporting_complete: true,
+            },
+            false,
+        );
+        assert!(status.contains("Deletion result needs a refresh"));
+        assert!(status.contains("final filesystem state may be unknown"));
     }
 }

@@ -1,15 +1,14 @@
 mod task_queue;
 mod task_spill;
 
+use std::collections::VecDeque;
 #[cfg(windows)]
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-#[cfg(all(test, unix))]
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
 use cap_primitives::ambient_authority;
@@ -37,6 +36,90 @@ pub struct ScannerOptions {
     pub exclusions: Vec<String>,
     pub internal_paths: Vec<PathBuf>,
     pub temporary_storage: TemporaryStorage,
+}
+
+const MAX_PENDING_PRIORITIES: usize = 32;
+
+/// Allows the owner loop to promote a visible directory without exposing the
+/// scanner's bounded queue outside this module.
+pub(crate) struct ScannerControl {
+    queue: Mutex<Option<Weak<TaskQueue>>>,
+    requested: Mutex<VecDeque<PathBuf>>,
+}
+
+impl ScannerControl {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(None),
+            requested: Mutex::new(VecDeque::with_capacity(MAX_PENDING_PRIORITIES)),
+        }
+    }
+
+    pub(crate) fn prioritize(&self, path: &Path) -> io::Result<()> {
+        let queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade);
+        {
+            let mut requested = self
+                .requested
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(index) = requested.iter().position(|requested| requested == path) {
+                let _ = requested.remove(index);
+            }
+            if requested.len() == MAX_PENDING_PRIORITIES {
+                let _ = requested.pop_front();
+            }
+            requested.push_back(path.to_path_buf());
+        }
+        if let Some(queue) = queue
+            && queue.prioritize(path)?
+        {
+            self.consume(path);
+        }
+        Ok(())
+    }
+
+    fn attach(&self, queue: &Arc<TaskQueue>) -> io::Result<()> {
+        *self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(queue));
+        let requested = self
+            .requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in requested {
+            if queue.prioritize(&path)? {
+                self.consume(&path);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_requested(&self, path: &Path) -> bool {
+        self.requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|requested| requested == path)
+    }
+
+    fn consume(&self, path: &Path) {
+        let mut requested = self
+            .requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = requested.iter().position(|requested| requested == path) {
+            let _ = requested.remove(index);
+        }
+    }
 }
 
 struct Exclusions {
@@ -109,14 +192,28 @@ pub fn spawn(
     options: ScannerOptions,
     sender: Sender<WorkerEvent>,
     cancelled: Arc<AtomicBool>,
-) -> Result<thread::JoinHandle<()>, std::io::Error> {
-    thread::Builder::new()
+) -> Result<(thread::JoinHandle<()>, Arc<ScannerControl>), std::io::Error> {
+    let control = Arc::new(ScannerControl::new());
+    let scanner_control = Arc::clone(&control);
+    let handle = thread::Builder::new()
         .name("excise-scanner".to_string())
-        .spawn(move || run(options, &sender, cancelled.as_ref()))
+        .spawn(move || run_with_control(options, &sender, cancelled.as_ref(), &scanner_control))?;
+    Ok((handle, control))
 }
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancelled: &AtomicBool) {
+    let control = Arc::new(ScannerControl::new());
+    run_with_control(options, sender, cancelled, &control);
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_with_control(
+    options: ScannerOptions,
+    sender: &Sender<WorkerEvent>,
+    cancelled: &AtomicBool,
+    control: &Arc<ScannerControl>,
+) {
     let ScannerOptions {
         root,
         root_identity,
@@ -223,6 +320,7 @@ pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancell
         root.clone(),
         threads.saturating_mul(TASK_QUEUE_PER_WORKER).max(1),
         &temporary_storage,
+        Arc::clone(control),
     ) {
         Ok(queue) => queue,
         Err(error) => {
@@ -242,6 +340,23 @@ pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancell
             return;
         }
     };
+    let queue = Arc::new(queue);
+    if let Err(error) = control.attach(&queue) {
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFailed {
+                path: Some(root.clone()),
+                message: format!("could not initialize scanner priority queue: {error}"),
+            },
+            cancelled,
+        );
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFinished { cancelled: false },
+            cancelled,
+        );
+        return;
+    }
     if let Some(task_spill_path) = task_spill_path {
         if !task_spill_path.is_absolute() {
             let _ = send_event(
@@ -1079,7 +1194,12 @@ mod tests {
                 WorkerEvent::ScanBatch { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1153,8 +1273,13 @@ mod tests {
             .expect("descendant identity should be available");
         replace_directory_with_link(&descendant, &displaced, outside.path());
 
-        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
-            .expect("scanner task queue should be available");
+        let (queue, _) = TaskQueue::new(
+            root.path().to_path_buf(),
+            1,
+            &TemporaryStorage::default(),
+            Arc::new(ScannerControl::new()),
+        )
+        .expect("scanner task queue should be available");
         let (sender, events) = bounded(4);
         let cancelled = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
@@ -1218,8 +1343,13 @@ mod tests {
             .expect("descendant identity should be available");
         replace_after_next_validation(descendant.clone(), displaced, outside.path().to_path_buf());
 
-        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
-            .expect("scanner task queue should be available");
+        let (queue, _) = TaskQueue::new(
+            root.path().to_path_buf(),
+            1,
+            &TemporaryStorage::default(),
+            Arc::new(ScannerControl::new()),
+        )
+        .expect("scanner task queue should be available");
         let (sender, events) = bounded(8);
         let cancelled = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
@@ -1269,7 +1399,12 @@ mod tests {
                 WorkerEvent::ScanFailed { .. }
                 | WorkerEvent::ScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1308,8 +1443,13 @@ mod tests {
         let escaped_path = descendant.join("outside-only");
         fs::write(&outside_only, b"outside").expect("outside fixture should be written");
 
-        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
-            .expect("scanner task queue should be available");
+        let (queue, _) = TaskQueue::new(
+            root.path().to_path_buf(),
+            1,
+            &TemporaryStorage::default(),
+            Arc::new(ScannerControl::new()),
+        )
+        .expect("scanner task queue should be available");
         let (sender, events) = bounded(8);
         let cancelled = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
@@ -1357,7 +1497,12 @@ mod tests {
                 WorkerEvent::ScanFailed { .. }
                 | WorkerEvent::ScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1397,8 +1542,13 @@ mod tests {
         tree.add_entry(&metadata, &descendant, identity.clone())
             .expect("descendant should be represented");
 
-        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
-            .expect("scanner task queue should be available");
+        let (queue, _) = TaskQueue::new(
+            root.path().to_path_buf(),
+            1,
+            &TemporaryStorage::default(),
+            Arc::new(ScannerControl::new()),
+        )
+        .expect("scanner task queue should be available");
         let (sender, events) = bounded(8);
         let cancelled = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
@@ -1447,7 +1597,12 @@ mod tests {
                 | WorkerEvent::ScanFailed { .. }
                 | WorkerEvent::ScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }

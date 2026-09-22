@@ -4,23 +4,33 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::deletion::DeletionPlan;
+use crate::model::NodeId;
+use crate::native_path::safe_display_path_text;
 
-use super::file_to_delete::FileToDelete;
+use super::FileToDelete;
 
+/// Interactive deletion retains only visible, independently cancellable work.
 pub(crate) const MAX_DELETION_WORK_ITEMS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct DeletionWorkId(pub(crate) u64);
 
+impl DeletionWorkId {
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeletionWorkSummary {
-    /// Operations that can still be cancelled without interrupting a mutation.
+    /// Operations that have not entered the serial filesystem mutation lane.
     pub pending_operations: usize,
-    /// At most one worker may mutate the file system at a time.
+    /// At most one executor may mutate the filesystem at a time.
     pub mutating: bool,
-    /// The active mutation's reviewed-entry count, when one is running.
+    /// Reviewed entries in the active mutation, if any.
     pub planned_entries: Option<u64>,
-    /// The active mutation's live completion count, when one is running.
+    /// Entries completed by the active mutation, if any.
     pub completed_entries: Option<u64>,
 }
 
@@ -53,16 +63,27 @@ pub(crate) enum DeletionWorkError {
     OverlappingTarget,
 }
 
+impl DeletionWorkError {
+    #[must_use]
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::QueueFull => {
+                "Deletion work queue is full; wait for an active check to finish or cancel it"
+            }
+            Self::OverlappingTarget => {
+                "Deletion work already covers this entry or one of its parent folders"
+            }
+        }
+    }
+}
+
+/// Commands are separated by capability: planning never gains filesystem mutation authority.
 pub(crate) enum DeletionWorkCommand {
     Plan {
         work_id: DeletionWorkId,
         target: Box<FileToDelete>,
         reduced_guardrails: bool,
         maximum_bytes: usize,
-    },
-    Revalidate {
-        work_id: DeletionWorkId,
-        plan: Box<DeletionPlan>,
     },
     Execute {
         work_id: DeletionWorkId,
@@ -75,48 +96,68 @@ impl DeletionWorkCommand {
     #[must_use]
     pub(crate) const fn work_id(&self) -> DeletionWorkId {
         match self {
-            Self::Plan { work_id, .. }
-            | Self::Revalidate { work_id, .. }
-            | Self::Execute { work_id, .. } => *work_id,
+            Self::Plan { work_id, .. } | Self::Execute { work_id, .. } => *work_id,
         }
     }
 }
 
-pub(crate) struct DeletionWork {
-    items: VecDeque<DeletionWorkItem>,
-    in_flight: Option<DeletionWorkId>,
-    next_id: u64,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkRailStatus {
+    Planning,
+    AwaitingConfirmation,
+    Queued,
+    Executing,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WorkRailItem<'a> {
+    pub path: &'a str,
+    pub status: WorkRailStatus,
+    pub planned_entries: Option<u64>,
+    pub completed: Option<&'a AtomicU64>,
 }
 
 struct DeletionWorkItem {
     id: DeletionWorkId,
-    target: PathBuf,
-    phase: DeletionWorkPhase,
+    path: PathBuf,
+    label: Box<str>,
+    /// A lightweight stale-refresh seed; planner input itself is moved to the worker.
+    target: Option<FileToDelete>,
+    plan: Option<Box<DeletionPlan>>,
+    stage: DeletionWorkStage,
 }
 
-enum DeletionWorkPhase {
+enum DeletionWorkStage {
+    AwaitingConfirmation {
+        target: Box<FileToDelete>,
+        reduced_guardrails: bool,
+        maximum_bytes: usize,
+    },
+    Confirming {
+        reduced_guardrails: bool,
+        maximum_bytes: usize,
+    },
     QueuedPlanning {
         target: Box<FileToDelete>,
         reduced_guardrails: bool,
         maximum_bytes: usize,
     },
     Planning,
-    AwaitingConfirmation,
-    QueuedRevalidation {
-        plan: Box<DeletionPlan>,
-        progress: Arc<AtomicU64>,
-    },
-    Revalidating {
-        progress: Arc<AtomicU64>,
-    },
-    QueuedExecution {
-        plan: Box<DeletionPlan>,
-        progress: Arc<AtomicU64>,
-    },
+    QueuedExecution,
     Executing {
         planned_entries: u64,
-        completed: Arc<AtomicU64>,
+        progress: Arc<AtomicU64>,
     },
+    CancellingPlanning,
+}
+
+/// Owner-loop deletion state. A single planner and a single executor have independent
+/// reservations, while every retained target stays bounded and non-overlapping.
+pub(crate) struct DeletionWork {
+    items: VecDeque<DeletionWorkItem>,
+    planner_in_flight: Option<DeletionWorkId>,
+    executor_in_flight: Option<DeletionWorkId>,
+    next_id: u64,
 }
 
 impl Default for DeletionWork {
@@ -130,112 +171,133 @@ impl DeletionWork {
     pub(crate) fn new() -> Self {
         Self {
             items: VecDeque::with_capacity(MAX_DELETION_WORK_ITEMS),
-            in_flight: None,
+            planner_in_flight: None,
+            executor_in_flight: None,
             next_id: 0,
         }
     }
 
-    pub(crate) fn enqueue_planning(
+    /// Retains an immediate user confirmation before granting the planner work.
+    pub(crate) fn enqueue_confirmation(
         &mut self,
         target: FileToDelete,
         reduced_guardrails: bool,
         maximum_bytes: usize,
     ) -> Result<DeletionWorkId, DeletionWorkError> {
+        let path = target.full_path();
+        let display_target = target.display_copy();
+        let stage = if reduced_guardrails {
+            DeletionWorkStage::QueuedPlanning {
+                target: Box::new(target),
+                reduced_guardrails,
+                maximum_bytes,
+            }
+        } else {
+            DeletionWorkStage::AwaitingConfirmation {
+                target: Box::new(target),
+                reduced_guardrails,
+                maximum_bytes,
+            }
+        };
+        self.enqueue(path, Some(display_target), stage)
+    }
+
+    fn enqueue(
+        &mut self,
+        path: PathBuf,
+        target: Option<FileToDelete>,
+        stage: DeletionWorkStage,
+    ) -> Result<DeletionWorkId, DeletionWorkError> {
         if self.items.len() >= MAX_DELETION_WORK_ITEMS {
             return Err(DeletionWorkError::QueueFull);
         }
-        let target_path = target.full_path();
         if self
             .items
             .iter()
-            .any(|item| targets_overlap(&item.target, &target_path))
+            .any(|item| targets_overlap(&item.path, &path))
         {
             return Err(DeletionWorkError::OverlappingTarget);
         }
         let id = self.next_work_id();
         self.items.push_back(DeletionWorkItem {
             id,
-            target: target_path,
-            phase: DeletionWorkPhase::QueuedPlanning {
-                target: Box::new(target),
-                reduced_guardrails,
-                maximum_bytes,
-            },
+            label: safe_display_path_text(&path).into_boxed_str(),
+            path,
+            target,
+            plan: None,
+            stage,
         });
         Ok(id)
     }
 
+    /// Starts at most one identity-planning request without blocking the executor lane.
     #[must_use]
-    pub(crate) fn next_command(&mut self) -> Option<DeletionWorkCommand> {
-        if self.in_flight.is_some() {
+    pub(crate) fn next_planning_command(&mut self) -> Option<DeletionWorkCommand> {
+        if self.planner_in_flight.is_some() {
             return None;
         }
-        let item = self.items.front_mut()?;
+        let item = self
+            .items
+            .iter_mut()
+            .find(|item| matches!(item.stage, DeletionWorkStage::QueuedPlanning { .. }))?;
         let work_id = item.id;
-        let command = match &mut item.phase {
-            DeletionWorkPhase::QueuedPlanning { .. } => {
-                let DeletionWorkPhase::QueuedPlanning {
-                    target,
-                    reduced_guardrails,
-                    maximum_bytes,
-                } = std::mem::replace(&mut item.phase, DeletionWorkPhase::Planning)
-                else {
-                    unreachable!("queued planning phase must remain queued planning")
-                };
-                DeletionWorkCommand::Plan {
-                    work_id,
-                    target,
-                    reduced_guardrails,
-                    maximum_bytes,
-                }
-            }
-            DeletionWorkPhase::QueuedRevalidation { .. } => {
-                let DeletionWorkPhase::QueuedRevalidation { plan, progress } =
-                    std::mem::replace(&mut item.phase, DeletionWorkPhase::Planning)
-                else {
-                    unreachable!("queued revalidation phase must remain queued revalidation")
-                };
-                item.phase = DeletionWorkPhase::Revalidating {
-                    progress: Arc::clone(&progress),
-                };
-                DeletionWorkCommand::Revalidate { work_id, plan }
-            }
-            DeletionWorkPhase::QueuedExecution { .. } => {
-                let DeletionWorkPhase::QueuedExecution { plan, progress } =
-                    std::mem::replace(&mut item.phase, DeletionWorkPhase::Planning)
-                else {
-                    unreachable!("queued execution phase must remain queued execution")
-                };
-                let planned_entries = plan.planned_entries();
-                item.phase = DeletionWorkPhase::Executing {
-                    planned_entries,
-                    completed: Arc::clone(&progress),
-                };
-                DeletionWorkCommand::Execute {
-                    work_id,
-                    plan,
-                    progress,
-                }
-            }
-            DeletionWorkPhase::Planning
-            | DeletionWorkPhase::AwaitingConfirmation
-            | DeletionWorkPhase::Revalidating { .. }
-            | DeletionWorkPhase::Executing { .. } => return None,
+        let DeletionWorkStage::QueuedPlanning {
+            target,
+            reduced_guardrails,
+            maximum_bytes,
+        } = std::mem::replace(&mut item.stage, DeletionWorkStage::Planning)
+        else {
+            unreachable!("queued planning stage must remain queued planning")
         };
-        self.in_flight = Some(work_id);
-        Some(command)
+        item.target = Some(target.display_copy());
+        self.planner_in_flight = Some(work_id);
+        Some(DeletionWorkCommand::Plan {
+            work_id,
+            target,
+            reduced_guardrails,
+            maximum_bytes,
+        })
     }
 
+    /// Starts at most one revalidate-and-execute request. The worker keeps those operations
+    /// adjacent, so a successful revalidation cannot race a later command queue turn.
+    #[must_use]
+    pub(crate) fn next_execution_command(&mut self) -> Option<DeletionWorkCommand> {
+        if self.executor_in_flight.is_some() {
+            return None;
+        }
+        let index = self
+            .items
+            .iter()
+            .position(|item| matches!(item.stage, DeletionWorkStage::QueuedExecution))?;
+        let work_id = self.items[index].id;
+        let plan = self.items[index].plan.take()?;
+        if self.items[index].path != plan.target.full_path() {
+            let _ = self.items.remove(index);
+            return None;
+        }
+        let progress = Arc::new(AtomicU64::new(0));
+        let planned_entries = plan.planned_entries();
+        self.items[index].stage = DeletionWorkStage::Executing {
+            planned_entries,
+            progress: Arc::clone(&progress),
+        };
+        self.executor_in_flight = Some(work_id);
+        Some(DeletionWorkCommand::Execute {
+            work_id,
+            plan,
+            progress,
+        })
+    }
+
+    /// Restores a command only when its worker lane did not accept it.
     pub(crate) fn restore_unsubmitted(&mut self, command: DeletionWorkCommand) {
         let work_id = command.work_id();
-        if self.in_flight != Some(work_id) {
-            return;
-        }
         let Some(item) = self.items.iter_mut().find(|item| item.id == work_id) else {
-            self.in_flight = None;
+            self.clear_lane(work_id);
             return;
         };
-        match (command, &mut item.phase) {
+        match (command, &mut item.stage) {
             (
                 DeletionWorkCommand::Plan {
                     target,
@@ -243,169 +305,340 @@ impl DeletionWork {
                     maximum_bytes,
                     ..
                 },
-                DeletionWorkPhase::Planning,
+                DeletionWorkStage::Planning,
             ) => {
-                item.phase = DeletionWorkPhase::QueuedPlanning {
+                item.stage = DeletionWorkStage::QueuedPlanning {
                     target,
                     reduced_guardrails,
                     maximum_bytes,
                 };
             }
             (
-                DeletionWorkCommand::Revalidate { plan, .. },
-                DeletionWorkPhase::Revalidating { progress },
-            ) => {
-                let progress = Arc::clone(progress);
-                item.phase = DeletionWorkPhase::QueuedRevalidation { plan, progress };
-            }
-            (
                 DeletionWorkCommand::Execute { plan, progress, .. },
-                DeletionWorkPhase::Executing { .. },
+                DeletionWorkStage::Executing { .. },
             ) => {
-                item.phase = DeletionWorkPhase::QueuedExecution { plan, progress };
+                item.plan = Some(plan);
+                item.stage = DeletionWorkStage::QueuedExecution;
+                let _ = progress;
             }
             _ => return,
         }
-        self.in_flight = None;
+        self.clear_lane(work_id);
     }
 
-    pub(crate) fn planning_succeeded(&mut self, work_id: DeletionWorkId) -> bool {
-        if self.in_flight != Some(work_id) {
+    pub(crate) fn planning_succeeded(
+        &mut self,
+        work_id: DeletionWorkId,
+        plan: Box<DeletionPlan>,
+    ) -> bool {
+        if self.planner_in_flight != Some(work_id) {
             return false;
         }
-        let Some(item) = self.items.iter_mut().find(|item| item.id == work_id) else {
+        self.planner_in_flight = None;
+        let Some(index) = self.items.iter().position(|item| item.id == work_id) else {
             return false;
         };
-        if !matches!(item.phase, DeletionWorkPhase::Planning) {
+        if matches!(
+            self.items[index].stage,
+            DeletionWorkStage::CancellingPlanning
+        ) {
+            let _ = self.items.remove(index);
             return false;
         }
-        item.phase = DeletionWorkPhase::AwaitingConfirmation;
-        self.in_flight = None;
+        let item = &mut self.items[index];
+        if !matches!(item.stage, DeletionWorkStage::Planning)
+            || item.path != plan.target.full_path()
+        {
+            let _ = self.items.remove(index);
+            return false;
+        }
+        item.plan = Some(plan);
+        item.stage = DeletionWorkStage::QueuedExecution;
         true
+    }
+
+    pub(crate) fn planning_cancelled(&mut self, work_id: DeletionWorkId) -> bool {
+        self.planning_failed(work_id)
     }
 
     pub(crate) fn planning_failed(&mut self, work_id: DeletionWorkId) -> bool {
-        self.remove_in_flight(work_id, DeletionWorkPhaseKind::Planning)
+        if self.planner_in_flight != Some(work_id) {
+            return false;
+        }
+        self.planner_in_flight = None;
+        self.remove_if(work_id, |stage| {
+            matches!(
+                stage,
+                DeletionWorkStage::Planning | DeletionWorkStage::CancellingPlanning
+            )
+        })
     }
 
-    pub(crate) fn confirm(
+    /// A changed or missing target is never retried from prior consent.
+    pub(crate) fn planning_stale(&mut self, work_id: DeletionWorkId) -> bool {
+        self.planning_failed(work_id)
+    }
+
+    #[must_use]
+    pub(crate) fn take_next_confirmation(&mut self) -> Option<(DeletionWorkId, Box<FileToDelete>)> {
+        let item = self
+            .items
+            .iter_mut()
+            .find(|item| matches!(item.stage, DeletionWorkStage::AwaitingConfirmation { .. }))?;
+        let DeletionWorkStage::AwaitingConfirmation {
+            target,
+            reduced_guardrails,
+            maximum_bytes,
+        } = std::mem::replace(
+            &mut item.stage,
+            DeletionWorkStage::Confirming {
+                reduced_guardrails: false,
+                maximum_bytes: 0,
+            },
+        )
+        else {
+            unreachable!("awaiting confirmation stage must remain awaiting confirmation")
+        };
+        item.stage = DeletionWorkStage::Confirming {
+            reduced_guardrails,
+            maximum_bytes,
+        };
+        Some((item.id, target))
+    }
+
+    pub(crate) fn return_confirmation(
         &mut self,
         work_id: DeletionWorkId,
-        plan: Box<DeletionPlan>,
-        progress: Arc<AtomicU64>,
+        target: Box<FileToDelete>,
     ) -> bool {
-        let Some(index) = self.items.iter().position(|item| item.id == work_id) else {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == work_id) else {
             return false;
         };
-        if !matches!(
-            self.items[index].phase,
-            DeletionWorkPhase::AwaitingConfirmation
-        ) {
+        let DeletionWorkStage::Confirming {
+            reduced_guardrails,
+            maximum_bytes,
+        } = &item.stage
+        else {
+            return false;
+        };
+        if item.path != target.full_path() {
             return false;
         }
-        if self.items[index].target != plan.target.full_path() {
-            let _ = self.items.remove(index);
-            return false;
-        }
-        self.items[index].phase = DeletionWorkPhase::QueuedRevalidation { plan, progress };
+        item.stage = DeletionWorkStage::AwaitingConfirmation {
+            target,
+            reduced_guardrails: *reduced_guardrails,
+            maximum_bytes: *maximum_bytes,
+        };
         true
     }
 
-    pub(crate) fn revalidation_succeeded(
+    pub(crate) fn queue_confirmation(
         &mut self,
         work_id: DeletionWorkId,
-        plan: Box<DeletionPlan>,
+        target: Box<FileToDelete>,
     ) -> bool {
-        if self.in_flight != Some(work_id) {
-            return false;
-        }
-        let Some(index) = self.items.iter().position(|item| item.id == work_id) else {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == work_id) else {
             return false;
         };
-        let progress = match &self.items[index].phase {
-            DeletionWorkPhase::Revalidating { progress } => Arc::clone(progress),
-            _ => return false,
+        let DeletionWorkStage::Confirming {
+            reduced_guardrails,
+            maximum_bytes,
+        } = &item.stage
+        else {
+            return false;
         };
-        if self.items[index].target != plan.target.full_path() {
-            let _ = self.items.remove(index);
-            self.in_flight = None;
+        if item.path != target.full_path() {
             return false;
         }
-        self.items[index].phase = DeletionWorkPhase::QueuedExecution { plan, progress };
-        self.in_flight = None;
+        item.stage = DeletionWorkStage::QueuedPlanning {
+            target,
+            reduced_guardrails: *reduced_guardrails,
+            maximum_bytes: *maximum_bytes,
+        };
         true
     }
 
-    pub(crate) fn revalidation_failed(&mut self, work_id: DeletionWorkId) -> bool {
-        self.remove_in_flight(work_id, DeletionWorkPhaseKind::Revalidating)
-    }
-
-    pub(crate) fn execution_finished(&mut self, work_id: DeletionWorkId) -> bool {
-        self.remove_in_flight(work_id, DeletionWorkPhaseKind::Executing)
-    }
-
-    /// Cancels only an operation still represented by the foreground deletion modal.
-    ///
-    /// Returns whether a planning worker must receive its cancellation signal.
+    /// Cancels an immediate foreground confirmation or signals an in-flight planner.
     pub(crate) fn cancel_modal(&mut self, work_id: DeletionWorkId) -> bool {
         let Some(index) = self.items.iter().position(|item| item.id == work_id) else {
             return false;
         };
-        let phase = &self.items[index].phase;
-        if !matches!(
-            phase,
-            DeletionWorkPhase::QueuedPlanning { .. }
-                | DeletionWorkPhase::Planning
-                | DeletionWorkPhase::AwaitingConfirmation
+        if matches!(self.items[index].stage, DeletionWorkStage::Planning) {
+            self.items[index].stage = DeletionWorkStage::CancellingPlanning;
+            return self.planner_in_flight == Some(work_id);
+        }
+        if matches!(
+            self.items[index].stage,
+            DeletionWorkStage::QueuedPlanning { .. }
+                | DeletionWorkStage::AwaitingConfirmation { .. }
+                | DeletionWorkStage::Confirming { .. }
+                | DeletionWorkStage::QueuedExecution
         ) {
+            let _ = self.items.remove(index);
+        }
+        false
+    }
+
+    /// Cancels every non-mutating operation. An in-flight planner remains
+    /// reserved until it acknowledges cancellation.
+    pub(crate) fn cancel_pending(&mut self) -> bool {
+        let mut planner_cancelled = false;
+        for item in &mut self.items {
+            if matches!(item.stage, DeletionWorkStage::Planning) {
+                item.stage = DeletionWorkStage::CancellingPlanning;
+                planner_cancelled |= self.planner_in_flight == Some(item.id);
+            }
+        }
+        self.items.retain(|item| {
+            matches!(
+                item.stage,
+                DeletionWorkStage::Executing { .. } | DeletionWorkStage::CancellingPlanning
+            )
+        });
+        planner_cancelled
+    }
+
+    /// A changed target is never retried from the earlier confirmation.
+    pub(crate) fn execution_stale(&mut self, work_id: DeletionWorkId) -> bool {
+        if self.executor_in_flight != Some(work_id) {
             return false;
         }
-        let cancel_planning =
-            self.in_flight == Some(work_id) && matches!(phase, DeletionWorkPhase::Planning);
-        let _ = self.items.remove(index);
-        cancel_planning
+        self.executor_in_flight = None;
+        self.remove_if(work_id, |stage| {
+            matches!(stage, DeletionWorkStage::Executing { .. })
+        })
     }
 
-    /// Drops work that has not reached a filesystem mutation. An in-flight worker is left
-    /// reserved until it reports completion, so no later command can overlap it.
-    pub(crate) fn cancel_pending(&mut self) {
-        self.items
-            .retain(|item| !matches!(item.phase, DeletionWorkPhase::Executing { .. }));
-    }
-
-    /// Releases the reservation left by a cancelled planner or revalidator after it reports.
-    pub(crate) fn discard_cancelled_event(&mut self, work_id: DeletionWorkId) {
-        if self.in_flight == Some(work_id) && !self.items.iter().any(|item| item.id == work_id) {
-            self.in_flight = None;
+    pub(crate) fn execution_finished(&mut self, work_id: DeletionWorkId) -> bool {
+        if self.executor_in_flight != Some(work_id) {
+            return false;
         }
+        self.executor_in_flight = None;
+        self.remove_if(work_id, |stage| {
+            matches!(stage, DeletionWorkStage::Executing { .. })
+        })
+    }
+
+    pub(crate) fn discard(&mut self, work_id: DeletionWorkId) -> bool {
+        let removed = self.remove_if(work_id, |_| true);
+        if removed {
+            self.clear_lane(work_id);
+        }
+        removed
+    }
+
+    /// Clears a planner reservation after a late cancellation event whose item was removed.
+    pub(crate) fn discard_cancelled_event(&mut self, work_id: DeletionWorkId) {
+        if !self.items.iter().any(|item| item.id == work_id) {
+            self.clear_lane(work_id);
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn has_work(&self) -> bool {
+        self.summary().has_work()
+    }
+
+    #[must_use]
+    pub(crate) fn has_background_activity(&self) -> bool {
+        self.items.iter().any(|item| {
+            matches!(
+                item.stage,
+                DeletionWorkStage::QueuedPlanning { .. }
+                    | DeletionWorkStage::Planning
+                    | DeletionWorkStage::QueuedExecution
+                    | DeletionWorkStage::Executing { .. }
+                    | DeletionWorkStage::CancellingPlanning
+            )
+        }) || self.planner_in_flight.is_some()
+    }
+
+    #[must_use]
+    pub(crate) fn has_active_mutation(&self) -> bool {
+        self.executor_in_flight.is_some()
+            && self
+                .items
+                .iter()
+                .any(|item| matches!(item.stage, DeletionWorkStage::Executing { .. }))
+    }
+
+    #[must_use]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.summary().pending_operations
+    }
+
+    #[must_use]
+    pub(crate) fn active_progress(&self) -> Option<(u64, Arc<AtomicU64>)> {
+        self.items.iter().find_map(|item| {
+            let DeletionWorkStage::Executing {
+                planned_entries,
+                progress,
+            } = &item.stage
+            else {
+                return None;
+            };
+            Some((*planned_entries, Arc::clone(progress)))
+        })
+    }
+
+    /// Returns the current background state for one retained model node.
+    #[must_use]
+    pub(crate) fn status_for_node(&self, node_id: NodeId) -> Option<WorkRailStatus> {
+        self.rail_item_for_node(node_id).map(|item| item.status)
+    }
+
+    /// Returns the presentation data for work targeting one retained model node.
+    #[must_use]
+    pub(crate) fn rail_item_for_node(&self, node_id: NodeId) -> Option<WorkRailItem<'_>> {
+        self.items
+            .iter()
+            .find(|item| {
+                item.target
+                    .as_ref()
+                    .is_some_and(|target| target.node_id == node_id)
+            })
+            .map(work_rail_item)
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    #[must_use]
+    pub(crate) fn rail_item(&self, index: usize) -> Option<WorkRailItem<'_>> {
+        self.items.get(index).map(work_rail_item)
+    }
+
+    #[must_use]
+    pub(crate) fn foreground_rail_item(&self) -> Option<WorkRailItem<'_>> {
+        let active = self
+            .items
+            .iter()
+            .position(|item| matches!(item.stage, DeletionWorkStage::Executing { .. }));
+        self.rail_item(active.unwrap_or(0))
     }
 
     #[must_use]
     pub(crate) fn summary(&self) -> DeletionWorkSummary {
         let mut summary = DeletionWorkSummary::default();
         for item in &self.items {
-            match &item.phase {
-                DeletionWorkPhase::Executing {
+            match &item.stage {
+                DeletionWorkStage::Executing {
                     planned_entries,
-                    completed,
+                    progress,
                 } => {
                     summary.mutating = true;
                     summary.planned_entries = Some(*planned_entries);
-                    summary.completed_entries = Some(completed.load(Ordering::Acquire));
+                    summary.completed_entries = Some(progress.load(Ordering::Acquire));
                 }
-                DeletionWorkPhase::QueuedPlanning { .. }
-                | DeletionWorkPhase::Planning
-                | DeletionWorkPhase::AwaitingConfirmation
-                | DeletionWorkPhase::QueuedRevalidation { .. }
-                | DeletionWorkPhase::Revalidating { .. }
-                | DeletionWorkPhase::QueuedExecution { .. } => {
+                _ => {
                     summary.pending_operations = summary.pending_operations.saturating_add(1);
                 }
             }
         }
-        if self
-            .in_flight
-            .is_some_and(|work_id| !self.items.iter().any(|item| item.id == work_id))
+        if let Some(work_id) = self.planner_in_flight
+            && !self.items.iter().any(|item| item.id == work_id)
         {
             summary.pending_operations = summary.pending_operations.saturating_add(1);
         }
@@ -420,63 +653,78 @@ impl DeletionWork {
         DeletionWorkId(self.next_id)
     }
 
-    fn remove_in_flight(&mut self, work_id: DeletionWorkId, phase: DeletionWorkPhaseKind) -> bool {
-        if self.in_flight != Some(work_id) {
-            return false;
+    fn clear_lane(&mut self, work_id: DeletionWorkId) {
+        if self.planner_in_flight == Some(work_id) {
+            self.planner_in_flight = None;
         }
+        if self.executor_in_flight == Some(work_id) {
+            self.executor_in_flight = None;
+        }
+    }
+
+    fn remove_if(
+        &mut self,
+        work_id: DeletionWorkId,
+        predicate: impl FnOnce(&DeletionWorkStage) -> bool,
+    ) -> bool {
         let Some(index) = self.items.iter().position(|item| item.id == work_id) else {
             return false;
         };
-        if !phase.matches(&self.items[index].phase) {
+        if !predicate(&self.items[index].stage) {
             return false;
         }
         let _ = self.items.remove(index);
-        self.in_flight = None;
         true
     }
 }
 
-#[derive(Clone, Copy)]
-enum DeletionWorkPhaseKind {
-    Planning,
-    Revalidating,
-    Executing,
-}
-
-impl DeletionWorkPhaseKind {
-    const fn matches(self, phase: &DeletionWorkPhase) -> bool {
-        matches!(
-            (self, phase),
-            (Self::Planning, DeletionWorkPhase::Planning)
-                | (Self::Revalidating, DeletionWorkPhase::Revalidating { .. })
-                | (Self::Executing, DeletionWorkPhase::Executing { .. })
-        )
+fn work_rail_item(item: &DeletionWorkItem) -> WorkRailItem<'_> {
+    let (status, planned_entries, completed) = match &item.stage {
+        DeletionWorkStage::Executing {
+            planned_entries,
+            progress,
+        } => (
+            WorkRailStatus::Executing,
+            Some(*planned_entries),
+            Some(progress.as_ref()),
+        ),
+        stage => (work_rail_status(stage), None, None),
+    };
+    WorkRailItem {
+        path: &item.label,
+        status,
+        planned_entries,
+        completed,
     }
 }
 
 fn targets_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
+fn work_rail_status(stage: &DeletionWorkStage) -> WorkRailStatus {
+    match stage {
+        DeletionWorkStage::QueuedPlanning { .. }
+        | DeletionWorkStage::Planning
+        | DeletionWorkStage::CancellingPlanning => WorkRailStatus::Planning,
+        DeletionWorkStage::AwaitingConfirmation { .. } | DeletionWorkStage::Confirming { .. } => {
+            WorkRailStatus::AwaitingConfirmation
+        }
+        DeletionWorkStage::QueuedExecution => WorkRailStatus::Queued,
+        DeletionWorkStage::Executing { .. } => WorkRailStatus::Executing,
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
-    #[cfg(unix)]
     use std::sync::Arc;
-    #[cfg(unix)]
     use std::sync::atomic::AtomicU64;
 
-    #[cfg(unix)]
-    use std::path::Path;
+    use crate::model::{EntrySnapshot, NodeId, NodeKind};
+    use crate::state::tiles::FileType;
 
     use super::*;
-    #[cfg(unix)]
-    use crate::deletion::{PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan};
-    use crate::model::{EntrySnapshot, NodeId, NodeKind};
-    #[cfg(unix)]
-    use crate::native_path::identity_for;
-    use crate::state::tiles::FileType;
 
     fn target(path: &[&str]) -> FileToDelete {
         FileToDelete {
@@ -501,118 +749,138 @@ mod tests {
     #[test]
     fn queue_rejects_overlapping_targets_and_enforces_its_capacity() {
         let mut work = DeletionWork::new();
-        work.enqueue_planning(target(&["first"]), false, 1024)
+        work.enqueue_confirmation(target(&["first"]), false, 1024)
             .expect("first target should fit");
         assert_eq!(
-            work.enqueue_planning(target(&["first", "child"]), false, 1024),
+            work.enqueue_confirmation(target(&["first", "child"]), false, 1024),
             Err(DeletionWorkError::OverlappingTarget)
         );
-        work.enqueue_planning(target(&["second"]), false, 1024)
+        work.enqueue_confirmation(target(&["second"]), false, 1024)
             .expect("second target should fit");
-        work.enqueue_planning(target(&["third"]), false, 1024)
+        work.enqueue_confirmation(target(&["third"]), false, 1024)
             .expect("third target should fit");
-        work.enqueue_planning(target(&["fourth"]), false, 1024)
+        work.enqueue_confirmation(target(&["fourth"]), false, 1024)
             .expect("fourth target should fit");
         assert_eq!(
-            work.enqueue_planning(target(&["fifth"]), false, 1024),
+            work.enqueue_confirmation(target(&["fifth"]), false, 1024),
             Err(DeletionWorkError::QueueFull)
         );
     }
 
-    #[cfg(unix)]
-    fn file_plan(root: &Path, name: &str) -> DeletionPlan {
-        use std::os::unix::fs::MetadataExt as _;
-        use std::time::UNIX_EPOCH;
-
-        let path = root.join(name);
-        std::fs::write(&path, b"file").expect("test target should be written");
-        let metadata = std::fs::symlink_metadata(&path).expect("test target metadata should exist");
-        let identity = identity_for(&path, &metadata)
-            .expect("test target identity should be readable")
-            .expect("test target should not be a link");
-        let snapshot = PlannedSnapshot {
-            identity: identity.clone(),
-            kind: PlannedKind::File,
-            apparent_bytes: u128::from(metadata.len()),
-            allocated_bytes: Some(u128::from(metadata.blocks()).saturating_mul(512)),
-            modified_nanos: metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos()),
-        };
-        let target = FileToDelete {
-            node_id: NodeId(2),
-            synthetic: false,
-            path_in_filesystem: root.to_path_buf(),
-            path_to_file: vec![OsString::from(name)],
-            file_type: FileType::File,
-            num_descendants: None,
-            size: snapshot.apparent_bytes,
-            expected_snapshot: EntrySnapshot {
-                identity: Some(identity),
-                kind: NodeKind::File,
-                apparent_bytes: snapshot.apparent_bytes,
-                allocated_bytes: snapshot.allocated_bytes,
-                modified_nanos: snapshot.modified_nanos,
-            },
-            reviewed_entries: vec![ReviewedEntry {
-                relative_path: PathBuf::from(name),
-                snapshot,
-            }],
-        };
-        build_plan(root, target, false).expect("test plan should build")
-    }
-
-    #[cfg(unix)]
     #[test]
-    fn revalidation_is_followed_immediately_by_its_serial_mutation() {
-        let root = tempfile::tempdir().expect("test root should exist");
-        let plan = Box::new(file_plan(root.path(), "first"));
-        let first_target = plan.target.clone();
-        let mut work = DeletionWork::new();
-        let first = work
-            .enqueue_planning(first_target, false, 1024)
-            .expect("first target should queue");
-        work.enqueue_planning(target(&["second"]), false, 1024)
-            .expect("second target should queue");
-
-        assert!(matches!(
-            work.next_command(),
-            Some(DeletionWorkCommand::Plan { work_id, .. }) if work_id == first
-        ));
-        assert!(work.planning_succeeded(first));
-        let progress = Arc::new(AtomicU64::new(0));
-        assert!(work.confirm(first, plan, Arc::clone(&progress)));
-        let plan = match work.next_command() {
-            Some(DeletionWorkCommand::Revalidate { work_id, plan }) if work_id == first => plan,
-            Some(_) | None => panic!("first operation should revalidate before later planning"),
-        };
-        assert!(work.revalidation_succeeded(first, plan));
-
-        let execution_progress = match work.next_command() {
-            Some(DeletionWorkCommand::Execute {
-                work_id, progress, ..
-            }) if work_id == first => progress,
-            Some(_) | None => panic!("revalidated work should execute before later planning"),
-        };
-        assert!(Arc::ptr_eq(&progress, &execution_progress));
-        assert!(work.summary().mutating);
-        assert_eq!(work.summary().pending_operations, 1);
-    }
-
-    #[test]
-    fn cancellation_retains_the_worker_reservation_until_its_event_arrives() {
+    fn cancellation_retains_the_planner_reservation_until_its_event_arrives() {
         let mut work = DeletionWork::new();
         let work_id = work
-            .enqueue_planning(target(&["first"]), false, 1024)
+            .enqueue_confirmation(target(&["first"]), true, 1024)
             .expect("target should queue");
-        let _ = work.next_command();
+        let command = work
+            .next_planning_command()
+            .expect("planner should receive the first command");
+        assert!(matches!(command, DeletionWorkCommand::Plan { .. }));
         assert!(work.cancel_modal(work_id));
         assert_eq!(work.summary().pending_operations, 1);
-        assert!(work.next_command().is_none());
+        assert!(work.next_planning_command().is_none());
 
-        work.discard_cancelled_event(work_id);
+        assert!(work.planning_cancelled(work_id));
         assert!(!work.summary().has_work());
+    }
+
+    #[test]
+    fn planner_lane_can_start_a_later_nonoverlapping_request_while_execution_runs() {
+        let mut work = DeletionWork::new();
+        let first = work
+            .enqueue_confirmation(target(&["first"]), true, 1024)
+            .expect("first target should queue");
+        let second = work
+            .enqueue_confirmation(target(&["second"]), true, 1024)
+            .expect("second target should queue");
+        let first_command = work
+            .next_planning_command()
+            .expect("first planner command should start");
+        let DeletionWorkCommand::Plan { target, .. } = first_command else {
+            panic!("first operation should plan")
+        };
+        let item = work
+            .items
+            .iter_mut()
+            .find(|item| item.id == first)
+            .expect("first item should remain retained");
+        item.stage = DeletionWorkStage::Executing {
+            planned_entries: 1,
+            progress: Arc::new(AtomicU64::new(0)),
+        };
+        work.planner_in_flight = None;
+        work.executor_in_flight = Some(first);
+
+        assert_eq!(target.full_path(), PathBuf::from("/scan-root/first"));
+        let later = work
+            .next_planning_command()
+            .expect("later planning must not wait for the executor lane");
+        assert!(matches!(later, DeletionWorkCommand::Plan { work_id, .. } if work_id == second));
+    }
+
+    #[test]
+    fn confirmation_precedes_planning_and_targets_are_status_addressable() {
+        let mut work = DeletionWork::new();
+        let target = target(&["first"]);
+        let node_id = target.node_id;
+        let work_id = work
+            .enqueue_confirmation(target, false, 1024)
+            .expect("confirmation should queue");
+        assert!(work.next_planning_command().is_none());
+        assert_eq!(
+            work.status_for_node(node_id),
+            Some(WorkRailStatus::AwaitingConfirmation)
+        );
+
+        let (shown_id, target) = work
+            .take_next_confirmation()
+            .expect("target should surface before planning");
+        assert_eq!(shown_id, work_id);
+        assert!(work.queue_confirmation(work_id, target));
+        assert_eq!(
+            work.status_for_node(node_id),
+            Some(WorkRailStatus::Planning)
+        );
+        assert!(matches!(
+            work.next_planning_command(),
+            Some(DeletionWorkCommand::Plan { work_id: id, .. }) if id == work_id
+        ));
+    }
+
+    #[test]
+    fn node_rail_item_exposes_execution_progress() {
+        let mut work = DeletionWork::new();
+        let target = target(&["target"]);
+        let node_id = target.node_id;
+        let work_id = work
+            .enqueue_confirmation(target, true, 1024)
+            .expect("work should queue");
+        let _ = work
+            .next_planning_command()
+            .expect("planner command should start");
+        let progress = Arc::new(AtomicU64::new(3));
+        let item = work
+            .items
+            .iter_mut()
+            .find(|item| item.id == work_id)
+            .expect("work should remain retained");
+        item.stage = DeletionWorkStage::Executing {
+            planned_entries: 8,
+            progress: Arc::clone(&progress),
+        };
+        work.planner_in_flight = None;
+        work.executor_in_flight = Some(work_id);
+
+        let rail = work
+            .rail_item_for_node(node_id)
+            .expect("target node should retain its execution state");
+        assert_eq!(rail.status, WorkRailStatus::Executing);
+        assert_eq!(rail.planned_entries, Some(8));
+        assert_eq!(
+            rail.completed
+                .map(|completed| completed.load(std::sync::atomic::Ordering::Acquire)),
+            Some(3)
+        );
     }
 }

@@ -2,8 +2,9 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
+use super::ScannerControl;
 use super::task_spill::TaskSpill;
 use crate::native_path::NativeIdentity;
 use crate::temporary_storage::TemporaryStorage;
@@ -21,11 +22,13 @@ pub(super) struct TaskQueue {
     ready: Condvar,
     capacity: usize,
     root: PathBuf,
+    control: Arc<ScannerControl>,
 }
 
 struct QueueState {
     tasks: VecDeque<DirectoryTask>,
     spill: TaskSpill,
+    spill_is_prioritized: bool,
     pending: usize,
 }
 
@@ -34,6 +37,7 @@ impl TaskQueue {
         root: PathBuf,
         capacity: usize,
         temporary_storage: &TemporaryStorage,
+        control: Arc<ScannerControl>,
     ) -> io::Result<(Self, Option<PathBuf>)> {
         let (spill, spill_path) = TaskSpill::new(temporary_storage)?;
         Ok((
@@ -45,10 +49,12 @@ impl TaskQueue {
                     }]),
                     spill,
                     pending: 1,
+                    spill_is_prioritized: false,
                 }),
                 ready: Condvar::new(),
                 capacity,
                 root,
+                control,
             },
             spill_path,
         ))
@@ -72,6 +78,14 @@ impl TaskQueue {
             {
                 return Ok(None);
             }
+            if state.spill_is_prioritized {
+                if let Some(task) = state.spill.take()? {
+                    state.spill_is_prioritized = false;
+                    validate_task_path(&self.root, &task.path)?;
+                    return Ok(Some(task));
+                }
+                state.spill_is_prioritized = false;
+            }
             if let Some(task) = state.tasks.pop_front() {
                 validate_task_path(&self.root, &task.path)?;
                 return Ok(Some(task));
@@ -89,6 +103,7 @@ impl TaskQueue {
 
     pub(super) fn schedule(&self, task: DirectoryTask) -> io::Result<()> {
         validate_task_path(&self.root, &task.path)?;
+        let prioritize = self.control.is_requested(&task.path);
         let mut state = self
             .state
             .lock()
@@ -97,7 +112,21 @@ impl TaskQueue {
             .pending
             .checked_add(1)
             .ok_or_else(|| io::Error::other("scanner task count overflow"))?;
-        if state.tasks.len() < self.capacity {
+        if prioritize {
+            if state.tasks.len() == self.capacity {
+                let displaced = state
+                    .tasks
+                    .back()
+                    .cloned()
+                    .expect("a full scanner queue must have a tail task");
+                state.spill.push(displaced)?;
+                let _ = state.tasks.pop_back();
+            }
+            state.tasks.push_front(task);
+            state.spill_is_prioritized = false;
+            self.control
+                .consume(&state.tasks.front().expect("queued task must exist").path);
+        } else if state.tasks.len() < self.capacity {
             state.tasks.push_back(task);
         } else {
             state.spill.push(task)?;
@@ -105,6 +134,32 @@ impl TaskQueue {
         state.pending = pending;
         self.ready.notify_one();
         Ok(())
+    }
+
+    /// Promotes an already queued directory without violating the bounded
+    /// resident queue or losing FIFO order for unrelated work.
+    pub(super) fn prioritize(&self, path: &Path) -> io::Result<bool> {
+        validate_task_path(&self.root, path)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = state.tasks.iter().position(|task| task.path == path) {
+            let task = state
+                .tasks
+                .remove(index)
+                .expect("scanner task index must remain valid while locked");
+            state.tasks.push_front(task);
+            state.spill_is_prioritized = false;
+            self.ready.notify_one();
+            return Ok(true);
+        }
+        let promoted = state.spill.promote_matching(path)?;
+        if promoted {
+            state.spill_is_prioritized = true;
+            self.ready.notify_one();
+        }
+        Ok(promoted)
     }
 
     pub(super) fn complete(&self) {
@@ -130,20 +185,25 @@ mod tests {
     #[cfg(windows)]
     use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
     #[cfg(windows)]
     use super::super::Exclusions;
-    use super::super::{BATCH_SIZE, task_spill::SPILL_LENGTH_BYTES};
+    use super::super::{BATCH_SIZE, ScannerControl, task_spill::SPILL_LENGTH_BYTES};
     use super::{DirectoryTask, TaskQueue};
     use crate::native_path::NativePath;
     use crate::temporary_storage::TemporaryStorage;
 
     #[test]
     fn task_queue_spills_overflow_without_growing_the_resident_queue() {
-        let (queue, task_spill_path) =
-            TaskQueue::new(PathBuf::from("/scan-root"), 1, &TemporaryStorage::default())
-                .expect("scanner task spill should be available");
+        let (queue, task_spill_path) = TaskQueue::new(
+            PathBuf::from("/scan-root"),
+            1,
+            &TemporaryStorage::default(),
+            Arc::new(ScannerControl::new()),
+        )
+        .expect("scanner task spill should be available");
         #[cfg(windows)]
         {
             let task_spill_path = task_spill_path.expect("Windows task spill should be named");
@@ -196,8 +256,13 @@ mod tests {
             .checked_add(u64::try_from(payload.len()).expect("task fixture length should fit"))
             .expect("task fixture record size should fit");
         let temporary_storage = TemporaryStorage::with_limit_bytes(record_bytes);
-        let (queue, _) = TaskQueue::new(root.clone(), 1, &temporary_storage)
-            .expect("scanner task queue should open");
+        let (queue, _) = TaskQueue::new(
+            root.clone(),
+            1,
+            &temporary_storage,
+            Arc::new(ScannerControl::new()),
+        )
+        .expect("scanner task queue should open");
 
         queue
             .schedule(task.clone())
@@ -255,8 +320,13 @@ mod tests {
                 .checked_mul(2)
                 .expect("two task records should fit in the test limit"),
         );
-        let (queue, _) = TaskQueue::new(root.clone(), 1, &temporary_storage)
-            .expect("scanner task queue should open");
+        let (queue, _) = TaskQueue::new(
+            root.clone(),
+            1,
+            &temporary_storage,
+            Arc::new(ScannerControl::new()),
+        )
+        .expect("scanner task queue should open");
         queue
             .schedule(task.clone())
             .expect("first spill record should fit");
@@ -292,12 +362,119 @@ mod tests {
         drop(queue);
         assert_eq!(temporary_storage.used(), 0);
     }
+    #[test]
+    fn visible_spill_task_runs_before_resident_background_work() {
+        let root = PathBuf::from("/scan-root");
+        let visible = root.join("visible");
+        let first_spilled = root.join("first-spilled");
+        let background = root.join("background");
+        let (queue, _) = TaskQueue::new(
+            root.clone(),
+            1,
+            &TemporaryStorage::default(),
+            Arc::new(ScannerControl::new()),
+        )
+        .expect("scanner task queue should open");
+        let cancelled = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let root_invalid = AtomicBool::new(false);
+
+        let root_task = queue
+            .take(&cancelled, &failed, &root_invalid)
+            .expect("root should dequeue")
+            .expect("root task should exist");
+        assert_eq!(root_task.path, root);
+        queue.complete();
+        for path in [&background, &first_spilled, &visible] {
+            queue
+                .schedule(DirectoryTask {
+                    path: path.clone(),
+                    identity: None,
+                })
+                .expect("fixture task should queue");
+        }
+
+        assert!(
+            queue
+                .prioritize(&visible)
+                .expect("visible task should promote from spill")
+        );
+        for expected in [&visible, &background, &first_spilled] {
+            let task = queue
+                .take(&cancelled, &failed, &root_invalid)
+                .expect("queued task should dequeue")
+                .expect("queued task should exist");
+            assert_eq!(&task.path, expected);
+            queue.complete();
+        }
+    }
+
+    #[test]
+    fn requested_visible_task_promotes_when_it_is_discovered() {
+        let root = PathBuf::from("/scan-root");
+        let visible = root.join("visible");
+        let background = root.join("background");
+        let control = Arc::new(ScannerControl::new());
+        let (queue, _) = TaskQueue::new(
+            root.clone(),
+            1,
+            &TemporaryStorage::default(),
+            Arc::clone(&control),
+        )
+        .expect("scanner task queue should open");
+        let queue = Arc::new(queue);
+        control
+            .attach(&queue)
+            .expect("scanner control should attach to the queue");
+        let cancelled = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let root_invalid = AtomicBool::new(false);
+
+        queue
+            .take(&cancelled, &failed, &root_invalid)
+            .expect("root should dequeue")
+            .expect("root task should exist");
+        queue.complete();
+        control
+            .prioritize(&visible)
+            .expect("visible path should be remembered before discovery");
+        queue
+            .schedule(DirectoryTask {
+                path: background.clone(),
+                identity: None,
+            })
+            .expect("background task should queue");
+        queue
+            .schedule(DirectoryTask {
+                path: visible.clone(),
+                identity: None,
+            })
+            .expect("visible task should queue");
+
+        let next = queue
+            .take(&cancelled, &failed, &root_invalid)
+            .expect("visible task should dequeue")
+            .expect("visible task should exist");
+        assert_eq!(next.path, visible);
+        queue.complete();
+        let next = queue
+            .take(&cancelled, &failed, &root_invalid)
+            .expect("background task should dequeue")
+            .expect("background task should exist");
+        assert_eq!(next.path, background);
+        queue.complete();
+    }
 
     #[test]
     fn task_queue_rejects_corrupt_spill_paths_outside_root() {
         let root = PathBuf::from("/scan-root");
-        let (queue, _) = TaskQueue::new(root.clone(), 1, &TemporaryStorage::default())
-            .expect("scanner task queue should open");
+        let (queue, _) = TaskQueue::new(
+            root.clone(),
+            1,
+            &TemporaryStorage::default(),
+            Arc::new(ScannerControl::new()),
+        )
+        .expect("scanner task queue should open");
         let cancelled = AtomicBool::new(false);
         let failed = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
