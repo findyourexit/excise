@@ -172,7 +172,22 @@ impl ScannerHandle {
         &self,
         options: ScannerOptions,
     ) -> Result<(), ScannerRequestError> {
-        let cancelled = Arc::new(AtomicBool::new(false));
+        self.enqueue_rebuild(options, false)
+    }
+
+    pub(super) fn request_pre_cancelled_rebuild(
+        &self,
+        options: ScannerOptions,
+    ) -> Result<(), ScannerRequestError> {
+        self.enqueue_rebuild(options, true)
+    }
+
+    fn enqueue_rebuild(
+        &self,
+        options: ScannerOptions,
+        initially_cancelled: bool,
+    ) -> Result<(), ScannerRequestError> {
+        let cancelled = Arc::new(AtomicBool::new(initially_cancelled));
         let mut active = self
             .rebuild_cancellation
             .lock()
@@ -280,6 +295,15 @@ fn run_generation(
     service_cancelled: &AtomicBool,
     active_scheduler: &Mutex<Option<SchedulerHandle>>,
 ) {
+    if cancelled.load(Ordering::Acquire) {
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFinished { cancelled: true },
+            service_cancelled,
+        );
+        return;
+    }
+
     let command_capacity = options.threads.saturating_mul(BATCH_SIZE).max(1);
     let (commands, command_receiver) = bounded(command_capacity);
     let (focus, focus_receiver) = bounded(MAX_FOCUS_REQUESTS);

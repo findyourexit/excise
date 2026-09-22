@@ -4,7 +4,7 @@
 .SH NAME
 excise
 .SH SYNOPSIS
-\fBexcise\fR [\fB\-\-config\fR] [\fB\-a\fR|\fB\-\-apparent\-size\fR] [\fB\-\-scan\-threads\fR] [\fB\-\-event\-buffer\fR] [\fB\-\-cross\-filesystems\fR] [\fB\-\-exclude\fR] [\fB\-\-memory\-mib\fR] [\fB\-\-temporary\-storage\-mib\fR] [\fB\-\-scan\-store\-mib\fR] [\fB\-\-scan\-store\-dir\fR] [\fB\-\-reduced\-motion\fR] [\fB\-\-theme\fR] [\fB\-\-ascii\fR] [\fB\-\-mouse\fR] [\fB\-\-keymap\fR] [\fB\-\-format\fR] [\fB\-\-output\fR] [\fB\-d\fR|\fB\-\-disable\-delete\-confirmation\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIfolder\fR]
+\fBexcise\fR [\fB\-\-config\fR] [\fB\-a\fR|\fB\-\-apparent\-size\fR] [\fB\-\-scan\-threads\fR] [\fB\-\-event\-buffer\fR] [\fB\-\-cross\-filesystems\fR] [\fB\-\-exclude\fR] [\fB\-\-memory\-mib\fR] [\fB\-\-temporary\-storage\-mib\fR] [\fB\-\-scan\-store\-mib\fR] [\fB\-\-scan\-store\-dir\fR] [\fB\-\-scan\-store\-reserve\-mib\fR] [\fB\-\-reduced\-motion\fR] [\fB\-\-theme\fR] [\fB\-\-ascii\fR] [\fB\-\-mouse\fR] [\fB\-\-keymap\fR] [\fB\-\-format\fR] [\fB\-\-output\fR] [\fB\-d\fR|\fB\-\-disable\-delete\-confirmation\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIfolder\fR]
 .SH DESCRIPTION
 .SH OPTIONS
 .TP
@@ -37,6 +37,9 @@ Canonical scanner journal, scan\-run, and page\-index storage upper limit per se
 .TP
 \fB\-\-scan\-store\-dir\fR \fI<DIR>\fR
 Parent directory for the private canonical scan\-store session
+.TP
+\fB\-\-scan\-store\-reserve\-mib\fR \fI<MIB>\fR
+Scratch space preserved outside scan\-store files (default: 25% of free space)
 .TP
 \fB\-\-reduced\-motion\fR
 Disable nonessential motion

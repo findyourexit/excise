@@ -144,7 +144,7 @@ fn benchmark_scanner(c: &mut Criterion) {
     focus.measurement_time(Duration::from_secs(5));
     focus.bench_function("16-requests/4-workers", |bencher| {
         bencher.iter_batched_ref(
-            || FilesystemScanBenchmark::scanning(fixture.path(), 4),
+            || FilesystemScanBenchmark::ready_for_focus(fixture.path(), 4),
             |scan| black_box(scan.focus_latency(&focus_paths)),
             BatchSize::PerIteration,
         );

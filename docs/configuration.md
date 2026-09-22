@@ -28,9 +28,10 @@ exclusions = [".git/", "target/"]
 [model]
 process_memory_mib = 512
 temporary_storage_mib = 4096
-scan_store_mib = 4096
+# Omit these optional limits to use the adaptive scratch-space budget.
+# scan_store_mib = 8192
+# scan_store_reserve_mib = 4096
 scan_store_dir = "/var/tmp/excise"
-
 [runtime]
 reduced_motion = false
 theme = "excise-dark"
@@ -66,7 +67,8 @@ right = "d"
 | `scanner.exclusions` | Ordered gitignore-style patterns | An array of strings |
 | `model.process_memory_mib` | Whole-process memory limit | At least 128 MiB and no more than detected memory |
 | `model.temporary_storage_mib` | Directory-plan and deletion-result storage per session | At least 2 MiB |
-| `model.scan_store_mib` | Scanner journal, canonical scan-run, and page-index storage per session | At least 2 MiB; capped by free space on its scratch volume |
+| `model.scan_store_mib` | Optional upper bound for scanner journal, canonical scan runs, and page indexes | At least 2 MiB; capped by safe free space on its scratch volume |
+| `model.scan_store_reserve_mib` | Scratch space held outside scan-store files | At least 0 MiB; defaults to 25 percent of free scratch space |
 | `model.scan_store_dir` | Parent directory for a private canonical scan-store session | A writable path |
 | `runtime.reduced_motion` | Disable nonessential transitions | true or false |
 | `runtime.theme` | Built-in color theme | See `excise --help` for names |
@@ -78,7 +80,7 @@ right = "d"
 
 The default memory limit is 512 MiB or the detected available memory when that is lower. Excise reserves 25 percent as process headroom and limits working data to the remaining 75 percent.
 The interactive `t` picker previews these existing `runtime.theme` values without changing configuration. Pressing `Enter` immediately saves the selected theme for later TUI sessions, while `Esc` restores the original value without writing a preference.
-The default temporary-storage and scan-store limits are each 4 GiB per session. `model.temporary_storage_mib`, `EXCISE_TEMPORARY_STORAGE_MIB`, and `--temporary-storage-mib` bound directory deletion-plan and outcome records. `model.scan_store_mib`, `EXCISE_SCAN_STORE_MIB`, and `--scan-store-mib` set an upper bound for the scanner journal, canonical scan runs, and page index that publish direct-child pages; each session clamps that bound to the free space on the volume holding its private scan-store directory when it starts. `model.scan_store_dir`, `EXCISE_SCAN_STORE_DIR`, and `--scan-store-dir` select the parent of that private, auto-cleaned session directory containing the durable generation manifest. Both budgets grow only as their session needs them. Publication consumes each raw scan run into its compact page-query run rather than retaining duplicate full inventories.
+The default temporary-storage limit is 4 GiB per session. The default scan-store budget is adaptive: it uses the safe 75 percent share of free space on the selected scratch volume, preserving the remaining 25 percent for the user and other process needs. `model.scan_store_mib`, `EXCISE_SCAN_STORE_MIB`, and `--scan-store-mib` set an optional upper bound. `model.scan_store_reserve_mib`, `EXCISE_SCAN_STORE_RESERVE_MIB`, and `--scan-store-reserve-mib` replace the default scratch reserve; the effective budget still retains at least the minimum usable scan-store capacity when the volume permits it. `model.scan_store_dir`, `EXCISE_SCAN_STORE_DIR`, and `--scan-store-dir` select the parent of the private, auto-cleaned session directory containing the durable generation manifest. Both budgets grow only as their session needs them. Page publication consumes raw fact runs phase by phase and retains only its compact query indexes after publication.
 By default, Excise uses one less than the detected available processor count, clamped from one through eight workers, so interactive input retains a processor when possible.
 
 ## Environment Variables
@@ -95,6 +97,7 @@ By default, Excise uses one less than the detected available processor count, cl
 | `EXCISE_MEMORY_MIB` | `model.process_memory_mib` |
 | `EXCISE_TEMPORARY_STORAGE_MIB` | `model.temporary_storage_mib` |
 | `EXCISE_SCAN_STORE_MIB` | `model.scan_store_mib` |
+| `EXCISE_SCAN_STORE_RESERVE_MIB` | `model.scan_store_reserve_mib` |
 | `EXCISE_SCAN_STORE_DIR` | `model.scan_store_dir` |
 | `EXCISE_REDUCED_MOTION` | `runtime.reduced_motion` |
 | `EXCISE_THEME` | `runtime.theme` |
