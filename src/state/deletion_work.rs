@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::deletion::DeletionPlan;
 use crate::model::NodeId;
@@ -11,6 +12,8 @@ use super::FileToDelete;
 
 /// Interactive deletion retains only visible, independently cancellable work.
 pub(crate) const MAX_DELETION_WORK_ITEMS: usize = 4;
+/// Time a newly confirmed target takes to fill with its checker preparation pattern.
+pub(crate) const DELETION_CHECKER_COVER_DURATION: Duration = Duration::from_millis(600);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct DeletionWorkId(pub(crate) u64);
@@ -115,6 +118,7 @@ pub(crate) struct WorkRailItem<'a> {
     pub status: WorkRailStatus,
     pub planned_entries: Option<u64>,
     pub completed: Option<&'a AtomicU64>,
+    pub confirmed_at: Option<Duration>,
 }
 
 struct DeletionWorkItem {
@@ -125,6 +129,7 @@ struct DeletionWorkItem {
     target: Option<FileToDelete>,
     plan: Option<Box<DeletionPlan>>,
     stage: DeletionWorkStage,
+    confirmed_at: Option<Duration>,
 }
 
 enum DeletionWorkStage {
@@ -183,6 +188,7 @@ impl DeletionWork {
         target: FileToDelete,
         reduced_guardrails: bool,
         maximum_bytes: usize,
+        now: Duration,
     ) -> Result<DeletionWorkId, DeletionWorkError> {
         let path = target.full_path();
         let display_target = target.display_copy();
@@ -199,7 +205,12 @@ impl DeletionWork {
                 maximum_bytes,
             }
         };
-        self.enqueue(path, Some(display_target), stage)
+        self.enqueue(
+            path,
+            Some(display_target),
+            stage,
+            reduced_guardrails.then_some(now),
+        )
     }
 
     fn enqueue(
@@ -207,6 +218,7 @@ impl DeletionWork {
         path: PathBuf,
         target: Option<FileToDelete>,
         stage: DeletionWorkStage,
+        confirmed_at: Option<Duration>,
     ) -> Result<DeletionWorkId, DeletionWorkError> {
         if self.items.len() >= MAX_DELETION_WORK_ITEMS {
             return Err(DeletionWorkError::QueueFull);
@@ -226,6 +238,7 @@ impl DeletionWork {
             target,
             plan: None,
             stage,
+            confirmed_at,
         });
         Ok(id)
     }
@@ -424,6 +437,7 @@ impl DeletionWork {
         if item.path != target.full_path() {
             return false;
         }
+        item.confirmed_at = None;
         item.stage = DeletionWorkStage::AwaitingConfirmation {
             target,
             reduced_guardrails: *reduced_guardrails,
@@ -436,6 +450,7 @@ impl DeletionWork {
         &mut self,
         work_id: DeletionWorkId,
         target: Box<FileToDelete>,
+        now: Duration,
     ) -> bool {
         let Some(item) = self.items.iter_mut().find(|item| item.id == work_id) else {
             return false;
@@ -450,6 +465,7 @@ impl DeletionWork {
         if item.path != target.full_path() {
             return false;
         }
+        item.confirmed_at = Some(now);
         item.stage = DeletionWorkStage::QueuedPlanning {
             target,
             reduced_guardrails: *reduced_guardrails,
@@ -560,6 +576,22 @@ impl DeletionWork {
                 .items
                 .iter()
                 .any(|item| matches!(item.stage, DeletionWorkStage::Executing { .. }))
+    }
+
+    /// Whether a newly confirmed target still needs checker-pattern frames.
+    #[must_use]
+    pub(crate) fn has_checker_animation(&self, now: Duration) -> bool {
+        self.items.iter().any(|item| {
+            matches!(
+                item.stage,
+                DeletionWorkStage::QueuedPlanning { .. }
+                    | DeletionWorkStage::Planning
+                    | DeletionWorkStage::QueuedExecution
+                    | DeletionWorkStage::CancellingPlanning
+            ) && item.confirmed_at.is_some_and(|confirmed_at| {
+                now.saturating_sub(confirmed_at) < DELETION_CHECKER_COVER_DURATION
+            })
+        })
     }
 
     #[must_use]
@@ -695,6 +727,7 @@ fn work_rail_item(item: &DeletionWorkItem) -> WorkRailItem<'_> {
         status,
         planned_entries,
         completed,
+        confirmed_at: item.confirmed_at,
     }
 }
 
@@ -720,6 +753,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
 
     use crate::model::{EntrySnapshot, NodeId, NodeKind};
     use crate::state::tiles::FileType;
@@ -749,20 +783,20 @@ mod tests {
     #[test]
     fn queue_rejects_overlapping_targets_and_enforces_its_capacity() {
         let mut work = DeletionWork::new();
-        work.enqueue_confirmation(target(&["first"]), false, 1024)
+        work.enqueue_confirmation(target(&["first"]), false, 1024, Duration::ZERO)
             .expect("first target should fit");
         assert_eq!(
-            work.enqueue_confirmation(target(&["first", "child"]), false, 1024),
+            work.enqueue_confirmation(target(&["first", "child"]), false, 1024, Duration::ZERO),
             Err(DeletionWorkError::OverlappingTarget)
         );
-        work.enqueue_confirmation(target(&["second"]), false, 1024)
+        work.enqueue_confirmation(target(&["second"]), false, 1024, Duration::ZERO)
             .expect("second target should fit");
-        work.enqueue_confirmation(target(&["third"]), false, 1024)
+        work.enqueue_confirmation(target(&["third"]), false, 1024, Duration::ZERO)
             .expect("third target should fit");
-        work.enqueue_confirmation(target(&["fourth"]), false, 1024)
+        work.enqueue_confirmation(target(&["fourth"]), false, 1024, Duration::ZERO)
             .expect("fourth target should fit");
         assert_eq!(
-            work.enqueue_confirmation(target(&["fifth"]), false, 1024),
+            work.enqueue_confirmation(target(&["fifth"]), false, 1024, Duration::ZERO),
             Err(DeletionWorkError::QueueFull)
         );
     }
@@ -771,7 +805,7 @@ mod tests {
     fn cancellation_retains_the_planner_reservation_until_its_event_arrives() {
         let mut work = DeletionWork::new();
         let work_id = work
-            .enqueue_confirmation(target(&["first"]), true, 1024)
+            .enqueue_confirmation(target(&["first"]), true, 1024, Duration::ZERO)
             .expect("target should queue");
         let command = work
             .next_planning_command()
@@ -789,10 +823,10 @@ mod tests {
     fn planner_lane_can_start_a_later_nonoverlapping_request_while_execution_runs() {
         let mut work = DeletionWork::new();
         let first = work
-            .enqueue_confirmation(target(&["first"]), true, 1024)
+            .enqueue_confirmation(target(&["first"]), true, 1024, Duration::ZERO)
             .expect("first target should queue");
         let second = work
-            .enqueue_confirmation(target(&["second"]), true, 1024)
+            .enqueue_confirmation(target(&["second"]), true, 1024, Duration::ZERO)
             .expect("second target should queue");
         let first_command = work
             .next_planning_command()
@@ -825,7 +859,7 @@ mod tests {
         let target = target(&["first"]);
         let node_id = target.node_id;
         let work_id = work
-            .enqueue_confirmation(target, false, 1024)
+            .enqueue_confirmation(target, false, 1024, Duration::ZERO)
             .expect("confirmation should queue");
         assert!(work.next_planning_command().is_none());
         assert_eq!(
@@ -837,7 +871,7 @@ mod tests {
             .take_next_confirmation()
             .expect("target should surface before planning");
         assert_eq!(shown_id, work_id);
-        assert!(work.queue_confirmation(work_id, target));
+        assert!(work.queue_confirmation(work_id, target, Duration::ZERO));
         assert_eq!(
             work.status_for_node(node_id),
             Some(WorkRailStatus::Planning)
@@ -854,7 +888,7 @@ mod tests {
         let target = target(&["target"]);
         let node_id = target.node_id;
         let work_id = work
-            .enqueue_confirmation(target, true, 1024)
+            .enqueue_confirmation(target, true, 1024, Duration::ZERO)
             .expect("work should queue");
         let _ = work
             .next_planning_command()

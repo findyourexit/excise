@@ -1,11 +1,12 @@
 //! Perceptual colour construction for the storage map.
 //!
-//! Map tiles are coloured by size: hue runs along a heat ramp from the smallest
-//! entry in the folder to the largest, so colour says the same thing area does
-//! and both stay put while a scan fills the map in. Lightness and chroma come
-//! from the active theme's own focus accent, which keeps each theme's identity
-//! without a hand-authored palette per theme and keeps every entry inside one
-//! band, so no entry can out-shout its neighbours.
+//! Map tiles use a fixed absolute size scale: hue moves from blue through
+//! cyan, green, and yellow to red. Every view shares the same logarithmic
+//! byte landmarks, so an entry keeps its colour when its neighbours, folder,
+//! or scan progress change. Lightness and chroma come from the active theme's
+//! own focus accent, which keeps each theme's identity without a hand-authored
+//! palette per theme and keeps every entry inside one band, so no entry can
+//! out-shout its neighbours.
 //!
 //! Themes whose palette is not truecolour (monochrome, high contrast) return
 //! [`None`] from [`MapPalette::for_theme`]. Callers fall back to shading glyphs.
@@ -29,6 +30,14 @@ const HEAT_COLD_HUE: f32 = 0.72;
 /// The ramp runs downward from the cold end, so it passes cyan, green, and
 /// yellow on the way to red rather than travelling through magenta.
 const HEAT_HOT_HUE: f32 = 0.06;
+/// Sizes at or below this absolute footprint use the cool-blue endpoint.
+pub(crate) const SIZE_HEAT_COLD_BYTES: u128 = 4 * 1024;
+/// Sizes at or above this absolute footprint use the hot-red endpoint.
+pub(crate) const SIZE_HEAT_HOT_BYTES: u128 = 64 * 1024 * 1024 * 1024;
+/// `SIZE_HEAT_COLD_BYTES` is exactly $2^{12}$ bytes.
+const SIZE_HEAT_COLD_ORDER: u32 = 12;
+/// The fixed scale covers twenty-four binary orders, from 4 KiB to 64 GiB.
+const SIZE_HEAT_ORDER_SPAN: f32 = 24.0;
 /// Chroma at the hot end, relative to the band, so the entries worth acting on
 /// carry the strongest colour on the map.
 const HEAT_HOT_CHROMA: f32 = 1.4;
@@ -70,6 +79,27 @@ const BOUNDARY_SAMPLE_COUNT: u16 = 256;
 /// read as texture at a glance and small enough to stay behind every drawn
 /// entry, however much of the map the remainder covers.
 const GRAIN_LIFT: f32 = 0.06;
+
+/// Resolves an entry's current space measure onto the map's fixed heat band.
+///
+/// Values below 4 KiB stay blue and values at or above 64 GiB stay red. The
+/// intervening binary orders are evenly spaced, with a cheap interpolation
+/// inside each order so neighbouring byte sizes do not jump between colours.
+/// This is deliberately independent of the other entries in the current view.
+#[must_use]
+pub(crate) fn size_heat(size: u128) -> f32 {
+    if size <= SIZE_HEAT_COLD_BYTES {
+        return 0.0;
+    }
+    if size >= SIZE_HEAT_HOT_BYTES {
+        return 1.0;
+    }
+
+    let order = size.ilog2();
+    let order_base = 1_u128 << order;
+    let within_order = (size - order_base) as f32 / order_base as f32;
+    ((order - SIZE_HEAT_COLD_ORDER) as f32 + within_order) / SIZE_HEAT_ORDER_SPAN
+}
 
 /// A colour in Oklch: perceptual lightness, chroma, and hue measured in turns.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -459,12 +489,10 @@ impl MapPalette {
         contrast >= MIN_SELECTION_BOUNDARY_CONTRAST
     }
 
-    /// Places one entry on the heat ramp.
-    ///
-    /// `heat` is the entry's size measured against the largest entry drawn
-    /// beside it, so the ramp always spends its whole range on the folder in
-    /// front of the reader: the biggest entry is red and the smallest is blue
-    /// whether the folder holds two entries or two thousand.
+    /// `heat` comes from [`size_heat`], which maps the current space measure
+    /// onto fixed absolute byte landmarks. The same-sized entry therefore has
+    /// the same colour in every folder instead of becoming red merely because
+    /// it is the largest thing currently visible.
     #[must_use]
     pub fn tile(self, heat: f32, tone: TileTone) -> Oklch {
         let heat = heat.clamp(0.0, 1.0);
@@ -958,7 +986,26 @@ mod tests {
     }
 
     #[test]
-    fn the_ramp_runs_from_blue_at_the_bottom_to_red_at_the_top() {
+    fn fixed_size_heat_uses_absolute_binary_landmarks() {
+        for (size, expected_heat) in [
+            (0, 0.0),
+            (SIZE_HEAT_COLD_BYTES, 0.0),
+            (SIZE_HEAT_COLD_BYTES * 64, 0.25),
+            (SIZE_HEAT_COLD_BYTES * 4_096, 0.5),
+            (SIZE_HEAT_COLD_BYTES * 262_144, 0.75),
+            (SIZE_HEAT_HOT_BYTES, 1.0),
+            (SIZE_HEAT_HOT_BYTES * 2, 1.0),
+        ] {
+            assert!(
+                (size_heat(size) - expected_heat).abs() < f32::EPSILON,
+                "{size} bytes should have heat {expected_heat}, not {}",
+                size_heat(size)
+            );
+        }
+    }
+
+    #[test]
+    fn the_heat_ramp_runs_from_blue_to_red() {
         let palette = MapPalette::for_theme(Theme::for_id(ThemeId::CatppuccinMocha))
             .expect("mocha is truecolour");
         let Color::Rgb(cold_r, _, cold_b) = palette.tile(0.0, TileTone::Folder).to_color() else {
@@ -969,16 +1016,13 @@ mod tests {
         };
         assert!(
             cold_b > cold_r,
-            "the smallest entry reads blue: {cold_r},{cold_b}"
+            "the cool endpoint reads blue: {cold_r},{cold_b}"
         );
-        assert!(
-            hot_r > hot_b,
-            "the largest entry reads red: {hot_r},{hot_b}"
-        );
+        assert!(hot_r > hot_b, "the hot endpoint reads red: {hot_r},{hot_b}");
     }
 
     #[test]
-    fn every_step_up_in_size_moves_further_along_the_ramp() {
+    fn every_heat_step_moves_further_along_the_ramp() {
         let palette = MapPalette::for_theme(Theme::for_id(ThemeId::CatppuccinMocha))
             .expect("mocha is truecolour");
         let steps: Vec<Oklch> = (0..32)

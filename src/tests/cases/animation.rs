@@ -149,6 +149,23 @@ fn focus_activity_keeps_frames_until_focus_is_cleared() {
 }
 
 #[test]
+fn persistent_chrome_uses_a_bounded_frame_cadence() {
+    let area = Rect::new(0, 0, 20, 4);
+    let mut buffer = Buffer::empty(area);
+    let mut scheduler = AnimationScheduler::new(false, false, Duration::ZERO);
+
+    scheduler.set_activity_with_cadence(true, false);
+    assert_eq!(scheduler.next_frame_at(), Some(Duration::from_millis(125)));
+
+    scheduler.schedule_completion();
+    scheduler.process(Duration::ZERO, &mut buffer, area, area);
+    assert_eq!(
+        scheduler.next_frame_at(),
+        Some(crate::animation::ACTIVE_FRAME_INTERVAL)
+    );
+}
+
+#[test]
 fn suspended_activity_drains_finite_effects_and_resumes_normally() {
     let area = Rect::new(0, 0, 20, 4);
     let mut buffer = Buffer::empty(area);

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::Rect;
@@ -11,13 +12,16 @@ use unicode_width::UnicodeWidthStr as _;
 
 use crate::model::SyntheticKind;
 use crate::native_path::SafeDisplayPath;
-use crate::state::deletion_work::{DeletionWork, WorkRailItem, WorkRailStatus};
+use crate::state::DeletionDeparture;
+use crate::state::deletion_work::{
+    DELETION_CHECKER_COVER_DURATION, DeletionWork, WorkRailItem, WorkRailStatus,
+};
 use crate::state::tiles::{FileType, HALF_ROWS_PER_CELL, MapOverflow, Tile};
 use crate::theme::Theme;
 use crate::ui::format::{DisplaySize, display_os_str_info, truncate_marked, truncate_middle};
 use crate::ui::palette::{
     Emphasis, MapPalette, Oklch, TILE_BASE_DROP, TILE_CROWN_LIFT, TILE_EDGE_DROP, TileTone,
-    derived_for,
+    derived_for, size_heat,
 };
 
 /// Composite cell: the upper half takes the foreground colour, the lower half
@@ -65,6 +69,12 @@ pub struct MapLayout<'a> {
     pub scanning: bool,
     /// Deletion state for displayed identities, retained outside the map model.
     pub deletion_work: Option<&'a DeletionWork>,
+    /// A copied target that dissolves beneath the immediate incoming map reflow.
+    pub deletion_departure: Option<&'a DeletionDeparture>,
+    /// Wall-clock frame time used for deletion visual progression.
+    pub now: Duration,
+    /// Whether this surface can show non-essential deletion motion.
+    pub animate_deletion_checker: bool,
 }
 
 /// A densely tessellated treemap.
@@ -88,6 +98,9 @@ pub struct DenseRectangleGrid<'a> {
     show_empty_label: bool,
     scanning: bool,
     deletion_work: Option<&'a DeletionWork>,
+    deletion_departure: Option<&'a DeletionDeparture>,
+    now: Duration,
+    animate_deletion_checker: bool,
 }
 
 impl<'a> DenseRectangleGrid<'a> {
@@ -105,6 +118,9 @@ impl<'a> DenseRectangleGrid<'a> {
             show_empty_label: layout.show_empty_label,
             scanning: layout.scanning,
             deletion_work: layout.deletion_work,
+            deletion_departure: layout.deletion_departure,
+            now: layout.now,
+            animate_deletion_checker: layout.animate_deletion_checker,
         }
     }
 
@@ -130,10 +146,17 @@ impl<'a> DenseRectangleGrid<'a> {
         tile: &Tile,
         palette: MapPalette,
         emphasis: Emphasis,
-        scale: HeatScale,
         work_status: Option<WorkRailStatus>,
     ) -> TileInk {
-        TileInk::resolve(tile, self.theme, palette, emphasis, scale, work_status)
+        if self.is_deletion_departure(tile) {
+            return TileInk::departure(self.theme, palette);
+        }
+        TileInk::resolve(tile, self.theme, palette, emphasis, work_status)
+    }
+
+    fn is_deletion_departure(&self, tile: &Tile) -> bool {
+        self.deletion_departure
+            .is_some_and(|departure| departure.tile.node_id == tile.node_id)
     }
 
     fn work_item(&self, tile: &Tile) -> Option<WorkRailItem<'_>> {
@@ -142,7 +165,95 @@ impl<'a> DenseRectangleGrid<'a> {
     }
 
     fn work_status(&self, tile: &Tile) -> Option<WorkRailStatus> {
-        self.work_item(tile).map(|work| work.status)
+        (!self.is_deletion_departure(tile))
+            .then(|| self.work_item(tile))
+            .flatten()
+            .map(|work| work.status)
+    }
+
+    fn confirmation_checker_elapsed(&self, tile: &Tile) -> Option<Duration> {
+        if !self.animate_deletion_checker || self.transitioning || self.is_deletion_departure(tile)
+        {
+            return None;
+        }
+        let work = self.work_item(tile)?;
+        if !has_confirmation_checker_status(work.status) {
+            return None;
+        }
+        let confirmed_at = work.confirmed_at?;
+        Some(
+            self.now
+                .saturating_sub(confirmed_at)
+                .min(DELETION_CHECKER_COVER_DURATION),
+        )
+    }
+
+    fn draw_composited_confirmation_checkers(
+        &self,
+        buffer: &mut Buffer,
+        area: Rect,
+        palette: MapPalette,
+        selected_last: Option<usize>,
+    ) {
+        for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
+            let Some(elapsed) = self.confirmation_checker_elapsed(tile) else {
+                continue;
+            };
+            let checker = palette
+                .emphasised(palette.semantic(self.theme.focus), self.emphasis(index))
+                .to_color();
+            paint_confirmation_checker(buffer, area, tile, elapsed, checker);
+        }
+    }
+
+    fn draw_composited_execution_progress(
+        &self,
+        buffer: &mut Buffer,
+        area: Rect,
+        palette: MapPalette,
+        selected_last: Option<usize>,
+    ) {
+        let muted = palette
+            .emphasised(
+                palette.semantic(self.theme.text_muted),
+                Emphasis::Unselected,
+            )
+            .to_color();
+        for (_, tile) in tile_paint_order(self.rectangles, selected_last) {
+            let Some(progress) = self.work_item(tile).and_then(execution_progress) else {
+                continue;
+            };
+            paint_execution_progress(buffer, area, tile, progress, muted);
+        }
+    }
+
+    fn draw_composited_deletion_departure(
+        &self,
+        buffer: &mut Buffer,
+        area: Rect,
+        palette: MapPalette,
+    ) {
+        let Some(departure) = self.deletion_departure else {
+            return;
+        };
+        let tile = &departure.tile;
+        let ink = TileInk::departure(self.theme, palette);
+        paint_tile(buffer, area, tile, &ink);
+        if !self.animate_deletion_checker {
+            return;
+        }
+        let Some(effect_area) = departure_effect_area(area, tile) else {
+            return;
+        };
+        let backdrop = palette.backdrop();
+        crate::animation::dissolve_deletion_departure(
+            self.now,
+            departure.started_at,
+            departure.duration,
+            buffer,
+            effect_area,
+            Style::default().fg(backdrop).bg(backdrop),
+        );
     }
 
     fn draw_composited_work_indicators(
@@ -150,23 +261,19 @@ impl<'a> DenseRectangleGrid<'a> {
         buffer: &mut Buffer,
         area: Rect,
         palette: MapPalette,
-        scale: HeatScale,
         selected_last: Option<usize>,
     ) {
         if self.transitioning {
             return;
         }
         for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
+            if self.is_deletion_departure(tile) {
+                continue;
+            }
             let Some(work) = self.work_item(tile) else {
                 continue;
             };
-            let ink = self.ink(
-                tile,
-                palette,
-                self.emphasis(index),
-                scale,
-                Some(work.status),
-            );
+            let ink = self.ink(tile, palette, self.emphasis(index), Some(work.status));
             let style = Style::default()
                 .fg(ink.text)
                 .bg(ink.fill)
@@ -186,6 +293,9 @@ impl<'a> DenseRectangleGrid<'a> {
             return;
         }
         for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
+            if self.is_deletion_departure(tile) {
+                continue;
+            }
             let Some(work) = self.work_item(tile) else {
                 continue;
             };
@@ -225,42 +335,29 @@ impl<'a> DenseRectangleGrid<'a> {
                 .set_symbol(HALF_CELL)
                 .set_style(Style::default().fg(backdrop).bg(backdrop));
         }
+        self.draw_composited_deletion_departure(buffer, area, palette);
 
         // The folder being left sits beneath the incoming layout. While geometry
         // moves, walk the same stack from front to back and rasterize only each
         // tile's exposed half-rows. That has the normal paint result without
         // repainting a pivot once for every child that starts inside it.
-        let departing_scale = HeatScale::for_ramp_tiles(self.departing);
-        let scale = HeatScale::for_ramp_tiles(self.rectangles);
         if self.transitioning {
             let mut covered = HalfRowCoverage::new();
             for (index, tile) in tile_paint_order(self.rectangles, selected_last).rev() {
-                let ink = self.ink(
-                    tile,
-                    palette,
-                    self.emphasis(index),
-                    scale,
-                    self.work_status(tile),
-                );
+                let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
                 paint_visible_tile(buffer, area, tile, &ink, &mut covered);
             }
             for tile in self.departing.iter().rev() {
-                let ink = self.ink(tile, palette, Emphasis::Unselected, departing_scale, None);
+                let ink = self.ink(tile, palette, Emphasis::Unselected, None);
                 paint_visible_tile(buffer, area, tile, &ink, &mut covered);
             }
         } else {
             for tile in self.departing {
-                let ink = self.ink(tile, palette, Emphasis::Unselected, departing_scale, None);
+                let ink = self.ink(tile, palette, Emphasis::Unselected, None);
                 paint_tile(buffer, area, tile, &ink);
             }
             for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
-                let ink = self.ink(
-                    tile,
-                    palette,
-                    self.emphasis(index),
-                    scale,
-                    self.work_status(tile),
-                );
+                let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
                 paint_tile(buffer, area, tile, &ink);
             }
         }
@@ -269,8 +366,13 @@ impl<'a> DenseRectangleGrid<'a> {
             .overflow
             .and_then(|overflow| overflow_region(area, overflow));
         collapse_flat_cells(buffer, area, overflow_area, palette.grain(), backdrop);
+        self.draw_composited_confirmation_checkers(buffer, area, palette, selected_last);
+        self.draw_composited_execution_progress(buffer, area, palette, selected_last);
 
         for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
+            if self.is_deletion_departure(tile) {
+                continue;
+            }
             if label_occlusions.is_some_and(|occlusions| occlusions[index]) {
                 continue;
             }
@@ -278,24 +380,12 @@ impl<'a> DenseRectangleGrid<'a> {
                 let Some(label) = labels[index].as_ref() else {
                     continue;
                 };
-                let ink = self.ink(
-                    tile,
-                    palette,
-                    self.emphasis(index),
-                    scale,
-                    self.work_status(tile),
-                );
+                let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
                 draw_prepared_tile_label(
                     buffer, area, tile, label, ink.fill, ink.text, ink.detail, false,
                 );
             } else {
-                let ink = self.ink(
-                    tile,
-                    palette,
-                    self.emphasis(index),
-                    scale,
-                    self.work_status(tile),
-                );
+                let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
                 draw_tile_label(
                     buffer, area, tile, ink.fill, ink.text, ink.detail, self.ascii, false,
                 );
@@ -314,7 +404,7 @@ impl<'a> DenseRectangleGrid<'a> {
                 self.ascii,
             );
         }
-        self.draw_composited_work_indicators(buffer, area, palette, scale, selected_last);
+        self.draw_composited_work_indicators(buffer, area, palette, selected_last);
     }
 
     /// Fallback for monochrome, high-contrast, and ASCII presentation, where a
@@ -344,36 +434,26 @@ impl<'a> DenseRectangleGrid<'a> {
             surface,
             text: self.theme.text_primary,
         };
-        // Density stands in for hue here, and it carries the same meaning: the
-        // larger the entry, the more solid its shading. Unlike the chromatic
-        // ramp, density has no semantic-state role, so every tile stays in its fit.
-        // Departing entries are fitted separately so the incoming layout does not jump.
-        let departing_scale = HeatScale::for_tiles(self.departing);
-        let scale = HeatScale::for_tiles(self.rectangles);
+        // Density preserves the same absolute size landmarks as the colour ramp:
+        // larger entries receive a more solid shade in every view. Unlike the
+        // chromatic ramp, density has no semantic-state role, so every tile
+        // stays in its fit.
         if self.transitioning {
             let mut covered = TerminalRowCoverage::new();
             for (index, tile) in tile_paint_order(self.rectangles, selected_last).rev() {
                 let selected = self.selected_rect_index == Some(index);
-                paint_visible_shaded_tile(buffer, area, tile, ink, selected, scale, &mut covered);
+                paint_visible_shaded_tile(buffer, area, tile, ink, selected, &mut covered);
             }
             for tile in self.departing.iter().rev() {
-                paint_visible_shaded_tile(
-                    buffer,
-                    area,
-                    tile,
-                    ink,
-                    false,
-                    departing_scale,
-                    &mut covered,
-                );
+                paint_visible_shaded_tile(buffer, area, tile, ink, false, &mut covered);
             }
         } else {
             for tile in self.departing {
-                paint_shaded_tile(buffer, area, tile, ink, false, departing_scale);
+                paint_shaded_tile(buffer, area, tile, ink, false);
             }
             for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
                 let selected = self.selected_rect_index == Some(index);
-                paint_shaded_tile(buffer, area, tile, ink, selected, scale);
+                paint_shaded_tile(buffer, area, tile, ink, selected);
             }
         }
         let overflow_area = self
@@ -396,6 +476,9 @@ impl<'a> DenseRectangleGrid<'a> {
         let text = self.theme.text_primary;
         let detail = self.theme.text_secondary;
         for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
+            if self.is_deletion_departure(tile) {
+                continue;
+            }
             if label_occlusions.is_some_and(|occlusions| occlusions[index]) {
                 continue;
             }
@@ -452,8 +535,28 @@ impl<'a> DenseRectangleGrid<'a> {
                 self.ascii,
             );
         }
+
         self.draw_shaded_work_indicators(buffer, area, surface, selected_last);
     }
+}
+
+fn has_confirmation_checker_status(status: WorkRailStatus) -> bool {
+    matches!(status, WorkRailStatus::Planning | WorkRailStatus::Queued)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutionProgress {
+    completed: u64,
+    planned: u64,
+}
+
+fn execution_progress(work: WorkRailItem<'_>) -> Option<ExecutionProgress> {
+    if work.status != WorkRailStatus::Executing {
+        return None;
+    }
+    let planned = work.planned_entries?;
+    let completed = work.completed?.load(Ordering::Acquire).min(planned);
+    (planned > 0).then_some(ExecutionProgress { completed, planned })
 }
 
 fn draw_work_indicator(
@@ -562,7 +665,11 @@ impl Widget for DenseRectangleGrid<'_> {
         // Entries that never earned a cell still exist: only a folder with
         // nothing in it at all may say so, or the map calls thousands of small
         // files an empty directory.
-        if self.rectangles.is_empty() && self.departing.is_empty() && self.overflow.is_none() {
+        if self.rectangles.is_empty()
+            && self.departing.is_empty()
+            && self.deletion_departure.is_none()
+            && self.overflow.is_none()
+        {
             draw_empty_surface(
                 buffer,
                 area,
@@ -633,7 +740,6 @@ impl TileInk {
         theme: Theme,
         palette: MapPalette,
         emphasis: Emphasis,
-        scale: HeatScale,
         work_status: Option<WorkRailStatus>,
     ) -> Self {
         let tone = match tile.file_type {
@@ -643,11 +749,11 @@ impl TileInk {
         let resting = if let Some(status) = work_status {
             palette.semantic(work_status_color(theme, status))
         } else if is_ramp_eligible(tile) {
-            palette.tile(scale.of(tile.size), tone)
+            palette.tile(size_heat(tile.size), tone)
         } else if is_virtual_summary(tile) {
             // `Other` and `Shared` represent totals rather than a filesystem
-            // object. Keep them deliberately quiet, including when a pointer
-            // passes over their geometry.
+            // object. Keep them quiet at rest; selection still lifts a grouped
+            // total clearly out of the map.
             palette.semantic(theme.text_muted)
         } else if tile.uncertain {
             palette.semantic(theme.state_uncertain)
@@ -679,6 +785,20 @@ impl TileInk {
             detail,
         }
     }
+
+    fn departure(theme: Theme, palette: MapPalette) -> Self {
+        let resting = palette.emphasised(palette.semantic(theme.text_muted), Emphasis::Unselected);
+        let (text, detail) = resting.inks();
+        let fill = resting.to_color();
+        Self {
+            fill,
+            crown: resting.shifted(CROWN_LIFT, 1.0).to_color(),
+            base: resting.shifted(-BASE_DROP, 1.0).to_color(),
+            edge: resting.shifted(-EDGE_DROP, 1.0).to_color(),
+            text,
+            detail,
+        }
+    }
 }
 
 fn work_status_color(theme: Theme, status: WorkRailStatus) -> Color {
@@ -701,79 +821,6 @@ fn selected_bevel_face(tone: Oklch, fill: Color, offset: f32) -> Color {
     } else {
         face
     }
-}
-
-/// The ramp fitted to one folder: where each entry sits between the smallest
-/// and the largest thing drawn beside it.
-///
-/// Sizes are heavy-tailed. One entry routinely holds more than everything
-/// around it put together, so positions are taken in log space. Measuring
-/// against both ends rather than the largest alone means the whole ramp is
-/// spent on the folder in front of the reader instead of collapsing into the
-/// cold end whenever one entry dominates.
-#[derive(Clone, Copy)]
-struct HeatScale {
-    coldest: f32,
-    span: f32,
-}
-
-impl HeatScale {
-    /// Nothing to compare, so a lone entry or a folder of one size rests in
-    /// the middle of the ramp rather than claiming either extreme.
-    const NEUTRAL: f32 = 0.5;
-
-    fn neutral() -> Self {
-        Self {
-            coldest: 0.0,
-            span: 0.0,
-        }
-    }
-
-    fn for_tiles(tiles: &[Tile]) -> Self {
-        Self::for_sizes(tiles.iter().map(|tile| tile.size))
-    }
-
-    fn for_ramp_tiles(tiles: &[Tile]) -> Self {
-        Self::for_sizes(
-            tiles
-                .iter()
-                .filter(|tile| is_ramp_eligible(tile))
-                .map(|tile| tile.size),
-        )
-    }
-
-    fn for_sizes(sizes: impl Iterator<Item = u128>) -> Self {
-        let mut positions = sizes.map(log_size);
-        let Some(first) = positions.next() else {
-            return Self::neutral();
-        };
-        let mut coldest = first;
-        let mut hottest = first;
-        for position in positions {
-            coldest = coldest.min(position);
-            hottest = hottest.max(position);
-        }
-        Self {
-            coldest,
-            span: hottest - coldest,
-        }
-    }
-
-    fn of(self, size: u128) -> f32 {
-        if self.span <= f32::EPSILON {
-            // One comparable entry, or several equal ones, genuinely has no
-            // ordering to express and deliberately rests at the ramp midpoint.
-            return Self::NEUTRAL;
-        }
-        ((log_size(size) - self.coldest) / self.span).clamp(0.0, 1.0)
-    }
-}
-
-/// Makes the zero-byte endpoint finite while keeping it distinct from one byte.
-/// The neutral branch above is therefore reserved for equal comparable sizes,
-/// not for a logarithm that happened to merge two different entries.
-fn log_size(size: u128) -> f32 {
-    (size as f64).ln_1p() as f32
 }
 
 /// The presentation a shaded frame shares across every entry, resolved once so
@@ -916,14 +963,13 @@ fn paint_shaded_tile(
     tile: &Tile,
     ink: ShadedInk<'_>,
     selected: bool,
-    scale: HeatScale,
 ) {
     let fill = if selected && ink.surface == Color::Reset {
         MONOCHROME_SELECTED_SHADE
     } else if selected {
         ink.shades[3]
     } else {
-        ink.shades[shade_index(scale, tile.size)]
+        ink.shades[shade_index(tile.size)]
     };
     let left = tile.x.max(area.x);
     let right = tile.x.saturating_add(tile.width).min(area.right());
@@ -954,7 +1000,6 @@ fn paint_visible_shaded_tile(
     tile: &Tile,
     ink: ShadedInk<'_>,
     selected: bool,
-    scale: HeatScale,
     covered: &mut TerminalRowCoverage,
 ) -> bool {
     let fill = if selected && ink.surface == Color::Reset {
@@ -962,7 +1007,7 @@ fn paint_visible_shaded_tile(
     } else if selected {
         ink.shades[3]
     } else {
-        ink.shades[shade_index(scale, tile.size)]
+        ink.shades[shade_index(tile.size)]
     };
     let style = shaded_tile_style(ink, selected);
     let left = tile.x.max(area.x);
@@ -1023,8 +1068,8 @@ fn shaded_fill_symbol<'a>(
     }
 }
 
-fn shade_index(scale: HeatScale, size: u128) -> usize {
-    match scale.of(size) {
+fn shade_index(size: u128) -> usize {
+    match size_heat(size) {
         heat if heat < 0.25 => 0,
         heat if heat < 0.5 => 1,
         heat if heat < 0.75 => 2,
@@ -1047,6 +1092,132 @@ fn paint_half(buffer: &mut Buffer, x: u16, y: u16, upper: bool, colour: Color) {
     } else {
         cell.bg = colour;
     }
+}
+
+/// Reveals every other interior half-block in diagonal order without allocating.
+/// Labels are painted later, so their text remains a stable foreground over the motion.
+fn paint_confirmation_checker(
+    buffer: &mut Buffer,
+    area: Rect,
+    tile: &Tile,
+    elapsed: Duration,
+    checker: Color,
+) {
+    if tile.width <= 2 || tile.height <= 2 {
+        return;
+    }
+    let half_rows = u32::from(HALF_ROWS_PER_CELL);
+    let left = tile.x.saturating_add(1).max(area.x);
+    let right = tile
+        .x
+        .saturating_add(tile.width)
+        .saturating_sub(1)
+        .min(area.right());
+    let first = tile
+        .y
+        .saturating_add(1)
+        .max(u32::from(area.y).saturating_mul(half_rows));
+    let last = tile
+        .y
+        .saturating_add(tile.height)
+        .saturating_sub(1)
+        .min(area_bottom_half_row(area));
+    if left >= right || first >= last {
+        return;
+    }
+    let maximum_diagonal = u32::from(tile.width.saturating_sub(2))
+        .saturating_add(tile.height.saturating_sub(2))
+        .saturating_sub(2);
+    let elapsed = elapsed
+        .as_millis()
+        .min(DELETION_CHECKER_COVER_DURATION.as_millis());
+    let duration = DELETION_CHECKER_COVER_DURATION.as_millis();
+    let diagonal_count = u128::from(maximum_diagonal).saturating_add(1);
+    for half in first..last {
+        let Ok(y) = u16::try_from(half / half_rows) else {
+            continue;
+        };
+        let row = half.saturating_sub(tile.y.saturating_add(1));
+        for x in left..right {
+            let column = u32::from(x.saturating_sub(tile.x.saturating_add(1)));
+            let diagonal = column.saturating_add(row);
+            if diagonal & 1 != 0
+                || u128::from(diagonal).saturating_mul(duration)
+                    >= elapsed.saturating_mul(diagonal_count)
+            {
+                continue;
+            }
+            paint_half(buffer, x, y, half % half_rows == 0, checker);
+        }
+    }
+}
+
+/// Ordered dither ranks distribute determinate deletion progress across a tile.
+const EXECUTION_PROGRESS_DITHER: [u8; 64] = [
+    0, 48, 12, 60, 3, 51, 15, 63, 32, 16, 44, 28, 35, 19, 47, 31, 8, 56, 4, 52, 11, 59, 7, 55, 40,
+    24, 36, 20, 43, 27, 39, 23, 2, 50, 14, 62, 1, 49, 13, 61, 34, 18, 46, 30, 33, 17, 45, 29, 10,
+    58, 6, 54, 9, 57, 5, 53, 42, 26, 38, 22, 41, 25, 37, 21,
+];
+
+/// Dulls a stable fraction of a target's half-blocks as entries complete.
+fn paint_execution_progress(
+    buffer: &mut Buffer,
+    area: Rect,
+    tile: &Tile,
+    progress: ExecutionProgress,
+    muted: Color,
+) -> usize {
+    if progress.completed == 0 || tile.width <= 2 || tile.height <= 2 {
+        return 0;
+    }
+    let half_rows = u32::from(HALF_ROWS_PER_CELL);
+    let left = tile.x.saturating_add(1).max(area.x);
+    let right = tile
+        .x
+        .saturating_add(tile.width)
+        .saturating_sub(1)
+        .min(area.right());
+    let first = tile
+        .y
+        .saturating_add(1)
+        .max(u32::from(area.y).saturating_mul(half_rows));
+    let last = tile
+        .y
+        .saturating_add(tile.height)
+        .saturating_sub(1)
+        .min(area_bottom_half_row(area));
+    if left >= right || first >= last {
+        return 0;
+    }
+    let threshold = u128::from(progress.completed).saturating_mul(64);
+    let denominator = u128::from(progress.planned);
+    let mut painted = 0_usize;
+    for half in first..last {
+        let Ok(y) = u16::try_from(half / half_rows) else {
+            continue;
+        };
+        let row = half.saturating_sub(tile.y.saturating_add(1));
+        for x in left..right {
+            let column = u32::from(x.saturating_sub(tile.x.saturating_add(1)));
+            let index = usize::try_from((row & 7) * 8 + (column & 7)).unwrap_or(0);
+            let rank = u128::from(EXECUTION_PROGRESS_DITHER[index]);
+            if rank.saturating_mul(denominator) >= threshold {
+                continue;
+            }
+            paint_half(buffer, x, y, half % half_rows == 0, muted);
+            painted = painted.saturating_add(1);
+        }
+    }
+    painted
+}
+
+/// The cell-aligned region a pre-reflow departure may safely dissolve.
+fn departure_effect_area(area: Rect, tile: &Tile) -> Option<Rect> {
+    let left = tile.x.max(area.x);
+    let right = tile.x.saturating_add(tile.width).min(area.right());
+    let top = u16::try_from(tile.top_row()).ok()?.max(area.y);
+    let bottom = u16::try_from(tile.bottom_row()).ok()?.min(area.bottom());
+    (left < right && top < bottom).then(|| Rect::new(left, top, right - left, bottom - top))
 }
 
 fn paint_tile(buffer: &mut Buffer, area: Rect, tile: &Tile, ink: &TileInk) {
@@ -1439,6 +1610,13 @@ fn tile_label(tile: &Tile, ascii: bool) -> Option<TileLabel> {
             detail
                 .filter(|value| value.width() <= usize::from(max_width))
                 .unwrap_or(folder)
+        }
+        FileType::Synthetic if tile.synthetic_kind == Some(SyntheticKind::Other) => {
+            let grouped = tile.descendants.map_or_else(
+                || "Grouped items".to_string(),
+                |count| format!("Grouped ({count})"),
+            );
+            format!("[{grouped}]")
         }
         FileType::Synthetic => format!("[{}]", name.text),
     };
@@ -1838,6 +2016,7 @@ fn draw_empty_surface(
 mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
@@ -1850,8 +2029,8 @@ mod tests {
 
     use super::*;
 
-    /// Entries are sized from their node id so that a fixture of several tiles
-    /// spans the heat ramp the way a real folder does.
+    /// Defaults are deliberately small; individual tests assign byte sizes for
+    /// the fixed absolute heat landmarks they need to exercise.
     fn tile(x: u16, y: u32, width: u16, height: u32, node_id: u32) -> Tile {
         Tile {
             x,
@@ -1919,6 +2098,9 @@ mod tests {
                 show_empty_label: true,
                 deletion_work: None,
                 scanning: false,
+                deletion_departure: None,
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
             },
             Theme::for_id(theme),
             ascii,
@@ -1950,6 +2132,9 @@ mod tests {
                 show_empty_label: true,
                 deletion_work: None,
                 scanning: false,
+                deletion_departure: None,
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
             },
             Theme::for_id(theme),
             ascii,
@@ -2025,6 +2210,9 @@ mod tests {
                 show_empty_label: true,
                 deletion_work: None,
                 scanning: false,
+                deletion_departure: None,
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -2194,6 +2382,17 @@ mod tests {
         let label = tile_label(&entry, true).expect("an eight-column tile can carry a label");
         assert!(label.first.starts_with(">="));
         assert!(label.first.cell_width() <= 6);
+    }
+
+    #[test]
+    fn grouped_summary_labels_disclose_contained_items() {
+        let mut grouped = tile(0, 0, 20, 4, 1);
+        grouped.file_type = FileType::Synthetic;
+        grouped.synthetic_kind = Some(crate::model::SyntheticKind::Other);
+        grouped.descendants = Some(12);
+
+        let label = tile_label(&grouped, false).expect("grouped tile should have a label");
+        assert_eq!(label.first, "[Grouped (12)]");
     }
 
     #[test]
@@ -2385,70 +2584,66 @@ mod tests {
     }
 
     #[test]
-    fn the_ramp_is_spent_on_the_folder_in_front_of_the_reader() {
-        // One entry dwarfs the rest: the small ones must still separate from
-        // each other rather than collapsing into one cold colour.
-        let mut giant = tile(0, 0, 4, 4, 1);
-        let mut middle = tile(4, 0, 2, 4, 2);
-        let mut small = tile(6, 0, 2, 4, 3);
-        giant.size = 64 * 1_048_576;
-        middle.size = 32_768;
-        small.size = 4_096;
+    fn same_absolute_size_has_the_same_colour_in_every_map_view() {
+        let mut target = tile(0, 0, 4, 4, 1);
+        target.size = 1_073_741_824;
+        let mut tiny_neighbour = tile(4, 0, 4, 4, 2);
+        tiny_neighbour.size = 4_096;
+        let mut huge_neighbour = tile(4, 0, 4, 4, 3);
+        huge_neighbour.size = 68_719_476_736;
         let area = Rect::new(0, 0, 8, 2);
-        let buffer = render(
-            &[giant, middle, small],
+
+        let alongside_tiny = render(
+            &[target.clone(), tiny_neighbour],
             area,
             None,
             ThemeId::CatppuccinMocha,
             false,
         );
-        let hot = Oklch::from_color(buffer[(1, 0)].bg).expect("map ink is truecolour");
-        let warm = Oklch::from_color(buffer[(4, 0)].bg).expect("map ink is truecolour");
-        let cold = Oklch::from_color(buffer[(6, 0)].bg).expect("map ink is truecolour");
-        assert!(
-            hot.hue < warm.hue && warm.hue < cold.hue,
-            "the ramp must stay ordered: {} {} {}",
-            hot.hue,
-            warm.hue,
-            cold.hue
+        let alongside_huge = render(
+            &[target, huge_neighbour],
+            area,
+            None,
+            ThemeId::CatppuccinMocha,
+            false,
         );
-        assert!(
-            cold.hue - hot.hue > 0.4,
-            "a folder that spans four orders of magnitude spends the ramp: {} to {}",
-            hot.hue,
-            cold.hue
+
+        assert_eq!(
+            alongside_tiny[(1, 0)].bg,
+            alongside_huge[(1, 0)].bg,
+            "one GiB must keep its colour regardless of its visible neighbours"
         );
     }
 
     #[test]
-    fn a_folder_of_one_size_claims_neither_end_of_the_ramp() {
-        let mut tiles = [tile(0, 0, 4, 4, 1), tile(4, 0, 4, 4, 2)];
-        for entry in &mut tiles {
-            entry.size = 8_192;
-        }
-        let scale = HeatScale::for_tiles(&tiles);
-        for entry in &tiles {
-            assert!(
-                (scale.of(entry.size) - HeatScale::NEUTRAL).abs() < f32::EPSILON,
-                "nothing to compare against must read as neutral"
-            );
-        }
-    }
+    fn same_absolute_size_has_the_same_density_in_every_monochrome_map_view() {
+        let mut target = tile(0, 0, 4, 4, 1);
+        target.size = 1_073_741_824;
+        let mut tiny_neighbour = tile(4, 0, 4, 4, 2);
+        tiny_neighbour.size = 4_096;
+        let mut huge_neighbour = tile(4, 0, 4, 4, 3);
+        huge_neighbour.size = 68_719_476_736;
+        let area = Rect::new(0, 0, 8, 2);
 
-    #[test]
-    fn zero_and_one_byte_entries_claim_distinct_ramp_ends() {
-        let mut zero = tile(0, 0, 4, 4, 1);
-        zero.size = 0;
-        let mut one = tile(4, 0, 4, 4, 2);
-        one.size = 1;
-        let scale = HeatScale::for_tiles(&[zero.clone(), one.clone()]);
-        assert!(
-            scale.of(zero.size) < 0.000_1,
-            "zero bytes must remain the cold endpoint"
+        let alongside_tiny = render(
+            &[target.clone(), tiny_neighbour],
+            area,
+            None,
+            ThemeId::Monochrome,
+            false,
         );
-        assert!(
-            (scale.of(one.size) - 1.0).abs() < 0.000_1,
-            "one byte must remain the hot endpoint"
+        let alongside_huge = render(
+            &[target, huge_neighbour],
+            area,
+            None,
+            ThemeId::Monochrome,
+            false,
+        );
+
+        assert_eq!(
+            alongside_tiny[(1, 1)].symbol(),
+            alongside_huge[(1, 1)].symbol(),
+            "one GiB must keep its density regardless of its visible neighbours"
         );
     }
 
@@ -2474,9 +2669,8 @@ mod tests {
         let Some(palette) = crate::ui::palette::derived_for(theme).1 else {
             panic!("the Catppuccin fixture needs a truecolour palette");
         };
-        let scale = HeatScale::for_tiles(&[cold.clone(), hot.clone()]);
-        let expected_cold = TileInk::resolve(&cold, theme, palette, Emphasis::Resting, scale, None);
-        let expected_hot = TileInk::resolve(&hot, theme, palette, Emphasis::Resting, scale, None);
+        let expected_cold = TileInk::resolve(&cold, theme, palette, Emphasis::Resting, None);
+        let expected_hot = TileInk::resolve(&hot, theme, palette, Emphasis::Resting, None);
         assert_eq!(
             buffer[(1, 1)].bg,
             expected_cold.fill,
@@ -2500,9 +2694,8 @@ mod tests {
                 entry
             })
             .collect();
-        let scale = HeatScale::for_tiles(&tiles);
         for entry in &tiles {
-            let ink = TileInk::resolve(entry, theme, palette, Emphasis::Resting, scale, None);
+            let ink = TileInk::resolve(entry, theme, palette, Emphasis::Resting, None);
             assert_ne!(ink.fill, theme.text_danger);
             assert_ne!(ink.fill, theme.surface_danger);
         }
@@ -2582,14 +2775,7 @@ mod tests {
         let palette = MapPalette::for_theme(theme).expect("mocha is truecolour");
         let buffer = render(&tiles, area, None, ThemeId::CatppuccinMocha, false);
         for tile in &tiles {
-            let ink = TileInk::resolve(
-                tile,
-                theme,
-                palette,
-                Emphasis::Resting,
-                HeatScale::for_tiles(&tiles),
-                None,
-            );
+            let ink = TileInk::resolve(tile, theme, palette, Emphasis::Resting, None);
             assert_eq!(
                 buffer[(tile.x + 2, 1)].bg,
                 ink.fill,
@@ -2600,11 +2786,13 @@ mod tests {
 
     #[test]
     fn dimming_keeps_the_hue_that_tells_two_entries_apart() {
-        let tiles = [
+        let mut tiles = [
             tile(0, 0, 4, 6, 1),
             tile(4, 0, 4, 6, 2),
             tile(8, 0, 4, 6, 3),
         ];
+        tiles[1].size = 16 * 1_048_576;
+        tiles[2].size = 1_073_741_824;
         let area = Rect::new(0, 0, 12, 3);
         let selected = render(&tiles, area, Some(0), ThemeId::CatppuccinMocha, false);
         assert_ne!(
@@ -2690,9 +2878,9 @@ mod tests {
     fn shaded_transition_keeps_departing_tiles_visible() {
         let departing = [tile(0, 0, 8, 4, 1)];
         let area = Rect::new(0, 0, 8, 2);
-        for (presentation, ascii, monochrome, shade) in [
-            ("ASCII", true, false, "+"),
-            ("monochrome", false, true, "▓"),
+        for (presentation, ascii, monochrome, shades) in [
+            ("ASCII", true, false, &ASCII_SHADES[..]),
+            ("monochrome", false, true, &SHADES[..]),
         ] {
             let rendered = text_of(&render_transitioning(
                 &[],
@@ -2704,7 +2892,7 @@ mod tests {
                 monochrome,
             ));
             assert!(
-                rendered.contains(shade),
+                shades.iter().any(|shade| rendered.contains(shade)),
                 "an outgoing entry must remain visible in {presentation}: {rendered:?}"
             );
         }
@@ -2755,10 +2943,9 @@ mod tests {
             surface: theme.map_surface(),
             text: theme.text_primary,
         };
-        let scale = HeatScale::for_tiles(&[selected.clone(), covered.clone()]);
         let mut direct = Buffer::empty(area);
-        paint_shaded_tile(&mut direct, area, &selected, ink, true, scale);
-        paint_shaded_tile(&mut direct, area, &covered, ink, false, scale);
+        paint_shaded_tile(&mut direct, area, &selected, ink, true);
+        paint_shaded_tile(&mut direct, area, &covered, ink, false);
         assert!(
             !direct[(0, 0)]
                 .modifier
@@ -2836,9 +3023,8 @@ mod tests {
         let area = Rect::new(0, 0, 4, 2);
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
         let palette = MapPalette::for_theme(theme).expect("mocha is truecolour");
-        let scale = HeatScale::for_ramp_tiles(&tiles);
-        let under_ink = TileInk::resolve(&under, theme, palette, Emphasis::Resting, scale, None);
-        let over_ink = TileInk::resolve(&over, theme, palette, Emphasis::Resting, scale, None);
+        let under_ink = TileInk::resolve(&under, theme, palette, Emphasis::Resting, None);
+        let over_ink = TileInk::resolve(&over, theme, palette, Emphasis::Resting, None);
 
         let mut culled = Buffer::empty(area);
         let mut coverage = HalfRowCoverage::new();
@@ -3063,7 +3249,9 @@ mod tests {
         // share a cell with neighbours. Its detail must not overwrite row 2.
         let mut upper = tile(0, 1, 20, 4, 1);
         upper.name = OsString::from("upper");
-        let lower = tile(0, 5, 20, 4, 2);
+        upper.size = 4_096;
+        let mut lower = tile(0, 5, 20, 4, 2);
+        lower.size = 1_073_741_824;
         let area = Rect::new(0, 0, 20, 5);
         let buffer = render(&[upper, lower], area, None, ThemeId::CatppuccinMocha, false);
         assert!(row_text(&buffer, area, 1).contains("upper"));
@@ -3117,7 +3305,7 @@ mod tests {
             false,
         );
         let mut work = DeletionWork::new();
-        work.enqueue_confirmation(deletion_target(entry.node_id), true, 1024)
+        work.enqueue_confirmation(deletion_target(entry.node_id), true, 1024, Duration::ZERO)
             .expect("background work should retain the target");
         let mut active = Buffer::empty(area);
         DenseRectangleGrid::new(
@@ -3130,6 +3318,9 @@ mod tests {
                 show_empty_label: false,
                 scanning: false,
                 deletion_work: Some(&work),
+                deletion_departure: None,
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -3142,6 +3333,189 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_deletion_reveals_a_checker_beneath_its_status_label() {
+        let area = Rect::new(0, 0, 30, 5);
+        let entry = tile(0, 0, 30, 10, 1);
+        let mut work = DeletionWork::new();
+        work.enqueue_confirmation(deletion_target(entry.node_id), true, 1024, Duration::ZERO)
+            .expect("confirmed target should enter planning");
+        let render_at = |now| {
+            let mut buffer = Buffer::empty(area);
+            DenseRectangleGrid::new(
+                MapLayout {
+                    rectangles: std::slice::from_ref(&entry),
+                    departing: &[],
+                    overflow: None,
+                    selected_rect_index: None,
+                    transitioning: false,
+                    show_empty_label: false,
+                    scanning: false,
+                    deletion_work: Some(&work),
+                    deletion_departure: None,
+                    now,
+                    animate_deletion_checker: true,
+                },
+                Theme::for_id(ThemeId::CatppuccinMocha),
+                false,
+                false,
+            )
+            .render(area, &mut buffer);
+            buffer
+        };
+
+        let initial = render_at(Duration::ZERO);
+        let middle = render_at(Duration::from_millis(300));
+        let complete = render_at(DELETION_CHECKER_COVER_DURATION);
+
+        assert!(text_of(&middle).contains("Checking deletion"));
+        assert_ne!(middle[(1, 0)].bg, initial[(1, 0)].bg);
+        assert_eq!(middle[(2, 0)].bg, initial[(2, 0)].bg);
+        assert_ne!(complete[(1, 0)].bg, initial[(1, 0)].bg);
+    }
+
+    #[test]
+    fn checker_staging_continues_while_execution_is_queued() {
+        assert!(has_confirmation_checker_status(WorkRailStatus::Planning));
+        assert!(has_confirmation_checker_status(WorkRailStatus::Queued));
+        assert!(!has_confirmation_checker_status(
+            WorkRailStatus::AwaitingConfirmation
+        ));
+        assert!(!has_confirmation_checker_status(WorkRailStatus::Executing));
+    }
+
+    #[test]
+    fn executing_deletion_dulls_a_monotonic_fraction_of_target_half_blocks() {
+        let area = Rect::new(0, 0, 10, 3);
+        let entry = tile(0, 0, 10, 6, 1);
+        let fresh_buffer = || {
+            let mut buffer = Buffer::empty(area);
+            let style = Style::default().fg(Color::Red).bg(Color::Red);
+            for position in area.positions() {
+                buffer[position].set_symbol(HALF_CELL).set_style(style);
+            }
+            buffer
+        };
+        let mut initial = fresh_buffer();
+        let mut halfway = fresh_buffer();
+        let mut complete = fresh_buffer();
+        let muted = Color::Blue;
+
+        assert_eq!(
+            paint_execution_progress(
+                &mut initial,
+                area,
+                &entry,
+                ExecutionProgress {
+                    completed: 0,
+                    planned: 8,
+                },
+                muted,
+            ),
+            0
+        );
+        let halfway_count = paint_execution_progress(
+            &mut halfway,
+            area,
+            &entry,
+            ExecutionProgress {
+                completed: 4,
+                planned: 8,
+            },
+            muted,
+        );
+        let complete_count = paint_execution_progress(
+            &mut complete,
+            area,
+            &entry,
+            ExecutionProgress {
+                completed: 8,
+                planned: 8,
+            },
+            muted,
+        );
+
+        assert!(halfway_count > 0);
+        assert!(halfway_count < complete_count);
+        assert_eq!(halfway[(1, 0)].bg, muted);
+        assert_eq!(halfway[(2, 0)].bg, Color::Red);
+    }
+
+    #[test]
+    fn completed_departure_mutes_the_target_and_hides_its_stale_label() {
+        let area = Rect::new(0, 0, 30, 5);
+        let entry = tile(0, 0, 30, 10, 1);
+        let selected = render(
+            std::slice::from_ref(&entry),
+            area,
+            Some(0),
+            ThemeId::CatppuccinMocha,
+            false,
+        );
+        let departure = DeletionDeparture {
+            tile: entry.clone(),
+            started_at: Duration::ZERO,
+            duration: crate::state::DELETION_DEPARTURE_MIN_DURATION,
+        };
+        let mut departing = Buffer::empty(area);
+        DenseRectangleGrid::new(
+            MapLayout {
+                rectangles: std::slice::from_ref(&entry),
+                departing: &[],
+                overflow: None,
+                selected_rect_index: Some(0),
+                transitioning: false,
+                show_empty_label: false,
+                scanning: false,
+                deletion_work: None,
+                deletion_departure: Some(&departure),
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
+            },
+            Theme::for_id(ThemeId::CatppuccinMocha),
+            false,
+            false,
+        )
+        .render(area, &mut departing);
+
+        assert!(!text_of(&departing).contains("entry-1"));
+        assert_ne!(departing[(1, 3)].bg, selected[(1, 3)].bg);
+    }
+
+    #[test]
+    fn copied_departure_remains_visible_while_the_incoming_map_is_empty() {
+        let area = Rect::new(0, 0, 30, 5);
+        let entry = tile(0, 0, 30, 10, 1);
+        let departure = DeletionDeparture {
+            tile: entry,
+            started_at: Duration::ZERO,
+            duration: crate::state::DELETION_DEPARTURE_MIN_DURATION,
+        };
+        let mut buffer = Buffer::empty(area);
+        DenseRectangleGrid::new(
+            MapLayout {
+                rectangles: &[],
+                departing: &[],
+                overflow: None,
+                selected_rect_index: None,
+                transitioning: true,
+                show_empty_label: true,
+                scanning: false,
+                deletion_work: None,
+                deletion_departure: Some(&departure),
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
+            },
+            Theme::for_id(ThemeId::CatppuccinMocha),
+            false,
+            false,
+        )
+        .render(area, &mut buffer);
+
+        assert_eq!(buffer[(1, 0)].symbol(), HALF_CELL);
+        assert!(!text_of(&buffer).contains("Folder is empty"));
+    }
+
+    #[test]
     fn executing_deletion_label_reports_progress() {
         let progress = std::sync::atomic::AtomicU64::new(3);
         let item = WorkRailItem {
@@ -3149,6 +3523,7 @@ mod tests {
             status: WorkRailStatus::Executing,
             planned_entries: Some(8),
             completed: Some(&progress),
+            confirmed_at: None,
         };
         assert_eq!(work_label(item, false).as_ref(), "◉ Deleting 3/8");
         progress.store(4, Ordering::Release);
@@ -3169,6 +3544,9 @@ mod tests {
                 show_empty_label: false,
                 scanning: true,
                 deletion_work: None,
+                deletion_departure: None,
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -3201,6 +3579,9 @@ mod tests {
                 show_empty_label: false,
                 deletion_work: None,
                 scanning: false,
+                deletion_departure: None,
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,

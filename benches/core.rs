@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, Metadata};
 use std::hint::black_box;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use excise::geometry::{FileMetadata, FileType, TreeMap};
 use excise::model::{Arena, MIN_PROCESS_MIB, MemoryBudget, NodeId};
-use excise::native_path::identity_for;
+use excise::native_path::{NativeIdentity, identity_for};
 use ratatui::layout::Rect;
 
 fn files(count: usize) -> Vec<FileMetadata> {
@@ -34,6 +34,12 @@ fn files(count: usize) -> Vec<FileMetadata> {
 const CAP_TIME_DIRECTORIES: usize = 128;
 const CAP_TIME_LEAVES_PER_DIRECTORY: usize = 32;
 
+struct IngestionEntry {
+    path: PathBuf,
+    metadata: Metadata,
+    identity: NativeIdentity,
+}
+
 fn add_path(arena: &mut Arena, path: &Path) {
     let metadata =
         fs::symlink_metadata(path).expect("benchmark fixture metadata should be readable");
@@ -54,6 +60,36 @@ fn populate_cap_time_fixture(root: &Path) {
                 .expect("benchmark fixture file should be written");
         }
     }
+}
+
+fn scan_ingestion_entries(root: &Path) -> Vec<IngestionEntry> {
+    let mut entries =
+        Vec::with_capacity(CAP_TIME_DIRECTORIES * (CAP_TIME_LEAVES_PER_DIRECTORY + 1));
+    for directory_index in 0..CAP_TIME_DIRECTORIES {
+        let directory = root.join(format!("directory-{directory_index:03}"));
+        let metadata = fs::symlink_metadata(&directory).expect("benchmark directory should exist");
+        let identity = identity_for(&directory, &metadata)
+            .expect("benchmark directory identity should be readable")
+            .expect("benchmark directory should not be a link");
+        entries.push(IngestionEntry {
+            path: directory.clone(),
+            metadata,
+            identity,
+        });
+        for leaf_index in 0..CAP_TIME_LEAVES_PER_DIRECTORY {
+            let path = directory.join(format!("leaf-{leaf_index:03}"));
+            let metadata = fs::symlink_metadata(&path).expect("benchmark leaf should exist");
+            let identity = identity_for(&path, &metadata)
+                .expect("benchmark leaf identity should be readable")
+                .expect("benchmark leaf should not be a link");
+            entries.push(IngestionEntry {
+                path,
+                metadata,
+                identity,
+            });
+        }
+    }
+    entries
 }
 
 fn cap_time_arena(root: &Path) -> Arena {
@@ -105,6 +141,38 @@ fn benchmark_cap_time_compaction(c: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_scan_ingestion(c: &mut Criterion) {
+    let root = tempfile::tempdir().expect("benchmark root should be created");
+    populate_cap_time_fixture(root.path());
+    let entries = scan_ingestion_entries(root.path());
+    let mut group = c.benchmark_group("model/scan-ingestion");
+    group.throughput(Throughput::Elements(
+        u64::try_from(entries.len()).expect("benchmark entry count should fit u64"),
+    ));
+    group.bench_function("128x32", |bencher| {
+        bencher.iter_batched_ref(
+            || {
+                Arena::new(
+                    root.path().to_path_buf(),
+                    MemoryBudget::from_mib(MIN_PROCESS_MIB)
+                        .expect("benchmark model budget should be available"),
+                )
+                .expect("benchmark arena should be created")
+            },
+            |arena| {
+                for entry in &entries {
+                    arena
+                        .add_entry(&entry.path, &entry.metadata, entry.identity.clone())
+                        .expect("benchmark entry should be retained");
+                }
+                black_box(arena.memory_used());
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
 fn benchmark_treemap(c: &mut Criterion) {
     let input = files(100_000);
     c.bench_function("treemap/layout/100k/190x48", |bencher| {
@@ -116,5 +184,10 @@ fn benchmark_treemap(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, benchmark_treemap, benchmark_cap_time_compaction);
+criterion_group!(
+    benches,
+    benchmark_treemap,
+    benchmark_cap_time_compaction,
+    benchmark_scan_ingestion
+);
 criterion_main!(benches);

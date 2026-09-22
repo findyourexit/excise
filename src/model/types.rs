@@ -160,6 +160,8 @@ pub struct Node {
     pub name: Arc<OsStr>,
     pub kind: NodeKind,
     pub state: NodeState,
+    /// The scanner has exhausted this directory's direct entries.
+    pub directory_scan_finished: bool,
     pub children: Vec<NodeId>,
     pub metrics: NodeMetrics,
     pub snapshot: EntrySnapshot,
@@ -183,6 +185,7 @@ impl Node {
             name,
             kind,
             state,
+            directory_scan_finished: !kind.is_directory(),
             children: Vec::new(),
             metrics: NodeMetrics::default(),
             snapshot,
@@ -207,6 +210,7 @@ mod tests {
             name: Arc::from(OsStr::new("fixture")),
             kind: NodeKind::File,
             state: NodeState::Complete,
+            directory_scan_finished: true,
             children: Vec::new(),
             metrics: NodeMetrics::default(),
             snapshot: EntrySnapshot {

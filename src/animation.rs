@@ -3,12 +3,15 @@ use std::time::Duration;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
-use tachyonfx::{Effect, fx};
+use ratatui::style::{Color, Style};
+use tachyonfx::{Effect, Interpolation, SimpleRng, fx, pattern::CheckerboardPattern};
 
 pub const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const MEDIUM_FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const LARGE_FRAME_INTERVAL: Duration = Duration::from_millis(66);
+/// Persistent focus and modal chrome redraw at this cadence; short effects and
+/// geometry keep the higher cadence needed to look continuous.
+const PERSISTENT_ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(125);
 const SMALL_SURFACE_CELLS: u32 = 4_000;
 const MEDIUM_SURFACE_CELLS: u32 = 12_000;
 /// How long the map takes to settle after a layout it can interpolate: a resize,
@@ -18,6 +21,31 @@ pub const ROUTINE_MOTION: Duration = Duration::from_millis(160);
 /// is replaced: the eye needs the extra frames to follow the entry it chose into
 /// its contents, or back out of them.
 pub const NAVIGATION_MOTION: Duration = Duration::from_millis(260);
+/// Stable seed keeps the target's checkerboard departure coherent between redraws.
+const DELETION_DISSOLVE_SEED: u32 = 0xD3E1_E7E;
+
+/// Applies the deterministic departure dissolve to a freshly painted map layer.
+pub(crate) fn dissolve_deletion_departure(
+    now: Duration,
+    started_at: Duration,
+    duration: Duration,
+    buffer: &mut Buffer,
+    area: Rect,
+    destination: Style,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let duration = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
+    let elapsed = now.saturating_sub(started_at);
+    let elapsed =
+        tachyonfx::Duration::from_millis(u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX));
+    let mut effect = fx::dissolve_to(destination, (duration, Interpolation::SineOut))
+        .with_area(area)
+        .with_pattern(CheckerboardPattern::new(1, 0.5))
+        .with_rng(SimpleRng::new(DELETION_DISSOLVE_SEED));
+    effect.process(elapsed, buffer, area);
+}
 
 /// Effects left in the scheduler are one-shot acknowledgements of an event the
 /// interface cannot otherwise show, and they are painted over the header band
@@ -63,6 +91,8 @@ pub struct AnimationScheduler {
     enabled: bool,
     activity_requested: bool,
     activity: bool,
+    /// Whether requested activity is a short-lived animation rather than chrome.
+    activity_fast: bool,
     activity_suspended: bool,
     geometry: bool,
 }
@@ -78,13 +108,25 @@ impl AnimationScheduler {
             enabled: !reduced_motion && !monochrome,
             activity_requested: false,
             activity: false,
+            activity_fast: false,
             activity_suspended: false,
             geometry: false,
         }
     }
 
+    #[must_use]
+    pub(crate) const fn animations_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn set_activity(&mut self, active: bool) {
+        self.set_activity_with_cadence(active, true);
+    }
+
+    /// Requests redraws for persistent chrome or a short-lived visual effect.
+    pub(crate) fn set_activity_with_cadence(&mut self, active: bool, fast: bool) {
         self.activity_requested = active;
+        self.activity_fast = active && fast;
         self.activity = active && self.enabled && !self.activity_suspended;
     }
 
@@ -116,6 +158,7 @@ impl AnimationScheduler {
         if !self.enabled {
             self.activity_requested = false;
             self.activity = false;
+            self.activity_fast = false;
             self.cancel_all();
         }
     }
@@ -203,10 +246,19 @@ impl AnimationScheduler {
     /// tracks across the entire screen, so it keeps the fast cadence.
     #[must_use]
     fn frame_interval(&self) -> Duration {
-        if self.geometry {
-            self.frame_interval.min(ACTIVE_FRAME_INTERVAL)
+        let persistent_only = self.activity
+            && !self.activity_fast
+            && self.effects.is_empty()
+            && self.pending.is_empty();
+        let interval = if persistent_only {
+            self.frame_interval.max(PERSISTENT_ACTIVITY_FRAME_INTERVAL)
         } else {
             self.frame_interval
+        };
+        if self.geometry {
+            interval.min(ACTIVE_FRAME_INTERVAL)
+        } else {
+            interval
         }
     }
 
@@ -225,5 +277,55 @@ impl AnimationScheduler {
         if self.enabled {
             self.pending.insert(key, effect);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn painted_buffer(area: Rect) -> Buffer {
+        let mut buffer = Buffer::empty(area);
+        let style = Style::default().fg(Color::Red).bg(Color::Blue);
+        for position in area.positions() {
+            buffer[position].set_symbol("x").set_style(style);
+        }
+        buffer
+    }
+
+    #[test]
+    fn departure_checkerboard_dissolves_to_the_canvas_by_its_deadline() {
+        let area = Rect::new(0, 0, 12, 6);
+        let canvas = Style::default().fg(Color::Green).bg(Color::Green);
+
+        let mut middle = painted_buffer(area);
+        dissolve_deletion_departure(
+            Duration::from_millis(45),
+            Duration::ZERO,
+            crate::state::DELETION_DEPARTURE_MIN_DURATION,
+            &mut middle,
+            area,
+            canvas,
+        );
+        let cleared = middle
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == " ")
+            .count();
+        assert!(cleared > 0);
+        assert!(cleared < middle.content.len());
+
+        let mut finished = painted_buffer(area);
+        dissolve_deletion_departure(
+            crate::state::DELETION_DEPARTURE_MIN_DURATION,
+            Duration::ZERO,
+            crate::state::DELETION_DEPARTURE_MIN_DURATION,
+            &mut finished,
+            area,
+            canvas,
+        );
+        assert!(finished.content.iter().all(|cell| {
+            cell.symbol() == " " && cell.fg == Color::Green && cell.bg == Color::Green
+        }));
     }
 }

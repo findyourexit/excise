@@ -249,11 +249,9 @@ impl WorkerPool {
         &self.events
     }
 
-    /// Promotes a visible directory ahead of unrelated queued scan work.
-    pub fn prioritize_scan(&self, path: &Path) -> Result<(), AppError> {
-        self.scanner_control
-            .prioritize(path)
-            .map_err(|error| AppError::io("could not prioritize visible scanner directory", error))
+    /// Prioritizes a visible directory without performing queue or spill I/O on the caller.
+    pub fn prioritize_scan(&self, path: &Path) {
+        self.scanner_control.prioritize(path);
     }
 
     pub(crate) fn submit_deletion_work(

@@ -34,7 +34,10 @@ const SPILL_RECORD_MAC_BYTES: u64 = 32;
 const SPILL_MAC_BYTES: usize = 32;
 const HMAC_BLOCK_BYTES: usize = 64;
 const MAX_PLAN_SPILL_RECORD_BYTES: usize = 1024 * 1024;
-const MAX_OUTCOME_DETAIL_BYTES: usize = 512;
+/// A complete directory report reserves one failure detail per entry before
+/// consent. Keep each diagnostic concise so cache-sized directory deletions
+/// remain practical within the shared temporary-storage budget.
+const MAX_OUTCOME_DETAIL_BYTES: usize = 128;
 const OUTCOME_DETAIL_TRUNCATION: &str = "…";
 const MAX_JSON_ESCAPED_BYTES_PER_INPUT_BYTE: usize = 6;
 const RESULT_SPILL_ENVELOPE_BYTES: usize = 64;
@@ -735,16 +738,20 @@ impl PlannedResultStorage {
         Ok(())
     }
 
-    fn into_collector(self) -> ResultCollector {
+    fn into_collector(self, target: PathBuf) -> ResultCollector {
         match self {
             Self::InMemory { maximum_bytes, .. } => ResultCollector::InMemory {
                 entries: Vec::new(),
                 estimated_bytes: 0,
                 maximum_bytes,
+                target,
+                target_removed: false,
                 summary: DeletionSummary::default(),
             },
             Self::Spilled(result_spill) => ResultCollector::Spilled {
                 result_spill,
+                target,
+                target_removed: false,
                 summary: DeletionSummary::default(),
             },
         }
@@ -757,12 +764,24 @@ enum ResultCollector {
         entries: Vec<DeletionEntryResult>,
         estimated_bytes: usize,
         maximum_bytes: usize,
+        target: PathBuf,
+        target_removed: bool,
         summary: DeletionSummary,
     },
     Spilled {
         result_spill: RecordSpill,
+        target: PathBuf,
+        target_removed: bool,
         summary: DeletionSummary,
     },
+}
+
+fn result_removes_target(result: &DeletionEntryResult, target: &Path) -> bool {
+    result.entry.relative_path == target
+        && matches!(
+            result.outcome,
+            DeletionEntryOutcome::Deleted | DeletionEntryOutcome::Missing
+        )
 }
 
 impl ResultCollector {
@@ -773,8 +792,11 @@ impl ResultCollector {
                 entries,
                 estimated_bytes,
                 maximum_bytes,
+                target,
+                target_removed,
                 summary,
             } => {
+                *target_removed |= result_removes_target(&result, target);
                 summary.note(&result);
                 let required = result_entry_resident_bytes(&result);
                 let next = estimated_bytes.saturating_add(required);
@@ -792,8 +814,11 @@ impl ResultCollector {
             }
             Self::Spilled {
                 result_spill,
+                target,
+                target_removed,
                 summary,
             } => {
+                *target_removed |= result_removes_target(&result, target);
                 summary.note(&result);
                 let payload = encode_spilled_result(&result)?;
                 result_spill.push_reserved(&payload)?;
@@ -806,21 +831,28 @@ impl ResultCollector {
         let error = error.map(|detail| bounded_outcome_detail(&detail));
         match self {
             Self::InMemory {
-                entries, summary, ..
+                entries,
+                target_removed,
+                summary,
+                ..
             } => DeletionEntries::in_memory(
                 Some(target.to_path_buf()),
                 entries,
                 summary,
+                target_removed,
                 complete,
                 error,
             ),
             Self::Spilled {
                 result_spill,
+                target_removed,
                 summary,
+                ..
             } => DeletionEntries::spilled(
                 target.to_path_buf(),
                 result_spill,
                 summary,
+                target_removed,
                 complete,
                 error,
             ),
@@ -881,6 +913,7 @@ pub struct DeletionEntries {
     target: Option<PathBuf>,
     records: u64,
     summary: DeletionSummary,
+    target_removed: bool,
     complete: bool,
     error: Option<String>,
 }
@@ -896,6 +929,7 @@ impl DeletionEntries {
         target: Option<PathBuf>,
         entries: Vec<DeletionEntryResult>,
         summary: DeletionSummary,
+        target_removed: bool,
         complete: bool,
         error: Option<String>,
     ) -> Self {
@@ -905,6 +939,7 @@ impl DeletionEntries {
             target,
             records,
             summary,
+            target_removed,
             complete,
             error,
         }
@@ -914,6 +949,7 @@ impl DeletionEntries {
         target: PathBuf,
         result_spill: RecordSpill,
         summary: DeletionSummary,
+        target_removed: bool,
         complete: bool,
         error: Option<String>,
     ) -> Self {
@@ -923,6 +959,7 @@ impl DeletionEntries {
             target: Some(target),
             records,
             summary,
+            target_removed,
             complete,
             error,
         }
@@ -946,6 +983,11 @@ impl DeletionEntries {
     #[must_use]
     pub fn reporting_error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) const fn target_removed(&self) -> bool {
+        self.target_removed
     }
 
     #[must_use]
@@ -988,7 +1030,7 @@ impl<'a> IntoIterator for &'a DeletionEntries {
 impl From<Vec<DeletionEntryResult>> for DeletionEntries {
     fn from(entries: Vec<DeletionEntryResult>) -> Self {
         let summary = DeletionSummary::from_entries(&entries);
-        Self::in_memory(None, entries, summary, true, None)
+        Self::in_memory(None, entries, summary, false, true, None)
     }
 }
 
@@ -1236,6 +1278,15 @@ impl DeletionReport {
     #[must_use]
     pub fn deleted_allocated_bytes(&self) -> u128 {
         self.entries.summary.deleted_allocated_bytes
+    }
+
+    /// Whether the exact target itself was removed under a complete, precise run.
+    #[must_use]
+    pub(crate) fn target_was_removed(&self) -> bool {
+        !self.soft_cancelled
+            && self.precise
+            && self.reporting_complete()
+            && self.entries.target_removed()
     }
 
     #[must_use]
@@ -1638,10 +1689,11 @@ pub fn execute_plan(
     _hard_cancelled: &AtomicBool,
 ) -> DeletionReport {
     let result_storage = std::mem::replace(&mut plan.result_storage, PlannedResultStorage::new(0));
+    let target = plan.root_relative_path.clone();
     failed_report(
         scan_root,
         plan,
-        result_storage.into_collector(),
+        result_storage.into_collector(target),
         "permanent deletion is unavailable on this target",
     )
 }
@@ -1738,12 +1790,12 @@ where
     G: FnMut(&OsStr),
 {
     let result_storage = std::mem::replace(&mut plan.result_storage, PlannedResultStorage::new(0));
-    let mut results = result_storage.into_collector();
+    let root_relative_path = plan.root_relative_path.clone();
+    let mut results = result_storage.into_collector(root_relative_path.clone());
     let root = match open_root(scan_root, &plan.scan_root_identity) {
         Ok(root) => root,
         Err(error) => return failed_report(scan_root, plan, results, &error.to_string()),
     };
-    let root_relative_path = plan.root_relative_path.clone();
     if let Err(error) = plan.entries.try_for_each(&root_relative_path, |_| Ok(())) {
         return failed_report(scan_root, plan, results, &error.to_string());
     }
@@ -2051,12 +2103,12 @@ fn execute_plan_windows(
     progress: Option<&AtomicU64>,
 ) -> DeletionReport {
     let result_storage = std::mem::replace(&mut plan.result_storage, PlannedResultStorage::new(0));
-    let mut results = result_storage.into_collector();
+    let root_relative_path = plan.root_relative_path.clone();
+    let mut results = result_storage.into_collector(root_relative_path.clone());
     let root = match open_root(scan_root, &plan.scan_root_identity) {
         Ok(root) => root,
         Err(error) => return failed_report(scan_root, plan, results, &error.to_string()),
     };
-    let root_relative_path = plan.root_relative_path.clone();
     if let Err(error) = plan.entries.try_for_each(&root_relative_path, |_| Ok(())) {
         return failed_report(scan_root, plan, results, &error.to_string());
     }
@@ -3740,7 +3792,51 @@ mod tests {
         assert!(!directory.exists());
         assert!(report.entries.is_spilled());
         assert!(report.reporting_complete());
+        assert!(report.target_was_removed());
         assert!(temporary_storage.used() > 0);
+        drop(report);
+        assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn large_directory_plan_keeps_complete_results_with_bounded_storage() {
+        const FILES: usize = 512;
+
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should exist");
+        for index in 0..FILES {
+            std::fs::write(directory.join(format!("artifact-{index:04}")), b"payload")
+                .expect("target artifact should exist");
+        }
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(1024 * 1024);
+
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("large directory plan should fit its bounded complete result store");
+        let planned_entries = plan.planned_entries();
+        assert_eq!(
+            planned_entries,
+            u64::try_from(FILES + 1).expect("count should fit")
+        );
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(report.deleted_entries(), planned_entries);
+        assert!(report.reporting_complete());
+        assert!(!directory.exists());
         drop(report);
         assert_eq!(temporary_storage.used(), 0);
     }
@@ -3883,6 +3979,7 @@ mod tests {
             spill,
             DeletionSummary::from_entries(&known),
             false,
+            false,
             Some("fixture result storage is incomplete".to_string()),
         );
         assert!(entries.is_spilled());
@@ -3895,6 +3992,7 @@ mod tests {
             precise: false,
             estimated_bytes: 0,
         };
+        assert!(!report.target_was_removed());
         let freed = report.deleted_apparent_bytes();
 
         tree.try_apply_deletion_report(&report)
@@ -4193,6 +4291,7 @@ mod tests {
             PathBuf::from("target"),
             spill,
             DeletionSummary::default(),
+            false,
             true,
             None,
         );

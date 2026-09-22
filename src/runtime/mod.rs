@@ -20,6 +20,7 @@ use crate::App;
 use crate::animation::AnimationScheduler;
 use crate::app::ExitWork;
 use crate::config::{CustomKeyBindings, KeyPreset, SafePreferences, save_safe_preferences};
+use crate::deletion::{DeletionPlanError, DeletionReport};
 use crate::error::{AppError, ExitClass};
 use crate::input::{InputCommand, InputEvent, InputSource, handle_keypress};
 use crate::native_path::{
@@ -30,13 +31,22 @@ use crate::report::{ScanReport, ScanReportState, scan_report_state};
 use crate::state::files::FileTree;
 use crate::temporary_storage::TemporaryStorage;
 use crate::theme::ThemeId;
+use crate::ui::palette::ColorCycle;
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const IDLE_INPUT_WAIT: Duration = Duration::from_hours(1);
-const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+/// Limits expensive layout rebuilds while a large scan streams in.
+const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(150);
 const TRANSIENT_STATUS_DURATION: Duration = Duration::from_millis(250);
 const DELETION_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_INPUT_BATCH: usize = 32;
+/// A scanner event is capped at 32 entries. Keep one owner slice bounded so
+/// scanning can never monopolize the UI loop.
+const MAX_SCAN_ENTRIES_PER_SLICE: usize = 32;
+/// Disk-backed identity accounting can make one model update visibly costly.
+/// Check input before a second mutation so a queued navigation key never waits
+/// behind an entire scanner batch.
+const SCAN_ENTRIES_PER_INPUT_CHECK: usize = 1;
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -74,6 +84,47 @@ struct ScheduledAction {
     action: TimedAction,
 }
 
+/// Records one rendered deletion counter and reports whether the map changed.
+fn deletion_progress_changed(
+    previous: &mut Option<(u64, u64)>,
+    planned: u64,
+    completed: u64,
+) -> bool {
+    let current = (planned, completed);
+    if *previous == Some(current) {
+        return false;
+    }
+    *previous = Some(current);
+    true
+}
+
+fn deletion_plan_failure_notice(error: &DeletionPlanError) -> &'static str {
+    match error {
+        DeletionPlanError::Io {
+            kind: std::io::ErrorKind::StorageFull,
+            ..
+        } => {
+            "Deletion did not start: temporary storage limit reached; increase --temporary-storage-mib"
+        }
+        DeletionPlanError::Io {
+            kind: std::io::ErrorKind::PermissionDenied,
+            ..
+        } => "Deletion did not start: access to part of the selected item was denied",
+        DeletionPlanError::MemoryLimit { .. } => {
+            "Deletion did not start: the selected item exceeds the plan memory limit"
+        }
+        DeletionPlanError::Io { .. }
+        | DeletionPlanError::Synthetic
+        | DeletionPlanError::Root
+        | DeletionPlanError::InvalidRelativePath
+        | DeletionPlanError::Changed
+        | DeletionPlanError::Missing(_)
+        | DeletionPlanError::Cancelled => {
+            "Deletion did not start: the selected item could not be checked"
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct OwnerLoop<B>
 where
@@ -94,9 +145,9 @@ where
     scan_view_dirty: bool,
     /// Folder whose incoming scan changes may refresh the visible map.
     scan_view_root: PathBuf,
-    /// One scanner batch, drained a single model mutation at a time.
+    /// Scanner entries queued for one bounded owner scheduling slice.
     pending_scan_entries: VecDeque<ScannedEntry>,
-    /// One focused scanner batch, drained ahead of unrelated primary scan data.
+    /// Focused entries take priority within the next bounded scheduling slice.
     pending_focused_scan_entries: VecDeque<ScannedEntry>,
     scan_cancelled: bool,
     rescan_active: bool,
@@ -108,6 +159,8 @@ where
     next_loading_frame: Duration,
     /// Live mutation progress needs redraws even when accessibility disables animation.
     next_deletion_progress_frame: Duration,
+    /// Last rendered counter snapshot; unchanged counters do not redraw the map.
+    last_deletion_progress: Option<(u64, u64)>,
 }
 
 /// # Errors
@@ -173,6 +226,7 @@ where
         timed_actions: Vec::new(),
         next_loading_frame: now.saturating_add(LOADING_FRAME_INTERVAL),
         next_deletion_progress_frame: now.saturating_add(DELETION_PROGRESS_INTERVAL),
+        last_deletion_progress: None,
     }
     .run()
 }
@@ -210,21 +264,25 @@ where
                 self.cancelled_while_scanning = true;
             }
             did_work |= self.process_worker_batch()?;
+            did_work |= self.process_deletion_departure(false)?;
             did_work |= self.process_deadlines();
-            self.update_animation_frame();
             did_work |= self.render()?;
 
             if !self.app.is_running {
                 break;
             }
             if !did_work {
-                let timeout = self.next_timeout();
-                if self.input.poll(timeout)? {
+                let input_ready = self.input.poll(self.next_timeout())?;
+                if input_ready {
                     self.process_one_input()?;
-                    self.process_deadlines();
-                    self.update_animation_frame();
-                    self.render()?;
                 }
+                // A timeout is work too: while `poll` sleeps, geometry and other
+                // deadlines become due. Service them even when no key woke us, or
+                // a finished scan leaves the map frozen until the next input.
+                self.process_deletion_departure(false)?;
+                self.process_deadlines();
+                self.update_animation_frame();
+                self.render()?;
             }
         }
         if !self.app.is_running && self.scan_active {
@@ -335,10 +393,12 @@ where
             InputCommand::RequestDeletion(target) => {
                 let reduced_guardrails = self.app.reduced_deletion_guardrails();
                 let maximum_bytes = self.app.maximum_deletion_plan_bytes();
-                if self
-                    .app
-                    .queue_deletion_confirmation(*target, reduced_guardrails, maximum_bytes)
-                {
+                if self.app.queue_deletion_confirmation(
+                    *target,
+                    reduced_guardrails,
+                    maximum_bytes,
+                    now,
+                ) {
                     self.app.show_next_deletion_confirmation();
                 }
             }
@@ -350,7 +410,7 @@ where
                 let overlaps_focused_scan = self.rescan_target.as_ref().is_some_and(|root| {
                     target_path.starts_with(root) || root.starts_with(&target_path)
                 });
-                if self.app.queue_confirmed_deletion(work_id, target) {
+                if self.app.queue_confirmed_deletion(work_id, target, now) {
                     if overlaps_focused_scan {
                         self.workers()?.cancel_rescan();
                     }
@@ -409,7 +469,10 @@ where
                     self.app.preferences_changed();
                 }
             }
-            InputCommand::PromptExit => self.app.prompt_exit(self.exit_work()),
+            InputCommand::PromptExit => {
+                self.process_deletion_departure(true)?;
+                self.app.prompt_exit(self.exit_work());
+            }
             InputCommand::CancelPendingWorkAndExit => self.cancel_pending_work_and_exit(false)?,
             InputCommand::StopDeletionAndExit => self.cancel_pending_work_and_exit(true)?,
             InputCommand::SavePreferencesAndExit => {
@@ -446,7 +509,7 @@ where
         if drilled {
             self.scan_view_root = self.app.current_folder_path();
             if self.primary_scan_active {
-                self.workers()?.prioritize_scan(&self.scan_view_root)?;
+                self.workers()?.prioritize_scan(&self.scan_view_root);
             }
         }
         if !self.exit_after_work {
@@ -486,6 +549,7 @@ where
     }
 
     fn cancel_pending_work_and_exit(&mut self, stop_active: bool) -> Result<(), AppError> {
+        self.process_deletion_departure(true)?;
         self.app.cancel_pending_deletion_work();
         self.flush_deletion_plan_cancellation()?;
         self.exit_after_work = true;
@@ -539,6 +603,9 @@ where
     }
 
     fn start_next_deletion_execution(&mut self) -> Result<(), AppError> {
+        if self.app.has_deletion_departure() {
+            return Ok(());
+        }
         let Some(command) = self.app.next_deletion_execution_work() else {
             return Ok(());
         };
@@ -567,7 +634,11 @@ where
     }
 
     fn finish_exit_after_work(&mut self) {
-        if !self.exit_after_work || self.rescan_active || self.app.deletion_work.has_work() {
+        if !self.exit_after_work
+            || self.rescan_active
+            || self.app.deletion_work.has_work()
+            || self.app.has_deletion_departure()
+        {
             return;
         }
         self.exit_after_work = false;
@@ -582,7 +653,7 @@ where
         if self.app.map_is_transitioning() || self.input.poll(Duration::ZERO)? {
             return Ok(false);
         }
-        if self.process_pending_scan_entry()? {
+        if self.process_pending_scan_entries()? {
             return Ok(true);
         }
         let event = match self.workers()?.events().try_recv() {
@@ -600,6 +671,20 @@ where
         self.handle_worker_event(event)?;
         self.flush_deletion_plan_cancellation()?;
         Ok(true)
+    }
+
+    fn process_pending_scan_entries(&mut self) -> Result<bool, AppError> {
+        let mut processed = false;
+        for index in 0..MAX_SCAN_ENTRIES_PER_SLICE {
+            if !self.process_pending_scan_entry()? {
+                break;
+            }
+            processed = true;
+            if (index + 1) % SCAN_ENTRIES_PER_INPUT_CHECK == 0 && self.input.poll(Duration::ZERO)? {
+                break;
+            }
+        }
+        Ok(processed)
     }
 
     fn process_pending_scan_entry(&mut self) -> Result<bool, AppError> {
@@ -768,7 +853,9 @@ where
             }
             WorkerEvent::ScanDirectoryComplete { path, identity } => {
                 if !self.app.primary_scan_path_is_stale(&path) {
-                    self.scan_view_dirty |= path.starts_with(&self.scan_view_root);
+                    // Completion changes scan state, not a tile's displayed size,
+                    // descendants, or interactivity. The next loading frame draws
+                    // that status without rebuilding the entire visible map.
                     self.app.complete_directory(&path, identity.as_ref())?;
                 }
             }
@@ -816,13 +903,12 @@ where
                         );
                     }
                 }
-                Err(_) => {
+                Err(error) => {
+                    let notice = deletion_plan_failure_notice(&error);
                     if self.app.deletion_plan_failed(work_id) {
                         self.summary.deletion_failed_entries =
                             self.summary.deletion_failed_entries.saturating_add(1);
-                        self.app.record_deletion_notice(
-                            "Deletion did not start: the selected item could not be checked",
-                        );
+                        self.app.record_deletion_notice(notice);
                     }
                 }
             },
@@ -873,24 +959,20 @@ where
                         .summary
                         .deletion_unattempted_entries
                         .saturating_add(report.unattempted_entries());
-                    match self.app.try_complete_deletion(report) {
-                        Ok(true) => {
-                            self.animation.schedule_deletion_result();
-                            self.app.flash_space_freed();
-                            self.schedule(
-                                self.clock.now(),
-                                TimedAction::UnflashSpace,
-                                TRANSIENT_STATUS_DURATION,
-                            );
-                        }
-                        Ok(false) => self.animation.schedule_deletion_result(),
-                        Err(error) => {
-                            self.summary.unreadable_entries =
-                                self.summary.unreadable_entries.saturating_add(1);
-                            self.summary.last_worker_error = Some(error.to_string());
-                            self.animation.schedule_error();
-                        }
+                    if self.animation.animations_enabled()
+                        && !self.settings.ascii
+                        && ColorCycle::can_animate(
+                            crate::theme::Theme::for_id(self.settings.theme).focus,
+                        )
+                        && report.target_was_removed()
+                    {
+                        let _ = self.app.begin_deletion_departure(
+                            report.target_node_id,
+                            report.deleted_entries(),
+                            self.clock.now(),
+                        );
                     }
+                    self.reconcile_deletion_report(report);
                 }
             }
         }
@@ -906,6 +988,43 @@ where
         }
         self.finish_exit_after_work();
         Ok(())
+    }
+
+    fn reconcile_deletion_report(&mut self, report: DeletionReport) {
+        match self.app.try_complete_deletion(report) {
+            Ok(true) => {
+                self.animation.schedule_deletion_result();
+                self.app.flash_space_freed();
+                self.schedule(
+                    self.clock.now(),
+                    TimedAction::UnflashSpace,
+                    TRANSIENT_STATUS_DURATION,
+                );
+            }
+            Ok(false) => self.animation.schedule_deletion_result(),
+            Err(error) => {
+                self.summary.unreadable_entries = self.summary.unreadable_entries.saturating_add(1);
+                self.summary.last_worker_error = Some(error.to_string());
+                self.animation.schedule_error();
+            }
+        }
+    }
+
+    /// Clears a copied departure after it finishes dissolving during the reflow.
+    fn process_deletion_departure(&mut self, force: bool) -> Result<bool, AppError> {
+        if !self.app.has_deletion_departure() {
+            return Ok(false);
+        }
+        if !force && !self.app.deletion_departure_is_finished(self.clock.now()) {
+            return Ok(false);
+        }
+        self.app.clear_deletion_departure();
+        if !self.exit_after_work {
+            self.start_next_deletion_planning()?;
+            self.start_next_deletion_execution()?;
+        }
+        self.finish_exit_after_work();
+        Ok(true)
     }
 
     fn process_deadlines(&mut self) -> bool {
@@ -933,13 +1052,20 @@ where
             self.next_loading_frame = now.saturating_add(LOADING_FRAME_INTERVAL);
             processed = true;
         }
-        let progress_needs_timer = self.app.deletion_work.has_active_mutation()
-            && self.animation.next_frame_at().is_none();
-        if progress_needs_timer && now >= self.next_deletion_progress_frame {
-            self.app.mark_dirty();
-            self.next_deletion_progress_frame = now.saturating_add(DELETION_PROGRESS_INTERVAL);
-            processed = true;
-        } else if !self.app.deletion_work.has_active_mutation() {
+        if let Some((planned, progress)) = self.app.deletion_work.active_progress() {
+            if now >= self.next_deletion_progress_frame {
+                if deletion_progress_changed(
+                    &mut self.last_deletion_progress,
+                    planned,
+                    progress.load(std::sync::atomic::Ordering::Acquire),
+                ) {
+                    self.app.mark_dirty();
+                    processed = true;
+                }
+                self.next_deletion_progress_frame = now.saturating_add(DELETION_PROGRESS_INTERVAL);
+            }
+        } else {
+            self.last_deletion_progress = None;
             self.next_deletion_progress_frame = now.saturating_add(DELETION_PROGRESS_INTERVAL);
         }
         processed
@@ -991,8 +1117,10 @@ where
         if let Some(deadline) = self.animation.next_frame_at() {
             timeout = timeout.min(deadline.saturating_sub(now));
         }
-        if self.app.deletion_work.has_active_mutation() && self.animation.next_frame_at().is_none()
-        {
+        if let Some(deadline) = self.app.deletion_departure_deadline() {
+            timeout = timeout.min(deadline.saturating_sub(now));
+        }
+        if self.app.deletion_work.has_active_mutation() {
             timeout = timeout.min(self.next_deletion_progress_frame.saturating_sub(now));
         }
         if let Some(deadline) = self.timed_actions.iter().map(|action| action.at).min() {
@@ -1002,38 +1130,53 @@ where
     }
 
     fn wait_for_quiescence(&mut self) -> Result<(), AppError> {
-        while self.scan_active || self.app.deletion_work.has_background_activity() {
-            if self.process_pending_scan_entry()? {
-                self.render()?;
-                continue;
+        'quiescence: loop {
+            while self.scan_active || self.app.deletion_work.has_background_activity() {
+                if self.process_pending_scan_entry()? {
+                    self.render()?;
+                    continue;
+                }
+                match self.workers()?.events().recv_timeout(WORKER_POLL_INTERVAL) {
+                    Ok(event) => {
+                        self.handle_worker_event(event)?;
+                        self.render()?;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(AppError::Worker(
+                            "worker event channel disconnected".to_string(),
+                        ));
+                    }
+                }
             }
-            match self.workers()?.events().recv_timeout(WORKER_POLL_INTERVAL) {
-                Ok(event) => {
-                    self.handle_worker_event(event)?;
+
+            loop {
+                if self.process_deletion_departure(false)? {
                     self.render()?;
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(AppError::Worker(
-                        "worker event channel disconnected".to_string(),
-                    ));
+                if self.scan_active || self.app.deletion_work.has_background_activity() {
+                    continue 'quiescence;
                 }
+                let next_timed = self.timed_actions.iter().map(|action| action.at).min();
+                let next_animation = self.animation.next_frame_at();
+                let next_departure = self.app.deletion_departure_deadline();
+                let next = next_timed
+                    .into_iter()
+                    .chain(next_animation)
+                    .chain(next_departure)
+                    .min();
+                let Some(next) = next else {
+                    break;
+                };
+                if !self.clock.advance_to(next) {
+                    break;
+                }
+                self.process_deletion_departure(false)?;
+                self.process_deadlines();
+                self.update_animation_frame();
+                self.render()?;
             }
-        }
-
-        loop {
-            let next_timed = self.timed_actions.iter().map(|action| action.at).min();
-            let next_animation = self.animation.next_frame_at();
-            let next = next_timed.into_iter().chain(next_animation).min();
-            let Some(next) = next else {
-                break;
-            };
-            if !self.clock.advance_to(next) {
-                break;
-            }
-            self.process_deadlines();
-            self.update_animation_frame();
-            self.render()?;
+            break;
         }
         Ok(())
     }
@@ -1350,6 +1493,7 @@ mod tests {
             timed_actions: Vec::new(),
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
+            last_deletion_progress: None,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while owner
@@ -1381,15 +1525,13 @@ mod tests {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "the preemption regression constructs an isolated owner loop and its scan batch"
+        reason = "the regression constructs an isolated owner loop and its staged scan batch"
     )]
     #[test]
-    fn pending_input_interrupts_a_scan_batch_between_entries() {
+    fn queued_input_preempts_after_one_scan_entry() {
         let root = tempfile::tempdir().expect("test root should be created");
         let first = root.path().join("first");
-        let second = root.path().join("second");
-        std::fs::write(&first, b"a").expect("first test entry should be created");
-        std::fs::write(&second, b"b").expect("second test entry should be created");
+        std::fs::write(&first, b"a").expect("test entry should be created");
         let root_metadata =
             std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
         let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
@@ -1413,11 +1555,6 @@ mod tests {
         let first_identity = crate::native_path::identity_for(&first, &first_metadata)
             .expect("first test identity should be readable")
             .expect("first test entry should not be a link");
-        let second_metadata =
-            std::fs::symlink_metadata(&second).expect("second test metadata should exist");
-        let second_identity = crate::native_path::identity_for(&second, &second_metadata)
-            .expect("second test identity should be readable")
-            .expect("second test entry should not be a link");
         let mut owner = OwnerLoop {
             app,
             input: Box::new(InputAfterFirstPoll { polls: 0 }),
@@ -1462,41 +1599,233 @@ mod tests {
             timed_actions: Vec::new(),
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
+            last_deletion_progress: None,
         };
 
         owner
             .handle_worker_event(WorkerEvent::ScanBatch {
-                entries: vec![
-                    ScannedEntry {
-                        metadata: first_metadata,
-                        path: first,
-                        identity: first_identity,
-                    },
-                    ScannedEntry {
-                        metadata: second_metadata,
-                        path: second,
-                        identity: second_identity,
-                    },
-                ],
+                entries: (0..=MAX_SCAN_ENTRIES_PER_SLICE)
+                    .map(|index| ScannedEntry {
+                        metadata: first_metadata.clone(),
+                        path: root.path().join(format!("entry-{index}")),
+                        identity: first_identity.clone(),
+                    })
+                    .collect(),
             })
             .expect("scan batch should be staged");
         assert_eq!(owner.summary.scanned_entries, 0);
-        assert_eq!(owner.pending_scan_entries.len(), 2);
+        assert_eq!(
+            owner.pending_scan_entries.len(),
+            MAX_SCAN_ENTRIES_PER_SLICE.saturating_add(1)
+        );
 
         assert!(
             owner
                 .process_worker_batch()
-                .expect("first scan entry should be processed")
+                .expect("staged scan batch should be applied")
         );
-        assert_eq!(owner.summary.scanned_entries, 1);
-        assert_eq!(owner.pending_scan_entries.len(), 1);
+        assert_eq!(
+            owner.summary.scanned_entries,
+            SCAN_ENTRIES_PER_INPUT_CHECK as u64
+        );
+        assert_eq!(
+            owner.pending_scan_entries.len(),
+            MAX_SCAN_ENTRIES_PER_SLICE
+                .saturating_add(1)
+                .saturating_sub(SCAN_ENTRIES_PER_INPUT_CHECK),
+            "an arriving keypress must preempt scan work before the producer batch drains"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn completed_target_reflows_immediately_while_its_copied_tile_departs() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let target_path = root.path().join("target");
+        std::fs::write(&target_path, vec![b'x'; 8 * 1024]).expect("test target should be created");
+        let survivor_path = root.path().join("survivor");
+        std::fs::write(&survivor_path, b"keep").expect("test survivor should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let target_metadata =
+            std::fs::symlink_metadata(&target_path).expect("test target metadata should exist");
+        let target_identity = crate::native_path::identity_for(&target_path, &target_metadata)
+            .expect("test target identity should be readable")
+            .expect("test target should not be a link");
+        let survivor_metadata =
+            std::fs::symlink_metadata(&survivor_path).expect("test survivor metadata should exist");
+        let survivor_identity =
+            crate::native_path::identity_for(&survivor_path, &survivor_metadata)
+                .expect("test survivor identity should be readable")
+                .expect("test survivor should not be a link");
+        let mut app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::MIN_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.add_entry_to_base_folder(&target_metadata, target_path.clone(), target_identity)
+            .expect("target should enter the model");
+        app.add_entry_to_base_folder(&survivor_metadata, survivor_path.clone(), survivor_identity)
+            .expect("survivor should enter the model");
+        app.complete_directory(root.path(), None)
+            .expect("root should complete");
+        app.finalize_scan().expect("scan should finalize");
+        app.start_ui();
+        let mut initial_animation = AnimationScheduler::new(true, false, Duration::ZERO);
+        app.render_if_dirty(
+            &mut initial_animation,
+            Duration::ZERO,
+            "test",
+            crate::theme::Theme::for_id(ThemeId::ExciseDark),
+            false,
+            false,
+            true,
+        )
+        .expect("target should render into the map");
+
+        let target = app
+            .request_deletion()
+            .expect("rendered target should delete");
+        let plan = crate::deletion::build_plan(root.path(), target.clone(), false)
+            .expect("target deletion plan should build");
+        assert!(app.queue_deletion_confirmation(target, false, 1024, Duration::ZERO));
+        assert!(app.show_next_deletion_confirmation());
+        let (work_id, confirmed) = app
+            .arm_and_confirm_deletion_target()
+            .expect("confirmation should arm deletion work");
+        assert!(app.queue_confirmed_deletion(work_id, confirmed, Duration::ZERO));
+        let _planning = app
+            .next_deletion_planning_work()
+            .expect("confirmed deletion should queue planning");
+        assert!(app.deletion_plan_ready(work_id, Box::new(plan)));
+        let execution = app
+            .next_deletion_execution_work()
+            .expect("planned deletion should queue execution");
+        let crate::state::deletion_work::DeletionWorkCommand::Execute { plan, .. } = execution
+        else {
+            panic!("queued deletion should enter its execution lane");
+        };
+        let report = crate::deletion::execute_plan(
+            root.path(),
+            *plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(report.target_was_removed());
+        assert!(!target_path.exists());
+
+        let scan_view_root = app.current_folder_path();
+        let mut owner = OwnerLoop {
+            app,
+            input: Box::new(PendingInput),
+            workers: None,
+            clock: Box::new(VirtualClock::new()),
+            animation: AnimationScheduler::new(false, false, Duration::ZERO),
+            settings: RuntimeSettings {
+                root: root.path().to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::MIN_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: false,
+                monochrome: false,
+                animate_loading: false,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: false,
+            },
+            temporary_storage: TemporaryStorage::default(),
+            summary: RunSummary::default(),
+            scan_active: false,
+            primary_scan_active: false,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries: VecDeque::new(),
+            pending_focused_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            rescan_active: false,
+            rescan_target: None,
+            cancelled_while_scanning: false,
+            exit_after_work: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: Duration::ZERO,
+            next_deletion_progress_frame: Duration::ZERO,
+            last_deletion_progress: None,
+        };
+
+        owner
+            .handle_worker_event(WorkerEvent::DeletionFinished { work_id, report })
+            .expect("deletion completion should enter the departure state");
+        assert!(owner.app.has_deletion_departure());
+        assert!(owner.app.map_is_transitioning());
+        assert!(owner.app.deletion_departure_deadline().is_some());
+        assert!(!owner.app.deletion_work.has_work());
+        assert!(!owner.app.can_exit_immediately());
+        let next_target = owner
+            .app
+            .request_deletion()
+            .expect("surviving node should be selectable before departure completes");
+        assert_eq!(next_target.full_path(), survivor_path);
+
+        let departure_deadline = owner
+            .app
+            .deletion_departure_deadline()
+            .expect("departure should have a deadline");
+        assert!(owner.clock.advance_to(departure_deadline));
         assert!(
-            !owner
-                .process_worker_batch()
-                .expect("pending input should preempt the second scan entry")
+            owner
+                .process_deletion_departure(false)
+                .expect("departure deadline should clear the copied tile")
         );
-        assert_eq!(owner.summary.scanned_entries, 1);
-        assert_eq!(owner.pending_scan_entries.len(), 1);
+        assert!(owner.app.deletion_departure_deadline().is_none());
+        assert!(owner.app.can_exit_immediately());
+        let next_target = owner
+            .app
+            .request_deletion()
+            .expect("surviving node should remain selectable after departure cleanup");
+        assert_eq!(next_target.full_path(), survivor_path);
+    }
+
+    #[test]
+    fn unchanged_deletion_progress_does_not_request_another_map_frame() {
+        let mut previous = None;
+        assert!(deletion_progress_changed(&mut previous, 8, 0));
+        assert!(!deletion_progress_changed(&mut previous, 8, 0));
+        assert!(deletion_progress_changed(&mut previous, 8, 1));
+        assert!(deletion_progress_changed(&mut previous, 16, 1));
+    }
+
+    #[test]
+    fn storage_limited_deletion_plan_explains_the_remedy() {
+        let error = DeletionPlanError::Io {
+            path: "target".to_string(),
+            message: "temporary storage capacity exhausted".to_string(),
+            kind: std::io::ErrorKind::StorageFull,
+        };
+
+        assert_eq!(
+            deletion_plan_failure_notice(&error),
+            "Deletion did not start: temporary storage limit reached; increase --temporary-storage-mib"
+        );
     }
 
     #[test]

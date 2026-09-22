@@ -565,18 +565,19 @@ impl FileTree {
         if self.scan_path_is_stale(entry_full_path) {
             return Ok(None);
         }
-        let pinned = self.pinned_nodes();
+        let filter = self.filter.as_ref();
+        let filter_root = self.filter_root.as_deref();
+        let current_path = self.current_path.as_slice();
         add_entry_to(
             &mut self.arena,
-            self.filter.as_ref(),
-            self.filter_root.as_deref(),
-            &pinned,
+            filter,
+            filter_root,
+            |arena| pinned_nodes_for(arena, current_path, filter_root),
             entry_metadata,
             entry_full_path,
             &identity,
         )
     }
-
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn add_focused_entry(
         &mut self,
@@ -587,18 +588,16 @@ impl FileTree {
         let stage = self.rescan.as_mut().ok_or_else(|| {
             ModelError::Invariant("focused scan entry arrived without a staging model".to_string())
         })?;
-        let pinned = HashSet::from([stage.arena.root()]);
         add_entry_to(
             &mut stage.arena,
             stage.filter.as_ref(),
             stage.filter_root.as_deref(),
-            &pinned,
+            |arena| HashSet::from([arena.root()]),
             entry_metadata,
             entry_full_path,
             &identity,
         )
     }
-
     #[allow(clippy::needless_pass_by_value)]
     pub fn record_unscanned(
         &mut self,
@@ -621,8 +620,14 @@ impl FileTree {
         if self.scan_path_is_stale(path) {
             return Ok(());
         }
-        let pinned = self.pinned_nodes();
-        record_unscanned_to(&mut self.arena, &pinned, path, &reason)
+        let filter_root = self.filter_root.as_deref();
+        let current_path = self.current_path.as_slice();
+        record_unscanned_to(
+            &mut self.arena,
+            |arena| pinned_nodes_for(arena, current_path, filter_root),
+            path,
+            &reason,
+        )
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -634,8 +639,12 @@ impl FileTree {
         let stage = self.rescan.as_mut().ok_or_else(|| {
             ModelError::Invariant("focused scan result arrived without a staging model".to_string())
         })?;
-        let pinned = HashSet::from([stage.arena.root()]);
-        record_unscanned_to(&mut stage.arena, &pinned, path, &reason)
+        record_unscanned_to(
+            &mut stage.arena,
+            |arena| HashSet::from([arena.root()]),
+            path,
+            &reason,
+        )
     }
 
     pub fn complete_directory(
@@ -812,13 +821,7 @@ impl FileTree {
     }
 
     fn pinned_nodes(&self) -> HashSet<NodeId> {
-        let mut pinned = self.current_path.iter().copied().collect::<HashSet<_>>();
-        if let Some(root) = self.filter_root.as_ref()
-            && let Some(ids) = self.arena.path_ids(root)
-        {
-            pinned.extend(ids);
-        }
-        pinned
+        pinned_nodes_for(&self.arena, &self.current_path, self.filter_root.as_deref())
     }
 
     fn restore_navigation(&mut self, previous_path: &Path) {
@@ -854,7 +857,7 @@ fn add_entry_to(
     arena: &mut Arena,
     filter: Option<&FilterPattern>,
     filter_root: Option<&Path>,
-    pinned: &HashSet<NodeId>,
+    mut pinned_nodes: impl FnMut(&Arena) -> HashSet<NodeId>,
     entry_metadata: &Metadata,
     entry_full_path: &Path,
     identity: &NativeIdentity,
@@ -872,7 +875,8 @@ fn add_entry_to(
         };
         match result {
             Err(error @ ModelError::MemoryExhausted { .. }) => {
-                if !arena.aggregate_cold_subtree(pinned)? {
+                let pinned = pinned_nodes(arena);
+                if !arena.aggregate_cold_subtree(&pinned)? {
                     return Err(error);
                 }
             }
@@ -883,14 +887,15 @@ fn add_entry_to(
 
 fn record_unscanned_to(
     arena: &mut Arena,
-    pinned: &HashSet<NodeId>,
+    mut pinned_nodes: impl FnMut(&Arena) -> HashSet<NodeId>,
     path: &Path,
     reason: &UnscannedReason,
 ) -> Result<(), ModelError> {
     loop {
         match arena.record_unscanned(path, reason.clone()) {
             Err(error @ ModelError::MemoryExhausted { .. }) => {
-                if !arena.aggregate_cold_subtree(pinned)? {
+                let pinned = pinned_nodes(arena);
+                if !arena.aggregate_cold_subtree(&pinned)? {
                     return Err(error);
                 }
             }
@@ -899,6 +904,19 @@ fn record_unscanned_to(
     }
 }
 
+fn pinned_nodes_for(
+    arena: &Arena,
+    current_path: &[NodeId],
+    filter_root: Option<&Path>,
+) -> HashSet<NodeId> {
+    let mut pinned = current_path.iter().copied().collect::<HashSet<_>>();
+    if let Some(root) = filter_root
+        && let Some(ids) = arena.path_ids(root)
+    {
+        pinned.extend(ids);
+    }
+    pinned
+}
 fn node_matches_planned_identity(node: &Node, planned: &PlannedSnapshot) -> bool {
     let kind_matches = matches!(
         (node.kind, planned.kind),
@@ -937,7 +955,7 @@ mod tests {
     };
     #[cfg(any(unix, windows))]
     use crate::model::ByteBounds;
-    use crate::model::{NodeKind, SyntheticKind};
+    use crate::model::{NodeKind, NodeState, SyntheticKind};
     use crate::native_path::identity_for;
     #[cfg(any(unix, windows))]
     use crate::state::FileToDelete;
@@ -993,6 +1011,46 @@ mod tests {
         state
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn fitting_entry_does_not_construct_compaction_pins() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let entry = root.path().join("entry");
+        fs::write(&entry, b"payload").expect("fixture entry should exist");
+        let metadata = fs::symlink_metadata(&entry).expect("fixture metadata should exist");
+        let identity = identity_for(&entry, &metadata)
+            .expect("fixture identity should be readable")
+            .expect("fixture should not be a link");
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            false,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("tree should be created");
+        let pins_constructed = std::cell::Cell::new(false);
+
+        assert!(
+            add_entry_to(
+                &mut tree.arena,
+                None,
+                None,
+                |_| {
+                    pins_constructed.set(true);
+                    HashSet::new()
+                },
+                &metadata,
+                &entry,
+                &identity,
+            )
+            .expect("fitting entry should be retained")
+            .is_some()
+        );
+        assert!(
+            !pins_constructed.get(),
+            "compaction pins are only needed after model memory is exhausted"
+        );
+    }
+
     #[test]
     fn focused_glob_rescan_keeps_matches_and_exact_other() {
         let root = tempfile::tempdir().expect("rescan root should exist");
@@ -1035,11 +1093,11 @@ mod tests {
         let other = files
             .iter()
             .find(|file| file.synthetic_kind == Some(SyntheticKind::Other))
-            .expect("filtered entries should have a virtual summary");
-        assert!(!other.is_interactive());
+            .expect("filtered entries should have a grouped summary");
+        assert!(other.is_interactive());
         let other_path = tree
             .path_for_id(other.node_id)
-            .expect("virtual summary should retain a model path");
+            .expect("grouped summary should retain a model path");
         assert!(matches!(
             tree.deletion_target_for_path(&other_path),
             Err(crate::model::ModelError::Invariant(_))
@@ -1153,6 +1211,11 @@ mod tests {
             .expect("incomplete model deletion should reconcile its retained target");
         assert!(!parent.exists());
         assert!(tree.arena.path_ids(&parent).is_none());
+        assert_eq!(
+            tree.total_node().state,
+            NodeState::Scanning,
+            "reconciliation must not finalize an active primary scan"
+        );
     }
     #[test]
     fn focused_rescan_staging_uses_only_remaining_live_model_budget() {

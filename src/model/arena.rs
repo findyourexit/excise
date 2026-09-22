@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{self, Metadata};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -281,10 +281,19 @@ impl Arena {
             return Ok(Some(self.root));
         }
 
-        let components = relative.iter().map(OsStr::to_os_string).collect::<Vec<_>>();
+        let mut components = relative.iter().peekable();
         let mut parent = self.root;
         let mut aggregate_at_parent = false;
-        for component in &components[..components.len() - 1] {
+        let name = loop {
+            let component = components
+                .next()
+                .ok_or_else(|| ModelError::InvalidPath("entry had no filename".to_string()))?;
+            if components.peek().is_none() {
+                break component;
+            }
+            if aggregate_at_parent {
+                continue;
+            }
             if let Some(existing) = self.find_child(parent, component) {
                 if self
                     .node(existing)
@@ -294,17 +303,14 @@ impl Arena {
                     continue;
                 }
                 aggregate_at_parent = true;
-                break;
+                continue;
             }
             if self.retained_child_count(parent) >= self.max_children_per_directory {
                 aggregate_at_parent = true;
-                break;
+                continue;
             }
             parent = self.ensure_directory(parent, component)?;
-        }
-        let name = components
-            .last()
-            .ok_or_else(|| ModelError::InvalidPath("entry had no filename".to_string()))?;
+        };
 
         let kind = if metadata.file_type().is_symlink() || identity.reparse_point {
             NodeKind::Link
@@ -341,21 +347,29 @@ impl Arena {
             },
             modified_nanos,
         };
-        if let Some(existing) = self.find_child(parent, name.as_os_str()) {
+        if let Some(existing) = self.find_child(parent, name) {
             if self
                 .node(existing)
                 .is_some_and(|node| node.kind.is_synthetic())
             {
                 aggregate_at_parent = true;
             } else {
+                let is_directory = kind.is_directory();
                 if let Some(node) = self.node_mut(existing) {
                     node.kind = kind;
                     node.snapshot = snapshot.clone();
+                    if is_directory && node.state == NodeState::Complete {
+                        node.state = NodeState::Scanning;
+                        node.directory_scan_finished = false;
+                    }
+                }
+                if is_directory {
+                    self.mark_directory_ancestors_scanning(existing);
                 }
                 return Ok(Some(existing));
             }
         }
-        let name: Arc<OsStr> = Arc::from(name.as_os_str());
+        let name: Arc<OsStr> = Arc::from(name);
         let at_child_limit = self.retained_child_count(parent) >= self.max_children_per_directory;
         let replacement = if !force_aggregate && !aggregate_at_parent && at_child_limit {
             let metrics = self.preview_leaf_metrics(kind, apparent, allocated, &identity)?;
@@ -407,6 +421,9 @@ impl Arena {
         self.insert_node(id, node)?;
         self.lookup.insert((parent, name), id);
         self.push_child(parent, id)?;
+        if kind.is_directory() {
+            self.mark_directory_ancestors_scanning(parent);
+        }
         self.propagate_add(
             parent,
             self.node(id)
@@ -429,8 +446,7 @@ impl Arena {
         let relative = path.strip_prefix(&self.root_path).map_err(|_| {
             ModelError::InvalidPath(format!("{} is outside scan root", path.to_string_lossy()))
         })?;
-        let components = relative.iter().map(OsStr::to_os_string).collect::<Vec<_>>();
-        if components.is_empty() {
+        if relative.as_os_str().is_empty() {
             if let Some(root) = self.node_mut(self.root) {
                 root.state = NodeState::Uncertain;
                 root.unscanned_reason = Some(reason);
@@ -446,9 +462,19 @@ impl Arena {
             }
             return Ok(());
         }
+        let mut components = relative.iter().peekable();
         let mut parent = self.root;
         let mut aggregate_at_parent = false;
-        for component in &components[..components.len() - 1] {
+        let name = loop {
+            let component = components
+                .next()
+                .ok_or_else(|| ModelError::InvalidPath("unscanned path had no name".to_string()))?;
+            if components.peek().is_none() {
+                break component;
+            }
+            if aggregate_at_parent {
+                continue;
+            }
             if let Some(existing) = self.find_child(parent, component) {
                 if self
                     .node(existing)
@@ -458,20 +484,15 @@ impl Arena {
                     continue;
                 }
                 aggregate_at_parent = true;
-                break;
+                continue;
             }
             if self.retained_child_count(parent) >= self.max_children_per_directory {
                 aggregate_at_parent = true;
-                break;
+                continue;
             }
             parent = self.ensure_directory(parent, component)?;
-        }
-        let name: Arc<OsStr> = Arc::from(
-            components
-                .last()
-                .ok_or_else(|| ModelError::InvalidPath("unscanned path had no name".to_string()))?
-                .as_os_str(),
-        );
+        };
+        let name: Arc<OsStr> = Arc::from(name);
         if let Some(existing) = self.find_child(parent, &name) {
             if self
                 .node(existing)
@@ -624,6 +645,7 @@ impl Arena {
         expected_identity: Option<&NativeIdentity>,
     ) -> Result<(), ModelError> {
         if let Some(id) = self.find_path(path) {
+            let mut direct_scan_finished = false;
             if let Some(expected_identity) = expected_identity {
                 // The scanner validates directory identity immediately before emitting
                 // completion, so the arena does not need to re-stat for an identity
@@ -641,28 +663,33 @@ impl Arena {
                             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
                             .map(|d| d.as_nanos());
                     }
-                    node.state = NodeState::Complete;
+                    node.directory_scan_finished = true;
                     node.snapshot.identity = Some(expected_identity.clone());
+                    direct_scan_finished = true;
                 }
-                return Ok(());
+            } else {
+                let metadata = fs::symlink_metadata(path).ok();
+                let identity = metadata
+                    .as_ref()
+                    .and_then(|metadata| identity_for(path, metadata).ok().flatten());
+                let modified_nanos = metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos());
+                if let Some(node) = self.node_mut(id)
+                    && node.state == NodeState::Scanning
+                {
+                    node.directory_scan_finished = true;
+                    node.snapshot.modified_nanos = modified_nanos;
+                    if let Some(identity) = identity {
+                        node.snapshot.identity = Some(identity);
+                    }
+                    direct_scan_finished = true;
+                }
             }
-            let metadata = fs::symlink_metadata(path).ok();
-            let identity = metadata
-                .as_ref()
-                .and_then(|metadata| identity_for(path, metadata).ok().flatten());
-            let modified_nanos = metadata
-                .as_ref()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos());
-            if let Some(node) = self.node_mut(id)
-                && node.state == NodeState::Scanning
-            {
-                node.state = NodeState::Complete;
-                node.snapshot.modified_nanos = modified_nanos;
-                if let Some(identity) = identity {
-                    node.snapshot.identity = Some(identity);
-                }
+            if direct_scan_finished {
+                self.settle_completed_directory_ancestors(id);
             }
             return Ok(());
         }
@@ -674,6 +701,51 @@ impl Arena {
             return Ok(());
         }
         Err(ModelError::InvalidPath(path.to_string_lossy().into_owned()))
+    }
+
+    fn directory_can_complete(&self, id: NodeId) -> bool {
+        self.node(id).is_some_and(|node| {
+            node.kind.is_directory()
+                && node.state == NodeState::Scanning
+                && node.directory_scan_finished
+                && node.children.iter().all(|child| {
+                    self.node(*child)
+                        .is_none_or(|child| child.state != NodeState::Scanning)
+                })
+        })
+    }
+
+    /// A direct completion can settle its ancestors only after every direct
+    /// directory child has itself stopped scanning.
+    fn settle_completed_directory_ancestors(&mut self, mut id: NodeId) {
+        while self.directory_can_complete(id) {
+            let parent = self.node(id).and_then(|node| node.parent);
+            if let Some(node) = self.node_mut(id) {
+                node.state = NodeState::Complete;
+            }
+            let Some(parent) = parent else {
+                break;
+            };
+            id = parent;
+        }
+    }
+
+    /// A late-arriving directory entry means every completed ancestor is once
+    /// again visibly growing until that child's completion reaches the root.
+    fn mark_directory_ancestors_scanning(&mut self, mut id: NodeId) {
+        loop {
+            let parent = self.node(id).and_then(|node| node.parent);
+            if let Some(node) = self.node_mut(id)
+                && node.kind.is_directory()
+                && node.state == NodeState::Complete
+            {
+                node.state = NodeState::Scanning;
+            }
+            let Some(parent) = parent else {
+                break;
+            };
+            id = parent;
+        }
     }
     pub fn finalize(&mut self) -> Result<(), ModelError> {
         self.sync_identity_accounting_uncertainty();
@@ -852,7 +924,7 @@ impl Arena {
             } else {
                 (self.reserve_untracked_slot(candidate, untracked)?, None)
             };
-        if let Err(error) = self.identities.remap_removed_nodes(&mut removed, candidate) {
+        if let Err(error) = self.rehome_removed_identity_nodes(&mut removed, candidate) {
             if let Some((source, source_metrics)) = recycled_untracked {
                 let recycled = self
                     .untracked_metrics
@@ -890,6 +962,44 @@ impl Arena {
         // former concrete child count into the synthetic summary. Its ancestors
         // therefore remain exact without collecting and sorting every live node.
         Ok(true)
+    }
+
+    /// Rehomes known leaf identities without sweeping unrelated spilled records.
+    ///
+    /// Concrete leaves retain their identity in their snapshot. A synthetic
+    /// summary can stand in for arbitrarily many identities, so it preserves
+    /// the full-store fallback needed to update every participant exactly.
+    fn rehome_removed_identity_nodes(
+        &mut self,
+        removed: &mut [NodeId],
+        replacement: NodeId,
+    ) -> Result<(), ModelError> {
+        removed.sort_unstable();
+        let mut file_ids = HashSet::new();
+        for id in removed.iter().copied() {
+            let Some(node) = self.node(id) else {
+                return self.identities.remap_removed_nodes(removed, replacement);
+            };
+            match node.kind {
+                NodeKind::Synthetic(_) => {
+                    return self.identities.remap_removed_nodes(removed, replacement);
+                }
+                NodeKind::File | NodeKind::Link => {
+                    let Some(identity) = node.snapshot.identity.as_ref() else {
+                        return self.identities.remap_removed_nodes(removed, replacement);
+                    };
+                    file_ids.insert(identity.file_id);
+                }
+                NodeKind::Root | NodeKind::Directory => {
+                    if let Some(identity) = node.snapshot.identity.as_ref() {
+                        file_ids.insert(identity.file_id);
+                    }
+                }
+            }
+        }
+        let file_ids = file_ids.into_iter().collect::<Vec<_>>();
+        self.identities
+            .remap_nodes_for_identities(&file_ids, removed, replacement)
     }
 
     pub fn remove_subtree(&mut self, root: NodeId) {
@@ -998,6 +1108,11 @@ impl Arena {
         self.remove_nodes(removal_order);
         self.remove_nodes(shared);
         self.identities = identities;
+        // Rebuilding a spilled identity store can exhaust the shared temporary
+        // storage even when the original store was still available. Observe that
+        // state before resetting leaf metrics, because there is then no record
+        // source from which to restore their known allocations.
+        self.sync_identity_accounting_uncertainty();
         self.refresh_surviving_link_counts(link_counts)?;
         self.prepare_identity_metrics();
         self.rebuild_identity_metrics(identity_scratch)?;
@@ -1568,6 +1683,12 @@ impl Arena {
     }
 
     fn prepare_identity_metrics(&mut self) {
+        // Once identity storage is exhausted, its records cannot reconstruct the
+        // allocations already observed by the live scan. Keep those leaf metrics;
+        // rebuild_metrics will recalculate ancestor totals after removed nodes go.
+        if self.identity_accounting_exhausted {
+            return;
+        }
         // Metrics are about to be rewritten from scratch, so any recorded
         // eviction order no longer describes the tree.
         self.clear_eviction_stashes();
@@ -1619,6 +1740,12 @@ impl Arena {
     }
 
     fn rebuild_identity_metrics(&mut self, replacement: IdentityStore) -> Result<(), ModelError> {
+        // This runs during deletion reconciliation as well as after a focused
+        // rescan. Preserve an in-flight primary scan rather than treating this
+        // accounting rebuild as its completion.
+        let root_was_scanning = self
+            .node(self.root)
+            .is_some_and(|root| root.state == NodeState::Scanning);
         let mut identities = std::mem::replace(&mut self.identities, replacement);
         let duplicate_bytes = self
             .duplicate_identities
@@ -1637,6 +1764,12 @@ impl Arena {
         result?;
         self.rebuild_metrics();
         self.finalize()?;
+        if root_was_scanning
+            && let Some(root) = self.node_mut(self.root)
+            && root.state == NodeState::Complete
+        {
+            root.state = NodeState::Scanning;
+        }
         Ok(())
     }
 
@@ -1652,12 +1785,12 @@ impl Arena {
         }
     }
 
-    fn ensure_directory(&mut self, parent: NodeId, name: &OsString) -> Result<NodeId, ModelError> {
+    fn ensure_directory(&mut self, parent: NodeId, name: &OsStr) -> Result<NodeId, ModelError> {
         if let Some(id) = self.find_child(parent, name) {
             return Ok(id);
         }
 
-        let name: Arc<OsStr> = Arc::from(name.as_os_str());
+        let name: Arc<OsStr> = Arc::from(name);
         let id = self.allocate_child_id(parent, &name)?;
         let node = Node::new(
             id,
@@ -1676,6 +1809,7 @@ impl Arena {
         self.insert_node(id, node)?;
         self.lookup.insert((parent, name), id);
         self.push_child(parent, id)?;
+        self.mark_directory_ancestors_scanning(parent);
         self.propagate_descendant(parent, 1);
         Ok(id)
     }
@@ -2034,28 +2168,15 @@ impl Arena {
         child: NodeId,
         other: NodeId,
     ) -> Result<(), ModelError> {
-        let (metrics, leaf_identity) = self
+        let metrics = self
             .node(child)
-            .map(|node| {
-                let identity = if node.children.is_empty() {
-                    node.snapshot.identity.clone()
-                } else {
-                    None
-                };
-                (node.metrics, identity)
-            })
+            .map(|node| node.metrics)
             .ok_or_else(|| ModelError::Invariant("retained child disappeared".to_string()))?;
         let untracked = self.untracked_metrics_for_subtree(child);
         let reserved = self.reserve_untracked_slot(other, untracked)?;
         let mut removed = Vec::new();
         self.collect_subtree_ids(child, &mut removed);
-        removed.sort_unstable();
-        let remap_result = if let Some(identity) = leaf_identity {
-            self.identities
-                .remap_nodes_for_identity(&identity.file_id, &removed, other)
-        } else {
-            self.identities.remap_removed_nodes(&mut removed, other)
-        };
+        let remap_result = self.rehome_removed_identity_nodes(&mut removed, other);
         if let Err(error) = remap_result {
             if reserved {
                 self.remove_untracked_metrics(other);
@@ -2959,6 +3080,58 @@ mod tests {
     }
 
     #[test]
+    fn directory_remains_scanning_until_directories_below_it_settle() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let first = root.path().join("first");
+        let later = root.path().join("later");
+        fs::create_dir(&first).expect("first directory should exist");
+        fs::create_dir(&later).expect("later directory should exist");
+        let mut arena = test_arena(root.path());
+        let first_id = add_path(&mut arena, &first).expect("first directory should be retained");
+
+        arena
+            .complete_directory(root.path(), None)
+            .expect("root direct scan should complete");
+        assert_eq!(
+            arena.node(arena.root()).map(|node| node.state),
+            Some(NodeState::Scanning)
+        );
+        assert_eq!(
+            arena.node(first_id).map(|node| node.state),
+            Some(NodeState::Scanning)
+        );
+
+        arena
+            .complete_directory(&first, None)
+            .expect("first directory scan should complete");
+        assert_eq!(
+            arena.node(first_id).map(|node| node.state),
+            Some(NodeState::Complete)
+        );
+        assert_eq!(
+            arena.node(arena.root()).map(|node| node.state),
+            Some(NodeState::Complete)
+        );
+
+        let later_id = add_path(&mut arena, &later).expect("later directory should be retained");
+        assert_eq!(
+            arena.node(arena.root()).map(|node| node.state),
+            Some(NodeState::Scanning)
+        );
+        arena
+            .complete_directory(&later, None)
+            .expect("later directory scan should complete");
+        assert_eq!(
+            arena.node(later_id).map(|node| node.state),
+            Some(NodeState::Complete)
+        );
+        assert_eq!(
+            arena.node(arena.root()).map(|node| node.state),
+            Some(NodeState::Complete)
+        );
+    }
+
+    #[test]
     fn finalization_and_deletion_rebuild_exact_metrics() {
         let root = tempfile::tempdir().expect("model root should exist");
         let directory = root.path().join("directory");
@@ -3650,6 +3823,11 @@ mod tests {
             arena
                 .aggregate_cold_subtree(&HashSet::from([arena.root()]))
                 .expect("cold subtree should compact")
+        );
+        assert_eq!(
+            arena.identities.broad_remap_scans(),
+            0,
+            "compacting known leaf identities must not scan every spilled identity"
         );
 
         let record = arena
@@ -5672,6 +5850,147 @@ mod tests {
         assert_eq!(root_node.metrics.reclaimable_bytes, ByteBounds::unknown());
         drop(arena);
         assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[test]
+    fn deletion_during_identity_capacity_uncertainty_preserves_known_live_metrics() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let target = root.path().join("target");
+        let target_child = target.join("target-child");
+        let survivor = root.path().join("survivor");
+        let capacity_trigger = root.path().join("capacity-trigger");
+        fs::create_dir(&target).expect("deletion target directory should exist");
+        fs::write(&target_child, b"target payload").expect("target child should exist");
+        fs::write(&survivor, b"survivor payload").expect("survivor should exist");
+        fs::write(&capacity_trigger, b"trigger payload").expect("trigger should exist");
+
+        let temporary_storage = TemporaryStorage::with_limit_bytes(256);
+        let mut arena = test_arena(root.path());
+        let target_id = add_path(&mut arena, &target).expect("target should be retained");
+        assert!(add_path(&mut arena, &target_child).is_some());
+        let survivor_id = add_path(&mut arena, &survivor).expect("survivor should be retained");
+        let survivor_metrics = arena
+            .node(survivor_id)
+            .expect("survivor should remain visible")
+            .metrics;
+        assert!(
+            survivor_metrics.allocated_bytes.lower > 0,
+            "fixture must have visible allocated bytes"
+        );
+
+        arena.identities = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+            .expect("bounded identity store should initialize");
+        assert!(add_path(&mut arena, &capacity_trigger).is_some());
+        assert!(arena.identity_accounting_exhausted);
+
+        assert!(
+            arena
+                .try_remove_path(&target)
+                .expect("deletion reconciliation should succeed")
+        );
+        assert!(arena.node(target_id).is_none());
+        assert_eq!(
+            arena
+                .node(survivor_id)
+                .expect("survivor should remain visible")
+                .metrics,
+            survivor_metrics,
+            "reconciliation must not erase metrics whose identity records are unavailable"
+        );
+    }
+
+    #[test]
+    fn deletion_rebuild_preserves_spilled_identity_metrics() {
+        let root = tempfile::tempdir().expect("model root should exist");
+        let target = root.path().join("target");
+        let target_child = target.join("target-child");
+        let survivor = root.path().join("survivor");
+        fs::create_dir(&target).expect("deletion target directory should exist");
+        fs::write(&target_child, b"target payload").expect("target child should exist");
+        fs::write(&survivor, b"survivor payload").expect("survivor should exist");
+
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let mut arena = test_arena(root.path());
+        arena.identities = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+            .expect("spilling identity store should initialize");
+        let target_id = add_path(&mut arena, &target).expect("target should be retained");
+        assert!(add_path(&mut arena, &target_child).is_some());
+        let survivor_id = add_path(&mut arena, &survivor).expect("survivor should be retained");
+        let survivor_metrics = arena
+            .node(survivor_id)
+            .expect("survivor should remain visible")
+            .metrics;
+        assert!(arena.identities.is_spilled());
+
+        assert!(
+            arena
+                .try_remove_path(&target)
+                .expect("deletion reconciliation should succeed")
+        );
+        assert!(arena.node(target_id).is_none());
+        assert_eq!(
+            arena
+                .node(survivor_id)
+                .expect("survivor should remain visible")
+                .metrics,
+            survivor_metrics
+        );
+    }
+
+    #[test]
+    fn deletion_rebuild_keeps_metrics_when_replacement_identity_store_exhausts_capacity() {
+        const STORAGE_LIMIT: u64 = 8 * 1024 * 1024;
+        const REBUILD_SESSION_HEADROOM: u64 = 256;
+
+        let root = tempfile::tempdir().expect("model root should exist");
+        let target = root.path().join("target");
+        let target_child = target.join("target-child");
+        let survivor = root.path().join("survivor");
+        fs::create_dir(&target).expect("deletion target directory should exist");
+        fs::write(&target_child, b"target payload").expect("target child should exist");
+        fs::write(&survivor, b"survivor payload").expect("survivor should exist");
+
+        let temporary_storage = TemporaryStorage::with_limit_bytes(STORAGE_LIMIT);
+        let mut arena = Arena::new_with_temporary_storage(
+            root.path().to_path_buf(),
+            MemoryBudget::from_mib(MIN_PROCESS_MIB).expect("model budget should be available"),
+            temporary_storage.clone(),
+        )
+        .expect("arena should be created");
+        arena.identities = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+            .expect("spilling identity store should initialize");
+        let target_id = add_path(&mut arena, &target).expect("target should be retained");
+        assert!(add_path(&mut arena, &target_child).is_some());
+        let survivor_id = add_path(&mut arena, &survivor).expect("survivor should be retained");
+        let survivor_metrics = arena
+            .node(survivor_id)
+            .expect("survivor should remain visible")
+            .metrics;
+        assert!(arena.identities.is_spilled());
+
+        let available = STORAGE_LIMIT
+            .checked_sub(temporary_storage.used())
+            .and_then(|available| available.checked_sub(REBUILD_SESSION_HEADROOM))
+            .expect("fixture identity spill should leave room for one session marker");
+        let _held_storage = temporary_storage
+            .reservation(available)
+            .expect("fixture should reserve replacement database capacity");
+
+        assert!(
+            arena
+                .try_remove_path(&target)
+                .expect("deletion reconciliation should succeed")
+        );
+        assert!(arena.node(target_id).is_none());
+        assert!(arena.identity_accounting_exhausted);
+        assert_eq!(
+            arena
+                .node(survivor_id)
+                .expect("survivor should remain visible")
+                .metrics,
+            survivor_metrics,
+            "replacement-store exhaustion must not erase observed survivor metrics"
+        );
     }
 
     #[test]

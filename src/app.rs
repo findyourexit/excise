@@ -15,7 +15,7 @@ use crate::deletion::{
 };
 use crate::error::AppError;
 use crate::filter::FilterPattern;
-use crate::model::{ModelError, SyntheticKind, UnscannedReason};
+use crate::model::{ModelError, NodeId, SyntheticKind, UnscannedReason};
 use crate::native_path::NativeIdentity;
 use crate::outcome::RunSummary;
 use crate::report::{
@@ -24,7 +24,7 @@ use crate::report::{
 };
 use crate::state::deletion_work::{DeletionWork, DeletionWorkCommand, DeletionWorkId};
 use crate::state::files::FileTree;
-use crate::state::tiles::{Board, Pivot};
+use crate::state::tiles::{Board, HALF_ROWS_PER_CELL, Pivot};
 use crate::state::{FileToDelete, UiEffects};
 use crate::temporary_storage::TemporaryStorage;
 use crate::theme::{Theme, ThemeId};
@@ -345,7 +345,10 @@ where
         let has_selection = self.board.currently_selected().is_some();
         // Rendering lays out the board and can establish or clear its selection.
         let selection_changed = self.ui_mode.allows_motion() && selection_before != has_selection;
+        let background_work = matches!(self.ui_mode, UiMode::Loading | UiMode::Rescanning { .. })
+            || self.deletion_work.has_background_activity();
         let animate_focus = self.ui_mode.allows_motion()
+            && !background_work
             && has_selection
             && !ascii
             && !monochrome
@@ -356,10 +359,19 @@ where
             && !monochrome
             && !reduced_motion
             && ColorCycle::can_animate(theme.focus);
-        // A live progress counter is the only background state that requests
-        // frame cadence; queued work redraws on state transitions alone.
-        animation.set_activity(
-            animate_focus || animate_modal || self.deletion_work.has_active_mutation(),
+        let animate_deletion_checker = !ascii
+            && !monochrome
+            && !reduced_motion
+            && ColorCycle::can_animate(theme.focus)
+            && self.deletion_work.has_checker_animation(now);
+        // Short map feedback keeps its responsive cadence. Persistent chrome is
+        // deliberately slower, and execution progress redraws from its own timer.
+        animation.set_activity_with_cadence(
+            animate_focus
+                || animate_modal
+                || animate_deletion_checker
+                || self.ui_effects.has_deletion_departure(),
+            animate_deletion_checker || self.ui_effects.has_deletion_departure(),
         );
         // The map transition runs on wall-clock time, so the loop has to keep waking up
         // until it settles. Nothing else in the frame would ask for those frames.
@@ -705,7 +717,7 @@ where
         else {
             return EnterAction::None;
         };
-        if self.deletion_work.status_for_node(id).is_some() {
+        if self.deletion_target_is_busy(id) {
             return EnterAction::None;
         }
         match synthetic_kind {
@@ -754,7 +766,7 @@ where
         let Some(target) = self.board.currently_selected().map(|tile| tile.node_id) else {
             return;
         };
-        if self.deletion_work.status_for_node(target).is_some() {
+        if self.deletion_target_is_busy(target) {
             return;
         }
         let pivot = self
@@ -810,11 +822,7 @@ where
             return None;
         }
         let selected = self.board.currently_selected()?;
-        if self
-            .deletion_work
-            .status_for_node(selected.node_id)
-            .is_some()
-        {
+        if self.deletion_target_is_busy(selected.node_id) {
             return None;
         }
         let path = self.file_tree.path_for_id(selected.node_id)?;
@@ -854,11 +862,14 @@ where
         target: FileToDelete,
         reduced_guardrails: bool,
         maximum_bytes: usize,
+        now: Duration,
     ) -> bool {
-        match self
-            .deletion_work
-            .enqueue_confirmation(target, reduced_guardrails, maximum_bytes)
-        {
+        match self.deletion_work.enqueue_confirmation(
+            target,
+            reduced_guardrails,
+            maximum_bytes,
+            now,
+        ) {
             Ok(_) => {
                 self.sync_deletion_work_summary();
                 true
@@ -940,6 +951,61 @@ where
     }
 
     #[must_use]
+    pub(crate) fn begin_deletion_departure(
+        &mut self,
+        node_id: NodeId,
+        deleted_entries: u64,
+        now: Duration,
+    ) -> bool {
+        if !self.ui_mode.allows_motion() || self.board.is_list_layout() {
+            return false;
+        }
+        let Some(tile) = self
+            .board
+            .rendered_tiles()
+            .iter()
+            .find(|tile| tile.node_id == node_id)
+        else {
+            return false;
+        };
+        let tile_cells = u64::from(tile.width)
+            .saturating_mul(u64::from(tile.height).div_ceil(u64::from(HALF_ROWS_PER_CELL)));
+        let duration = crate::state::deletion_departure_duration(deleted_entries, tile_cells);
+        self.ui_effects
+            .begin_deletion_departure(tile.clone(), now, duration);
+        self.mark_dirty();
+        true
+    }
+
+    #[must_use]
+    pub(crate) fn deletion_departure_is_finished(&self, now: Duration) -> bool {
+        self.ui_effects.deletion_departure_is_finished(now)
+    }
+
+    #[must_use]
+    pub(crate) fn deletion_departure_deadline(&self) -> Option<Duration> {
+        self.ui_effects
+            .deletion_departure()
+            .map(|departure| departure.started_at.saturating_add(departure.duration))
+    }
+
+    #[must_use]
+    pub(crate) const fn has_deletion_departure(&self) -> bool {
+        self.ui_effects.has_deletion_departure()
+    }
+
+    pub(crate) fn clear_deletion_departure(&mut self) {
+        self.ui_effects.clear_deletion_departure();
+        self.mark_dirty();
+    }
+
+    #[must_use]
+    fn deletion_target_is_busy(&self, node_id: NodeId) -> bool {
+        self.deletion_work.status_for_node(node_id).is_some()
+            || self.ui_effects.has_deletion_departure_for(node_id)
+    }
+
+    #[must_use]
     pub fn deletion_work_summary(&self) -> crate::state::DeletionWorkSummary {
         self.deletion_work.summary()
     }
@@ -995,8 +1061,9 @@ where
         &mut self,
         work_id: DeletionWorkId,
         target: Box<FileToDelete>,
+        now: Duration,
     ) -> bool {
-        if !self.deletion_work.queue_confirmation(work_id, target) {
+        if !self.deletion_work.queue_confirmation(work_id, target, now) {
             self.show_error("Deletion confirmation did not match pending work");
             return false;
         }
@@ -1113,6 +1180,7 @@ where
 
     pub fn try_complete_deletion(&mut self, report: DeletionReport) -> Result<bool, AppError> {
         let deleted = report.deleted_entries() > 0;
+        // A visible departure owns its copied pre-reflow tile until its timer expires.
         if let Err(error) = self.file_tree.try_apply_deletion_report(&report) {
             self.replace_ui_mode(UiMode::ErrorMessage(format!(
                 "Deletion accounting failed: {error}"
@@ -1201,7 +1269,9 @@ where
 
     #[must_use]
     pub(crate) fn can_exit_immediately(&self) -> bool {
-        !self.preferences_dirty && !self.deletion_work.has_work()
+        !self.preferences_dirty
+            && !self.deletion_work.has_work()
+            && !self.ui_effects.has_deletion_departure()
     }
 
     #[must_use]
@@ -1562,12 +1632,12 @@ mod tests {
             .expect("selected directory should produce a deletion target");
         let selected_node = target.node_id;
         assert_eq!(target.file_type, FileType::Folder);
-        assert!(app.queue_deletion_confirmation(target, false, 1024));
+        assert!(app.queue_deletion_confirmation(target, false, 1024, Duration::ZERO));
         assert!(app.show_next_deletion_confirmation());
         let (work_id, target) = app
             .arm_and_confirm_deletion_target()
             .expect("directory confirmation should arm background planning");
-        assert!(app.queue_confirmed_deletion(work_id, target));
+        assert!(app.queue_confirmed_deletion(work_id, target, Duration::ZERO));
 
         let command = crate::input::handle_keypress(
             &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
@@ -1585,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn loading_selection_keeps_focus_chrome_animating() {
+    fn loading_selection_does_not_keep_focus_chrome_animating() {
         let root = tempfile::tempdir().expect("app root should exist");
         let entry = root.path().join("entry");
         std::fs::write(&entry, b"payload").expect("fixture entry should be created");
@@ -1607,13 +1677,12 @@ mod tests {
         let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
 
         draw(&mut app, &mut animation, 0);
+        app.mark_dirty();
+        draw(&mut app, &mut animation, 200);
 
         assert!(matches!(app.ui_mode, UiMode::Loading));
         assert!(app.board.currently_selected().is_some());
-        assert!(
-            animation.next_frame_at().is_some(),
-            "a visible selection must keep its animated loading border advancing"
-        );
+        assert_eq!(animation.next_frame_at(), None);
     }
 
     #[test]
@@ -2174,7 +2243,7 @@ mod tests {
 
     #[cfg(unix)]
     fn stage_deletion_confirmation<B: Backend>(app: &mut App<B>, plan: &DeletionPlan) {
-        assert!(app.queue_deletion_confirmation(plan.target.clone(), false, 1024));
+        assert!(app.queue_deletion_confirmation(plan.target.clone(), false, 1024, Duration::ZERO));
         assert!(app.show_next_deletion_confirmation());
         assert!(app.deletion_challenge().is_some());
     }
@@ -2259,7 +2328,7 @@ mod tests {
         .expect("app should initialize");
         app.loaded = true;
         app.ui_mode = UiMode::Normal;
-        assert!(app.queue_deletion_confirmation(plan.target, false, 1024));
+        assert!(app.queue_deletion_confirmation(plan.target, false, 1024, Duration::ZERO));
         assert!(app.show_next_deletion_confirmation());
         assert!(app.next_deletion_planning_work().is_none());
 
@@ -2268,7 +2337,7 @@ mod tests {
             .expect("Enter should return the target for background planning");
         assert_eq!(target.full_path(), expected_path);
         assert!(matches!(app.ui_mode, UiMode::Normal));
-        assert!(app.queue_confirmed_deletion(work_id, target));
+        assert!(app.queue_confirmed_deletion(work_id, target, Duration::ZERO));
         assert!(matches!(
             app.next_deletion_planning_work(),
             Some(DeletionWorkCommand::Plan { work_id: id, .. }) if id == work_id
