@@ -26,6 +26,7 @@ set edit:completion:arg-completer[excise] = {|@words|
             cand --temporary-storage-mib 'Directory-plan, deletion-result, and identity-spill storage limit per session (2+)'
             cand --scan-store-mib 'Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)'
             cand --scan-store-dir 'Parent directory for the private canonical scan-store session'
+            cand --scan-store-reserve-mib 'Scratch space preserved outside scan-store files (default: 25% of free space)'
             cand --theme 'Built-in semantic color theme'
             cand --keymap 'Keyboard preset. Arrows and safety keys always work'
             cand --format 'Output mode. Table and JSON never acquire a terminal'

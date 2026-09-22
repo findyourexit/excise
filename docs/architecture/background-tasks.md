@@ -22,12 +22,12 @@ A compacted aggregate directory keeps a verified concrete backing path and ident
 
 Planning, rebuilding, queueing, execution, and completion remain in the work rail. A ready plan becomes the normal confirmation dialog only when the foreground mode can present it. Accepted consent returns immediately to normal map navigation; the serial worker continues its final checks and mutation in the background.
 
-The primary scanner is breadth-first. Entering and leaving visible folders uses immutable canonical page queries and never starts a focused scan or reorders scanner work. A mutation that invalidates a published generation may schedule one root rebuild; until that rebuild publishes, the prior exact map is never mixed with live facts.
+The primary scanner is breadth-first. Entering and leaving visible folders uses immutable canonical page queries and never creates a folder-scoped scan or reorders scanner work. A mutation that invalidates a published generation may schedule one root rebuild through the persistent scanner; until that rebuild publishes, the prior exact map is never mixed with live facts.
 
 ## Bounds and Target Conflicts
 
 - `MAX_DELETION_WORK_ITEMS` caps every retained operation, including active work, confirmations, refreshes, and planner cancellation reservations.
-- Planner, executor, root-rebuild, and event channels have fixed capacities. Owner-loop submission is nonblocking; a rejected submission restores its item rather than dropping it.
+- Planner, executor, scanner-rebuild, and event channels have fixed capacities. Owner-loop submission is nonblocking; a rejected submission restores its item rather than dropping it.
 - A new item is rejected when its componentwise target path equals, contains, or is contained by a retained target. This prevents ancestor, descendant, and duplicate operations from racing.
 - A cancelled in-flight planner retains its reservation until its acknowledgement arrives. A generation rebuild retains its canonical session boundary until it publishes or is cancelled.
 - Deletion history has both a byte limit and a fixed report-count cap. Summaries retain only fixed-size counters and an atomic progress value; reports stream directly from bounded resident or authenticated spill storage.

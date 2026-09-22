@@ -1260,27 +1260,21 @@ impl BenchmarkScan {
         self.await_scan_finished(false)
     }
 
+    pub(crate) fn start_focus_scan(&self) -> Result<(), AppError> {
+        self.workers()?
+            .request_generation_rebuild(self.options.clone())
+    }
+
     pub(crate) fn focus_latency(&self, paths: &[PathBuf]) -> Result<Duration, AppError> {
         let workers = self.workers()?;
-        let waiting_started = Instant::now();
-        let snapshot = loop {
-            if let Some(snapshot) = workers.scheduler_snapshot() {
-                break snapshot;
-            }
-            if waiting_started.elapsed() >= Self::COMPLETION_TIMEOUT {
-                return Err(AppError::Worker(
-                    "scanner benchmark did not publish a scheduler snapshot".to_string(),
-                ));
-            }
-            std::thread::sleep(Duration::from_micros(50));
-        };
+        let snapshot = self.await_active_scan()?;
         let initial_epoch = snapshot.focus_epoch();
         let started = Instant::now();
-        for path in paths {
-            workers.prioritize_scan(path);
-        }
         let required = u64::try_from(paths.len()).unwrap_or(u64::MAX);
         loop {
+            for path in paths {
+                workers.prioritize_scan(path);
+            }
             if workers.scheduler_snapshot().is_some_and(|snapshot| {
                 snapshot.focus_epoch().wrapping_sub(initial_epoch) >= required
             }) {
@@ -1297,12 +1291,29 @@ impl BenchmarkScan {
 
     pub(crate) fn cancel_rebuild_latency(&self) -> Result<Duration, AppError> {
         let workers = self.workers()?;
-        workers.request_generation_rebuild(self.options.clone())?;
+        workers.request_pre_cancelled_generation_rebuild(self.options.clone())?;
         let started = Instant::now();
-        workers.cancel_generation_rebuild();
         let result = self.await_scan_finished(true).map(|_| started.elapsed());
         workers.finish_generation_rebuild();
         result
+    }
+
+    fn await_active_scan(&self) -> Result<SchedulerSnapshot, AppError> {
+        let workers = self.workers()?;
+        let waiting_started = Instant::now();
+        loop {
+            if let Some(snapshot) = workers.scheduler_snapshot()
+                && (snapshot.active_leases() > 0 || snapshot.pending().total() > 0)
+            {
+                return Ok(snapshot);
+            }
+            if waiting_started.elapsed() >= Self::COMPLETION_TIMEOUT {
+                return Err(AppError::Worker(
+                    "scanner benchmark did not begin scan work".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
     }
 
     fn workers(&self) -> Result<&WorkerPool, AppError> {

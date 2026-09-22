@@ -6,6 +6,7 @@ complete -c excise -l memory-mib -d 'Whole-process memory envelope in MiB' -r
 complete -c excise -l temporary-storage-mib -d 'Directory-plan, deletion-result, and identity-spill storage limit per session (2+)' -r
 complete -c excise -l scan-store-mib -d 'Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)' -r
 complete -c excise -l scan-store-dir -d 'Parent directory for the private canonical scan-store session' -r -F
+complete -c excise -l scan-store-reserve-mib -d 'Scratch space preserved outside scan-store files (default: 25% of free space)' -r
 complete -c excise -l theme -d 'Built-in semantic color theme' -r -f -a "excise-dark\t''
 excise-light\t''
 high-contrast\t''

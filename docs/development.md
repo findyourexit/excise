@@ -265,7 +265,21 @@ cargo +1.98.0 bench --bench tachyonfx --features internal --locked -- --noplot
 cargo +1.98.0 bench --bench core --features internal --locked -- --noplot
 ```
 
-`core` measures the flat canonical-store amplification matrix at 1,024 and 16,384 entries (`scan-store/storage-amplification/publish-flat/*`) and sparse late-page reads at each size (`scan-store/query-latency/late-page-flat/*`). `tachyonfx` measures completion-frame processing at `80x24`, `160x50`, and `200x80`; the scheduler's unit matrix verifies the corresponding small, medium, large, persistent-chrome, and geometry frame cadences.
+Run the one-million-tiny-file scale probe explicitly. It starts from premerged raw facts to isolate canonical reduction and late-page query cost; the bounded workload matrix continues to measure scanner-batch fan-in. The probe uses a 2,048 MiB private scan-store ceiling, leaving deliberate headroom above its measured temporary peak, and is intentionally outside the default hosted matrix.
+
+```console
+EXCISE_BENCH_MILLION=1 cargo +1.98.0 bench --bench core --features internal --locked -- scan-store/million-tiny-files --noplot --profile-time 1
+```
+
+Measure the real bounded-batch million-file fan-in separately:
+
+```console
+EXCISE_BENCH_MILLION=1 EXCISE_BENCH_MILLION_FANIN=1 cargo +1.98.0 bench --bench core --features internal --locked -- scan-store/million-tiny-files/bounded-fan-in --noplot --profile-time 1
+```
+
+Both probes print deterministic logical serialized read/write bytes, per-observation ratios, merge write amplification, retained and peak temporary bytes, phase wall time, and Unix process CPU time. `--profile-time 1` performs one scale smoke; omit it on provisioned comparable hardware when collecting Criterion samples.
+
+`core` measures bounded-batch canonical publication and late-page queries across flat, fanout, deep, and shared-link workloads (`scan-store/publication/*` and `scan-store/page-query/*`). With `EXCISE_BENCH_MILLION=1`, it adds premerged one-million-file publication and late-page probes; `EXCISE_BENCH_MILLION_FANIN=1` additionally exercises the production bounded fan-in path. It also measures a fixed 16,512-entry real filesystem walk at one, two, and eight workers (`scanner/filesystem-walk/workers/*`), delivery of sixteen focus requests during an active scan (`scanner/focus-delivery/*`), and rebuild-cancellation acknowledgement (`scanner/rebuild-cancellation/*`). `tachyonfx` measures completion-frame processing at `80x24`, `160x50`, and `200x80`.
 
 To assess a reported regression, obtain the reference and candidate run IDs from their checks, download both evidence artifacts, and inspect their contexts before comparing measurements:
 

@@ -23,7 +23,7 @@ _excise() {
 
     case "${cmd}" in
         excise)
-            opts="-a -d -h -V --config --apparent-size --scan-threads --event-buffer --cross-filesystems --exclude --memory-mib --temporary-storage-mib --scan-store-mib --scan-store-dir --reduced-motion --theme --ascii --mouse --keymap --format --output --disable-delete-confirmation --help --version"
+            opts="-a -d -h -V --config --apparent-size --scan-threads --event-buffer --cross-filesystems --exclude --memory-mib --temporary-storage-mib --scan-store-mib --scan-store-dir --scan-store-reserve-mib --reduced-motion --theme --ascii --mouse --keymap --format --output --disable-delete-confirmation --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -58,6 +58,10 @@ _excise() {
                     return 0
                     ;;
                 --scan-store-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --scan-store-reserve-mib)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

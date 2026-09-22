@@ -313,18 +313,37 @@ impl WorkerPool {
         self.deletion_plan_cancelled.store(true, Ordering::Release);
     }
 
-    pub fn request_generation_rebuild(&self, mut options: ScannerOptions) -> Result<(), AppError> {
+    pub fn request_generation_rebuild(&self, options: ScannerOptions) -> Result<(), AppError> {
+        self.request_generation_rebuild_inner(options, false)
+    }
+
+    #[cfg(feature = "internal")]
+    pub(crate) fn request_pre_cancelled_generation_rebuild(
+        &self,
+        options: ScannerOptions,
+    ) -> Result<(), AppError> {
+        self.request_generation_rebuild_inner(options, true)
+    }
+
+    fn request_generation_rebuild_inner(
+        &self,
+        mut options: ScannerOptions,
+        pre_cancelled: bool,
+    ) -> Result<(), AppError> {
         options.session = self.scan_session;
-        self.scanner
-            .request_rebuild(options)
-            .map_err(|error| match error {
-                ScannerRequestError::Busy => {
-                    AppError::Invariant("scan rebuild queue is full".to_string())
-                }
-                ScannerRequestError::Disconnected => {
-                    AppError::Worker("scanner worker disconnected".to_string())
-                }
-            })
+        let request = if pre_cancelled {
+            self.scanner.request_pre_cancelled_rebuild(options)
+        } else {
+            self.scanner.request_rebuild(options)
+        };
+        request.map_err(|error| match error {
+            ScannerRequestError::Busy => {
+                AppError::Invariant("scan rebuild queue is full".to_string())
+            }
+            ScannerRequestError::Disconnected => {
+                AppError::Worker("scanner worker disconnected".to_string())
+            }
+        })
     }
 
     pub fn cancel_generation_rebuild(&self) {

@@ -29,6 +29,7 @@ Register-ArgumentCompleter -Native -CommandName 'excise' -ScriptBlock {
             [CompletionResult]::new('--temporary-storage-mib', '--temporary-storage-mib', [CompletionResultType]::ParameterName, 'Directory-plan, deletion-result, and identity-spill storage limit per session (2+)')
             [CompletionResult]::new('--scan-store-mib', '--scan-store-mib', [CompletionResultType]::ParameterName, 'Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)')
             [CompletionResult]::new('--scan-store-dir', '--scan-store-dir', [CompletionResultType]::ParameterName, 'Parent directory for the private canonical scan-store session')
+            [CompletionResult]::new('--scan-store-reserve-mib', '--scan-store-reserve-mib', [CompletionResultType]::ParameterName, 'Scratch space preserved outside scan-store files (default: 25% of free space)')
             [CompletionResult]::new('--theme', '--theme', [CompletionResultType]::ParameterName, 'Built-in semantic color theme')
             [CompletionResult]::new('--keymap', '--keymap', [CompletionResultType]::ParameterName, 'Keyboard preset. Arrows and safety keys always work')
             [CompletionResult]::new('--format', '--format', [CompletionResultType]::ParameterName, 'Output mode. Table and JSON never acquire a terminal')

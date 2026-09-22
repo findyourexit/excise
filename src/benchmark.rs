@@ -62,6 +62,20 @@ impl FilesystemScanBenchmark {
             .expect("benchmark initial scan should complete");
         benchmark
     }
+    /// Completes an initial scan, then starts a fresh generation for focus-delivery timing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scanner fixture cannot start its controlled focus scan.
+    #[must_use]
+    pub fn ready_for_focus(root: &Path, threads: usize) -> Self {
+        let benchmark = Self::ready_for_rebuild(root, threads);
+        benchmark
+            .scan
+            .start_focus_scan()
+            .expect("benchmark focus scan should start");
+        benchmark
+    }
 
     /// Returns the time until every requested focus reaches the scanner scheduler.
     ///
