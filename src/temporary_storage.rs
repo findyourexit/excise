@@ -1,11 +1,17 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(unix))]
+use sysinfo::Disks;
+
 use redb::StorageBackend;
 
-pub(crate) const DEFAULT_TEMPORARY_STORAGE_MIB: usize = 1024;
+pub(crate) const DEFAULT_TEMPORARY_STORAGE_MIB: usize = 4_096;
+pub(crate) const DEFAULT_SCAN_STORE_MIB: usize = 4_096;
+pub(crate) const MIN_SCAN_STORE_MIB: usize = 2;
 pub(crate) const MIN_TEMPORARY_STORAGE_MIB: usize = 2;
 const MIB: u64 = 1024 * 1024;
 
@@ -17,6 +23,8 @@ pub(crate) struct TemporaryStorage {
 #[derive(Debug)]
 struct TemporaryStorageState {
     limit: u64,
+    capacity_name: &'static str,
+    increase_flag: &'static str,
     used: AtomicU64,
 }
 
@@ -29,23 +37,117 @@ impl Default for TemporaryStorage {
 
 impl TemporaryStorage {
     pub(crate) fn from_mib(mib: usize) -> io::Result<Self> {
-        let bytes = u64::try_from(mib)
-            .ok()
-            .and_then(|mib| mib.checked_mul(MIB))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "temporary storage limit does not fit in bytes",
-                )
-            })?;
-        Ok(Self::with_limit_bytes(bytes))
+        Self::from_mib_named(mib, "temporary storage", "--temporary-storage-mib")
     }
 
+    #[cfg(any(test, feature = "internal"))]
+    pub(crate) fn scan_store_from_mib(mib: usize) -> io::Result<Self> {
+        Self::from_mib_named(mib, "scan store", "--scan-store-mib")
+    }
+
+    /// Bounds the configured scan-store budget by the free space on its
+    /// actual scratch volume.
+    ///
+    /// The storage limit remains a logical per-session cap, but it can never
+    /// claim more bytes than the filesystem hosting its private run files has
+    /// available when the session starts.
+    pub(crate) fn scan_store_from_mib_for_scratch(mib: usize, scratch: &Path) -> io::Result<Self> {
+        let requested = mib_to_bytes(mib, "scan store")?;
+        let available = scratch_volume_available_bytes(scratch)?;
+        Ok(Self::with_limit_bytes_named(
+            scan_store_limit_bytes(requested, available),
+            "scan store",
+            "--scan-store-mib",
+        ))
+    }
+
+    fn from_mib_named(
+        mib: usize,
+        capacity_name: &'static str,
+        increase_flag: &'static str,
+    ) -> io::Result<Self> {
+        let bytes = mib_to_bytes(mib, capacity_name)?;
+        Ok(Self::with_limit_bytes_named(
+            bytes,
+            capacity_name,
+            increase_flag,
+        ))
+    }
+}
+
+fn mib_to_bytes(mib: usize, capacity_name: &str) -> io::Result<u64> {
+    u64::try_from(mib)
+        .ok()
+        .and_then(|mib| mib.checked_mul(MIB))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{capacity_name} limit does not fit in bytes"),
+            )
+        })
+}
+
+const fn scan_store_limit_bytes(requested: u64, available: u64) -> u64 {
+    if requested < available {
+        requested
+    } else {
+        available
+    }
+}
+
+#[cfg(unix)]
+fn scratch_volume_available_bytes(scratch: &Path) -> io::Result<u64> {
+    let statistics = rustix::fs::statvfs(scratch).map_err(io::Error::from)?;
+    let block_size = statistics.f_frsize.max(statistics.f_bsize);
+    statistics.f_bavail.checked_mul(block_size).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scratch volume available-space calculation overflowed",
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn scratch_volume_available_bytes(scratch: &Path) -> io::Result<u64> {
+    let scratch = std::fs::canonicalize(scratch)?;
+    let disks = Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| scratch.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count())
+        .map(sysinfo::Disk::available_space)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "could not identify the filesystem holding scan-store scratch storage",
+            )
+        })
+}
+
+impl TemporaryStorage {
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_limit_bytes(limit: u64) -> Self {
+        Self::with_limit_bytes_named(limit, "temporary storage", "--temporary-storage-mib")
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn scan_store_with_limit_bytes(limit: u64) -> Self {
+        Self::with_limit_bytes_named(limit, "scan store", "--scan-store-mib")
+    }
+
+    fn with_limit_bytes_named(
+        limit: u64,
+        capacity_name: &'static str,
+        increase_flag: &'static str,
+    ) -> Self {
         Self {
             state: Arc::new(TemporaryStorageState {
                 limit,
+                capacity_name,
+                increase_flag,
                 used: AtomicU64::new(0),
             }),
         }
@@ -58,8 +160,8 @@ impl TemporaryStorage {
                 io::Error::new(
                     io::ErrorKind::StorageFull,
                     format!(
-                        "temporary storage capacity exhausted: more than {} bytes are required; increase --temporary-storage-mib",
-                        self.state.limit
+                        "{} capacity exhausted: more than {} bytes are required; increase {}",
+                        self.state.capacity_name, self.state.limit, self.state.increase_flag,
                     ),
                 )
             })?;
@@ -67,8 +169,8 @@ impl TemporaryStorage {
                 return Err(io::Error::new(
                     io::ErrorKind::StorageFull,
                     format!(
-                        "temporary storage capacity exhausted: {required} bytes exceed the {} byte session limit; increase --temporary-storage-mib",
-                        self.state.limit
+                        "{} capacity exhausted: {required} bytes exceed the {} byte session limit; increase {}",
+                        self.state.capacity_name, self.state.limit, self.state.increase_flag,
                     ),
                 ));
             }
@@ -92,10 +194,14 @@ impl TemporaryStorage {
         })
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn used(&self) -> u64 {
         self.state.used.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub(crate) fn limit(&self) -> u64 {
+        self.state.limit
     }
 
     fn release(&self, bytes: u64) {
@@ -326,7 +432,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_temporary_storage_reserves_one_gib() {
+    fn default_temporary_storage_reserves_four_gib() {
+        assert_eq!(DEFAULT_TEMPORARY_STORAGE_MIB, 4_096);
         let storage = TemporaryStorage::default();
         let bytes = u64::try_from(DEFAULT_TEMPORARY_STORAGE_MIB)
             .expect("default temporary-storage MiB should fit")
@@ -338,6 +445,11 @@ mod tests {
         assert!(storage.reserve(1).is_err());
         drop(reservation);
         assert_eq!(storage.used(), 0);
+    }
+    #[test]
+    fn scan_store_quota_never_exceeds_scratch_volume_capacity() {
+        assert_eq!(scan_store_limit_bytes(8 * MIB, 3 * MIB), 3 * MIB);
+        assert_eq!(scan_store_limit_bytes(2 * MIB, 3 * MIB), 2 * MIB);
     }
 
     #[test]

@@ -330,4 +330,46 @@ mod tests {
             cell.symbol() == " " && cell.fg == Color::Green && cell.bg == Color::Green
         }));
     }
+
+    #[test]
+    fn frame_cadence_matrix_scales_by_surface_and_activity() {
+        enum Mode {
+            Effect,
+            Persistent,
+            Geometry,
+        }
+
+        let cases = [
+            (Rect::new(0, 0, 80, 24), Mode::Effect, ACTIVE_FRAME_INTERVAL),
+            (
+                Rect::new(0, 0, 160, 50),
+                Mode::Effect,
+                MEDIUM_FRAME_INTERVAL,
+            ),
+            (Rect::new(0, 0, 200, 80), Mode::Effect, LARGE_FRAME_INTERVAL),
+            (
+                Rect::new(0, 0, 200, 80),
+                Mode::Persistent,
+                PERSISTENT_ACTIVITY_FRAME_INTERVAL,
+            ),
+            (
+                Rect::new(0, 0, 200, 80),
+                Mode::Geometry,
+                ACTIVE_FRAME_INTERVAL,
+            ),
+        ];
+
+        for (surface, mode, expected) in cases {
+            let header = Rect::new(0, 0, surface.width, 3);
+            let mut buffer = Buffer::empty(surface);
+            let mut scheduler = AnimationScheduler::new(false, false, Duration::ZERO);
+            match mode {
+                Mode::Effect => scheduler.schedule_completion(),
+                Mode::Persistent => scheduler.set_activity_with_cadence(true, false),
+                Mode::Geometry => scheduler.set_geometry_active(true),
+            }
+            scheduler.process(Duration::ZERO, &mut buffer, header, surface);
+            assert_eq!(scheduler.next_frame_at(), Some(expected));
+        }
+    }
 }

@@ -103,7 +103,7 @@ fn headless_json_output_satisfies_the_published_schema() -> Result<()> {
     );
     let document: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(document["document_kind"], "scan-report");
-    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["schema_version"], 3);
     scan_report_validator()
         .validate(&document)
         .map_err(|error| anyhow::anyhow!("CLI JSON report violated its schema: {error}"))?;

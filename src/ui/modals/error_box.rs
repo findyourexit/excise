@@ -10,6 +10,7 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 pub struct ErrorBox<'a> {
     error_message: &'a str,
+    dismissal_hint: &'a str,
     theme: Theme,
     ascii: bool,
     chrome: ModalChrome,
@@ -22,8 +23,19 @@ impl<'a> ErrorBox<'a> {
         ascii: bool,
         chrome: ModalChrome,
     ) -> Self {
+        Self::with_chrome_and_hint(error_message, theme, ascii, chrome, "[Esc/q/Ctrl-C] close")
+    }
+
+    pub(crate) const fn with_chrome_and_hint(
+        error_message: &'a str,
+        theme: Theme,
+        ascii: bool,
+        chrome: ModalChrome,
+        dismissal_hint: &'a str,
+    ) -> Self {
         Self {
             error_message,
+            dismissal_hint,
             theme,
             ascii,
             chrome,
@@ -54,7 +66,7 @@ impl Widget for ErrorBox<'_> {
             Line::from(display_text(self.error_message)),
             Line::from(""),
             Line::styled(
-                "[Esc/q/Ctrl-C] close",
+                self.dismissal_hint,
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ])
@@ -96,5 +108,24 @@ mod tests {
         assert!(!text.contains('\u{202e}'));
         assert!(text.contains("ERROR"));
         assert!(text.contains("[Esc/q/Ctrl-C] close"));
+    }
+
+    #[test]
+    fn custom_error_hint_is_rendered() {
+        let area = Rect::new(0, 0, 40, 9);
+        let mut buffer = Buffer::empty(area);
+        ErrorBox::with_chrome_and_hint(
+            "scan results are unavailable",
+            Theme::for_id(ThemeId::ExciseDark),
+            false,
+            ModalChrome::new(std::time::Duration::ZERO, false, false),
+            "[q/Ctrl-C] exit",
+        )
+        .render(area, &mut buffer);
+        let text = buffer.content.iter().fold(String::new(), |mut text, cell| {
+            text.push_str(cell.symbol());
+            text
+        });
+        assert!(text.contains("[q/Ctrl-C] exit"));
     }
 }

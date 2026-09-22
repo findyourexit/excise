@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek as _, SeekFrom, Write as _};
+use std::path::PathBuf;
 
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -25,6 +26,7 @@ pub(crate) enum RunKind {
     AllocationContribution = 3,
     DirectorySummary = 4,
     ChildQuery = 5,
+    PathCatalog = 6,
 }
 
 impl RunKind {
@@ -41,6 +43,7 @@ impl RunKind {
             3 => Some(Self::AllocationContribution),
             4 => Some(Self::DirectorySummary),
             5 => Some(Self::ChildQuery),
+            6 => Some(Self::PathCatalog),
             _ => None,
         }
     }
@@ -104,25 +107,42 @@ pub(crate) enum RunError {
     TrailingData,
     #[error("scan run was already consumed")]
     AlreadyConsumed,
+    #[error("sealed run does not support indexed range reads")]
+    UnindexedRange,
     #[error("scan run count overflow")]
     CountOverflow,
     #[error("scan run byte offset overflow")]
     OffsetOverflow,
 }
 
+#[derive(Debug)]
+struct SparseRunIndex {
+    block_capacity: usize,
+    blocks: Vec<SparseRunBlock>,
+}
+
+#[derive(Debug)]
+struct SparseRunBlock {
+    first_key: Vec<u8>,
+    offset: u64,
+}
+
 /// Builds one sorted immutable run using bounded blocks and sequential writes.
 pub(crate) struct RunWriter {
     writer: BufWriter<File>,
-    reservation: TemporaryStorageReservation,
+    path: Option<PathBuf>,
+    reservation: Option<TemporaryStorageReservation>,
     descriptor: RunDescriptor,
     block_capacity: usize,
     block: Vec<u8>,
+    block_first_key: Option<Vec<u8>>,
     block_records: u32,
     total_records: u64,
     total_blocks: u64,
     bytes_written: u64,
     last_key: Vec<u8>,
     has_key: bool,
+    sparse_index: Option<Vec<SparseRunBlock>>,
 }
 
 impl RunWriter {
@@ -136,6 +156,17 @@ impl RunWriter {
         descriptor: RunDescriptor,
         block_capacity: usize,
     ) -> Result<Self, RunError> {
+        Self::new_with_path(file, None, reservation, descriptor, block_capacity)
+    }
+
+    /// Builds a run backed by a named private-session file.
+    pub(crate) fn new_with_path(
+        file: File,
+        path: Option<PathBuf>,
+        reservation: TemporaryStorageReservation,
+        descriptor: RunDescriptor,
+        block_capacity: usize,
+    ) -> Result<Self, RunError> {
         if block_capacity == 0 {
             return Err(RunError::ZeroBlockCapacity);
         }
@@ -144,16 +175,23 @@ impl RunWriter {
         }
         let mut writer = Self {
             writer: BufWriter::new(file),
-            reservation,
+            path,
+            reservation: Some(reservation),
             descriptor,
             block_capacity,
             block: Vec::with_capacity(block_capacity),
+            block_first_key: None,
             block_records: 0,
             total_records: 0,
             total_blocks: 0,
             bytes_written: 0,
             last_key: Vec::new(),
             has_key: false,
+            sparse_index: matches!(
+                descriptor.kind(),
+                RunKind::ChildQuery | RunKind::PathCatalog
+            )
+            .then(Vec::new),
         };
         let header = encode_header(descriptor, block_capacity)?;
         writer.write_reserved(&header)?;
@@ -193,6 +231,9 @@ impl RunWriter {
         {
             self.flush_block()?;
         }
+        if self.block.is_empty() && self.sparse_index.is_some() {
+            self.block_first_key = Some(key.to_vec());
+        }
         self.block.extend_from_slice(&key_length.to_le_bytes());
         self.block.extend_from_slice(&value_length.to_le_bytes());
         self.block.extend_from_slice(key);
@@ -211,23 +252,25 @@ impl RunWriter {
         Ok(())
     }
 
-    /// Seals, flushes, and syncs the run. Only a sealed run can be read.
+    /// Seals and flushes the run. Only a sealed run can be read.
     pub(crate) fn seal(mut self) -> Result<SealedRun, RunError> {
         self.flush_block()?;
         let footer = encode_footer(self.total_records, self.total_blocks);
         self.write_reserved(&footer)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
-        let file = self
-            .writer
-            .into_inner()
-            .map_err(std::io::IntoInnerError::into_error)?;
-
+        let file = self.writer.get_ref().try_clone()?;
+        let path = self.path.take();
         Ok(SealedRun {
             file: Some(file),
-            reservation: Some(self.reservation),
+            path,
+            reservation: self.reservation.take(),
             descriptor: self.descriptor,
             bytes: self.bytes_written,
+            sparse_index: self.sparse_index.map(|blocks| SparseRunIndex {
+                block_capacity: self.block_capacity,
+                blocks,
+            }),
         })
     }
 
@@ -243,6 +286,16 @@ impl RunWriter {
         header.extend_from_slice(&payload_length.to_le_bytes());
         header.extend_from_slice(&Sha256::digest(&self.block));
         debug_assert_eq!(header.len(), BLOCK_HEADER_BYTES);
+        if let Some(index) = self.sparse_index.as_mut() {
+            let first_key = self
+                .block_first_key
+                .take()
+                .expect("an indexed nonempty block has a first key");
+            index.push(SparseRunBlock {
+                first_key,
+                offset: self.bytes_written,
+            });
+        }
         self.write_reserved(&header)?;
         let payload = std::mem::take(&mut self.block);
         self.write_reserved(&payload)?;
@@ -260,7 +313,10 @@ impl RunWriter {
             .bytes_written
             .checked_add(u64::try_from(bytes.len()).map_err(|_| RunError::OffsetOverflow)?)
             .ok_or(RunError::OffsetOverflow)?;
-        self.reservation.grow_to(next)?;
+        self.reservation
+            .as_mut()
+            .expect("run writer must retain its reservation")
+            .grow_to(next)?;
         self.writer.write_all(bytes)?;
         self.bytes_written = next;
         Ok(())
@@ -271,9 +327,20 @@ impl RunWriter {
 #[derive(Debug)]
 pub(crate) struct SealedRun {
     file: Option<File>,
+    path: Option<PathBuf>,
     reservation: Option<TemporaryStorageReservation>,
     descriptor: RunDescriptor,
     bytes: u64,
+    sparse_index: Option<SparseRunIndex>,
+}
+
+impl Drop for SealedRun {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl SealedRun {
@@ -287,6 +354,44 @@ impl SealedRun {
         self.bytes
     }
 
+    /// Reopens one manifest-owned private-session run and validates its footer.
+    pub(crate) fn open_named(
+        file: File,
+        path: PathBuf,
+        reservation: TemporaryStorageReservation,
+        descriptor: RunDescriptor,
+        bytes: u64,
+    ) -> Result<Self, RunError> {
+        if file.metadata()?.len() != bytes {
+            return Err(RunError::Truncated);
+        }
+        let sparse_index = matches!(
+            descriptor.kind(),
+            RunKind::ChildQuery | RunKind::PathCatalog
+        )
+        .then(|| rebuild_sparse_index(&file, bytes))
+        .transpose()?;
+        let mut file = file;
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = RunReader::open(file, Some(path), reservation, bytes, sparse_index)
+            .map_err(|mut error| {
+                error
+                    .error
+                    .take()
+                    .expect("open error should retain its error")
+            })?;
+        if reader.descriptor() != descriptor {
+            return Err(RunError::InvalidHeader);
+        }
+        reader.visit_records(|_, _| Ok(()))?;
+        Ok(reader.into_sealed())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preserve_path_for_recovery(&mut self) {
+        let _ = self.path.take();
+    }
+
     /// # Errors
     ///
     /// Returns an error when the sealed file cannot be rewound and validated.
@@ -297,7 +402,20 @@ impl SealedRun {
             .take()
             .expect("sealed run must own its reservation");
         file.seek(SeekFrom::Start(0))?;
-        RunReader::open(file, reservation, self.bytes).map_err(|error| error.error)
+        let path = self.path.take();
+        RunReader::open(
+            file,
+            path,
+            reservation,
+            self.bytes,
+            self.sparse_index.take(),
+        )
+        .map_err(|mut error| {
+            error
+                .error
+                .take()
+                .expect("open error should retain its error")
+        })
     }
 
     /// Borrows this sealed run for one sequential pass, restoring ownership
@@ -314,40 +432,115 @@ impl SealedRun {
         E: From<RunError>,
     {
         let mut file = self.file.take().expect("sealed run must own a file");
+        let path = self.path.take();
         let reservation = self
             .reservation
             .take()
             .expect("sealed run must own its reservation");
+        let sparse_index = self.sparse_index.take();
         if let Err(error) = file.seek(SeekFrom::Start(0)) {
             self.file = Some(file);
+            self.path = path;
             self.reservation = Some(reservation);
+            self.sparse_index = sparse_index;
             return Err(E::from(RunError::Io(error)));
         }
-        let mut reader = match RunReader::open(file, reservation, self.bytes) {
+        let mut reader = match RunReader::open(file, path, reservation, self.bytes, sparse_index) {
             Ok(reader) => reader,
-            Err(error) => {
+            Err(mut error) => {
                 self.file = Some(error.file);
+                self.path = error.path.take();
                 self.reservation = Some(error.reservation);
-                return Err(E::from(error.error));
+                self.sparse_index = error.sparse_index;
+                return Err(E::from(
+                    error
+                        .error
+                        .take()
+                        .expect("open error should retain its error"),
+                ));
             }
         };
         let result = visit(&mut reader);
-        let restored = reader.into_sealed();
-        self.file = restored.file;
-        self.reservation = restored.reservation;
+        let mut restored = reader.into_sealed();
+        self.file = restored.file.take();
+        self.path = restored.path.take();
+        self.reservation = restored.reservation.take();
+        self.sparse_index = restored.sparse_index.take();
         result
+    }
+    /// Starts a checksum-validating read near `lower_bound` using a sparse
+    /// block index captured while this immutable child-query run was written.
+    ///
+    /// The reader may return records before `lower_bound` from the preceding
+    /// block; callers compare keys before consuming them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this is not an indexed child-query run or its
+    /// backing file cannot be cloned and positioned.
+    pub(crate) fn range_reader(&self, lower_bound: &[u8]) -> Result<RunRangeReader, RunError> {
+        if !matches!(
+            self.descriptor.kind(),
+            RunKind::ChildQuery | RunKind::PathCatalog
+        ) {
+            return Err(RunError::UnindexedRange);
+        }
+        let index = self.sparse_index.as_ref().ok_or(RunError::UnindexedRange)?;
+        let footer_bytes = u64::try_from(FOOTER_BYTES).expect("footer length fits u64");
+        let fallback = self
+            .bytes
+            .checked_sub(footer_bytes)
+            .ok_or(RunError::InvalidBlock)?;
+        let block = index
+            .blocks
+            .partition_point(|block| block.first_key.as_slice() <= lower_bound)
+            .checked_sub(1)
+            .and_then(|position| index.blocks.get(position));
+        let offset = block.map_or(fallback, |block| block.offset);
+        let mut file = self
+            .file
+            .as_ref()
+            .expect("sealed run must retain its file")
+            .try_clone()?;
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(RunRangeReader::new(file, index.block_capacity))
     }
 }
 
 struct RunOpenError {
-    error: RunError,
+    error: Option<RunError>,
     file: File,
+    path: Option<PathBuf>,
     reservation: TemporaryStorageReservation,
+    sparse_index: Option<SparseRunIndex>,
+}
+
+struct RunPathGuard {
+    path: Option<PathBuf>,
+}
+
+impl RunPathGuard {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self { path }
+    }
+
+    fn take(&mut self) -> Option<PathBuf> {
+        self.path.take()
+    }
+}
+
+impl Drop for RunPathGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Sequential reader for a sealed run with one reusable decoded block.
 pub(crate) struct RunReader {
     reader: BufReader<File>,
+    path_guard: RunPathGuard,
     reservation: TemporaryStorageReservation,
     descriptor: RunDescriptor,
     bytes: u64,
@@ -361,27 +554,33 @@ pub(crate) struct RunReader {
     has_key: bool,
     consumed: bool,
     finished: bool,
+    sparse_index: Option<SparseRunIndex>,
 }
 
 impl RunReader {
     fn open(
         file: File,
+        path: Option<PathBuf>,
         reservation: TemporaryStorageReservation,
         bytes: u64,
+        sparse_index: Option<SparseRunIndex>,
     ) -> Result<Self, RunOpenError> {
         let mut reader = BufReader::new(file);
         let (descriptor, block_capacity) = match decode_header(&mut reader) {
             Ok(decoded) => decoded,
             Err(error) => {
                 return Err(RunOpenError {
-                    error,
+                    error: Some(error),
                     file: reader.into_inner(),
+                    path,
                     reservation,
+                    sparse_index,
                 });
             }
         };
         Ok(Self {
             reader,
+            path_guard: RunPathGuard::new(path),
             reservation,
             descriptor,
             bytes,
@@ -395,6 +594,7 @@ impl RunReader {
             has_key: false,
             consumed: false,
             finished: false,
+            sparse_index,
         })
     }
 
@@ -408,32 +608,27 @@ impl RunReader {
     /// A subsequent reader always rewinds and validates the header again. The
     /// caller may stop early when its query has enough records.
     #[must_use]
-    pub(crate) fn into_sealed(self) -> SealedRun {
+    pub(crate) fn into_sealed(mut self) -> SealedRun {
+        let path = self.path_guard.take();
         let Self {
             reader,
             reservation,
             descriptor,
             bytes,
+            sparse_index,
             ..
         } = self;
 
         SealedRun {
             file: Some(reader.into_inner()),
+            path,
             reservation: Some(reservation),
             descriptor,
             bytes,
+            sparse_index,
         }
     }
 
-    /// Decodes the next record into caller-owned reusable buffers.
-    ///
-    /// `false` means the validated sealed footer was reached. The method uses
-    /// only one decoded block plus the supplied key/value buffers.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a frame is malformed, corrupt, out of order, or
-    /// truncated.
     pub(crate) fn next_record_into(
         &mut self,
         key: &mut Vec<u8>,
@@ -549,6 +744,121 @@ impl RunReader {
     }
 }
 
+/// Read cursor positioned from a sparse block index rather than the run head.
+/// It validates every traversed frame, including its SHA-256 payload digest,
+/// but deliberately cannot re-count records preceding its start block.
+pub(crate) struct RunRangeReader {
+    reader: BufReader<File>,
+    block_capacity: usize,
+    block: Vec<u8>,
+    block_cursor: usize,
+    block_records: u32,
+    last_key: Vec<u8>,
+    has_key: bool,
+    finished: bool,
+}
+
+impl RunRangeReader {
+    fn new(file: File, block_capacity: usize) -> Self {
+        Self {
+            reader: BufReader::new(file),
+            block_capacity,
+            block: Vec::with_capacity(block_capacity),
+            block_cursor: 0,
+            block_records: 0,
+            last_key: Vec::new(),
+            has_key: false,
+            finished: false,
+        }
+    }
+
+    /// Decodes the next traversed record into caller-owned reusable buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a traversed frame is malformed, out of order, or
+    /// has a checksum mismatch.
+    pub(crate) fn next_record_into(
+        &mut self,
+        key: &mut Vec<u8>,
+        value: &mut Vec<u8>,
+    ) -> Result<bool, RunError> {
+        if self.finished {
+            return Ok(false);
+        }
+        if self.block_records == 0 && !self.load_next_block()? {
+            return Ok(false);
+        }
+        let key_length = read_length(&self.block, &mut self.block_cursor)?;
+        let value_length = read_length(&self.block, &mut self.block_cursor)?;
+        let key_end = self
+            .block_cursor
+            .checked_add(key_length)
+            .ok_or(RunError::InvalidBlock)?;
+        let value_end = key_end
+            .checked_add(value_length)
+            .ok_or(RunError::InvalidBlock)?;
+        if value_end > self.block.len() {
+            return Err(RunError::InvalidBlock);
+        }
+        let input_key = &self.block[self.block_cursor..key_end];
+        if self.has_key && input_key <= self.last_key.as_slice() {
+            return Err(RunError::UnsortedKey);
+        }
+        key.clear();
+        key.extend_from_slice(input_key);
+        value.clear();
+        value.extend_from_slice(&self.block[key_end..value_end]);
+        self.last_key.clear();
+        self.last_key.extend_from_slice(input_key);
+        self.has_key = true;
+        self.block_cursor = value_end;
+        self.block_records = self
+            .block_records
+            .checked_sub(1)
+            .ok_or(RunError::InvalidBlock)?;
+        if self.block_records == 0 && self.block_cursor != self.block.len() {
+            return Err(RunError::InvalidBlock);
+        }
+        Ok(true)
+    }
+
+    fn load_next_block(&mut self) -> Result<bool, RunError> {
+        let mut tag = [0_u8; 4];
+        read_exact(&mut self.reader, &mut tag)?;
+        if tag == FOOTER_MAGIC {
+            let _expected_records = read_u64(&mut self.reader)?;
+            let _expected_blocks = read_u64(&mut self.reader)?;
+            let mut trailing = [0_u8; 1];
+            if self.reader.read(&mut trailing)? != 0 {
+                return Err(RunError::TrailingData);
+            }
+            self.finished = true;
+            return Ok(false);
+        }
+        if tag != BLOCK_MAGIC {
+            return Err(RunError::InvalidBlock);
+        }
+        let records = read_u32(&mut self.reader)?;
+        let payload_length =
+            usize::try_from(read_u32(&mut self.reader)?).map_err(|_| RunError::InvalidBlock)?;
+        if records == 0 || payload_length == 0 || payload_length > self.block_capacity {
+            return Err(RunError::InvalidBlock);
+        }
+        let mut expected_digest = [0_u8; 32];
+        read_exact(&mut self.reader, &mut expected_digest)?;
+        self.block.clear();
+        self.block.resize(payload_length, 0);
+        read_exact(&mut self.reader, &mut self.block)?;
+        if Sha256::digest(&self.block).as_slice() != expected_digest {
+            return Err(RunError::ChecksumMismatch);
+        }
+        self.block_cursor = 0;
+        self.block_records = records;
+        Ok(true)
+    }
+}
+
 fn encode_header(
     descriptor: RunDescriptor,
     block_capacity: usize,
@@ -597,6 +907,62 @@ fn decode_header(reader: &mut impl Read) -> Result<(RunDescriptor, usize), RunEr
         return Err(RunError::InvalidHeader);
     }
     Ok((RunDescriptor::new(generation, run_id, kind), block_capacity))
+}
+
+fn rebuild_sparse_index(file: &File, bytes: u64) -> Result<SparseRunIndex, RunError> {
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(0))?;
+    let (_, block_capacity) = decode_header(&mut reader)?;
+    let mut blocks = Vec::new();
+    loop {
+        let offset = reader.stream_position()?;
+        let mut tag = [0_u8; 4];
+        read_exact(&mut reader, &mut tag)?;
+        if tag == FOOTER_MAGIC {
+            let _records = read_u64(&mut reader)?;
+            let _blocks = read_u64(&mut reader)?;
+            if reader.stream_position()? != bytes {
+                return Err(RunError::TrailingData);
+            }
+            break;
+        }
+        if tag != BLOCK_MAGIC {
+            return Err(RunError::InvalidBlock);
+        }
+        let records = read_u32(&mut reader)?;
+        let payload_length =
+            usize::try_from(read_u32(&mut reader)?).map_err(|_| RunError::InvalidBlock)?;
+        if records == 0 || payload_length == 0 || payload_length > block_capacity {
+            return Err(RunError::InvalidBlock);
+        }
+        let mut expected_digest = [0_u8; 32];
+        read_exact(&mut reader, &mut expected_digest)?;
+        let mut payload = vec![0_u8; payload_length];
+        read_exact(&mut reader, &mut payload)?;
+        if Sha256::digest(&payload).as_slice() != expected_digest {
+            return Err(RunError::ChecksumMismatch);
+        }
+        let mut cursor = 0;
+        let key_length = read_length(&payload, &mut cursor)?;
+        let value_length = read_length(&payload, &mut cursor)?;
+        let key_end = cursor
+            .checked_add(key_length)
+            .ok_or(RunError::InvalidBlock)?;
+        let value_end = key_end
+            .checked_add(value_length)
+            .ok_or(RunError::InvalidBlock)?;
+        if value_end > payload.len() {
+            return Err(RunError::InvalidBlock);
+        }
+        blocks.push(SparseRunBlock {
+            first_key: payload[cursor..key_end].to_vec(),
+            offset,
+        });
+    }
+    Ok(SparseRunIndex {
+        block_capacity,
+        blocks,
+    })
 }
 
 fn encode_footer(records: u64, blocks: u64) -> [u8; FOOTER_BYTES] {
@@ -779,6 +1145,50 @@ mod tests {
             reader.visit_records(|_, _| Ok(())),
             Err(RunError::Truncated)
         ));
+    }
+
+    #[test]
+    fn child_query_range_reader_seeks_to_the_requested_block() {
+        let storage = TemporaryStorage::with_limit_bytes(16 * 1024);
+        let mut writer = RunWriter::new(
+            tempfile::tempfile().expect("child query file should open"),
+            storage
+                .reservation(0)
+                .expect("empty child query reservation should fit"),
+            RunDescriptor::new(ScanGeneration::initial(), 7, RunKind::ChildQuery),
+            24,
+        )
+        .expect("child query writer should initialize");
+        for (key, value) in [
+            (b"alpha".as_slice(), b"one".as_slice()),
+            (b"beta".as_slice(), b"two".as_slice()),
+            (b"delta".as_slice(), b"four".as_slice()),
+            (b"gamma".as_slice(), b"three".as_slice()),
+        ] {
+            writer
+                .append(key, value)
+                .expect("child query records should remain sorted");
+        }
+        let sealed = writer.seal().expect("child query should seal");
+        let mut reader = sealed
+            .range_reader(b"delta")
+            .expect("child query should have a sparse index");
+        let mut key = Vec::new();
+        let mut value = Vec::new();
+        assert!(
+            reader
+                .next_record_into(&mut key, &mut value)
+                .expect("indexed block should validate")
+        );
+        assert_eq!(key, b"delta");
+        assert_eq!(value, b"four");
+        assert!(
+            reader
+                .next_record_into(&mut key, &mut value)
+                .expect("following block should validate")
+        );
+        assert_eq!(key, b"gamma");
+        assert_eq!(value, b"three");
     }
 
     #[test]

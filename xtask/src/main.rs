@@ -728,8 +728,15 @@ fn run_behavior_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
     )?;
     run(
         cargo,
-        "package verification",
-        &["package", "--package", "excise", "--locked"],
+        "package contents",
+        &[
+            "package",
+            "--package",
+            "excise",
+            "--locked",
+            "--allow-dirty",
+            "--list",
+        ],
     )?;
     run(cargo, "dependency policy", &["deny", "check"])
 }

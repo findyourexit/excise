@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
+use crate::filter::FilterPattern;
 use crate::model::{
     EntrySnapshot, ModelError, Node, NodeId, NodeKind, NodeMetrics, NodeState, SyntheticKind,
     UnscannedReason,
@@ -12,8 +13,10 @@ use crate::model::{
 
 use crate::native_path::identity_for;
 use crate::os::physical_size;
-use crate::scan_coordinator::RelativePath;
-use crate::scan_store::page::{PageEntryKind, ScanPage, ScanPageEntry, SharedAllocationSummary};
+use crate::scan_coordinator::{RelativePath, ScanGeneration};
+use crate::scan_store::page::{
+    PageCursor, PageEntryKind, ScanPage, ScanPageEntry, SharedAllocationSummary,
+};
 use crate::scan_store::path_reducer::{Coverage, SummaryMetrics};
 use crate::state::FileToDelete;
 use crate::state::files::tree_view::TreeView;
@@ -22,17 +25,28 @@ use crate::state::tiles::{FileMetadata, FileType};
 
 /// A small materialized view of one immutable `ScanStore` page.
 ///
-/// It owns only the current folder's direct entries and its ancestor chain. The
-/// underlying generation remains in the `ScanStore`; switching folders replaces
-/// this view rather than growing a second full in-memory tree.
+/// It owns only one folder's direct entries and its ancestor chain. The
+/// underlying generation remains in the `ScanStore`; a bounded page cache may
+/// retain this view for quick backtracking without building a full memory tree.
 pub(crate) struct SnapshotTree {
     root_path: PathBuf,
+    generation: ScanGeneration,
     current_relative: RelativePath,
     current_id: NodeId,
     nodes: Vec<Node>,
     relative_paths: Vec<Option<RelativePath>>,
-    model_stats: (usize, usize, bool),
-    next_after: Option<RelativePath>,
+    page_memory_limit: usize,
+    scan_store_stats: (u64, u64),
+    retained_bytes: usize,
+    next_after: Option<PageCursor>,
+    unrecorded_path_count: u64,
+    filter: Option<SnapshotFilter>,
+    provisional: bool,
+}
+
+#[derive(Clone)]
+struct SnapshotFilter {
+    pattern: FilterPattern,
 }
 
 struct SnapshotNode {
@@ -45,6 +59,16 @@ struct SnapshotNode {
     use_live_snapshot: bool,
 }
 
+struct ConcreteDeletionTarget {
+    root_path: PathBuf,
+    node_id: NodeId,
+    relative: RelativePath,
+    expected_kind: NodeKind,
+    file_type: FileType,
+    metrics: SummaryMetrics,
+    expected_snapshot: Option<EntrySnapshot>,
+}
+
 impl SnapshotTree {
     /// # Errors
     ///
@@ -53,10 +77,95 @@ impl SnapshotTree {
     pub(crate) fn from_page(
         root_path: PathBuf,
         page: ScanPage,
-        model_stats: (usize, usize, bool),
+        page_memory_limit: usize,
+        scan_store_stats: (u64, u64),
     ) -> Result<Self, ModelError> {
-        ensure_page_fits(&page, model_stats.1)?;
+        Self::from_page_with_source(
+            root_path,
+            page,
+            page_memory_limit,
+            scan_store_stats,
+            None,
+            false,
+        )
+    }
+
+    /// Builds one incomplete bounded page while its canonical generation is still scanning.
+    pub(crate) fn from_provisional_page(
+        root_path: PathBuf,
+        page: ScanPage,
+        page_memory_limit: usize,
+        scan_store_stats: (u64, u64),
+    ) -> Result<Self, ModelError> {
+        Self::from_page_with_source(
+            root_path,
+            page,
+            page_memory_limit,
+            scan_store_stats,
+            None,
+            true,
+        )
+    }
+
+    /// Builds the bounded root-only view shown before an active scan has emitted
+    /// any concrete page entries.
+    pub(crate) fn loading(
+        root_path: PathBuf,
+        generation: ScanGeneration,
+        page_memory_limit: usize,
+        scan_store_stats: (u64, u64),
+    ) -> Result<Self, ModelError> {
+        Self::from_page_with_source(
+            root_path,
+            ScanPage {
+                generation,
+                folder: RelativePath::root(),
+                folder_metrics: SummaryMetrics::default(),
+                folder_coverage: Coverage::Uncertain,
+                root_metrics: SummaryMetrics::default(),
+                root_coverage: Coverage::Uncertain,
+                entries: Vec::new(),
+                next_after: None,
+                shared_allocation: None,
+                unrecorded_path_count: 0,
+            },
+            page_memory_limit,
+            scan_store_stats,
+            None,
+            true,
+        )
+    }
+
+    /// Builds one bounded page while retaining the active canonical filter.
+    pub(crate) fn from_page_with_filter(
+        root_path: PathBuf,
+        page: ScanPage,
+        page_memory_limit: usize,
+        scan_store_stats: (u64, u64),
+        filter: Option<(FilterPattern, RelativePath)>,
+    ) -> Result<Self, ModelError> {
+        Self::from_page_with_source(
+            root_path,
+            page,
+            page_memory_limit,
+            scan_store_stats,
+            filter,
+            false,
+        )
+    }
+
+    fn from_page_with_source(
+        root_path: PathBuf,
+        page: ScanPage,
+        page_memory_limit: usize,
+        scan_store_stats: (u64, u64),
+        filter: Option<(FilterPattern, RelativePath)>,
+        provisional: bool,
+    ) -> Result<Self, ModelError> {
+        let retained_bytes = page_retained_bytes(&page);
+        ensure_page_fits(retained_bytes, page_memory_limit)?;
         let ScanPage {
+            generation,
             folder,
             folder_metrics,
             folder_coverage,
@@ -65,14 +174,18 @@ impl SnapshotTree {
             entries,
             next_after,
             shared_allocation,
-            ..
+            unrecorded_path_count,
         } = page;
         let mut root = Node::new(
             NodeId(0),
             None,
             Arc::from(OsStr::new("")),
             NodeKind::Root,
-            state_for(root_coverage),
+            if provisional {
+                NodeState::Scanning
+            } else {
+                state_for(root_coverage)
+            },
             snapshot_for_path(
                 &root_path,
                 &RelativePath::root(),
@@ -81,15 +194,21 @@ impl SnapshotTree {
             ),
         );
         root.metrics = node_metrics(root_metrics);
-        root.unscanned_reason = reason_for(root_coverage);
+        root.unscanned_reason = (!provisional).then(|| reason_for(root_coverage)).flatten();
         let mut tree = Self {
             root_path,
+            generation,
             current_relative: folder.clone(),
             current_id: NodeId(0),
             nodes: vec![root],
             relative_paths: vec![Some(RelativePath::root())],
-            model_stats,
+            page_memory_limit,
+            scan_store_stats,
+            retained_bytes,
             next_after,
+            unrecorded_path_count,
+            filter: filter.map(|(pattern, _)| SnapshotFilter { pattern }),
+            provisional,
         };
         let current_id = tree.append_ancestors(&folder, folder_metrics, folder_coverage)?;
         tree.current_id = current_id;
@@ -183,8 +302,7 @@ impl SnapshotTree {
         Ok(())
     }
 
-    #[must_use]
-    pub(crate) fn next_after(&self) -> Option<&RelativePath> {
+    pub(crate) fn next_after(&self) -> Option<&PageCursor> {
         self.next_after.as_ref()
     }
 
@@ -199,6 +317,25 @@ impl SnapshotTree {
     }
 
     #[must_use]
+    pub(crate) const fn generation(&self) -> ScanGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub(crate) const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    #[must_use]
+    pub(crate) const fn page_cache_budget_bytes(&self) -> usize {
+        self.page_memory_limit / 4
+    }
+    #[must_use]
+    pub(crate) fn filter_raw(&self) -> Option<&str> {
+        self.filter.as_ref().map(|filter| filter.pattern.raw())
+    }
+
+    #[must_use]
     pub(crate) fn path_for_id(&self, id: NodeId) -> Option<PathBuf> {
         self.relative_paths
             .get(id.index())
@@ -209,6 +346,15 @@ impl SnapshotTree {
     #[must_use]
     pub(crate) fn relative_for_id(&self, id: NodeId) -> Option<&RelativePath> {
         self.relative_paths.get(id.index()).and_then(Option::as_ref)
+    }
+
+    #[must_use]
+    pub(crate) fn id_for_relative(&self, relative: &RelativePath) -> Option<NodeId> {
+        self.relative_paths
+            .iter()
+            .position(|candidate| candidate.as_ref() == Some(relative))
+            .and_then(|index| u32::try_from(index).ok())
+            .map(NodeId)
     }
 
     #[must_use]
@@ -277,53 +423,123 @@ impl SnapshotTree {
         normalize_file_metadata(files, offset)
     }
 
-    /// Builds an identity-bound deletion target from the immutable page's
-    /// scan-time snapshot. The planner revalidates this exact snapshot again
-    /// immediately before every filesystem mutation.
+    /// Builds an identity-bound deletion target from one immutable canonical entry.
+    ///
+    /// The planner revalidates this scan-time snapshot immediately before every
+    /// filesystem mutation.
     ///
     /// # Errors
     ///
-    /// Returns an error when the selected page entry is virtual or lacks the
-    /// stable scan-time identity required for safe deletion.
-    pub(crate) fn deletion_target_for_id(
-        &self,
-        id: NodeId,
+    /// Returns an error when the canonical entry lacks the stable scan-time
+    /// identity required for safe deletion.
+    pub(crate) fn deletion_target_from_entry(
+        root_path: PathBuf,
+        node_id: NodeId,
+        relative: &RelativePath,
+        entry: ScanPageEntry,
         show_apparent_size: bool,
     ) -> Result<FileToDelete, ModelError> {
-        let node = self
-            .node(id)
-            .ok_or_else(|| ModelError::InvalidPath("selected page item disappeared".to_string()))?;
+        let (expected_kind, file_type) = match entry.kind {
+            PageEntryKind::Directory => (NodeKind::Directory, FileType::Folder),
+            PageEntryKind::File => (NodeKind::File, FileType::File),
+            PageEntryKind::Link => (NodeKind::Link, FileType::File),
+        };
+        Self::concrete_deletion_target(
+            ConcreteDeletionTarget {
+                root_path,
+                node_id,
+                relative: relative.clone(),
+                expected_kind,
+                file_type,
+                metrics: entry.metrics,
+                expected_snapshot: entry.snapshot,
+            },
+            show_apparent_size,
+        )
+    }
+
+    /// Builds a deletion target only for a directly observed item on the active
+    /// live page. Aggregate and inferred preview nodes are deliberately rejected.
+    pub(crate) fn deletion_target_from_preview(
+        &self,
+        node_id: NodeId,
+        show_apparent_size: bool,
+    ) -> Result<FileToDelete, ModelError> {
+        let node = self.node(node_id).ok_or_else(|| {
+            ModelError::Invariant("Selected item is no longer on this scan page".to_string())
+        })?;
+        if node.parent != Some(self.current_id) {
+            return Err(ModelError::Invariant(
+                "Only a directly observed item can be deleted while scanning".to_string(),
+            ));
+        }
         let (expected_kind, file_type) = match node.kind {
             NodeKind::Directory => (NodeKind::Directory, FileType::Folder),
             NodeKind::File => (NodeKind::File, FileType::File),
             NodeKind::Link => (NodeKind::Link, FileType::File),
             NodeKind::Root | NodeKind::Synthetic(_) => {
                 return Err(ModelError::Invariant(
-                    "virtual scan summaries cannot be deleted".to_string(),
+                    "Only a directly observed file or folder can be deleted while scanning"
+                        .to_string(),
                 ));
             }
         };
-        let relative = self.relative_for_id(id).ok_or_else(|| {
-            ModelError::Invariant("selected page item has no backing path".to_string())
+        let relative = self.relative_for_id(node_id).ok_or_else(|| {
+            ModelError::Invariant("Selected item has no concrete scan path".to_string())
         })?;
-        let expected_snapshot = node.snapshot.clone();
+        Self::concrete_deletion_target(
+            ConcreteDeletionTarget {
+                root_path: self.root_path.clone(),
+                node_id,
+                relative: relative.clone(),
+                expected_kind,
+                file_type,
+                metrics: SummaryMetrics {
+                    apparent_bytes: node.metrics.apparent_bytes,
+                    allocated_bytes: node.metrics.allocated_bytes,
+                    reclaimable_bytes: node.metrics.reclaimable_bytes,
+                    descendants: node.metrics.descendants,
+                },
+                expected_snapshot: Some(node.snapshot.clone()),
+            },
+            show_apparent_size,
+        )
+    }
+
+    fn concrete_deletion_target(
+        target: ConcreteDeletionTarget,
+        show_apparent_size: bool,
+    ) -> Result<FileToDelete, ModelError> {
+        let ConcreteDeletionTarget {
+            root_path,
+            node_id,
+            relative,
+            expected_kind,
+            file_type,
+            metrics,
+            expected_snapshot,
+        } = target;
+        let expected_snapshot = expected_snapshot.ok_or_else(|| {
+            ModelError::Invariant(
+                "Wait for this item to receive a verified scan preview before deleting".to_string(),
+            )
+        })?;
         if expected_snapshot.kind != expected_kind || expected_snapshot.identity.is_none() {
             return Err(ModelError::Invariant(
-                "selected item has no verified scan-time identity".to_string(),
+                "Wait for this item to receive a verified scan preview before deleting".to_string(),
             ));
         }
         Ok(FileToDelete {
-            node_id: id,
+            node_id,
             synthetic: false,
-            path_in_filesystem: self.root_path.clone(),
+            path_in_filesystem: root_path,
             path_to_file: relative.components().to_vec(),
             file_type,
-            num_descendants: (expected_kind == NodeKind::Directory)
-                .then_some(node.metrics.descendants),
+            num_descendants: (expected_kind == NodeKind::Directory).then_some(metrics.descendants),
             size: if show_apparent_size {
-                node.metrics.apparent_bytes
+                metrics.apparent_bytes
             } else {
-                node.metrics.allocated_bytes.lower
+                metrics.allocated_bytes.lower
             },
             expected_snapshot,
             reviewed_entries: Vec::new(),
@@ -344,7 +560,7 @@ impl SnapshotTree {
             NodeId(
                 u32::try_from(self.nodes.len()).map_err(|_| ModelError::MemoryExhausted {
                     required: usize::MAX,
-                    limit: self.model_stats.1,
+                    limit: self.page_memory_limit,
                 })?,
             );
         let snapshot = match scan_snapshot {
@@ -355,9 +571,25 @@ impl SnapshotTree {
             ),
             None => snapshot_from_metrics(kind, metrics),
         };
-        let mut node = Node::new(id, Some(parent), name, kind, state_for(coverage), snapshot);
+        let scanning_directory = self.provisional && kind.is_directory();
+        let mut node = Node::new(
+            id,
+            Some(parent),
+            name,
+            kind,
+            if scanning_directory {
+                NodeState::Scanning
+            } else {
+                state_for(coverage)
+            },
+            snapshot,
+        );
         node.metrics = node_metrics(metrics);
-        node.unscanned_reason = reason_for(coverage);
+        node.unscanned_reason = if scanning_directory {
+            None
+        } else {
+            reason_for(coverage)
+        };
         let parent_node = self.nodes.get_mut(parent.index()).ok_or_else(|| {
             ModelError::Invariant("snapshot page parent disappeared while building".to_string())
         })?;
@@ -388,11 +620,11 @@ impl TreeView for SnapshotTree {
     }
 
     fn has_filter(&self) -> bool {
-        false
+        self.filter.is_some()
     }
 
-    fn model_stats(&self) -> (usize, usize, bool) {
-        self.model_stats
+    fn storage_stats(&self) -> Option<(u64, u64)> {
+        Some(self.scan_store_stats)
     }
 
     fn failed_to_read(&self) -> u64 {
@@ -404,9 +636,21 @@ impl TreeView for SnapshotTree {
         )
         .unwrap_or(u64::MAX)
     }
+
+    fn unreadable_path_count(&self) -> u64 {
+        self.unrecorded_path_count
+            .saturating_add(self.failed_to_read())
+    }
 }
 
-fn ensure_page_fits(page: &ScanPage, limit: usize) -> Result<(), ModelError> {
+fn ensure_page_fits(required: usize, limit: usize) -> Result<(), ModelError> {
+    if required > limit {
+        return Err(ModelError::MemoryExhausted { required, limit });
+    }
+    Ok(())
+}
+
+fn page_retained_bytes(page: &ScanPage) -> usize {
     let node_count = page
         .entries
         .len()
@@ -432,14 +676,10 @@ fn ensure_page_fits(page: &ScanPage, limit: usize) -> Result<(), ModelError> {
                 .sum(),
         )
         .saturating_add(usize::from(page.shared_allocation.is_some()) * "Shared allocation".len());
-    let required = node_count
+    node_count
         .saturating_mul(size_of::<Node>())
         .saturating_add(names)
-        .saturating_add(node_count.saturating_mul(size_of::<Option<RelativePath>>()));
-    if required > limit {
-        return Err(ModelError::MemoryExhausted { required, limit });
-    }
-    Ok(())
+        .saturating_add(node_count.saturating_mul(size_of::<Option<RelativePath>>()))
 }
 
 fn snapshot_for_path(
@@ -578,6 +818,7 @@ mod tests {
                 metrics: SummaryMetrics::leaf(0, ByteBounds::exact(2), ByteBounds::exact(2)),
                 coverage: Coverage::Complete,
             }),
+            unrecorded_path_count: 0,
         }
     }
 
@@ -587,7 +828,8 @@ mod tests {
         let tree = SnapshotTree::from_page(
             root.path().to_path_buf(),
             page(RelativePath::root()),
-            (0, 64 * 1024, false),
+            64 * 1024,
+            (0, 4 * 1024 * 1024),
         )
         .expect("snapshot should materialize");
         let files = tree.files_in_current_folder(0, false);
@@ -627,12 +869,16 @@ mod tests {
                 .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_nanos()),
         });
-        let tree = SnapshotTree::from_page(root.path().to_path_buf(), page, (0, 64 * 1024, false))
-            .expect("snapshot should materialize");
-        fs::write(&entry, b"replacement").expect("fixture should change after scan");
-        let target = tree
-            .deletion_target_for_id(NodeId(1), false)
-            .expect("concrete page entry should plan");
+        let canonical_entry = page.entries[0].clone();
+        let relative = canonical_entry.path.clone();
+        let target = SnapshotTree::deletion_target_from_entry(
+            root.path().to_path_buf(),
+            NodeId(1),
+            &relative,
+            canonical_entry,
+            false,
+        )
+        .expect("concrete canonical entry should plan");
         assert_eq!(target.full_path(), entry);
         assert_eq!(target.file_type, FileType::File);
         assert_eq!(target.expected_snapshot.identity, Some(identity));

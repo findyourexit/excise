@@ -1,123 +1,57 @@
+mod scheduler;
 mod task_queue;
 mod task_spill;
-
-use std::collections::VecDeque;
 #[cfg(windows)]
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use cap_primitives::ambient_authority;
 use cap_primitives::fs::{self as cap_fs};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+pub(super) use scheduler::SchedulerHandle;
+use scheduler::{LeasedDirectoryTask, SchedulerCommand};
 use task_queue::{DirectoryTask, TASK_QUEUE_PER_WORKER, TaskQueue};
 
 use super::worker::{ScannedEntry, WorkerEvent, send_event};
-use crate::model::UnscannedReason;
+use crate::model::{ByteBounds, EntrySnapshot, NodeKind, UnscannedReason};
 use crate::native_path::{NativeIdentity, identity_for};
+use crate::os::physical_size;
+use crate::scan_coordinator::{
+    RelativePath, ScanGeneration, SchedulerSnapshot, WorkCompletion, WorkLease,
+};
+use crate::scan_session::ScanSessionId;
+use crate::scan_store::identity_observation::IdentityObservation;
+use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, SummaryMetrics};
+use crate::scan_store::run_file::SealedRun;
+use crate::scan_store::session::ScanInputRunFactory;
 use crate::temporary_storage::TemporaryStorage;
-
 // The owner consumes each bounded batch before checking input again. Keep the
 // batch small so scanning never makes keyboard feedback wait indefinitely.
+const MAX_FOCUS_REQUESTS: usize = 32;
 const BATCH_SIZE: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct ScannerOptions {
     pub root: PathBuf,
+    /// Root used to encode canonical run paths; may contain `root` for a scope.
+    pub canonical_root: PathBuf,
+    pub session: ScanSessionId,
     pub root_identity: Option<NativeIdentity>,
+    pub generation: ScanGeneration,
     pub threads: usize,
     pub cross_filesystems: bool,
     pub exclusions: Vec<String>,
     pub internal_paths: Vec<PathBuf>,
     pub temporary_storage: TemporaryStorage,
-}
-
-const MAX_PENDING_PRIORITIES: usize = 32;
-
-struct RequestedPaths {
-    paths: VecDeque<PathBuf>,
-    generation: u64,
-}
-
-/// Allows the owner loop to promote a visible directory without exposing the
-/// scanner's bounded queue outside this module.
-pub(crate) struct ScannerControl {
-    requested: Mutex<RequestedPaths>,
-}
-
-impl ScannerControl {
-    fn new() -> Self {
-        Self {
-            requested: Mutex::new(RequestedPaths {
-                paths: VecDeque::with_capacity(MAX_PENDING_PRIORITIES),
-                generation: 0,
-            }),
-        }
-    }
-
-    /// Records a foreground directory request. Resolving it against the
-    /// resident queue or spill happens on a scanner worker, never in the TUI.
-    pub(crate) fn prioritize(&self, path: &Path) {
-        let mut requested = self
-            .requested
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = requested
-            .paths
-            .iter()
-            .position(|requested| requested == path)
-        {
-            let _ = requested.paths.remove(index);
-        }
-        if requested.paths.len() == MAX_PENDING_PRIORITIES {
-            let _ = requested.paths.pop_front();
-        }
-        requested.paths.push_back(path.to_path_buf());
-        requested.generation = requested.generation.wrapping_add(1);
-    }
-
-    fn is_requested(&self, path: &Path) -> bool {
-        self.requested
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .paths
-            .iter()
-            .any(|requested| requested == path)
-    }
-
-    /// Takes a bounded snapshot so scanner workers can resolve one spill
-    /// promotion without holding the control lock across file I/O.
-    fn requested_snapshot(&self) -> (u64, Vec<PathBuf>) {
-        let requested = self
-            .requested
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (
-            requested.generation,
-            requested.paths.iter().cloned().collect(),
-        )
-    }
-
-    fn consume(&self, path: &Path) {
-        let mut requested = self
-            .requested
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = requested
-            .paths
-            .iter()
-            .position(|requested| requested == path)
-        {
-            let _ = requested.paths.remove(index);
-            requested.generation = requested.generation.wrapping_add(1);
-        }
-    }
+    pub input_runs: Option<ScanInputRunFactory>,
 }
 
 struct Exclusions {
@@ -190,37 +124,103 @@ pub fn spawn(
     options: ScannerOptions,
     sender: Sender<WorkerEvent>,
     cancelled: Arc<AtomicBool>,
-) -> Result<(thread::JoinHandle<()>, Arc<ScannerControl>), std::io::Error> {
-    let control = Arc::new(ScannerControl::new());
-    let scanner_control = Arc::clone(&control);
+) -> Result<(thread::JoinHandle<()>, SchedulerHandle), std::io::Error> {
+    let command_capacity = options.threads.saturating_mul(BATCH_SIZE).max(1);
+    let (commands, command_receiver) = bounded(command_capacity);
+    let (focus, focus_receiver) = bounded(MAX_FOCUS_REQUESTS);
+    let snapshot = Arc::new(Mutex::new(None));
+    let scheduler = SchedulerHandle::new(focus, Arc::clone(&snapshot));
     let handle = thread::Builder::new()
         .name("excise-scanner".to_string())
-        .spawn(move || run_with_control(options, &sender, cancelled.as_ref(), &scanner_control))?;
-    Ok((handle, control))
+        .spawn(move || {
+            run_with_scheduler(
+                options,
+                &sender,
+                cancelled.as_ref(),
+                commands,
+                command_receiver,
+                focus_receiver,
+                &snapshot,
+            );
+        })?;
+    Ok((handle, scheduler))
 }
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancelled: &AtomicBool) {
-    let control = Arc::new(ScannerControl::new());
-    run_with_control(options, sender, cancelled, &control);
+    let command_capacity = options.threads.saturating_mul(BATCH_SIZE).max(1);
+    let (commands, command_receiver) = bounded(command_capacity);
+    let (focus, focus_receiver) = bounded(MAX_FOCUS_REQUESTS);
+    let snapshot = Arc::new(Mutex::new(None));
+    run_with_scheduler(
+        options,
+        sender,
+        cancelled,
+        commands,
+        command_receiver,
+        focus_receiver,
+        &snapshot,
+    );
+    drop(focus);
 }
-
 #[allow(clippy::too_many_lines)]
-fn run_with_control(
+fn run_with_scheduler(
     options: ScannerOptions,
     sender: &Sender<WorkerEvent>,
     cancelled: &AtomicBool,
-    control: &Arc<ScannerControl>,
+    scheduler_commands: Sender<SchedulerCommand>,
+    scheduler_receiver: Receiver<SchedulerCommand>,
+    focus_receiver: Receiver<PathBuf>,
+    scheduler_snapshot: &Arc<Mutex<Option<SchedulerSnapshot>>>,
 ) {
     let ScannerOptions {
+        session,
+        generation,
         root,
+        canonical_root,
         root_identity,
         threads,
         cross_filesystems,
         exclusions: exclusion_patterns,
         internal_paths,
         temporary_storage,
+        input_runs,
     } = options;
+    if !root.starts_with(&canonical_root) {
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFailed {
+                path: Some(root.clone()),
+                message: "focused scan root is outside the canonical scan root".to_string(),
+            },
+            cancelled,
+        );
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFinished { cancelled: false },
+            cancelled,
+        );
+        return;
+    }
+    if input_runs
+        .as_ref()
+        .is_some_and(|factory| factory.generation() != generation)
+    {
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFailed {
+                path: Some(root.clone()),
+                message: "scanner input-run factory targets a different generation".to_string(),
+            },
+            cancelled,
+        );
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFinished { cancelled: false },
+            cancelled,
+        );
+        return;
+    }
     if let Err(message) = validate_scan_root(&root, root_identity.as_ref()) {
         let _ = send_event(
             sender,
@@ -318,7 +318,6 @@ fn run_with_control(
         root.clone(),
         threads.saturating_mul(TASK_QUEUE_PER_WORKER).max(1),
         &temporary_storage,
-        Arc::clone(control),
     ) {
         Ok(queue) => queue,
         Err(error) => {
@@ -361,9 +360,66 @@ fn run_with_control(
     let root_invalid = AtomicBool::new(false);
     let scan_failed = AtomicBool::new(false);
     thread::scope(|scope| {
-        for index in 0..threads {
-            let worker_queue = &queue;
-            let worker_sender = sender;
+        let mut assignment_senders = Vec::with_capacity(threads);
+        let mut assignment_receivers = Vec::with_capacity(threads);
+        let mut worker_event_senders = Vec::with_capacity(threads);
+        let mut worker_event_receivers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let (assignment_sender, assignment_receiver) = bounded(1);
+            let (worker_event_sender, worker_event_receiver) = bounded(1);
+            assignment_senders.push(assignment_sender);
+            assignment_receivers.push(assignment_receiver);
+            worker_event_senders.push(worker_event_sender);
+            worker_event_receivers.push(worker_event_receiver);
+        }
+
+        let scheduler_queue = Arc::clone(&queue);
+        let scheduler_root = &root;
+        let scheduler_cancelled = cancelled;
+        let scheduler_failed = &scan_failed;
+        let scheduler_root_invalid = &root_invalid;
+        let scheduler_events = sender;
+        let scheduler_snapshot = Arc::clone(scheduler_snapshot);
+        let scheduler = match thread::Builder::new()
+            .name("excise-scan-coordinator".to_string())
+            .spawn_scoped(scope, move || {
+                scheduler::run(
+                    scheduler_queue,
+                    scheduler_root,
+                    session,
+                    generation,
+                    scheduler_receiver,
+                    focus_receiver,
+                    assignment_senders,
+                    worker_event_receivers,
+                    scheduler_cancelled,
+                    scheduler_failed,
+                    scheduler_root_invalid,
+                    scheduler_events,
+                    scheduler_snapshot.as_ref(),
+                );
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                scan_failed.store(true, Ordering::Release);
+                let _ = send_event(
+                    sender,
+                    WorkerEvent::ScanFailed {
+                        path: Some(root.clone()),
+                        message: format!("could not spawn scan coordinator: {error}"),
+                    },
+                    cancelled,
+                );
+                return;
+            }
+        };
+
+        for (index, (worker_assignments, worker_events)) in assignment_receivers
+            .into_iter()
+            .zip(worker_event_senders)
+            .enumerate()
+        {
+            let worker_commands = scheduler_commands.clone();
             let worker_cancelled = cancelled;
             let worker_failed = &scan_failed;
             let worker_root_invalid = &root_invalid;
@@ -371,19 +427,25 @@ fn run_with_control(
             let worker_exclusions = &exclusions;
             let worker_root_filesystem = root_filesystem.as_ref();
             let worker_root = &root;
+            let worker_canonical_root = &canonical_root;
             let worker_root_identity = root_identity.as_ref();
+            let worker_input_runs = input_runs.as_ref();
             if let Err(error) = thread::Builder::new()
                 .name(format!("excise-scan-{index}"))
                 .spawn_scoped(scope, move || {
                     scan_worker(
-                        worker_queue,
-                        worker_sender,
+                        index,
+                        &worker_assignments,
+                        &worker_commands,
+                        &worker_events,
                         worker_cancelled,
                         worker_failed,
                         worker_root_invalid,
                         worker_root_directory,
                         worker_root,
+                        worker_canonical_root,
                         worker_root_identity,
+                        worker_input_runs,
                         worker_exclusions,
                         worker_root_filesystem,
                         cross_filesystems,
@@ -401,8 +463,19 @@ fn run_with_control(
                 );
             }
         }
+        drop(scheduler_commands);
+        if scheduler.join().is_err() {
+            scan_failed.store(true, Ordering::Release);
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanFailed {
+                    path: Some(root.clone()),
+                    message: "scan coordinator thread panicked".to_string(),
+                },
+                cancelled,
+            );
+        }
     });
-    queue.cancel();
     let completion_delivery = AtomicBool::new(false);
     let _ = send_event(
         sender,
@@ -418,69 +491,94 @@ fn run_with_control(
 struct ScanFrame {
     task: DirectoryTask,
     _directory: File,
-    identity: Option<NativeIdentity>,
     entries: cap_fs::ReadDir,
     batch: Vec<ScannedEntry>,
     directories: Vec<DirectoryTask>,
+}
+
+struct ScanDirectoryOutcome {
+    continue_scanning: bool,
+    completed: bool,
 }
 #[allow(
     clippy::too_many_arguments,
     reason = "The worker receives its bounded queue, cancellation state, root identity, and scan policy explicitly."
 )]
 fn scan_worker(
-    queue: &TaskQueue,
-    sender: &Sender<WorkerEvent>,
+    worker: usize,
+    assignments: &Receiver<LeasedDirectoryTask>,
+    scheduler: &Sender<SchedulerCommand>,
+    events: &Sender<WorkerEvent>,
     cancelled: &AtomicBool,
     failed: &AtomicBool,
     root_invalid: &AtomicBool,
     root_directory: &File,
     root: &Path,
+    canonical_root: &Path,
     root_identity: Option<&NativeIdentity>,
+    input_runs: Option<&ScanInputRunFactory>,
     exclusions: &Exclusions,
     root_filesystem: Option<&FilesystemKey>,
     cross_filesystems: bool,
 ) {
     loop {
-        let task = match queue.take(cancelled, failed, root_invalid) {
-            Ok(Some(task)) => task,
-            Ok(None) => return,
-            Err(error) => {
-                let _ = send_event(
-                    sender,
-                    WorkerEvent::ScanFailed {
-                        path: None,
-                        message: format!("could not read scanner task spill: {error}"),
-                    },
-                    cancelled,
-                );
-                failed.store(true, Ordering::Release);
-                queue.cancel();
-                return;
-            }
+        if cancelled.load(Ordering::Acquire)
+            || failed.load(Ordering::Acquire)
+            || root_invalid.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let assignment = match assignments.recv_timeout(Duration::from_millis(25)) {
+            Ok(assignment) => assignment,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
         };
-        let completed = scan_directory(
-            task,
-            queue,
-            sender,
+        let lease = assignment.lease.clone();
+        let outcome = scan_directory(
+            assignment.task,
+            Some(&lease),
+            scheduler,
+            events,
             cancelled,
             failed,
             root_invalid,
             root_directory,
             root,
+            canonical_root,
+            input_runs,
             root_identity,
             exclusions,
             root_filesystem,
             cross_filesystems,
         );
-        queue.complete();
-        if !completed {
+        let work_completion = if outcome.completed {
+            WorkCompletion::Succeeded
+        } else if root_invalid.load(Ordering::Acquire) {
+            WorkCompletion::Invalidated
+        } else if failed.load(Ordering::Acquire) || outcome.continue_scanning {
+            WorkCompletion::Failed
+        } else {
+            WorkCompletion::Cancelled
+        };
+        if !send_scheduler_command(
+            scheduler,
+            SchedulerCommand::Complete {
+                worker,
+                lease: assignment.lease,
+                work_completion,
+            },
+            cancelled,
+        ) {
+            failed.store(true, Ordering::Release);
+            return;
+        }
+        if !outcome.continue_scanning {
             if !root_invalid.load(Ordering::Acquire)
                 && !failed.load(Ordering::Acquire)
                 && !cancelled.load(Ordering::Acquire)
             {
                 cancelled.store(true, Ordering::Release);
             }
-            queue.cancel();
             return;
         }
     }
@@ -489,56 +587,104 @@ fn scan_worker(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn scan_directory(
     task: DirectoryTask,
-    queue: &TaskQueue,
+    lease: Option<&WorkLease>,
+    scheduler: &Sender<SchedulerCommand>,
     sender: &Sender<WorkerEvent>,
     cancelled: &AtomicBool,
     failed: &AtomicBool,
     root_invalid: &AtomicBool,
     root_directory: &File,
     root: &Path,
+    canonical_root: &Path,
+    input_runs: Option<&ScanInputRunFactory>,
     root_identity: Option<&NativeIdentity>,
     exclusions: &Exclusions,
     root_filesystem: Option<&FilesystemKey>,
     cross_filesystems: bool,
-) -> bool {
+) -> ScanDirectoryOutcome {
     if cancelled.load(Ordering::Acquire)
         || failed.load(Ordering::Acquire)
         || root_invalid.load(Ordering::Acquire)
     {
-        return false;
+        return ScanDirectoryOutcome {
+            continue_scanning: false,
+            completed: false,
+        };
     }
     if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
-        return false;
+        return ScanDirectoryOutcome {
+            continue_scanning: false,
+            completed: false,
+        };
     }
     let mut frame = match open_frame(root_directory, root, task) {
         Ok(frame) => frame,
         Err(error) => {
             let (task, error) = *error;
-            report_directory_task_error(task.path, error, sender, cancelled);
-            return true;
+            report_directory_task_error(task.path, error, lease, sender, cancelled);
+            return ScanDirectoryOutcome {
+                continue_scanning: true,
+                completed: false,
+            };
         }
     };
     if let Err(error) = validate_directory_task(root_directory, root, &frame.task) {
-        report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
-        return true;
+        report_directory_task_error(frame.task.path.clone(), error, lease, sender, cancelled);
+        return ScanDirectoryOutcome {
+            continue_scanning: true,
+            completed: false,
+        };
     }
     if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
-        return false;
+        return ScanDirectoryOutcome {
+            continue_scanning: false,
+            completed: false,
+        };
     }
     loop {
         if cancelled.load(Ordering::Acquire)
             || failed.load(Ordering::Acquire)
             || root_invalid.load(Ordering::Acquire)
         {
-            return false;
+            return ScanDirectoryOutcome {
+                continue_scanning: false,
+                completed: false,
+            };
         }
         if frame.batch.len() == BATCH_SIZE {
-            if !flush_frame(&mut frame, queue, sender, cancelled, failed) {
-                return false;
+            if !flush_frame(
+                &mut frame,
+                lease,
+                canonical_root,
+                input_runs,
+                scheduler,
+                sender,
+                cancelled,
+                failed,
+            ) {
+                return ScanDirectoryOutcome {
+                    continue_scanning: false,
+                    completed: false,
+                };
+            }
+            if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
+                return ScanDirectoryOutcome {
+                    continue_scanning: false,
+                    completed: false,
+                };
             }
             if let Err(error) = validate_directory_task(root_directory, root, &frame.task) {
-                report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
-                return true;
+                report_directory_task_error(
+                    frame.task.path.clone(),
+                    error,
+                    lease,
+                    sender,
+                    cancelled,
+                );
+                return ScanDirectoryOutcome {
+                    continue_scanning: true,
+                    completed: false,
+                };
             }
         }
         match frame.entries.next() {
@@ -546,8 +692,12 @@ fn scan_directory(
                 process_entry(
                     &mut frame,
                     &entry,
+                    canonical_root,
+                    lease,
+                    input_runs,
                     sender,
                     cancelled,
+                    failed,
                     exclusions,
                     root_filesystem,
                     cross_filesystems,
@@ -567,26 +717,104 @@ fn scan_directory(
         }
     }
     if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
-        return false;
+        return ScanDirectoryOutcome {
+            continue_scanning: false,
+            completed: false,
+        };
     }
-    if !frame.batch.is_empty() && !flush_frame(&mut frame, queue, sender, cancelled, failed) {
-        return false;
+    if !frame.batch.is_empty()
+        && !flush_frame(
+            &mut frame,
+            lease,
+            canonical_root,
+            input_runs,
+            scheduler,
+            sender,
+            cancelled,
+            failed,
+        )
+    {
+        return ScanDirectoryOutcome {
+            continue_scanning: false,
+            completed: false,
+        };
     }
     if !validate_root_for_traversal(root, root_identity, sender, cancelled, root_invalid) {
-        return false;
+        return ScanDirectoryOutcome {
+            continue_scanning: false,
+            completed: false,
+        };
     }
     if let Err(error) = validate_directory_task(root_directory, root, &frame.task) {
-        report_directory_task_error(frame.task.path.clone(), error, sender, cancelled);
-        return true;
+        report_directory_task_error(frame.task.path.clone(), error, lease, sender, cancelled);
+        return ScanDirectoryOutcome {
+            continue_scanning: true,
+            completed: false,
+        };
     }
-    send_event(
+    ScanDirectoryOutcome {
+        continue_scanning: true,
+        completed: true,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn scan_directory_with_queue(
+    task: DirectoryTask,
+    queue: &TaskQueue,
+    sender: &Sender<WorkerEvent>,
+    cancelled: &AtomicBool,
+    failed: &AtomicBool,
+    root_invalid: &AtomicBool,
+    root_directory: &File,
+    root: &Path,
+    root_identity: Option<&NativeIdentity>,
+    exclusions: &Exclusions,
+    root_filesystem: Option<&FilesystemKey>,
+    cross_filesystems: bool,
+) -> bool {
+    let (scheduler, commands) = bounded(BATCH_SIZE);
+    let outcome = scan_directory(
+        task,
+        None,
+        &scheduler,
         sender,
-        WorkerEvent::ScanDirectoryComplete {
-            path: frame.task.path,
-            identity: frame.identity,
-        },
         cancelled,
-    )
+        failed,
+        root_invalid,
+        root_directory,
+        root,
+        root,
+        None,
+        root_identity,
+        exclusions,
+        root_filesystem,
+        cross_filesystems,
+    );
+    drop(scheduler);
+    for command in commands.try_iter() {
+        match command {
+            SchedulerCommand::Enqueue(task) => {
+                if let Err(error) = queue.schedule(task) {
+                    failed.store(true, Ordering::Release);
+                    let _ = send_event(
+                        sender,
+                        WorkerEvent::ScanFailed {
+                            path: None,
+                            message: format!("could not queue scanner directory: {error}"),
+                        },
+                        cancelled,
+                    );
+                    return false;
+                }
+            }
+            SchedulerCommand::Complete { .. } => {
+                panic!("direct scan helper cannot receive a task completion")
+            }
+        }
+    }
+    outcome.continue_scanning
 }
 
 fn validate_root_for_traversal(
@@ -737,6 +965,7 @@ pub(super) fn replace_after_next_batch(path: PathBuf, displaced: PathBuf, target
 fn report_directory_task_error(
     path: PathBuf,
     error: DirectoryTaskError,
+    lease: Option<&WorkLease>,
     sender: &Sender<WorkerEvent>,
     cancelled: &AtomicBool,
 ) {
@@ -745,8 +974,10 @@ fn report_directory_task_error(
             let _ = send_event(
                 sender,
                 WorkerEvent::ScanUnscanned {
+                    lease: lease.cloned(),
                     path,
                     reason: UnscannedReason::Replacement(message),
+                    input_runs: Vec::new(),
                 },
                 cancelled,
             );
@@ -928,7 +1159,6 @@ fn open_frame(
     Ok(ScanFrame {
         task,
         _directory: directory,
-        identity: Some(actual),
         entries,
         batch: Vec::with_capacity(BATCH_SIZE),
         directories: Vec::with_capacity(BATCH_SIZE),
@@ -968,12 +1198,54 @@ fn identity_from_entry_metadata(metadata: &cap_fs::Metadata) -> io::Result<Optio
     }
 }
 
-fn report_symbolic_link(path: PathBuf, sender: &Sender<WorkerEvent>, cancelled: &AtomicBool) {
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the boundary event retains its complete scan-time identity and transport context"
+)]
+fn report_unscanned_entry(
+    canonical_root: &Path,
+    lease: Option<&WorkLease>,
+    factory: Option<&ScanInputRunFactory>,
+    metadata: &Metadata,
+    path: PathBuf,
+    identity: NativeIdentity,
+    reason: UnscannedReason,
+    sender: &Sender<WorkerEvent>,
+    cancelled: &AtomicBool,
+    failed: &AtomicBool,
+) {
+    let coverage = if matches!(reason, UnscannedReason::SymbolicLink) {
+        Coverage::Complete
+    } else {
+        Coverage::Uncertain
+    };
+    let entry = ScannedEntry {
+        metadata: metadata.clone(),
+        path: path.clone(),
+        identity,
+    };
+    let input_runs = match seal_scanned_entries(canonical_root, &[entry], coverage, factory) {
+        Ok(input_runs) => input_runs,
+        Err(message) => {
+            failed.store(true, Ordering::Release);
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanFailed {
+                    path: Some(path),
+                    message,
+                },
+                cancelled,
+            );
+            return;
+        }
+    };
     let _ = send_event(
         sender,
         WorkerEvent::ScanUnscanned {
+            lease: lease.cloned(),
             path,
-            reason: UnscannedReason::SymbolicLink,
+            reason,
+            input_runs,
         },
         cancelled,
     );
@@ -983,8 +1255,12 @@ fn report_symbolic_link(path: PathBuf, sender: &Sender<WorkerEvent>, cancelled: 
 fn process_entry(
     frame: &mut ScanFrame,
     entry: &cap_fs::DirEntry,
+    canonical_root: &Path,
+    lease: Option<&WorkLease>,
+    input_runs: Option<&ScanInputRunFactory>,
     sender: &Sender<WorkerEvent>,
     cancelled: &AtomicBool,
+    failed: &AtomicBool,
     exclusions: &Exclusions,
     root_filesystem: Option<&FilesystemKey>,
     cross_filesystems: bool,
@@ -1010,7 +1286,21 @@ fn process_entry(
     };
     let identity = match identity_for(&path, &metadata) {
         Ok(Some(identity)) => identity,
-        Ok(None) => return,
+        Ok(None) => {
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanUnscanned {
+                    lease: lease.cloned(),
+                    path,
+                    reason: UnscannedReason::Metadata(
+                        "scan entry identity is unavailable".to_string(),
+                    ),
+                    input_runs: Vec::new(),
+                },
+                cancelled,
+            );
+            return;
+        }
         Err(error) => {
             let message = format!(
                 "{}: {error}",
@@ -1031,18 +1321,33 @@ fn process_entry(
     };
     let is_dir = metadata.is_dir();
     if let Some(pattern) = exclusions.reason(&path, is_dir) {
-        let _ = send_event(
+        report_unscanned_entry(
+            canonical_root,
+            lease,
+            input_runs,
+            &metadata,
+            path,
+            identity,
+            UnscannedReason::Excluded(pattern),
             sender,
-            WorkerEvent::ScanUnscanned {
-                path,
-                reason: UnscannedReason::Excluded(pattern),
-            },
             cancelled,
+            failed,
         );
         return;
     }
     if metadata.file_type().is_symlink() || identity.reparse_point {
-        report_symbolic_link(path, sender, cancelled);
+        report_unscanned_entry(
+            canonical_root,
+            lease,
+            input_runs,
+            &metadata,
+            path,
+            identity,
+            UnscannedReason::SymbolicLink,
+            sender,
+            cancelled,
+            failed,
+        );
         return;
     }
     if is_dir && !cross_filesystems {
@@ -1053,10 +1358,17 @@ fn process_entry(
             )),
         };
         if let Some(reason) = reason {
-            let _ = send_event(
+            report_unscanned_entry(
+                canonical_root,
+                lease,
+                input_runs,
+                &metadata,
+                path,
+                identity,
+                reason,
                 sender,
-                WorkerEvent::ScanUnscanned { path, reason },
                 cancelled,
+                failed,
             );
             return;
         }
@@ -1075,15 +1387,47 @@ fn process_entry(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "batch sealing keeps every worker-to-actor cancellation boundary explicit"
+)]
 fn flush_frame(
     frame: &mut ScanFrame,
-    queue: &TaskQueue,
+    lease: Option<&WorkLease>,
+    canonical_root: &Path,
+    input_runs: Option<&ScanInputRunFactory>,
+    scheduler: &Sender<SchedulerCommand>,
     sender: &Sender<WorkerEvent>,
     cancelled: &AtomicBool,
     failed: &AtomicBool,
 ) -> bool {
     let entries = std::mem::replace(&mut frame.batch, Vec::with_capacity(BATCH_SIZE));
-    if !send_event(sender, WorkerEvent::ScanBatch { entries }, cancelled) {
+    let input_runs =
+        match seal_scanned_entries(canonical_root, &entries, Coverage::Complete, input_runs) {
+            Ok(input_runs) => input_runs,
+            Err(message) => {
+                failed.store(true, Ordering::Release);
+                frame.directories.clear();
+                let _ = send_event(
+                    sender,
+                    WorkerEvent::ScanFailed {
+                        path: Some(frame.task.path.clone()),
+                        message,
+                    },
+                    cancelled,
+                );
+                return false;
+            }
+        };
+    if !send_event(
+        sender,
+        WorkerEvent::ScanBatch {
+            lease: lease.cloned(),
+            entries,
+            input_runs,
+        },
+        cancelled,
+    ) {
         frame.directories.clear();
         return false;
     }
@@ -1091,13 +1435,13 @@ fn flush_frame(
     #[cfg(test)]
     maybe_replace_after_batch(&frame.task.path);
     for task in std::mem::take(&mut frame.directories) {
-        if let Err(error) = queue.schedule(task) {
+        if !send_scheduler_command(scheduler, SchedulerCommand::Enqueue(task), cancelled) {
             failed.store(true, Ordering::Release);
             let _ = send_event(
                 sender,
                 WorkerEvent::ScanFailed {
                     path: None,
-                    message: format!("could not queue scanner directory: {error}"),
+                    message: "scanner coordinator disconnected".to_string(),
                 },
                 cancelled,
             );
@@ -1107,6 +1451,111 @@ fn flush_frame(
     true
 }
 
+fn seal_scanned_entries(
+    root: &Path,
+    entries: &[ScannedEntry],
+    coverage: Coverage,
+    factory: Option<&ScanInputRunFactory>,
+) -> Result<Vec<SealedRun>, String> {
+    let Some(factory) = factory else {
+        return Ok(Vec::new());
+    };
+    let mut paths = Vec::with_capacity(entries.len());
+    let mut identities = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let relative = entry
+            .path
+            .strip_prefix(root)
+            .map_err(|_| "scanner entry escaped its configured root".to_string())?;
+        let relative = RelativePath::from_path(relative)
+            .map_err(|_| "scanner entry has an invalid root-relative path".to_string())?;
+        let kind = if entry.metadata.file_type().is_symlink() || entry.identity.reparse_point {
+            PathEntryKind::Link
+        } else if entry.metadata.is_dir() {
+            PathEntryKind::Directory
+        } else {
+            PathEntryKind::File
+        };
+        let node_kind = match kind {
+            PathEntryKind::Directory => NodeKind::Directory,
+            PathEntryKind::File => NodeKind::File,
+            PathEntryKind::Link => NodeKind::Link,
+        };
+        let allocated_bytes = (kind != PathEntryKind::Directory)
+            .then(|| {
+                physical_size(&entry.path, &entry.metadata)
+                    .ok()
+                    .map(u128::from)
+            })
+            .flatten();
+        let direct_allocation =
+            kind != PathEntryKind::Directory && entry.identity.link_count == Some(1);
+        let physical_bounds = allocated_bytes.map_or_else(ByteBounds::unknown, ByteBounds::exact);
+        let (allocated_bounds, reclaimable_bounds) = if direct_allocation {
+            (physical_bounds, physical_bounds)
+        } else {
+            (ByteBounds::exact(0), ByteBounds::exact(0))
+        };
+        let snapshot = EntrySnapshot {
+            identity: Some(entry.identity.clone()),
+            kind: node_kind,
+            apparent_bytes: if kind == PathEntryKind::Directory {
+                0
+            } else {
+                u128::from(entry.metadata.len())
+            },
+            allocated_bytes,
+            modified_nanos: entry
+                .metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+        };
+        paths.push(PathObservation::with_snapshot(
+            relative.clone(),
+            kind,
+            SummaryMetrics::leaf(
+                snapshot.apparent_bytes,
+                allocated_bounds,
+                reclaimable_bounds,
+            ),
+            coverage,
+            Some(snapshot),
+        ));
+        if kind != PathEntryKind::Directory && entry.identity.link_count != Some(1) {
+            identities.push(IdentityObservation {
+                path: relative,
+                file_id: entry.identity.file_id,
+                declared_links: entry.identity.link_count,
+                allocated_bytes: allocated_bytes
+                    .map_or_else(ByteBounds::unknown, ByteBounds::exact),
+            });
+        }
+    }
+    factory
+        .seal_observation_batch(paths, identities)
+        .map_err(|error| error.to_string())
+}
+
+fn send_scheduler_command(
+    sender: &Sender<SchedulerCommand>,
+    mut command: SchedulerCommand,
+    cancelled: &AtomicBool,
+) -> bool {
+    loop {
+        match sender.send_timeout(command, Duration::from_millis(25)) {
+            Ok(()) => return true,
+            Err(SendTimeoutError::Timeout(returned)) => {
+                if cancelled.load(Ordering::Acquire) {
+                    return false;
+                }
+                command = returned;
+            }
+            Err(SendTimeoutError::Disconnected(_)) => return false,
+        }
+    }
+}
 fn validate_scan_root(path: &Path, expected: Option<&NativeIdentity>) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         format!(
@@ -1136,11 +1585,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scanner_reports_temporary_storage_exhaustion_without_completing_the_root() {
+    fn scanner_reports_temporary_storage_exhaustion_without_committing_root() {
         use crossbeam_channel::unbounded;
 
         let root = tempfile::tempdir().expect("scan root should exist");
-        for index in 0..=TASK_QUEUE_PER_WORKER {
+        for index in 0..=TASK_QUEUE_PER_WORKER.saturating_add(1) {
             fs::create_dir(root.path().join(format!("directory-{index}")))
                 .expect("directory fixture should be created");
         }
@@ -1148,40 +1597,35 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         run(
             ScannerOptions {
+                session: ScanSessionId::from_bytes([4; 16]),
+                generation: ScanGeneration::initial(),
                 root: root.path().to_path_buf(),
+                canonical_root: root.path().to_path_buf(),
                 root_identity: None,
                 threads: 1,
                 cross_filesystems: false,
                 exclusions: Vec::new(),
                 internal_paths: Vec::new(),
-                temporary_storage: TemporaryStorage::with_limit_bytes(0),
+                temporary_storage: TemporaryStorage::scan_store_with_limit_bytes(0),
+                input_runs: None,
             },
             &sender,
             &cancelled,
         );
 
         let mut saw_capacity_error = false;
-        let mut completed_root = false;
         let mut finished = false;
         for event in events.try_iter() {
             match event {
                 WorkerEvent::ScanFailed { message, .. } => {
-                    saw_capacity_error |= message.contains("temporary storage capacity exhausted")
-                        && message.contains("--temporary-storage-mib");
-                }
-                WorkerEvent::ScanDirectoryComplete { path, .. } => {
-                    completed_root |= path == root.path();
+                    saw_capacity_error |= message.contains("scan store capacity exhausted")
+                        && message.contains("--scan-store-mib");
                 }
                 WorkerEvent::ScanFinished { cancelled } => finished |= !cancelled,
                 WorkerEvent::ScanBatch { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1193,9 +1637,364 @@ mod tests {
             finished,
             "scanner should report a terminal event after failure"
         );
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test validates every scanner event and canonical admission boundary"
+    )]
+    #[test]
+    fn scanner_seals_worker_facts_for_lease_validated_store_admission() {
+        use crossbeam_channel::unbounded;
+
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let entry = root.path().join("entry");
+        fs::write(&entry, b"payload").expect("scan fixture should exist");
+        let excluded = root.path().join("excluded");
+        fs::create_dir(&excluded).expect("excluded fixture should exist");
+        let storage = TemporaryStorage::scan_store_with_limit_bytes(8 * 1024 * 1024);
+        let mut store =
+            crate::scan_store::session::ScanStore::new(ScanGeneration::initial(), storage.clone())
+                .expect("scan store should initialize");
+        let input_runs = store
+            .input_run_factory()
+            .expect("initial generation should accept input");
+        let (sender, events) = unbounded();
+        let cancelled = AtomicBool::new(false);
+        run(
+            ScannerOptions {
+                session: store.session(),
+                generation: input_runs.generation(),
+                root: root.path().to_path_buf(),
+                canonical_root: root.path().to_path_buf(),
+                root_identity: None,
+                threads: 1,
+                cross_filesystems: false,
+                exclusions: vec!["excluded/".to_string()],
+                internal_paths: Vec::new(),
+                temporary_storage: storage,
+                input_runs: Some(input_runs),
+            },
+            &sender,
+            &cancelled,
+        );
+
+        let mut admitted_runs: usize = 0;
+        let mut finished = false;
+        for event in events.try_iter() {
+            match event {
+                WorkerEvent::ScanBatch {
+                    lease: Some(lease),
+                    input_runs,
+                    ..
+                } => {
+                    admitted_runs = admitted_runs.saturating_add(input_runs.len());
+                    for run in input_runs {
+                        assert!(
+                            store
+                                .accept_leased_input_run(&lease, run)
+                                .expect("lease-validated scanner run should be admitted")
+                        );
+                    }
+                }
+                WorkerEvent::ScanBatch { lease: None, .. } => {
+                    panic!("scanner sealed an unleased batch")
+                }
+                WorkerEvent::ScanFinished { cancelled } => finished |= !cancelled,
+                WorkerEvent::ScanFailed { message, .. } => panic!("scanner failed: {message}"),
+                WorkerEvent::ScanUnscanned {
+                    lease: Some(lease),
+                    input_runs,
+                    ..
+                } => {
+                    assert!(
+                        !input_runs.is_empty(),
+                        "known unscanned coverage must arrive in a sealed run"
+                    );
+                    admitted_runs = admitted_runs.saturating_add(input_runs.len());
+                    for run in input_runs {
+                        assert!(
+                            store
+                                .accept_leased_input_run(&lease, run)
+                                .expect("lease-validated coverage run should be admitted")
+                        );
+                    }
+                }
+                WorkerEvent::ScanUnscanned { lease: None, .. } => {
+                    panic!("scanner sealed an unleased coverage result")
+                }
+                WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+
+        assert!(finished, "scanner should report normal completion");
         assert!(
-            !completed_root,
-            "a capacity failure must not report the partially queued root as complete"
+            admitted_runs > 0,
+            "scanner should seal at least one input run"
+        );
+        store
+            .publish()
+            .expect("admitted scanner facts should publish");
+        let page = store
+            .published()
+            .expect("published generation should exist")
+            .page(crate::scan_store::page::PageRequest::first(
+                RelativePath::root(),
+                8,
+            ))
+            .expect("published root page should load");
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(
+            page.entries[0].path,
+            RelativePath::from_path(Path::new("entry")).expect("fixture path should be relative")
+        );
+        assert!(
+            page.entries.iter().any(|entry| entry.path
+                == RelativePath::from_path(Path::new("excluded"))
+                    .expect("fixture path should be relative")
+                && entry.coverage == Coverage::Uncertain),
+            "excluded directory must remain a canonical uncertain boundary"
+        );
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct WorkerTrace {
+        observed_paths: std::collections::BTreeSet<RelativePath>,
+        admitted_runs: usize,
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the trace records each worker event and its canonical admission boundary"
+    )]
+    fn trace_scan_with_workers(root: &Path, threads: usize) -> WorkerTrace {
+        use crossbeam_channel::unbounded;
+
+        let storage = TemporaryStorage::scan_store_with_limit_bytes(8 * 1024 * 1024);
+        let mut store =
+            crate::scan_store::session::ScanStore::new(ScanGeneration::initial(), storage.clone())
+                .expect("scan store should initialize");
+        let input_runs = store
+            .input_run_factory()
+            .expect("initial generation should accept input");
+        let (sender, events) = unbounded();
+        let cancelled = AtomicBool::new(false);
+        run(
+            ScannerOptions {
+                session: store.session(),
+                generation: input_runs.generation(),
+                root: root.to_path_buf(),
+                canonical_root: root.to_path_buf(),
+                root_identity: None,
+                threads,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                internal_paths: Vec::new(),
+                temporary_storage: storage,
+                input_runs: Some(input_runs),
+            },
+            &sender,
+            &cancelled,
+        );
+
+        let mut observed_paths = std::collections::BTreeSet::new();
+        let mut admitted_runs: usize = 0;
+        let mut finished = false;
+        for event in events.try_iter() {
+            match event {
+                WorkerEvent::ScanBatch {
+                    lease: Some(lease),
+                    entries,
+                    input_runs,
+                } => {
+                    for entry in entries {
+                        let relative = entry
+                            .path
+                            .strip_prefix(root)
+                            .ok()
+                            .and_then(|path| RelativePath::from_path(path).ok())
+                            .expect("scanner entries should remain rooted");
+                        assert!(
+                            observed_paths.insert(relative),
+                            "scanner must emit each path exactly once"
+                        );
+                    }
+                    admitted_runs = admitted_runs.saturating_add(input_runs.len());
+                    for run in input_runs {
+                        assert!(
+                            store
+                                .accept_leased_input_run(&lease, run)
+                                .expect("lease-validated run should be admitted")
+                        );
+                    }
+                }
+                WorkerEvent::ScanBatch { lease: None, .. } => {
+                    panic!("scanner emitted an unleased batch")
+                }
+                WorkerEvent::ScanFinished { cancelled } => finished |= !cancelled,
+                WorkerEvent::ScanFailed { message, .. } => panic!("scanner failed: {message}"),
+                WorkerEvent::ScanUnscanned { path, reason, .. } => {
+                    panic!("fixture path was unexpectedly unscanned: {path:?}: {reason:?}")
+                }
+                WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        assert!(finished, "scanner should reach its normal terminal event");
+        assert!(
+            admitted_runs > 0,
+            "scanner should seal canonical input runs"
+        );
+        store
+            .publish()
+            .expect("worker trace facts should publish canonically");
+        for path in &observed_paths {
+            assert!(
+                store
+                    .published()
+                    .expect("published generation should remain available")
+                    .page_entry(path)
+                    .expect("canonical exact lookup should succeed")
+                    .is_some(),
+                "every worker result must recover through the published generation"
+            );
+        }
+        WorkerTrace {
+            observed_paths,
+            admitted_runs,
+        }
+    }
+
+    #[test]
+    fn worker_count_recovery_trace_matrix_preserves_canonical_paths() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let mut expected_paths = std::collections::BTreeSet::new();
+        for branch in ["alpha", "beta", "gamma", "delta"] {
+            let directory = root.path().join(branch);
+            let nested = directory.join("nested");
+            fs::create_dir(&directory).expect("branch should exist");
+            fs::create_dir(&nested).expect("nested branch should exist");
+            fs::write(directory.join("top"), b"top").expect("top file should exist");
+            fs::write(nested.join("leaf"), b"leaf").expect("leaf file should exist");
+            let branch_relative = RelativePath::from_path(Path::new(branch))
+                .expect("fixture branch should be relative");
+            let nested_relative = RelativePath::from_path(&PathBuf::from(branch).join("nested"))
+                .expect("fixture nested branch should be relative");
+            for relative in [
+                branch_relative,
+                nested_relative,
+                RelativePath::from_path(&PathBuf::from(branch).join("top"))
+                    .expect("fixture file should be relative"),
+                RelativePath::from_path(&PathBuf::from(branch).join("nested/leaf"))
+                    .expect("fixture leaf should be relative"),
+            ] {
+                expected_paths.insert(relative);
+            }
+        }
+
+        for workers in [1, 2, 4, 8] {
+            let trace = trace_scan_with_workers(root.path(), workers);
+            assert_eq!(
+                trace.observed_paths, expected_paths,
+                "worker count {workers} must retain every observed path"
+            );
+        }
+    }
+
+    #[test]
+    fn focused_scanner_writes_paths_relative_to_the_canonical_root() {
+        use crossbeam_channel::unbounded;
+
+        let root = tempfile::tempdir().expect("canonical root should exist");
+        let target = root.path().join("target");
+        let entry = target.join("entry");
+        fs::create_dir(&target).expect("focused root should exist");
+        fs::write(&entry, b"payload").expect("focused fixture should exist");
+        let storage = TemporaryStorage::scan_store_with_limit_bytes(8 * 1024 * 1024);
+        let mut store =
+            crate::scan_store::session::ScanStore::new(ScanGeneration::initial(), storage.clone())
+                .expect("scan store should initialize");
+        let target_relative =
+            RelativePath::from_path(Path::new("target")).expect("target path should be relative");
+        store
+            .append_observation_batch(
+                vec![PathObservation::new(
+                    target_relative.clone(),
+                    PathEntryKind::Directory,
+                    SummaryMetrics::default(),
+                    Coverage::Complete,
+                )],
+                Vec::new(),
+            )
+            .expect("target directory fact should be admitted");
+        let input_runs = store
+            .input_run_factory()
+            .expect("focused generation should accept input");
+        let (sender, events) = unbounded();
+        let cancelled = AtomicBool::new(false);
+        run(
+            ScannerOptions {
+                session: store.session(),
+                generation: input_runs.generation(),
+                root: target.clone(),
+                canonical_root: root.path().to_path_buf(),
+                root_identity: None,
+                threads: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                internal_paths: Vec::new(),
+                temporary_storage: storage,
+                input_runs: Some(input_runs),
+            },
+            &sender,
+            &cancelled,
+        );
+        for event in events.try_iter() {
+            match event {
+                WorkerEvent::ScanBatch {
+                    lease: Some(lease),
+                    input_runs,
+                    ..
+                } => {
+                    for run in input_runs {
+                        assert!(
+                            store
+                                .accept_leased_input_run(&lease, run)
+                                .expect("focused scanner run should be admitted")
+                        );
+                    }
+                }
+                WorkerEvent::ScanBatch { lease: None, .. } => {
+                    panic!("focused scanner sealed an unleased batch")
+                }
+                WorkerEvent::ScanFailed { message, .. } => {
+                    panic!("focused scanner failed: {message}")
+                }
+                WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::ScanFinished { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        store
+            .publish()
+            .expect("focused canonical generation should publish");
+        let page = store
+            .published_mut()
+            .expect("published generation should exist")
+            .page(crate::scan_store::page::PageRequest::first(
+                target_relative,
+                8,
+            ))
+            .expect("focused canonical page should load");
+        assert_eq!(
+            page.entries[0].path,
+            RelativePath::from_path(Path::new("target/entry"))
+                .expect("focused entry path should remain rooted globally")
         );
     }
 
@@ -1255,13 +2054,8 @@ mod tests {
             .expect("descendant identity should be available");
         replace_directory_with_link(&descendant, &displaced, outside.path());
 
-        let (queue, _) = TaskQueue::new(
-            root.path().to_path_buf(),
-            1,
-            &TemporaryStorage::default(),
-            Arc::new(ScannerControl::new()),
-        )
-        .expect("scanner task queue should be available");
+        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
+            .expect("scanner task queue should be available");
         let (sender, events) = bounded(4);
         let cancelled = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
@@ -1270,7 +2064,7 @@ mod tests {
             .expect("scan root handle should open");
         let exclusions = Exclusions::new(root.path(), Vec::new(), Vec::new())
             .expect("scanner exclusions should compile");
-        assert!(scan_directory(
+        assert!(scan_directory_with_queue(
             DirectoryTask {
                 path: descendant.clone(),
                 identity: Some(identity),
@@ -1292,7 +2086,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("replaced descendant should be reported")
         {
-            WorkerEvent::ScanUnscanned { path, reason } => {
+            WorkerEvent::ScanUnscanned { path, reason, .. } => {
                 assert_eq!(path, descendant);
                 assert!(matches!(reason, UnscannedReason::Replacement(_)));
             }
@@ -1325,13 +2119,8 @@ mod tests {
             .expect("descendant identity should be available");
         replace_after_next_validation(descendant.clone(), displaced, outside.path().to_path_buf());
 
-        let (queue, _) = TaskQueue::new(
-            root.path().to_path_buf(),
-            1,
-            &TemporaryStorage::default(),
-            Arc::new(ScannerControl::new()),
-        )
-        .expect("scanner task queue should be available");
+        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
+            .expect("scanner task queue should be available");
         let (sender, events) = bounded(8);
         let cancelled = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
@@ -1340,7 +2129,7 @@ mod tests {
             .expect("scan root handle should open");
         let exclusions = Exclusions::new(root.path(), Vec::new(), Vec::new())
             .expect("scanner exclusions should compile");
-        assert!(scan_directory(
+        assert!(scan_directory_with_queue(
             DirectoryTask {
                 path: descendant.clone(),
                 identity: Some(identity),
@@ -1361,13 +2150,13 @@ mod tests {
         let mut saw_replacement = false;
         while let Ok(event) = events.recv_timeout(Duration::from_secs(1)) {
             match event {
-                WorkerEvent::ScanUnscanned { path, reason } => {
+                WorkerEvent::ScanUnscanned { path, reason, .. } => {
                     assert_eq!(path, descendant);
                     assert!(matches!(reason, UnscannedReason::Replacement(_)));
                     saw_replacement = true;
                     break;
                 }
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch { entries, .. } => {
                     assert!(
                         !entries
                             .iter()
@@ -1375,18 +2164,10 @@ mod tests {
                         "scanner must not enumerate the replacement target"
                     );
                 }
-                WorkerEvent::ScanDirectoryComplete { .. } => {
-                    panic!("replaced directory must not be reported complete")
-                }
                 WorkerEvent::ScanFailed { .. }
                 | WorkerEvent::ScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1425,13 +2206,8 @@ mod tests {
         let escaped_path = descendant.join("outside-only");
         fs::write(&outside_only, b"outside").expect("outside fixture should be written");
 
-        let (queue, _) = TaskQueue::new(
-            root.path().to_path_buf(),
-            1,
-            &TemporaryStorage::default(),
-            Arc::new(ScannerControl::new()),
-        )
-        .expect("scanner task queue should be available");
+        let (queue, _) = TaskQueue::new(root.path().to_path_buf(), 1, &TemporaryStorage::default())
+            .expect("scanner task queue should be available");
         let (sender, events) = bounded(8);
         let cancelled = AtomicBool::new(false);
         let root_invalid = AtomicBool::new(false);
@@ -1440,7 +2216,7 @@ mod tests {
             .expect("scan root handle should open");
         let exclusions = Exclusions::new(root.path(), Vec::new(), Vec::new())
             .expect("scanner exclusions should compile");
-        assert!(scan_directory(
+        assert!(scan_directory_with_queue(
             DirectoryTask {
                 path: descendant.clone(),
                 identity: Some(identity),
@@ -1461,30 +2237,22 @@ mod tests {
         let mut saw_replacement = false;
         while let Ok(event) = events.recv_timeout(Duration::from_secs(1)) {
             match event {
-                WorkerEvent::ScanUnscanned { path, reason } => {
+                WorkerEvent::ScanUnscanned { path, reason, .. } => {
                     assert_eq!(path, descendant);
                     assert!(matches!(reason, UnscannedReason::Replacement(_)));
                     saw_replacement = true;
                     break;
                 }
-                WorkerEvent::ScanBatch { entries } => {
+                WorkerEvent::ScanBatch { entries, .. } => {
                     assert!(
                         !entries.iter().any(|entry| entry.path == escaped_path),
                         "scanner must not enumerate the moved ancestor"
                     );
                 }
-                WorkerEvent::ScanDirectoryComplete { .. } => {
-                    panic!("replaced ancestor must not be reported complete")
-                }
                 WorkerEvent::ScanFailed { .. }
                 | WorkerEvent::ScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1496,106 +2264,6 @@ mod tests {
             outside_only.exists(),
             "outside target should remain untouched"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scanner_validated_completion_trusts_provided_identity() {
-        use crate::model::{MIN_PROCESS_MIB, NodeKind, NodeState};
-        use crate::state::files::FileTree;
-        use crossbeam_channel::bounded;
-
-        let root = tempfile::tempdir().expect("scan root should exist");
-        let outside = tempfile::tempdir().expect("outside root should exist");
-        fs::write(outside.path().join("secret"), b"outside")
-            .expect("outside fixture should be written");
-        let descendant = root.path().join("descendant");
-        let displaced = root.path().join("displaced-descendant");
-        fs::create_dir(&descendant).expect("descendant should be created");
-        fs::write(descendant.join("original"), b"inside")
-            .expect("descendant fixture should be written");
-        let metadata = fs::symlink_metadata(&descendant).expect("descendant metadata should exist");
-        let identity = identity_for(&descendant, &metadata)
-            .expect("descendant identity should be readable")
-            .expect("descendant identity should be available");
-
-        let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
-            .expect("file tree should be created");
-        tree.add_entry(&metadata, &descendant, &identity)
-            .expect("descendant should be represented");
-
-        let (queue, _) = TaskQueue::new(
-            root.path().to_path_buf(),
-            1,
-            &TemporaryStorage::default(),
-            Arc::new(ScannerControl::new()),
-        )
-        .expect("scanner task queue should be available");
-        let (sender, events) = bounded(8);
-        let cancelled = AtomicBool::new(false);
-        let root_invalid = AtomicBool::new(false);
-        let failed = AtomicBool::new(false);
-        let root_directory = cap_fs::open_ambient_dir(root.path(), ambient_authority())
-            .expect("scan root handle should open");
-        let exclusions = Exclusions::new(root.path(), Vec::new(), Vec::new())
-            .expect("scanner exclusions should compile");
-        assert!(scan_directory(
-            DirectoryTask {
-                path: descendant.clone(),
-                identity: Some(identity.clone()),
-            },
-            &queue,
-            &sender,
-            &cancelled,
-            &failed,
-            &root_invalid,
-            &root_directory,
-            root.path(),
-            None,
-            &exclusions,
-            None,
-            true,
-        ));
-
-        replace_directory_with_link(&descendant, &displaced, outside.path());
-
-        let mut saw_completion = false;
-        for event in events.try_iter() {
-            match event {
-                WorkerEvent::ScanBatch { entries } => {
-                    for entry in entries {
-                        tree.add_entry(&entry.metadata, &entry.path, &entry.identity)
-                            .expect("scanned entry should be represented");
-                    }
-                }
-                WorkerEvent::ScanDirectoryComplete { path, identity } => {
-                    assert_eq!(path, descendant);
-                    assert!(identity.is_some());
-                    tree.complete_directory(&path, identity.as_ref())
-                        .expect("completion should be represented");
-                    saw_completion = true;
-                }
-                WorkerEvent::ScanUnscanned { .. }
-                | WorkerEvent::ScanFailed { .. }
-                | WorkerEvent::ScanFinished { .. }
-                | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::FocusedScanBatch { .. }
-                | WorkerEvent::FocusedScanDirectoryComplete { .. }
-                | WorkerEvent::FocusedScanUnscanned { .. }
-                | WorkerEvent::FocusedScanFailed { .. }
-                | WorkerEvent::FocusedScanFinished { .. }
-                | WorkerEvent::DeletionFinished { .. } => {}
-            }
-        }
-        assert!(saw_completion, "scan should emit a completion event");
-        let node = tree
-            .nodes()
-            .find(|node| tree.path_for_id(node.id).as_deref() == Some(descendant.as_path()))
-            .expect("directory should remain represented");
-        assert_eq!(node.kind, NodeKind::Directory);
-        assert_eq!(node.state, NodeState::Complete);
-        assert!(outside.path().join("secret").exists());
     }
 }
 

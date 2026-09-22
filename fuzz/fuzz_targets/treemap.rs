@@ -2,8 +2,8 @@
 
 use std::ffi::OsString;
 
-use excise::geometry::{FileMetadata, FileType, HALF_ROWS_PER_CELL, TreeMap};
-use excise::model::NodeId;
+use excise::fuzz::geometry::{FileMetadata, FileType, HALF_ROWS_PER_CELL, TreeMap};
+use excise::fuzz::model::NodeId;
 use libfuzzer_sys::fuzz_target;
 use ratatui::layout::Rect;
 

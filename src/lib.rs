@@ -11,83 +11,86 @@
     clippy::cast_sign_loss
 )]
 
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod animation;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod animation;
 #[allow(dead_code)]
 mod app;
+#[cfg(feature = "internal")]
+pub mod benchmark;
 #[allow(dead_code)]
 mod cli;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod config;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod config;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod deletion;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod deletion;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod error;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod error;
 mod file_id_codec;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod filter;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod filter;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod input;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod input;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod model;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod model;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod native_path;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod native_path;
 #[allow(dead_code)]
 mod os;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod outcome;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod outcome;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod report;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod report;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod runtime;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod runtime;
 #[allow(dead_code)]
 mod scan_coordinator;
+mod scan_session;
 #[allow(dead_code)]
 mod scan_store;
 #[allow(dead_code)]
 mod state;
 mod temporary_storage;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod terminal;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod terminal;
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod theme;
-#[cfg(not(any(feature = "fuzzing", feature = "internal")))]
+#[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod theme;
 #[allow(dead_code)]
@@ -111,14 +114,69 @@ pub fn cli_command() -> clap::Command {
     config::Cli::command()
 }
 
-#[cfg(any(feature = "fuzzing", feature = "internal"))]
+#[cfg(feature = "internal")]
 pub mod geometry {
     pub use crate::state::tiles::{FileMetadata, FileType, HALF_ROWS_PER_CELL, Tile, TreeMap};
 }
 #[cfg(feature = "fuzzing")]
-pub use state::FileToDelete;
-#[cfg(feature = "fuzzing")]
-pub use terminal::{TerminalState, TerminalTransition};
+pub mod fuzz {
+    pub use crate::state::FileToDelete;
+    pub use crate::terminal::{TerminalState, TerminalTransition};
+
+    pub mod animation {
+        pub use crate::animation::{ACTIVE_FRAME_INTERVAL, AnimationScheduler};
+    }
+
+    pub mod config {
+        pub use crate::config::{
+            Cli, EnvironmentOverrides, KeyPreset, RuntimeConfig, parse_file_config,
+        };
+    }
+
+    pub mod deletion {
+        pub use crate::deletion::{
+            DeletionEntryOutcome, DeletionEntryResult, DeletionPlanError, DeletionReport,
+            PlannedEntry, PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan_cancellable,
+            execute_plan,
+        };
+    }
+
+    pub mod error {
+        pub use crate::error::AppError;
+    }
+
+    pub mod filter {
+        pub use crate::filter::FilterPattern;
+    }
+
+    pub mod geometry {
+        pub use crate::state::tiles::{FileMetadata, FileType, HALF_ROWS_PER_CELL, TreeMap};
+    }
+
+    pub mod input {
+        pub use crate::input::{InputEvent, InputSource};
+    }
+
+    pub mod model {
+        pub use crate::model::{ByteBounds, DEFAULT_PROCESS_MIB, EntrySnapshot, NodeId, NodeKind};
+    }
+
+    pub mod native_path {
+        pub use crate::native_path::{NativeIdentity, NativePath, identity_for};
+    }
+
+    pub mod report {
+        pub use crate::report::{DeletionHistoryDocument, ScanReportDocument};
+    }
+
+    pub mod runtime {
+        pub use crate::runtime::{RuntimeSettings, VirtualClock, run};
+    }
+
+    pub mod theme {
+        pub use crate::theme::ThemeId;
+    }
+}
 
 #[cfg(test)]
 mod tests;
@@ -146,6 +204,8 @@ pub(crate) fn start<B>(
         exclusions: Vec::new(),
         memory_mib: crate::model::DEFAULT_PROCESS_MIB,
         temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+        scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+        scan_store_dir: None,
         apparent_size: show_apparent_size,
         disable_delete_confirmation,
         reduced_motion: true,

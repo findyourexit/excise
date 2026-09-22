@@ -1,5 +1,4 @@
 #![allow(clippy::unnested_or_patterns)]
-use std::path::PathBuf;
 
 use std::time::Duration;
 
@@ -59,7 +58,6 @@ pub(crate) enum InputCommand {
     Drill,
     Navigation,
     PathError,
-    StartRescan(PathBuf),
     CancelRescan,
     RequestDeletion(Box<FileToDelete>),
     CancelDeletionConfirmation,
@@ -123,6 +121,9 @@ pub(crate) fn handle_keypress<B: Backend>(evt: &Event, app: &mut App<B>) -> Inpu
         crate::UiMode::ThemePicker { .. } => handle_keypress_theme_picker_mode(evt, app),
         crate::UiMode::DeleteConfirm { .. } => handle_keypress_delete_confirm_mode(evt, app),
         crate::UiMode::ErrorMessage(_) => handle_keypress_error_message(evt, app),
+        crate::UiMode::ScanResultsUnavailable(_) => {
+            handle_keypress_scan_results_unavailable(evt, app)
+        }
         crate::UiMode::Exiting { .. } => handle_keypress_exiting_mode(evt, app),
         crate::UiMode::Notice(_) => handle_keypress_notice_mode(evt, app),
         crate::UiMode::WarningMessage => {
@@ -272,7 +273,6 @@ fn handle_navigation<B: Backend>(evt: &Event, app: &mut App<B>, loading: bool) -
         key!(char '\n') | key!(Enter) => match app.handle_enter_action() {
             EnterAction::None => InputCommand::None,
             EnterAction::Drill => InputCommand::Drill,
-            EnterAction::Rescan(path) => InputCommand::StartRescan(path),
         },
         key!(Backspace) if loading => {
             app.show_warning_modal();
@@ -310,6 +310,7 @@ fn handle_keypress_rescanning_mode<B: Backend>(evt: &Event, app: &mut App<B>) ->
     } else if matches!(evt, key!(Backspace)) {
         deletion_request(app)
     } else if matches!(evt, key!(Esc)) {
+        app.go_up();
         InputCommand::CancelRescan
     } else {
         handle_navigation(evt, app, true)
@@ -407,6 +408,21 @@ fn handle_keypress_error_message<B: Backend>(evt: &Event, app: &mut App<B>) -> I
     InputCommand::None
 }
 
+fn handle_keypress_scan_results_unavailable<B: Backend>(
+    evt: &Event,
+    app: &mut App<B>,
+) -> InputCommand {
+    if !matches!(evt, key!(ctrl 'c') | key!(char 'q')) {
+        return InputCommand::None;
+    }
+    if app.can_exit_immediately() {
+        app.exit();
+        InputCommand::None
+    } else {
+        InputCommand::PromptExit
+    }
+}
+
 fn handle_keypress_notice_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
     if matches!(evt, key!(Enter) | key!(Esc) | key!(char 'q')) {
         app.normal_mode();
@@ -462,6 +478,10 @@ fn handle_keypress_exiting_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> In
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use crate::animation::AnimationScheduler;
+    use crate::theme::Theme;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
 
@@ -514,6 +534,42 @@ mod tests {
             InputCommand::RestoreTheme(ThemeId::ExciseDark)
         ));
         assert!(matches!(app.ui_mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn loading_navigation_drills_into_a_live_canonical_page() {
+        let (root, mut app) = app();
+        let folder = root.path().join("folder");
+        let leaf = folder.join("leaf");
+        std::fs::create_dir(&folder).expect("fixture folder should exist");
+        std::fs::write(&leaf, b"payload").expect("fixture leaf should exist");
+        for path in [&folder, &leaf] {
+            let metadata = std::fs::symlink_metadata(path).expect("fixture metadata should exist");
+            let identity = crate::native_path::identity_for(path, &metadata)
+                .expect("fixture identity should resolve")
+                .expect("fixture should be concrete");
+            app.append_scan_store_entry_for_test(&metadata, path, &identity);
+        }
+        app.refresh_board_from_scan()
+            .expect("live canonical page should refresh");
+        let mut animation = AnimationScheduler::new(true, true, Duration::ZERO);
+        app.render_if_dirty(
+            &mut animation,
+            Duration::ZERO,
+            "test",
+            Theme::for_id(ThemeId::ExciseDark),
+            false,
+            false,
+            true,
+        )
+        .expect("live page should render");
+
+        assert!(matches!(
+            handle_keypress(&key(KeyCode::Enter, KeyModifiers::NONE), &mut app),
+            InputCommand::Drill
+        ));
+        assert_eq!(app.current_folder_path(), folder);
+        assert!(!app.loaded, "the initial scan must remain active");
     }
 
     #[test]

@@ -77,6 +77,22 @@ fn temporary_storage_limit_must_be_at_least_two_mib() {
 }
 
 #[test]
+fn scan_store_limit_must_be_at_least_two_mib() {
+    let error = RuntimeConfig::from_layers(
+        cli(&["excise", "--scan-store-mib", "1"]),
+        None,
+        EnvironmentOverrides::default(),
+        PathBuf::from("cwd"),
+        None,
+    )
+    .expect_err("one MiB scan store should fail configuration resolution");
+
+    assert!(
+        matches!(error, AppError::Config(message) if message.contains("scan store must be between 2"))
+    );
+}
+
+#[test]
 fn precedence_is_cli_then_environment_then_file_then_default() {
     let config = RuntimeConfig::from_layers(
         cli(&[
@@ -93,6 +109,10 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
             "emacs",
             "--temporary-storage-mib",
             "4",
+            "--scan-store-mib",
+            "5",
+            "--scan-store-dir",
+            "cli-scan-store",
             "cli-root",
         ]),
         Some(&FileConfig {
@@ -110,6 +130,8 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
             model: ModelFileConfig {
                 process_memory_mib: Some(crate::model::DEFAULT_PROCESS_MIB),
                 temporary_storage_mib: Some(2),
+                scan_store_mib: Some(2),
+                scan_store_dir: Some(PathBuf::from("file-scan-store")),
             },
         }),
         EnvironmentOverrides {
@@ -123,6 +145,8 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
             exclusions: Vec::new(),
             memory_mib: Some(crate::model::DEFAULT_PROCESS_MIB),
             temporary_storage_mib: Some(3),
+            scan_store_mib: Some(3),
+            scan_store_dir: Some(PathBuf::from("env-scan-store")),
             theme: None,
             ascii: None,
             mouse: None,
@@ -138,7 +162,9 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
     assert_eq!(config.root, PathBuf::from("cli-root"));
     assert_eq!(config.scan_threads, 4);
     assert_eq!(config.event_buffer, 64);
+    assert_eq!(config.scan_store_dir, Some(PathBuf::from("cli-scan-store")));
     assert_eq!(config.temporary_storage_mib, 4);
+    assert_eq!(config.scan_store_mib, 5);
     assert!(config.apparent_size);
     assert!(config.reduced_motion);
     assert!(config.monochrome);
