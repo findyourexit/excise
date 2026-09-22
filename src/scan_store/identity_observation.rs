@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::mem::size_of;
 
 use file_id::FileId;
@@ -6,7 +7,8 @@ use thiserror::Error;
 use super::path_key::{PathKeyError, append_path_key, decode_path_key};
 use super::run_file::{RunError, RunKind, RunReader, RunWriter};
 use crate::file_id_codec::{
-    FileIdCodecError, decode_file_id, decode_file_id_prefix, encode_file_id_into,
+    FileIdCodecError, compare_file_ids_by_encoding, decode_file_id, decode_file_id_prefix,
+    encode_file_id_into,
 };
 use crate::model::ByteBounds;
 use crate::scan_coordinator::RelativePath;
@@ -31,6 +33,16 @@ pub(crate) struct IdentityObservation {
     pub(crate) file_id: FileId,
     pub(crate) declared_links: Option<u64>,
     pub(crate) allocated_bytes: ByteBounds,
+}
+
+/// Compares observations by their exact identity-observation run key.
+#[must_use]
+pub(crate) fn compare_identity_observations(
+    left: &IdentityObservation,
+    right: &IdentityObservation,
+) -> Ordering {
+    compare_file_ids_by_encoding(&left.file_id, &right.file_id)
+        .then_with(|| left.path.cmp(&right.path))
 }
 
 /// Where a once-per-identity physical allocation belongs in the presentation tree.

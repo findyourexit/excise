@@ -69,7 +69,7 @@ pub fn files_in_folder(
     filter: Option<&FilterPattern>,
     filter_root: Option<&std::path::Path>,
 ) -> Vec<FileMetadata> {
-    let mut files = arena
+    let files = arena
         .children(parent)
         .iter()
         .filter_map(|id| arena.node(*id))
@@ -120,6 +120,14 @@ pub fn files_in_folder(
             }
         })
         .collect::<Vec<_>>();
+    normalize_file_metadata(files, offset)
+}
+
+/// Sorts one bounded direct-child page and recalculates its visible weights.
+pub(crate) fn normalize_file_metadata(
+    mut files: Vec<FileMetadata>,
+    offset: usize,
+) -> Vec<FileMetadata> {
     let total_size = files
         .iter()
         .fold(0_u128, |total, file| total.saturating_add(file.size));

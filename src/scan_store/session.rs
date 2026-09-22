@@ -4,11 +4,17 @@ use thiserror::Error;
 
 use super::directory_summary::{DirectorySummaryRunError, reduce_path_observation_run};
 use super::identity_observation::{
-    AllocationContributionRunError, IdentityReductionError, reduce_identity_observations,
+    AllocationContributionRunError, IdentityObservation, IdentityObservationRunError,
+    IdentityReductionError, append_identity_observation, compare_identity_observations,
+    decode_identity_observation, reduce_identity_observations,
 };
 use super::manifest::{
     ManifestError, ManifestState, RunManifestEntry, ScanManifest, ScanSessionId,
 };
+use super::path_observation::{
+    PathObservationRunError, append_path_observation, decode_path_observation,
+};
+use super::path_reducer::PathObservation;
 use super::run_file::{RunDescriptor, RunError, RunKind, RunReader, RunWriter, SealedRun};
 use super::run_merge::{RunMergeError, merge_sorted_runs};
 use crate::scan_coordinator::ScanGeneration;
@@ -18,6 +24,10 @@ use crate::temporary_storage::TemporaryStorage;
 /// live scanner batches. Each family is folded immediately at this limit.
 const MAX_ACTIVE_INPUT_RUNS: usize = 8;
 const RUN_BLOCK_BYTES: usize = 64 * 1024;
+
+/// Scanner workers emit bounded batches. Keep this input cap below the event
+/// channel's worst-case payload so the owner never needs an unbounded sort.
+pub(crate) const MAX_OBSERVATIONS_PER_BATCH: usize = 128;
 
 #[derive(Debug, Error)]
 pub(crate) enum ScanStoreError {
@@ -34,9 +44,15 @@ pub(crate) enum ScanStoreError {
     #[error(transparent)]
     AllocationContribution(#[from] AllocationContributionRunError),
     #[error(transparent)]
+    PathObservation(#[from] PathObservationRunError),
+    #[error(transparent)]
+    IdentityObservation(#[from] IdentityObservationRunError),
+    #[error(transparent)]
     Manifest(#[from] ManifestError),
     #[error("scan store has no active generation")]
     NoActiveGeneration,
+    #[error("scan store has no published generation to use as an overlay base")]
+    NoPublishedGeneration,
     #[error("scan store generation is not accepting scanner input")]
     ClosedGeneration,
     #[error("scan store accepted a run for a different generation")]
@@ -47,6 +63,8 @@ pub(crate) enum ScanStoreError {
     NonMonotonicGeneration,
     #[error("scan store exhausted run identifiers")]
     RunIdOverflow,
+    #[error("scan store observation batch exceeds {MAX_OBSERVATIONS_PER_BATCH} entries")]
+    BatchTooLarge,
 }
 
 /// A coherent, immutable scan generation retained after successful reduction.
@@ -225,6 +243,125 @@ impl ScanStore {
         Ok(())
     }
 
+    /// Drops the active unpublishable generation while retaining the last
+    /// immutable published snapshot.
+    pub(crate) fn discard_active(&mut self) {
+        self.active = None;
+    }
+
+    /// Starts a newer generation by retaining every prior raw fact outside
+    /// `replaced_prefix`. A focused scanner may then write the authoritative
+    /// replacement subtree before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no published base exists, generation ordering is
+    /// invalid, a retained run is corrupt, or the copy cannot fit the shared
+    /// temporary-storage budget. Copy failure leaves the new generation marked
+    /// incomplete and preserves the prior published snapshot.
+    pub(crate) fn begin_overlay_generation(
+        &mut self,
+        generation: ScanGeneration,
+        replaced_prefix: &crate::scan_coordinator::RelativePath,
+    ) -> Result<(), ScanStoreError> {
+        if self.published.is_none() {
+            return Err(ScanStoreError::NoPublishedGeneration);
+        }
+        self.begin_generation(generation)?;
+        if replaced_prefix.is_root() {
+            return Ok(());
+        }
+
+        let mut path_writer = match self.begin_input_run(RunKind::PathObservation) {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.mark_active_incomplete();
+                return Err(error);
+            }
+        };
+        let copied_paths = self
+            .published
+            .as_mut()
+            .ok_or(ScanStoreError::NoPublishedGeneration)?
+            .with_path_observations(|reader| -> Result<(), ScanStoreError> {
+                let mut key = Vec::new();
+                let mut value = Vec::new();
+                while reader.next_record_into(&mut key, &mut value)? {
+                    let observation = decode_path_observation(&key, &value)
+                        .map_err(PathObservationRunError::from)?;
+                    if !observation.path.starts_with(replaced_prefix) {
+                        append_path_observation(
+                            &mut path_writer,
+                            &observation,
+                            &mut key,
+                            &mut value,
+                        )?;
+                    }
+                }
+                Ok(())
+            });
+        if let Err(error) = copied_paths {
+            self.mark_active_incomplete();
+            return Err(error);
+        }
+        let path_run = match path_writer.seal() {
+            Ok(run) => run,
+            Err(error) => {
+                self.mark_active_incomplete();
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self.accept_input_run(path_run) {
+            self.mark_active_incomplete();
+            return Err(error);
+        }
+
+        let mut identity_writer = match self.begin_input_run(RunKind::IdentityObservation) {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.mark_active_incomplete();
+                return Err(error);
+            }
+        };
+        let copied_identities = self
+            .published
+            .as_mut()
+            .ok_or(ScanStoreError::NoPublishedGeneration)?
+            .with_identity_observations(|reader| -> Result<(), ScanStoreError> {
+                let mut key = Vec::new();
+                let mut value = Vec::new();
+                while reader.next_record_into(&mut key, &mut value)? {
+                    let observation = decode_identity_observation(&key, &value)
+                        .map_err(IdentityObservationRunError::from)?;
+                    if !observation.path.starts_with(replaced_prefix) {
+                        append_identity_observation(
+                            &mut identity_writer,
+                            &observation,
+                            &mut key,
+                            &mut value,
+                        )?;
+                    }
+                }
+                Ok(())
+            });
+        if let Err(error) = copied_identities {
+            self.mark_active_incomplete();
+            return Err(error);
+        }
+        let identity_run = match identity_writer.seal() {
+            Ok(run) => run,
+            Err(error) => {
+                self.mark_active_incomplete();
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self.accept_input_run(identity_run) {
+            self.mark_active_incomplete();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Creates one empty scanner-input run for the active generation.
     ///
     /// The caller writes a locally sorted bounded batch, seals it, then returns
@@ -283,6 +420,56 @@ impl ScanStore {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Sorts and persists one bounded scanner batch in both raw fact families.
+    ///
+    /// Physical bytes belong only to the identity observations. Path metrics
+    /// retain hierarchy, apparent size, and coverage; publishing derives the
+    /// once-per-identity physical totals from the companion run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an oversized batch, stale generation, duplicate
+    /// canonical key, or temporary-storage failure. Any partial batch failure
+    /// marks the active generation incomplete instead of permitting a false
+    /// exact result.
+    pub(crate) fn append_observation_batch(
+        &mut self,
+        mut paths: Vec<PathObservation>,
+        mut identities: Vec<IdentityObservation>,
+    ) -> Result<(), ScanStoreError> {
+        if paths.len() > MAX_OBSERVATIONS_PER_BATCH || identities.len() > MAX_OBSERVATIONS_PER_BATCH
+        {
+            return Err(ScanStoreError::BatchTooLarge);
+        }
+        let result = (|| {
+            paths.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+            identities.sort_unstable_by(compare_identity_observations);
+            if !paths.is_empty() {
+                let mut writer = self.begin_input_run(RunKind::PathObservation)?;
+                let mut key = Vec::new();
+                let mut value = Vec::new();
+                for observation in &paths {
+                    append_path_observation(&mut writer, observation, &mut key, &mut value)?;
+                }
+                self.accept_input_run(writer.seal()?)?;
+            }
+            if !identities.is_empty() {
+                let mut writer = self.begin_input_run(RunKind::IdentityObservation)?;
+                let mut key = Vec::new();
+                let mut value = Vec::new();
+                for observation in &identities {
+                    append_identity_observation(&mut writer, observation, &mut key, &mut value)?;
+                }
+                self.accept_input_run(writer.seal()?)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.mark_active_incomplete();
+        }
+        result
     }
 
     /// Seals all raw runs, reduces them, and atomically installs the resulting
@@ -515,6 +702,7 @@ mod tests {
         AllocationPlacement, IdentityObservation, append_identity_observation,
         visit_allocation_contributions,
     };
+    use crate::scan_store::page::PageRequest;
     use crate::scan_store::path_observation::append_path_observation;
     use crate::scan_store::path_reducer::{
         Coverage, PathEntryKind, PathObservation, SummaryMetrics,
@@ -712,5 +900,71 @@ mod tests {
             store.accept_input_run(stale),
             Err(ScanStoreError::GenerationMismatch)
         ));
+    }
+    #[test]
+    fn overlay_generation_replaces_only_the_focused_subtree() {
+        let mut store = store(TemporaryStorage::with_limit_bytes(256 * 1024));
+        add_path_run(
+            &mut store,
+            &[
+                path_observation("alpha", PathEntryKind::Directory, 0),
+                path_observation("alpha/old", PathEntryKind::File, 4),
+                path_observation("beta", PathEntryKind::File, 3),
+            ],
+        );
+        add_identity_run(
+            &mut store,
+            &[
+                identity_observation("alpha/old", file_id::FileId::new_inode(1, 1)),
+                identity_observation("beta", file_id::FileId::new_inode(2, 2)),
+            ],
+        );
+        store.publish().expect("base generation should publish");
+
+        let next = ScanGeneration::from_value(1);
+        store
+            .begin_overlay_generation(next, &path("alpha"))
+            .expect("focused overlay should start");
+        add_path_run(
+            &mut store,
+            &[
+                path_observation("alpha", PathEntryKind::Directory, 0),
+                path_observation("alpha/new", PathEntryKind::File, 9),
+            ],
+        );
+        add_identity_run(
+            &mut store,
+            &[identity_observation(
+                "alpha/new",
+                file_id::FileId::new_inode(3, 3),
+            )],
+        );
+        assert_eq!(store.publish().expect("overlay should publish"), next);
+
+        let root = store
+            .published_mut()
+            .expect("overlay should be published")
+            .page(PageRequest::first(RelativePath::root(), 8))
+            .expect("root page should load");
+        assert_eq!(
+            root.entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![path("alpha"), path("beta")]
+        );
+        let alpha = store
+            .published_mut()
+            .expect("overlay should be published")
+            .page(PageRequest::first(path("alpha"), 8))
+            .expect("focused page should load");
+        assert_eq!(
+            alpha
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![path("alpha/new")]
+        );
     }
 }

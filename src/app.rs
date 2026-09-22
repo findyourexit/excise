@@ -1,9 +1,9 @@
-use std::fs::Metadata;
+use std::fs::{self, Metadata};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use ratatui::backend::Backend;
 
@@ -15,14 +15,24 @@ use crate::deletion::{
 };
 use crate::error::AppError;
 use crate::filter::FilterPattern;
-use crate::model::{ModelError, NodeId, NodeKind, SyntheticKind, UnscannedReason};
-use crate::native_path::NativeIdentity;
+use crate::model::{
+    ByteBounds, EntrySnapshot, ModelError, NodeId, NodeKind, SyntheticKind, UnscannedReason,
+};
+use crate::native_path::{NativeIdentity, identity_for};
+use crate::os::physical_size;
 use crate::outcome::RunSummary;
 use crate::report::{
     ReportError, scan_is_uncertain, scan_report_state, write_deletion_history_json,
     write_scan_report_json,
 };
+use crate::scan_coordinator::{RelativePath, ScanGeneration};
+use crate::scan_store::identity_observation::IdentityObservation;
+use crate::scan_store::page::PageRequest;
+use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, SummaryMetrics};
+use crate::scan_store::session::{MAX_OBSERVATIONS_PER_BATCH, ScanStore, ScanStoreError};
 use crate::state::deletion_work::{DeletionWork, DeletionWorkCommand, DeletionWorkId};
+use crate::state::files::snapshot_tree::SnapshotTree;
+use crate::state::files::tree_view::TreeView;
 use crate::state::files::{FileTree, RescanPreparationProgress};
 use crate::state::tiles::{Board, HALF_ROWS_PER_CELL, Pivot};
 use crate::state::{FileToDelete, UiEffects};
@@ -161,6 +171,13 @@ where
     suspended_ui_mode: Option<UiMode>,
     board: Board,
     file_tree: FileTree,
+    scan_store: ScanStore,
+    snapshot_tree: Option<SnapshotTree>,
+    scan_store_paths: Vec<PathObservation>,
+    scan_store_identities: Vec<IdentityObservation>,
+    scan_store_available: bool,
+    scan_store_rescan_active: bool,
+    scan_store_rescan_target: Option<RelativePath>,
     display: Display<B>,
     ui_effects: UiEffects,
     pub(crate) deletion_work: DeletionWork,
@@ -249,6 +266,8 @@ where
     ) -> Result<Self, AppError> {
         let display = Display::new(terminal_backend)?;
         let board = Board::new();
+        let scan_store = ScanStore::new(ScanGeneration::initial(), temporary_storage.clone())
+            .map_err(scan_store_error)?;
         let file_tree = FileTree::new_with_root_identity_and_temporary_storage(
             path_in_filesystem,
             root_identity,
@@ -261,6 +280,7 @@ where
             display,
             board,
             file_tree,
+            scan_store,
             disable_delete_confirmation,
             keymap,
             custom_keys,
@@ -274,6 +294,7 @@ where
         display: Display<B>,
         mut board: Board,
         file_tree: FileTree,
+        scan_store: ScanStore,
         disable_delete_confirmation: bool,
         keymap: KeyPreset,
         custom_keys: Option<CustomKeyBindings>,
@@ -286,6 +307,13 @@ where
             loaded: false,
             board,
             file_tree,
+            scan_store,
+            snapshot_tree: None,
+            scan_store_paths: Vec::with_capacity(MAX_OBSERVATIONS_PER_BATCH),
+            scan_store_identities: Vec::with_capacity(MAX_OBSERVATIONS_PER_BATCH),
+            scan_store_available: true,
+            scan_store_rescan_active: false,
+            scan_store_rescan_target: None,
             display,
             ui_mode: UiMode::Loading,
             suspended_ui_mode: None,
@@ -330,12 +358,29 @@ where
             && !monochrome
             && !reduced_motion
             && ColorCycle::can_animate(theme.focus);
-        self.display.render(
-            &self.file_tree,
+        let use_snapshot = self.uses_snapshot_view();
+        let (display, board, file_tree, snapshot_tree, ui_mode, ui_effects, deletion_work) = (
+            &mut self.display,
             &mut self.board,
+            &self.file_tree,
+            &self.snapshot_tree,
             &self.ui_mode,
             &self.ui_effects,
             &self.deletion_work,
+        );
+        let tree: &dyn TreeView = if use_snapshot {
+            snapshot_tree
+                .as_ref()
+                .expect("snapshot use was checked above")
+        } else {
+            file_tree
+        };
+        display.render(
+            tree,
+            board,
+            ui_mode,
+            ui_effects,
+            deletion_work,
             animation,
             now,
             theme_name,
@@ -429,7 +474,22 @@ where
 
     #[must_use]
     pub fn current_folder_path(&self) -> PathBuf {
-        self.file_tree.get_current_path()
+        self.visible_tree().get_current_path()
+    }
+
+    #[must_use]
+    fn uses_snapshot_view(&self) -> bool {
+        self.snapshot_tree.is_some() && self.file_tree.filter().is_none()
+    }
+
+    fn visible_tree(&self) -> &dyn TreeView {
+        if self.uses_snapshot_view() {
+            self.snapshot_tree
+                .as_ref()
+                .expect("snapshot use was checked above")
+        } else {
+            &self.file_tree
+        }
     }
 
     #[must_use]
@@ -458,12 +518,286 @@ where
     }
 
     fn update_board(&mut self) -> bool {
+        let offset = self.board.zoom_level;
+        if self.uses_snapshot_view() {
+            let snapshot = self
+                .snapshot_tree
+                .as_ref()
+                .expect("snapshot use was checked above");
+            return self.board.change_files_for_view(
+                snapshot.files_in_current_folder(offset, self.file_tree.show_apparent_size()),
+                snapshot.current_id(),
+                None,
+            );
+        }
         let folder = self.file_tree.current_id();
         let filter = self.file_tree.filter().map(FilterPattern::raw);
-        let files = self
-            .file_tree
-            .files_in_current_folder(self.board.zoom_level);
+        let files = self.file_tree.files_in_current_folder(offset);
         self.board.change_files_for_view(files, folder, filter)
+    }
+
+    fn files_in_current_view(&self, offset: usize) -> Vec<crate::state::tiles::FileMetadata> {
+        if self.uses_snapshot_view() {
+            return self
+                .snapshot_tree
+                .as_ref()
+                .expect("snapshot use was checked above")
+                .files_in_current_folder(offset, self.file_tree.show_apparent_size());
+        }
+        self.file_tree.files_in_current_folder(offset)
+    }
+
+    fn record_scan_store_entry(
+        &mut self,
+        metadata: &Metadata,
+        path: &Path,
+        identity: Option<&NativeIdentity>,
+        coverage: Coverage,
+    ) {
+        if !self.scan_store_available {
+            return;
+        }
+        let relative = path
+            .strip_prefix(&self.file_tree.path_in_filesystem)
+            .ok()
+            .and_then(|path| RelativePath::from_path(path).ok());
+        let Some(relative) = relative.filter(|relative| !relative.is_root()) else {
+            self.abandon_scan_store_generation();
+            return;
+        };
+        let kind = if metadata.file_type().is_symlink()
+            || identity.is_some_and(|identity| identity.reparse_point)
+        {
+            PathEntryKind::Link
+        } else if metadata.is_dir() {
+            PathEntryKind::Directory
+        } else {
+            PathEntryKind::File
+        };
+        let coverage = if kind != PathEntryKind::Directory && identity.is_none() {
+            Coverage::Uncertain
+        } else {
+            coverage
+        };
+        let apparent_bytes = if kind == PathEntryKind::Directory {
+            0
+        } else {
+            u128::from(metadata.len())
+        };
+        let allocated_bytes = (kind != PathEntryKind::Directory)
+            .then(|| physical_size(path, metadata).ok().map(u128::from))
+            .flatten();
+        let modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos());
+        let snapshot_identity = identity.cloned();
+        self.scan_store_paths.push(PathObservation::with_snapshot(
+            relative.clone(),
+            kind,
+            SummaryMetrics::leaf(apparent_bytes, ByteBounds::exact(0), ByteBounds::exact(0)),
+            coverage,
+            Some(EntrySnapshot {
+                identity: snapshot_identity,
+                kind: match kind {
+                    PathEntryKind::Directory => NodeKind::Directory,
+                    PathEntryKind::File => NodeKind::File,
+                    PathEntryKind::Link => NodeKind::Link,
+                },
+                apparent_bytes,
+                allocated_bytes,
+                modified_nanos,
+            }),
+        ));
+        if kind != PathEntryKind::Directory
+            && let Some(identity) = identity
+        {
+            self.scan_store_identities.push(IdentityObservation {
+                path: relative,
+                file_id: identity.file_id,
+                declared_links: identity.link_count,
+                allocated_bytes: allocated_bytes
+                    .map_or_else(ByteBounds::unknown, ByteBounds::exact),
+            });
+        }
+        if self.scan_store_paths.len() >= MAX_OBSERVATIONS_PER_BATCH {
+            self.flush_scan_store_batch();
+        }
+    }
+
+    fn record_scan_store_unscanned(&mut self, path: &Path, reason: &UnscannedReason) {
+        if matches!(
+            reason,
+            UnscannedReason::IdentityStorageCapacity | UnscannedReason::MemoryAggregation
+        ) || !self.scan_store_available
+        {
+            return;
+        }
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            self.abandon_scan_store_generation();
+            return;
+        };
+
+        let identity = identity_for(path, &metadata).ok().flatten();
+        let coverage = if matches!(reason, UnscannedReason::SymbolicLink) {
+            Coverage::Complete
+        } else {
+            Coverage::Uncertain
+        };
+        self.record_scan_store_entry(&metadata, path, identity.as_ref(), coverage);
+    }
+
+    fn flush_scan_store_batch(&mut self) {
+        if !self.scan_store_available || self.scan_store_paths.is_empty() {
+            return;
+        }
+        let paths = std::mem::replace(
+            &mut self.scan_store_paths,
+            Vec::with_capacity(MAX_OBSERVATIONS_PER_BATCH),
+        );
+        let identities = std::mem::replace(
+            &mut self.scan_store_identities,
+            Vec::with_capacity(MAX_OBSERVATIONS_PER_BATCH),
+        );
+        if self
+            .scan_store
+            .append_observation_batch(paths, identities)
+            .is_err()
+        {
+            self.abandon_scan_store_generation();
+        }
+    }
+
+    fn abandon_scan_store_generation(&mut self) {
+        self.scan_store_paths.clear();
+        self.scan_store_identities.clear();
+        self.scan_store.discard_active();
+        self.scan_store_available = false;
+    }
+
+    fn publish_scan_store(&mut self) {
+        self.flush_scan_store_batch();
+        if !self.scan_store_available || self.scan_store.publish().is_err() {
+            self.abandon_scan_store_generation();
+            return;
+        }
+        if self.load_snapshot_page(RelativePath::root()).is_err() {
+            self.snapshot_tree = None;
+            self.scan_store_available = false;
+        }
+    }
+
+    fn load_snapshot_page(&mut self, folder: RelativePath) -> Result<(), AppError> {
+        let page = self
+            .scan_store
+            .published_mut()
+            .ok_or_else(|| AppError::Model("scan generation was not published".to_string()))?
+            .page(PageRequest::first(folder, 4_096))
+            .map_err(|error| AppError::Model(error.to_string()))?;
+        let model_stats = self.file_tree.model_stats();
+        self.snapshot_tree = Some(
+            SnapshotTree::from_page(self.file_tree.path_in_filesystem.clone(), page, model_stats)
+                .map_err(model_error)?,
+        );
+        Ok(())
+    }
+
+    fn refresh_snapshot_after_deletion(&mut self, report: &DeletionReport) {
+        if !self.uses_snapshot_view() || !self.scan_store_available {
+            return;
+        }
+        if !report.target_was_removed() {
+            self.snapshot_tree = None;
+            return;
+        }
+        let Some(prefix) = RelativePath::from_path(&report.root_relative_path)
+            .ok()
+            .filter(|path| !path.is_root())
+        else {
+            self.snapshot_tree = None;
+            return;
+        };
+        let Some(next_generation) = self
+            .scan_store
+            .published_generation()
+            .and_then(|generation| generation.value().checked_add(1))
+            .map(ScanGeneration::from_value)
+        else {
+            self.snapshot_tree = None;
+            self.scan_store_available = false;
+            return;
+        };
+        let current = self
+            .snapshot_tree
+            .as_ref()
+            .map_or_else(RelativePath::root, |snapshot| {
+                snapshot.current_relative().clone()
+            });
+
+        let fallback = relative_parent(&prefix);
+        let desired = if current.starts_with(&prefix) {
+            fallback.clone()
+        } else {
+            current
+        };
+        if self
+            .scan_store
+            .begin_overlay_generation(next_generation, &prefix)
+            .and_then(|()| self.scan_store.publish())
+            .is_err()
+        {
+            self.scan_store.discard_active();
+            self.scan_store_available = false;
+            self.snapshot_tree = None;
+            return;
+        }
+        if self.load_snapshot_page(desired).is_err() && self.load_snapshot_page(fallback).is_err() {
+            self.scan_store_available = false;
+            self.snapshot_tree = None;
+        }
+    }
+
+    fn begin_snapshot_rescan(&mut self, target: &Path) -> bool {
+        if !self.uses_snapshot_view() || !self.scan_store_available {
+            return false;
+        }
+        self.flush_scan_store_batch();
+        let Some(relative) = target
+            .strip_prefix(&self.file_tree.path_in_filesystem)
+            .ok()
+            .and_then(|path| RelativePath::from_path(path).ok())
+        else {
+            return false;
+        };
+        let Some(next_generation) = self
+            .scan_store
+            .published_generation()
+            .and_then(|generation| generation.value().checked_add(1))
+            .map(ScanGeneration::from_value)
+        else {
+            return false;
+        };
+        let metadata = match fs::symlink_metadata(target) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+            _ => return false,
+        };
+        if self.load_snapshot_page(relative.clone()).is_err()
+            || self
+                .scan_store
+                .begin_overlay_generation(next_generation, &relative)
+                .is_err()
+        {
+            self.abandon_scan_store_generation();
+            return false;
+        }
+        self.scan_store_rescan_active = true;
+        self.scan_store_rescan_target = Some(relative.clone());
+        if !relative.is_root() {
+            let identity = identity_for(target, &metadata).ok().flatten();
+            self.record_scan_store_entry(&metadata, target, identity.as_ref(), Coverage::Complete);
+        }
+        self.scan_store_available
     }
 
     pub const fn flash_space_freed(&mut self) {
@@ -518,6 +852,12 @@ where
         entry_path: PathBuf,
         identity: NativeIdentity,
     ) -> Result<(), AppError> {
+        self.record_scan_store_entry(
+            file_metadata,
+            &entry_path,
+            Some(&identity),
+            Coverage::Complete,
+        );
         self.file_tree
             .add_primary_entry(file_metadata, &entry_path, identity)
             .map_err(model_error)?;
@@ -531,18 +871,28 @@ where
         entry_path: PathBuf,
         identity: NativeIdentity,
     ) -> Result<(), AppError> {
-        self.file_tree
-            .add_focused_entry(file_metadata, &entry_path, identity)
-            .map_err(model_error)?;
+        if self.scan_store_rescan_active {
+            self.record_scan_store_entry(
+                file_metadata,
+                &entry_path,
+                Some(&identity),
+                Coverage::Complete,
+            );
+        } else {
+            self.file_tree
+                .add_focused_entry(file_metadata, &entry_path, identity)
+                .map_err(model_error)?;
+        }
         self.ui_effects.record_loading_entry(entry_path);
         Ok(())
     }
 
     pub fn record_unscanned(
         &mut self,
-        path: &std::path::Path,
+        path: &Path,
         reason: UnscannedReason,
     ) -> Result<(), AppError> {
+        self.record_scan_store_unscanned(path, &reason);
         self.file_tree
             .record_primary_unscanned(path, reason)
             .map_err(model_error)
@@ -550,9 +900,13 @@ where
 
     pub(crate) fn record_focused_unscanned(
         &mut self,
-        path: &std::path::Path,
+        path: &Path,
         reason: UnscannedReason,
     ) -> Result<(), AppError> {
+        if self.scan_store_rescan_active {
+            self.record_scan_store_unscanned(path, &reason);
+            return Ok(());
+        }
         self.file_tree
             .record_focused_unscanned(path, reason)
             .map_err(model_error)
@@ -570,9 +924,12 @@ where
 
     pub(crate) fn complete_focused_directory(
         &mut self,
-        path: &std::path::Path,
+        path: &Path,
         expected_identity: Option<&NativeIdentity>,
     ) -> Result<(), AppError> {
+        if self.scan_store_rescan_active {
+            return Ok(());
+        }
         self.file_tree
             .complete_focused_directory(path, expected_identity)
             .map_err(model_error)
@@ -582,13 +939,21 @@ where
         self.file_tree.primary_scan_path_is_stale(path)
     }
 
+    /// Prevents publication of a generation whose scanner reported an
+    /// unrepresentable failure. The last complete snapshot remains available.
+    pub(crate) fn record_scan_store_failure(&mut self) {
+        self.abandon_scan_store_generation();
+    }
+
     pub fn finalize_scan(&mut self) -> Result<(), AppError> {
-        self.file_tree.finalize().map_err(model_error)
+        self.file_tree.finalize().map_err(model_error)?;
+        self.publish_scan_store();
+        Ok(())
     }
 
     #[must_use]
     pub fn model_stats(&self) -> (usize, usize, bool) {
-        self.file_tree.model_stats()
+        self.visible_tree().model_stats()
     }
 
     #[must_use]
@@ -793,6 +1158,27 @@ where
             .board
             .selected_rendered_geometry()
             .or_else(|| self.board.selected_geometry());
+        if self.uses_snapshot_view() {
+            let folder = self
+                .snapshot_tree
+                .as_ref()
+                .and_then(|snapshot| snapshot.selected_folder(target));
+            let Some(folder) = folder else {
+                return;
+            };
+            if let Err(error) = self.load_snapshot_page(folder) {
+                self.show_error(format!("Could not open this scan page: {error}"));
+                return;
+            }
+            self.board.record_current_zoom_level();
+            if let Some(pivot) = pivot {
+                self.board.pivot_transition_on_geometry(pivot);
+            }
+            self.board.reset_zoom_index();
+            self.board.reset_selected_index();
+            self.render_and_update_board();
+            return;
+        }
         if !self.file_tree.enter_folder(target) {
             return;
         }
@@ -806,6 +1192,25 @@ where
     }
 
     pub fn go_up(&mut self) -> bool {
+        if self.uses_snapshot_view() {
+            let (leaving, parent) = self
+                .snapshot_tree
+                .as_ref()
+                .map(|snapshot| (snapshot.current_id(), snapshot.parent_folder()))
+                .expect("snapshot use was checked above");
+            let succeeded = parent.is_some_and(|parent| self.load_snapshot_page(parent).is_ok());
+            if let Some(zoom_level) = self.board.pop_previous_zoom_level() {
+                self.board.set_zoom_index(zoom_level);
+            }
+            if succeeded {
+                self.board.pivot_transition_on(Pivot::Entry(leaving));
+            }
+            self.render_and_update_board();
+            if succeeded && !self.board.select_node(leaving) {
+                self.board.select_largest();
+            }
+            return succeeded;
+        }
         let leaving = self.file_tree.current_id();
         let succeeded = self.file_tree.leave_folder();
         if let Some(zoom_level) = self.board.pop_previous_zoom_level() {
@@ -844,6 +1249,27 @@ where
         let selected = self.board.currently_selected()?;
         if self.deletion_target_is_busy(selected.node_id) {
             return None;
+        }
+        if self.uses_snapshot_view() {
+            let snapshot = self
+                .snapshot_tree
+                .as_ref()
+                .expect("snapshot use was checked above");
+            let path = snapshot.path_for_id(selected.node_id)?;
+            if path.file_name() != Some(selected.name.as_os_str())
+                || path.parent() != Some(self.current_folder_path().as_path())
+            {
+                return None;
+            }
+            return match snapshot
+                .deletion_target_for_id(selected.node_id, self.file_tree.show_apparent_size())
+            {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    self.show_error(error.to_string());
+                    None
+                }
+            };
         }
         let path = self.file_tree.path_for_id(selected.node_id)?;
         let current_folder = self.file_tree.get_current_path();
@@ -1021,6 +1447,13 @@ where
 
     #[must_use]
     fn deletion_target_is_busy(&self, node_id: NodeId) -> bool {
+        if self.uses_snapshot_view() {
+            return self
+                .snapshot_tree
+                .as_ref()
+                .and_then(|snapshot| snapshot.path_for_id(node_id))
+                .is_some_and(|path| self.deletion_work.status_for_path(&path).is_some());
+        }
         self.deletion_work.status_for_node(node_id).is_some()
             || self.ui_effects.has_deletion_departure_for(node_id)
     }
@@ -1208,6 +1641,7 @@ where
             self.mark_dirty();
             return Err(model_error(error));
         }
+        self.refresh_snapshot_after_deletion(&report);
         self.ui_effects.record_deletion_result(&report);
         let report = Arc::new(report);
         if self.deletion_history.len() < MAX_RETAINED_DELETION_REPORTS
@@ -1242,6 +1676,13 @@ where
 
     #[must_use]
     pub fn scan_is_uncertain(&self, summary: &RunSummary) -> bool {
+        if self.uses_snapshot_view() {
+            let root = self.visible_tree().total_node();
+            return summary.unreadable_entries > 0
+                || root.state == crate::model::NodeState::Uncertain
+                || root.metrics.allocated_bytes.upper.is_none()
+                || root.metrics.reclaimable_bytes.upper.is_none();
+        }
         scan_is_uncertain(&self.file_tree, summary)
     }
 
@@ -1362,10 +1803,17 @@ where
         self.replace_ui_mode(self.navigation_mode());
         self.render_and_update_board();
     }
-
-    /// Presents the focused scan immediately; the owner incrementally prepares
-    /// its staging arena before handing work to the focused scanner.
+    /// Presents a focused scan immediately. Published `ScanStore` snapshots stage
+    /// a replacement generation; legacy live models retain their bounded arena
+    /// staging path until no snapshot is available.
     pub fn begin_rescan(&mut self, target: PathBuf) -> Result<(), AppError> {
+        if self.begin_snapshot_rescan(&target) {
+            self.ui_effects.reset_loading_activity();
+            self.board.arm_scan_reveal();
+            self.replace_ui_mode(UiMode::Rescanning { target });
+            self.render_and_update_board();
+            return Ok(());
+        }
         let filter = self.file_tree.filter().cloned();
         self.file_tree
             .begin_rescan_preparation(target.clone(), filter)
@@ -1386,13 +1834,37 @@ where
     pub(crate) fn advance_rescan_preparation(
         &mut self,
     ) -> Result<RescanPreparationProgress, AppError> {
+        if self.scan_store_rescan_active {
+            return Ok(RescanPreparationProgress::Ready);
+        }
         self.file_tree
             .advance_rescan_preparation()
             .map_err(model_error)
     }
 
     pub fn finish_rescan(&mut self) -> Result<(), AppError> {
-        self.file_tree.finish_rescan().map_err(model_error)?;
+        if self.scan_store_rescan_active {
+            let target = self
+                .scan_store_rescan_target
+                .take()
+                .expect("focused ScanStore target must be retained");
+            let current = self.snapshot_tree.as_ref().map_or_else(
+                || target.clone(),
+                |snapshot| snapshot.current_relative().clone(),
+            );
+            self.flush_scan_store_batch();
+            self.scan_store_rescan_active = false;
+            if self.scan_store_available && self.scan_store.publish().is_ok() {
+                if self.load_snapshot_page(current).is_err() {
+                    let _ = self.load_snapshot_page(target);
+                }
+            } else {
+                self.scan_store.discard_active();
+                self.scan_store_available = false;
+            }
+        } else {
+            self.file_tree.finish_rescan().map_err(model_error)?;
+        }
         if matches!(self.ui_mode, UiMode::Rescanning { .. }) {
             self.ui_mode = self.navigation_mode();
         } else if let UiMode::ThemePicker { return_to, .. } = &mut self.ui_mode
@@ -1430,7 +1902,15 @@ where
     }
 
     pub fn cancel_rescan(&mut self) -> Result<(), AppError> {
-        self.file_tree.cancel_rescan().map_err(model_error)?;
+        if self.scan_store_rescan_active {
+            self.scan_store.discard_active();
+            self.scan_store_paths.clear();
+            self.scan_store_identities.clear();
+            self.scan_store_rescan_active = false;
+            self.scan_store_rescan_target = None;
+        } else {
+            self.file_tree.cancel_rescan().map_err(model_error)?;
+        }
         self.board.disarm_scan_reveal();
         self.ui_mode = self.navigation_mode();
         self.render_and_update_board();
@@ -1500,23 +1980,19 @@ where
     }
 
     pub fn zoom_in(&mut self) {
-        let files = self
-            .file_tree
-            .files_in_current_folder(self.board.zoom_level.saturating_add(1));
+        let files = self.files_in_current_view(self.board.zoom_level.saturating_add(1));
         self.board.zoom_in(files);
         self.mark_dirty();
     }
 
     pub fn zoom_out(&mut self) {
-        let offset = self.board.zoom_level.saturating_sub(1);
-        let files = self.file_tree.files_in_current_folder(offset);
+        let files = self.files_in_current_view(self.board.zoom_level.saturating_sub(1));
         self.board.zoom_out(files);
         self.mark_dirty();
     }
 
     pub fn reset_zoom(&mut self) {
-        let files = self.file_tree.files_in_current_folder(0);
-        self.board.reset_zoom(files);
+        self.board.reset_zoom(self.files_in_current_view(0));
         self.mark_dirty();
     }
 }
@@ -1524,6 +2000,16 @@ where
 #[allow(clippy::needless_pass_by_value)]
 fn model_error(error: ModelError) -> AppError {
     AppError::Model(error.to_string())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn scan_store_error(error: ScanStoreError) -> AppError {
+    AppError::Model(error.to_string())
+}
+
+fn relative_parent(path: &RelativePath) -> RelativePath {
+    RelativePath::from_components(path.components()[..path.depth().saturating_sub(1)].to_vec())
+        .expect("a prefix of a valid scan path remains valid")
 }
 
 #[cfg(test)]
@@ -2595,5 +3081,71 @@ mod tests {
             &app.ui_mode,
             UiMode::Rescanning { target: current } if current == &target
         ));
+    }
+    #[test]
+    fn focused_rescan_replaces_the_snapshot_page_without_an_arena_stage() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let folder = root.path().join("folder");
+        let old = folder.join("old");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir(&folder).expect("fixture folder should exist");
+        std::fs::write(&old, b"old").expect("old fixture should exist");
+        std::fs::write(&sibling, b"sibling").expect("sibling fixture should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            true,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        for path in [folder.as_path(), old.as_path(), sibling.as_path()] {
+            add_fixture_entry(&mut app, path);
+        }
+        for path in [folder.as_path(), root.path()] {
+            app.complete_directory(path, None)
+                .expect("fixture directory should complete");
+        }
+        app.finalize_scan().expect("initial scan should finalize");
+        app.start_ui();
+
+        app.begin_rescan(folder.clone())
+            .expect("focused snapshot scan should begin");
+        assert!(app.scan_store_rescan_active);
+        std::fs::remove_file(&old).expect("old file should be removed before rescan result");
+        let new = folder.join("new");
+        std::fs::write(&new, b"replacement").expect("replacement fixture should exist");
+        let metadata = std::fs::symlink_metadata(&new).expect("replacement metadata should exist");
+        let identity = identity_for(&new, &metadata)
+            .expect("replacement identity should resolve")
+            .expect("replacement should be concrete");
+        app.add_entry_to_focused_folder(&metadata, new.clone(), identity)
+            .expect("focused entry should enter ScanStore");
+        app.finish_rescan()
+            .expect("focused snapshot scan should publish");
+
+        assert!(!app.scan_store_rescan_active);
+        assert_eq!(app.current_folder_path(), folder);
+        assert_eq!(
+            app.files_in_current_view(0)
+                .into_iter()
+                .map(|file| file.name)
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("new")]
+        );
+        assert!(app.go_up());
+        assert_eq!(
+            app.files_in_current_view(0)
+                .into_iter()
+                .map(|file| file.name)
+                .collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsString::from("folder"),
+                std::ffi::OsString::from("sibling"),
+            ]
+        );
     }
 }

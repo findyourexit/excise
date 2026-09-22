@@ -180,6 +180,11 @@ impl FileTree {
     }
 
     #[must_use]
+    pub(crate) const fn show_apparent_size(&self) -> bool {
+        self.show_apparent_size
+    }
+
+    #[must_use]
     pub fn node_kind(&self, id: NodeId) -> Option<NodeKind> {
         self.arena.node(id).map(|node| node.kind)
     }

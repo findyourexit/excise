@@ -2,19 +2,35 @@ use thiserror::Error;
 
 use super::path_key::{PathKeyError, decode_path_key, encode_path_key_into};
 #[cfg(test)]
-use super::path_reducer::Coverage;
+#[cfg(test)]
+use super::path_reducer::{Coverage, SummaryMetrics};
 use super::path_reducer::{PathEntryKind, PathObservation, coverage_code, coverage_from_code};
 use super::run_file::{RunError, RunKind, RunReader, RunWriter};
 use super::summary_metrics::{
-    decode_summary_metrics, encode_summary_metrics_into, summary_metrics_flags,
+    ALLOCATED_UPPER_PRESENT, RECLAIMABLE_UPPER_PRESENT, decode_summary_metrics,
+    encode_summary_metrics_into, summary_metrics_flags,
 };
+use crate::file_id_codec::{FileIdCodecError, append_file_id, decode_file_id_prefix};
+use crate::model::{EntrySnapshot, NodeKind};
+use crate::native_path::NativeIdentity;
 
-const PATH_OBSERVATION_VERSION: u8 = 1;
+const PATH_OBSERVATION_VERSION: u8 = 2;
+const METRIC_FLAGS: u8 = ALLOCATED_UPPER_PRESENT | RECLAIMABLE_UPPER_PRESENT;
+const SNAPSHOT_PRESENT: u8 = 1 << 2;
+const SNAPSHOT_IDENTITY_PRESENT: u8 = 1 << 3;
+const SNAPSHOT_LINK_COUNT_PRESENT: u8 = 1 << 4;
+const SNAPSHOT_ALLOCATED_PRESENT: u8 = 1 << 5;
+const SNAPSHOT_MODIFIED_PRESENT: u8 = 1 << 6;
+const SNAPSHOT_REPARSE_POINT: u8 = 1 << 7;
 
 #[derive(Debug, Error)]
 pub(crate) enum PathObservationCodecError {
     #[error(transparent)]
     PathKey(#[from] PathKeyError),
+    #[error(transparent)]
+    FileId(#[from] FileIdCodecError),
+    #[error("path observation snapshot kind does not match its entry kind")]
+    SnapshotKindMismatch,
     #[error("path observation value is malformed")]
     Malformed,
 }
@@ -31,24 +47,66 @@ pub(crate) enum PathObservationRunError {
 
 /// Reuses `key` and `value` to encode one canonical path observation.
 ///
-/// The key is a component-order-preserving native path representation; the
-/// value stores only scanner facts, never another copy of the path.
+/// The key is a component-order-preserving native path representation. The
+/// value retains scan-time identity, allocation, and modification facts when
+/// available, so later deletion planning never mistakes a newly replaced entry
+/// for the item the user saw in the immutable generation.
 ///
 /// # Errors
 ///
-/// Returns an error when the path cannot be represented natively.
+/// Returns an error when the path cannot be represented natively or the
+/// supplied snapshot is inconsistent with the observed entry kind.
 pub(crate) fn encode_path_observation_into(
     observation: &PathObservation,
     key: &mut Vec<u8>,
     value: &mut Vec<u8>,
 ) -> Result<(), PathObservationCodecError> {
     encode_path_key_into(&observation.path, key)?;
+    let mut flags = summary_metrics_flags(observation.metrics);
+    if let Some(snapshot) = observation.snapshot.as_ref() {
+        if snapshot.kind != node_kind_for_entry(observation.kind) {
+            return Err(PathObservationCodecError::SnapshotKindMismatch);
+        }
+        flags |= SNAPSHOT_PRESENT;
+        if let Some(identity) = snapshot.identity.as_ref() {
+            if identity.link_count == Some(0) {
+                return Err(PathObservationCodecError::Malformed);
+            }
+            flags |= SNAPSHOT_IDENTITY_PRESENT;
+            if identity.link_count.is_some() {
+                flags |= SNAPSHOT_LINK_COUNT_PRESENT;
+            }
+            if identity.reparse_point {
+                flags |= SNAPSHOT_REPARSE_POINT;
+            }
+        }
+        if snapshot.allocated_bytes.is_some() {
+            flags |= SNAPSHOT_ALLOCATED_PRESENT;
+        }
+        if snapshot.modified_nanos.is_some() {
+            flags |= SNAPSHOT_MODIFIED_PRESENT;
+        }
+    }
     value.clear();
     value.push(PATH_OBSERVATION_VERSION);
     value.push(entry_kind_byte(observation.kind));
     value.push(coverage_code(observation.coverage));
-    value.push(summary_metrics_flags(observation.metrics));
+    value.push(flags);
     encode_summary_metrics_into(observation.metrics, value);
+    if let Some(snapshot) = observation.snapshot.as_ref() {
+        if let Some(identity) = snapshot.identity.as_ref() {
+            append_file_id(&identity.file_id, value);
+            if let Some(link_count) = identity.link_count {
+                value.extend_from_slice(&link_count.to_le_bytes());
+            }
+        }
+        if let Some(allocated_bytes) = snapshot.allocated_bytes {
+            value.extend_from_slice(&allocated_bytes.to_le_bytes());
+        }
+        if let Some(modified_nanos) = snapshot.modified_nanos {
+            value.extend_from_slice(&modified_nanos.to_le_bytes());
+        }
+    }
     Ok(())
 }
 
@@ -70,16 +128,65 @@ pub(crate) fn decode_path_observation(
     let coverage =
         coverage_from_code(take_u8(&mut value)?).ok_or(PathObservationCodecError::Malformed)?;
     let flags = take_u8(&mut value)?;
-    let metrics = decode_summary_metrics(flags, &mut value)
+    if flags & !SNAPSHOT_PRESENT == 0
+        && flags
+            & (SNAPSHOT_IDENTITY_PRESENT
+                | SNAPSHOT_LINK_COUNT_PRESENT
+                | SNAPSHOT_ALLOCATED_PRESENT
+                | SNAPSHOT_MODIFIED_PRESENT
+                | SNAPSHOT_REPARSE_POINT)
+            != 0
+    {
+        return Err(PathObservationCodecError::Malformed);
+    }
+    let metrics = decode_summary_metrics(flags & METRIC_FLAGS, &mut value)
         .map_err(|_| PathObservationCodecError::Malformed)?;
+    let snapshot = if flags & SNAPSHOT_PRESENT == 0 {
+        None
+    } else {
+        let identity = if flags & SNAPSHOT_IDENTITY_PRESENT == 0 {
+            if flags & (SNAPSHOT_LINK_COUNT_PRESENT | SNAPSHOT_REPARSE_POINT) != 0 {
+                return Err(PathObservationCodecError::Malformed);
+            }
+            None
+        } else {
+            let (file_id, bytes) = decode_file_id_prefix(value)?;
+            value = &value[bytes..];
+            let link_count = (flags & SNAPSHOT_LINK_COUNT_PRESENT != 0)
+                .then(|| take_u64(&mut value))
+                .transpose()?;
+            if link_count == Some(0) {
+                return Err(PathObservationCodecError::Malformed);
+            }
+            Some(NativeIdentity {
+                file_id,
+                link_count,
+                reparse_point: flags & SNAPSHOT_REPARSE_POINT != 0,
+            })
+        };
+        let allocated_bytes = (flags & SNAPSHOT_ALLOCATED_PRESENT != 0)
+            .then(|| take_u128(&mut value))
+            .transpose()?;
+        let modified_nanos = (flags & SNAPSHOT_MODIFIED_PRESENT != 0)
+            .then(|| take_u128(&mut value))
+            .transpose()?;
+        Some(EntrySnapshot {
+            identity,
+            kind: node_kind_for_entry(kind),
+            apparent_bytes: metrics.apparent_bytes,
+            allocated_bytes,
+            modified_nanos,
+        })
+    };
     if !value.is_empty() {
         return Err(PathObservationCodecError::Malformed);
     }
-    Ok(PathObservation::new(
+    Ok(PathObservation::with_snapshot(
         decode_path_key(key)?,
         kind,
         metrics,
         coverage,
+        snapshot,
     ))
 }
 
@@ -115,11 +222,11 @@ pub(crate) fn visit_path_observations(
     if reader.descriptor().kind() != RunKind::PathObservation {
         return Err(PathObservationRunError::WrongRunKind);
     }
-    reader.visit_records(|key, value| {
-        let observation =
-            decode_path_observation(key, value).map_err(|_| RunError::InvalidBlock)?;
-        visit(observation).map_err(|_| RunError::InvalidBlock)
-    })?;
+    let mut key = Vec::new();
+    let mut value = Vec::new();
+    while reader.next_record_into(&mut key, &mut value)? {
+        visit(decode_path_observation(&key, &value)?)?;
+    }
     Ok(())
 }
 
@@ -140,11 +247,37 @@ const fn entry_kind_from_byte(value: u8) -> Option<PathEntryKind> {
     }
 }
 
+const fn node_kind_for_entry(kind: PathEntryKind) -> NodeKind {
+    match kind {
+        PathEntryKind::Directory => NodeKind::Directory,
+        PathEntryKind::File => NodeKind::File,
+        PathEntryKind::Link => NodeKind::Link,
+    }
+}
+
 fn take_u8(input: &mut &[u8]) -> Result<u8, PathObservationCodecError> {
     let (&value, remainder) = input
         .split_first()
         .ok_or(PathObservationCodecError::Malformed)?;
     *input = remainder;
+    Ok(value)
+}
+
+fn take_u64(input: &mut &[u8]) -> Result<u64, PathObservationCodecError> {
+    Ok(u64::from_le_bytes(take_array(input)?))
+}
+
+fn take_u128(input: &mut &[u8]) -> Result<u128, PathObservationCodecError> {
+    Ok(u128::from_le_bytes(take_array(input)?))
+}
+
+fn take_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], PathObservationCodecError> {
+    if input.len() < N {
+        return Err(PathObservationCodecError::Malformed);
+    }
+    let mut value = [0_u8; N];
+    value.copy_from_slice(&input[..N]);
+    *input = &input[N..];
     Ok(value)
 }
 
@@ -155,7 +288,6 @@ mod tests {
     use super::*;
     use crate::model::ByteBounds;
     use crate::scan_coordinator::{RelativePath, ScanGeneration};
-    use crate::scan_store::path_reducer::SummaryMetrics;
     use crate::scan_store::run_file::{RunDescriptor, RunWriter};
     use crate::temporary_storage::TemporaryStorage;
 
@@ -203,6 +335,36 @@ mod tests {
                 observation
             );
         }
+    }
+
+    #[test]
+    fn observation_codec_retains_stable_deletion_snapshot() {
+        let snapshot = EntrySnapshot {
+            identity: Some(NativeIdentity {
+                file_id: file_id::FileId::new_inode(3, 4),
+                link_count: Some(2),
+                reparse_point: false,
+            }),
+            kind: NodeKind::File,
+            apparent_bytes: 7,
+            allocated_bytes: Some(8),
+            modified_nanos: Some(9),
+        };
+        let observation = PathObservation::with_snapshot(
+            RelativePath::from_path(Path::new("entry")).expect("fixture path should be relative"),
+            PathEntryKind::File,
+            SummaryMetrics::leaf(7, ByteBounds::exact(0), ByteBounds::exact(0)),
+            Coverage::Complete,
+            Some(snapshot),
+        );
+        let mut key = Vec::new();
+        let mut value = Vec::new();
+        encode_path_observation_into(&observation, &mut key, &mut value)
+            .expect("observation should encode");
+        assert_eq!(
+            decode_path_observation(&key, &value).expect("observation should decode"),
+            observation
+        );
     }
 
     #[test]

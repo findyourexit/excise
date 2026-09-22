@@ -619,6 +619,22 @@ impl DeletionWork {
         self.rail_item_for_node(node_id).map(|item| item.status)
     }
 
+    /// Returns the current background state for a concrete target path.
+    ///
+    /// Snapshot page node IDs are intentionally page-local, so foreground
+    /// availability must be keyed by the stable filesystem path instead.
+    #[must_use]
+    pub(crate) fn status_for_path(&self, path: &Path) -> Option<WorkRailStatus> {
+        self.items
+            .iter()
+            .find(|item| {
+                item.target
+                    .as_ref()
+                    .is_some_and(|target| target_matches_path(target, path))
+            })
+            .map(|item| work_rail_item(item).status)
+    }
+
     /// Returns the presentation data for work targeting one retained model node.
     #[must_use]
     pub(crate) fn rail_item_for_node(&self, node_id: NodeId) -> Option<WorkRailItem<'_>> {
@@ -729,6 +745,16 @@ fn work_rail_item(item: &DeletionWorkItem) -> WorkRailItem<'_> {
         completed,
         confirmed_at: item.confirmed_at,
     }
+}
+
+fn target_matches_path(target: &FileToDelete, path: &Path) -> bool {
+    path.strip_prefix(&target.path_in_filesystem)
+        .is_ok_and(|relative| {
+            relative.iter().eq(target
+                .path_to_file
+                .iter()
+                .map(std::ffi::OsString::as_os_str))
+        })
 }
 
 fn targets_overlap(left: &Path, right: &Path) -> bool {
