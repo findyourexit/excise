@@ -16,6 +16,7 @@ use crate::state::DeletionDeparture;
 use crate::state::deletion_work::{
     DELETION_CHECKER_COVER_DURATION, DeletionWork, WorkRailItem, WorkRailStatus,
 };
+use crate::state::files::tree_view::TreeView;
 use crate::state::tiles::{FileType, HALF_ROWS_PER_CELL, MapOverflow, Tile};
 use crate::theme::Theme;
 use crate::ui::format::{DisplaySize, display_os_str_info, truncate_marked, truncate_middle};
@@ -101,6 +102,8 @@ pub struct MapLayout<'a> {
     pub show_empty_label: bool,
     /// Live scan state for the empty surface and its transition into measured tiles.
     pub scan: Option<ScanVisual>,
+    /// Stable path source for the page that produced these page-local node IDs.
+    pub file_tree: Option<&'a dyn TreeView>,
     /// Deletion state for displayed identities, retained outside the map model.
     pub deletion_work: Option<&'a DeletionWork>,
     /// A copied target that dissolves beneath the immediate incoming map reflow.
@@ -131,6 +134,7 @@ pub struct DenseRectangleGrid<'a> {
     transitioning: bool,
     show_empty_label: bool,
     scan: Option<ScanVisual>,
+    file_tree: Option<&'a dyn TreeView>,
     deletion_work: Option<&'a DeletionWork>,
     deletion_departure: Option<&'a DeletionDeparture>,
     now: Duration,
@@ -151,6 +155,7 @@ impl<'a> DenseRectangleGrid<'a> {
             transitioning: layout.transitioning,
             show_empty_label: layout.show_empty_label,
             scan: layout.scan,
+            file_tree: layout.file_tree,
             deletion_work: layout.deletion_work,
             deletion_departure: layout.deletion_departure,
             now: layout.now,
@@ -188,14 +193,22 @@ impl<'a> DenseRectangleGrid<'a> {
         TileInk::resolve(tile, self.theme, palette, emphasis, work_status)
     }
 
+    fn current_deletion_departure(&self) -> Option<&DeletionDeparture> {
+        let file_tree = self.file_tree?;
+        let departure = self.deletion_departure?;
+        (file_tree.current_relative_path() == &departure.source_folder).then_some(departure)
+    }
+
     fn is_deletion_departure(&self, tile: &Tile) -> bool {
-        self.deletion_departure
+        self.current_deletion_departure()
             .is_some_and(|departure| departure.tile.node_id == tile.node_id)
     }
 
     fn work_item(&self, tile: &Tile) -> Option<WorkRailItem<'_>> {
-        self.deletion_work
-            .and_then(|work| work.rail_item_for_node(tile.node_id))
+        let file_tree = self.file_tree?;
+        let relative_path = file_tree.relative_path_for_id(tile.node_id)?;
+        self.deletion_work?
+            .rail_item_for_relative_path(file_tree.scan_root(), relative_path)
     }
 
     fn work_status(&self, tile: &Tile) -> Option<WorkRailStatus> {
@@ -344,7 +357,7 @@ impl<'a> DenseRectangleGrid<'a> {
         area: Rect,
         palette: MapPalette,
     ) {
-        let Some(departure) = self.deletion_departure else {
+        let Some(departure) = self.current_deletion_departure() else {
             return;
         };
         let tile = &departure.tile;
@@ -780,7 +793,7 @@ impl Widget for DenseRectangleGrid<'_> {
         // files an empty directory.
         if self.rectangles.is_empty()
             && self.departing.is_empty()
-            && self.deletion_departure.is_none()
+            && self.current_deletion_departure().is_none()
             && self.overflow.is_none()
         {
             self.draw_empty_surface(buffer, area, palette);
@@ -2508,15 +2521,15 @@ fn centered_x(area: Rect, width: u16) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use std::path::PathBuf;
-    use std::time::Duration;
-
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::widgets::Widget;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use crate::model::{EntrySnapshot, NodeId, NodeKind};
+    use crate::scan_coordinator::RelativePath;
     use crate::state::FileToDelete;
     use crate::theme::ThemeId;
     use crate::ui::palette::Oklch;
@@ -2560,6 +2573,66 @@ mod tests {
                 modified_nanos: None,
             },
             reviewed_entries: Vec::new(),
+        }
+    }
+
+    struct TestPage {
+        node_id: NodeId,
+        relative_path: RelativePath,
+        current_folder: RelativePath,
+    }
+
+    impl TestPage {
+        fn new(node_id: NodeId, current_folder: &str, relative_path: &str) -> Self {
+            Self {
+                node_id,
+                relative_path: RelativePath::from_path(Path::new(relative_path))
+                    .expect("test entry path should be relative"),
+                current_folder: RelativePath::from_path(Path::new(current_folder))
+                    .expect("test folder path should be relative"),
+            }
+        }
+    }
+
+    impl crate::state::files::tree_view::TreeView for TestPage {
+        fn current_node(&self) -> &crate::model::Node {
+            unreachable!("grid tests do not inspect page nodes")
+        }
+
+        fn total_node(&self) -> &crate::model::Node {
+            unreachable!("grid tests do not inspect page nodes")
+        }
+
+        fn get_current_path(&self) -> PathBuf {
+            PathBuf::from("/scan-root").join(self.current_folder.to_path_buf())
+        }
+
+        fn current_relative_path(&self) -> &RelativePath {
+            &self.current_folder
+        }
+
+        fn node(&self, _id: NodeId) -> Option<&crate::model::Node> {
+            None
+        }
+
+        fn scan_root(&self) -> &Path {
+            Path::new("/scan-root")
+        }
+
+        fn relative_path_for_id(&self, id: NodeId) -> Option<&RelativePath> {
+            (id == self.node_id).then_some(&self.relative_path)
+        }
+
+        fn has_filter(&self) -> bool {
+            false
+        }
+
+        fn storage_stats(&self) -> Option<(u64, u64)> {
+            None
+        }
+
+        fn failed_to_read(&self) -> u64 {
+            0
         }
     }
 
@@ -2610,6 +2683,7 @@ mod tests {
                 selected_rect_index: selected,
                 transitioning: false,
                 show_empty_label: true,
+                file_tree: None,
                 deletion_work: None,
                 scan: None,
                 deletion_departure: None,
@@ -2640,6 +2714,7 @@ mod tests {
                 transitioning: false,
                 show_empty_label: false,
                 scan,
+                file_tree: None,
                 deletion_work: None,
                 deletion_departure: None,
                 now,
@@ -2673,6 +2748,7 @@ mod tests {
                 selected_rect_index: selected,
                 transitioning: true,
                 show_empty_label: true,
+                file_tree: None,
                 deletion_work: None,
                 scan: None,
                 deletion_departure: None,
@@ -2751,6 +2827,7 @@ mod tests {
                 selected_rect_index: None,
                 transitioning: false,
                 show_empty_label: true,
+                file_tree: None,
                 deletion_work: None,
                 scan: None,
                 deletion_departure: None,
@@ -3975,6 +4052,7 @@ mod tests {
         let mut work = DeletionWork::new();
         work.enqueue_confirmation(deletion_target(entry.node_id), true, 1024, Duration::ZERO)
             .expect("background work should retain the target");
+        let page = TestPage::new(entry.node_id, "", "entry");
         let mut active = Buffer::empty(area);
         DenseRectangleGrid::new(
             MapLayout {
@@ -3985,6 +4063,7 @@ mod tests {
                 transitioning: false,
                 show_empty_label: false,
                 scan: None,
+                file_tree: Some(&page),
                 deletion_work: Some(&work),
                 deletion_departure: None,
                 now: Duration::ZERO,
@@ -4001,12 +4080,77 @@ mod tests {
     }
 
     #[test]
+    fn page_local_node_id_does_not_mark_an_unrelated_path_as_deletion_work() {
+        let entry = tile(0, 0, 30, 10, 1);
+        let page = TestPage::new(entry.node_id, ".cache", ".cache/unrelated");
+        let mut work = DeletionWork::new();
+        work.enqueue_confirmation(deletion_target(entry.node_id), true, 1024, Duration::ZERO)
+            .expect("background work should retain the target");
+
+        let grid = DenseRectangleGrid::new(
+            MapLayout {
+                rectangles: std::slice::from_ref(&entry),
+                departing: &[],
+                overflow: None,
+                selected_rect_index: None,
+                transitioning: false,
+                show_empty_label: false,
+                scan: None,
+                file_tree: Some(&page),
+                deletion_work: Some(&work),
+                deletion_departure: None,
+                now: Duration::ZERO,
+                animate_deletion_checker: true,
+            },
+            Theme::for_id(ThemeId::CatppuccinMocha),
+            false,
+            false,
+        );
+
+        assert!(grid.work_item(&entry).is_none());
+    }
+    #[test]
+    fn departure_does_not_cover_a_same_id_entry_in_another_folder() {
+        let entry = tile(0, 0, 30, 10, 1);
+        let page = TestPage::new(entry.node_id, ".cache", ".cache/unrelated");
+        let departure = DeletionDeparture {
+            tile: entry.clone(),
+            source_folder: RelativePath::from_path(Path::new("Development"))
+                .expect("test folder should be relative"),
+            started_at: Duration::ZERO,
+            duration: crate::state::DELETION_DEPARTURE_MIN_DURATION,
+        };
+        let grid = DenseRectangleGrid::new(
+            MapLayout {
+                rectangles: std::slice::from_ref(&entry),
+                departing: &[],
+                overflow: None,
+                selected_rect_index: None,
+                transitioning: false,
+                show_empty_label: false,
+                scan: None,
+                file_tree: Some(&page),
+                deletion_work: None,
+                deletion_departure: Some(&departure),
+                now: Duration::ZERO,
+                animate_deletion_checker: false,
+            },
+            Theme::for_id(ThemeId::CatppuccinMocha),
+            false,
+            false,
+        );
+
+        assert!(!grid.is_deletion_departure(&entry));
+    }
+
+    #[test]
     fn confirmed_deletion_reveals_a_checker_beneath_its_status_label() {
         let area = Rect::new(0, 0, 30, 5);
         let entry = tile(0, 0, 30, 10, 1);
         let mut work = DeletionWork::new();
         work.enqueue_confirmation(deletion_target(entry.node_id), true, 1024, Duration::ZERO)
             .expect("confirmed target should enter planning");
+        let page = TestPage::new(entry.node_id, "", "entry");
         let render_at = |now| {
             let mut buffer = Buffer::empty(area);
             DenseRectangleGrid::new(
@@ -4018,6 +4162,7 @@ mod tests {
                     transitioning: false,
                     show_empty_label: false,
                     scan: None,
+                    file_tree: Some(&page),
                     deletion_work: Some(&work),
                     deletion_departure: None,
                     now,
@@ -4121,9 +4266,11 @@ mod tests {
         );
         let departure = DeletionDeparture {
             tile: entry.clone(),
+            source_folder: RelativePath::root(),
             started_at: Duration::ZERO,
             duration: crate::state::DELETION_DEPARTURE_MIN_DURATION,
         };
+        let page = TestPage::new(entry.node_id, "", "entry");
         let mut departing = Buffer::empty(area);
         DenseRectangleGrid::new(
             MapLayout {
@@ -4134,6 +4281,7 @@ mod tests {
                 transitioning: false,
                 show_empty_label: false,
                 scan: None,
+                file_tree: Some(&page),
                 deletion_work: None,
                 deletion_departure: Some(&departure),
                 now: Duration::ZERO,
@@ -4154,10 +4302,12 @@ mod tests {
         let area = Rect::new(0, 0, 30, 5);
         let entry = tile(0, 0, 30, 10, 1);
         let departure = DeletionDeparture {
-            tile: entry,
+            tile: entry.clone(),
+            source_folder: RelativePath::root(),
             started_at: Duration::ZERO,
             duration: crate::state::DELETION_DEPARTURE_MIN_DURATION,
         };
+        let page = TestPage::new(entry.node_id, "", "entry");
         let mut buffer = Buffer::empty(area);
         DenseRectangleGrid::new(
             MapLayout {
@@ -4168,6 +4318,7 @@ mod tests {
                 transitioning: true,
                 show_empty_label: true,
                 scan: None,
+                file_tree: Some(&page),
                 deletion_work: None,
                 deletion_departure: Some(&departure),
                 now: Duration::ZERO,
@@ -4355,6 +4506,7 @@ mod tests {
                 selected_rect_index: None,
                 transitioning: false,
                 show_empty_label: false,
+                file_tree: None,
                 deletion_work: None,
                 scan: None,
                 deletion_departure: None,

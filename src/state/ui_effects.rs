@@ -4,7 +4,7 @@ use std::time::Duration;
 use super::deletion_work::DeletionWorkSummary;
 use super::tiles::Tile;
 use crate::deletion::DeletionReport;
-use crate::model::NodeId;
+use crate::scan_coordinator::RelativePath;
 
 /// Human-facing counters from the last reconciled deletion. The report itself
 /// remains the source of exact history; this fixed-size summary keeps normal
@@ -64,6 +64,7 @@ pub(crate) fn deletion_departure_duration(deleted_entries: u64, tile_cells: u64)
 #[derive(Clone, Debug)]
 pub(crate) struct DeletionDeparture {
     pub(crate) tile: Tile,
+    pub(crate) source_folder: RelativePath,
     pub(crate) started_at: Duration,
     pub(crate) duration: Duration,
 }
@@ -112,11 +113,13 @@ impl UiEffects {
     pub(crate) fn begin_deletion_departure(
         &mut self,
         tile: Tile,
+        source_folder: RelativePath,
         now: Duration,
         duration: Duration,
     ) {
         self.deletion_departure = Some(DeletionDeparture {
             tile,
+            source_folder,
             started_at: now,
             duration,
         });
@@ -125,12 +128,6 @@ impl UiEffects {
     #[must_use]
     pub(crate) fn deletion_departure(&self) -> Option<&DeletionDeparture> {
         self.deletion_departure.as_ref()
-    }
-
-    pub(crate) fn has_deletion_departure_for(&self, node_id: NodeId) -> bool {
-        self.deletion_departure
-            .as_ref()
-            .is_some_and(|departure| departure.tile.node_id == node_id)
     }
 
     #[must_use]

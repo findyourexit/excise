@@ -997,7 +997,8 @@ where
                         && report.target_was_removed()
                     {
                         let _ = self.app.begin_deletion_departure(
-                            report.target_node_id,
+                            &report.scan_root,
+                            &report.root_relative_path,
                             report.deleted_entries(),
                             self.clock.now(),
                         );

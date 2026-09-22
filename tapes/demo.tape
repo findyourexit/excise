@@ -48,7 +48,7 @@ Show
 
 # The map arms its own cursor on the largest entry, so the demo starts by
 # moving it onto a folder worth opening rather than by creating a selection.
-Sleep 1.0s
+Sleep 1.75s
 Right@350ms 1
 Sleep 900ms
 
