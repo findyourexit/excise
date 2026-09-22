@@ -701,7 +701,8 @@ impl ScanCoordinator {
     /// Returns `None` only after the generation identifier is exhausted.
     pub fn advance_generation(&mut self) -> Option<ScanGeneration> {
         let next = self.generation.0.checked_add(1).map(ScanGeneration)?;
-        debug_assert!(self.advance_to(next));
+        let advanced = self.advance_to(next);
+        debug_assert!(advanced);
         Some(next)
     }
 

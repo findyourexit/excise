@@ -15,20 +15,20 @@ rustup target add \
   x86_64-pc-windows-msvc
 ```
 
-The published target set has separate native-behavior and release-artifact evidence. The `1.0.0` support policy is runtime evidence first: only native behavioral targets are fully supported.
+The published target set has separate native-behavior and release-artifact evidence. The stable v1 support policy is runtime-evidence first: only native behavioral targets are fully supported.
 
 ## Target evidence
 
 | Target | Support classification | Published evidence |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` (x86_64 Linux) | Supported in `1.0.0` and tested on the target system | Native checks and hosted release archive |
-| `aarch64-apple-darwin` (AArch64 macOS) | Supported in `1.0.0` and tested on the target system | Native checks and hosted release archive |
-| `x86_64-pc-windows-msvc` (x86_64 Windows) | Supported in `1.0.0` and tested on the target system | Native checks and hosted release archive |
+| `x86_64-unknown-linux-gnu` (x86_64 Linux) | Supported in stable v1 and tested on the target system | Native checks and hosted release archive |
+| `aarch64-apple-darwin` (AArch64 macOS) | Supported in stable v1 and tested on the target system | Native checks and hosted release archive |
+| `x86_64-pc-windows-msvc` (x86_64 Windows) | Supported in stable v1 and tested on the target system | Native checks and hosted release archive |
 | `x86_64-apple-darwin` (x86_64 macOS) | Build-only and best effort | Hosted release archive |
 | `aarch64-unknown-linux-gnu` (AArch64 Linux) | Build-only and best effort | Hosted release archive |
 | `aarch64-pc-windows-msvc` (AArch64 Windows) | Build-only and best effort | Hosted release archive |
 
-The native behavioral rows are the complete `1.0.0` runtime support set. The release pipeline continues to publish all six archives, but the three compile-only targets carry no native runtime guarantee and remain best-effort until promoted by native evidence. A successful hosted build or archive demonstrates release compilation and packaging, not native runtime compatibility.
+The native behavioral rows are the complete stable-v1 runtime support set. The release pipeline continues to publish all six archives, but the three compile-only targets carry no native runtime guarantee and remain best-effort until promoted by native evidence. A successful hosted build or archive demonstrates release compilation and packaging, not native runtime compatibility.
 
 The target rows and workflow matrices are checked by `cargo run --locked --package xtask -- check-support-matrix` and are included in `cargo verify`.
 
@@ -256,7 +256,7 @@ Crash artifacts and evolving corpora are ignored. Curated seeds under `fuzz/seed
 
 ## Benchmarks
 
-The hosted `benchmark.yml` retains the `criterion-benchmark-evidence` artifact for 90 days. It contains Criterion's raw samples and reports from `target/criterion` plus `benchmark-context.txt`, which records the checked-out SHA, workflow run, runner image and CPU, commands, Rust toolchain, and `Cargo.lock` digest.
+The hosted `benchmark.yml` retains the `criterion-benchmark-evidence` artifact for 90 days. It contains Criterion's raw samples and reports from `target/criterion`, the one-million and bounded-fan-in probe logs, plus `benchmark-context.txt`, which records the checked-out SHA, workflow run, runner image and CPU, commands, Rust toolchain, and `Cargo.lock` digest.
 
 Run the same local measurements with:
 
@@ -265,7 +265,7 @@ cargo +1.98.0 bench --bench tachyonfx --features internal --locked -- --noplot
 cargo +1.98.0 bench --bench core --features internal --locked -- --noplot
 ```
 
-Run the one-million-tiny-file scale probe explicitly. It starts from premerged raw facts to isolate canonical reduction and late-page query cost; the bounded workload matrix continues to measure scanner-batch fan-in. The probe uses a 2,048 MiB private scan-store ceiling, leaving deliberate headroom above its measured temporary peak, and is intentionally outside the default hosted matrix.
+The hosted workflow runs the one-million-tiny-file scale probe and the bounded-batch fan-in probe once with `--profile-time 1`. The premerged probe isolates canonical reduction and late-page query cost; the bounded probe exercises production fan-in. Both use explicit private scan-store ceilings and remain reproducible locally with the commands below.
 
 ```console
 EXCISE_BENCH_MILLION=1 cargo +1.98.0 bench --bench core --features internal --locked -- scan-store/million-tiny-files --noplot --profile-time 1

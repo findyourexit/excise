@@ -51,7 +51,7 @@ If scanner journal work cannot reserve scan-store capacity, the scanner reports 
 ## Map Invariants
 
 - Child areas add up to the parent's represented known space.
-- `Shared` and `Other` preserve additive totals.
+- `Shared` preserves the allocation total that is not attributable to one direct entry.
 - Unknown space is shown outside any falsely exact area.
 - Map geometry is finite, repeatable, inside its bounds, and non-overlapping.
 - Animation moves between valid old and new geometry without changing the underlying numbers.
@@ -65,5 +65,5 @@ If scanner journal work cannot reserve scan-store capacity, the scanner reports 
 - Missing allocated-space metadata
 - Inaccessible directories
 - Zero and maximum-size values
-- Aggregation and pressure on temporary identity storage
+- Scan-store capacity pressure and recovery
 - Platform-specific identity sources

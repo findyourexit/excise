@@ -8,8 +8,8 @@ Excise permanently removes the confirmed file identities. It does not use a tras
 
 Deletion can be prepared only when all of these conditions hold:
 
-- The selected entry is real, retained in the map, and is not a virtual `Other` or `Shared` summary.
-- Its model snapshot has a verified concrete backing identity. The display subtree may still be incomplete or summarized.
+- The selected entry is real, retained in the map, and is not the virtual `Shared` allocation summary.
+- Its canonical scan snapshot has a verified concrete backing identity. The displayed direct-child page may still be incomplete.
 - The entry is not the scan root, a filesystem, drive, or mount root.
 - The platform has a reviewed method for deleting the entry without following links.
 
@@ -23,7 +23,7 @@ The display model only selects the target. The planner creates the authoritative
 4. Authenticate every spilled record with a process-private key. Every decoded path must have safe components whose prefix is the selected target before revalidation or execution.
 5. Reserve resident and temporary capacity for every planned identity and outcome before confirmation. If either complete plan or report cannot be retained, discard it before confirmation and delete nothing.
 6. Check every planned entry again immediately before deletion; reject a directory plan that targets or contains a filesystem or mount root.
-7. If anything changed, discard the plan, scan again, and ask for confirmation again.
+7. If pre-consent planning or final whole-plan revalidation finds a change, discard that plan and require a fresh user request. Prior consent is never reused.
 
 ## Confirmation
 

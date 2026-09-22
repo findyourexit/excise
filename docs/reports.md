@@ -25,9 +25,8 @@ JSON uses named document types and stable version numbers. The published Draft 2
 
 `scan-report` version 3 reports `scan_store_bytes` and `scan_store_limit_bytes` in its summary. They describe the private canonical scan-store reservation at the terminal state; they are not file-system space totals or process-memory measurements.
 
-
-An unknown upper bound is `null`. Excise never replaces it with an apparent file length. `Shared`, `Other`, and other summary records have explicit types and cannot be deletion targets.
-A `summary-only` scan report means the scan-store capacity was reached. It preserves transport counts and terminal status, but deliberately contains no navigable inventory; rerun with a larger `--scan-store-mib` value.
+An unknown upper bound is `null`. Excise never replaces it with an apparent file length. The `Shared` allocation summary has an explicit type and cannot be a deletion target.
+A `summary-only` scan report means the scan-store capacity was reached after deterministic directory reduction. It retains the terminal summary and root metrics, but deliberately contains no navigable entry inventory; rerun with a larger `--scan-store-mib` value.
 
 ## Interactive Exports
 

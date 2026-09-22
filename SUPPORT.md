@@ -1,16 +1,16 @@
 # Support
 
-## The 1.0.0 Stable Release
+## Stable v1 Support Policy
 
-The `1.0.0` release defines the stable command-line tool, configuration, and versioned JSON report formats. Deletion remains permanent with no trash or undo. Start with [Getting Started](docs/getting-started.md), use a disposable fixture first, and report safety or release-integrity defects privately under [SECURITY.md](SECURITY.md).
+The stable v1 line defines the command-line tool, configuration, and versioned JSON report formats. Deletion remains permanent with no trash or undo. Start with [Getting Started](docs/getting-started.md), use a disposable fixture first, and report safety or release-integrity defects privately under [SECURITY.md](SECURITY.md).
 
 The `0.3.x` releases were early testing and are superseded. They remain in the changelog and release history as historical records.
 
-## The 1.0.0 Support Matrix
+## Support Matrix
 
 The stable platform support set is:
 
-| Target | `1.0.0` status | Evidence |
+| Target | Stable v1 status | Evidence |
 |---|---|---|
 | x86_64 Linux (`x86_64-unknown-linux-gnu`) | Supported | Testing on Linux, terminal testing, and release archive |
 | AArch64 macOS (`aarch64-apple-darwin`) | Supported | Testing on macOS, terminal testing, and release archive |

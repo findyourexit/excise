@@ -267,7 +267,7 @@ fn check_support_matrix() -> Result<(), Box<dyn Error>> {
         require_row(
             &development,
             target,
-            "Supported in `1.0.0`",
+            "Supported in stable v1",
             "docs/development.md",
         )?;
         require_row(&support, target, "| Supported |", "SUPPORT.md")?;

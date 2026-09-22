@@ -26,7 +26,7 @@ Register-ArgumentCompleter -Native -CommandName 'excise' -ScriptBlock {
             [CompletionResult]::new('--event-buffer', '--event-buffer', [CompletionResultType]::ParameterName, 'Bounded worker-event capacity (16-4096)')
             [CompletionResult]::new('--exclude', '--exclude', [CompletionResultType]::ParameterName, 'Ordered gitignore-style exclusion pattern')
             [CompletionResult]::new('--memory-mib', '--memory-mib', [CompletionResultType]::ParameterName, 'Whole-process memory envelope in MiB')
-            [CompletionResult]::new('--temporary-storage-mib', '--temporary-storage-mib', [CompletionResultType]::ParameterName, 'Directory-plan, deletion-result, and identity-spill storage limit per session (2+)')
+            [CompletionResult]::new('--temporary-storage-mib', '--temporary-storage-mib', [CompletionResultType]::ParameterName, 'Directory-plan and deletion-result storage limit per session (2+)')
             [CompletionResult]::new('--scan-store-mib', '--scan-store-mib', [CompletionResultType]::ParameterName, 'Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)')
             [CompletionResult]::new('--scan-store-dir', '--scan-store-dir', [CompletionResultType]::ParameterName, 'Parent directory for the private canonical scan-store session')
             [CompletionResult]::new('--scan-store-reserve-mib', '--scan-store-reserve-mib', [CompletionResultType]::ParameterName, 'Scratch space preserved outside scan-store files (default: 25% of free space)')

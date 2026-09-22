@@ -129,7 +129,7 @@ Configuration takes values in this order: command line, environment, versioned T
 - **Reliable terminal behavior:** The terminal is restored after normal exit, errors, panics, and boundary-safe cancellation; active filesystem work is never detached silently.
 - **Accessible interaction:** Keyboard controls, narrow layouts, plain ASCII output, monochrome output, and reduced motion preserve the important safety information.
 - **Useful reports:** Table output is intended for people to read. JSON output uses stable, versioned formats for scan results, deletion history, and file paths.
-- **Readable maps:** The interface uses allocated space by default. Ordinary entries use a fixed absolute size scale, not their rank in the visible folder: 4 KiB and below are blue, 16 MiB is midpoint green, 1 GiB is yellow, and 64 GiB and above are red. `--apparent-size` applies the same scale to logical file length. Uncertain, shared, and summary entries keep their own meaning. Entries that do not fit remain visible as an overflow summary instead of making a folder look empty.
+- **Readable maps:** The interface uses allocated space by default. Ordinary entries use a fixed absolute size scale, not their rank in the visible folder: 4 KiB and below are blue, 16 MiB is midpoint green, 1 GiB is yellow, and 64 GiB and above are red. `--apparent-size` applies the same scale to logical file length. Uncertain entries and shared-allocation totals retain distinct semantics. Entries that do not fit remain visible as a `MapOverflow` summary instead of making a folder look empty.
 
 ## Terminal Controls
 
@@ -152,7 +152,7 @@ The interactive interface needs standard input and output connected to a termina
 
 ## Safety Model
 
-Excise offers deletion as soon as a real item appears in the map, including while the initial scan continues, on a platform with tested deletion support. A backed summarized folder can be opened with an on-demand scan or planned for deletion immediately; incomplete real entries use the same flow. Virtual summaries and filesystem roots remain noninteractive. The background planner independently makes the authoritative no-follow live review, binds it to the selected identity, and checks every planned entry again immediately before deletion.
+Excise offers deletion as soon as a real file or directory appears in the map, including while the initial scan continues, on a platform with tested deletion support. Completed navigation reads concrete canonical child pages; shared-allocation summaries and filesystem roots remain noninteractive. The background planner independently makes the authoritative no-follow live review, binds it to the selected identity, and checks every planned entry again immediately before deletion.
 
 Changed, replaced, missing, newly created, permission-blocked, and uncertain entries are never silently deleted. Accepted plans return to the map while a bounded named work rail shows planning, queueing, and deletion progress; one executor mutates entries serially. Quitting can cancel pending plans or wait, and an active mutation can only stop at an entry boundary or be awaited. There is no recovery or undo mechanism.
 
@@ -180,7 +180,8 @@ Behavior can vary with file system types, access rules, network file systems, fi
 - [Reports and JSON Formats](docs/reports.md)
 - [Permanent Deletion Contract](docs/safety/deletion.md)
 - [Space Accounting Contract](docs/safety/accounting.md)
-- [Architecture and Threat Model](docs/architecture/overview.md)
+- [Architecture](docs/architecture/overview.md)
+- [Threat Model](docs/architecture/threat-model.md)
 - [Development](docs/development.md)
 - [Release Process](docs/releasing.md)
 - [Support Policy](SUPPORT.md)
