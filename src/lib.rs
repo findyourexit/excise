@@ -35,6 +35,7 @@ pub mod error;
 #[cfg(not(any(feature = "fuzzing", feature = "internal")))]
 #[allow(dead_code)]
 mod error;
+mod file_id_codec;
 #[cfg(any(feature = "fuzzing", feature = "internal"))]
 pub mod filter;
 #[cfg(not(any(feature = "fuzzing", feature = "internal")))]
@@ -72,6 +73,10 @@ pub mod runtime;
 #[cfg(not(any(feature = "fuzzing", feature = "internal")))]
 #[allow(dead_code)]
 mod runtime;
+#[allow(dead_code)]
+mod scan_coordinator;
+#[allow(dead_code)]
+mod scan_store;
 #[allow(dead_code)]
 mod state;
 mod temporary_storage;
