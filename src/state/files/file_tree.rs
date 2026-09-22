@@ -484,12 +484,11 @@ impl FileTree {
                         (Some(_), Some(next)) => Some(next),
                         _ => None,
                     };
+                } else if affected_link_counts.try_reserve(1).is_err() {
+                    target_uncertain = true;
+                    tree_uncertain = true;
+                    break;
                 } else {
-                    if affected_link_counts.try_reserve(1).is_err() {
-                        target_uncertain = true;
-                        tree_uncertain = true;
-                        break;
-                    }
                     affected_link_counts.insert(file_id, post_delete);
                 }
             }
@@ -572,12 +571,11 @@ impl FileTree {
         }
     }
 
-    #[allow(clippy::needless_pass_by_value)]
     pub fn add_entry(
         &mut self,
         entry_metadata: &Metadata,
         entry_full_path: &Path,
-        identity: NativeIdentity,
+        identity: &NativeIdentity,
     ) -> Result<Option<NodeId>, ModelError> {
         if self.rescan.is_some() {
             self.add_focused_entry(entry_metadata, entry_full_path, identity)
@@ -586,12 +584,11 @@ impl FileTree {
         }
     }
 
-    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn add_primary_entry(
         &mut self,
         entry_metadata: &Metadata,
         entry_full_path: &Path,
-        identity: NativeIdentity,
+        identity: &NativeIdentity,
     ) -> Result<Option<NodeId>, ModelError> {
         if self.scan_path_is_stale(entry_full_path) {
             return Ok(None);
@@ -606,15 +603,14 @@ impl FileTree {
             |arena| pinned_nodes_for(arena, current_path, filter_root),
             entry_metadata,
             entry_full_path,
-            &identity,
+            identity,
         )
     }
-    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn add_focused_entry(
         &mut self,
         entry_metadata: &Metadata,
         entry_full_path: &Path,
-        identity: NativeIdentity,
+        identity: &NativeIdentity,
     ) -> Result<Option<NodeId>, ModelError> {
         let stage = self.rescan.as_mut().ok_or_else(|| {
             ModelError::Invariant("focused scan entry arrived without a staging model".to_string())
@@ -626,7 +622,7 @@ impl FileTree {
             |arena| HashSet::from([arena.root()]),
             entry_metadata,
             entry_full_path,
-            &identity,
+            identity,
         )
     }
     #[allow(clippy::needless_pass_by_value)]
@@ -1087,7 +1083,7 @@ mod tests {
         let identity = identity_for(path, &metadata)
             .expect("fixture identity should be readable")
             .expect("fixture should not be a link");
-        tree.add_entry(&metadata, path, identity)
+        tree.add_entry(&metadata, path, &identity)
             .expect("fixture should be added");
     }
 
@@ -1275,14 +1271,14 @@ mod tests {
         let primary_identity = identity_for(&primary_entry, &primary_metadata)
             .expect("primary entry should be identifiable")
             .expect("primary entry should not be a link");
-        tree.add_primary_entry(&primary_metadata, &primary_entry, primary_identity)
+        tree.add_primary_entry(&primary_metadata, &primary_entry, &primary_identity)
             .expect("primary entry should remain in the live model");
         let focused_metadata =
             fs::symlink_metadata(&target_child).expect("focused child metadata should be readable");
         let focused_identity = identity_for(&target_child, &focused_metadata)
             .expect("focused child should be identifiable")
             .expect("focused child should not be a link");
-        tree.add_focused_entry(&focused_metadata, &target_child, focused_identity)
+        tree.add_focused_entry(&focused_metadata, &target_child, &focused_identity)
             .expect("focused child should enter the staging model");
         tree.complete_focused_directory(&target, None)
             .expect("focused target should complete");
@@ -1764,7 +1760,7 @@ mod tests {
             .expect("late primary entry should not be a link");
         assert!(tree.primary_scan_path_is_stale(&late_primary));
         assert!(
-            tree.add_primary_entry(&metadata, &late_primary, identity)
+            tree.add_primary_entry(&metadata, &late_primary, &identity)
                 .expect("late primary entry should be ignored rather than overwrite focus")
                 .is_none()
         );
@@ -2069,7 +2065,7 @@ mod tests {
         assert!(tree.primary_scan_path_is_stale(&compacted));
         assert!(tree.primary_scan_path_is_stale(&child));
 
-        tree.add_entry(&stale_metadata, &compacted, stale_identity)
+        tree.add_entry(&stale_metadata, &compacted, &stale_identity)
             .expect("late primary scan entry should be safely ignored");
         assert!(tree.path_for_id(compacted_id).is_none());
     }

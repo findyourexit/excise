@@ -2791,7 +2791,7 @@ mod tests {
             .expect("fixture should not be a link");
         let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
             .expect("file tree should be created");
-        tree.add_entry(&metadata, &path, identity)
+        tree.add_entry(&metadata, &path, &identity)
             .expect("fixture should be added")
             .expect("fixture should remain materialized");
         tree.complete_directory(root.path(), None)
@@ -2896,7 +2896,7 @@ mod tests {
             let identity = identity_for(path, &metadata)
                 .expect("fixture identity should be readable")
                 .expect("fixture should not be a link");
-            tree.add_entry(&metadata, path, identity)
+            tree.add_entry(&metadata, path, &identity)
                 .expect("fixture should be accepted");
         }
         tree.finish_rescan().expect("filtered rescan should finish");
@@ -2957,7 +2957,7 @@ mod tests {
             .expect("fixture should not be a link");
         let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
             .expect("file tree should be created");
-        tree.add_entry(&metadata, &path, identity)
+        tree.add_entry(&metadata, &path, &identity)
             .expect("fixture should be added")
             .expect("fixture should remain materialized");
         tree.record_unscanned(
@@ -3012,7 +3012,7 @@ mod tests {
             .expect("fixture should not be a link");
         let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
             .expect("file tree should be created");
-        tree.add_entry(&metadata, &path, identity)
+        tree.add_entry(&metadata, &path, &identity)
             .expect("fixture should be added")
             .expect("fixture should remain materialized");
         tree.record_unscanned(

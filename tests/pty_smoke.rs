@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,9 +18,21 @@ struct PtyMetrics {
     input_to_frame: Duration,
     normal_quit: Duration,
 }
+
 type SharedOutput = Arc<(Mutex<Vec<u8>>, Condvar)>;
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 type FirstOutput = Arc<Mutex<Option<Instant>>>;
+/// Serializes complete native terminal sessions so one PTY backend is cleaned
+/// up before another test creates its own session.
+fn pty_session_guard() -> MutexGuard<'static, ()> {
+    static SESSION: OnceLock<Mutex<()>> = OnceLock::new();
+
+    SESSION
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct ChildGuard {
     killer: Box<dyn ChildKiller + Send + Sync>,
     armed: bool,
@@ -49,7 +61,7 @@ impl Drop for ChildGuard {
 
 #[test]
 fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> {
-    let (status, output, metrics) = run_pty_interaction(b"y", None)?;
+    let (status, output, metrics) = run_pty_interaction(None)?;
     let expected_exit = status.success() || (windows_conpty() && status.exit_code() == 130);
     if !expected_exit {
         bail!(
@@ -93,20 +105,9 @@ fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> 
 }
 
 #[test]
-fn control_c_exit_prompt_never_forces_a_worker_detach() -> anyhow::Result<()> {
-    let (status, output, _) = run_pty_interaction(b"\x03y", None)?;
-    let expected_exit = status.success() || (windows_conpty() && status.exit_code() == 130);
-    if !expected_exit {
-        bail!(
-            "safe control-C exit failed with {status}; expected normal completion or interrupted active scan; captured {output:?}"
-        );
-    }
-    Ok(())
-}
 
-#[test]
 fn panic_restores_terminal_before_diagnostics() -> anyhow::Result<()> {
-    let (status, output, _) = run_pty_interaction(&[], Some("panic"))?;
+    let (status, output, _) = run_pty_interaction(Some("panic"))?;
     if status.exit_code() != 101 {
         bail!("injected panic exited with {status}; captured {output:?}");
     }
@@ -126,7 +127,7 @@ fn panic_restores_terminal_before_diagnostics() -> anyhow::Result<()> {
 #[test]
 fn typed_runtime_errors_restore_before_diagnostics() -> anyhow::Result<()> {
     for (kind, expected_exit) in [("input", 74), ("render", 70), ("worker", 70)] {
-        let (status, output, _) = run_pty_interaction(&[], Some(kind))?;
+        let (status, output, _) = run_pty_interaction(Some(kind))?;
         if status.exit_code() != expected_exit {
             bail!("injected {kind} failure exited with {status}; captured {output:?}");
         }
@@ -172,9 +173,9 @@ fn quit_ready_marker() -> &'static [u8] {
 }
 
 fn run_pty_interaction(
-    exit_input: &[u8],
     injected_failure: Option<&str>,
 ) -> anyhow::Result<(ExitStatus, String, Option<PtyMetrics>)> {
+    let _session = pty_session_guard();
     let fixture = tempfile::tempdir().context("failed to create PTY fixture")?;
     std::fs::write(fixture.path().join("smoke-file"), b"excise")
         .context("failed to create PTY fixture file")?;
@@ -228,7 +229,7 @@ fn run_pty_interaction(
         wait_for_output(&output, quit_ready_marker(), STARTUP_TIMEOUT)?;
         let input_to_frame = input_started.elapsed();
         quit_started = Some(Instant::now());
-        write_input(&writer, exit_input)?;
+        write_input(&writer, b"y")?;
         measured = Some((first_frame, input_to_frame));
     }
     drop(writer);

@@ -3250,7 +3250,7 @@ mod tests {
         let identity = crate::native_path::identity_for(path, &metadata)
             .expect("fixture identity lookup should succeed")
             .expect("fixture identity should be readable");
-        tree.add_entry(&metadata, path, identity)
+        tree.add_entry(&metadata, path, &identity)
             .expect("fixture entry should be retained");
     }
 

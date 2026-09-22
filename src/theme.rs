@@ -72,7 +72,7 @@ impl ThemeId {
             .iter()
             .position(|candidate| *candidate == self)
             .unwrap_or_default();
-        Self::ALL[(index + 1) % Self::ALL.len()]
+        Self::ALL[index.wrapping_add(1) % Self::ALL.len()]
     }
 
     /// Moves one row up in the theme picker, wrapping at the first row.
@@ -82,7 +82,7 @@ impl ThemeId {
             .iter()
             .position(|candidate| *candidate == self)
             .unwrap_or_default();
-        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+        Self::ALL[index.checked_sub(1).unwrap_or(Self::ALL.len() - 1)]
     }
 
     #[must_use]

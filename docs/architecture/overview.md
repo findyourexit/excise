@@ -22,25 +22,31 @@ The main loop polls terminal input with a bounded timeout. It renders each folde
 
 ### Scanner
 
-The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. Queued directory tasks, identity spill files, and overflow directory deletion-plan and outcome records share one per-session temporary-storage limit and reserve capacity before their files grow. A queued-task capacity breach reports an actionable incomplete scan; identity-store capacity exhaustion releases its private database and continues traversal with unknown physical-accounting bounds; a deletion plan that cannot retain every reviewed identity and outcome is rejected before consent, and a post-consent result-storage failure stops new mutations with an explicit incomplete result. Backpressure never silently drops an entry.
+The scanner uses a fixed number of workers and walks directories without recursion. Directory tasks and worker events use queues with fixed limits. Queued directory tasks, ScanStore runs, identity spill files, and overflow directory deletion-plan and outcome records share one per-session temporary-storage limit and reserve capacity before their files grow. A queued-task capacity breach reports an actionable incomplete scan; a ScanStore write or merge failure is never published as an exact generation; identity-store capacity exhaustion releases its private database and continues traversal with unknown legacy-model bounds; a deletion plan that cannot retain every reviewed identity and outcome is rejected before consent, and a post-consent result-storage failure stops new mutations with an explicit incomplete result. Backpressure never silently drops work.
 
 The default worker count leaves one available processor for the owner loop when possible and is clamped from one through eight. The configured value must be between one and 32. Exclusions and file system boundaries remain visible in the working model. Link targets are never traversed.
 
+### ScanStore
+
+The owner buffers at most 128 scanner facts, sorts each bounded batch into canonical path and identity runs, and folds each run family at a fixed fan-in. Final reduction produces immutable path facts, one physical allocation contribution per file identity, and post-order directory summaries. Every published generation is checksummed by its manifest and retains its run reservations until replacement.
+
+The interactive map materializes only one 512-entry direct-child page plus its ancestor chain. `PageDown` and `PageUp` move between concrete pages; no child is collapsed into an undeletable storage aggregate. Page entries retain the scan-time identity, allocation, and modification snapshot used by deletion planning. Focused rescans and completed full-target deletions publish a new overlay generation while retaining the previous immutable generation until replacement succeeds.
+
 ### Working Model
 
-A table indexed by stable node numbers stores each name once along with its parent, children, file identity, measurements, scan state, and summary state. Walking, compacting, and removing entries use loops rather than the call stack.
+The live table indexed by stable node numbers remains the bounded compatibility and report model while scanning. Once a ScanStore generation publishes, the interactive map reads its page snapshot instead: names, metrics, and child lists are bounded to the visible page rather than retained for the complete filesystem. Walking, compacting, and removing entries use loops rather than the call stack.
 
-The map keeps a `MapOverflow` summary for entries that do not fit in the final view. It retains their count, space, and uncertainty even when there is no room to draw an overflow region. The renderer checks the available drawing area before it paints the summary and shows count or weight labels only when there is enough room.
+The map keeps a `MapOverflow` summary for regions that do not fit in the terminal viewport. This is display geometry only; direct-child pagination keeps filesystem entries concrete and selectable. The renderer checks the available drawing area before it paints the summary and shows count or weight labels only when there is enough room.
 
-The default process memory limit is 512 MiB. Working data may use 75 percent of that limit, leaving 25 percent for the rest of the process. Compaction preserves exact summaries while visible entries, active parents, and deletion targets remain available.
+The default process memory limit is 512 MiB. Working data may use 75 percent of that limit, leaving 25 percent for the rest of the process. ScanStore run fan-in, batch size, and page size are all fixed; no scanner result makes a UI-owned collection grow with the scanned filesystem.
 
 ### Space Accounting
 
-The identity table counts files with more than one name once within the scan scope. When exact identity data exceeds the memory limit, a permission-restricted store for the current session keeps the minimum records needed for accounting within the shared temporary-storage limit. If that bounded store fills, the scan discards every partial physical total and continues with uniformly unknown physical-allocation and reclaimability bounds rather than a scan-order-dependent estimate or a model failure.
+The identity table counts files with more than one name once within the scan scope. When exact identity data exceeds the memory limit, a permission-restricted store for the current session keeps the minimum records needed for legacy-model accounting within the shared temporary-storage limit. Published ScanStore generations independently reduce canonical identity observations, place multi-name allocations at their lowest common ancestor as noninteractive shared totals, and retain concrete directory paths. A real metadata failure remains uncertain; arena capacity pressure never fabricates a partial ScanStore total.
 
 ### Deletion
 
-The main loop retains at most four non-overlapping interactive deletion requests. A separate planner can build the next identity plan while the single executor performs a confirmed target's final full-plan revalidation and serial mutation. Large directory plans retain a bounded resident prefix and use authenticated temporary storage outside the selected target for later plan and outcome records before consent. Platform code works relative to the confirmed parent and does not follow links. It validates each decoded plan path as a componentwise descendant of the selected target, checks the file identity, type, size, allocation, and modification state before each deletion, and skips changed entries. Newly observed entries are never added to the consented plan; a plan that cannot retain every identity and outcome is rejected before confirmation.
+The main loop retains at most four non-overlapping interactive deletion requests. A separate planner can build the next identity plan while the single executor performs a confirmed target's final full-plan revalidation and serial mutation. Large directory plans retain a bounded resident prefix and use authenticated temporary storage outside the selected target for later plan and outcome records before consent. Platform code works relative to the confirmed parent and does not follow links. It validates each decoded plan path as a componentwise descendant of the selected target, checks the file identity, type, size, allocation, and modification state before each deletion, and skips changed entries. Newly observed entries are never added to the consented plan. A complete removal invalidates its ScanStore prefix and publishes a replacement generation before the map accepts another view of that path.
 
 The [background task system decision](background-tasks.md) defines the bounded deletion-work foundation and the review required before adding other task kinds.
 
@@ -50,7 +56,7 @@ Versioned `scan-report` and `deletion-history` documents use the same stable enc
 
 ## Dependency Direction
 
-Platform code supplies file information to the scanner and deletion code. The scanner supplies information to the working model and space accounting. Application state supplies data to the interface. The reporting code reads the resulting state. Domain code does not depend on terminal widgets, and interface code does not change the file system.
+Platform code supplies file information to the scanner and deletion code. The scanner supplies facts to the bounded compatibility model and ScanStore. ScanStore publishes immutable pages to application state; reporting reads the compatibility model. Domain code does not depend on terminal widgets, and interface code does not change the file system.
 
 The storage map uses dense half-block cells inside its pane. Each cell can carry foreground and background shading without inserting gaps between entries. Map movement belongs to application state. The board keeps the current position, the next position, and one transition clock. A new scan can redirect the transition from its current position without restarting it.
 

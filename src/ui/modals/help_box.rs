@@ -111,7 +111,7 @@ impl Widget for HelpBox<'_> {
                 movement,
                 Line::from("  Enter                  open / rescan"),
                 Line::from("  Esc                    back / cancel"),
-                Line::from("  +  -  0                zoom in / out / reset"),
+                Line::from("  +  -  0 / PgUp PgDn   zoom / scan pages"),
                 Line::from("  /                      filter items"),
                 Line::from("  e                      export report"),
                 Line::from("  t                      preview and save themes"),
@@ -167,7 +167,7 @@ impl Widget for HelpBox<'_> {
                 Line::from("  changed/new: skipped"),
                 Line::from("  Enter: open / rescan"),
                 Line::from("  Esc: back / cancel"),
-                Line::from("  +/-/0: zoom"),
+                Line::from("  +/-/0 zoom; PgUp/PgDn pages"),
                 Line::from("  / filter; e scan; E history; t saves theme"),
             ]);
             content.truncate(usize::from(inner.height));

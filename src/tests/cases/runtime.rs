@@ -670,6 +670,53 @@ fn skipped_link_is_an_explicit_scoped_boundary() {
 }
 
 #[test]
+fn concurrent_interactive_scan_publishes_a_complete_bounded_generation() {
+    const BRANCHES: usize = 8;
+    const FILES_PER_BRANCH: usize = 64;
+
+    let root = tempfile::tempdir().expect("scan root should exist");
+    for branch in 0..BRANCHES {
+        let directory = root.path().join(format!("branch-{branch:02}"));
+        std::fs::create_dir(&directory).expect("branch should exist");
+        for file in 0..FILES_PER_BRANCH {
+            std::fs::write(
+                directory.join(format!("file-{file:03}")),
+                [branch as u8, file as u8],
+            )
+            .expect("fixture file should exist");
+        }
+    }
+    let (_, _, backend) = test_backend_factory(100, 32);
+    let input = TerminalEvents::new(vec![
+        None,
+        Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+    ]);
+    let mut scan_settings = settings(root.path());
+    scan_settings.scan_threads = 4;
+    scan_settings.event_capacity = 16;
+    scan_settings.memory_mib = crate::model::MIN_PROCESS_MIB;
+    scan_settings.temporary_storage_mib = 64;
+    let outcome = run(
+        backend,
+        Box::new(input),
+        scan_settings,
+        Box::new(VirtualClock::new()),
+    )
+    .expect("concurrent scan should finish cleanly");
+    let OperationOutcome::Exact(summary) = outcome else {
+        panic!("complete concurrent scan must remain exact: {outcome:?}");
+    };
+    assert_eq!(
+        summary.scanned_entries,
+        u64::try_from(BRANCHES.saturating_add(BRANCHES.saturating_mul(FILES_PER_BRANCH)))
+            .expect("fixture count should fit")
+    );
+    assert_eq!(summary.unreadable_entries, 0);
+    assert_eq!(summary.unscanned_entries, 0);
+}
+
+#[test]
 fn headless_scan_streams_a_round_trippable_bounded_report() {
     let root = tempfile::tempdir().expect("headless root should exist");
     std::fs::write(root.path().join("zeta"), b"a").expect("first fixture should be written");

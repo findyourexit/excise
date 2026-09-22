@@ -111,11 +111,6 @@ pub(crate) enum ScanPageError {
     NotDirectory,
 }
 
-struct PageEntries {
-    states: Vec<PageEntryState>,
-    next_after: Option<RelativePath>,
-}
-
 impl PublishedGeneration {
     /// Materializes one bounded direct-child page from an immutable scan result.
     ///
@@ -128,72 +123,42 @@ impl PublishedGeneration {
     /// Returns an error for an invalid request, corrupt run, or a missing/non-
     /// directory folder in this generation.
     pub(crate) fn page(&mut self, request: PageRequest) -> Result<ScanPage, ScanPageError> {
-        if request.limit == 0 || request.limit > MAX_PAGE_ENTRIES {
-            return Err(ScanPageError::InvalidLimit);
+        validate_page_request(&request)?;
+        if let Some(page) = self.cached_page(&request) {
+            return Ok(page);
         }
-        if request
-            .after
-            .as_ref()
-            .is_some_and(|after| !after.is_direct_child_of(&request.folder))
-        {
-            return Err(ScanPageError::InvalidCursor);
-        }
-
-        let PageEntries {
-            mut states,
-            next_after,
-        } = self.page_entries(&request)?;
-        let direct_index = states
-            .iter()
-            .enumerate()
-            .map(|(index, state)| (state.entry.path.clone(), index))
-            .collect::<HashMap<_, _>>();
-        let (mut folder_metrics, folder_coverage, mut root_metrics, root_coverage) =
-            self.page_directory_summaries(&request.folder, &direct_index, &mut states)?;
-        folder_metrics.allocated_bytes = ByteBounds::exact(0);
-        folder_metrics.reclaimable_bytes = ByteBounds::exact(0);
-        root_metrics.allocated_bytes = ByteBounds::exact(0);
-        root_metrics.reclaimable_bytes = ByteBounds::exact(0);
-        for state in &mut states {
-            state.prepare_physical_accounting();
-        }
-        self.mark_page_identity_entries(&direct_index, &mut states)?;
-        let shared_allocation = self.apply_page_physical_accounting(
-            &request.folder,
-            &direct_index,
-            &mut states,
-            &mut folder_metrics,
-            &mut root_metrics,
-        )?;
-        if folder_coverage == Coverage::Uncertain {
-            folder_metrics.allocated_bytes.upper = None;
-            folder_metrics.reclaimable_bytes.upper = None;
-        }
-        if root_coverage == Coverage::Uncertain {
-            root_metrics.allocated_bytes.upper = None;
-            root_metrics.reclaimable_bytes.upper = None;
-        }
-        for state in &mut states {
-            state.finish_physical_accounting();
-        }
-        Ok(ScanPage {
+        let cache_key = request.clone();
+        let mut entries = self.collect_page_entries(&request)?;
+        let mut metrics = self.collect_directory_metrics(&request, &mut entries)?;
+        entries.prepare_physical_accounting();
+        self.mark_page_identities(&mut entries)?;
+        let shared_allocation =
+            self.apply_page_allocations(&request, &mut entries, &mut metrics)?;
+        metrics.clear_uncertain_physical_bounds();
+        entries.finish_physical_accounting();
+        let (entries, next_after) = entries.into_parts();
+        let page = ScanPage {
             generation: self.generation(),
             folder: request.folder,
-            folder_metrics,
-            folder_coverage,
-            root_metrics,
-            root_coverage,
-            entries: states.into_iter().map(|state| state.entry).collect(),
+            folder_metrics: metrics.folder,
+            folder_coverage: metrics.folder_coverage,
+            root_metrics: metrics.root,
+            root_coverage: metrics.root_coverage,
+            entries,
             next_after,
             shared_allocation,
-        })
+        };
+        self.cache_page(cache_key, page.clone());
+        Ok(page)
     }
 
-    fn page_entries(&mut self, request: &PageRequest) -> Result<PageEntries, ScanPageError> {
-        let mut states = Vec::with_capacity(request.limit);
+    fn collect_page_entries(
+        &mut self,
+        request: &PageRequest,
+    ) -> Result<PageEntries, ScanPageError> {
+        let mut entries = PageEntries::with_capacity(request.limit);
         let mut folder_found = request.folder.is_root();
         let mut folder_is_directory = request.folder.is_root();
-        let mut next_after = None;
         self.with_path_observations(|reader| {
             let mut key = Vec::new();
             let mut value = Vec::new();
@@ -204,23 +169,22 @@ impl PublishedGeneration {
                     folder_is_directory = observation.kind == PathEntryKind::Directory;
                     continue;
                 }
-                if !observation.path.is_direct_child_of(&request.folder) {
-                    continue;
-                }
-                if request
-                    .after
-                    .as_ref()
-                    .is_some_and(|after| observation.path <= *after)
+                if !observation.path.is_direct_child_of(&request.folder)
+                    || request
+                        .after
+                        .as_ref()
+                        .is_some_and(|after| observation.path <= *after)
                 {
                     continue;
                 }
-                if states.len() == request.limit {
-                    next_after = states
-                        .last()
-                        .map(|state: &PageEntryState| state.entry.path.clone());
+                if entries.states.len() == request.limit {
+                    entries.next_after =
+                        entries.states.last().map(|state| state.entry.path.clone());
                     break;
                 }
-                states.push(PageEntryState::from_observation(observation));
+                entries
+                    .states
+                    .push(PageEntryState::from_observation(observation));
             }
             Ok::<(), ScanPageError>(())
         })?;
@@ -230,15 +194,15 @@ impl PublishedGeneration {
         if !folder_is_directory {
             return Err(ScanPageError::NotDirectory);
         }
-        Ok(PageEntries { states, next_after })
+        entries.index_direct_children();
+        Ok(entries)
     }
 
-    fn page_directory_summaries(
+    fn collect_directory_metrics(
         &mut self,
-        folder: &RelativePath,
-        direct_index: &HashMap<RelativePath, usize>,
-        states: &mut [PageEntryState],
-    ) -> Result<(SummaryMetrics, Coverage, SummaryMetrics, Coverage), ScanPageError> {
+        request: &PageRequest,
+        entries: &mut PageEntries,
+    ) -> Result<PageMetrics, ScanPageError> {
         let mut folder_summary = None;
         let mut root_summary = None;
         self.with_directory_summaries(|reader| {
@@ -246,16 +210,16 @@ impl PublishedGeneration {
             let mut value = Vec::new();
             while reader.next_record_into(&mut key, &mut value)? {
                 let (_, summary) = decode_directory_summary(&key, &value)?;
-                if summary.path == *folder {
+                if summary.path == request.folder {
                     folder_summary = Some((summary.metrics, summary.coverage));
                 }
                 if summary.path.is_root() {
                     root_summary = Some((summary.metrics, summary.coverage));
                 }
-                let Some(&index) = direct_index.get(&summary.path) else {
+                let Some(index) = entries.direct_index.get(&summary.path).copied() else {
                     continue;
                 };
-                let state = &mut states[index];
+                let state = &mut entries.states[index];
                 if !state.entry.kind.is_directory() {
                     continue;
                 }
@@ -267,26 +231,19 @@ impl PublishedGeneration {
             }
             Ok::<(), ScanPageError>(())
         })?;
-        let (folder_metrics, folder_coverage) =
-            folder_summary.ok_or(ScanPageError::MissingFolder)?;
-        let (root_metrics, root_coverage) = root_summary.ok_or(ScanPageError::MissingFolder)?;
-        Ok((folder_metrics, folder_coverage, root_metrics, root_coverage))
+        PageMetrics::from_summaries(folder_summary, root_summary)
     }
 
-    fn mark_page_identity_entries(
-        &mut self,
-        direct_index: &HashMap<RelativePath, usize>,
-        states: &mut [PageEntryState],
-    ) -> Result<(), ScanPageError> {
+    fn mark_page_identities(&mut self, entries: &mut PageEntries) -> Result<(), ScanPageError> {
         self.with_identity_observations(|reader| {
             let mut key = Vec::new();
             let mut value = Vec::new();
             while reader.next_record_into(&mut key, &mut value)? {
                 let observation = decode_identity_observation(&key, &value)?;
-                let Some(&index) = direct_index.get(&observation.path) else {
+                let Some(index) = entries.direct_index.get(&observation.path).copied() else {
                     continue;
                 };
-                let state = &mut states[index];
+                let state = &mut entries.states[index];
                 if !state.entry.kind.is_directory() {
                     state.identity_seen = true;
                 }
@@ -295,54 +252,44 @@ impl PublishedGeneration {
         })
     }
 
-    fn apply_page_physical_accounting(
+    fn apply_page_allocations(
         &mut self,
-        folder: &RelativePath,
-        direct_index: &HashMap<RelativePath, usize>,
-        states: &mut [PageEntryState],
-        folder_metrics: &mut SummaryMetrics,
-        root_metrics: &mut SummaryMetrics,
+        request: &PageRequest,
+        entries: &mut PageEntries,
+        metrics: &mut PageMetrics,
     ) -> Result<Option<SharedAllocationSummary>, ScanPageError> {
-        let mut shared = SummaryMetrics::default();
-        let mut shared_unknown = false;
-        let mut shared_seen = false;
+        let mut shared = SharedAllocationAccounting::default();
         self.with_allocation_contributions(|reader| {
             let mut key = Vec::new();
             let mut value = Vec::new();
             while reader.next_record_into(&mut key, &mut value)? {
                 let (_, contribution) = decode_allocation_contribution(&key, &value)?;
-                if contribution.recipient.starts_with(folder) {
+                if contribution.recipient.starts_with(&request.folder) {
                     add_physical(
-                        folder_metrics,
+                        &mut metrics.folder,
                         contribution.allocated_bytes,
                         contribution.reclaimable_bytes,
                     );
                 }
                 add_physical(
-                    root_metrics,
+                    &mut metrics.root,
                     contribution.allocated_bytes,
                     contribution.reclaimable_bytes,
                 );
                 if contribution.placement == AllocationPlacement::Shared
-                    && contribution.recipient == *folder
+                    && contribution.recipient == request.folder
                 {
-                    add_physical(
-                        &mut shared,
-                        contribution.allocated_bytes,
-                        contribution.reclaimable_bytes,
-                    );
-                    shared_unknown |= !bounds_are_exact(contribution.allocated_bytes)
-                        || !bounds_are_exact(contribution.reclaimable_bytes);
-                    shared_seen = true;
+                    shared.add(contribution.allocated_bytes, contribution.reclaimable_bytes);
                     continue;
                 }
-                let Some(child) = direct_child_under(folder, &contribution.recipient) else {
+                let Some(child) = direct_child_under(&request.folder, &contribution.recipient)
+                else {
                     continue;
                 };
-                let Some(&index) = direct_index.get(&child) else {
+                let Some(index) = entries.direct_index.get(&child).copied() else {
                     continue;
                 };
-                let state = &mut states[index];
+                let state = &mut entries.states[index];
                 match contribution.placement {
                     AllocationPlacement::Leaf if contribution.recipient == state.entry.path => {
                         state.entry.metrics.allocated_bytes = contribution.allocated_bytes;
@@ -363,15 +310,127 @@ impl PublishedGeneration {
             }
             Ok::<(), ScanPageError>(())
         })?;
-        Ok(shared_seen.then_some(SharedAllocationSummary {
-            metrics: shared,
-            coverage: if shared_unknown {
+        Ok(shared.into_summary())
+    }
+}
+
+struct PageEntries {
+    states: Vec<PageEntryState>,
+    direct_index: HashMap<RelativePath, usize>,
+    next_after: Option<RelativePath>,
+}
+
+impl PageEntries {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            states: Vec::with_capacity(capacity),
+            direct_index: HashMap::with_capacity(capacity),
+            next_after: None,
+        }
+    }
+
+    fn index_direct_children(&mut self) {
+        for (index, state) in self.states.iter().enumerate() {
+            self.direct_index.insert(state.entry.path.clone(), index);
+        }
+    }
+
+    fn prepare_physical_accounting(&mut self) {
+        for state in &mut self.states {
+            state.prepare_physical_accounting();
+        }
+    }
+
+    fn finish_physical_accounting(&mut self) {
+        for state in &mut self.states {
+            state.finish_physical_accounting();
+        }
+    }
+
+    fn into_parts(self) -> (Vec<ScanPageEntry>, Option<RelativePath>) {
+        (
+            self.states.into_iter().map(|state| state.entry).collect(),
+            self.next_after,
+        )
+    }
+}
+
+struct PageMetrics {
+    folder: SummaryMetrics,
+    folder_coverage: Coverage,
+    root: SummaryMetrics,
+    root_coverage: Coverage,
+}
+
+impl PageMetrics {
+    fn from_summaries(
+        folder_summary: Option<(SummaryMetrics, Coverage)>,
+        root_summary: Option<(SummaryMetrics, Coverage)>,
+    ) -> Result<Self, ScanPageError> {
+        let (mut folder, folder_coverage) = folder_summary.ok_or(ScanPageError::MissingFolder)?;
+        let (mut root, root_coverage) = root_summary.ok_or(ScanPageError::MissingFolder)?;
+        folder.allocated_bytes = ByteBounds::exact(0);
+        folder.reclaimable_bytes = ByteBounds::exact(0);
+        root.allocated_bytes = ByteBounds::exact(0);
+        root.reclaimable_bytes = ByteBounds::exact(0);
+        Ok(Self {
+            folder,
+            folder_coverage,
+            root,
+            root_coverage,
+        })
+    }
+
+    fn clear_uncertain_physical_bounds(&mut self) {
+        if self.folder_coverage == Coverage::Uncertain {
+            self.folder.allocated_bytes.upper = None;
+            self.folder.reclaimable_bytes.upper = None;
+        }
+        if self.root_coverage == Coverage::Uncertain {
+            self.root.allocated_bytes.upper = None;
+            self.root.reclaimable_bytes.upper = None;
+        }
+    }
+}
+
+#[derive(Default)]
+struct SharedAllocationAccounting {
+    metrics: SummaryMetrics,
+    unknown: bool,
+    seen: bool,
+}
+
+impl SharedAllocationAccounting {
+    fn add(&mut self, allocated: ByteBounds, reclaimable: ByteBounds) {
+        add_physical(&mut self.metrics, allocated, reclaimable);
+        self.unknown |= !bounds_are_exact(allocated) || !bounds_are_exact(reclaimable);
+        self.seen = true;
+    }
+
+    fn into_summary(self) -> Option<SharedAllocationSummary> {
+        self.seen.then_some(SharedAllocationSummary {
+            metrics: self.metrics,
+            coverage: if self.unknown {
                 Coverage::Uncertain
             } else {
                 Coverage::Complete
             },
-        }))
+        })
     }
+}
+
+fn validate_page_request(request: &PageRequest) -> Result<(), ScanPageError> {
+    if request.limit == 0 || request.limit > MAX_PAGE_ENTRIES {
+        return Err(ScanPageError::InvalidLimit);
+    }
+    if request
+        .after
+        .as_ref()
+        .is_some_and(|after| !after.is_direct_child_of(&request.folder))
+    {
+        return Err(ScanPageError::InvalidCursor);
+    }
+    Ok(())
 }
 
 struct PageEntryState {

@@ -13,7 +13,7 @@ use crate::model::{
 use crate::native_path::identity_for;
 use crate::os::physical_size;
 use crate::scan_coordinator::RelativePath;
-use crate::scan_store::page::{PageEntryKind, ScanPage, ScanPageEntry};
+use crate::scan_store::page::{PageEntryKind, ScanPage, ScanPageEntry, SharedAllocationSummary};
 use crate::scan_store::path_reducer::{Coverage, SummaryMetrics};
 use crate::state::FileToDelete;
 use crate::state::files::tree_view::TreeView;
@@ -25,10 +25,14 @@ use crate::state::tiles::{FileMetadata, FileType};
 /// It owns only the current folder's direct entries and its ancestor chain. The
 /// underlying generation remains in the `ScanStore`; switching folders replaces
 /// this view rather than growing a second full in-memory tree.
-enum SnapshotSource {
-    Stored(EntrySnapshot),
-    LivePath,
-    Metrics,
+pub(crate) struct SnapshotTree {
+    root_path: PathBuf,
+    current_relative: RelativePath,
+    current_id: NodeId,
+    nodes: Vec<Node>,
+    relative_paths: Vec<Option<RelativePath>>,
+    model_stats: (usize, usize, bool),
+    next_after: Option<RelativePath>,
 }
 
 struct SnapshotNode {
@@ -37,16 +41,8 @@ struct SnapshotNode {
     metrics: SummaryMetrics,
     coverage: Coverage,
     relative: Option<RelativePath>,
-    source: SnapshotSource,
-}
-
-pub(crate) struct SnapshotTree {
-    root_path: PathBuf,
-    current_relative: RelativePath,
-    current_id: NodeId,
-    nodes: Vec<Node>,
-    relative_paths: Vec<Option<RelativePath>>,
-    model_stats: (usize, usize, bool),
+    scan_snapshot: Option<EntrySnapshot>,
+    use_live_snapshot: bool,
 }
 
 impl SnapshotTree {
@@ -67,22 +63,22 @@ impl SnapshotTree {
             root_metrics,
             root_coverage,
             entries,
+            next_after,
             shared_allocation,
             ..
         } = page;
-        let root_snapshot = snapshot_for_path(
-            &root_path,
-            &RelativePath::root(),
-            NodeKind::Root,
-            root_metrics,
-        );
         let mut root = Node::new(
             NodeId(0),
             None,
             Arc::from(OsStr::new("")),
             NodeKind::Root,
             state_for(root_coverage),
-            root_snapshot,
+            snapshot_for_path(
+                &root_path,
+                &RelativePath::root(),
+                NodeKind::Root,
+                root_metrics,
+            ),
         );
         root.metrics = node_metrics(root_metrics);
         root.unscanned_reason = reason_for(root_coverage);
@@ -93,8 +89,20 @@ impl SnapshotTree {
             nodes: vec![root],
             relative_paths: vec![Some(RelativePath::root())],
             model_stats,
+            next_after,
         };
+        let current_id = tree.append_ancestors(&folder, folder_metrics, folder_coverage)?;
+        tree.current_id = current_id;
+        tree.append_page_entries(entries, shared_allocation)?;
+        Ok(tree)
+    }
 
+    fn append_ancestors(
+        &mut self,
+        folder: &RelativePath,
+        folder_metrics: SummaryMetrics,
+        folder_coverage: Coverage,
+    ) -> Result<NodeId, ModelError> {
         let mut parent = NodeId(0);
         for (index, component) in folder.components().iter().enumerate() {
             let relative = RelativePath::from_components(
@@ -104,26 +112,35 @@ impl SnapshotTree {
                 ModelError::Invariant("scan page contained an invalid ancestor".to_string())
             })?;
             let is_current = index.saturating_add(1) == folder.depth();
-
-            let (metrics, coverage) = if is_current {
-                (folder_metrics, folder_coverage)
-            } else {
-                (SummaryMetrics::default(), Coverage::Uncertain)
-            };
-            parent = tree.push_node(
+            parent = self.push_node(
                 parent,
                 SnapshotNode {
                     name: Arc::from(component.as_os_str()),
                     kind: NodeKind::Directory,
-                    metrics,
-                    coverage,
+                    metrics: if is_current {
+                        folder_metrics
+                    } else {
+                        SummaryMetrics::default()
+                    },
+                    coverage: if is_current {
+                        folder_coverage
+                    } else {
+                        Coverage::Uncertain
+                    },
                     relative: Some(relative),
-                    source: SnapshotSource::LivePath,
+                    scan_snapshot: None,
+                    use_live_snapshot: true,
                 },
             )?;
         }
-        tree.current_id = parent;
+        Ok(parent)
+    }
 
+    fn append_page_entries(
+        &mut self,
+        entries: Vec<ScanPageEntry>,
+        shared_allocation: Option<SharedAllocationSummary>,
+    ) -> Result<(), ModelError> {
         for ScanPageEntry {
             path,
             kind,
@@ -136,32 +153,39 @@ impl SnapshotTree {
                 .components()
                 .last()
                 .ok_or_else(|| ModelError::Invariant("scan page entry had no name".to_string()))?;
-            tree.push_node(
-                tree.current_id,
+            self.push_node(
+                self.current_id,
                 SnapshotNode {
                     name: Arc::from(name.as_os_str()),
                     kind: node_kind_for(kind),
                     metrics,
                     coverage,
                     relative: Some(path),
-                    source: snapshot.map_or(SnapshotSource::Metrics, SnapshotSource::Stored),
+                    scan_snapshot: snapshot,
+                    use_live_snapshot: false,
                 },
             )?;
         }
         if let Some(shared) = shared_allocation {
-            tree.push_node(
-                tree.current_id,
+            self.push_node(
+                self.current_id,
                 SnapshotNode {
                     name: Arc::from(OsStr::new("Shared allocation")),
                     kind: NodeKind::Synthetic(SyntheticKind::Shared),
                     metrics: shared.metrics,
                     coverage: shared.coverage,
                     relative: None,
-                    source: SnapshotSource::Metrics,
+                    scan_snapshot: None,
+                    use_live_snapshot: false,
                 },
             )?;
         }
-        Ok(tree)
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn next_after(&self) -> Option<&RelativePath> {
+        self.next_after.as_ref()
     }
 
     #[must_use]
@@ -313,7 +337,8 @@ impl SnapshotTree {
             metrics,
             coverage,
             relative,
-            source,
+            scan_snapshot,
+            use_live_snapshot,
         } = input;
         let id =
             NodeId(
@@ -322,13 +347,13 @@ impl SnapshotTree {
                     limit: self.model_stats.1,
                 })?,
             );
-        let snapshot = match source {
-            SnapshotSource::Stored(snapshot) => snapshot,
-            SnapshotSource::LivePath => relative.as_ref().map_or_else(
+        let snapshot = match scan_snapshot {
+            Some(snapshot) => snapshot,
+            None if use_live_snapshot => relative.as_ref().map_or_else(
                 || snapshot_from_metrics(kind, metrics),
                 |relative| snapshot_for_path(&self.root_path, relative, kind, metrics),
             ),
-            SnapshotSource::Metrics => snapshot_from_metrics(kind, metrics),
+            None => snapshot_from_metrics(kind, metrics),
         };
         let mut node = Node::new(id, Some(parent), name, kind, state_for(coverage), snapshot);
         node.metrics = node_metrics(metrics);

@@ -826,7 +826,7 @@ mod tests {
             deep_path.push("d");
         }
         deep_path.push("leaf");
-        tree.add_entry(&metadata, &deep_path, identity)
+        tree.add_entry(&metadata, &deep_path, &identity)
             .expect("deep model entry should be retained");
 
         let summary = RunSummary::default();
@@ -880,7 +880,7 @@ mod tests {
         let hostile_path = root.join("entry-\u{1b}[31m");
         let mut tree = FileTree::new(root.clone(), false, crate::model::DEFAULT_PROCESS_MIB)
             .expect("report model should be created");
-        tree.add_entry(&metadata, &hostile_path, entry_identity.clone())
+        tree.add_entry(&metadata, &hostile_path, &entry_identity)
             .expect("hostile report entry should be added");
         tree.complete_directory(&root, None)
             .expect("report root should complete");

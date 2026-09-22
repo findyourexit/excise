@@ -3845,16 +3845,66 @@ mod tests {
         );
     }
     #[cfg(unix)]
+    const SPILLED_FANOUT_COLD_LINKS: u64 = 128;
+
+    #[cfg(unix)]
+    fn assert_spilled_fanout_after_compaction(
+        arena: &mut Arena,
+        file_id: &file_id::FileId,
+        cold_id: NodeId,
+        survivor_id: NodeId,
+    ) -> ByteBounds {
+        arena
+            .finalize()
+            .expect("hard links should finalize after compaction");
+        let shared = arena
+            .children(arena.root())
+            .iter()
+            .filter_map(|id| arena.node(*id))
+            .find(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Shared))
+            .expect("shared allocation should remain visible at the common ancestor");
+        let shared_allocation = shared.metrics.allocated_bytes;
+        assert_eq!(shared.parent, Some(arena.root()));
+        assert_eq!(
+            arena
+                .node(cold_id)
+                .expect("cold aggregate should remain")
+                .metrics
+                .allocated_bytes,
+            ByteBounds::exact(0)
+        );
+        assert_eq!(
+            arena
+                .node(survivor_id)
+                .expect("survivor should remain")
+                .metrics
+                .allocated_bytes,
+            ByteBounds::exact(0)
+        );
+        let record = arena
+            .identities
+            .get(file_id)
+            .expect("identity lookup should succeed")
+            .expect("identity should remain");
+        assert_eq!(record.observed_links, SPILLED_FANOUT_COLD_LINKS + 1);
+        assert_eq!(
+            record.nodes,
+            vec![(cold_id, SPILLED_FANOUT_COLD_LINKS), (survivor_id, 1)]
+        );
+        assert_eq!(record.allocation_node, Some(cold_id));
+        shared_allocation
+    }
+
+    #[cfg(unix)]
     #[test]
     fn spilled_fanout_hard_links_coalesce_remaps_and_delete_exactly() {
-        const COLD_LINKS: u64 = 128;
         let root = tempfile::tempdir().expect("model root should exist");
         let cold = root.path().join("cold");
         fs::create_dir(&cold).expect("cold directory should be created");
         let first = cold.join("link-000");
         fs::write(&first, b"payload").expect("fixture should be written");
         let mut cold_links = vec![first.clone()];
-        for index in 1..COLD_LINKS {
+        for index in 1..SPILLED_FANOUT_COLD_LINKS {
             let path = cold.join(format!("link-{index:03}"));
             fs::hard_link(&first, &path).expect("hard link should be created");
             cold_links.push(path);
@@ -3886,41 +3936,8 @@ mod tests {
             "compacting known leaf identities must not scan every spilled identity"
         );
 
-        assert_spilled_identity(
-            &mut arena,
-            &file_id,
-            COLD_LINKS + 1,
-            &[(cold_id, COLD_LINKS), (survivor_id, 1)],
-            cold_id,
-        );
-
-        arena
-            .finalize()
-            .expect("hard links should finalize after compaction");
-        let shared = arena
-            .children(arena.root())
-            .iter()
-            .filter_map(|id| arena.node(*id))
-            .find(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Shared))
-            .expect("shared allocation should remain visible at the common ancestor");
-        let shared_allocation = shared.metrics.allocated_bytes;
-        assert_eq!(shared.parent, Some(arena.root()));
-        assert_eq!(
-            arena
-                .node(cold_id)
-                .expect("cold aggregate should remain")
-                .metrics
-                .allocated_bytes,
-            ByteBounds::exact(0)
-        );
-        assert_eq!(
-            arena
-                .node(survivor_id)
-                .expect("survivor should remain")
-                .metrics
-                .allocated_bytes,
-            ByteBounds::exact(0)
-        );
+        let shared_allocation =
+            assert_spilled_fanout_after_compaction(&mut arena, &file_id, cold_id, survivor_id);
 
         assert!(arena.remove_path(&cold));
         assert_spilled_identity(&mut arena, &file_id, 1, &[(survivor_id, 1)], survivor_id);

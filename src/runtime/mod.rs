@@ -753,7 +753,7 @@ where
         self.scan_view_dirty |= entry.path.starts_with(&self.scan_view_root);
         self.summary.scanned_entries = self.summary.scanned_entries.saturating_add(1);
         self.app
-            .add_entry_to_base_folder(&entry.metadata, entry.path, entry.identity)?;
+            .add_entry_to_base_folder(&entry.metadata, entry.path, &entry.identity)?;
         self.summary.identified_entries =
             u64::try_from(self.app.identity_count()).unwrap_or(u64::MAX);
         Ok(())
@@ -761,7 +761,7 @@ where
 
     fn handle_focused_scan_entry(&mut self, entry: ScannedEntry) -> Result<(), AppError> {
         self.app
-            .add_entry_to_focused_folder(&entry.metadata, entry.path, entry.identity)
+            .add_entry_to_focused_folder(&entry.metadata, entry.path, &entry.identity)
     }
 
     fn handle_primary_unscanned(
@@ -1308,7 +1308,7 @@ pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanR
                     summary.scanned_entries =
                         summary.scanned_entries.saturating_add(entries.len() as u64);
                     for entry in entries {
-                        tree.add_entry(&entry.metadata, &entry.path, entry.identity)
+                        tree.add_entry(&entry.metadata, &entry.path, &entry.identity)
                             .map_err(|error| AppError::Model(error.to_string()))?;
                     }
                     summary.identified_entries =
@@ -1436,7 +1436,6 @@ pub const fn outcome_exit_class(outcome: &OperationOutcome<RunSummary>) -> ExitC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::DeletionWorkId;
     use ratatui::backend::TestBackend;
 
     struct PendingInput;
@@ -1845,71 +1844,14 @@ mod tests {
         );
     }
     #[cfg(any(unix, windows))]
-    fn completed_deletion_fixture() -> (
-        App<TestBackend>,
-        tempfile::TempDir,
-        NativeIdentity,
-        PathBuf,
-        DeletionWorkId,
-        DeletionReport,
-    ) {
-        let root = tempfile::tempdir().expect("test root should be created");
-        let target_path = root.path().join("target");
-        std::fs::write(&target_path, vec![b'x'; 8 * 1024]).expect("test target should be created");
-        let survivor_path = root.path().join("survivor");
-        std::fs::write(&survivor_path, b"keep").expect("test survivor should be created");
-        let root_metadata =
-            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
-        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
-            .expect("test root identity should be readable")
-            .expect("test root should not be a link");
-        let target_metadata =
-            std::fs::symlink_metadata(&target_path).expect("test target metadata should exist");
-        let target_identity = crate::native_path::identity_for(&target_path, &target_metadata)
-            .expect("test target identity should be readable")
-            .expect("test target should not be a link");
-        let survivor_metadata =
-            std::fs::symlink_metadata(&survivor_path).expect("test survivor metadata should exist");
-        let survivor_identity =
-            crate::native_path::identity_for(&survivor_path, &survivor_metadata)
-                .expect("test survivor identity should be readable")
-                .expect("test survivor should not be a link");
-        let mut app = App::new_with_root_identity(
-            TestBackend::new(80, 24),
-            root.path().to_path_buf(),
-            root_identity.clone(),
-            false,
-            false,
-            crate::model::MIN_PROCESS_MIB,
-            KeyPreset::Vim,
-            None,
-            false,
-        )
-        .expect("app should initialize");
-        app.add_entry_to_base_folder(&target_metadata, target_path.clone(), target_identity)
-            .expect("target should enter the model");
-        app.add_entry_to_base_folder(&survivor_metadata, survivor_path.clone(), survivor_identity)
-            .expect("survivor should enter the model");
-        app.complete_directory(root.path(), None)
-            .expect("root should complete");
-        app.finalize_scan().expect("scan should finalize");
-        app.start_ui();
-        let mut initial_animation = AnimationScheduler::new(true, false, Duration::ZERO);
-        app.render_if_dirty(
-            &mut initial_animation,
-            Duration::ZERO,
-            "test",
-            crate::theme::Theme::for_id(ThemeId::ExciseDark),
-            false,
-            false,
-            true,
-        )
-        .expect("target should render into the map");
-
+    fn complete_queued_deletion(
+        app: &mut App<TestBackend>,
+        root: &std::path::Path,
+    ) -> (crate::state::deletion_work::DeletionWorkId, DeletionReport) {
         let target = app
             .request_deletion()
             .expect("rendered target should delete");
-        let plan = crate::deletion::build_plan(root.path(), target.clone(), false)
+        let plan = crate::deletion::build_plan(root, target.clone(), false)
             .expect("target deletion plan should build");
         assert!(app.queue_deletion_confirmation(target, false, 1024, Duration::ZERO));
         assert!(app.show_next_deletion_confirmation());
@@ -1929,15 +1871,13 @@ mod tests {
             panic!("queued deletion should enter its execution lane");
         };
         let report = crate::deletion::execute_plan(
-            root.path(),
+            root,
             *plan,
             &std::sync::atomic::AtomicBool::new(false),
             &std::sync::atomic::AtomicBool::new(false),
         );
         assert!(report.target_was_removed());
-        assert!(!target_path.exists());
-
-        (app, root, root_identity, survivor_path, work_id, report)
+        (work_id, report)
     }
 
     #[cfg(any(unix, windows))]
@@ -2000,8 +1940,65 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn completed_target_reflows_immediately_while_its_copied_tile_departs() {
-        let (app, root, root_identity, survivor_path, work_id, report) =
-            completed_deletion_fixture();
+        let root = tempfile::tempdir().expect("test root should be created");
+        let target_path = root.path().join("target");
+        std::fs::write(&target_path, vec![b'x'; 8 * 1024]).expect("test target should be created");
+        let survivor_path = root.path().join("survivor");
+        std::fs::write(&survivor_path, b"keep").expect("test survivor should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let target_metadata =
+            std::fs::symlink_metadata(&target_path).expect("test target metadata should exist");
+        let target_identity = crate::native_path::identity_for(&target_path, &target_metadata)
+            .expect("test target identity should be readable")
+            .expect("test target should not be a link");
+        let survivor_metadata =
+            std::fs::symlink_metadata(&survivor_path).expect("test survivor metadata should exist");
+        let survivor_identity =
+            crate::native_path::identity_for(&survivor_path, &survivor_metadata)
+                .expect("test survivor identity should be readable")
+                .expect("test survivor should not be a link");
+        let mut app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::MIN_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.add_entry_to_base_folder(&target_metadata, target_path.clone(), &target_identity)
+            .expect("target should enter the model");
+        app.add_entry_to_base_folder(
+            &survivor_metadata,
+            survivor_path.clone(),
+            &survivor_identity,
+        )
+        .expect("survivor should enter the model");
+        app.complete_directory(root.path(), None)
+            .expect("root should complete");
+        app.finalize_scan().expect("scan should finalize");
+        app.start_ui();
+        let mut initial_animation = AnimationScheduler::new(true, false, Duration::ZERO);
+        app.render_if_dirty(
+            &mut initial_animation,
+            Duration::ZERO,
+            "test",
+            crate::theme::Theme::for_id(ThemeId::ExciseDark),
+            false,
+            false,
+            true,
+        )
+        .expect("target should render into the map");
+
+        let (work_id, report) = complete_queued_deletion(&mut app, root.path());
+        assert!(!target_path.exists());
         let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
 
         owner

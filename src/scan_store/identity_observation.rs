@@ -374,9 +374,7 @@ pub(crate) fn decode_allocation_contribution(
         upper: reclaimable_upper,
     };
     validate_bounds(allocated_bytes).map_err(|()| AllocationContributionCodecError::Malformed)?;
-
     validate_bounds(reclaimable_bytes).map_err(|()| AllocationContributionCodecError::Malformed)?;
-
     Ok((
         file_id,
         AllocationContribution {
