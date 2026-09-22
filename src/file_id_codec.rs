@@ -16,38 +16,72 @@ pub(crate) enum FileIdCodecError {
 /// Encodes a file identity without JSON allocation or platform-dependent text.
 #[must_use]
 pub(crate) fn encode_file_id(file_id: &FileId) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encode_file_id_into(file_id, &mut encoded);
+    encoded
+}
+
+/// Reuses `encoded` for one canonical file identity.
+pub(crate) fn encode_file_id_into(file_id: &FileId, encoded: &mut Vec<u8>) {
+    encoded.clear();
     match *file_id {
         FileId::Inode {
             device_id,
             inode_number,
         } => {
-            let mut encoded = Vec::with_capacity(1 + 2 * size_of::<u64>());
+            encoded.reserve(1 + 2 * size_of::<u64>());
             encoded.push(INODE_TAG);
             encoded.extend_from_slice(&device_id.to_le_bytes());
             encoded.extend_from_slice(&inode_number.to_le_bytes());
-            encoded
         }
         FileId::LowRes {
             volume_serial_number,
             file_index,
         } => {
-            let mut encoded = Vec::with_capacity(1 + size_of::<u32>() + size_of::<u64>());
+            encoded.reserve(1 + size_of::<u32>() + size_of::<u64>());
             encoded.push(LOW_RES_TAG);
             encoded.extend_from_slice(&volume_serial_number.to_le_bytes());
             encoded.extend_from_slice(&file_index.to_le_bytes());
-            encoded
         }
         FileId::HighRes {
             volume_serial_number,
             file_id,
         } => {
-            let mut encoded = Vec::with_capacity(1 + size_of::<u64>() + size_of::<u128>());
+            encoded.reserve(1 + size_of::<u64>() + size_of::<u128>());
             encoded.push(HIGH_RES_TAG);
             encoded.extend_from_slice(&volume_serial_number.to_le_bytes());
             encoded.extend_from_slice(&file_id.to_le_bytes());
-            encoded
         }
     }
+}
+
+/// Decodes one canonical file identity at the start of `encoded`.
+///
+/// # Errors
+///
+/// Returns [`FileIdCodecError::Malformed`] when `encoded` starts with an
+/// unknown tag or lacks the complete canonical bytes for that tag.
+pub(crate) fn decode_file_id_prefix(encoded: &[u8]) -> Result<(FileId, usize), FileIdCodecError> {
+    let (&tag, _) = encoded.split_first().ok_or(FileIdCodecError::Malformed)?;
+    let payload_bytes = match tag {
+        INODE_TAG => 2 * size_of::<u64>(),
+        LOW_RES_TAG => size_of::<u32>() + size_of::<u64>(),
+        HIGH_RES_TAG => size_of::<u64>() + size_of::<u128>(),
+        _ => return Err(FileIdCodecError::Malformed),
+    };
+    let total_bytes = payload_bytes.saturating_add(1);
+    if encoded.len() < total_bytes {
+        return Err(FileIdCodecError::Malformed);
+    }
+    let mut payload = &encoded[1..total_bytes];
+    let file_id = match tag {
+        INODE_TAG => FileId::new_inode(take_u64(&mut payload)?, take_u64(&mut payload)?),
+        LOW_RES_TAG => FileId::new_low_res(take_u32(&mut payload)?, take_u64(&mut payload)?),
+        HIGH_RES_TAG => FileId::new_high_res(take_u64(&mut payload)?, take_u128(&mut payload)?),
+        _ => unreachable!("the tag was validated before decoding"),
+    };
+    debug_assert!(payload.is_empty());
+    Ok((file_id, total_bytes))
 }
 
 /// # Errors
@@ -55,20 +89,11 @@ pub(crate) fn encode_file_id(file_id: &FileId) -> Vec<u8> {
 /// Returns [`FileIdCodecError::Malformed`] when `encoded` has an unknown tag or
 /// does not have the exact canonical length for that tag.
 pub(crate) fn decode_file_id(encoded: &[u8]) -> Result<FileId, FileIdCodecError> {
-    let (&tag, mut payload) = encoded.split_first().ok_or(FileIdCodecError::Malformed)?;
-    match tag {
-        INODE_TAG if payload.len() == 2 * size_of::<u64>() => Ok(FileId::new_inode(
-            take_u64(&mut payload)?,
-            take_u64(&mut payload)?,
-        )),
-        LOW_RES_TAG if payload.len() == size_of::<u32>() + size_of::<u64>() => Ok(
-            FileId::new_low_res(take_u32(&mut payload)?, take_u64(&mut payload)?),
-        ),
-        HIGH_RES_TAG if payload.len() == size_of::<u64>() + size_of::<u128>() => Ok(
-            FileId::new_high_res(take_u64(&mut payload)?, take_u128(&mut payload)?),
-        ),
-        _ => Err(FileIdCodecError::Malformed),
+    let (file_id, consumed) = decode_file_id_prefix(encoded)?;
+    if consumed != encoded.len() {
+        return Err(FileIdCodecError::Malformed);
     }
+    Ok(file_id)
 }
 
 fn take_u32(input: &mut &[u8]) -> Result<u32, FileIdCodecError> {
@@ -109,6 +134,19 @@ mod tests {
                 file_id
             );
         }
+    }
+
+    #[test]
+    fn file_identity_prefix_decoder_preserves_a_following_key() {
+        let file_id = FileId::new_low_res(7, 9);
+        let mut encoded = encode_file_id(&file_id);
+        let identity_bytes = encoded.len();
+        encoded.extend_from_slice(b"child\0");
+        assert_eq!(
+            decode_file_id_prefix(&encoded).expect("identity prefix should decode"),
+            (file_id, identity_bytes)
+        );
+        assert_eq!(decode_file_id(&encoded), Err(FileIdCodecError::Malformed));
     }
 
     #[test]

@@ -221,10 +221,11 @@ impl RunWriter {
         let file = self
             .writer
             .into_inner()
-            .map_err(|error| error.into_error())?;
+            .map_err(std::io::IntoInnerError::into_error)?;
+
         Ok(SealedRun {
-            file,
-            reservation: self.reservation,
+            file: Some(file),
+            reservation: Some(self.reservation),
             descriptor: self.descriptor,
             bytes: self.bytes_written,
         })
@@ -266,11 +267,11 @@ impl RunWriter {
     }
 }
 
-/// A sealed run owns both its file and storage charge until the reader drops.
+/// A sealed run owns both its file and storage charge until it is dropped.
 #[derive(Debug)]
 pub(crate) struct SealedRun {
-    file: File,
-    reservation: TemporaryStorageReservation,
+    file: Option<File>,
+    reservation: Option<TemporaryStorageReservation>,
     descriptor: RunDescriptor,
     bytes: u64,
 }
@@ -290,9 +291,58 @@ impl SealedRun {
     ///
     /// Returns an error when the sealed file cannot be rewound and validated.
     pub(crate) fn into_reader(mut self) -> Result<RunReader, RunError> {
-        self.file.seek(SeekFrom::Start(0))?;
-        RunReader::open(self.file, self.reservation)
+        let mut file = self.file.take().expect("sealed run must own a file");
+        let reservation = self
+            .reservation
+            .take()
+            .expect("sealed run must own its reservation");
+        file.seek(SeekFrom::Start(0))?;
+        RunReader::open(file, reservation, self.bytes).map_err(|error| error.error)
     }
+
+    /// Borrows this sealed run for one sequential pass, restoring ownership
+    /// before returning even when `visit` fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a run validation error or the visitor's error.
+    pub(crate) fn with_reader<T, E>(
+        &mut self,
+        visit: impl FnOnce(&mut RunReader) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<RunError>,
+    {
+        let mut file = self.file.take().expect("sealed run must own a file");
+        let reservation = self
+            .reservation
+            .take()
+            .expect("sealed run must own its reservation");
+        if let Err(error) = file.seek(SeekFrom::Start(0)) {
+            self.file = Some(file);
+            self.reservation = Some(reservation);
+            return Err(E::from(RunError::Io(error)));
+        }
+        let mut reader = match RunReader::open(file, reservation, self.bytes) {
+            Ok(reader) => reader,
+            Err(error) => {
+                self.file = Some(error.file);
+                self.reservation = Some(error.reservation);
+                return Err(E::from(error.error));
+            }
+        };
+        let result = visit(&mut reader);
+        let restored = reader.into_sealed();
+        self.file = restored.file;
+        self.reservation = restored.reservation;
+        result
+    }
+}
+
+struct RunOpenError {
+    error: RunError,
+    file: File,
+    reservation: TemporaryStorageReservation,
 }
 
 /// Sequential reader for a sealed run with one reusable decoded block.
@@ -300,6 +350,7 @@ pub(crate) struct RunReader {
     reader: BufReader<File>,
     _reservation: TemporaryStorageReservation,
     descriptor: RunDescriptor,
+    bytes: u64,
     block_capacity: usize,
     block: Vec<u8>,
     block_cursor: usize,
@@ -313,13 +364,27 @@ pub(crate) struct RunReader {
 }
 
 impl RunReader {
-    fn open(file: File, reservation: TemporaryStorageReservation) -> Result<Self, RunError> {
+    fn open(
+        file: File,
+        reservation: TemporaryStorageReservation,
+        bytes: u64,
+    ) -> Result<Self, RunOpenError> {
         let mut reader = BufReader::new(file);
-        let (descriptor, block_capacity) = decode_header(&mut reader)?;
+        let (descriptor, block_capacity) = match decode_header(&mut reader) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return Err(RunOpenError {
+                    error,
+                    file: reader.into_inner(),
+                    reservation,
+                });
+            }
+        };
         Ok(Self {
             reader,
             _reservation: reservation,
             descriptor,
+            bytes,
             block_capacity,
             block: Vec::with_capacity(block_capacity),
             block_cursor: 0,
@@ -336,6 +401,28 @@ impl RunReader {
     #[must_use]
     pub(crate) const fn descriptor(&self) -> RunDescriptor {
         self.descriptor
+    }
+
+    /// Returns the sealed run after a sequential pass.
+    ///
+    /// A subsequent reader always rewinds and validates the header again. The
+    /// caller may stop early when its query has enough records.
+    #[must_use]
+    pub(crate) fn into_sealed(self) -> SealedRun {
+        let Self {
+            reader,
+            _reservation: reservation,
+            descriptor,
+            bytes,
+            ..
+        } = self;
+
+        SealedRun {
+            file: Some(reader.into_inner()),
+            reservation: Some(reservation),
+            descriptor,
+            bytes,
+        }
     }
 
     /// Decodes the next record into caller-owned reusable buffers.
@@ -647,7 +734,12 @@ mod tests {
             .append(b"alpha", b"one")
             .expect("record should append");
         let sealed = writer.seal().expect("run should seal");
-        let mut file = sealed.file.try_clone().expect("sealed file should clone");
+        let mut file = sealed
+            .file
+            .as_ref()
+            .expect("sealed run should retain its file")
+            .try_clone()
+            .expect("sealed file should clone");
         file.seek(SeekFrom::Start(
             u64::try_from(HEADER_BYTES + BLOCK_HEADER_BYTES).expect("offset should fit"),
         ))
@@ -670,7 +762,12 @@ mod tests {
             .append(b"alpha", b"one")
             .expect("record should append");
         let sealed = writer.seal().expect("run should seal");
-        let file = sealed.file.try_clone().expect("sealed file should clone");
+        let file = sealed
+            .file
+            .as_ref()
+            .expect("sealed run should retain its file")
+            .try_clone()
+            .expect("sealed file should clone");
         file.set_len(sealed.bytes() - 1)
             .expect("footer should truncate");
         file.sync_data().expect("truncation should flush");

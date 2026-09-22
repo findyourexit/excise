@@ -1,15 +1,15 @@
 use thiserror::Error;
 
 use super::path_key::{PathKeyError, decode_path_key, encode_path_key_into};
-use super::path_reducer::{Coverage, PathEntryKind, PathObservation, SummaryMetrics};
+#[cfg(test)]
+use super::path_reducer::Coverage;
+use super::path_reducer::{PathEntryKind, PathObservation, coverage_code, coverage_from_code};
 use super::run_file::{RunError, RunKind, RunReader, RunWriter};
-use crate::model::ByteBounds;
+use super::summary_metrics::{
+    decode_summary_metrics, encode_summary_metrics_into, summary_metrics_flags,
+};
 
 const PATH_OBSERVATION_VERSION: u8 = 1;
-const ALLOCATED_UPPER_PRESENT: u8 = 1;
-const RECLAIMABLE_UPPER_PRESENT: u8 = 1 << 1;
-const KNOWN_FLAGS: u8 = ALLOCATED_UPPER_PRESENT | RECLAIMABLE_UPPER_PRESENT;
-const FIXED_VALUE_BYTES: usize = 4 + 3 * size_of::<u128>() + size_of::<u64>();
 
 #[derive(Debug, Error)]
 pub(crate) enum PathObservationCodecError {
@@ -44,44 +44,11 @@ pub(crate) fn encode_path_observation_into(
 ) -> Result<(), PathObservationCodecError> {
     encode_path_key_into(&observation.path, key)?;
     value.clear();
-    let optional_bytes = observation
-        .metrics
-        .allocated_bytes
-        .upper
-        .map_or(0, |_| size_of::<u128>())
-        .saturating_add(
-            observation
-                .metrics
-                .reclaimable_bytes
-                .upper
-                .map_or(0, |_| size_of::<u128>()),
-        );
-    value.reserve(
-        FIXED_VALUE_BYTES
-            .saturating_add(optional_bytes)
-            .saturating_sub(value.capacity()),
-    );
-    let mut flags = 0_u8;
-    if observation.metrics.allocated_bytes.upper.is_some() {
-        flags |= ALLOCATED_UPPER_PRESENT;
-    }
-    if observation.metrics.reclaimable_bytes.upper.is_some() {
-        flags |= RECLAIMABLE_UPPER_PRESENT;
-    }
     value.push(PATH_OBSERVATION_VERSION);
     value.push(entry_kind_byte(observation.kind));
-    value.push(coverage_byte(observation.coverage));
-    value.push(flags);
-    push_u128(value, observation.metrics.apparent_bytes);
-    push_u128(value, observation.metrics.allocated_bytes.lower);
-    push_u128(value, observation.metrics.reclaimable_bytes.lower);
-    push_u64(value, observation.metrics.descendants);
-    if let Some(upper) = observation.metrics.allocated_bytes.upper {
-        push_u128(value, upper);
-    }
-    if let Some(upper) = observation.metrics.reclaimable_bytes.upper {
-        push_u128(value, upper);
-    }
+    value.push(coverage_code(observation.coverage));
+    value.push(summary_metrics_flags(observation.metrics));
+    encode_summary_metrics_into(observation.metrics, value);
     Ok(())
 }
 
@@ -101,39 +68,17 @@ pub(crate) fn decode_path_observation(
     let kind =
         entry_kind_from_byte(take_u8(&mut value)?).ok_or(PathObservationCodecError::Malformed)?;
     let coverage =
-        coverage_from_byte(take_u8(&mut value)?).ok_or(PathObservationCodecError::Malformed)?;
+        coverage_from_code(take_u8(&mut value)?).ok_or(PathObservationCodecError::Malformed)?;
     let flags = take_u8(&mut value)?;
-    if flags & !KNOWN_FLAGS != 0 {
-        return Err(PathObservationCodecError::Malformed);
-    }
-    let apparent_bytes = take_u128(&mut value)?;
-    let allocated_lower = take_u128(&mut value)?;
-    let reclaimable_lower = take_u128(&mut value)?;
-    let descendants = take_u64(&mut value)?;
-    let allocated_upper = (flags & ALLOCATED_UPPER_PRESENT != 0)
-        .then(|| take_u128(&mut value))
-        .transpose()?;
-    let reclaimable_upper = (flags & RECLAIMABLE_UPPER_PRESENT != 0)
-        .then(|| take_u128(&mut value))
-        .transpose()?;
+    let metrics = decode_summary_metrics(flags, &mut value)
+        .map_err(|_| PathObservationCodecError::Malformed)?;
     if !value.is_empty() {
         return Err(PathObservationCodecError::Malformed);
     }
     Ok(PathObservation::new(
         decode_path_key(key)?,
         kind,
-        SummaryMetrics {
-            apparent_bytes,
-            allocated_bytes: ByteBounds {
-                lower: allocated_lower,
-                upper: allocated_upper,
-            },
-            reclaimable_bytes: ByteBounds {
-                lower: reclaimable_lower,
-                upper: reclaimable_upper,
-            },
-            descendants,
-        },
+        metrics,
         coverage,
     ))
 }
@@ -195,29 +140,6 @@ const fn entry_kind_from_byte(value: u8) -> Option<PathEntryKind> {
     }
 }
 
-const fn coverage_byte(coverage: Coverage) -> u8 {
-    match coverage {
-        Coverage::Complete => 1,
-        Coverage::Uncertain => 2,
-    }
-}
-
-const fn coverage_from_byte(value: u8) -> Option<Coverage> {
-    match value {
-        1 => Some(Coverage::Complete),
-        2 => Some(Coverage::Uncertain),
-        _ => None,
-    }
-}
-
-fn push_u64(output: &mut Vec<u8>, value: u64) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u128(output: &mut Vec<u8>, value: u128) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
 fn take_u8(input: &mut &[u8]) -> Result<u8, PathObservationCodecError> {
     let (&value, remainder) = input
         .split_first()
@@ -226,30 +148,14 @@ fn take_u8(input: &mut &[u8]) -> Result<u8, PathObservationCodecError> {
     Ok(value)
 }
 
-fn take_u64(input: &mut &[u8]) -> Result<u64, PathObservationCodecError> {
-    Ok(u64::from_le_bytes(take_array(input)?))
-}
-
-fn take_u128(input: &mut &[u8]) -> Result<u128, PathObservationCodecError> {
-    Ok(u128::from_le_bytes(take_array(input)?))
-}
-
-fn take_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], PathObservationCodecError> {
-    if input.len() < N {
-        return Err(PathObservationCodecError::Malformed);
-    }
-    let mut value = [0_u8; N];
-    value.copy_from_slice(&input[..N]);
-    *input = &input[N..];
-    Ok(value)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::model::ByteBounds;
     use crate::scan_coordinator::{RelativePath, ScanGeneration};
+    use crate::scan_store::path_reducer::SummaryMetrics;
     use crate::scan_store::run_file::{RunDescriptor, RunWriter};
     use crate::temporary_storage::TemporaryStorage;
 

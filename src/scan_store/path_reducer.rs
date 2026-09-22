@@ -28,6 +28,23 @@ impl Coverage {
     }
 }
 
+#[must_use]
+pub(crate) const fn coverage_code(coverage: Coverage) -> u8 {
+    match coverage {
+        Coverage::Complete => 1,
+        Coverage::Uncertain => 2,
+    }
+}
+
+#[must_use]
+pub(crate) const fn coverage_from_code(value: u8) -> Option<Coverage> {
+    match value {
+        1 => Some(Coverage::Complete),
+        2 => Some(Coverage::Uncertain),
+        _ => None,
+    }
+}
+
 /// Accounting facts that can be reduced without a mutable presentation tree.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SummaryMetrics {
@@ -149,8 +166,28 @@ impl OpenDirectory {
 /// Returns an error for noncanonical paths or when `emit` rejects a summary.
 pub(crate) fn reduce_sorted_paths(
     observations: impl IntoIterator<Item = PathObservation>,
-    mut emit: impl FnMut(DirectorySummary) -> Result<(), PathReductionError>,
+    emit: impl FnMut(DirectorySummary) -> Result<(), PathReductionError>,
 ) -> Result<(), PathReductionError> {
+    let mut observations = observations.into_iter();
+    reduce_sorted_path_stream::<PathReductionError>(|| Ok(observations.next()), emit)
+}
+
+/// Reduces a fallible observation source without materializing its records.
+///
+/// This is the streaming counterpart of [`reduce_sorted_paths`]. It preserves
+/// the source's typed error instead of collapsing malformed on-disk records
+/// into a reduction error.
+///
+/// # Errors
+///
+/// Returns a source, reduction, or emit error.
+pub(crate) fn reduce_sorted_path_stream<E>(
+    mut next: impl FnMut() -> Result<Option<PathObservation>, E>,
+    mut emit: impl FnMut(DirectorySummary) -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<PathReductionError>,
+{
     let mut directories = vec![OpenDirectory {
         path: RelativePath::root(),
         metrics: SummaryMetrics::default(),
@@ -158,14 +195,14 @@ pub(crate) fn reduce_sorted_paths(
     }];
     let mut previous = None;
 
-    for observation in observations {
+    while let Some(observation) = next()? {
         if observation.path.is_root() {
-            return Err(PathReductionError::RootObservation);
+            return Err(PathReductionError::RootObservation.into());
         }
         if let Some(previous) = previous.as_ref() {
             match observation.path.cmp(previous) {
-                std::cmp::Ordering::Less => return Err(PathReductionError::UnsortedPath),
-                std::cmp::Ordering::Equal => return Err(PathReductionError::DuplicatePath),
+                std::cmp::Ordering::Less => return Err(PathReductionError::UnsortedPath.into()),
+                std::cmp::Ordering::Equal => return Err(PathReductionError::DuplicatePath.into()),
                 std::cmp::Ordering::Greater => {}
             }
         }
@@ -179,11 +216,11 @@ pub(crate) fn reduce_sorted_paths(
         }
         let parent = directories.last().expect("root directory must remain");
         if !observation.path.is_direct_child_of(&parent.path) {
-            return Err(PathReductionError::MissingParent);
+            return Err(PathReductionError::MissingParent.into());
         }
         match observation.kind {
             PathEntryKind::Directory => {
-                directories.push(OpenDirectory::from_observation(observation))
+                directories.push(OpenDirectory::from_observation(observation));
             }
             PathEntryKind::File | PathEntryKind::Link => {
                 directories
@@ -201,10 +238,10 @@ pub(crate) fn reduce_sorted_paths(
     emit(root.into_summary())
 }
 
-fn close_directory(
+fn close_directory<E>(
     directories: &mut Vec<OpenDirectory>,
-    emit: &mut impl FnMut(DirectorySummary) -> Result<(), PathReductionError>,
-) -> Result<(), PathReductionError> {
+    emit: &mut impl FnMut(DirectorySummary) -> Result<(), E>,
+) -> Result<(), E> {
     let directory = directories.pop().expect("root directory must remain");
     let metrics = directory.metrics;
     let coverage = directory.coverage;
