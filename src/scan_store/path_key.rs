@@ -36,17 +36,31 @@ pub(crate) fn encode_path_key_into(
     encoded: &mut Vec<u8>,
 ) -> Result<(), PathKeyError> {
     encoded.clear();
+    append_path_key(path, encoded)
+}
 
+/// Appends one component-delimited canonical path key to an existing record.
+///
+/// # Errors
+///
+/// Returns an error only for a component containing a native NUL code unit.
+pub(crate) fn append_path_key(
+    path: &RelativePath,
+    encoded: &mut Vec<u8>,
+) -> Result<(), PathKeyError> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let capacity = path.components().iter().fold(0_usize, |total, component| {
+        let required = path.components().iter().fold(0_usize, |total, component| {
             total
                 .saturating_add(component.as_bytes().len())
                 .saturating_add(1)
         });
-        encoded.reserve(capacity.saturating_sub(encoded.capacity()));
+        let available = encoded.capacity().saturating_sub(encoded.len());
+        if available < required {
+            encoded.reserve(required.saturating_sub(available));
+        }
         for component in path.components() {
             let component = component.as_bytes();
             if component.contains(&0) {
@@ -55,13 +69,22 @@ pub(crate) fn encode_path_key_into(
             encoded.extend_from_slice(component);
             encoded.push(0);
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt as _;
 
+        let required = path.components().iter().fold(0_usize, |total, component| {
+            total
+                .saturating_add(component.encode_wide().count().saturating_mul(2))
+                .saturating_add(2)
+        });
+        let available = encoded.capacity().saturating_sub(encoded.len());
+        if available < required {
+            encoded.reserve(required.saturating_sub(available));
+        }
         for component in path.components() {
             for unit in component.encode_wide() {
                 if unit == 0 {
@@ -71,11 +94,20 @@ pub(crate) fn encode_path_key_into(
             }
             encoded.extend_from_slice(&0_u16.to_be_bytes());
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(any(unix, windows)))]
     {
+        let required = path.components().iter().fold(0_usize, |total, component| {
+            total
+                .saturating_add(component.as_encoded_bytes().len())
+                .saturating_add(1)
+        });
+        let available = encoded.capacity().saturating_sub(encoded.len());
+        if available < required {
+            encoded.reserve(required.saturating_sub(available));
+        }
         for component in path.components() {
             let Some(component) = component.to_str() else {
                 return Err(PathKeyError::WrongPlatform);
@@ -125,8 +157,8 @@ pub(crate) fn decode_path_key(encoded: &[u8]) -> Result<RelativePath, PathKeyErr
         }
         let mut components = Vec::new();
         let mut component = Vec::new();
-        for bytes in encoded.chunks_exact(2) {
-            let unit = u16::from_be_bytes([bytes[0], bytes[1]]);
+        for &[high, low] in encoded.as_chunks::<2>().0 {
+            let unit = u16::from_be_bytes([high, low]);
             if unit == 0 {
                 if component.is_empty() {
                     return Err(PathKeyError::Malformed);
