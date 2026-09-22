@@ -42,6 +42,8 @@ The identity table counts files with more than one name once within the scan sco
 
 The main loop builds and reviews a complete deletion plan. Large directory plans retain a bounded resident prefix and use authenticated temporary storage outside the selected target for later plan and outcome records before consent. Platform code works relative to the confirmed parent and does not follow links. It validates each decoded plan path as a componentwise descendant of the selected target, checks the file identity, type, size, allocation, and modification state before each deletion, and skips changed entries. Newly observed entries are never added to the consented plan; a plan that cannot retain every identity and outcome is rejected before confirmation.
 
+The [background task system decision](background-tasks.md) defines the bounded deletion-work foundation and the review required before adding other task kinds.
+
 ### Reports
 
 Versioned `scan-report` and `deletion-history` documents use the same stable encoding for file paths. Reports describe the bounded working model and identify uncertainty and summary entries explicitly.

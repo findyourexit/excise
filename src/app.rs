@@ -22,6 +22,9 @@ use crate::report::{
     ReportError, scan_is_uncertain, scan_report_state, write_deletion_history_json,
     write_scan_report_json,
 };
+use crate::state::deletion_work::{
+    DeletionWork, DeletionWorkCommand, DeletionWorkError, DeletionWorkId,
+};
 use crate::state::files::FileTree;
 use crate::state::tiles::{Board, FileType, Pivot};
 use crate::state::{FileToDelete, UiEffects};
@@ -32,6 +35,7 @@ use crate::ui::palette::ColorCycle;
 
 const MIB: usize = 1024 * 1024;
 const MINIMUM_PLAN_BYTES: usize = 4 * 1024;
+const MAX_RETAINED_DELETION_REPORTS: usize = 32;
 
 fn directory_target_was_replaced(path: &Path, expected: &NativeIdentity) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
@@ -115,6 +119,9 @@ where
     file_tree: FileTree,
     display: Display<B>,
     ui_effects: UiEffects,
+    deletion_work: DeletionWork,
+    deletion_modal_work_id: Option<DeletionWorkId>,
+    deletion_plan_cancellation_requested: bool,
     delete_confirmation_disabled: bool,
     deletion_history: Vec<Arc<DeletionReport>>,
     deletion_history_bytes: usize,
@@ -246,7 +253,10 @@ where
             dirty: true,
             deletion_history_bytes: 0,
             deletion_history_limit: process_memory_mib.saturating_mul(MIB) / 8,
-            deletion_history: Vec::new(),
+            deletion_history: Vec::with_capacity(MAX_RETAINED_DELETION_REPORTS),
+            deletion_work: DeletionWork::new(),
+            deletion_modal_work_id: None,
+            deletion_plan_cancellation_requested: false,
             deletion_enter_armed: false,
             deletion_replan: None,
         }
@@ -263,12 +273,13 @@ where
         monochrome: bool,
         reduced_motion: bool,
     ) -> Result<bool, AppError> {
+        self.sync_deletion_work_summary();
         if !self.dirty {
             return Ok(false);
         }
         let full_screen_size = self.display.size()?;
         if full_screen_size.width < 32 || full_screen_size.height < 8 {
-            self.ui_mode = UiMode::ScreenTooSmall;
+            self.replace_ui_mode(UiMode::ScreenTooSmall);
         }
         let selection_before = self.board.currently_selected().is_some();
         self.display.render(
@@ -414,8 +425,7 @@ where
             // The arm is only valid inside PlanningDeletion. Any mode not in the
             // preserved list (e.g. Exiting when q was pressed during planning) has
             // no valid deletion target, so clear it.
-            self.deletion_enter_armed = false;
-            self.ui_mode = UiMode::Normal;
+            self.replace_ui_mode(UiMode::Normal);
             self.render_and_update_board();
         }
         emit_pty_test_marker("SCAN_COMPLETE");
@@ -477,28 +487,46 @@ where
     }
 
     pub fn reset_ui_mode(&mut self) {
-        self.deletion_enter_armed = false;
         if !matches!(self.ui_mode, UiMode::Loading | UiMode::Normal) {
-            self.ui_mode = if self.loaded {
+            self.replace_ui_mode(if self.loaded {
                 UiMode::Normal
             } else {
                 UiMode::Loading
-            };
+            });
             self.mark_dirty();
         }
     }
 
+    fn replace_ui_mode(&mut self, mode: UiMode) {
+        self.cancel_foreground_deletion_modal();
+        self.ui_mode = mode;
+    }
+
+    pub(crate) fn cancel_foreground_deletion_modal(&mut self) {
+        self.deletion_enter_armed = false;
+        let Some(work_id) = self.deletion_modal_work_id.take() else {
+            return;
+        };
+        self.deletion_plan_cancellation_requested |= self.deletion_work.cancel_modal(work_id);
+        self.sync_deletion_work_summary();
+    }
+
+    #[must_use]
+    pub(crate) fn take_deletion_plan_cancellation(&mut self) -> bool {
+        std::mem::take(&mut self.deletion_plan_cancellation_requested)
+    }
+
     pub fn show_warning_modal(&mut self) {
         if self.get_file_to_delete().is_some() {
-            self.ui_mode = UiMode::WarningMessage;
+            self.replace_ui_mode(UiMode::WarningMessage);
             self.mark_dirty();
         }
     }
 
     pub fn prompt_exit(&mut self) {
-        self.ui_mode = UiMode::Exiting {
+        self.replace_ui_mode(UiMode::Exiting {
             save_preferences: self.preferences_dirty,
-        };
+        });
         emit_pty_test_marker("QUIT_PROMPT");
         self.mark_dirty();
     }
@@ -659,7 +687,9 @@ where
             };
         }
         self.deletion_replan = None;
-        self.ui_mode = UiMode::PlanningDeletion(Box::new(file_to_delete.display_copy()));
+        self.replace_ui_mode(UiMode::PlanningDeletion(Box::new(
+            file_to_delete.display_copy(),
+        )));
         self.mark_dirty();
         Some(file_to_delete)
     }
@@ -680,56 +710,189 @@ where
         self.remaining_deletion_history_bytes() / 2
     }
 
-    /// Called when the deletion worker finishes planning. Returns the plan when
-    /// it should be immediately forwarded to the worker for revalidation
-    /// (Enter was pre-armed and the challenge is single-key).
-    #[must_use]
-    pub fn deletion_plan_ready(
+    pub(crate) fn queue_deletion_plan(
         &mut self,
-        target_node_id: crate::model::NodeId,
-        result: Result<Box<DeletionPlan>, String>,
+        target: FileToDelete,
+        reduced_guardrails: bool,
+        maximum_bytes: usize,
+    ) -> bool {
+        if !matches!(self.ui_mode, UiMode::PlanningDeletion(_))
+            || self.deletion_modal_work_id.is_some()
+        {
+            return false;
+        }
+        match self
+            .deletion_work
+            .enqueue_planning(target, reduced_guardrails, maximum_bytes)
+        {
+            Ok(work_id) => {
+                self.deletion_modal_work_id = Some(work_id);
+                self.sync_deletion_work_summary();
+                true
+            }
+            Err(DeletionWorkError::QueueFull) => {
+                self.show_error("Deletion work queue is full; wait for pending work");
+                false
+            }
+            Err(DeletionWorkError::OverlappingTarget) => {
+                self.show_error("Deletion target overlaps pending deletion work");
+                false
+            }
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn next_deletion_work(&mut self) -> Option<DeletionWorkCommand> {
+        let command = self.deletion_work.next_command();
+        self.sync_deletion_work_summary();
+        command
+    }
+
+    pub(crate) fn restore_deletion_work(&mut self, command: DeletionWorkCommand) {
+        self.deletion_work.restore_unsubmitted(command);
+        self.sync_deletion_work_summary();
+    }
+
+    pub(crate) fn confirm_deletion_work(&mut self, plan: DeletionPlan) -> bool {
+        let Some(work_id) = self.deletion_modal_work_id else {
+            return false;
+        };
+        let Some(progress) = self.deletion_progress_counter() else {
+            return false;
+        };
+        if !self
+            .deletion_work
+            .confirm(work_id, Box::new(plan), progress)
+        {
+            self.show_error("Deletion confirmation did not match pending work");
+            return false;
+        }
+        self.deletion_modal_work_id = None;
+        self.sync_deletion_work_summary();
+        true
+    }
+
+    #[must_use]
+    pub(crate) fn deletion_plan_ready(
+        &mut self,
+        work_id: DeletionWorkId,
+        plan: Box<DeletionPlan>,
     ) -> Option<Box<DeletionPlan>> {
-        // Always consume the arm flag; it no longer matters once we leave planning.
-        let enter_armed = std::mem::replace(&mut self.deletion_enter_armed, false);
-        if !matches!(
-            &self.ui_mode,
-            UiMode::PlanningDeletion(current) if current.node_id == target_node_id
-        ) {
+        if !self.deletion_work.planning_succeeded(work_id) {
+            self.deletion_work.discard_cancelled_event(work_id);
+            self.sync_deletion_work_summary();
             return None;
         }
-        match result {
-            Ok(plan) => {
-                // If Enter was pre-armed and the challenge is a single-key type,
-                // skip the confirm dialog and proceed straight to revalidation.
-                if enter_armed
-                    && matches!(
-                        plan.challenge,
-                        ConfirmationChallenge::ConfirmFile | ConfirmationChallenge::ReducedGuard
-                    )
-                {
-                    let planned_entries = plan.planned_entries();
-                    let completed = Arc::new(AtomicU64::new(0));
-                    self.ui_mode = UiMode::Deleting {
-                        planned_entries,
-                        completed,
-                        stopping: false,
-                    };
-                    self.ui_effects.deletion_in_progress = true;
-                    self.mark_dirty();
-                    return Some(plan);
-                }
-                self.ui_mode = UiMode::DeleteConfirm {
-                    plan: Some(plan),
-                    input: String::new(),
-                };
-                self.mark_dirty();
-                None
+        let target_node_id = match &self.ui_mode {
+            UiMode::PlanningDeletion(target) if self.deletion_modal_work_id == Some(work_id) => {
+                target.node_id
             }
-            Err(error) => {
-                self.ui_mode = UiMode::ErrorMessage(error);
-                self.mark_dirty();
-                None
+            _ => {
+                self.cancel_foreground_deletion_modal();
+                return None;
             }
+        };
+        if plan.target.node_id != target_node_id {
+            self.show_error("Deletion planning returned an unexpected target");
+            return None;
+        }
+        let enter_armed = std::mem::replace(&mut self.deletion_enter_armed, false);
+        if enter_armed
+            && matches!(
+                plan.challenge,
+                ConfirmationChallenge::ConfirmFile | ConfirmationChallenge::ReducedGuard
+            )
+        {
+            let planned_entries = plan.planned_entries();
+            let completed = Arc::new(AtomicU64::new(0));
+            self.ui_mode = UiMode::Deleting {
+                planned_entries,
+                completed,
+                stopping: false,
+            };
+            self.ui_effects.deletion_in_progress = true;
+            self.mark_dirty();
+            return Some(plan);
+        }
+        // This advances the same foreground work; retain its id through confirmation.
+        self.ui_mode = UiMode::DeleteConfirm {
+            plan: Some(plan),
+            input: String::new(),
+        };
+        self.mark_dirty();
+        None
+    }
+
+    #[must_use]
+    pub(crate) fn deletion_plan_failed(
+        &mut self,
+        work_id: DeletionWorkId,
+    ) -> Option<crate::model::NodeId> {
+        if !self.deletion_work.planning_failed(work_id) {
+            self.deletion_work.discard_cancelled_event(work_id);
+            self.sync_deletion_work_summary();
+            return None;
+        }
+        let target_node_id = match &self.ui_mode {
+            UiMode::PlanningDeletion(target) if self.deletion_modal_work_id == Some(work_id) => {
+                Some(target.node_id)
+            }
+            _ => None,
+        };
+        if self.deletion_modal_work_id == Some(work_id) {
+            self.deletion_modal_work_id = None;
+        }
+        self.sync_deletion_work_summary();
+        target_node_id
+    }
+
+    pub(crate) fn deletion_revalidation_succeeded(
+        &mut self,
+        work_id: DeletionWorkId,
+        plan: Box<DeletionPlan>,
+    ) -> bool {
+        let succeeded = self.deletion_work.revalidation_succeeded(work_id, plan);
+        if !succeeded {
+            self.deletion_work.discard_cancelled_event(work_id);
+        }
+        self.sync_deletion_work_summary();
+        succeeded
+    }
+
+    pub(crate) fn deletion_revalidation_failed(&mut self, work_id: DeletionWorkId) -> bool {
+        let failed = self.deletion_work.revalidation_failed(work_id);
+        if !failed {
+            self.deletion_work.discard_cancelled_event(work_id);
+        }
+        self.sync_deletion_work_summary();
+        failed
+    }
+
+    pub(crate) fn deletion_execution_finished(&mut self, work_id: DeletionWorkId) -> bool {
+        let finished = self.deletion_work.execution_finished(work_id);
+        if !finished {
+            self.deletion_work.discard_cancelled_event(work_id);
+        }
+        self.sync_deletion_work_summary();
+        finished
+    }
+
+    #[must_use]
+    pub fn deletion_work_summary(&self) -> crate::state::DeletionWorkSummary {
+        self.deletion_work.summary()
+    }
+
+    pub fn cancel_pending_deletion_work(&mut self) {
+        self.cancel_foreground_deletion_modal();
+        self.deletion_work.cancel_pending();
+        self.sync_deletion_work_summary();
+    }
+
+    fn sync_deletion_work_summary(&mut self) {
+        let summary = self.deletion_work_summary();
+        if self.ui_effects.deletion_work != summary {
+            self.ui_effects.deletion_work = summary;
+            self.mark_dirty();
         }
     }
 
@@ -793,10 +956,10 @@ where
         } = self.ui_mode
         {
             let completed = Arc::clone(completed);
-            self.ui_mode = UiMode::DeletionCancel {
+            self.replace_ui_mode(UiMode::DeletionCancel {
                 planned_entries,
                 completed,
-            };
+            });
             self.mark_dirty();
         }
     }
@@ -885,7 +1048,7 @@ where
                 }
             };
         }
-        self.ui_mode = UiMode::PlanningDeletion(Box::new(target.display_copy()));
+        self.replace_ui_mode(UiMode::PlanningDeletion(Box::new(target.display_copy())));
         self.mark_dirty();
         Some(DeletionReplanResult::Ready(Box::new(target)))
     }
@@ -905,7 +1068,7 @@ where
         self.ui_effects.deletion_in_progress = false;
         // Return to Loading; the initial scan is still running and the user
         // should see that, not a stale planning overlay.
-        self.ui_mode = UiMode::Loading;
+        self.replace_ui_mode(UiMode::Loading);
         self.mark_dirty();
     }
 
@@ -925,18 +1088,18 @@ where
         self.deletion_replan = Some(target);
         self.deletion_enter_armed = false;
         self.ui_effects.deletion_in_progress = false;
-        self.ui_mode = UiMode::Loading;
+        self.replace_ui_mode(UiMode::Loading);
         self.mark_dirty();
     }
 
     pub(crate) fn complete_missing_deletion(&mut self) {
         self.deletion_enter_armed = false;
         self.ui_effects.deletion_in_progress = false;
-        self.ui_mode = if self.loaded {
+        self.replace_ui_mode(if self.loaded {
             UiMode::Normal
         } else {
             UiMode::Loading
-        };
+        });
         self.render_and_update_board();
     }
 
@@ -947,11 +1110,11 @@ where
         } = self.ui_mode
         {
             let completed = Arc::clone(completed);
-            self.ui_mode = UiMode::Deleting {
+            self.replace_ui_mode(UiMode::Deleting {
                 planned_entries,
                 completed,
                 stopping,
-            };
+            });
             self.mark_dirty();
         }
     }
@@ -965,18 +1128,22 @@ where
         self.ui_effects.deletion_in_progress = false;
         let deleted = report.deleted_entries() > 0;
         if let Err(error) = self.file_tree.try_apply_deletion_report(&report) {
-            self.ui_mode = UiMode::ErrorMessage(format!("Deletion accounting failed: {error}"));
+            self.replace_ui_mode(UiMode::ErrorMessage(format!(
+                "Deletion accounting failed: {error}"
+            )));
             self.mark_dirty();
             return Err(model_error(error));
         }
         let report = Arc::new(report);
-        if report.estimated_bytes <= self.remaining_deletion_history_bytes() {
+        if self.deletion_history.len() < MAX_RETAINED_DELETION_REPORTS
+            && report.estimated_bytes <= self.remaining_deletion_history_bytes()
+        {
             self.deletion_history_bytes = self
                 .deletion_history_bytes
                 .saturating_add(report.estimated_bytes);
             self.deletion_history.push(report.clone());
         }
-        self.ui_mode = UiMode::DeletionResult { report };
+        self.replace_ui_mode(UiMode::DeletionResult { report });
         self.board.reset_selected_index();
         self.render_and_update_board();
         Ok(deleted)
@@ -995,7 +1162,7 @@ where
     }
 
     pub fn open_help(&mut self) {
-        self.ui_mode = UiMode::Help;
+        self.replace_ui_mode(UiMode::Help);
         self.mark_dirty();
     }
 
@@ -1028,7 +1195,7 @@ where
     }
 
     pub fn show_notice(&mut self, message: impl Into<String>) {
-        self.ui_mode = UiMode::Notice(message.into());
+        self.replace_ui_mode(UiMode::Notice(message.into()));
         self.mark_dirty();
     }
 
@@ -1115,21 +1282,19 @@ where
     }
 
     pub fn show_error(&mut self, message: impl Into<String>) {
-        self.deletion_enter_armed = false;
         self.ui_effects.deletion_in_progress = false;
-        self.ui_mode = UiMode::ErrorMessage(message.into());
+        self.replace_ui_mode(UiMode::ErrorMessage(message.into()));
         self.mark_dirty();
     }
 
     pub fn normal_mode(&mut self) {
         self.deletion_replan = None;
-        self.deletion_enter_armed = false;
         self.ui_effects.deletion_in_progress = false;
-        self.ui_mode = if self.loaded {
+        self.replace_ui_mode(if self.loaded {
             UiMode::Normal
         } else {
             UiMode::Loading
-        };
+        });
         self.render_and_update_board();
     }
 
@@ -1138,14 +1303,14 @@ where
         self.file_tree
             .begin_rescan(target.clone(), filter)
             .map_err(model_error)?;
-        self.ui_mode = UiMode::Rescanning { target };
+        self.replace_ui_mode(UiMode::Rescanning { target });
         self.render_and_update_board();
         Ok(())
     }
 
     pub fn finish_rescan(&mut self) -> Result<(), AppError> {
         self.file_tree.finish_rescan().map_err(model_error)?;
-        self.ui_mode = UiMode::Normal;
+        self.replace_ui_mode(UiMode::Normal);
         self.render_and_update_board();
         Ok(())
     }
@@ -1154,7 +1319,7 @@ where
         self.file_tree.cancel_rescan().map_err(model_error)?;
         self.deletion_replan = None;
         self.deletion_enter_armed = false;
-        self.ui_mode = UiMode::Normal;
+        self.replace_ui_mode(UiMode::Normal);
         self.render_and_update_board();
         Ok(())
     }
@@ -1164,7 +1329,7 @@ where
             .file_tree
             .filter()
             .map_or_else(String::new, |filter| filter.raw().to_string());
-        self.ui_mode = UiMode::FilterInput { input, error: None };
+        self.replace_ui_mode(UiMode::FilterInput { input, error: None });
         self.mark_dirty();
     }
     pub fn push_filter_character(&mut self, character: char) {
@@ -1189,9 +1354,13 @@ where
     }
 
     pub fn apply_filter(&mut self) {
+        if !matches!(self.ui_mode, UiMode::FilterInput { .. }) {
+            self.replace_ui_mode(UiMode::Normal);
+            return;
+        }
         let mode = std::mem::replace(&mut self.ui_mode, UiMode::Normal);
         let UiMode::FilterInput { input, .. } = mode else {
-            return;
+            unreachable!("filter mode must remain active after its guard")
         };
         if input.is_empty() {
             self.file_tree.set_filter(None);
@@ -1205,10 +1374,10 @@ where
                 self.render_and_update_board();
             }
             Err(error) => {
-                self.ui_mode = UiMode::FilterInput {
+                self.replace_ui_mode(UiMode::FilterInput {
                     input,
                     error: Some(error.to_string()),
-                };
+                });
                 self.mark_dirty();
             }
         }
@@ -1774,6 +1943,62 @@ mod tests {
             estimated_bytes,
         }
     }
+    #[cfg(unix)]
+    fn file_plan(root: &std::path::Path) -> DeletionPlan {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::time::UNIX_EPOCH;
+
+        let path = root.join("target");
+        std::fs::write(&path, b"original").expect("target should be written");
+        let metadata = std::fs::symlink_metadata(&path).expect("target metadata should exist");
+        let identity = identity_for(&path, &metadata)
+            .expect("target identity should be readable")
+            .expect("target should not be a symbolic link");
+        let snapshot = PlannedSnapshot {
+            identity: identity.clone(),
+            kind: PlannedKind::File,
+            apparent_bytes: u128::from(metadata.len()),
+            allocated_bytes: Some(u128::from(metadata.blocks()).saturating_mul(512)),
+            modified_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+        };
+        let target = FileToDelete {
+            node_id: crate::model::NodeId(1),
+            synthetic: false,
+            path_in_filesystem: root.to_path_buf(),
+            path_to_file: vec![std::ffi::OsString::from("target")],
+            file_type: FileType::File,
+            num_descendants: None,
+            size: snapshot.apparent_bytes,
+            expected_snapshot: crate::model::EntrySnapshot {
+                identity: Some(identity),
+                kind: crate::model::NodeKind::File,
+                apparent_bytes: snapshot.apparent_bytes,
+                allocated_bytes: snapshot.allocated_bytes,
+                modified_nanos: snapshot.modified_nanos,
+            },
+            reviewed_entries: vec![ReviewedEntry {
+                relative_path: PathBuf::from("target"),
+                snapshot,
+            }],
+        };
+        build_plan(root, target, false).expect("deletion plan should build")
+    }
+
+    #[cfg(unix)]
+    fn stage_deletion_confirmation<B: Backend>(app: &mut App<B>, plan: DeletionPlan) {
+        let target = plan.target.clone();
+        app.replace_ui_mode(UiMode::PlanningDeletion(Box::new(target.display_copy())));
+        assert!(app.queue_deletion_plan(target, false, 1024));
+        let Some(DeletionWorkCommand::Plan { work_id, .. }) = app.next_deletion_work() else {
+            panic!("queued deletion should start planning");
+        };
+        assert!(app.deletion_plan_ready(work_id, Box::new(plan)).is_none());
+        assert!(app.deletion_challenge().is_some());
+    }
 
     #[test]
     fn deletion_history_never_exceeds_its_budget_and_export_can_reclaim_it() {
@@ -1803,51 +2028,38 @@ mod tests {
         assert!(app.deletion_history.is_empty());
         assert_eq!(app.remaining_deletion_history_bytes(), limit);
     }
+
+    #[test]
+    fn deletion_history_count_bounds_zero_byte_reports() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+
+        for _ in 0..=MAX_RETAINED_DELETION_REPORTS {
+            assert!(!app.complete_deletion(report(0)));
+        }
+
+        assert_eq!(app.deletion_history.len(), MAX_RETAINED_DELETION_REPORTS);
+        assert_eq!(
+            app.remaining_deletion_history_bytes(),
+            app.deletion_history_limit
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn confirmed_plan_is_deferred_to_worker_revalidation() {
-        use std::os::unix::fs::MetadataExt as _;
-        use std::time::UNIX_EPOCH;
-
         let root = tempfile::tempdir().expect("app root should exist");
         let path = root.path().join("target");
-        std::fs::write(&path, b"original").expect("target should be written");
-        let metadata = std::fs::symlink_metadata(&path).expect("target metadata should exist");
-        let identity = identity_for(&path, &metadata)
-            .expect("target identity should be readable")
-            .expect("target should not be a symbolic link");
-        let snapshot = PlannedSnapshot {
-            identity: identity.clone(),
-            kind: PlannedKind::File,
-            apparent_bytes: u128::from(metadata.len()),
-            allocated_bytes: Some(u128::from(metadata.blocks()).saturating_mul(512)),
-            modified_nanos: metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos()),
-        };
-        let target = FileToDelete {
-            node_id: crate::model::NodeId(1),
-            synthetic: false,
-            path_in_filesystem: root.path().to_path_buf(),
-            path_to_file: vec![std::ffi::OsString::from("target")],
-            file_type: FileType::File,
-            num_descendants: None,
-            size: snapshot.apparent_bytes,
-            expected_snapshot: crate::model::EntrySnapshot {
-                identity: Some(identity),
-                kind: crate::model::NodeKind::File,
-                apparent_bytes: snapshot.apparent_bytes,
-                allocated_bytes: snapshot.allocated_bytes,
-                modified_nanos: snapshot.modified_nanos,
-            },
-            reviewed_entries: vec![ReviewedEntry {
-                relative_path: PathBuf::from("target"),
-                snapshot,
-            }],
-        };
-        let plan = build_plan(root.path(), target, false).expect("deletion plan should build");
+        let plan = file_plan(root.path());
         let mut app = App::new(
             TestBackend::new(80, 24),
             root.path().to_path_buf(),
@@ -1871,5 +2083,60 @@ mod tests {
         assert_eq!(confirmed.planned_entries(), 1);
         assert!(matches!(app.ui_mode, UiMode::Deleting { .. }));
         assert!(app.take_deletion_replan().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resize_and_too_small_transitions_cancel_confirmation_before_retry() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let terminal_events = Arc::new(Mutex::new(Vec::new()));
+        let draw_events = Arc::new(Mutex::new(Vec::new()));
+        let terminal_width = Arc::new(Mutex::new(80));
+        let terminal_height = Arc::new(Mutex::new(24));
+        let backend = ResizableTestBackend::new(
+            terminal_events,
+            draw_events,
+            Arc::clone(&terminal_width),
+            Arc::clone(&terminal_height),
+        );
+        let mut app = App::new(
+            backend,
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.loaded = true;
+
+        stage_deletion_confirmation(&mut app, file_plan(root.path()));
+        app.reset_ui_mode();
+        assert!(matches!(&app.ui_mode, UiMode::Normal));
+        assert!(!app.deletion_work_summary().has_work());
+
+        stage_deletion_confirmation(&mut app, file_plan(root.path()));
+        *terminal_width
+            .lock()
+            .expect("terminal width should be writable") = 31;
+        *terminal_height
+            .lock()
+            .expect("terminal height should be writable") = 8;
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        draw(&mut app, &mut animation, 0);
+        assert!(matches!(&app.ui_mode, UiMode::ScreenTooSmall));
+        assert!(!app.deletion_work_summary().has_work());
+
+        *terminal_width
+            .lock()
+            .expect("terminal width should be writable") = 80;
+        *terminal_height
+            .lock()
+            .expect("terminal height should be writable") = 24;
+        app.reset_ui_mode();
+        stage_deletion_confirmation(&mut app, file_plan(root.path()));
+        assert_eq!(app.deletion_work_summary().pending_operations, 1);
     }
 }

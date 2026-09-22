@@ -52,6 +52,25 @@ fn metric_value_range(line: &str, marker: &str) -> Option<std::ops::Range<usize>
     Some(value_start..value_end)
 }
 
+/// Locates the progress value rendered by a live deletion worker.
+///
+/// The worker may advance between two terminal frames on any platform, so a
+/// snapshot must retain the progress sentence without pinning a race-dependent
+/// count.
+fn deletion_progress_range(line: &str) -> Option<std::ops::Range<usize>> {
+    const SUFFIX: &str = " items processed.";
+
+    let end = line.find(SUFFIX)?.saturating_add(SUFFIX.len());
+    let start = line[..end].rfind('▏')?.saturating_add('▏'.len_utf8());
+    let range = start..end;
+    let progress = line.get(range.clone())?;
+    let (completed, total_and_suffix) = progress.split_once(" of ")?;
+    let (total, _) = total_and_suffix.split_once(SUFFIX)?;
+    (completed.bytes().all(|byte| byte.is_ascii_digit())
+        && total.bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some(range)
+}
+
 const CANONICAL_IDENTITY: &str = "Inode { device_id: ########, inode_number: ######## }";
 const IDENTITY_VARIANTS: [&str; 3] = ["Inode", "LowRes", "HighRes"];
 const IDENTITY_CELL_MARKERS: [&str; 3] = ["identity  ", "identity ", "Item check: "];
@@ -283,6 +302,7 @@ fn normalize_snapshot(frame: &str) -> String {
             metric_value_range(&line, "Can reclaim "),
             metric_value_range(&line, "Used "),
             metric_value_range(&line, "Reclaim "),
+            deletion_progress_range(&line),
         ];
         let mut in_identity_or_links_number = false;
         for (index, character) in line.char_indices() {
