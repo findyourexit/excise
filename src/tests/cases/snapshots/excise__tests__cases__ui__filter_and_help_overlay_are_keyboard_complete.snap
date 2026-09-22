@@ -3,7 +3,7 @@ source: src/tests/cases/ui.rs
 expression: normalized
 ---
  EXCISE  /tmp/excise_tests/filter_and_help_overlay  ◆ COMPLETE                                      
- allocated ##.#K   reclaim ##.#K   apparent 12.0K   2 entries                                       
+ Space used ##.#K · Can reclaim ##.#K · Content size 12.0K · 2 items                                
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
 ▟▐ STORAGE MAP ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏██████████████████████████████████████████████████████████████████████████████████████████████████▕
@@ -21,14 +21,14 @@ expression: normalized
 ▏██████████████████████████████████████████████████████████████████████████████████████████████████▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
                                                                                                     
-▟▐ INSPECT ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▟▐ SELECTED ITEM ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏file2                                                                                             ▕
 ▏◆ COMPLETE · file                                                                                 ▕
-▏allocated #.#K · reclaim #.#K                                                                     ▕
-▏apparent 8.0K · entries 0                                                                         ▕
-▏identity  Inode { device_id: ########, inode_number: ######## }                                   ▕
-▏links     # · scope     materialized                                                              ▕
-▏Enter open · Backspace permanent delete                                                           ▕
+▏Enter open · Backspace delete                                                                     ▕
+▏Can reclaim #.#K · Space used #.#K                                                                ▕
+▏Content size 8.0K · 0 items                                                                       ▕
+▏Item check: Inode { device_id: ########, inode_number: ######## }                                 ▕
+▏Scan result: included                                                                             ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
  arrows/hjkl move  Enter open/rescan  / filter  e export  t theme  Backspace delete  ? help         
 Excise · REDUCED MOTION

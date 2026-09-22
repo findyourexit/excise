@@ -3,32 +3,32 @@ source: src/tests/cases/ui.rs
 expression: normalized
 ---
  EXCISE  /tmp/excise_tests/filter_and_help_overlay  ◆ COMPLETE                                      
- allocated ##.#K   reclaim ##.#K   apparent 12.0K   2 entries                                       
+ Space used ##.#K · Can reclaim ##.#K · Content size 12.0K · 2 items                                
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
 ▟▐ STORAGE MAP ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏██████████████████████████████████████████████████████████████████████████████████████████████████▕
-▏███████████▟▐ EXCISE COMMANDS ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜███████████▕
-▏███████████▏Explore                                                                   ▕███████████▕
-▏███████████▏  arrows                 move focus                                       ▕███████████▕
-▏███████████▏  h/j/k/l                Vim preset movement                              ▕███████████▕
-▏███████████▏  Enter                  open or focused rescan                           ▕███████████▕
-▏███████████▏  Esc                    parent / cancel                                  ▕███████████▕
+▏███████████▟▐ HELP ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜███████████▕
+▏███████████▏Navigate                                                                  ▕███████████▕
+▏███████████▏  arrows                 move selection                                   ▕███████████▕
+▏███████████▏  h/j/k/l                Vim movement                                     ▕███████████▕
+▏███████████▏  Enter                  open / rescan                                    ▕███████████▕
+▏███████████▏  Esc                    back / cancel                                    ▕███████████▕
 ▏███████████▏  +  -  0                zoom in / out / reset                            ▕███████████▕
-▏███████████▏  /                      exact or glob filter                             ▕███████████▕
-▏███████████▏  e                      export scan report                               ▕███████████▕
-▏███████████▏  t                      cycle themes                                     ▕███████████▕
+▏███████████▏  /                      filter items                                     ▕███████████▕
+▏███████████▏  e                      export report                                    ▕███████████▕
+▏███████████▏  t                      change theme                                     ▕███████████▕
 ▏███████████▏                                                                          ▕███████████▕
-▏███████████▏Safety                                                                    ▕███████████▕
+▏███████████▏Delete safely                                                             ▕███████████▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▏  Backspace              plan permanent deletion                          ▕▔▔▔▔▔▔▔▔▔▔▔▔
-            ▏  q / Ctrl-c             quit or interruption options                     ▕            
-▟▐ INSPECT ▌▏  synthetic aggregates   never directly deletable                         ▕▔▔▔▔▔▔▔▔▔▔▔▜
-▏file2      ▏  new/changed entries    skipped by identity plan                         ▕           ▕
+            ▏  q / Ctrl-c             quit / interruption options                      ▕            
+▟▐ SELECTED ▏  summary items          cannot be deleted                                ▕▔▔▔▔▔▔▔▔▔▔▔▜
+▏file2      ▏  new/changed items      skipped before deletion                          ▕           ▕
 ▏◆ COMPLETE ▏[Esc/?/q] close help                                                      ▕           ▕
-▏allocated #▏                                                                          ▕           ▕
-▏apparent 8.▏                                                                          ▕           ▕
-▏identity  …▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔           ▕
-▏links     # · scope     materialized                                                              ▕
-▏Actions unavailable                                                                               ▕
+▏Actions una▏                                                                          ▕           ▕
+▏Can reclaim▏                                                                          ▕           ▕
+▏Content siz▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔           ▕
+▏Item check: Inode { device_id: ########, inode_number: ######## }                                 ▕
+▏Scan result: included                                                                             ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
  arrows/hjkl move  Enter open/rescan  / filter  e export  t theme  Backspace delete  ? help         
 Excise · REDUCED MOTION

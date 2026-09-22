@@ -970,13 +970,7 @@ impl DeletionEntries {
         DeletionEntriesIter { inner }
     }
 
-    pub(crate) fn as_slice(&self) -> Option<&[DeletionEntryResult]> {
-        match &self.storage {
-            DeletionEntriesStorage::InMemory(entries) => Some(entries),
-            DeletionEntriesStorage::Spilled(_) => None,
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn is_spilled(&self) -> bool {
         matches!(self.storage, DeletionEntriesStorage::Spilled(_))
     }
@@ -1252,6 +1246,12 @@ impl DeletionReport {
     #[must_use]
     pub fn reporting_error(&self) -> Option<&str> {
         self.entries.reporting_error()
+    }
+
+    /// Returns whether an outcome path remains a validated descendant of this report's target.
+    #[must_use]
+    pub(crate) fn contains_entry_path(&self, path: &Path) -> bool {
+        validate_entry_for_target(path, &self.root_relative_path).is_ok()
     }
 }
 
@@ -2717,7 +2717,7 @@ fn matches_for_execution(expected: &PlannedSnapshot, actual: &PlannedSnapshot) -
                 && expected.modified_nanos == actual.modified_nanos))
 }
 
-fn same_object(expected: &NativeIdentity, actual: &NativeIdentity) -> bool {
+pub(crate) fn same_object(expected: &NativeIdentity, actual: &NativeIdentity) -> bool {
     expected.file_id == actual.file_id && expected.reparse_point == actual.reparse_point
 }
 
@@ -2942,6 +2942,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use super::*;
+    use crate::state::files::FileTree;
     use crate::state::tiles::FileType;
 
     fn reviewed_snapshot(path: &Path, metadata: &std::fs::Metadata) -> PlannedSnapshot {
@@ -3036,6 +3037,26 @@ mod tests {
             },
             reviewed_entries,
         }
+    }
+
+    fn add_tree_entry(tree: &mut FileTree, path: &Path) {
+        let metadata =
+            std::fs::symlink_metadata(path).expect("fixture metadata should be readable");
+        let identity = crate::native_path::identity_for(path, &metadata)
+            .expect("fixture identity lookup should succeed")
+            .expect("fixture identity should be readable");
+        tree.add_entry(&metadata, path, identity)
+            .expect("fixture entry should be retained");
+    }
+
+    fn tree_node_id(tree: &FileTree, path: &Path) -> NodeId {
+        tree.nodes()
+            .find_map(|node| {
+                tree.path_for_id(node.id)
+                    .is_some_and(|node_path| node_path == path)
+                    .then_some(node.id)
+            })
+            .expect("fixture node should be retained")
     }
 
     #[test]
@@ -3528,6 +3549,173 @@ mod tests {
         assert!(temporary_storage.used() > 0);
         drop(report);
         assert_eq!(temporary_storage.used(), 0);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn complete_spilled_report_reconciles_paths_and_hard_link_accounting() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        let inside = directory.join("inside");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&directory).expect("target directory should exist");
+        std::fs::write(&inside, b"payload").expect("target entry should exist");
+        std::fs::hard_link(&inside, &outside).expect("surviving hard link should exist");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        for path in [&directory, &inside, &outside] {
+            add_tree_entry(&mut tree, path);
+        }
+        for path in [&directory, root.path()] {
+            tree.complete_directory(path, None)
+                .expect("fixture directory should complete");
+        }
+        tree.finalize().expect("fixture tree should finalize");
+        let directory_id = tree_node_id(&tree, &directory);
+        let outside_id = tree_node_id(&tree, &outside);
+
+        let mut deletion_target = target(root.path(), OsString::from("target"), FileType::Folder);
+        deletion_target.reviewed_entries.clear();
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            deletion_target,
+            false,
+            &AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("directory plan should spill");
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        assert!(report.entries.is_spilled());
+        assert!(report.reporting_complete());
+        let freed = report.deleted_apparent_bytes();
+
+        tree.try_apply_deletion_report(&report)
+            .expect("spilled outcomes should reconcile");
+
+        assert!(tree.path_for_id(directory_id).is_none());
+        assert_eq!(tree.total_node().state, crate::model::NodeState::Complete);
+        assert_eq!(tree.space_freed, freed);
+        assert_eq!(
+            tree.node(outside_id)
+                .and_then(|node| node.snapshot.identity.as_ref())
+                .and_then(|identity| identity.link_count),
+            Some(1),
+            "the surviving hard link must be refreshed after streamed reconciliation"
+        );
+    }
+
+    #[test]
+    fn incomplete_spilled_report_reconciles_known_outcomes_and_marks_uncertainty() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        let deleted = directory.join("deleted");
+        let missing = directory.join("missing");
+        let unresolved = directory.join("unresolved");
+        std::fs::create_dir(&directory).expect("target directory should exist");
+        for path in [&deleted, &missing, &unresolved] {
+            std::fs::write(path, b"payload").expect("fixture entry should exist");
+        }
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        for path in [&directory, &deleted, &missing, &unresolved] {
+            add_tree_entry(&mut tree, path);
+        }
+        for path in [&directory, root.path()] {
+            tree.complete_directory(path, None)
+                .expect("fixture directory should complete");
+        }
+        tree.finalize().expect("fixture tree should finalize");
+        let directory_id = tree_node_id(&tree, &directory);
+        let deleted_id = tree_node_id(&tree, &deleted);
+        let missing_id = tree_node_id(&tree, &missing);
+        let unresolved_id = tree_node_id(&tree, &unresolved);
+        let known = vec![
+            DeletionEntryResult {
+                entry: PlannedEntry {
+                    relative_path: PathBuf::from("target/deleted"),
+                    snapshot: reviewed_snapshot(
+                        &deleted,
+                        &std::fs::symlink_metadata(&deleted)
+                            .expect("deleted metadata should be readable"),
+                    ),
+                },
+                outcome: DeletionEntryOutcome::Deleted,
+            },
+            DeletionEntryResult {
+                entry: PlannedEntry {
+                    relative_path: PathBuf::from("target/missing"),
+                    snapshot: reviewed_snapshot(
+                        &missing,
+                        &std::fs::symlink_metadata(&missing)
+                            .expect("missing metadata should be readable"),
+                    ),
+                },
+                outcome: DeletionEntryOutcome::Missing,
+            },
+        ];
+        std::fs::remove_file(&deleted).expect("known deleted path should be removed");
+        std::fs::remove_file(&missing).expect("known missing path should be removed");
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let mut spill = RecordSpill::new(
+            &temporary_storage,
+            MAX_RESULT_SPILL_RECORD_BYTES,
+            root.path(),
+        )
+        .expect("result spill should open");
+        for result in &known {
+            spill
+                .push(&encode_spilled_result(result).expect("result should encode"))
+                .expect("result should spill");
+        }
+        let entries = DeletionEntries::spilled(
+            PathBuf::from("target"),
+            spill,
+            DeletionSummary::from_entries(&known),
+            false,
+            Some("fixture result storage is incomplete".to_string()),
+        );
+        assert!(entries.is_spilled());
+        let report = DeletionReport {
+            target_node_id: directory_id,
+            root_relative_path: PathBuf::from("target"),
+            scan_root: root.path().to_path_buf(),
+            entries,
+            soft_cancelled: false,
+            precise: false,
+            estimated_bytes: 0,
+        };
+        let freed = report.deleted_apparent_bytes();
+
+        tree.try_apply_deletion_report(&report)
+            .expect("known spilled outcomes should reconcile");
+
+        assert!(tree.path_for_id(deleted_id).is_none());
+        assert!(tree.path_for_id(missing_id).is_none());
+        assert_eq!(tree.path_for_id(unresolved_id), Some(unresolved));
+        assert_eq!(
+            tree.node_state(directory_id),
+            Some(crate::model::NodeState::Uncertain)
+        );
+        assert_eq!(tree.total_node().state, crate::model::NodeState::Uncertain);
+        assert_eq!(tree.total_node().metrics.allocated_bytes.upper, None);
+        assert_eq!(tree.space_freed, freed);
     }
 
     #[test]

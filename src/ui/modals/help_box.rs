@@ -227,7 +227,6 @@ mod tests {
         assert!(rendered.contains("cannot be deleted"));
         assert!(rendered.contains("skipped before deletion"));
         assert!(rendered.contains("[Esc/?/q] close help"));
-
     }
     #[test]
     fn narrow_help_keeps_compact_safety_text_unclipped() {
@@ -256,7 +255,8 @@ mod tests {
         }
 
         let rendered = rendered_help_in(Rect::new(0, 0, 59, 20), KeyPreset::Vim, None);
-        assert!(rendered.contains("q / Ctrl-c             quit or interruption options"));
+        assert!(rendered.contains("q / Ctrl-c"));
+        assert!(rendered.contains("quit / interruption options"));
     }
 
     #[test]

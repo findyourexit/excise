@@ -235,7 +235,10 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
                     ));
                 }
                 ConfirmationChallenge::TypePhrase(expected) => {
-                    content.push(Line::from(format!("Type this exactly: {}", display_text(expected))));
+                    content.push(Line::from(format!(
+                        "Type this exactly: {}",
+                        display_text(expected)
+                    )));
                     content.push(Line::from(format!("> {}_", display_text(input))));
                     content.push(Line::styled(
                         format!("[Enter] delete when exact {separator} [Esc/q] cancel"),
@@ -338,7 +341,6 @@ fn append_safety_labels(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,7 +397,13 @@ mod tests {
 
     #[test]
     fn deletion_stop_dialog_distinguishes_precise_and_immediate_choices() {
-        let text = text(&lines(DeletionView::Cancel { planned_entries: 12 }, 78, false));
+        let text = text(&lines(
+            DeletionView::Cancel {
+                planned_entries: 12,
+            },
+            78,
+            false,
+        ));
         assert!(text.contains("12 items in this deletion."));
         assert!(text.contains("[s] stop after current item; results stay precise"));
         assert!(text.contains("[h/Ctrl-C] stop now; final state may be unknown"));

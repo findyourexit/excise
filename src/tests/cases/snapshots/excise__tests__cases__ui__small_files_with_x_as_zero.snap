@@ -3,7 +3,7 @@ source: src/tests/cases/ui.rs
 expression: normalized
 ---
  EXCISE  /tmp/ex[...]_as_zero  ◆ COMPLETE         
- allocated #.#M   reclaim #.#M   apparent 2.4M   1
+ Used #.#M · Reclaim #.#M                         
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
 ▟▐ LIST ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏▌  file1                      1.0M   41.9%      ▕
@@ -41,14 +41,14 @@ expression: normalized
 ▏   small_file37               4.0K    0.2%      ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
                                                   
-▟▐ INSPECT ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▟▐ SELECTED ITEM ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏file1                                           ▕
 ▏◆ COMPLETE · file                               ▕
-▏allocated #.#M                                  ▕
-▏reclaim   #.#M                                  ▕
-▏apparent 1.0M · entries 0                       ▕
-▏identity  Inode { device_id: ########, inode_nu…▕
-▏links     # · scope     materialized            ▕
+▏Enter open · Backspace delete                   ▕
+▏Can reclaim #.#M                                ▕
+▏Space used #.#M                                 ▕
+▏Content size 1.0M · 0 items                     ▕
+▏Scan result: included                           ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
  arrows/hjkl move  Enter open/rescan  ? help      
 68 more entries below · use arrows to scroll

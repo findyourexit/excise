@@ -1,4 +1,4 @@
-# Deterministic current-main hero demo for the README. It writes assets/demo-main.gif.
+# Deterministic hero demo for the README. It writes assets/demo-main.gif.
 #
 # The fixture and its explicit terminal interface configuration are created in guarded
 # temporary paths. Excise is pointed only at the generated fixture and the
@@ -16,7 +16,7 @@
 # recording is never resampled. Fixture sizes span a decade so the map's colour
 # band is legible in the first frame.
 
-Output assets/demo-main.gif
+Output assets/demo-main.rendered.gif
 
 Require vhs
 Require ttyd
@@ -78,12 +78,12 @@ Type "0"
 Wait+Screen /media\//
 Sleep 900ms
 Right@350ms 1
-Wait+Screen /apparent 3\.2M · entries 1/
+Wait+Screen /Content size 3\.2M · 1 item/
 Sleep 1.1s
 
 # Surface the contextual command help before the final hidden exit.
 Type "?"
-Wait+Screen /EXCISE COMMANDS/
+Wait+Screen /HELP/
 Sleep 1.1s
 Type "?"
 Sleep 600ms

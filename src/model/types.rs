@@ -106,6 +106,21 @@ impl NodeKind {
     pub const fn is_synthetic(self) -> bool {
         matches!(self, Self::Synthetic(_))
     }
+    /// Returns whether this node is a concrete directory that was compacted only
+    /// to satisfy the model memory budget.
+    #[must_use]
+    pub const fn is_memory_compacted_directory(self) -> bool {
+        matches!(self, Self::Synthetic(SyntheticKind::Aggregate))
+    }
+
+    /// Returns whether this synthetic node is only a virtual accounting summary.
+    #[must_use]
+    pub const fn is_virtual_summary(self) -> bool {
+        matches!(
+            self,
+            Self::Synthetic(SyntheticKind::Other | SyntheticKind::Shared)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -182,7 +197,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::sync::Arc;
 
-    use super::{EntrySnapshot, Node, NodeId, NodeKind, NodeMetrics, NodeState};
+    use super::{EntrySnapshot, Node, NodeId, NodeKind, NodeMetrics, NodeState, SyntheticKind};
 
     #[test]
     fn node_literal_does_not_require_arena_accounting() {
@@ -206,5 +221,20 @@ mod tests {
         };
 
         assert_eq!(node.id, NodeId(7));
+    }
+
+    #[test]
+    fn compacted_directories_remain_distinct_from_virtual_summaries() {
+        let aggregate = NodeKind::Synthetic(SyntheticKind::Aggregate);
+        assert!(aggregate.is_synthetic());
+        assert!(aggregate.is_memory_compacted_directory());
+        assert!(!aggregate.is_virtual_summary());
+
+        for summary in [SyntheticKind::Other, SyntheticKind::Shared] {
+            let summary = NodeKind::Synthetic(summary);
+            assert!(summary.is_synthetic());
+            assert!(!summary.is_memory_compacted_directory());
+            assert!(summary.is_virtual_summary());
+        }
     }
 }
