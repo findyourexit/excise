@@ -3331,7 +3331,7 @@ fn filter_and_help_overlay_are_keyboard_complete() {
     assert!(
         terminal_draw_events
             .iter()
-            .any(|frame| frame.contains("preview themes")),
+            .any(|frame| frame.contains("preview and save themes")),
         "help must describe the theme picker rather than a cycle"
     );
     assert!(
@@ -3343,7 +3343,7 @@ fn filter_and_help_overlay_are_keyboard_complete() {
 }
 
 #[test]
-fn theme_picker_commit_requires_explicit_save_or_discard_on_exit() {
+fn theme_picker_commit_saves_without_an_exit_preference_prompt() {
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(100, 30);
     let keyboard_events = Box::new(TerminalEvents::new(vec![
         None,
@@ -3355,18 +3355,52 @@ fn theme_picker_commit_requires_explicit_save_or_discard_on_exit() {
         None,
         Some(key!(ctrl 'c')),
         None,
-        Some(key!(char 'd')),
+        Some(key!(char 'y')),
     ]));
-    let temp_dir_path =
-        create_root_temp_dir("theme_save_prompt").expect("failed to create temp dir");
+    let temp_dir_path = create_root_temp_dir("theme_auto_save").expect("failed to create temp dir");
     create_temp_file(temp_dir_path.path().join("file"), 4096).expect("fixture should be created");
-
-    start(
+    let root_metadata = std::fs::symlink_metadata(temp_dir_path.path())
+        .expect("theme test root metadata should be readable");
+    let root_identity = crate::native_path::identity_for(temp_dir_path.path(), &root_metadata)
+        .expect("theme test root identity should be readable")
+        .expect("theme test root should not be a symbolic link");
+    let preference_directory = tempfile::tempdir().expect("preference directory should exist");
+    let preference_path = preference_directory.path().join("config.toml");
+    crate::runtime::run(
         backend,
         keyboard_events,
-        temp_dir_path.path().to_path_buf(),
-        SHOW_APPARENT_SIZE,
-        DELETE_CONFIRMATION_ENABLED,
+        crate::runtime::RuntimeSettings {
+            root: temp_dir_path.path().to_path_buf(),
+            root_identity,
+            scan_threads: 1,
+            event_capacity: 256,
+            cross_filesystems: false,
+            exclusions: Vec::new(),
+            memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+            temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+            apparent_size: SHOW_APPARENT_SIZE,
+            disable_delete_confirmation: DELETE_CONFIRMATION_ENABLED,
+            reduced_motion: true,
+            monochrome: true,
+            animate_loading: false,
+            theme: crate::theme::ThemeId::ExciseDark,
+            ascii: false,
+            mouse: false,
+            keymap: crate::config::KeyPreset::Vim,
+            custom_keys: None,
+            config_path: Some(preference_path.clone()),
+            monochrome_locked: true,
+        },
+        Box::new(crate::runtime::VirtualClock::new()),
+    )
+    .expect("theme selection should save and exit normally");
+    let saved = std::fs::read_to_string(&preference_path)
+        .expect("selected theme preference should be saved before exit");
+    let saved_config = crate::config::parse_file_config(&saved)
+        .expect("saved theme preference should remain valid configuration");
+    assert_eq!(
+        saved_config.runtime.theme,
+        Some(crate::theme::ThemeId::ExciseLight)
     );
     let terminal_draw_events = terminal_draw_events
         .lock()
@@ -3386,8 +3420,14 @@ fn theme_picker_commit_requires_explicit_save_or_discard_on_exit() {
     assert!(
         terminal_draw_events
             .iter()
-            .any(|frame| frame.contains("Safe UI preferences changed this session.")),
-        "Enter must mark a changed preview for the ordinary exit choice"
+            .any(|frame| frame.contains("Quit Excise?")),
+        "theme selection must return to the ordinary quit dialog"
+    );
+    assert!(
+        !terminal_draw_events
+            .iter()
+            .any(|frame| frame.contains("Save interface preferences before quitting?")),
+        "theme selection must not add an exit preference prompt"
     );
 }
 

@@ -261,11 +261,16 @@ impl SessionDirectory {
                     .map_err(identity_error)?;
                 #[cfg(not(windows))]
                 fs::remove_file(&database).map_err(identity_error)?;
-                Ok(())
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(identity_error(error)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(identity_error(error)),
         }
+        let mut reservation = self
+            .database_reservation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reservation.shrink_to(0);
+        Ok(())
     }
 }
 
@@ -314,11 +319,14 @@ impl IdentityStore {
         node: Option<NodeId>,
         allocation_node: Option<NodeId>,
     ) -> Result<(bool, IdentityRecord), ModelError> {
-        if self.capacity_exhausted {
+        if self.disable_if_capacity_exhausted()? {
             return Ok((false, IdentityRecord::unavailable()));
         }
         let result = (|| -> Result<(bool, IdentityRecord), ModelError> {
             let existing = self.get(file_id)?;
+            if self.capacity_exhausted {
+                return Ok((false, IdentityRecord::unavailable()));
+            }
             let is_new = existing.is_none();
             let mut record = existing.unwrap_or(IdentityRecord {
                 observed_links: 0,
@@ -358,11 +366,11 @@ impl IdentityStore {
         }
     }
 
-    pub fn get(&self, file_id: &FileId) -> Result<Option<IdentityRecord>, ModelError> {
-        if self.capacity_exhausted {
+    pub fn get(&mut self, file_id: &FileId) -> Result<Option<IdentityRecord>, ModelError> {
+        if self.disable_if_capacity_exhausted()? {
             return Ok(None);
         }
-        match &self.storage {
+        let result = match &self.storage {
             Storage::Memory(records) => Ok(records.get(file_id).cloned()),
             Storage::Migrating {
                 records,
@@ -379,7 +387,8 @@ impl IdentityStore {
             Storage::Disk {
                 database, pending, ..
             } => read_identity_record(database, pending, file_id),
-        }
+        };
+        Ok(self.recover_capacity(result)?.flatten())
     }
 
     #[must_use]
@@ -393,6 +402,13 @@ impl IdentityStore {
     #[must_use]
     pub(crate) const fn capacity_exhausted(&self) -> bool {
         self.capacity_exhausted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signal_database_capacity_exhaustion_for_test(&self) {
+        self.session
+            .database_capacity_exhausted
+            .store(true, Ordering::Release);
     }
 
     #[must_use]
@@ -464,18 +480,19 @@ impl IdentityStore {
         &mut self,
         mut visitor: impl FnMut(FileId, IdentityRecord) -> Result<(), ModelError>,
     ) -> Result<(), ModelError> {
-        if self.capacity_exhausted {
+        if self.disable_if_capacity_exhausted()? {
             return Ok(());
         }
         let flush = self.flush_pending();
         if self.recover_capacity(flush)?.is_none() {
             return Ok(());
         }
-        match &self.storage {
+        let result = match &self.storage {
             Storage::Memory(records) => {
                 for (file_id, record) in records {
                     visitor(*file_id, record.clone())?;
                 }
+                Ok(())
             }
             Storage::Migrating {
                 records, database, ..
@@ -483,10 +500,11 @@ impl IdentityStore {
                 for (file_id, record) in records {
                     visitor(*file_id, record.clone())?;
                 }
-                visit_disk_records(database, &mut visitor)?;
+                visit_disk_records(database, &mut visitor)
             }
-            Storage::Disk { database, .. } => visit_disk_records(database, &mut visitor)?,
-        }
+            Storage::Disk { database, .. } => visit_disk_records(database, &mut visitor),
+        };
+        let _ = self.recover_capacity(result)?;
         Ok(())
     }
 
@@ -495,11 +513,14 @@ impl IdentityStore {
         file_id: &FileId,
         record: &IdentityRecord,
     ) -> Result<Option<IdentityRecord>, ModelError> {
-        if self.capacity_exhausted {
+        if self.disable_if_capacity_exhausted()? {
             return Ok(None);
         }
         let result = (|| -> Result<Option<IdentityRecord>, ModelError> {
             let existing = self.get(file_id)?;
+            if self.capacity_exhausted {
+                return Ok(None);
+            }
             if matches!(self.storage, Storage::Memory(_)) {
                 let value = serde_json::to_vec(record).map_err(identity_error)?;
                 let previous = existing.as_ref().map_or(0, |current| {
@@ -544,16 +565,6 @@ impl IdentityStore {
         self.upsert_record(file_id, &record).map(|_| ())
     }
 
-    /// Repoints one identity's participants using a caller-sorted removal set.
-    pub(crate) fn remap_nodes_for_identity(
-        &mut self,
-        file_id: &FileId,
-        removed: &[NodeId],
-        replacement: NodeId,
-    ) -> Result<(), ModelError> {
-        self.remap_nodes_for_identities(std::slice::from_ref(file_id), removed, replacement)
-    }
-
     /// Repoints a known subset of identities using one bounded database pass per batch.
     ///
     /// The caller supplies a sorted removal set. Records represented by an
@@ -565,7 +576,7 @@ impl IdentityStore {
         removed: &[NodeId],
         replacement: NodeId,
     ) -> Result<(), ModelError> {
-        if self.capacity_exhausted || file_ids.is_empty() || removed.is_empty() {
+        if self.disable_if_capacity_exhausted()? || file_ids.is_empty() || removed.is_empty() {
             return Ok(());
         }
         let result = match &mut self.storage {
@@ -618,7 +629,7 @@ impl IdentityStore {
         removed: &mut [NodeId],
         replacement: NodeId,
     ) -> Result<(), ModelError> {
-        if self.capacity_exhausted || removed.is_empty() {
+        if self.disable_if_capacity_exhausted()? || removed.is_empty() {
             return Ok(());
         }
 
@@ -682,7 +693,7 @@ impl IdentityStore {
     /// A spill begins at the memory boundary, so eagerly rewriting every old
     /// record would freeze the owner loop precisely when the scan is busiest.
     pub(crate) fn advance_migration(&mut self, maximum_records: usize) -> Result<bool, ModelError> {
-        if self.capacity_exhausted || maximum_records == 0 {
+        if self.disable_if_capacity_exhausted()? || maximum_records == 0 {
             return Ok(false);
         }
         let result = (|| -> Result<bool, ModelError> {
@@ -779,17 +790,31 @@ impl IdentityStore {
         self.session.remove_database()
     }
 
+    /// Releases the private database as soon as its bounded backend signals a
+    /// capacity breach. The signal can precede the redb error that exposes it.
+    fn disable_if_capacity_exhausted(&mut self) -> Result<bool, ModelError> {
+        if !self.capacity_exhausted && self.session.database_capacity_exhausted() {
+            self.disable_for_capacity()?;
+        }
+        Ok(self.capacity_exhausted)
+    }
+
     fn recover_capacity<T>(
         &mut self,
         result: Result<T, ModelError>,
     ) -> Result<Option<T>, ModelError> {
+        if self.disable_if_capacity_exhausted()? {
+            return Ok(None);
+        }
         match result {
             Ok(value) => Ok(Some(value)),
-            Err(_) if self.session.database_capacity_exhausted() => {
-                self.disable_for_capacity()?;
-                Ok(None)
+            Err(error) => {
+                if self.disable_if_capacity_exhausted()? {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -1572,6 +1597,50 @@ mod tests {
         assert_eq!(temporary_storage.used(), 0);
         assert!(!spill_path.exists());
     }
+
+    #[test]
+    fn signalled_spill_capacity_is_recovered_before_identity_reads() {
+        const TEMPORARY_STORAGE_LIMIT: u64 = 2 * 1024 * 1024;
+
+        let temporary_storage = TemporaryStorage::with_limit_bytes(TEMPORARY_STORAGE_LIMIT);
+        let spill_path = {
+            let mut store = IdentityStore::new_with_temporary_storage(1, &temporary_storage)
+                .expect("private session should initialize");
+            let file_id = FileId::new_inode(13, 1);
+            store
+                .observe(&file_id, Some(1), ByteBounds::exact(4096), None, None)
+                .expect("identity should spill");
+            assert!(store.is_spilled());
+            let path = store
+                .spill_path()
+                .expect("spilled identity should expose its private session")
+                .to_path_buf();
+
+            store.signal_database_capacity_exhaustion_for_test();
+            let mut visited = false;
+            store
+                .visit_records(|_, _| {
+                    visited = true;
+                    Ok(())
+                })
+                .expect("a signalled capacity limit must not escape through iteration");
+            assert!(!visited, "an exhausted store must not visit stale records");
+
+            assert!(
+                store
+                    .get(&file_id)
+                    .expect("a signalled capacity limit must not escape through lookup")
+                    .is_none()
+            );
+            assert!(store.capacity_exhausted());
+            assert!(!store.is_spilled());
+            assert!(!path.join(IDENTITY_DATABASE_FILE).exists());
+            assert!(temporary_storage.used() <= MAX_MARKER_BYTES);
+            path
+        };
+        assert_eq!(temporary_storage.used(), 0);
+        assert!(!spill_path.exists());
+    }
     #[test]
     fn conflicting_declared_link_counts_are_unknown() {
         let file_id = FileId::new_inode(2, 2);
@@ -1784,7 +1853,7 @@ mod tests {
         assert!(store.is_spilled());
 
         store
-            .remap_nodes_for_identity(&file_id, &[NodeId(4)], NodeId(9))
+            .remap_nodes_for_identities(std::slice::from_ref(&file_id), &[NodeId(4)], NodeId(9))
             .expect("spilled participant should be remapped");
 
         let Storage::Disk { pending, .. } = &store.storage else {
@@ -1844,7 +1913,7 @@ mod tests {
         }
 
         store
-            .remap_nodes_for_identity(&file_id, &[NodeId(4)], NodeId(9))
+            .remap_nodes_for_identities(std::slice::from_ref(&file_id), &[NodeId(4)], NodeId(9))
             .expect("keyed remap should succeed");
         let Storage::Disk { pending, .. } = &store.storage else {
             panic!("identity should spill");

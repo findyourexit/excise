@@ -8,12 +8,16 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ### Changed
 
-* Replaced the cyclic theme toggle with a keyboard preview picker. `Enter` keeps the selected session theme, while `Esc` restores the prior theme; normal safe-preference saving remains unchanged.
+* Replaced the cyclic theme toggle with a keyboard preview picker. `Enter` immediately persists the selected theme for later TUI sessions, while `Esc` restores the prior theme.
 * Moved deletion planning, refresh, queueing, progress, and results into a bounded background work rail. Accepted confirmation returns to the map, and a backed summarized folder is freshly materialized before it can re-enter the ordinary review flow.
 * Made pending and active deletion exit choices explicit, restored a valid map selection after reconciliation, and clarified virtual-summary and scan-state guidance.
 * Added frame-only modal attention chrome on capable terminals while keeping reduced-motion, ASCII, monochrome, and high-contrast output static.
 
 * Changed storage-map colour scaling from per-folder relative rank to fixed absolute size landmarks: blue through red from 4 KiB to 64 GiB, using the selected allocated-space or apparent-size measure.
+
+### Fixed
+
+* Scans no longer terminate when a spilled identity database reaches its temporary-storage limit during later identity reads. Excise releases the private cache and finishes with explicit uncertain allocation and reclaimability bounds.
 
 ## [1.2.4] - 2026-09-12
 

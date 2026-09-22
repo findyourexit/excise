@@ -7,8 +7,8 @@ use crate::theme::{Theme, ThemeId};
 use crate::ui::pane::{ModalChrome, readable_text_on, render_modal};
 
 /// A keyboard-only list of built-in themes. Selection previews immediately;
-/// committing and restoring are owned by the runtime so persistent preferences
-/// change only after an explicit Enter.
+/// committing persists the selected theme immediately, while restoring leaves
+/// the saved preference untouched.
 pub struct ThemePicker {
     selected: ThemeId,
     theme: Theme,
@@ -59,19 +59,19 @@ impl Widget for ThemePicker {
         buffer.set_stringn(
             inner.x,
             inner.y,
-            "Preview applies immediately",
+            "Preview applies immediately; Enter saves",
             usize::from(inner.width),
             Style::default().fg(text),
         );
         let instruction_y = inner.bottom().saturating_sub(1);
         let instruction = if inner.width >= 50 {
-            "[Up/Down/j/k] preview  [Enter] keep  [Esc] restore"
+            "[Up/Down/j/k] preview  [Enter] save  [Esc] restore"
         } else if inner.width >= 46 {
-            "[Up/Down] preview  [Enter] keep  [Esc] restore"
+            "[Up/Down] preview  [Enter] save  [Esc] restore"
         } else if self.ascii {
-            "[Up/Dn] Enter keep Esc undo"
+            "[Up/Dn] Enter save Esc undo"
         } else {
-            "[↑↓] Enter keep Esc undo"
+            "[↑↓] Enter save Esc undo"
         };
         buffer.set_stringn(
             inner.x,
@@ -145,12 +145,13 @@ mod tests {
 
         let text = buffer.content.iter().map(Cell::symbol).collect::<String>();
         assert!(text.contains("Tokyo Night"));
+        assert!(text.contains("save"));
         assert!(text.contains("restore"));
         assert!(text.contains("THEME PREVIEW"));
     }
 
     #[test]
-    fn narrow_ascii_picker_keeps_commit_and_restore_actions_visible() {
+    fn narrow_ascii_picker_keeps_save_and_restore_actions_visible() {
         let area = Rect::new(0, 0, 32, 8);
         let mut buffer = Buffer::empty(area);
         ThemePicker::new(
@@ -162,6 +163,6 @@ mod tests {
         .render(area, &mut buffer);
 
         let text = buffer.content.iter().map(Cell::symbol).collect::<String>();
-        assert!(text.contains("[Up/Dn] Enter keep Esc undo"));
+        assert!(text.contains("[Up/Dn] Enter save Esc undo"));
     }
 }

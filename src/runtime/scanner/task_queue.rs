@@ -391,8 +391,9 @@ mod tests {
     }
     #[test]
     fn visible_spill_task_is_promoted_by_worker_without_owner_spill_io() {
-        let root = PathBuf::from("/scan-root");
         const SPILLED_TASKS: usize = 256;
+
+        let root = PathBuf::from("/scan-root");
         let visible = root.join("visible");
         let control = Arc::new(ScannerControl::new());
         let (queue, _) = TaskQueue::new(

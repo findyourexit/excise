@@ -79,8 +79,6 @@ pub(crate) enum InputCommand {
     PromptExit,
     CancelPendingWorkAndExit,
     StopDeletionAndExit,
-    SavePreferencesAndExit,
-    DiscardPreferencesAndExit,
 }
 
 macro_rules! key {
@@ -445,19 +443,7 @@ fn handle_keypress_exiting_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> In
         key!(char 's') if matches!(app.exit_work(), Some(ExitWork::Active { .. })) => {
             InputCommand::StopDeletionAndExit
         }
-        key!(char 's')
-            if app.preferences_dirty() && matches!(app.exit_work(), Some(ExitWork::None)) =>
-        {
-            InputCommand::SavePreferencesAndExit
-        }
-        key!(char 'd')
-            if app.preferences_dirty() && matches!(app.exit_work(), Some(ExitWork::None)) =>
-        {
-            InputCommand::DiscardPreferencesAndExit
-        }
-        key!(char 'y')
-            if !app.preferences_dirty() && matches!(app.exit_work(), Some(ExitWork::None)) =>
-        {
+        key!(char 'y') if matches!(app.exit_work(), Some(ExitWork::None)) => {
             app.exit();
             InputCommand::None
         }
@@ -522,15 +508,14 @@ mod tests {
     }
 
     #[test]
-    fn small_screen_exit_still_uses_the_safe_exit_prompt() {
+    fn small_screen_exit_without_work_is_immediate() {
         let (_root, mut app) = app();
         app.ui_mode = UiMode::ScreenTooSmall;
-        app.preferences_changed();
 
         let command = handle_keypress(&key(KeyCode::Char('q'), KeyModifiers::NONE), &mut app);
 
-        assert!(matches!(command, InputCommand::PromptExit));
-        assert!(app.is_running);
+        assert!(matches!(command, InputCommand::None));
+        assert!(!app.is_running);
     }
 
     #[test]
@@ -540,7 +525,6 @@ mod tests {
 
         let (_root, mut app) = app();
         app.ui_mode = UiMode::Exiting {
-            save_preferences: false,
             work: ExitWork::Active {
                 planned_entries: 1,
                 completed: Arc::new(AtomicU64::new(0)),

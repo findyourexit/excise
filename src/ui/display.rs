@@ -289,13 +289,9 @@ where
                             full_screen,
                         );
                     }
-                    UiMode::Exiting {
-                        save_preferences,
-                        work,
-                        ..
-                    } => {
+                    UiMode::Exiting { work, .. } => {
                         frame.render_widget(
-                            ConfirmBox::with_chrome(*save_preferences, work, theme, ascii, chrome),
+                            ConfirmBox::with_chrome(work, theme, ascii, chrome),
                             full_screen,
                         );
                     }

@@ -11,7 +11,6 @@ use crate::theme::Theme;
 use crate::ui::pane::{ModalChrome, readable_text_on, render_modal};
 
 pub struct ConfirmBox<'a> {
-    save_preferences: bool,
     work: &'a ExitWork,
     theme: Theme,
     ascii: bool,
@@ -20,14 +19,12 @@ pub struct ConfirmBox<'a> {
 
 impl<'a> ConfirmBox<'a> {
     pub(crate) const fn with_chrome(
-        save_preferences: bool,
         work: &'a ExitWork,
         theme: Theme,
         ascii: bool,
         chrome: ModalChrome,
     ) -> Self {
         Self {
-            save_preferences,
             work,
             theme,
             ascii,
@@ -42,7 +39,6 @@ impl Widget for ConfirmBox<'_> {
         let height = match self.work {
             ExitWork::Active { .. } | ExitWork::Stopping { .. } => 11,
             ExitWork::Pending { .. } | ExitWork::Cancelling { .. } => 9,
-            ExitWork::None if self.save_preferences => 10,
             ExitWork::None => 8,
         }
         .min(area.height);
@@ -61,29 +57,15 @@ impl Widget for ConfirmBox<'_> {
             self.ascii,
             self.chrome,
         );
-        Paragraph::new(exit_lines(self.save_preferences, self.work))
+        Paragraph::new(exit_lines(self.work))
             .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
             .alignment(Alignment::Center)
             .render(inner, buffer);
     }
 }
 
-fn exit_lines(save_preferences: bool, work: &ExitWork) -> Vec<Line<'static>> {
+fn exit_lines(work: &ExitWork) -> Vec<Line<'static>> {
     match work {
-        ExitWork::None if save_preferences => vec![
-            Line::from("Safe UI preferences changed this session."),
-            Line::from("Save interface preferences before quitting?"),
-            Line::from(""),
-            Line::styled(
-                "[s] Save and quit",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::styled(
-                "[d] Quit without saving",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::from("[Esc/q/n] Keep working"),
-        ],
         ExitWork::None => vec![
             Line::from("Quit Excise?"),
             Line::from(""),
@@ -157,14 +139,11 @@ mod tests {
 
     #[test]
     fn active_exit_requires_an_explicit_safe_stop_or_wait() {
-        let lines = exit_lines(
-            false,
-            &ExitWork::Active {
-                planned_entries: 12,
-                completed: Arc::new(AtomicU64::new(7)),
-                pending: 2,
-            },
-        );
+        let lines = exit_lines(&ExitWork::Active {
+            planned_entries: 12,
+            completed: Arc::new(AtomicU64::new(7)),
+            pending: 2,
+        });
         let rendered = text(&lines);
         assert!(rendered.contains("7 of 12 items processed."));
         assert!(rendered.contains("The active removal cannot be detached."));
@@ -174,7 +153,7 @@ mod tests {
 
     #[test]
     fn pending_exit_can_cancel_without_claiming_mutation_started() {
-        let rendered = text(&exit_lines(false, &ExitWork::Pending { count: 3 }));
+        let rendered = text(&exit_lines(&ExitWork::Pending { count: 3 }));
         assert!(rendered.contains("3 deletion check(s) are waiting."));
         assert!(rendered.contains("No filesystem mutation has started."));
         assert!(rendered.contains("[c] Cancel checks and quit"));

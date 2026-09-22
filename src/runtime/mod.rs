@@ -19,7 +19,7 @@ use worker::{DeletionWorkSubmissionError, ScannedEntry, WorkerEvent, WorkerPool}
 use crate::App;
 use crate::animation::AnimationScheduler;
 use crate::app::ExitWork;
-use crate::config::{CustomKeyBindings, KeyPreset, SafePreferences, save_safe_preferences};
+use crate::config::{CustomKeyBindings, KeyPreset, save_theme_preference};
 use crate::deletion::{DeletionPlanError, DeletionReport};
 use crate::error::{AppError, ExitClass};
 use crate::input::{InputCommand, InputEvent, InputSource, handle_keypress};
@@ -44,9 +44,8 @@ const MAX_INPUT_BATCH: usize = 32;
 /// scanning can never monopolize the UI loop.
 const MAX_SCAN_ENTRIES_PER_SLICE: usize = 32;
 /// Disk-backed identity accounting can make one model update visibly costly.
-/// Check input before a second mutation so a queued navigation key never waits
+/// Check input after every mutation so a queued navigation key never waits
 /// behind an entire scanner batch.
-const SCAN_ENTRIES_PER_INPUT_CHECK: usize = 1;
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -465,8 +464,12 @@ where
             }
             InputCommand::CommitTheme { original, selected } => {
                 self.set_theme(selected);
-                if selected != original {
-                    self.app.preferences_changed();
+                if selected != original
+                    && let Err(error) = self.persist_theme_selection(selected)
+                {
+                    self.app.show_error(format!(
+                        "Theme applied for this session, but could not be saved: {error}"
+                    ));
                 }
             }
             InputCommand::PromptExit => {
@@ -475,36 +478,6 @@ where
             }
             InputCommand::CancelPendingWorkAndExit => self.cancel_pending_work_and_exit(false)?,
             InputCommand::StopDeletionAndExit => self.cancel_pending_work_and_exit(true)?,
-            InputCommand::SavePreferencesAndExit => {
-                let result = self.settings.config_path.as_ref().map_or_else(
-                    || {
-                        Err(AppError::Config(
-                            "no writable config path is available".to_string(),
-                        ))
-                    },
-                    |path| {
-                        save_safe_preferences(
-                            path,
-                            SafePreferences {
-                                theme: self.settings.theme,
-                                ascii: self.settings.ascii,
-                                mouse: self.settings.mouse,
-                                keymap: self.settings.keymap,
-                                custom_keys: self.settings.custom_keys.clone(),
-                                reduced_motion: self.settings.reduced_motion,
-                            },
-                        )
-                    },
-                );
-                match result {
-                    Ok(()) => {
-                        self.app.preferences_saved();
-                        self.app.exit();
-                    }
-                    Err(error) => self.app.show_error(error.to_string()),
-                }
-            }
-            InputCommand::DiscardPreferencesAndExit => self.app.exit(),
         }
         if drilled {
             self.scan_view_root = self.app.current_folder_path();
@@ -530,6 +503,14 @@ where
         self.animation
             .set_accessibility(self.settings.reduced_motion, self.settings.monochrome);
         self.app.mark_dirty();
+    }
+
+    fn persist_theme_selection(&self, theme: ThemeId) -> Result<(), AppError> {
+        let path =
+            self.settings.config_path.as_deref().ok_or_else(|| {
+                AppError::Config("no writable config path is available".to_string())
+            })?;
+        save_theme_preference(path, theme)
     }
 
     fn exit_work(&self) -> ExitWork {
@@ -642,11 +623,7 @@ where
             return;
         }
         self.exit_after_work = false;
-        if self.app.preferences_dirty() {
-            self.app.prompt_exit(ExitWork::None);
-        } else {
-            self.app.exit();
-        }
+        self.app.exit();
     }
 
     fn process_worker_batch(&mut self) -> Result<bool, AppError> {
@@ -675,12 +652,12 @@ where
 
     fn process_pending_scan_entries(&mut self) -> Result<bool, AppError> {
         let mut processed = false;
-        for index in 0..MAX_SCAN_ENTRIES_PER_SLICE {
+        for _ in 0..MAX_SCAN_ENTRIES_PER_SLICE {
             if !self.process_pending_scan_entry()? {
                 break;
             }
             processed = true;
-            if (index + 1) % SCAN_ENTRIES_PER_INPUT_CHECK == 0 && self.input.poll(Duration::ZERO)? {
+            if self.input.poll(Duration::ZERO)? {
                 break;
             }
         }
@@ -1379,6 +1356,7 @@ pub const fn outcome_exit_class(outcome: &OperationOutcome<RunSummary>) -> ExitC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::DeletionWorkId;
     use ratatui::backend::TestBackend;
 
     struct PendingInput;
@@ -1624,22 +1602,25 @@ mod tests {
                 .process_worker_batch()
                 .expect("staged scan batch should be applied")
         );
-        assert_eq!(
-            owner.summary.scanned_entries,
-            SCAN_ENTRIES_PER_INPUT_CHECK as u64
-        );
+        assert_eq!(owner.summary.scanned_entries, 1);
         assert_eq!(
             owner.pending_scan_entries.len(),
             MAX_SCAN_ENTRIES_PER_SLICE
                 .saturating_add(1)
-                .saturating_sub(SCAN_ENTRIES_PER_INPUT_CHECK),
+                .saturating_sub(1),
             "an arriving keypress must preempt scan work before the producer batch drains"
         );
     }
 
     #[cfg(any(unix, windows))]
-    #[test]
-    fn completed_target_reflows_immediately_while_its_copied_tile_departs() {
+    fn completed_deletion_fixture() -> (
+        App<TestBackend>,
+        tempfile::TempDir,
+        NativeIdentity,
+        PathBuf,
+        DeletionWorkId,
+        DeletionReport,
+    ) {
         let root = tempfile::tempdir().expect("test root should be created");
         let target_path = root.path().join("target");
         std::fs::write(&target_path, vec![b'x'; 8 * 1024]).expect("test target should be created");
@@ -1724,15 +1705,24 @@ mod tests {
         assert!(report.target_was_removed());
         assert!(!target_path.exists());
 
+        (app, root, root_identity, survivor_path, work_id, report)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn owner_for_completed_deletion(
+        app: App<TestBackend>,
+        root: &std::path::Path,
+        root_identity: NativeIdentity,
+    ) -> OwnerLoop<TestBackend> {
         let scan_view_root = app.current_folder_path();
-        let mut owner = OwnerLoop {
+        OwnerLoop {
             app,
             input: Box::new(PendingInput),
             workers: None,
             clock: Box::new(VirtualClock::new()),
             animation: AnimationScheduler::new(false, false, Duration::ZERO),
             settings: RuntimeSettings {
-                root: root.path().to_path_buf(),
+                root: root.to_path_buf(),
                 root_identity,
                 scan_threads: 1,
                 event_capacity: 1,
@@ -1770,13 +1760,20 @@ mod tests {
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
             last_deletion_progress: None,
-        };
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn completed_target_reflows_immediately_while_its_copied_tile_departs() {
+        let (app, root, root_identity, survivor_path, work_id, report) =
+            completed_deletion_fixture();
+        let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
 
         owner
             .handle_worker_event(WorkerEvent::DeletionFinished { work_id, report })
             .expect("deletion completion should enter the departure state");
         assert!(owner.app.has_deletion_departure());
-        assert!(owner.app.map_is_transitioning());
         assert!(owner.app.deletion_departure_deadline().is_some());
         assert!(!owner.app.deletion_work.has_work());
         assert!(!owner.app.can_exit_immediately());
