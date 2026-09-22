@@ -420,50 +420,26 @@ const fn shows_modal(ui_mode: &UiMode) -> bool {
     )
 }
 
-const COMPACT_INSPECTOR_HEIGHT: u16 = 9;
+const INSPECTOR_HEIGHT: u16 = 9;
 const MINIMUM_WORKSPACE_HEIGHT: u16 = 5;
-/// Inner columns the treemap needs before the board falls back to a list.
-const MINIMUM_MAP_WIDTH: u16 = 72;
-const MINIMUM_INSPECTOR_WIDTH: u16 = 34;
-const MAXIMUM_INSPECTOR_WIDTH: u16 = 44;
 const MIN_CURSOR_CONTRAST: f32 = 3.0;
 
-/// Splits the body into map and inspector.
+/// Splits the body into a map and its decision details.
 ///
-/// The split never depends on what is selected. An inspector that appears and
-/// disappears with the cursor resizes the map underneath it, and every resize
-/// re-lays out the treemap: the pane arrangement has to be a property of the
-/// terminal, not of the selection.
+/// The layout never depends on selection: showing or clearing a selection must
+/// not relayout the map beneath it. The map keeps every available column so
+/// people can compare space before acting; its details are always stacked
+/// below it when the supported viewport has room for both panes.
 fn body_areas(area: Rect) -> (Rect, Option<Rect>) {
-    // Pane borders cost two columns on each side, and the map only stays a map
-    // while its inner width holds `MINIMUM_MAP_WIDTH`.
-    let side_by_side = area
-        .width
-        .saturating_sub(MINIMUM_MAP_WIDTH + 2 + PANE_GAP)
-        .min(MAXIMUM_INSPECTOR_WIDTH);
-    if side_by_side >= MINIMUM_INSPECTOR_WIDTH {
-        let inspector_width = (area.width / 4).clamp(MINIMUM_INSPECTOR_WIDTH, side_by_side);
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(MINIMUM_MAP_WIDTH + 2),
-                Constraint::Length(PANE_GAP),
-                Constraint::Length(inspector_width),
-            ])
-            .split(area);
-        return (body[0], Some(body[2]));
-    }
     if area.width >= 32
-        && area.height >= MINIMUM_WORKSPACE_HEIGHT + COMPACT_INSPECTOR_HEIGHT + PANE_GAP
+        && area.height >= MINIMUM_WORKSPACE_HEIGHT + INSPECTOR_HEIGHT + PANE_GAP
     {
-        let workspace_height = area
-            .height
-            .saturating_sub(COMPACT_INSPECTOR_HEIGHT + PANE_GAP);
+        let workspace_height = area.height.saturating_sub(INSPECTOR_HEIGHT + PANE_GAP);
         let inspector = Rect::new(
             area.x,
             area.y + workspace_height + PANE_GAP,
             area.width,
-            COMPACT_INSPECTOR_HEIGHT,
+            INSPECTOR_HEIGHT,
         );
         let workspace = Rect::new(area.x, area.y, area.width, workspace_height);
         return (workspace, Some(inspector));
@@ -565,27 +541,15 @@ fn render_instrument_header(
         ),
     ]);
     let metrics = total.metrics;
-    let detail = Line::from(vec![
-        Span::styled(" allocated ", Style::default().fg(theme.text_muted)),
-        Span::styled(
-            format_bounds(metrics.allocated_bytes),
-            Style::default().fg(theme.text_primary),
-        ),
-        Span::styled("   reclaim ", Style::default().fg(theme.text_muted)),
-        Span::styled(
-            format_bounds(metrics.reclaimable_bytes),
-            Style::default().fg(theme.text_primary),
-        ),
-        Span::styled("   apparent ", Style::default().fg(theme.text_muted)),
-        Span::styled(
-            format!("{}", DisplaySize(metrics.apparent_bytes as f64)),
-            Style::default().fg(theme.text_secondary),
-        ),
-        Span::styled(
-            format!("   {} entries ", metrics.descendants),
-            Style::default().fg(theme.text_muted),
-        ),
-    ]);
+    let detail = storage_summary(
+        metrics.allocated_bytes,
+        metrics.reclaimable_bytes,
+        metrics.apparent_bytes,
+        metrics.descendants,
+        area.width,
+        theme,
+        ascii,
+    );
     Paragraph::new(vec![title, detail]).render(area, buffer);
     let rule_y = area.y.saturating_add(area.height.saturating_sub(1));
     for x in area.x..area.right() {
@@ -594,6 +558,99 @@ fn render_instrument_header(
                 .set_style(Style::default().fg(theme.border));
         }
     }
+}
+
+fn storage_summary(
+    allocated: ByteBounds,
+    reclaimable: ByteBounds,
+    apparent: u128,
+    descendants: u64,
+    width: u16,
+    theme: Theme,
+    ascii: bool,
+) -> Line<'static> {
+    let space_used = format_bounds(allocated);
+    let can_reclaim = format_bounds(reclaimable);
+    let content_size = DisplaySize(apparent as f64).to_string();
+    let items = format!("{descendants} items");
+    let separator = if ascii { " . " } else { " · " };
+    let label = Style::default().fg(theme.text_muted);
+    let primary_value = Style::default().fg(theme.text_primary);
+    let secondary_value = Style::default().fg(theme.text_secondary);
+    let full_width = " Space used ".width()
+        + space_used.width()
+        + separator.width()
+        + "Can reclaim ".width()
+        + can_reclaim.width()
+        + separator.width()
+        + "Content size ".width()
+        + content_size.width()
+        + separator.width()
+        + items.width();
+    if full_width <= usize::from(width) {
+        return Line::from(vec![
+            Span::styled(" Space used ", label),
+            Span::styled(space_used, primary_value),
+            Span::styled(separator, label),
+            Span::styled("Can reclaim ", label),
+            Span::styled(can_reclaim, primary_value),
+            Span::styled(separator, label),
+            Span::styled("Content size ", label),
+            Span::styled(content_size, secondary_value),
+            Span::styled(separator, label),
+            Span::styled(items, label),
+        ]);
+    }
+
+    let compact_width = " Used ".width()
+        + space_used.width()
+        + separator.width()
+        + "Can reclaim ".width()
+        + can_reclaim.width()
+        + separator.width()
+        + "Content ".width()
+        + content_size.width()
+        + separator.width()
+        + items.width();
+    if compact_width <= usize::from(width) {
+        return Line::from(vec![
+            Span::styled(" Used ", label),
+            Span::styled(space_used, primary_value),
+            Span::styled(separator, label),
+            Span::styled("Can reclaim ", label),
+            Span::styled(can_reclaim, primary_value),
+            Span::styled(separator, label),
+            Span::styled("Content ", label),
+            Span::styled(content_size, secondary_value),
+            Span::styled(separator, label),
+            Span::styled(items, label),
+        ]);
+    }
+
+    let decision_width = " Used ".width()
+        + space_used.width()
+        + separator.width()
+        + "Reclaim ".width()
+        + can_reclaim.width();
+    if decision_width <= usize::from(width) {
+        return Line::from(vec![
+            Span::styled(" Used ", label),
+            Span::styled(space_used, primary_value),
+            Span::styled(separator, label),
+            Span::styled("Reclaim ", label),
+            Span::styled(can_reclaim, primary_value),
+        ]);
+    }
+
+    let prefix = " Can reclaim ";
+    let prefix_width = u16::try_from(prefix.width()).unwrap_or(u16::MAX);
+    Line::from(vec![
+        Span::styled(prefix, label),
+        Span::styled(
+            truncate_middle(&can_reclaim, width.saturating_sub(prefix_width)),
+            primary_value,
+        ),
+    ])
 }
 
 fn view_state(
@@ -783,51 +840,84 @@ fn inspector_action(
         UiMode::Normal => {
             if synthetic {
                 if ascii {
-                    "Enter focused rescan . deletion unavailable"
+                    "Enter rescan . cannot delete"
                 } else {
-                    "Enter focused rescan · deletion unavailable"
+                    "Enter rescan · cannot delete"
                 }
             } else if complete {
                 if ascii {
-                    "Enter open . Backspace permanent delete"
+                    "Enter open . Backspace delete"
                 } else {
-                    "Enter open · Backspace permanent delete"
+                    "Enter open · Backspace delete"
                 }
             } else if ascii {
-                "Incomplete scope . deletion unavailable"
+                "Scan incomplete . cannot delete"
             } else {
-                "Incomplete scope · deletion unavailable"
+                "Scan incomplete · cannot delete"
             }
         }
         UiMode::FilterInput { .. } => {
             if ascii {
-                "Filter input . Enter apply . Esc cancel"
+                "Filtering . Enter apply . Esc cancel"
             } else {
-                "Filter input · Enter apply · Esc cancel"
+                "Filtering · Enter apply · Esc cancel"
             }
         }
         UiMode::Loading => {
-            // Deletion is available during the initial scan for complete entries.
+            // Deletion remains available during the initial scan for complete entries.
             if !synthetic && complete {
                 if ascii {
-                    "Scanning . [Backspace] permanent delete"
+                    "Scanning . Backspace delete"
                 } else {
-                    "Scanning · [Backspace] permanent delete"
+                    "Scanning · Backspace delete"
                 }
             } else if ascii {
-                "Scanning . deletion unavailable"
+                "Scanning . cannot delete"
             } else {
-                "Scanning · deletion unavailable"
+                "Scanning · cannot delete"
             }
         }
         UiMode::Rescanning { .. } => {
             if ascii {
-                "Scanning . deletion unavailable"
+                "Scanning . cannot delete"
             } else {
-                "Scanning · deletion unavailable"
+                "Scanning · cannot delete"
             }
         }
         _ => "Actions unavailable",
+    }
+}
+
+fn inspection_reason_detail(reason: Option<&UnscannedReason>) -> SafeDisplayPath {
+    match reason {
+        None => display_text_info("Scan result: included"),
+        Some(UnscannedReason::Excluded(value)) => {
+            inspection_reason_with_value("Scan result: excluded by filter: ", value)
+        }
+        Some(UnscannedReason::Metadata(value)) => {
+            inspection_reason_with_value("Scan result: could not read: ", value)
+        }
+        Some(UnscannedReason::Replacement(value)) => {
+            inspection_reason_with_value("Scan result: changed while scanning: ", value)
+        }
+        Some(UnscannedReason::SymbolicLink) => {
+            display_text_info("Scan result: link target not scanned")
+        }
+        Some(UnscannedReason::FilesystemBoundary) => {
+            display_text_info("Scan result: outside this file system")
+        }
+        Some(UnscannedReason::IdentityStorageCapacity) => {
+            display_text_info("Scan result: some space totals are unknown")
+        }
+        Some(UnscannedReason::MemoryAggregation) => display_text_info("Scan result: summarized"),
+    }
+}
+
+fn inspection_reason_with_value(prefix: &str, value: &str) -> SafeDisplayPath {
+    let displayed = display_text_info(value);
+    SafeDisplayPath {
+        text: format!("{prefix}{}", displayed.text),
+        deceptive: displayed.deceptive || value.contains(DECEPTIVE_DISPLAY_MARKER),
     }
 }
 
@@ -849,12 +939,20 @@ fn render_inspector(
 ) {
     Clear.render(area, buffer);
     // Only the pane that owns the cursor animates. The workspace holds the
-    // selection, so the inspector stays a quiet reference surface beside it.
+    // selection, so the details stay a quiet reference surface below it.
     let inner = render_pane(
-        buffer, area, "INSPECT", theme, false, false, monochrome, ascii, now,
+        buffer,
+        area,
+        "SELECTED ITEM",
+        theme,
+        false,
+        false,
+        monochrome,
+        ascii,
+        now,
     );
     let Some(tile) = board.currently_selected() else {
-        Paragraph::new("Select an entry for identity, bounds, state, and actions.")
+        Paragraph::new("Choose an item to see its space, deletion options, and scan status.")
             .style(Style::default().fg(theme.text_muted))
             .wrap(Wrap { trim: true })
             .render(inner, buffer);
@@ -865,64 +963,40 @@ fn render_inspector(
     };
     let (marker, state, state_color) = view_state(&UiMode::Normal, node.state, ascii, theme);
     let kind = match node.kind {
-        NodeKind::Root => "root",
-        NodeKind::Directory => "directory",
+        NodeKind::Root | NodeKind::Directory => "folder",
         NodeKind::File => "file",
         NodeKind::Link => "link",
-        NodeKind::Synthetic(SyntheticKind::Other) => "Other aggregate",
-        NodeKind::Synthetic(SyntheticKind::Shared) => "Shared allocation",
-        NodeKind::Synthetic(SyntheticKind::Aggregate) => "cold aggregate",
+        NodeKind::Synthetic(SyntheticKind::Other | SyntheticKind::Aggregate) => "summary",
+        NodeKind::Synthetic(SyntheticKind::Shared) => "shared item",
     };
     let separator = if ascii { "." } else { "·" };
-    let folded_detail = match node.kind {
-        NodeKind::Synthetic(SyntheticKind::Other) => Some(format!(
-            "folded    {} entries {separator} grouped into this aggregate",
-            node.metrics.descendants
-        )),
-        _ => None,
+    let item_label = if node.metrics.descendants == 1 {
+        "item"
+    } else {
+        "items"
     };
-    let identity = node.snapshot.identity.as_ref().map_or_else(
-        || "identity  unknown".to_string(),
-        |identity| format!("identity  {:?}", identity.file_id),
+    let item_count = format!("{} {item_label}", node.metrics.descendants);
+    let folded_detail = matches!(node.kind, NodeKind::Synthetic(SyntheticKind::Other))
+        .then(|| format!("{item_count} summarized here"));
+    let item_check = node.snapshot.identity.as_ref().map_or_else(
+        || "Item check: unavailable".to_string(),
+        |identity| format!("Item check: {:?}", identity.file_id),
     );
-    let link_detail = node.snapshot.identity.as_ref().map_or_else(
-        || "links     unknown".to_string(),
+    let known_names = node.snapshot.identity.as_ref().map_or_else(
+        || "Known names: unavailable".to_string(),
         |identity| {
             identity.link_count.map_or_else(
-                || "links     unknown".to_string(),
-                |count| format!("links     {count}"),
+                || "Known names: unavailable".to_string(),
+                |count| format!("Known names: {count}"),
             )
         },
     );
-    // An Other node can represent either filter-omitted or capacity-folded entries,
-    // so its scope cannot claim a cause the model does not retain.
-    let reason = if matches!(node.kind, NodeKind::Synthetic(SyntheticKind::Other)) {
-        display_text_info("scope     aggregate")
+    // An Other node can represent either filter-omitted or capacity-folded
+    // items, so do not claim a cause the model does not retain.
+    let scan_detail = if matches!(node.kind, NodeKind::Synthetic(SyntheticKind::Other)) {
+        display_text_info("Scan result: summary")
     } else {
-        node.unscanned_reason.as_ref().map_or_else(
-            || display_text_info("scope     materialized"),
-            |reason| {
-                let mut displayed = display_text_info(&format!("scope     {reason:?}"));
-                let deceptive = match reason {
-                    UnscannedReason::Excluded(value)
-                    | UnscannedReason::Metadata(value)
-                    | UnscannedReason::Replacement(value) => {
-                        let displayed = display_text_info(value);
-                        displayed.deceptive || value.contains(DECEPTIVE_DISPLAY_MARKER)
-                    }
-                    UnscannedReason::SymbolicLink
-                    | UnscannedReason::FilesystemBoundary
-                    | UnscannedReason::IdentityStorageCapacity
-                    | UnscannedReason::MemoryAggregation => false,
-                };
-                displayed.deceptive |= deceptive;
-                displayed
-            },
-        )
-    };
-    let reason_detail = SafeDisplayPath {
-        text: format!("{link_detail} {separator} {}", reason.text),
-        deceptive: reason.deceptive,
+        inspection_reason_detail(node.unscanned_reason.as_ref())
     };
     let action = inspector_action(
         ui_mode,
@@ -930,6 +1004,9 @@ fn render_inspector(
         node.state == NodeState::Complete,
         ascii,
     );
+    let space_used = format_bounds(node.metrics.allocated_bytes);
+    let can_reclaim = format_bounds(node.metrics.reclaimable_bytes);
+    let content_size = DisplaySize(node.metrics.apparent_bytes as f64).to_string();
     let name_line = Line::styled(
         display_os_str_middle(&node.name, inner.width),
         Style::default()
@@ -950,14 +1027,15 @@ fn render_inspector(
         truncate_middle(&format!("{marker} {state} {separator} {kind}"), inner.width),
         Style::default().fg(state_color),
     );
+    let action_line = Line::styled(
+        truncate_middle(action, inner.width),
+        Style::default().fg(theme.text_muted).add_modifier(Modifier::BOLD),
+    );
     let details = if inner.width < 54 {
         let compact_state_line = if folded_detail.is_some() {
             Line::styled(
                 truncate_middle(
-                    &format!(
-                        "{marker} {state} {separator} {} folded",
-                        node.metrics.descendants
-                    ),
+                    &format!("{marker} {state} {separator} {item_count} summarized"),
                     inner.width,
                 ),
                 Style::default().fg(state_color),
@@ -965,98 +1043,73 @@ fn render_inspector(
         } else {
             narrow_state_line
         };
-        let compact_identity_line = if folded_detail.is_some() {
-            Line::styled(
-                truncate_middle(action, inner.width),
-                Style::default().fg(theme.text_muted),
-            )
-        } else {
-            Line::from(truncate_middle(&identity, inner.width))
-        };
         vec![
             name_line,
             compact_state_line,
+            action_line,
             Line::from(truncate_middle(
-                &format!("allocated {}", format_bounds(node.metrics.allocated_bytes)),
+                &format!("Can reclaim {can_reclaim}"),
                 inner.width,
             )),
             Line::from(truncate_middle(
-                &format!(
-                    "reclaim   {}",
-                    format_bounds(node.metrics.reclaimable_bytes)
-                ),
+                &format!("Space used {space_used}"),
                 inner.width,
             )),
             Line::from(truncate_middle(
-                &format!(
-                    "apparent {} {separator} entries {}",
-                    DisplaySize(node.metrics.apparent_bytes as f64),
-                    node.metrics.descendants
-                ),
+                &format!("Content size {content_size} {separator} {item_count}"),
                 inner.width,
             )),
-            compact_identity_line,
             Line::from(truncate_marked(
-                &reason_detail,
+                &scan_detail,
                 inner.width,
                 truncate_middle,
             )),
         ]
     } else if inner.height < 12 || (folded_detail.is_some() && inner.height < 13) {
-        let identity_or_folded = folded_detail.as_ref().map_or_else(
-            || truncate_middle(&identity, inner.width),
+        let item_check_or_summary = folded_detail.as_ref().map_or_else(
+            || truncate_middle(&item_check, inner.width),
             |detail| truncate_middle(detail, inner.width),
         );
         vec![
             name_line,
             state_line,
-            Line::from(format!(
-                "allocated {} {separator} reclaim {}",
-                format_bounds(node.metrics.allocated_bytes),
-                format_bounds(node.metrics.reclaimable_bytes)
+            action_line,
+            Line::from(truncate_middle(
+                &format!("Can reclaim {can_reclaim} {separator} Space used {space_used}"),
+                inner.width,
             )),
-            Line::from(format!(
-                "apparent {} {separator} entries {}",
-                DisplaySize(node.metrics.apparent_bytes as f64),
-                node.metrics.descendants
+            Line::from(truncate_middle(
+                &format!("Content size {content_size} {separator} {item_count}"),
+                inner.width,
             )),
-            Line::from(identity_or_folded),
+            Line::from(item_check_or_summary),
             Line::from(truncate_marked(
-                &reason_detail,
+                &scan_detail,
                 inner.width,
                 truncate_middle,
             )),
-            Line::styled(
-                truncate_middle(action, inner.width),
-                Style::default().fg(theme.text_muted),
-            ),
         ]
     } else {
         let mut details = vec![
             name_line,
             state_line,
             Line::from(""),
-            Line::from(format!(
-                "allocated {}",
-                format_bounds(node.metrics.allocated_bytes)
-            )),
-            Line::from(format!(
-                "reclaim   {}",
-                format_bounds(node.metrics.reclaimable_bytes)
-            )),
-            Line::from(format!(
-                "apparent  {}",
-                DisplaySize(node.metrics.apparent_bytes as f64)
-            )),
-            Line::from(format!("entries   {}", node.metrics.descendants)),
-            Line::from(truncate_middle(&identity, inner.width)),
-            Line::from(link_detail),
-            Line::from(truncate_marked(&reason, inner.width, truncate_middle)),
+            action_line,
+            Line::from(format!("Can reclaim {can_reclaim}")),
+            Line::from(format!("Space used {space_used}")),
+            Line::from(format!("Content size {content_size}")),
+            Line::from(item_count),
             Line::from(""),
-            Line::styled(action, Style::default().fg(theme.text_muted)),
+            Line::from(truncate_middle(&item_check, inner.width)),
+            Line::from(known_names),
+            Line::from(truncate_marked(
+                &scan_detail,
+                inner.width,
+                truncate_middle,
+            )),
         ];
         if let Some(folded_detail) = &folded_detail {
-            details.insert(7, Line::from(truncate_middle(folded_detail, inner.width)));
+            details.insert(8, Line::from(truncate_middle(folded_detail, inner.width)));
         }
         details
     };
@@ -1410,6 +1463,13 @@ mod tests {
     use crate::theme::ThemeId;
 
     use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().fold(String::new(), |mut text, span| {
+            text.push_str(span.content.as_ref());
+            text
+        })
+    }
 
     fn map_file(id: u32, size: u128, percentage: f64) -> crate::state::tiles::FileMetadata {
         crate::state::tiles::FileMetadata {
@@ -1962,35 +2022,59 @@ mod tests {
     }
 
     #[test]
-    fn the_inspector_stacks_below_the_map_until_the_terminal_can_seat_it_beside() {
-        for width in [32, 60, 80, 100] {
-            let (workspace, inspector) = body_areas(Rect::new(0, 0, width, 19));
-            let inspector = inspector.expect("a narrow terminal stacks the inspector");
-            assert_eq!(workspace.width, width);
-            assert_eq!(workspace.height, 9);
-            assert_eq!(inspector.y, workspace.bottom() + PANE_GAP);
-            assert_eq!(inspector.width, width);
-            assert_eq!(inspector.height, COMPACT_INSPECTOR_HEIGHT);
-        }
+    fn inspector_stacks_below_the_map_at_every_supported_width() {
+        for width in [32, 60, 80, 100, 140, 240] {
+            let area = Rect::new(4, 3, width, 19);
+            let (workspace, inspector) = body_areas(area);
+            let inspector = inspector.expect("a supported terminal stacks the inspector");
 
-        let (workspace, inspector) = body_areas(Rect::new(0, 0, 140, 19));
-        let inspector = inspector.expect("a wide terminal seats the inspector beside the map");
-        assert_eq!(
-            workspace.height, 19,
-            "a side inspector costs the map no rows"
-        );
-        assert_eq!(inspector.x, workspace.right() + PANE_GAP);
-        assert!(
-            workspace.width >= MINIMUM_MAP_WIDTH + 2,
-            "the map keeps the columns it needs to stay a map: {}",
-            workspace.width
-        );
-        assert!((MINIMUM_INSPECTOR_WIDTH..=MAXIMUM_INSPECTOR_WIDTH).contains(&inspector.width));
+            assert_eq!(workspace.x, area.x);
+            assert_eq!(workspace.width, area.width);
+            assert_eq!(workspace.height, 9);
+            assert_eq!(inspector.x, area.x);
+            assert_eq!(inspector.y, workspace.bottom() + PANE_GAP);
+            assert_eq!(inspector.width, area.width);
+            assert_eq!(inspector.height, INSPECTOR_HEIGHT);
+        }
 
         assert!(
             body_areas(Rect::new(0, 0, 100, 8)).1.is_none(),
             "a terminal too short for both panes keeps the map whole"
         );
+    }
+
+    #[test]
+    fn storage_summary_keeps_reclaim_decision_visible_at_narrow_widths() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+        let wide = line_text(&storage_summary(
+            ByteBounds::exact(2_048),
+            ByteBounds::exact(1_024),
+            4_096,
+            3,
+            120,
+            theme,
+            false,
+        ));
+        assert!(wide.contains("Space used"));
+        assert!(wide.contains("Can reclaim"));
+        assert!(wide.contains("Content size"));
+        assert!(wide.contains("3 items"));
+
+        let narrow = line_text(&storage_summary(
+            ByteBounds::exact(2_048),
+            ByteBounds::exact(1_024),
+            4_096,
+            3,
+            32,
+            theme,
+            true,
+        ));
+        assert!(narrow.width() <= 32, "narrow summary exceeds its viewport: {narrow:?}");
+        assert!(narrow.contains("Used"));
+        assert!(narrow.contains("Reclaim"));
+        assert!(!narrow.contains("allocated"));
+        assert!(!narrow.contains("apparent"));
+        assert!(!narrow.contains('·'));
     }
 
     #[test]
@@ -2015,10 +2099,18 @@ mod tests {
     }
 
     #[test]
-    fn inspector_actions_follow_the_active_ui_mode() {
+    fn inspector_actions_remain_accurate_across_modes() {
         assert_eq!(
             inspector_action(&UiMode::Normal, false, true, false),
-            "Enter open · Backspace permanent delete"
+            "Enter open · Backspace delete"
+        );
+        assert_eq!(
+            inspector_action(&UiMode::Normal, false, true, true),
+            "Enter open . Backspace delete"
+        );
+        assert_eq!(
+            inspector_action(&UiMode::Normal, true, true, false),
+            "Enter rescan · cannot delete"
         );
         assert_eq!(
             inspector_action(
@@ -2030,7 +2122,7 @@ mod tests {
                 true,
                 false,
             ),
-            "Filter input · Enter apply · Esc cancel"
+            "Filtering · Enter apply · Esc cancel"
         );
         assert_eq!(
             inspector_action(
@@ -2041,26 +2133,24 @@ mod tests {
                 true,
                 false,
             ),
-            "Scanning · deletion unavailable"
+            "Scanning · cannot delete"
         );
-        // Loading mode: complete non-synthetic entries now show the Backspace action.
         assert_eq!(
             inspector_action(&UiMode::Loading, false, true, false),
-            "Scanning · [Backspace] permanent delete"
+            "Scanning · Backspace delete"
         );
-        // Incomplete or synthetic entries during loading still report unavailability.
         assert_eq!(
             inspector_action(&UiMode::Loading, false, false, false),
-            "Scanning · deletion unavailable"
+            "Scanning · cannot delete"
         );
         assert_eq!(
             inspector_action(&UiMode::Loading, true, true, false),
-            "Scanning · deletion unavailable"
+            "Scanning · cannot delete"
         );
     }
 
     #[test]
-    fn compact_inspector_exposes_identity_bounds_links_and_aggregation() {
+    fn compact_inspector_prioritizes_actions_space_and_scan_coverage() {
         let root = tempfile::tempdir().expect("inspector root should exist");
         let path = root.path().join("selected-entry");
         fs::write(&path, b"selected contents").expect("fixture should be written");
@@ -2081,7 +2171,7 @@ mod tests {
         board.change_area(Rect::new(0, 0, 78, 10));
         board.change_files(tree.files_in_current_folder(0));
         board.set_selected_index(0);
-        let area = Rect::new(0, 0, 80, COMPACT_INSPECTOR_HEIGHT);
+        let area = Rect::new(0, 0, 80, INSPECTOR_HEIGHT);
         let mut buffer = Buffer::empty(area);
         render_inspector(
             &mut buffer,
@@ -2101,22 +2191,33 @@ mod tests {
         for expected in [
             "selected-entry",
             "COMPLETE",
-            "allocated",
-            "reclaim",
-            "entries",
-            "identity",
-            "links",
-            "scope",
+            "Enter open · Backspace delete",
+            "Can reclaim",
+            "Space used",
+            "Content size",
+            "Item check:",
+            "Scan result: included",
         ] {
             assert!(
                 text.contains(expected),
-                "missing compact detail: {expected}"
+                "missing compact decision detail: {expected}"
+            );
+        }
+        assert!(
+            text.find("Enter open").expect("action should render")
+                < text.find("Can reclaim").expect("reclaim estimate should render"),
+            "the action should precede supporting storage details"
+        );
+        for jargon in ["allocated", "apparent", "identity", "links", "scope"] {
+            assert!(
+                !text.contains(jargon),
+                "implementation label leaked into the selected-item surface: {jargon}"
             );
         }
     }
 
     #[test]
-    fn filtered_other_inspector_keeps_action_and_scope_within_seven_compact_rows() {
+    fn summary_item_explains_scan_coverage_without_model_jargon() {
         let root = tempfile::tempdir().expect("inspector root should exist");
         let matched = root.path().join("matched.log");
         let omitted = root.path().join("omitted.tmp");
@@ -2168,13 +2269,16 @@ mod tests {
             text.push_str(cell.symbol());
             text
         });
-        assert!(text.contains("folded    1 entries"));
-        assert!(text.contains("grouped into this aggregate"));
-        assert!(!text.contains("retained-entry cap"));
-        assert!(!text.contains("memory budget"));
-        assert!(!text.contains("MemoryAggregation"));
+        assert!(text.contains("1 item summarized here"));
+        assert!(text.contains("Scan result: summary"));
+        for jargon in ["retained-entry cap", "memory budget", "MemoryAggregation", "scope"] {
+            assert!(
+                !text.contains(jargon),
+                "model detail leaked into summary presentation: {jargon}"
+            );
+        }
 
-        let compact_area = Rect::new(0, 0, 52, COMPACT_INSPECTOR_HEIGHT);
+        let compact_area = Rect::new(0, 0, 52, INSPECTOR_HEIGHT);
         let mut compact_buffer = Buffer::empty(compact_area);
         render_inspector(
             &mut compact_buffer,
@@ -2195,13 +2299,13 @@ mod tests {
                 text
             });
         for expected in [
-            "1 folded",
-            "Enter focused rescan · deletion unavailable",
-            "scope     aggregate",
+            "1 item summarized",
+            "Enter rescan · cannot delete",
+            "Scan result: summary",
         ] {
             assert!(
                 compact_text.contains(expected),
-                "missing compact aggregate detail: {expected}"
+                "missing compact summary detail: {expected}"
             );
         }
     }

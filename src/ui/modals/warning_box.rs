@@ -1,6 +1,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::theme::Theme;
@@ -30,17 +31,47 @@ impl Widget for WarningBox {
         let inner = render_modal(
             buffer,
             rect,
-            "WARNING",
+            "SCAN IN PROGRESS",
             self.theme,
-            self.theme.state_aggregated,
+            self.theme.state_rescanning,
             self.ascii,
         );
-        Paragraph::new(
-            "Deletion is locked during rescanning. Wait for it to complete.\n\n[Any key] dismiss",
-        )
+        Paragraph::new(vec![
+            Line::from("Scanning is still in progress."),
+            Line::from("Deletion is unavailable until it finishes."),
+            Line::from(""),
+            Line::styled(
+                "[Any key] close",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])
         .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
         .render(inner, buffer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::widgets::Widget;
+
+    use crate::theme::ThemeId;
+
+    use super::*;
+
+    #[test]
+    fn rescan_warning_explains_that_deletion_is_unavailable() {
+        let area = Rect::new(0, 0, 48, 9);
+        let mut buffer = Buffer::empty(area);
+        WarningBox::new(Theme::for_id(ThemeId::ExciseDark), false).render(area, &mut buffer);
+        let text = buffer.content.iter().fold(String::new(), |mut text, cell| {
+            text.push_str(cell.symbol());
+            text
+        });
+
+        assert!(text.contains("SCAN IN PROGRESS"));
+        assert!(text.contains("Deletion is unavailable until it finishes."));
+        assert!(text.contains("[Any key] close"));
     }
 }

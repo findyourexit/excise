@@ -128,29 +128,16 @@ impl Widget for MessageBox<'_> {
             height,
         );
         let title = match &self.view {
-            DeletionView::Planning { .. } => "! BUILDING IDENTITY PLAN",
+            DeletionView::Planning { .. } => "PREPARING DELETE",
             DeletionView::Confirm { plan, .. } => match plan.root_snapshot().kind {
-                PlannedKind::Directory => "! PERMANENT DIRECTORY DELETION",
-                PlannedKind::Link => "! PERMANENT LINK DELETION",
-                PlannedKind::File => "! PERMANENT FILE DELETION",
+                PlannedKind::Directory => "DELETE FOLDER",
+                PlannedKind::Link => "DELETE LINK",
+                PlannedKind::File => "DELETE FILE",
             },
-            DeletionView::Deleting { stopping: true, .. } => "! STOPPING PERMANENT DELETION",
-            DeletionView::Deleting { .. } => "! PERMANENT DELETION ACTIVE",
-            DeletionView::Cancel { .. } => "! INTERRUPT DELETION",
-            DeletionView::Result(report) if report.precise => {
-                if self.ascii {
-                    "! DELETION RESULT . PRECISE"
-                } else {
-                    "! DELETION RESULT · PRECISE"
-                }
-            }
-            DeletionView::Result(_) => {
-                if self.ascii {
-                    "! DELETION RESULT . UNKNOWN"
-                } else {
-                    "! DELETION RESULT · UNKNOWN"
-                }
-            }
+            DeletionView::Deleting { stopping: true, .. } => "STOPPING DELETE",
+            DeletionView::Deleting { .. } => "DELETING",
+            DeletionView::Cancel { .. } => "STOP DELETE?",
+            DeletionView::Result(_) => "DELETION RESULTS",
         };
         let inner = render_modal(
             buf,
@@ -162,7 +149,7 @@ impl Widget for MessageBox<'_> {
         );
         let text = readable_text_on(self.theme, self.theme.surface_raised);
         Paragraph::new(lines(self.view, inner.width, self.ascii))
-            .style(Style::default().fg(text).add_modifier(Modifier::BOLD))
+            .style(Style::default().fg(text))
             .alignment(Alignment::Left)
             .wrap(Wrap { trim: true })
             .render(inner, buf);
@@ -182,36 +169,33 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
             armable,
         } => {
             let status_line = if enter_armed {
-                "Armed: will execute when plan is ready."
+                "Deletion starts when checks finish."
             } else {
-                "Building identity plan."
+                "Checking the selected item before deletion."
             };
-            // Show the in-memory entry count as a planning estimate when available.
-            // For directories this is populated from the scanned subtree; for files
-            // it is always 1. The tilde signals it is an estimate, not the final plan.
-            let estimate_line = target.num_descendants.map(|n| {
-                let label = if n == 1 { "entry" } else { "entries" };
-                format!("~{n} {label} expected")
+            let estimate_line = target.num_descendants.map(|count| {
+                let item = if count == 1 { "item" } else { "items" };
+                format!("About {count} {item} to check")
             });
-            let key_line = if enter_armed {
-                String::from("[Esc] disarm and cancel")
+            let action = if enter_armed {
+                String::from("[Esc] stop and cancel")
             } else if armable {
-                format!("[Enter] arm for immediate execution {separator} [Esc] cancel")
+                format!("[Enter] delete when ready {separator} [Esc] cancel")
             } else {
                 String::from("[Esc] cancel")
             };
-            let mut lines = vec![
-                Line::from(""),
+            let mut content = vec![
                 Line::from(display_path_end(&target.full_path(), width)),
-                Line::from(""),
                 Line::from(status_line),
             ];
             if let Some(estimate) = estimate_line {
-                lines.push(Line::from(estimate));
+                content.push(Line::from(estimate));
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(key_line));
-            lines
+            content.push(Line::styled(
+                action,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            content
         }
         DeletionView::Confirm {
             plan,
@@ -221,39 +205,44 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
         } => {
             let reduced_guardrails = reduced_guardrails
                 || matches!(&plan.challenge, ConfirmationChallenge::ReducedGuard);
-            let identity = format!("identity {:?}", plan.root_snapshot().identity.file_id);
+            let count = plan.planned_entries();
+            let item = if count == 1 { "item" } else { "items" };
             let mut content = vec![
-                Line::from(""),
                 Line::from(display_path_end(&plan.target.full_path(), width)),
-                Line::from(truncate(&identity, width)),
                 Line::from(format!(
-                    "{} planned entries {separator} {} logical",
-                    plan.planned_entries(),
+                    "{count} {item} {separator} {} content",
                     DisplaySize(plan.apparent_bytes as f64)
                 )),
-                Line::from(""),
-                Line::from("This cannot be undone. New or changed entries are skipped."),
+                Line::from("Permanent deletion. New or changed items are skipped."),
             ];
             append_safety_labels(&mut content, reduced_guardrails, elevated, width, ascii);
             match &plan.challenge {
-                ConfirmationChallenge::ConfirmFile => {
-                    content.push(Line::from("[Enter] or y to permanently delete this entry."));
-                }
-                ConfirmationChallenge::ReducedGuard => {
-                    content.push(Line::from("[Enter] or y to arm permanent deletion."));
+                ConfirmationChallenge::ConfirmFile | ConfirmationChallenge::ReducedGuard => {
+                    content.push(Line::styled(
+                        format!("[Enter/y] delete permanently {separator} [Esc/q] cancel"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
                 }
                 ConfirmationChallenge::TypeName(expected) => {
-                    content.push(Line::from(format!("Type exact name: {expected}")));
+                    content.push(Line::from(format!(
+                        "Type this name exactly: {}",
+                        display_text(expected)
+                    )));
                     content.push(Line::from(format!("> {}_", display_text(input))));
-                    content.push(Line::from("[Enter] arm when exact"));
+                    content.push(Line::styled(
+                        format!("[Enter] delete when exact {separator} [Esc/q] cancel"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
                 }
                 ConfirmationChallenge::TypePhrase(expected) => {
-                    content.push(Line::from(format!("Type: {expected}")));
+                    content.push(Line::from(format!("Type this exactly: {}", display_text(expected))));
                     content.push(Line::from(format!("> {}_", display_text(input))));
-                    content.push(Line::from("[Enter] arm when exact"));
+                    content.push(Line::styled(
+                        format!("[Enter] delete when exact {separator} [Esc/q] cancel"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
                 }
             }
-            content.push(Line::from("[Esc] cancel"));
             content
         }
         DeletionView::Deleting {
@@ -261,49 +250,61 @@ fn lines(view: DeletionView<'_>, width: u16, ascii: bool) -> Vec<Line<'static>> 
             completed,
             stopping: false,
         } => vec![
+            Line::from(format!("{completed} of {planned_entries} items processed.")),
+            Line::from("Every item is checked again before removal."),
+            Line::from("New or changed items are skipped."),
             Line::from(""),
-            Line::from(format!(
-                "{completed} of {planned_entries} {separator} revalidated before each mutation"
-            )),
-            Line::from("New and changed entries are never swept."),
-            Line::from(""),
-            Line::from("[Esc/q] interruption options"),
+            Line::styled(
+                "[Esc/q] stop options",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ],
         DeletionView::Deleting {
             planned_entries,
             completed,
             stopping: true,
         } => vec![
-            Line::from(""),
             Line::from(format!(
-                "Stopping after current entry… {completed} of {planned_entries}."
+                "{completed} of {planned_entries} items processed; stopping after the current item."
             )),
-            Line::from("No further entry will start."),
-            Line::from("Waiting for the active identity mutation to finish."),
-            Line::from("[h/Ctrl-C] hard cancel and return control immediately"),
+            Line::from("No new items will start."),
+            Line::from("Waiting for the current removal to finish."),
+            Line::styled(
+                "[h/Ctrl-C] stop now; final state may be unknown",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ],
         DeletionView::Cancel { planned_entries } => vec![
-            Line::from(""),
-            Line::from(format!("Deletion plan: {planned_entries} identities")),
-            Line::from("[s] soft cancel between entries; result remains precise"),
-            Line::from("[h/Ctrl-C] hard cancel; final filesystem state is unknown"),
-            Line::from("[Esc/b] back; continue deletion"),
+            Line::from(format!("{planned_entries} items in this deletion.")),
+            Line::styled(
+                "[s] stop after current item; results stay precise",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "[h/Ctrl-C] stop now; final state may be unknown",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "[Esc/b] continue deletion",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ],
         DeletionView::Result(report) => vec![
-            Line::from(""),
-            Line::from(format!("deleted       {}", report.deleted_entries())),
-            Line::from(format!("changed       {}", report.changed_entries())),
-            Line::from(format!("missing       {}", report.missing_entries())),
-            Line::from(format!("failed        {}", report.failed_entries())),
-            Line::from(format!("unattempted   {}", report.unattempted_entries())),
-            Line::from(""),
-            Line::from(if !report.reporting_complete() {
-                "Result reporting is incomplete; rescan required. [Enter/Esc] close"
-            } else if report.precise {
-                "Result is precise. [Enter/Esc] close"
-            } else {
-                "Result is unknown; rescan required. [Enter/Esc] close"
-            }),
+            Line::from(format!("Removed      {}", report.deleted_entries())),
+            Line::from(format!("Changed      {}", report.changed_entries())),
+            Line::from(format!("Missing      {}", report.missing_entries())),
+            Line::from(format!("Failed       {}", report.failed_entries())),
+            Line::from(format!("Not started  {}", report.unattempted_entries())),
+            Line::styled(
+                if !report.reporting_complete() {
+                    "Results incomplete; rescan needed. [Enter/Esc/q] close"
+                } else if report.precise {
+                    "Finished. [Enter/Esc/q] close"
+                } else {
+                    "Final state unknown; rescan needed. [Enter/Esc/q] close"
+                },
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ],
     }
 }
@@ -317,31 +318,26 @@ fn append_safety_labels(
 ) {
     let separator = if ascii { "." } else { "·" };
     if reduced_guardrails && elevated && width < 56 {
-        content.push(Line::from(format!(
-            "ELEVATED {separator} REDUCED GUARDRAILS ACTIVE"
-        )));
+        content.push(Line::styled(
+            format!("ELEVATED {separator} REDUCED SAFEGUARDS ACTIVE"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
     } else {
         if reduced_guardrails {
-            content.push(Line::from("SESSION-ONLY REDUCED GUARDRAILS ACTIVE"));
+            content.push(Line::styled(
+                "REDUCED DELETE SAFEGUARDS ACTIVE",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
         }
         if elevated {
-            content.push(Line::from("ELEVATED PRIVILEGES ACTIVE"));
+            content.push(Line::styled(
+                "ELEVATED PRIVILEGES ACTIVE",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
         }
     }
 }
 
-fn truncate(value: &str, width: u16) -> String {
-    let maximum = usize::from(width.saturating_sub(1));
-    if value.chars().count() <= maximum {
-        value.to_string()
-    } else if maximum > 1 {
-        let mut text = value.chars().take(maximum - 1).collect::<String>();
-        text.push('…');
-        text
-    } else {
-        String::new()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -369,24 +365,40 @@ mod tests {
             false,
         );
         let text = text(&lines);
-        assert!(text.contains("Stopping after current entry…"));
-        assert!(text.contains("No further entry will start."));
-        assert!(text.contains("hard cancel"));
+        assert!(text.contains("7 of 12 items processed; stopping after the current item."));
+        assert!(text.contains("No new items will start."));
+        assert!(text.contains("[h/Ctrl-C] stop now; final state may be unknown"));
         assert!(!text.contains("Esc"));
         assert!(text.contains("Ctrl-C"));
     }
 
     #[test]
-    fn confirmation_safety_labels_are_independent() {
+    fn deletion_safety_alerts_stay_separate_and_ascii_safe() {
         let mut lines = Vec::new();
         append_safety_labels(&mut lines, true, true, 78, false);
         let expanded_text = text(&lines);
-        assert!(expanded_text.contains("REDUCED GUARDRAILS ACTIVE"));
+        assert!(expanded_text.contains("REDUCED DELETE SAFEGUARDS ACTIVE"));
         assert!(expanded_text.contains("ELEVATED PRIVILEGES ACTIVE"));
+
         let mut compact = Vec::new();
         append_safety_labels(&mut compact, true, true, 48, false);
         let compact = text(&compact);
         assert!(compact.contains("ELEVATED"));
-        assert!(compact.contains("REDUCED GUARDRAILS ACTIVE"));
+        assert!(compact.contains("REDUCED SAFEGUARDS ACTIVE"));
+
+        let mut ascii = Vec::new();
+        append_safety_labels(&mut ascii, true, true, 48, true);
+        let ascii = text(&ascii);
+        assert!(ascii.contains("ELEVATED . REDUCED SAFEGUARDS ACTIVE"));
+        assert!(!ascii.contains('·'));
+    }
+
+    #[test]
+    fn deletion_stop_dialog_distinguishes_precise_and_immediate_choices() {
+        let text = text(&lines(DeletionView::Cancel { planned_entries: 12 }, 78, false));
+        assert!(text.contains("12 items in this deletion."));
+        assert!(text.contains("[s] stop after current item; results stay precise"));
+        assert!(text.contains("[h/Ctrl-C] stop now; final state may be unknown"));
+        assert!(text.contains("[Esc/b] continue deletion"));
     }
 }

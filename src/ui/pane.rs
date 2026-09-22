@@ -69,18 +69,18 @@ pub(crate) fn render_pane(
     now: Duration,
 ) -> Rect {
     let perimeter = border_len(area);
+    let animated = active
+        && animate
+        && ColorCycle::can_animate_with_capabilities(theme.focus, monochrome, ascii);
     let active_cycle = active.then(|| derived_for_with_monochrome(theme, monochrome).0);
-    let accent = active_cycle.map_or(theme.border, |cycle| {
-        if animate || monochrome {
-            cycle.at_perimeter(0, 0, perimeter)
-        } else {
-            cycle.at(0)
-        }
-    });
-    let cycle = active_cycle.filter(|_| animate || monochrome).map(|cycle| {
-        let step = if animate { cycle_step(now) } else { 0 };
-        (cycle, step, perimeter)
-    });
+    let accent = active_cycle.map_or(theme.border, |cycle| cycle.at(0));
+    let phase = if animated { cycle_step(now) } else { 0 };
+    let border_cycle = active_cycle
+        .filter(|_| animated)
+        .map(|cycle| (cycle, phase, perimeter));
+    let chip_cycle = active_cycle
+        .filter(|_| animated || monochrome)
+        .map(|cycle| (cycle, phase, perimeter));
     let border_set = if ascii {
         ASCII_PANE_BORDER_SET
     } else {
@@ -94,7 +94,7 @@ pub(crate) fn render_pane(
     let inner = block.inner(area);
     block.render(area, buffer);
 
-    if let Some((cycle, step, perimeter)) = cycle.as_ref() {
+    if let Some((cycle, step, perimeter)) = border_cycle.as_ref() {
         walk_border(area, |x, y, index| {
             if let Some(cell) = buffer.cell_mut((x, y)) {
                 cell.fg = cycle.at_perimeter(*step, index, *perimeter);
@@ -109,7 +109,7 @@ pub(crate) fn render_pane(
         theme,
         theme.surface_panel,
         accent,
-        cycle
+        chip_cycle
             .as_ref()
             .map(|(cycle, step, perimeter)| (cycle, *step, *perimeter)),
         monochrome,
@@ -573,17 +573,38 @@ mod tests {
         now: Duration,
         theme: ThemeId,
     ) -> Buffer {
-        let area = Rect::new(0, 0, 20, 5);
-        let mut buffer = Buffer::empty(area);
-        render_pane(
-            &mut buffer,
-            area,
+        render_with_capabilities(
+            Rect::new(0, 0, 20, 5),
             "STORAGE MAP",
-            Theme::for_id(theme),
             active,
             animate,
             monochrome,
             false,
+            now,
+            theme,
+        )
+    }
+
+    fn render_with_capabilities(
+        area: Rect,
+        title: &str,
+        active: bool,
+        animate: bool,
+        monochrome: bool,
+        ascii: bool,
+        now: Duration,
+        theme: ThemeId,
+    ) -> Buffer {
+        let mut buffer = Buffer::empty(area);
+        render_pane(
+            &mut buffer,
+            area,
+            title,
+            Theme::for_id(theme),
+            active,
+            animate,
+            monochrome,
+            ascii,
             now,
         );
         buffer
@@ -741,13 +762,27 @@ mod tests {
     #[test]
     fn reduced_motion_pins_the_focused_frame_to_the_focus_accent() {
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
-        let buffer = render(
+        let early = render(true, false, Duration::ZERO, ThemeId::CatppuccinMocha);
+        let late = render(
             true,
             false,
             Duration::from_millis(900),
             ThemeId::CatppuccinMocha,
         );
-        assert_eq!(buffer[(0, 4)].fg, derived_for(theme).0.at(0));
+
+        assert_eq!(early[(0, 4)].fg, derived_for(theme).0.at(0));
+        assert!(
+            early
+                .content
+                .iter()
+                .zip(late.content.iter())
+                .all(|(left, right)| {
+                    left.fg == right.fg
+                        && left.bg == right.bg
+                        && left.modifier == right.modifier
+                }),
+            "reduced-motion chrome must not advance its phase"
+        );
     }
 
     #[test]
@@ -761,6 +796,34 @@ mod tests {
                 "{id:?} reduced-motion focus border lost contrast"
             );
         }
+    }
+
+    #[test]
+    fn high_contrast_active_panes_stay_static_with_a_legible_title_chip() {
+        let early = render(true, true, Duration::ZERO, ThemeId::HighContrast);
+        let late = render(
+            true,
+            true,
+            Duration::from_millis(933),
+            ThemeId::HighContrast,
+        );
+
+        assert!(
+            early
+                .content
+                .iter()
+                .zip(late.content.iter())
+                .all(|(left, right)| {
+                    left.fg == right.fg
+                        && left.bg == right.bg
+                        && left.modifier == right.modifier
+                }),
+            "palette-only high-contrast chrome must not animate"
+        );
+        assert!(
+            early[(3, 0)].modifier.contains(Modifier::REVERSED),
+            "the static high-contrast chip must retain an explicit contrast treatment"
+        );
     }
 
     #[test]
@@ -786,6 +849,85 @@ mod tests {
     }
 
     #[test]
+    fn active_ascii_panes_hold_a_static_truncated_chip_inside_their_corners() {
+        let area = Rect::new(0, 0, 7, 5);
+        let early = render_with_capabilities(
+            area,
+            "WIDE",
+            true,
+            true,
+            false,
+            true,
+            Duration::ZERO,
+            ThemeId::CatppuccinMocha,
+        );
+        let late = render_with_capabilities(
+            area,
+            "WIDE",
+            true,
+            true,
+            false,
+            true,
+            Duration::from_millis(933),
+            ThemeId::CatppuccinMocha,
+        );
+
+        assert!(
+            early
+                .content
+                .iter()
+                .zip(late.content.iter())
+                .all(|(left, right)| {
+                    left.fg == right.fg
+                        && left.bg == right.bg
+                        && left.modifier == right.modifier
+                }),
+            "ASCII chrome must remain static even when the caller requests animation"
+        );
+        assert_eq!(row_text(&early, 0), "+| W |+");
+        assert!(
+            early.content.iter().all(|cell| cell.symbol().is_ascii()),
+            "ASCII chrome emitted a non-ASCII cell"
+        );
+    }
+
+    #[test]
+    fn animated_truncated_title_chip_keeps_corners_and_its_perimeter_phase() {
+        let area = Rect::new(4, 2, 7, 5);
+        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
+        let now = Duration::from_millis(533);
+        let cycle = derived_for(theme).0;
+        let step = cycle_step(now);
+        let perimeter = border_len(area);
+        let buffer = render_with_capabilities(
+            area,
+            "WIDE",
+            true,
+            true,
+            false,
+            false,
+            now,
+            ThemeId::CatppuccinMocha,
+        );
+
+        assert_eq!(row_text(&buffer, area.y), "▟▐ W ▌▜");
+        for x in (area.x + 2)..=(area.x + 4) {
+            assert_eq!(
+                buffer[(x, area.y)].bg,
+                cycle.at_perimeter(step, usize::from(x - area.x), perimeter),
+                "chip cell {x} must continue the top-border phase after truncation"
+            );
+        }
+        for x in [area.x, area.x + 1, area.x + 5, area.x + 6] {
+            assert_eq!(
+                buffer[(x, area.y)].fg,
+                cycle.at_perimeter(step, usize::from(x - area.x), perimeter),
+                "corner or cap {x} must preserve its top-border phase"
+            );
+        }
+    }
+
+    #[test]
     fn the_frame_walk_covers_each_border_cell_exactly_once() {
         let area = Rect::new(0, 0, 6, 4);
         let mut visits: Vec<(u16, u16)> = Vec::new();
@@ -801,18 +943,20 @@ mod tests {
     }
 
     #[test]
-    fn a_non_multiple_perimeter_closes_the_frame_cycle() {
+    fn a_non_multiple_perimeter_advances_as_one_closed_cycle() {
         let area = Rect::new(0, 0, 80, 15);
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
         let cycle = derived_for(theme).0;
         let now = Duration::from_millis(533);
         let step = cycle_step(now);
+        let later_now = now + Duration::from_millis(34);
+        let later_step = cycle_step(later_now);
         let perimeter = border_len(area);
-        let mut buffer = Buffer::empty(area);
+        let mut early = Buffer::empty(area);
         render_pane(
-            &mut buffer,
+            &mut early,
             area,
-            "PANE",
+            "",
             theme,
             true,
             true,
@@ -820,22 +964,44 @@ mod tests {
             false,
             now,
         );
+        let mut later = Buffer::empty(area);
+        render_pane(
+            &mut later,
+            area,
+            "",
+            theme,
+            true,
+            true,
+            false,
+            false,
+            later_now,
+        );
 
-        let mut last = (area.x, area.y);
-        walk_border(area, |x, y, _| last = (x, y));
         assert_eq!(
             perimeter, 186,
             "the fixture must not align with the 44-sample loop"
         );
-        assert_eq!(buffer[(0, 0)].fg, cycle.at_perimeter(step, 0, perimeter));
-        assert_eq!(
-            buffer[last].fg,
-            cycle.at_perimeter(step, perimeter - 1, perimeter),
-            "the trailing border cell must use the closed perimeter phase"
+        assert_ne!(step, later_step, "the fixture must cross an animation tick");
+        walk_border(area, |x, y, index| {
+            assert_eq!(
+                early[(x, y)].fg,
+                cycle.at_perimeter(step, index, perimeter),
+                "early phase restarted at border position {index}"
+            );
+            assert_eq!(
+                later[(x, y)].fg,
+                cycle.at_perimeter(later_step, index, perimeter),
+                "later phase restarted at border position {index}"
+            );
+        });
+        assert_ne!(
+            early[(0, 0)].fg,
+            later[(0, 0)].fg,
+            "the moving phase must visibly advance at the start of the perimeter"
         );
         assert_eq!(
             cycle.at_perimeter(step, perimeter, perimeter),
-            buffer[(0, 0)].fg,
+            early[(0, 0)].fg,
             "the virtual cell after the perimeter must join the first"
         );
     }
@@ -857,11 +1023,36 @@ mod tests {
     }
 
     #[test]
-    fn forced_monochrome_reverses_an_rgb_focused_chip() {
-        let buffer =
-            render_with_monochrome(true, false, true, Duration::ZERO, ThemeId::CatppuccinMocha);
+    fn forced_monochrome_focus_chrome_stays_static_and_reversed() {
+        let early = render_with_monochrome(
+            true,
+            true,
+            true,
+            Duration::ZERO,
+            ThemeId::CatppuccinMocha,
+        );
+        let late = render_with_monochrome(
+            true,
+            true,
+            true,
+            Duration::from_millis(933),
+            ThemeId::CatppuccinMocha,
+        );
+
         assert!(
-            buffer[(2, 0)].modifier.contains(Modifier::REVERSED),
+            early
+                .content
+                .iter()
+                .zip(late.content.iter())
+                .all(|(left, right)| {
+                    left.fg == right.fg
+                        && left.bg == right.bg
+                        && left.modifier == right.modifier
+                }),
+            "forced monochrome chrome must not advance its truecolour phase"
+        );
+        assert!(
+            early[(2, 0)].modifier.contains(Modifier::REVERSED),
             "a forced monochrome RGB chip must retain explicit focus contrast"
         );
     }

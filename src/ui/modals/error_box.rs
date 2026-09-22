@@ -1,6 +1,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::theme::Theme;
@@ -36,15 +37,19 @@ impl Widget for ErrorBox<'_> {
         let inner = render_modal(
             buffer,
             rect,
-            "! ERROR",
+            "ERROR",
             self.theme,
             self.theme.text_danger,
             self.ascii,
         );
-        Paragraph::new(format!(
-            "{}\n\n[Esc] dismiss",
-            display_text(self.error_message)
-        ))
+        Paragraph::new(vec![
+            Line::from(display_text(self.error_message)),
+            Line::from(""),
+            Line::styled(
+                "[Esc/q/Ctrl-C] close",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])
         .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
@@ -80,5 +85,7 @@ mod tests {
         assert!(text.contains("\\x1b"));
         assert!(!text.chars().any(char::is_control));
         assert!(!text.contains('\u{202e}'));
+        assert!(text.contains("ERROR"));
+        assert!(text.contains("[Esc/q/Ctrl-C] close"));
     }
 }

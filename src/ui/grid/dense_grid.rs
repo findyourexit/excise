@@ -13,8 +13,8 @@ use crate::state::tiles::{FileType, HALF_ROWS_PER_CELL, MapOverflow, Tile};
 use crate::theme::Theme;
 use crate::ui::format::{DisplaySize, display_os_str_info, truncate_marked, truncate_middle};
 use crate::ui::palette::{
-    Emphasis, MapPalette, TILE_BASE_DROP, TILE_CROWN_LIFT, TILE_EDGE_DROP, TILE_SELECTED_BASE_DROP,
-    TILE_SELECTED_EDGE_DROP, TileTone, derived_for,
+    Emphasis, MapPalette, Oklch, TILE_BASE_DROP, TILE_CROWN_LIFT, TILE_EDGE_DROP, TileTone,
+    derived_for,
 };
 
 /// Composite cell: the upper half takes the foreground colour, the lower half
@@ -440,24 +440,41 @@ impl TileInk {
         };
         let resting = palette.emphasised(resting, emphasis);
         let (text, detail) = resting.inks();
-        let base_drop = if emphasis == Emphasis::Selected {
-            TILE_SELECTED_BASE_DROP
+        let fill = resting.to_color();
+        let (crown, base, edge) = if emphasis == Emphasis::Selected {
+            (
+                selected_bevel_face(resting, fill, CROWN_LIFT),
+                selected_bevel_face(resting, fill, -BASE_DROP),
+                selected_bevel_face(resting, fill, -EDGE_DROP),
+            )
         } else {
-            BASE_DROP
-        };
-        let edge_drop = if emphasis == Emphasis::Selected {
-            TILE_SELECTED_EDGE_DROP
-        } else {
-            EDGE_DROP
+            (
+                resting.shifted(CROWN_LIFT, 1.0).to_color(),
+                resting.shifted(-BASE_DROP, 1.0).to_color(),
+                resting.shifted(-EDGE_DROP, 1.0).to_color(),
+            )
         };
         Self {
-            fill: resting.to_color(),
-            crown: resting.shifted(CROWN_LIFT, 1.0).to_color(),
-            base: resting.shifted(-base_drop, 1.0).to_color(),
-            edge: resting.shifted(-edge_drop, 1.0).to_color(),
+            fill,
+            crown,
+            base,
+            edge,
             text,
             detail,
         }
+    }
+}
+
+/// Keeps a selected bevel face visible when sRGB encoding clips its intended lift or drop.
+///
+/// The opposite half-strength shade is an endpoint escape hatch. It keeps all three faces
+/// distinct without changing the normal crown/base/edge direction away from gamut limits.
+fn selected_bevel_face(tone: Oklch, fill: Color, offset: f32) -> Color {
+    let face = tone.shifted(offset, 1.0).to_color();
+    if face == fill {
+        tone.shifted(-(offset * 0.5), 1.0).to_color()
+    } else {
+        face
     }
 }
 
@@ -2252,18 +2269,45 @@ mod tests {
     }
 
     #[test]
-    fn selected_tiles_keep_their_bottom_boundary_level() {
-        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
-        let palette = MapPalette::for_theme(theme).expect("mocha is truecolour");
-        let mut selected = tile(0, 0, 12, 6, 166);
-        selected.size = 1_048_576;
-        let scale = HeatScale::for_tiles(std::slice::from_ref(&selected));
-        let ink = TileInk::resolve(&selected, theme, palette, Emphasis::Selected, scale);
+    fn selected_tiles_keep_dimensional_crown_base_and_edge() {
+        let selected = tile(0, 0, 12, 6, 166);
+        let area = Rect::new(0, 0, 12, 3);
 
-        assert_eq!(
-            ink.base, ink.fill,
-            "selected bottom cells must not be darkened into a neighbouring entry"
-        );
+        for id in ThemeId::ALL {
+            if MapPalette::for_theme(Theme::for_id(id)).is_none() {
+                continue;
+            }
+            let buffer = render(
+                std::slice::from_ref(&selected),
+                area,
+                Some(0),
+                id,
+                false,
+            );
+
+            let body = buffer[(0, 1)].bg;
+            let crown = buffer[(0, 0)].fg;
+            let base = buffer[(0, 2)].bg;
+            let edge = buffer[(11, 1)].bg;
+            assert_ne!(
+                crown,
+                body,
+                "{id:?}: a selected crown must remain distinct from its fill"
+            );
+            assert_ne!(
+                base,
+                body,
+                "{id:?}: a selected base must remain distinct from its fill"
+            );
+            assert_ne!(
+                edge,
+                body,
+                "{id:?}: a selected trailing edge must remain distinct from its fill"
+            );
+            assert_ne!(crown, base, "{id:?}: crown and base must remain separate faces");
+            assert_ne!(crown, edge, "{id:?}: crown and edge must remain separate faces");
+            assert_ne!(base, edge, "{id:?}: base and edge must remain separate faces");
+        }
     }
 
     #[test]

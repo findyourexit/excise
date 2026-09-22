@@ -1,6 +1,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::theme::Theme;
@@ -36,16 +37,23 @@ impl Widget for NoticeBox<'_> {
         let inner = render_modal(
             buffer,
             rect,
-            "COMPLETE",
+            "DONE",
             self.theme,
             self.theme.state_complete,
             self.ascii,
         );
-        Paragraph::new(display_text(self.message))
-            .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true })
-            .render(inner, buffer);
+        Paragraph::new(vec![
+            Line::from(display_text(self.message)),
+            Line::from(""),
+            Line::styled(
+                "[Enter/Esc/q] close",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .render(inner, buffer);
     }
 }
 
@@ -77,5 +85,7 @@ mod tests {
         assert!(text.contains("\\x1b"));
         assert!(!text.chars().any(char::is_control));
         assert!(!text.contains('\u{202e}'));
+        assert!(text.contains("DONE"));
+        assert!(text.contains("[Enter/Esc/q] close"));
     }
 }
