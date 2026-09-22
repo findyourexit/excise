@@ -23,7 +23,7 @@ concurrency:
 jobs:
   tachyonfx:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       RELEASE_SHA: ${{ github.sha }}
     steps:
@@ -44,6 +44,18 @@ jobs:
         run: cargo bench --bench tachyonfx --features internal --locked -- --noplot
       - name: Run statistical core benchmark
         run: cargo bench --bench core --features internal --locked -- --noplot
+      - name: Run one-million canonical store evidence probe
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p target/criterion
+          EXCISE_BENCH_MILLION=1 cargo bench --bench core --features internal --locked -- scan-store/million-tiny-files --noplot --profile-time 1 2>&1 | tee target/criterion/million-tiny-files.log
+      - name: Run bounded million-file fan-in evidence probe
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p target/criterion
+          EXCISE_BENCH_MILLION=1 EXCISE_BENCH_MILLION_FANIN=1 cargo bench --bench core --features internal --locked -- scan-store/million-tiny-files/bounded-fan-in --noplot --profile-time 1 2>&1 | tee target/criterion/million-tiny-files-bounded-fan-in.log
       - name: Record reproducible benchmark context
         shell: bash
         run: |
@@ -61,7 +73,9 @@ jobs:
             printf '\ncommands:\n'
             printf '%s\n' \
               'cargo bench --bench tachyonfx --features internal --locked -- --noplot' \
-              'cargo bench --bench core --features internal --locked -- --noplot'
+              'cargo bench --bench core --features internal --locked -- --noplot' \
+              'EXCISE_BENCH_MILLION=1 cargo bench --bench core --features internal --locked -- scan-store/million-tiny-files --noplot --profile-time 1' \
+              'EXCISE_BENCH_MILLION=1 EXCISE_BENCH_MILLION_FANIN=1 cargo bench --bench core --features internal --locked -- scan-store/million-tiny-files/bounded-fan-in --noplot --profile-time 1'
             printf '\nrequested_toolchain=1.98.0\n'
             printf '\ntoolchain:\n'
             rustup show active-toolchain
