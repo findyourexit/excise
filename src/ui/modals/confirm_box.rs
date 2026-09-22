@@ -45,7 +45,10 @@ impl Widget for ConfirmBox {
             vec![
                 Line::from("Save interface preferences before quitting?"),
                 Line::from(""),
-                Line::styled("[s] Save and quit", Style::default().add_modifier(Modifier::BOLD)),
+                Line::styled(
+                    "[s] Save and quit",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Line::styled(
                     "[d] Quit without saving",
                     Style::default().add_modifier(Modifier::BOLD),
@@ -78,12 +81,8 @@ mod tests {
     fn rendered_quit_dialog(save_preferences: bool) -> String {
         let area = Rect::new(0, 0, 64, 10);
         let mut buffer = Buffer::empty(area);
-        ConfirmBox::new(
-            save_preferences,
-            Theme::for_id(ThemeId::ExciseDark),
-            false,
-        )
-        .render(area, &mut buffer);
+        ConfirmBox::new(save_preferences, Theme::for_id(ThemeId::ExciseDark), false)
+            .render(area, &mut buffer);
         buffer.content.iter().fold(String::new(), |mut text, cell| {
             text.push_str(cell.symbol());
             text

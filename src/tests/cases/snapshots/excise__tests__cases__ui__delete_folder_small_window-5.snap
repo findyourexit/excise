@@ -3,7 +3,7 @@ source: src/tests/cases/ui.rs
 expression: normalized
 ---
  EXCISE  /tmp/excise_[...]_small_window  ◆ COMPLETE         
- allocated #.#K   reclaim #.#K   apparent 8.0K   2 entries  
+ Used #.#K · Can reclaim #.#K · Content 8.0K · 2 items      
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
 ▟▐ LIST ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏▌  file2                                4.0K   50.0%      ▕
@@ -19,15 +19,15 @@ expression: normalized
 ▏                                                          ▕
 ▏                                                          ▕
 ▏                                                          ▕
-▏ ▟▐ ! DELETION RESULT · PRECISE ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜ ▕
+▏ ▟▐ DELETION RESULTS ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜ ▕
+▏ ▏Removed      2                                        ▕ ▕
+▏ ▏Changed      0                                        ▕ ▕
+▏ ▏Missing      0                                        ▕ ▕
+▏ ▏Failed       0                                        ▕ ▕
+▏ ▏Not started  0                                        ▕ ▕
+▏ ▏Finished. [Enter/Esc/q] close                         ▕ ▕
 ▏ ▏                                                      ▕ ▕
-▏ ▏deleted       2                                       ▕ ▕
-▏ ▏changed       0                                       ▕ ▕
-▏ ▏missing       0                                       ▕ ▕
-▏ ▏failed        0                                       ▕ ▕
-▏ ▏unattempted   0                                       ▕ ▕
 ▏ ▏                                                      ▕ ▕
-▏ ▏Result is precise. [Enter/Esc] close                  ▕ ▕
 ▏ ▏                                                      ▕ ▕
 ▏ ▏                                                      ▕ ▕
 ▏ ▏                                                      ▕ ▕
@@ -41,14 +41,14 @@ expression: normalized
 ▏                                                          ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
                                                             
-▟▐ INSPECT ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▟▐ SELECTED ITEM ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏file2                                                     ▕
 ▏◆ COMPLETE · file                                         ▕
-▏allocated #.#K · reclaim #.#K                             ▕
-▏apparent 4.0K · entries 0                                 ▕
-▏identity  Inode { device_id: ########, inode_number: ####…▕
-▏links     # · scope     materialized                      ▕
 ▏Actions unavailable                                       ▕
+▏Can reclaim #.#K · Space used #.#K                        ▕
+▏Content size 4.0K · 0 items                               ▕
+▏Item check: Inode { device_id: ########, inode_number: ##…▕
+▏Scan result: included                                     ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
  arrows/hjkl move  Enter open/rescan  / filter  ? help      
 Excise · REDUCED MOTION

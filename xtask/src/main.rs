@@ -376,9 +376,8 @@ const DEMO_MIN_FRAMES: u64 = 160;
 const DEMO_CURRENT_MAIN_GIF: &str = "assets/demo-main.gif";
 /// Staging output from `vhs`.
 ///
-/// The tape names the current-main GIF so it can also be rendered directly,
-/// but the task overrides that destination so a failed recording cannot reach
-/// the published current-main asset.
+/// The tape writes directly to this transient path, so a failed recording
+/// cannot overwrite the published current-main asset.
 const DEMO_RENDERED: &str = "assets/demo-main.rendered.gif";
 /// Intermediate for the palette pass.
 ///

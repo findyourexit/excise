@@ -3,7 +3,7 @@ source: src/tests/cases/ui.rs
 expression: normalized
 ---
  EXCISE  /tmp/excise_tests/medium_width  ◆ COMPLETE         
- allocated ##.#K   reclaim ##.#K   apparent 20.0K   3 entrie
+ Used ##.#K · Can reclaim ##.#K · Content 20.0K · 3 items   
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
 ▟▐ LIST ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏▌  file2                                8.0K   40.0%      ▕
@@ -23,11 +23,11 @@ expression: normalized
 ▏                                                          ▕
 ▏                                                          ▕
 ▏                                                          ▕
-▏ ▟▐ EXIT ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜ ▕
-▏ ▏                                                      ▕ ▕
+▏ ▟▐ QUIT ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜ ▕
 ▏ ▏                     Quit Excise?                     ▕ ▕
-▏ ▏              [y] quit    [Esc/q/n] back              ▕ ▕
 ▏ ▏                                                      ▕ ▕
+▏ ▏                       [y] Quit                       ▕ ▕
+▏ ▏                [Esc/q/n] Keep working                ▕ ▕
 ▏ ▏                                                      ▕ ▕
 ▏ ▏                                                      ▕ ▕
 ▏ ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ▕
@@ -41,14 +41,14 @@ expression: normalized
 ▏                                                          ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
                                                             
-▟▐ INSPECT ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▟▐ SELECTED ITEM ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏file2                                                     ▕
 ▏◆ COMPLETE · file                                         ▕
-▏allocated #.#K · reclaim #.#K                             ▕
-▏apparent 8.0K · entries 0                                 ▕
-▏identity  Inode { device_id: ########, inode_number: ####…▕
-▏links     # · scope     materialized                      ▕
 ▏Actions unavailable                                       ▕
+▏Can reclaim #.#K · Space used #.#K                        ▕
+▏Content size 8.0K · 0 items                               ▕
+▏Item check: Inode { device_id: ########, inode_number: ##…▕
+▏Scan result: included                                     ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
  arrows/hjkl move  Enter open/rescan  / filter  ? help      
 Excise · REDUCED MOTION

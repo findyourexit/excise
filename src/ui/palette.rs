@@ -41,7 +41,7 @@ const FILE_LIGHTNESS_LIFT: f32 = 0.05;
 /// it, so brightness remains a cursor signal in both light and dark themes.
 const SELECTION_LIGHTNESS_DISTANCE: f32 = 0.13;
 const SELECTION_CHROMA_SCALE: f32 = 0.75;
-const UNSELECTED_SINK: f32 = 0.42;
+const UNSELECTED_SINK: f32 = 0.60;
 const UNSELECTED_CHROMA_SCALE: f32 = 0.62;
 /// A baseline gap keeps selection away from the canvas before rendered contrast
 /// is checked against every tone boundary.
@@ -55,8 +55,8 @@ pub(crate) const TILE_EDGE_DROP: f32 = 0.085;
 /// map has no outline to carry the cursor when their brightness converges.
 #[cfg(test)]
 const MIN_SELECTION_CONTRAST: f32 = 3.0;
-/// Leave a small margin for rounded boundary samples between cached endpoints.
-const MIN_SELECTION_BOUNDARY_CONTRAST: f32 = 3.5;
+/// Margin for RGB rounding and between-sample boundary peaks.
+const MIN_SELECTION_BOUNDARY_CONTRAST: f32 = 3.55;
 /// Focus borders and other non-text emphasis must clear this contrast floor.
 pub(crate) const MIN_FOCUS_CONTRAST: f32 = 3.0;
 /// The name line needs normal text contrast against its rendered tile fill.

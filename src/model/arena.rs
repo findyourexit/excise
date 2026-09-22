@@ -748,6 +748,24 @@ impl Arena {
         Some(ids)
     }
 
+    /// Resolves a validated scan-root-relative path without allocating a full path.
+    #[must_use]
+    pub(crate) fn node_id_for_relative_path(&self, path: &Path) -> Option<NodeId> {
+        let mut current = self.root;
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(component) => {
+                    current = self.find_child(current, component)?;
+                }
+                std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => return None,
+            }
+        }
+        Some(current)
+    }
+
     #[must_use]
     pub fn children(&self, parent: NodeId) -> &[NodeId] {
         self.node(parent)
@@ -907,12 +925,40 @@ impl Arena {
         paths: &[PathBuf],
         link_counts: &HashMap<FileId, Option<u64>>,
     ) -> Result<usize, ModelError> {
+        let ids = paths
+            .iter()
+            .filter_map(|path| self.find_path(path))
+            .collect::<HashSet<_>>();
+        self.try_remove_node_ids_with_link_counts(&ids, link_counts)
+    }
+
+    /// Removes model-backed nodes selected while streaming deletion outcomes.
+    ///
+    /// The caller deduplicates the IDs before this method so reconciliation
+    /// remains bounded by the retained model rather than the report storage.
+    /// Covered descendants are pruned before their parent subtree is walked,
+    /// avoiding a removal buffer proportional to report paths times depth.
+    pub(crate) fn try_remove_node_ids_with_link_counts(
+        &mut self,
+        ids: &HashSet<NodeId>,
+        link_counts: &HashMap<FileId, Option<u64>>,
+    ) -> Result<usize, ModelError> {
         let mut removed = Vec::new();
-        for path in paths {
-            if let Some(id) = self.find_path(path)
-                && id != self.root
-            {
-                self.collect_subtree_ids(id, &mut removed);
+        for id in ids {
+            if *id == self.root || self.node(*id).is_none() {
+                continue;
+            }
+            let mut parent = self.node(*id).and_then(|node| node.parent);
+            let mut covered = false;
+            while let Some(ancestor) = parent {
+                if ids.contains(&ancestor) {
+                    covered = true;
+                    break;
+                }
+                parent = self.node(ancestor).and_then(|node| node.parent);
+            }
+            if !covered {
+                self.collect_subtree_ids(*id, &mut removed);
             }
         }
         self.remove_nodes_with_accounting_and_link_counts(removed, link_counts)

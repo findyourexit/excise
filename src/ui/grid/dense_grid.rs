@@ -2277,36 +2277,36 @@ mod tests {
             if MapPalette::for_theme(Theme::for_id(id)).is_none() {
                 continue;
             }
-            let buffer = render(
-                std::slice::from_ref(&selected),
-                area,
-                Some(0),
-                id,
-                false,
-            );
+            let buffer = render(std::slice::from_ref(&selected), area, Some(0), id, false);
 
             let body = buffer[(0, 1)].bg;
             let crown = buffer[(0, 0)].fg;
             let base = buffer[(0, 2)].bg;
             let edge = buffer[(11, 1)].bg;
             assert_ne!(
-                crown,
-                body,
+                crown, body,
                 "{id:?}: a selected crown must remain distinct from its fill"
             );
             assert_ne!(
-                base,
-                body,
+                base, body,
                 "{id:?}: a selected base must remain distinct from its fill"
             );
             assert_ne!(
-                edge,
-                body,
+                edge, body,
                 "{id:?}: a selected trailing edge must remain distinct from its fill"
             );
-            assert_ne!(crown, base, "{id:?}: crown and base must remain separate faces");
-            assert_ne!(crown, edge, "{id:?}: crown and edge must remain separate faces");
-            assert_ne!(base, edge, "{id:?}: base and edge must remain separate faces");
+            assert_ne!(
+                crown, base,
+                "{id:?}: crown and base must remain separate faces"
+            );
+            assert_ne!(
+                crown, edge,
+                "{id:?}: crown and edge must remain separate faces"
+            );
+            assert_ne!(
+                base, edge,
+                "{id:?}: base and edge must remain separate faces"
+            );
         }
     }
 

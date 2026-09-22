@@ -4,7 +4,7 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
 use crate::deletion::{
-    DeletionEntryOutcome, DeletionReport, PlannedKind, PlannedSnapshot, ReviewedEntry,
+    DeletionEntryOutcome, DeletionReport, PlannedKind, PlannedSnapshot, ReviewedEntry, same_object,
     validate_scan_root_identity,
 };
 use crate::filter::FilterPattern;
@@ -14,6 +14,7 @@ use crate::model::{
 };
 use crate::native_path::NativeIdentity;
 use crate::state::tiles::{FileMetadata, files_in_folder};
+use crate::state::{DeletionEligibility, DirectoryMaterialization, FileToDelete};
 use crate::temporary_storage::TemporaryStorage;
 use file_id::FileId;
 
@@ -172,10 +173,19 @@ impl FileTree {
         let id = self.arena.path_ids(path)?.last().copied()?;
         self.arena.node(id)?.snapshot.identity.clone()
     }
-    pub fn deletion_target_for_path(
-        &self,
-        path: &Path,
-    ) -> Result<crate::state::FileToDelete, ModelError> {
+    /// Returns a ready deletion target only when this path is fully materialized.
+    ///
+    /// Memory-compacted directories deliberately remain unavailable here; callers
+    /// that can run a fresh scan should use [`Self::deletion_eligibility_for_path`].
+    pub fn deletion_target_for_path(&self, path: &Path) -> Result<FileToDelete, ModelError> {
+        match self.deletion_eligibility_for_path(path)? {
+            DeletionEligibility::Ready(target) => Ok(target),
+            DeletionEligibility::RequiresMaterialization(_) => Err(ModelError::Invariant(
+                "deletion requires a fresh materialization of the compacted directory".to_string(),
+            )),
+        }
+    }
+    fn deletion_path_target_id(&self, path: &Path) -> Result<NodeId, ModelError> {
         let ids = self
             .arena
             .path_ids(path)
@@ -183,54 +193,163 @@ impl FileTree {
         let node_id = *ids
             .last()
             .ok_or_else(|| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
-        if ids.iter().any(|id| {
+        let ancestors_are_materialized = ids[..ids.len().saturating_sub(1)].iter().all(|id| {
             self.arena
                 .node(*id)
-                .is_none_or(|node| node.state != NodeState::Complete)
-        }) {
+                .is_some_and(|node| node.kind.is_directory() && node.state == NodeState::Complete)
+        });
+        if !ancestors_are_materialized {
             return Err(ModelError::Invariant(
-                "deletion requires a fully materialized path".to_string(),
+                "deletion requires a fully materialized concrete path".to_string(),
             ));
         }
+        Ok(node_id)
+    }
+
+    /// Returns the only safe next action for a retained model path.
+    ///
+    /// A compacted directory retains its concrete name and stable identity but no
+    /// child review. It must therefore be materialized through a fresh no-follow
+    /// scan before it can become a deletion target. Virtual `Other` and `Shared`
+    /// summaries, roots, incomplete paths, and nodes without an identity remain
+    /// ineligible.
+    pub fn deletion_eligibility_for_path(
+        &self,
+        path: &Path,
+    ) -> Result<DeletionEligibility, ModelError> {
+        let node_id = self.deletion_path_target_id(path)?;
+
+        let backing_path = self
+            .arena
+            .path_for(node_id)
+            .ok_or_else(|| ModelError::Invariant("deletion path disappeared".to_string()))?;
         let node = self
             .arena
             .node(node_id)
             .ok_or_else(|| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
-        if node.kind.is_synthetic() {
+        if node.snapshot.kind != node.kind {
             return Err(ModelError::Invariant(
-                "deletion requires a fully materialized subtree".to_string(),
+                "deletion target has an inconsistent model snapshot".to_string(),
             ));
         }
-        let relative = path
-            .strip_prefix(&self.path_in_filesystem)
-            .map_err(|_| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
-        let (file_type, num_descendants) = match node.kind {
-            NodeKind::Directory => (
-                crate::state::tiles::FileType::Folder,
-                Some(node.metrics.descendants),
-            ),
-            NodeKind::File | NodeKind::Link => (crate::state::tiles::FileType::File, None),
-            NodeKind::Root | NodeKind::Synthetic(_) => {
-                return Err(ModelError::Invariant(
-                    "scan roots and synthetic nodes cannot be deleted".to_string(),
-                ));
+        match node.kind {
+            NodeKind::Root => Err(ModelError::Invariant(
+                "scan roots cannot be deleted".to_string(),
+            )),
+            NodeKind::Synthetic(SyntheticKind::Aggregate) => {
+                if node.state != NodeState::Aggregated {
+                    return Err(ModelError::Invariant(
+                        "compacted deletion target is not ready for materialization".to_string(),
+                    ));
+                }
+                let identity = node.snapshot.identity.clone().ok_or_else(|| {
+                    ModelError::Invariant(
+                        "compacted deletion target has no verified concrete backing path"
+                            .to_string(),
+                    )
+                })?;
+                if identity.reparse_point {
+                    return Err(ModelError::Invariant(
+                        "compacted deletion target cannot be a link".to_string(),
+                    ));
+                }
+                Ok(DeletionEligibility::RequiresMaterialization(
+                    DirectoryMaterialization::new(node_id, backing_path, identity),
+                ))
             }
-        };
-        Ok(crate::state::FileToDelete {
-            node_id,
-            synthetic: false,
-            path_in_filesystem: self.path_in_filesystem.clone(),
-            path_to_file: relative.iter().map(OsStr::to_os_string).collect(),
-            file_type,
-            num_descendants,
-            size: if self.show_apparent_size {
-                node.metrics.apparent_bytes
-            } else {
-                node.metrics.allocated_bytes.lower
-            },
-            expected_snapshot: node.snapshot.clone(),
-            reviewed_entries: Vec::new(),
-        })
+            NodeKind::Synthetic(_) => {
+                debug_assert!(node.kind.is_virtual_summary());
+                Err(ModelError::Invariant(
+                    "virtual synthetic summaries cannot be deleted".to_string(),
+                ))
+            }
+            NodeKind::Directory | NodeKind::File | NodeKind::Link => {
+                if node.state != NodeState::Complete {
+                    return Err(ModelError::Invariant(
+                        "deletion requires a fully materialized target".to_string(),
+                    ));
+                }
+                if node.snapshot.identity.is_none() {
+                    return Err(ModelError::Invariant(
+                        "deletion requires a verified concrete backing path".to_string(),
+                    ));
+                }
+                let relative = backing_path
+                    .strip_prefix(&self.path_in_filesystem)
+                    .map_err(|_| ModelError::InvalidPath(path.to_string_lossy().into_owned()))?;
+                let (file_type, num_descendants) = match node.kind {
+                    NodeKind::Directory => (
+                        crate::state::tiles::FileType::Folder,
+                        Some(node.metrics.descendants),
+                    ),
+                    NodeKind::File | NodeKind::Link => (crate::state::tiles::FileType::File, None),
+                    NodeKind::Root | NodeKind::Synthetic(_) => unreachable!(
+                        "only concrete non-root targets reach deletion target construction"
+                    ),
+                };
+                Ok(DeletionEligibility::Ready(FileToDelete {
+                    node_id,
+                    synthetic: false,
+                    path_in_filesystem: self.path_in_filesystem.clone(),
+                    path_to_file: relative.iter().map(OsStr::to_os_string).collect(),
+                    file_type,
+                    num_descendants,
+                    size: if self.show_apparent_size {
+                        node.metrics.apparent_bytes
+                    } else {
+                        node.metrics.allocated_bytes.lower
+                    },
+                    expected_snapshot: node.snapshot.clone(),
+                    reviewed_entries: Vec::new(),
+                }))
+            }
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the integration layer owns dispatching a fresh scan from an issued request"
+    )]
+    /// Starts model staging for a fresh no-follow materialization scan.
+    ///
+    /// After this succeeds, the caller must dispatch its scanner with the
+    /// request path and expected identity. The request is rechecked against the
+    /// retained node so a stale or reused `NodeId` cannot stage an unrelated path.
+    pub fn begin_deletion_materialization(
+        &mut self,
+        materialization: &DirectoryMaterialization,
+        filter: Option<FilterPattern>,
+    ) -> Result<(), ModelError> {
+        let ids = self
+            .arena
+            .path_ids(materialization.path())
+            .ok_or_else(|| ModelError::Invariant("materialization path disappeared".to_string()))?;
+        let target_matches = ids.last().copied() == Some(materialization.node_id());
+        let ancestors_are_complete = ids[..ids.len().saturating_sub(1)].iter().all(|id| {
+            self.arena
+                .node(*id)
+                .is_some_and(|node| node.kind.is_directory() && node.state == NodeState::Complete)
+        });
+        let node_matches = self
+            .arena
+            .node(materialization.node_id())
+            .is_some_and(|node| {
+                node.kind.is_memory_compacted_directory()
+                    && node.snapshot.kind == node.kind
+                    && node.state == NodeState::Aggregated
+                    && node.snapshot.identity.as_ref().is_some_and(|identity| {
+                        same_object(identity, materialization.expected_identity())
+                    })
+                    && !materialization.expected_identity().reparse_point
+            });
+        let path_matches = self.arena.path_for(materialization.node_id()).as_deref()
+            == Some(materialization.path());
+        if !target_matches || !ancestors_are_complete || !node_matches || !path_matches {
+            return Err(ModelError::Invariant(
+                "deletion materialization request is stale".to_string(),
+            ));
+        }
+        self.begin_rescan(materialization.path().to_path_buf(), filter)
     }
 
     pub fn reviewed_subtree(
@@ -340,83 +459,121 @@ impl FileTree {
     }
 
     pub fn try_apply_deletion_report(&mut self, report: &DeletionReport) -> Result<(), ModelError> {
-        if !report.reporting_complete() || report.entries.is_spilled() {
-            self.mark_deletion_result_uncertain(report);
-            return Ok(());
-        }
-        let Some(entries) = report.entries.as_slice() else {
-            self.mark_deletion_result_uncertain(report);
-            return Ok(());
-        };
+        let report_target_is_valid = report.scan_root == self.path_in_filesystem
+            && report.contains_entry_path(&report.root_relative_path);
+        let mut target_uncertain =
+            !report_target_is_valid || !report.precise || !report.reporting_complete();
+        let mut tree_uncertain = target_uncertain;
+        // Reports can spill far beyond model memory. Retain only current model
+        // node IDs and their affected identities, never every report path.
+        let mut removed_nodes = HashSet::new();
         let mut affected_link_counts: HashMap<FileId, Option<u64>> = HashMap::new();
-        for result in entries {
-            if !matches!(
-                result.outcome,
-                DeletionEntryOutcome::Deleted | DeletionEntryOutcome::Missing
-            ) || !matches!(
-                result.entry.snapshot.kind,
-                PlannedKind::File | PlannedKind::Link
-            ) {
-                continue;
-            }
-            let file_id = result.entry.snapshot.identity.file_id;
-            let post_delete = matches!(result.outcome, DeletionEntryOutcome::Deleted)
-                .then(|| result.entry.snapshot.identity.link_count)
-                .flatten()
-                .map(|count| count.saturating_sub(1));
-            affected_link_counts
-                .entry(file_id)
-                .and_modify(|current| {
+        if report_target_is_valid {
+            for result in &report.entries {
+                let Ok(result) = result else {
+                    target_uncertain = true;
+                    tree_uncertain = true;
+                    break;
+                };
+                if !report.contains_entry_path(&result.entry.relative_path) {
+                    target_uncertain = true;
+                    tree_uncertain = true;
+                    continue;
+                }
+                if !matches!(
+                    &result.outcome,
+                    DeletionEntryOutcome::Deleted | DeletionEntryOutcome::Missing
+                ) {
+                    target_uncertain = true;
+                    continue;
+                }
+                let Some(node_id) = self
+                    .arena
+                    .node_id_for_relative_path(&result.entry.relative_path)
+                else {
+                    target_uncertain = true;
+                    tree_uncertain = true;
+                    continue;
+                };
+                let model_matches = self.arena.node(node_id).is_some_and(|node| {
+                    node_matches_planned_identity(node, &result.entry.snapshot)
+                });
+                if node_id == self.arena.root() || !model_matches {
+                    target_uncertain = true;
+                    tree_uncertain = true;
+                    continue;
+                }
+                if !removed_nodes.contains(&node_id) {
+                    if removed_nodes.try_reserve(1).is_err() {
+                        target_uncertain = true;
+                        tree_uncertain = true;
+                        break;
+                    }
+                    removed_nodes.insert(node_id);
+                }
+                if !matches!(
+                    result.entry.snapshot.kind,
+                    PlannedKind::File | PlannedKind::Link
+                ) {
+                    continue;
+                }
+                let file_id = result.entry.snapshot.identity.file_id;
+                let post_delete = matches!(&result.outcome, DeletionEntryOutcome::Deleted)
+                    .then_some(result.entry.snapshot.identity.link_count)
+                    .flatten()
+                    .map(|count| count.saturating_sub(1));
+                if let Some(current) = affected_link_counts.get_mut(&file_id) {
                     *current = match (*current, post_delete) {
                         (Some(_), Some(next)) => Some(next),
                         _ => None,
                     };
-                })
-                .or_insert(post_delete);
+                } else {
+                    if affected_link_counts.try_reserve(1).is_err() {
+                        target_uncertain = true;
+                        tree_uncertain = true;
+                        break;
+                    }
+                    affected_link_counts.insert(file_id, post_delete);
+                }
+            }
         }
-        let removed_paths = entries
-            .iter()
-            .filter(|result| {
-                matches!(
-                    result.outcome,
-                    DeletionEntryOutcome::Deleted | DeletionEntryOutcome::Missing
-                )
-            })
-            .map(|result| self.path_in_filesystem.join(&result.entry.relative_path))
-            .collect::<Vec<_>>();
         self.arena
-            .try_remove_paths_with_link_counts(&removed_paths, &affected_link_counts)?;
-        if report.changed_entries() > 0
-            || report.failed_entries() > 0
-            || report.unattempted_entries() > 0
-        {
-            let root = self.path_in_filesystem.join(&report.root_relative_path);
-            self.arena.mark_path_uncertain(
-                &root,
-                UnscannedReason::Metadata("deletion result requires a focused rescan".to_string()),
-            );
+            .try_remove_node_ids_with_link_counts(&removed_nodes, &affected_link_counts)?;
+        if target_uncertain {
+            self.mark_deletion_result_uncertain(report, report_target_is_valid, tree_uncertain);
         }
-        let freed = if self.show_apparent_size {
-            report.deleted_apparent_bytes()
-        } else {
-            report.deleted_allocated_bytes()
-        };
-        self.space_freed = self.space_freed.saturating_add(freed);
+        if report_target_is_valid {
+            let freed = if self.show_apparent_size {
+                report.deleted_apparent_bytes()
+            } else {
+                report.deleted_allocated_bytes()
+            };
+            self.space_freed = self.space_freed.saturating_add(freed);
+        }
         Ok(())
     }
 
-    fn mark_deletion_result_uncertain(&mut self, report: &DeletionReport) {
-        let root = self.path_in_filesystem.join(&report.root_relative_path);
-        self.arena.mark_path_uncertain(
-            &root,
-            UnscannedReason::Metadata("deletion result requires a focused rescan".to_string()),
-        );
-        let freed = if self.show_apparent_size {
-            report.deleted_apparent_bytes()
-        } else {
-            report.deleted_allocated_bytes()
-        };
-        self.space_freed = self.space_freed.saturating_add(freed);
+    fn mark_deletion_result_uncertain(
+        &mut self,
+        report: &DeletionReport,
+        report_target_is_valid: bool,
+        whole_tree: bool,
+    ) {
+        if report_target_is_valid {
+            let target = self.path_in_filesystem.join(&report.root_relative_path);
+            self.arena.mark_path_uncertain(
+                &target,
+                UnscannedReason::Metadata("deletion result requires a focused rescan".to_string()),
+            );
+        }
+        if whole_tree {
+            self.arena.mark_path_uncertain(
+                &self.path_in_filesystem,
+                UnscannedReason::Metadata(
+                    "deletion result has unresolved identity accounting".to_string(),
+                ),
+            );
+        }
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -692,6 +849,24 @@ fn record_unscanned_to(
             result => return result,
         }
     }
+}
+
+fn node_matches_planned_identity(node: &Node, planned: &PlannedSnapshot) -> bool {
+    let kind_matches = matches!(
+        (node.kind, planned.kind),
+        (NodeKind::Directory, PlannedKind::Directory)
+            | (NodeKind::File, PlannedKind::File)
+            | (NodeKind::Link, PlannedKind::Link)
+    );
+    // Deleted hard-link records intentionally clear the volatile link count.
+    // The stable object identity still binds the outcome to this model node.
+    kind_matches
+        && node.snapshot.kind == node.kind
+        && node
+            .snapshot
+            .identity
+            .as_ref()
+            .is_some_and(|identity| same_object(identity, &planned.identity))
 }
 
 #[cfg(test)]
@@ -1328,6 +1503,306 @@ mod tests {
             tree.deletion_target_for_path(&target),
             Err(crate::model::ModelError::Invariant(_))
         ));
+    }
+
+    #[test]
+    fn backed_aggregate_requires_fresh_materialization_before_deletion() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let compacted = root.path().join("compacted");
+        let child = compacted.join("child");
+        fs::create_dir(&compacted).expect("compacted directory should exist");
+        fs::write(&child, b"payload").expect("compacted child should exist");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &compacted);
+        add(&mut tree, &child);
+        for path in [&compacted, root.path()] {
+            tree.complete_directory(path, None)
+                .expect("fixture directory should complete");
+        }
+        tree.finalize().expect("fixture tree should finalize");
+        let compacted_id = node_id_at(&tree, &compacted);
+        let expected_identity = tree
+            .entry_snapshot(compacted_id)
+            .and_then(|snapshot| snapshot.identity)
+            .expect("concrete directory should retain its identity");
+        let root_id = tree.arena.root();
+        assert!(
+            tree.arena
+                .aggregate_cold_subtree(&HashSet::from([root_id]))
+                .expect("directory should compact")
+        );
+        assert_eq!(
+            tree.node_kind(compacted_id),
+            Some(NodeKind::Synthetic(SyntheticKind::Aggregate))
+        );
+
+        let materialization = match tree
+            .deletion_eligibility_for_path(&compacted)
+            .expect("compacted directory should have a materialization path")
+        {
+            crate::state::DeletionEligibility::RequiresMaterialization(request) => request,
+            crate::state::DeletionEligibility::Ready(_) => {
+                panic!("compacted directory must not be deletion-ready")
+            }
+        };
+        assert_eq!(materialization.node_id(), compacted_id);
+        assert_eq!(materialization.path(), compacted.as_path());
+        assert_eq!(materialization.expected_identity(), &expected_identity);
+        assert!(tree.deletion_target_for_path(&compacted).is_err());
+
+        tree.begin_deletion_materialization(&materialization, None)
+            .expect("issued materialization should start a focused scan");
+        add(&mut tree, &child);
+        tree.complete_directory(&compacted, None)
+            .expect("focused root should complete");
+        tree.finish_rescan()
+            .expect("focused materialization should replace the aggregate");
+
+        let target = match tree
+            .deletion_eligibility_for_path(&compacted)
+            .expect("materialized directory should be eligible")
+        {
+            crate::state::DeletionEligibility::Ready(target) => target,
+            crate::state::DeletionEligibility::RequiresMaterialization(_) => {
+                panic!("freshly scanned directory must be deletion-ready")
+            }
+        };
+        assert_eq!(target.expected_snapshot.kind, NodeKind::Directory);
+    }
+
+    #[test]
+    fn deletion_eligibility_refuses_virtual_and_unverified_nodes() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let compacted = root.path().join("compacted");
+        let child = compacted.join("child");
+        fs::create_dir(&compacted).expect("compacted directory should exist");
+        fs::write(&child, b"payload").expect("compacted child should exist");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &compacted);
+        add(&mut tree, &child);
+        for path in [&compacted, root.path()] {
+            tree.complete_directory(path, None)
+                .expect("fixture directory should complete");
+        }
+        tree.finalize().expect("fixture tree should finalize");
+        let compacted_id = node_id_at(&tree, &compacted);
+        let root_id = tree.arena.root();
+        assert!(
+            tree.arena
+                .aggregate_cold_subtree(&HashSet::from([root_id]))
+                .expect("directory should compact")
+        );
+        tree.arena
+            .node_mut(compacted_id)
+            .expect("aggregate should remain")
+            .snapshot
+            .identity = None;
+        assert!(matches!(
+            tree.deletion_eligibility_for_path(&compacted),
+            Err(crate::model::ModelError::Invariant(_))
+        ));
+
+        let summary_root = tempfile::tempdir().expect("summary root should exist");
+        let omitted = summary_root.path().join("omitted");
+        fs::write(&omitted, b"payload").expect("omitted entry should exist");
+        let mut summary_tree = FileTree::new(
+            summary_root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("summary tree should be created");
+        let metadata = fs::symlink_metadata(&omitted).expect("omitted metadata should exist");
+        let identity = identity_for(&omitted, &metadata)
+            .expect("omitted identity should be readable")
+            .expect("omitted entry should not be a link");
+        assert!(
+            summary_tree
+                .arena
+                .add_entry_aggregated(&omitted, &metadata, identity)
+                .expect("Other summary should be represented")
+                .is_none()
+        );
+        summary_tree
+            .complete_directory(summary_root.path(), None)
+            .expect("summary root should complete");
+        summary_tree
+            .finalize()
+            .expect("summary tree should finalize");
+        let other = summary_tree
+            .nodes()
+            .find(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Other))
+            .and_then(|node| summary_tree.path_for_id(node.id))
+            .expect("Other summary should remain");
+        assert!(matches!(
+            summary_tree.deletion_eligibility_for_path(&other),
+            Err(crate::model::ModelError::Invariant(_))
+        ));
+        assert!(matches!(
+            summary_tree.deletion_eligibility_for_path(summary_root.path()),
+            Err(crate::model::ModelError::Invariant(_))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn deletion_eligibility_refuses_shared_allocation_summary() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"payload").expect("first link should exist");
+        fs::hard_link(&first, &second).expect("second hard link should exist");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            false,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &first);
+        add(&mut tree, &second);
+        tree.complete_directory(root.path(), None)
+            .expect("root should complete");
+        tree.finalize().expect("tree should finalize");
+        let shared = tree
+            .nodes()
+            .find(|node| node.kind == NodeKind::Synthetic(SyntheticKind::Shared))
+            .and_then(|node| tree.path_for_id(node.id))
+            .expect("shared summary should remain");
+
+        assert!(matches!(
+            tree.deletion_eligibility_for_path(&shared),
+            Err(crate::model::ModelError::Invariant(_))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn stale_deletion_outcome_does_not_remove_a_replaced_model_entry() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let target = root.path().join("target");
+        let displaced = root.path().join("displaced");
+        fs::write(&target, b"old").expect("original target should exist");
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &target);
+        tree.complete_directory(root.path(), None)
+            .expect("root should complete");
+        tree.finalize().expect("tree should finalize");
+        let target_id = node_id_at(&tree, &target);
+        let snapshot = tree
+            .entry_snapshot(target_id)
+            .expect("target snapshot should exist");
+        let planned = PlannedEntry {
+            relative_path: PathBuf::from("target"),
+            snapshot: crate::deletion::PlannedSnapshot {
+                identity: snapshot
+                    .identity
+                    .clone()
+                    .expect("target should retain its identity"),
+                kind: PlannedKind::File,
+                apparent_bytes: snapshot.apparent_bytes,
+                allocated_bytes: snapshot.allocated_bytes,
+                modified_nanos: snapshot.modified_nanos,
+            },
+        };
+        fs::rename(&target, &displaced).expect("original target should be displaced");
+        fs::write(&target, b"new").expect("replacement target should exist");
+        add(&mut tree, &target);
+        let report = DeletionReport {
+            target_node_id: target_id,
+            root_relative_path: PathBuf::from("target"),
+            scan_root: root.path().to_path_buf(),
+            entries: vec![DeletionEntryResult {
+                entry: planned,
+                outcome: DeletionEntryOutcome::Deleted,
+            }]
+            .into(),
+            soft_cancelled: false,
+            precise: true,
+            estimated_bytes: 0,
+        };
+
+        tree.try_apply_deletion_report(&report)
+            .expect("stale outcome should be reconciled conservatively");
+
+        assert_eq!(tree.path_for_id(target_id), Some(target));
+        assert_eq!(tree.node_state(target_id), Some(NodeState::Uncertain));
+        assert_eq!(tree.total_node().state, NodeState::Uncertain);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn deletion_report_never_removes_a_path_outside_its_target() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let target = root.path().join("target");
+        let sibling = root.path().join("sibling");
+        fs::write(&target, b"target").expect("target should exist");
+        fs::write(&sibling, b"sibling").expect("sibling should exist");
+
+        let mut tree = FileTree::new(
+            root.path().to_path_buf(),
+            true,
+            crate::model::MIN_PROCESS_MIB,
+        )
+        .expect("file tree should be created");
+        add(&mut tree, &target);
+        add(&mut tree, &sibling);
+        tree.complete_directory(root.path(), None)
+            .expect("root should complete");
+        tree.finalize().expect("tree should finalize");
+        let target_id = node_id_at(&tree, &target);
+        let sibling_id = node_id_at(&tree, &sibling);
+        let sibling_snapshot = tree
+            .entry_snapshot(sibling_id)
+            .expect("sibling snapshot should exist");
+        let report = DeletionReport {
+            target_node_id: target_id,
+            root_relative_path: PathBuf::from("target"),
+            scan_root: root.path().to_path_buf(),
+            entries: vec![DeletionEntryResult {
+                entry: PlannedEntry {
+                    relative_path: PathBuf::from("sibling"),
+                    snapshot: crate::deletion::PlannedSnapshot {
+                        identity: sibling_snapshot
+                            .identity
+                            .expect("sibling should retain its identity"),
+                        kind: PlannedKind::File,
+                        apparent_bytes: sibling_snapshot.apparent_bytes,
+                        allocated_bytes: sibling_snapshot.allocated_bytes,
+                        modified_nanos: sibling_snapshot.modified_nanos,
+                    },
+                },
+                outcome: DeletionEntryOutcome::Deleted,
+            }]
+            .into(),
+            soft_cancelled: false,
+            precise: true,
+            estimated_bytes: 0,
+        };
+
+        tree.try_apply_deletion_report(&report)
+            .expect("invalid report path should be contained conservatively");
+
+        assert_eq!(tree.path_for_id(target_id), Some(target));
+        assert_eq!(tree.path_for_id(sibling_id), Some(sibling));
+        assert_eq!(tree.node_state(target_id), Some(NodeState::Uncertain));
+        assert_eq!(tree.total_node().state, NodeState::Uncertain);
     }
 
     #[cfg(any(unix, windows))]

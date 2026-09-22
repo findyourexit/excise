@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -601,8 +600,6 @@ where
     #[must_use]
     pub fn get_file_to_delete(&self) -> Option<FileToDelete> {
         let currently_selected = self.board.currently_selected()?;
-        let kind = self.file_tree.node_kind(currently_selected.node_id)?;
-        let synthetic = kind.is_synthetic();
         let full_path = self.file_tree.path_for_id(currently_selected.node_id)?;
         // Guard against NodeId reuse during loading: verify the model's current
         // leaf name AND parent directory for this NodeId match what the board
@@ -614,20 +611,7 @@ where
         {
             return None;
         }
-        let relative = full_path
-            .strip_prefix(&self.file_tree.path_in_filesystem)
-            .ok()?;
-        Some(FileToDelete {
-            node_id: currently_selected.node_id,
-            synthetic,
-            path_in_filesystem: self.file_tree.path_in_filesystem.clone(),
-            path_to_file: relative.iter().map(OsStr::to_os_string).collect(),
-            file_type: currently_selected.file_type,
-            num_descendants: currently_selected.descendants,
-            size: currently_selected.size,
-            expected_snapshot: self.file_tree.entry_snapshot(currently_selected.node_id)?,
-            reviewed_entries: Vec::new(),
-        })
+        self.file_tree.deletion_target_for_path(&full_path).ok()
     }
 
     pub fn prompt_file_deletion(&mut self) -> Option<FileToDelete> {

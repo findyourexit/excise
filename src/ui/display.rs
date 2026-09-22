@@ -431,9 +431,7 @@ const MIN_CURSOR_CONTRAST: f32 = 3.0;
 /// people can compare space before acting; its details are always stacked
 /// below it when the supported viewport has room for both panes.
 fn body_areas(area: Rect) -> (Rect, Option<Rect>) {
-    if area.width >= 32
-        && area.height >= MINIMUM_WORKSPACE_HEIGHT + INSPECTOR_HEIGHT + PANE_GAP
-    {
+    if area.width >= 32 && area.height >= MINIMUM_WORKSPACE_HEIGHT + INSPECTOR_HEIGHT + PANE_GAP {
         let workspace_height = area.height.saturating_sub(INSPECTOR_HEIGHT + PANE_GAP);
         let inspector = Rect::new(
             area.x,
@@ -1029,7 +1027,9 @@ fn render_inspector(
     );
     let action_line = Line::styled(
         truncate_middle(action, inner.width),
-        Style::default().fg(theme.text_muted).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.text_muted)
+            .add_modifier(Modifier::BOLD),
     );
     let details = if inner.width < 54 {
         let compact_state_line = if folded_detail.is_some() {
@@ -1059,11 +1059,7 @@ fn render_inspector(
                 &format!("Content size {content_size} {separator} {item_count}"),
                 inner.width,
             )),
-            Line::from(truncate_marked(
-                &scan_detail,
-                inner.width,
-                truncate_middle,
-            )),
+            Line::from(truncate_marked(&scan_detail, inner.width, truncate_middle)),
         ]
     } else if inner.height < 12 || (folded_detail.is_some() && inner.height < 13) {
         let item_check_or_summary = folded_detail.as_ref().map_or_else(
@@ -1083,11 +1079,7 @@ fn render_inspector(
                 inner.width,
             )),
             Line::from(item_check_or_summary),
-            Line::from(truncate_marked(
-                &scan_detail,
-                inner.width,
-                truncate_middle,
-            )),
+            Line::from(truncate_marked(&scan_detail, inner.width, truncate_middle)),
         ]
     } else {
         let mut details = vec![
@@ -1102,11 +1094,7 @@ fn render_inspector(
             Line::from(""),
             Line::from(truncate_middle(&item_check, inner.width)),
             Line::from(known_names),
-            Line::from(truncate_marked(
-                &scan_detail,
-                inner.width,
-                truncate_middle,
-            )),
+            Line::from(truncate_marked(&scan_detail, inner.width, truncate_middle)),
         ];
         if let Some(folded_detail) = &folded_detail {
             details.insert(8, Line::from(truncate_middle(folded_detail, inner.width)));
@@ -2069,7 +2057,10 @@ mod tests {
             theme,
             true,
         ));
-        assert!(narrow.width() <= 32, "narrow summary exceeds its viewport: {narrow:?}");
+        assert!(
+            narrow.width() <= 32,
+            "narrow summary exceeds its viewport: {narrow:?}"
+        );
         assert!(narrow.contains("Used"));
         assert!(narrow.contains("Reclaim"));
         assert!(!narrow.contains("allocated"));
@@ -2205,7 +2196,9 @@ mod tests {
         }
         assert!(
             text.find("Enter open").expect("action should render")
-                < text.find("Can reclaim").expect("reclaim estimate should render"),
+                < text
+                    .find("Can reclaim")
+                    .expect("reclaim estimate should render"),
             "the action should precede supporting storage details"
         );
         for jargon in ["allocated", "apparent", "identity", "links", "scope"] {
@@ -2271,7 +2264,12 @@ mod tests {
         });
         assert!(text.contains("1 item summarized here"));
         assert!(text.contains("Scan result: summary"));
-        for jargon in ["retained-entry cap", "memory budget", "MemoryAggregation", "scope"] {
+        for jargon in [
+            "retained-entry cap",
+            "memory budget",
+            "MemoryAggregation",
+            "scope",
+        ] {
             assert!(
                 !text.contains(jargon),
                 "model detail leaked into summary presentation: {jargon}"

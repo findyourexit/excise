@@ -54,6 +54,7 @@ fn metric_value_range(line: &str, marker: &str) -> Option<std::ops::Range<usize>
 
 const CANONICAL_IDENTITY: &str = "Inode { device_id: ########, inode_number: ######## }";
 const IDENTITY_VARIANTS: [&str; 3] = ["Inode", "LowRes", "HighRes"];
+const IDENTITY_CELL_MARKERS: [&str; 3] = ["identity  ", "identity ", "Item check: "];
 
 /// Canonical identity text, fitted to the width the inspector cell offers.
 ///
@@ -209,15 +210,12 @@ fn is_identity_cell_left_edge(character: char) -> bool {
 
 /// Replaces an identity cell with one canonical value of the same width.
 ///
-/// Identity carries filesystem numbers whose digit counts vary by machine, and
-/// Windows reports a different identity variant entirely, so the inspector's
-/// truncation lands on a different character on every platform. An overlay can
-/// also clip the cell down to one character of the variant name, which is
-/// still `I` on Unix and `L` or `H` on Windows. Replacing the whole cell rather
-/// than masking digits inside it is what keeps these frames comparable across
-/// the targets CI runs.
+/// Inspector identity text carries filesystem numbers whose digit counts vary
+/// by machine, and Windows reports a different identity variant entirely.
+/// Replacing the whole cell rather than masking digits inside it keeps these
+/// frames comparable across the targets CI runs.
 fn normalize_identity_cell(line: &str) -> String {
-    let Some((start, marker, end)) = ["identity  ", "identity "].into_iter().find_map(|marker| {
+    let Some((start, marker, end)) = IDENTITY_CELL_MARKERS.into_iter().find_map(|marker| {
         let start = line.find(marker)?;
         let value_start = start + marker.len();
         let rest = line.get(value_start..)?;
@@ -269,8 +267,9 @@ fn normalize_snapshot(frame: &str) -> String {
         let line = normalize_identity_cell(raw_line);
         let identity_start = (line != raw_line)
             .then(|| {
-                line.find("identity ")
-                    .map(|index| index + "identity ".len())
+                IDENTITY_CELL_MARKERS
+                    .into_iter()
+                    .find_map(|marker| line.find(marker).map(|index| index + marker.len()))
             })
             .flatten()
             .unwrap_or(usize::MAX);
@@ -280,6 +279,10 @@ fn normalize_snapshot(frame: &str) -> String {
         let metric_ranges = [
             metric_value_range(&line, "allocated "),
             metric_value_range(&line, "reclaim "),
+            metric_value_range(&line, "Space used "),
+            metric_value_range(&line, "Can reclaim "),
+            metric_value_range(&line, "Used "),
+            metric_value_range(&line, "Reclaim "),
         ];
         let mut in_identity_or_links_number = false;
         for (index, character) in line.char_indices() {
@@ -343,6 +346,15 @@ fn identity_cells_read_the_same_on_every_platform() {
         neighboring_paint,
         "paint after the closing border is outside the identity cell"
     );
+}
+
+#[test]
+fn item_check_cells_normalize_dynamic_identity_numbers() {
+    let item_check = "▏Item check: Inode { device_id: 16777232, inode_number: 1234567 }  ▕";
+    let normalized = normalize_snapshot(item_check);
+    assert!(normalized.contains("Item check: Inode"));
+    assert!(!normalized.contains("16777232"));
+    assert_eq!(normalize_snapshot(&normalized), normalized);
 }
 
 /// ASCII overlays reuse the map's shades and grain, so they must end an
@@ -509,12 +521,13 @@ fn create_temp_file<P: AsRef<Path>>(path: P, size: usize) -> Result<(), anyhow::
 
 fn assert_compact_inspector(frame: &str) {
     for expected in [
-        "INSPECT",
-        "allocated",
-        "reclaim",
-        "entries",
-        "identity",
-        "links",
+        "SELECTED ITEM",
+        "Enter open",
+        "Can reclaim",
+        "Space used",
+        "Content size",
+        "Item check:",
+        "Scan result:",
     ] {
         assert!(
             frame.contains(expected),
@@ -1108,13 +1121,13 @@ fn enter_folder_medium_width() {
     assert_snapshot!(&terminal_draw_events_mirror[0]);
     let selected_frame = &terminal_draw_events_mirror[1];
     for expected in [
-        "INSPECT",
-        "allocated",
-        "reclaim",
-        "entries",
-        "identity",
-        "links",
-        "scope",
+        "SELECTED ITEM",
+        "Enter open",
+        "Can reclaim",
+        "Space used",
+        "Content size",
+        "Item check:",
+        "Scan result:",
     ] {
         assert!(
             selected_frame.contains(expected),
@@ -2260,177 +2273,6 @@ fn cant_delete_file_with_term_too_small() {
 }
 
 #[test]
-fn delete_folder() {
-    let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
-
-    let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(None); // the map arms its own cursor; no priming keypress needed
-    events.push(None);
-    events.push(Some(key!(char 'l')));
-    events.push(None);
-    events.push(Some(key!(Backspace)));
-    events.push(None);
-    events.push(Some(key!(Enter)));
-    // here we sleep extra to allow the blink events to happen and be tested before the app exits
-    // with the following ctrl-c
-    events.push(None);
-    events.push(None);
-    events.push(None);
-    events.push(None);
-    events.push(Some(key!(ctrl 'c')));
-    events.push(None);
-    events.push(Some(key!(char 'y')));
-    let keyboard_events = Box::new(TerminalEvents::new(events));
-
-    let temp_dir_path = create_root_temp_dir("delete_folder").expect("failed to create temp dir");
-
-    let mut subfolder_1_path = temp_dir_path.path().to_path_buf();
-    subfolder_1_path.push("subfolder1");
-    create_dir(&subfolder_1_path).expect("failed to create temporary directory");
-
-    let mut file_1_path = temp_dir_path.path().to_path_buf();
-    file_1_path.push("subfolder1");
-    file_1_path.push("file1");
-    create_temp_file(&file_1_path, 4096).expect("failed to create temp file");
-
-    let mut file_2_path = temp_dir_path.path().to_path_buf();
-    file_2_path.push("file2");
-    create_temp_file(&file_2_path, 4096).expect("failed to create temp file");
-
-    let mut file_3_path = temp_dir_path.path().to_path_buf();
-    file_3_path.push("file3");
-    create_temp_file(&file_3_path, 4096).expect("failed to create temp file");
-
-    start(
-        backend,
-        keyboard_events,
-        temp_dir_path.path().to_path_buf(),
-        SHOW_APPARENT_SIZE,
-        DELETE_CONFIRMATION_ENABLED,
-    );
-    let terminal_draw_events_mirror = terminal_draw_events
-        .lock()
-        .expect("could not acquire lock on terminal events");
-
-    assert_terminal_lifecycle(
-        &terminal_events
-            .lock()
-            .expect("could not acquire lock on terminal_events"),
-    );
-    assert!(
-        std::fs::metadata(&subfolder_1_path).is_err(),
-        "folder successfully deleted"
-    );
-    assert!(
-        std::fs::metadata(&file_1_path).is_err(),
-        "internal file successfully deleted"
-    ); // can't really fail on its own, but left here for clarity
-    assert!(
-        std::fs::metadata(&file_2_path).is_ok(),
-        "different file was untouched"
-    );
-    assert!(
-        std::fs::metadata(&file_3_path).is_ok(),
-        "second different file was untouched"
-    );
-    drop(temp_dir_path);
-
-    assert_snapshot!(&terminal_draw_events_mirror[0]);
-    assert_snapshot!(&terminal_draw_events_mirror[1]);
-    assert_snapshot!(&terminal_draw_events_mirror[2]);
-    assert_snapshot!(&terminal_draw_events_mirror[3]);
-    assert_snapshot!(&terminal_draw_events_mirror[4]);
-    assert_snapshot!(&terminal_draw_events_mirror[5]);
-    assert_snapshot!(&terminal_draw_events_mirror[6]);
-    assert_snapshot!(&terminal_draw_events_mirror[7]);
-}
-
-#[test]
-fn delete_folder_no_confirmation() {
-    let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
-
-    let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(None); // the map arms its own cursor; no priming keypress needed
-    events.push(None);
-    events.push(Some(key!(char 'l')));
-    events.push(None);
-    events.push(Some(key!(Backspace)));
-    // here we sleep extra to allow the blink events to happen and be tested before the app exits
-    // with the following ctrl-c
-    events.push(None);
-    events.push(Some(key!(char 'y')));
-    events.push(None);
-    events.push(None);
-    events.push(None);
-    events.push(Some(key!(ctrl 'c')));
-    events.push(None);
-    events.push(Some(key!(char 'y')));
-    let keyboard_events = Box::new(TerminalEvents::new(events));
-
-    let temp_dir_path =
-        create_root_temp_dir("delete_folder_no_confirmation").expect("failed to create temp dir");
-
-    let mut subfolder_1_path = temp_dir_path.path().to_path_buf();
-    subfolder_1_path.push("subfolder1");
-    create_dir(&subfolder_1_path).expect("failed to create temporary directory");
-
-    let mut file_1_path = temp_dir_path.path().to_path_buf();
-    file_1_path.push("subfolder1");
-    file_1_path.push("file1");
-    create_temp_file(&file_1_path, 4096).expect("failed to create temp file");
-
-    let mut file_2_path = temp_dir_path.path().to_path_buf();
-    file_2_path.push("file2");
-    create_temp_file(&file_2_path, 4096).expect("failed to create temp file");
-
-    let mut file_3_path = temp_dir_path.path().to_path_buf();
-    file_3_path.push("file3");
-    create_temp_file(&file_3_path, 4096).expect("failed to create temp file");
-
-    start(
-        backend,
-        keyboard_events,
-        temp_dir_path.path().to_path_buf(),
-        SHOW_APPARENT_SIZE,
-        DELETE_CONFIRMATION_DISABLED,
-    );
-    let terminal_draw_events_mirror = terminal_draw_events
-        .lock()
-        .expect("could not acquire lock on terminal events");
-
-    assert_terminal_lifecycle(
-        &terminal_events
-            .lock()
-            .expect("could not acquire lock on terminal_events"),
-    );
-    assert!(
-        std::fs::metadata(&subfolder_1_path).is_err(),
-        "folder successfully deleted"
-    );
-    assert!(
-        std::fs::metadata(&file_1_path).is_err(),
-        "internal file successfully deleted"
-    ); // can't really fail on its own, but left here for clarity
-    assert!(
-        std::fs::metadata(&file_2_path).is_ok(),
-        "different file was untouched"
-    );
-    assert!(
-        std::fs::metadata(&file_3_path).is_ok(),
-        "second different file was untouched"
-    );
-    drop(temp_dir_path);
-
-    assert_snapshot!(&terminal_draw_events_mirror[0]);
-    assert_snapshot!(&terminal_draw_events_mirror[1]);
-    assert_snapshot!(&terminal_draw_events_mirror[2]);
-    assert_snapshot!(&terminal_draw_events_mirror[3]);
-    assert_snapshot!(&terminal_draw_events_mirror[4]);
-    assert_snapshot!(&terminal_draw_events_mirror[5]);
-    assert_snapshot!(&terminal_draw_events_mirror[6]);
-}
-
-#[test]
 fn delete_folder_small_window() {
     // terminal window with a width of 60 (shorter message window layout)
     let (terminal_events, terminal_draw_events, backend) = test_backend_factory(60, 50);
@@ -2608,325 +2450,6 @@ fn delete_folder_small_window_no_confirmation() {
     assert_snapshot!(&terminal_draw_events_mirror[5]);
     assert_snapshot!(&terminal_draw_events_mirror[6]);
     assert_snapshot!(&terminal_draw_events_mirror[7]);
-}
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn delete_folder_with_multiple_children() {
-    let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
-
-    let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(None); // the map arms its own cursor; no priming keypress needed
-    events.push(None);
-    events.push(Some(key!(char 'l')));
-    events.push(None);
-    events.push(Some(key!(Backspace)));
-    events.push(None);
-    events.push(Some(key!(Enter)));
-    // here we sleep extra to allow the blink events to happen and be tested before the app exits
-    // with the following ctrl-c
-    events.push(None);
-    events.push(None);
-    events.push(None);
-    events.push(None);
-    events.push(Some(key!(ctrl 'c')));
-    events.push(None);
-    events.push(Some(key!(char 'y')));
-    let keyboard_events = Box::new(TerminalEvents::new(events));
-
-    let temp_dir_path = create_root_temp_dir("delete_folder_with_multiple_children")
-        .expect("failed to create temp dir");
-
-    let mut file_1_path = temp_dir_path.path().to_path_buf();
-    file_1_path.push("file1");
-    create_temp_file(&file_1_path, 16384).expect("failed to create temp file");
-
-    let mut file_2_path = temp_dir_path.path().to_path_buf();
-    file_2_path.push("file2");
-    create_temp_file(&file_2_path, 16384).expect("failed to create temp file");
-
-    let mut subfolder_1_path = temp_dir_path.path().to_path_buf();
-    subfolder_1_path.push("subfolder1");
-    create_dir(&subfolder_1_path).expect("failed to create temporary directory");
-
-    let mut subfolder_2_path = temp_dir_path.path().to_path_buf();
-    subfolder_2_path.push("subfolder1");
-    subfolder_2_path.push("subfolder2");
-    create_dir(&subfolder_2_path).expect("failed to create temporary directory");
-
-    let mut file_3_path = temp_dir_path.path().to_path_buf();
-    file_3_path.push("subfolder1");
-    file_3_path.push("subfolder2");
-    file_3_path.push("file3");
-    create_temp_file(&file_3_path, 4096).expect("failed to create temp file");
-
-    let mut file_4_path = temp_dir_path.path().to_path_buf();
-    file_4_path.push("subfolder1");
-    file_4_path.push("subfolder2");
-    file_4_path.push("file4");
-    create_temp_file(&file_4_path, 4096).expect("failed to create temp file");
-
-    let mut file_5_path = temp_dir_path.path().to_path_buf();
-    file_5_path.push("subfolder1");
-    file_5_path.push("file5");
-    create_temp_file(&file_5_path, 4096).expect("failed to create temp file");
-
-    start(
-        backend,
-        keyboard_events,
-        temp_dir_path.path().to_path_buf(),
-        SHOW_APPARENT_SIZE,
-        DELETE_CONFIRMATION_ENABLED,
-    );
-    let terminal_draw_events_mirror = terminal_draw_events
-        .lock()
-        .expect("could not acquire lock on terminal events");
-
-    assert_terminal_lifecycle(
-        &terminal_events
-            .lock()
-            .expect("could not acquire lock on terminal_events"),
-    );
-    assert!(
-        std::fs::metadata(&subfolder_1_path).is_err(),
-        "folder successfully deleted"
-    );
-    assert!(
-        std::fs::metadata(&subfolder_2_path).is_err(),
-        "folder inside deleted folder successfully deleted"
-    );
-    assert!(
-        std::fs::metadata(&file_1_path).is_ok(),
-        "different file was untouched"
-    );
-    assert!(
-        std::fs::metadata(&file_2_path).is_ok(),
-        "different file was untouched"
-    );
-    assert!(
-        std::fs::metadata(&file_3_path).is_err(),
-        "internal file in folder deleted"
-    );
-    assert!(
-        std::fs::metadata(&file_4_path).is_err(),
-        "internal file in folder deleted"
-    );
-    assert!(
-        std::fs::metadata(&file_5_path).is_err(),
-        "internal file in folder deleted"
-    );
-    drop(temp_dir_path);
-
-    assert_snapshot!(&terminal_draw_events_mirror[0]);
-    assert_snapshot!(&terminal_draw_events_mirror[1]);
-    assert_snapshot!(&terminal_draw_events_mirror[2]);
-    assert_snapshot!(&terminal_draw_events_mirror[3]);
-    assert_snapshot!(&terminal_draw_events_mirror[4]);
-    assert_snapshot!(&terminal_draw_events_mirror[5]);
-    assert_snapshot!(&terminal_draw_events_mirror[6]);
-    assert_snapshot!(&terminal_draw_events_mirror[7]);
-}
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn delete_folder_with_multiple_children_no_confirmation() {
-    let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
-
-    let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(None); // the map arms its own cursor; no priming keypress needed
-    events.push(None);
-    events.push(Some(key!(char 'l')));
-    events.push(None);
-    events.push(Some(key!(Backspace)));
-    events.push(None);
-    events.push(Some(key!(char 'y')));
-    // here we sleep extra to allow the blink events to happen and be tested before the app exits
-    // with the following ctrl-c
-    events.push(None);
-    events.push(None);
-    events.push(None);
-    events.push(Some(key!(ctrl 'c')));
-    events.push(None);
-    events.push(Some(key!(char 'y')));
-    let keyboard_events = Box::new(TerminalEvents::new(events));
-
-    let temp_dir_path =
-        create_root_temp_dir("delete_folder_with_multiple_children_no_confirmation")
-            .expect("failed to create temp dir");
-
-    let mut file_1_path = temp_dir_path.path().to_path_buf();
-    file_1_path.push("file1");
-    create_temp_file(&file_1_path, 16384).expect("failed to create temp file");
-
-    let mut file_2_path = temp_dir_path.path().to_path_buf();
-    file_2_path.push("file2");
-    create_temp_file(&file_2_path, 16384).expect("failed to create temp file");
-
-    let mut subfolder_1_path = temp_dir_path.path().to_path_buf();
-    subfolder_1_path.push("subfolder1");
-    create_dir(&subfolder_1_path).expect("failed to create temporary directory");
-
-    let mut subfolder_2_path = temp_dir_path.path().to_path_buf();
-    subfolder_2_path.push("subfolder1");
-    subfolder_2_path.push("subfolder2");
-    create_dir(&subfolder_2_path).expect("failed to create temporary directory");
-
-    let mut file_3_path = temp_dir_path.path().to_path_buf();
-    file_3_path.push("subfolder1");
-    file_3_path.push("subfolder2");
-    file_3_path.push("file3");
-    create_temp_file(&file_3_path, 4096).expect("failed to create temp file");
-
-    let mut file_4_path = temp_dir_path.path().to_path_buf();
-    file_4_path.push("subfolder1");
-    file_4_path.push("subfolder2");
-    file_4_path.push("file4");
-    create_temp_file(&file_4_path, 4096).expect("failed to create temp file");
-
-    let mut file_5_path = temp_dir_path.path().to_path_buf();
-    file_5_path.push("subfolder1");
-    file_5_path.push("file5");
-    create_temp_file(&file_5_path, 4096).expect("failed to create temp file");
-
-    start(
-        backend,
-        keyboard_events,
-        temp_dir_path.path().to_path_buf(),
-        SHOW_APPARENT_SIZE,
-        DELETE_CONFIRMATION_DISABLED,
-    );
-    let terminal_draw_events_mirror = terminal_draw_events
-        .lock()
-        .expect("could not acquire lock on terminal events");
-
-    assert_terminal_lifecycle(
-        &terminal_events
-            .lock()
-            .expect("could not acquire lock on terminal_events"),
-    );
-    assert!(
-        std::fs::metadata(&subfolder_1_path).is_err(),
-        "folder successfully deleted"
-    );
-    assert!(
-        std::fs::metadata(&subfolder_2_path).is_err(),
-        "folder inside deleted folder successfully deleted"
-    );
-    assert!(
-        std::fs::metadata(&file_1_path).is_ok(),
-        "different file was untouched"
-    );
-    assert!(
-        std::fs::metadata(&file_2_path).is_ok(),
-        "different file was untouched"
-    );
-    assert!(
-        std::fs::metadata(&file_3_path).is_err(),
-        "internal file in folder deleted"
-    );
-    assert!(
-        std::fs::metadata(&file_4_path).is_err(),
-        "internal file in folder deleted"
-    );
-    assert!(
-        std::fs::metadata(&file_5_path).is_err(),
-        "internal file in folder deleted"
-    );
-    drop(temp_dir_path);
-
-    assert_snapshot!(&terminal_draw_events_mirror[0]);
-    assert_snapshot!(&terminal_draw_events_mirror[1]);
-    assert_snapshot!(&terminal_draw_events_mirror[2]);
-    assert_snapshot!(&terminal_draw_events_mirror[3]);
-    assert_snapshot!(&terminal_draw_events_mirror[4]);
-    assert_snapshot!(&terminal_draw_events_mirror[5]);
-    assert_snapshot!(&terminal_draw_events_mirror[6]);
-}
-
-/// The map arms a cursor as soon as it has entries, so the first Backspace of a
-/// session already has a target and raises the confirmation. Answering `n`
-/// leaves the filesystem untouched.
-#[test]
-fn a_fresh_map_already_has_a_delete_target() {
-    let (terminal_events, terminal_draw_events, backend) = test_backend_factory(190, 50);
-
-    let mut events: Vec<Option<Event>> = std::iter::repeat_n(None, 1).collect();
-    events.push(Some(key!(Backspace)));
-    events.push(None);
-    events.push(Some(key!(char 'n')));
-    events.push(None);
-    events.push(Some(key!(ctrl 'c')));
-    events.push(None);
-    events.push(Some(key!(char 'y')));
-    let keyboard_events = Box::new(TerminalEvents::new(events));
-
-    let temp_dir_path = create_root_temp_dir("a_fresh_map_already_has_a_delete_target")
-        .expect("failed to create temp dir");
-
-    let mut subfolder_1_path = temp_dir_path.path().to_path_buf();
-    subfolder_1_path.push("subfolder1");
-    create_dir(&subfolder_1_path).expect("failed to create temporary directory");
-
-    let mut file_1_path = temp_dir_path.path().to_path_buf();
-    file_1_path.push("subfolder1");
-    file_1_path.push("file1");
-    create_temp_file(&file_1_path, 4096).expect("failed to create temp file");
-
-    let mut file_2_path = temp_dir_path.path().to_path_buf();
-    file_2_path.push("file2");
-    create_temp_file(&file_2_path, 4096).expect("failed to create temp file");
-
-    let mut file_3_path = temp_dir_path.path().to_path_buf();
-    file_3_path.push("file3");
-    create_temp_file(&file_3_path, 4096).expect("failed to create temp file");
-
-    start(
-        backend,
-        keyboard_events,
-        temp_dir_path.path().to_path_buf(),
-        SHOW_APPARENT_SIZE,
-        DELETE_CONFIRMATION_ENABLED,
-    );
-    let terminal_draw_events_mirror = terminal_draw_events
-        .lock()
-        .expect("could not acquire lock on terminal events");
-
-    assert_terminal_lifecycle(
-        &terminal_events
-            .lock()
-            .expect("could not acquire lock on terminal_events"),
-    );
-    assert!(std::fs::metadata(&file_2_path).is_ok(), "file not deleted");
-    assert!(
-        std::fs::metadata(&subfolder_1_path).is_ok(),
-        "different folder stayed the same"
-    );
-    assert!(
-        std::fs::metadata(&file_1_path).is_ok(),
-        "different file was untoucehd"
-    );
-    assert!(
-        std::fs::metadata(&file_3_path).is_ok(),
-        "second different file was untouched"
-    );
-    drop(temp_dir_path);
-
-    assert_snapshot!(&terminal_draw_events_mirror[0]);
-    assert_snapshot!(&terminal_draw_events_mirror[1]);
-    let confirmation_index = terminal_draw_events_mirror
-        .iter()
-        .position(|frame| frame.contains("PERMANENT FILE DELETION"))
-        .expect("fresh-map deletion should reach confirmation");
-    terminal_draw_events_mirror
-        .iter()
-        .skip(confirmation_index.saturating_add(1))
-        .find(|frame| {
-            frame.contains("STORAGE MAP")
-                && !frame.contains("PERMANENT FILE DELETION")
-                && !frame.contains("BUILDING IDENTITY PLAN")
-                && !frame.contains("Quit Excise?")
-        })
-        .expect("n should return to the normal map before quitting");
 }
 
 #[test]

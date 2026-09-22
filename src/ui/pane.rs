@@ -109,6 +109,7 @@ pub(crate) fn render_pane(
         theme,
         theme.surface_panel,
         accent,
+        active,
         chip_cycle
             .as_ref()
             .map(|(cycle, step, perimeter)| (cycle, *step, *perimeter)),
@@ -191,6 +192,7 @@ fn draw_title_chip(
     theme: Theme,
     surface: Color,
     accent: Color,
+    active: bool,
     cycle: Option<(&ColorCycle, usize, usize)>,
     monochrome: bool,
     ascii: bool,
@@ -205,7 +207,7 @@ fn draw_title_chip(
         return;
     }
     let static_style = if cycle.is_none() {
-        static_chip_style(accent, theme, monochrome)
+        static_chip_style(accent, theme, monochrome, active)
     } else {
         Style::default()
     };
@@ -296,22 +298,32 @@ const TITLE_CHIP_CONTRAST_FLOOR: f32 = 4.5;
 
 /// Applies the strongest semantic contrast once for a chip that does not travel
 /// with the focus cycle, falling back to the animated chip's neutral polarity.
-fn static_chip_style(lead: Color, theme: Theme, monochrome: bool) -> Style {
+fn static_chip_style(lead: Color, theme: Theme, monochrome: bool, active: bool) -> Style {
     if lead == Color::Reset && theme.surface_base == Color::Reset {
-        // The monochrome theme has no colour channel. Leave the inactive chip
-        // plain so the active chip's reverse-video treatment remains distinct.
-        return Style::default()
+        // The monochrome theme has no colour channel. Reverse the active chip
+        // so it remains distinct from its inactive counterpart.
+        let style = Style::default()
             .fg(lead)
             .bg(theme.surface_panel)
             .add_modifier(Modifier::BOLD);
+        return if active {
+            style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
+        };
     }
     if monochrome && !matches!(lead, Color::Rgb(..)) {
-        // ANSI colours cannot be measured, and the active chip already carries
-        // reverse video in forced monochrome. Keep this inactive chip plain.
-        return Style::default()
+        // ANSI colours cannot be measured for contrast. Reverse the active
+        // chip so palette terminals retain a visible focus cue.
+        let style = Style::default()
             .fg(lead)
             .bg(theme.surface_panel)
             .add_modifier(Modifier::BOLD);
+        return if active {
+            style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
+        };
     }
     match strongest_static_ink(lead, [theme.text_primary, theme.surface_base]) {
         Some(ink) => Style::default()
@@ -534,6 +546,7 @@ pub(crate) fn render_modal(
         theme,
         theme.surface_raised,
         accent,
+        true,
         None,
         false,
         ascii,
@@ -562,6 +575,22 @@ mod tests {
         })
     }
 
+    #[derive(Clone, Copy)]
+    enum PanePresentation {
+        Color,
+        Monochrome,
+        Ascii,
+    }
+
+    #[derive(Clone, Copy)]
+    struct PaneRenderSettings {
+        active: bool,
+        animate: bool,
+        presentation: PanePresentation,
+        now: Duration,
+        theme: ThemeId,
+    }
+
     fn render(active: bool, animate: bool, now: Duration, theme: ThemeId) -> Buffer {
         render_with_monochrome(active, animate, false, now, theme)
     }
@@ -576,36 +605,38 @@ mod tests {
         render_with_capabilities(
             Rect::new(0, 0, 20, 5),
             "STORAGE MAP",
-            active,
-            animate,
-            monochrome,
-            false,
-            now,
-            theme,
+            PaneRenderSettings {
+                active,
+                animate,
+                presentation: if monochrome {
+                    PanePresentation::Monochrome
+                } else {
+                    PanePresentation::Color
+                },
+                now,
+                theme,
+            },
         )
     }
 
-    fn render_with_capabilities(
-        area: Rect,
-        title: &str,
-        active: bool,
-        animate: bool,
-        monochrome: bool,
-        ascii: bool,
-        now: Duration,
-        theme: ThemeId,
-    ) -> Buffer {
+    fn render_with_capabilities(area: Rect, title: &str, settings: PaneRenderSettings) -> Buffer {
+        let (monochrome, ascii) = match settings.presentation {
+            PanePresentation::Color => (false, false),
+            PanePresentation::Monochrome => (true, false),
+            PanePresentation::Ascii => (false, true),
+        };
+
         let mut buffer = Buffer::empty(area);
         render_pane(
             &mut buffer,
             area,
             title,
-            Theme::for_id(theme),
-            active,
-            animate,
+            Theme::for_id(settings.theme),
+            settings.active,
+            settings.animate,
             monochrome,
             ascii,
-            now,
+            settings.now,
         );
         buffer
     }
@@ -777,9 +808,7 @@ mod tests {
                 .iter()
                 .zip(late.content.iter())
                 .all(|(left, right)| {
-                    left.fg == right.fg
-                        && left.bg == right.bg
-                        && left.modifier == right.modifier
+                    left.fg == right.fg && left.bg == right.bg && left.modifier == right.modifier
                 }),
             "reduced-motion chrome must not advance its phase"
         );
@@ -814,9 +843,7 @@ mod tests {
                 .iter()
                 .zip(late.content.iter())
                 .all(|(left, right)| {
-                    left.fg == right.fg
-                        && left.bg == right.bg
-                        && left.modifier == right.modifier
+                    left.fg == right.fg && left.bg == right.bg && left.modifier == right.modifier
                 }),
             "palette-only high-contrast chrome must not animate"
         );
@@ -854,22 +881,26 @@ mod tests {
         let early = render_with_capabilities(
             area,
             "WIDE",
-            true,
-            true,
-            false,
-            true,
-            Duration::ZERO,
-            ThemeId::CatppuccinMocha,
+            PaneRenderSettings {
+                active: true,
+                animate: true,
+                presentation: PanePresentation::Ascii,
+
+                now: Duration::ZERO,
+                theme: ThemeId::CatppuccinMocha,
+            },
         );
         let late = render_with_capabilities(
             area,
             "WIDE",
-            true,
-            true,
-            false,
-            true,
-            Duration::from_millis(933),
-            ThemeId::CatppuccinMocha,
+            PaneRenderSettings {
+                active: true,
+                animate: true,
+                presentation: PanePresentation::Ascii,
+
+                now: Duration::from_millis(933),
+                theme: ThemeId::CatppuccinMocha,
+            },
         );
 
         assert!(
@@ -878,9 +909,7 @@ mod tests {
                 .iter()
                 .zip(late.content.iter())
                 .all(|(left, right)| {
-                    left.fg == right.fg
-                        && left.bg == right.bg
-                        && left.modifier == right.modifier
+                    left.fg == right.fg && left.bg == right.bg && left.modifier == right.modifier
                 }),
             "ASCII chrome must remain static even when the caller requests animation"
         );
@@ -902,12 +931,13 @@ mod tests {
         let buffer = render_with_capabilities(
             area,
             "WIDE",
-            true,
-            true,
-            false,
-            false,
-            now,
-            ThemeId::CatppuccinMocha,
+            PaneRenderSettings {
+                active: true,
+                animate: true,
+                presentation: PanePresentation::Color,
+                now,
+                theme: ThemeId::CatppuccinMocha,
+            },
         );
 
         assert_eq!(row_text(&buffer, area.y), "▟▐ W ▌▜");
@@ -953,28 +983,10 @@ mod tests {
         let later_step = cycle_step(later_now);
         let perimeter = border_len(area);
         let mut early = Buffer::empty(area);
-        render_pane(
-            &mut early,
-            area,
-            "",
-            theme,
-            true,
-            true,
-            false,
-            false,
-            now,
-        );
+        render_pane(&mut early, area, "", theme, true, true, false, false, now);
         let mut later = Buffer::empty(area);
         render_pane(
-            &mut later,
-            area,
-            "",
-            theme,
-            true,
-            true,
-            false,
-            false,
-            later_now,
+            &mut later, area, "", theme, true, true, false, false, later_now,
         );
 
         assert_eq!(
@@ -1024,13 +1036,8 @@ mod tests {
 
     #[test]
     fn forced_monochrome_focus_chrome_stays_static_and_reversed() {
-        let early = render_with_monochrome(
-            true,
-            true,
-            true,
-            Duration::ZERO,
-            ThemeId::CatppuccinMocha,
-        );
+        let early =
+            render_with_monochrome(true, true, true, Duration::ZERO, ThemeId::CatppuccinMocha);
         let late = render_with_monochrome(
             true,
             true,
@@ -1045,9 +1052,7 @@ mod tests {
                 .iter()
                 .zip(late.content.iter())
                 .all(|(left, right)| {
-                    left.fg == right.fg
-                        && left.bg == right.bg
-                        && left.modifier == right.modifier
+                    left.fg == right.fg && left.bg == right.bg && left.modifier == right.modifier
                 }),
             "forced monochrome chrome must not advance its truecolour phase"
         );
