@@ -1137,19 +1137,14 @@ mod tests {
     }
 
     #[test]
-    fn grouped_summaries_are_selectable_but_shared_totals_are_not() {
-        let mut grouped = file(1, 0.7);
-        grouped.file_type = FileType::Synthetic;
-        grouped.synthetic_kind = Some(SyntheticKind::Other);
+    fn shared_totals_are_not_selectable() {
+        let concrete = file(1, 0.8);
         let mut shared = file(2, 0.2);
         shared.file_type = FileType::Synthetic;
         shared.synthetic_kind = Some(SyntheticKind::Shared);
-        let mut aggregate = file(3, 0.1);
-        aggregate.file_type = FileType::Folder;
-        aggregate.synthetic_kind = Some(SyntheticKind::Aggregate);
         let mut board = Board::new();
         board.change_area(Rect::new(0, 0, 80, 24));
-        board.change_files(vec![grouped, shared, aggregate]);
+        board.change_files(vec![concrete, shared]);
 
         assert_eq!(
             board.currently_selected().map(|tile| tile.node_id),

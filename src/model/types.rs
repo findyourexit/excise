@@ -81,9 +81,7 @@ impl NodeMetrics {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SyntheticKind {
-    Other,
     Shared,
-    Aggregate,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -106,21 +104,6 @@ impl NodeKind {
     pub const fn is_synthetic(self) -> bool {
         matches!(self, Self::Synthetic(_))
     }
-    /// Returns whether this node is a concrete directory that was compacted only
-    /// to satisfy the model memory budget.
-    #[must_use]
-    pub const fn is_memory_compacted_directory(self) -> bool {
-        matches!(self, Self::Synthetic(SyntheticKind::Aggregate))
-    }
-
-    /// Returns whether this synthetic node is only a virtual accounting summary.
-    #[must_use]
-    pub const fn is_virtual_summary(self) -> bool {
-        matches!(
-            self,
-            Self::Synthetic(SyntheticKind::Other | SyntheticKind::Shared)
-        )
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -128,7 +111,6 @@ impl NodeKind {
 pub enum NodeState {
     Scanning,
     Complete,
-    Aggregated,
     Uncertain,
 }
 
@@ -151,7 +133,6 @@ pub enum UnscannedReason {
     /// The scan continues, but its bounded identity store can no longer prove
     /// exact physical-allocation and reclaimability metrics.
     IdentityStorageCapacity,
-    MemoryAggregation,
 }
 #[derive(Clone, Debug)]
 pub struct Node {
@@ -228,17 +209,8 @@ mod tests {
     }
 
     #[test]
-    fn compacted_directories_remain_distinct_from_virtual_summaries() {
-        let aggregate = NodeKind::Synthetic(SyntheticKind::Aggregate);
-        assert!(aggregate.is_synthetic());
-        assert!(aggregate.is_memory_compacted_directory());
-        assert!(!aggregate.is_virtual_summary());
-
-        for summary in [SyntheticKind::Other, SyntheticKind::Shared] {
-            let summary = NodeKind::Synthetic(summary);
-            assert!(summary.is_synthetic());
-            assert!(!summary.is_memory_compacted_directory());
-            assert!(summary.is_virtual_summary());
-        }
+    fn shared_allocation_remains_the_only_synthetic_summary() {
+        let summary = NodeKind::Synthetic(SyntheticKind::Shared);
+        assert!(summary.is_synthetic());
     }
 }

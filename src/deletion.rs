@@ -1320,9 +1320,7 @@ pub enum DeletionPlanError {
 impl fmt::Display for DeletionPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Synthetic => {
-                formatter.write_str("aggregate and synthetic nodes cannot be deleted")
-            }
+            Self::Synthetic => formatter.write_str("synthetic summary nodes cannot be deleted"),
             Self::Root => {
                 formatter.write_str("scan, filesystem, and mount roots cannot be deleted")
             }

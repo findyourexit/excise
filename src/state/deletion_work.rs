@@ -4,16 +4,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use super::FileToDelete;
 use crate::deletion::DeletionPlan;
 use crate::model::NodeId;
 use crate::native_path::safe_display_path_text;
 use crate::scan_coordinator::{
-    CompletionOutcome, RelativePath, RequeueOutcome, ScanCoordinator, ScanGeneration,
-    WorkCompletion, WorkKey, WorkKind, WorkLease, WorkPriority,
+    CompletionOutcome, RelativePath, RequeueOutcome, ScanGeneration, SessionCoordinator,
+    WorkCompletion, WorkKind, WorkLease, WorkPriority,
 };
 use crate::scan_session::ScanSessionId;
-
-use super::FileToDelete;
 
 /// Interactive deletion retains only visible, independently cancellable work.
 pub(crate) const MAX_DELETION_WORK_ITEMS: usize = 4;
@@ -162,11 +161,11 @@ enum DeletionWorkStage {
     CancellingPlanning,
 }
 
-/// Owner-loop deletion state. The coordinator ledger owns every active plan
+/// Owner-loop deletion state. The session coordinator owns every active plan
 /// and mutation lease, while this bounded rail retains only user-facing work.
 pub(crate) struct DeletionWork {
     items: VecDeque<DeletionWorkItem>,
-    coordinator: ScanCoordinator,
+    coordinator: SessionCoordinator,
     leases: Vec<(DeletionWorkId, WorkLease)>,
     next_id: u64,
 }
@@ -180,17 +179,19 @@ impl Default for DeletionWork {
 impl DeletionWork {
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self::new_for_session(
+        let coordinator = SessionCoordinator::start(
             ScanSessionId::from_bytes([0; 16]),
             ScanGeneration::initial(),
         )
+        .expect("test deletion coordinator should start");
+        Self::new_for_coordinator(coordinator)
     }
 
     #[must_use]
-    pub(crate) fn new_for_session(session: ScanSessionId, generation: ScanGeneration) -> Self {
+    pub(crate) fn new_for_coordinator(coordinator: SessionCoordinator) -> Self {
         Self {
             items: VecDeque::with_capacity(MAX_DELETION_WORK_ITEMS),
-            coordinator: ScanCoordinator::new(session, generation),
+            coordinator,
             leases: Vec::with_capacity(MAX_DELETION_WORK_ITEMS),
             next_id: 0,
         }
@@ -633,7 +634,9 @@ impl DeletionWork {
 
     #[must_use]
     pub(crate) fn has_active_mutation(&self) -> bool {
-        self.coordinator.snapshot().active_deletion_execution()
+        self.coordinator
+            .snapshot()
+            .is_ok_and(crate::scan_coordinator::SchedulerSnapshot::active_deletion_execution)
             && self
                 .items
                 .iter()
@@ -764,26 +767,10 @@ impl DeletionWork {
         relative_path: RelativePath,
         priority: WorkPriority,
     ) -> Option<WorkLease> {
-        let key = WorkKey::new(
-            self.coordinator.session(),
-            self.coordinator.generation(),
-            kind,
-            relative_path,
-        );
-        if !matches!(
-            self.coordinator.schedule(key.clone(), priority),
-            crate::scan_coordinator::ScheduleOutcome::Enqueued
-                | crate::scan_coordinator::ScheduleOutcome::PriorityRaised
-                | crate::scan_coordinator::ScheduleOutcome::AlreadyPending
-        ) {
-            return None;
-        }
-        let lease = self.coordinator.lease_next()?;
-        if lease.key() == &key {
-            return Some(lease);
-        }
-        let _ = self.coordinator.requeue(&lease);
-        None
+        self.coordinator
+            .acquire(kind, relative_path, priority)
+            .ok()
+            .flatten()
     }
 
     fn remember_lease(&mut self, work_id: DeletionWorkId, lease: WorkLease) {
@@ -808,14 +795,18 @@ impl DeletionWork {
         let Some(lease) = self.take_lease(work_id) else {
             return false;
         };
-        self.coordinator.finish(&lease, completion) == CompletionOutcome::Accepted
+        self.coordinator
+            .finish(lease, completion)
+            .is_ok_and(|outcome| outcome == CompletionOutcome::Accepted)
     }
 
     fn requeue_lease(&mut self, work_id: DeletionWorkId) -> bool {
         let Some(lease) = self.take_lease(work_id) else {
             return false;
         };
-        self.coordinator.requeue(&lease) == RequeueOutcome::Requeued
+        self.coordinator
+            .requeue(lease)
+            .is_ok_and(|outcome| outcome == RequeueOutcome::Requeued)
     }
 
     fn finish_planning(&mut self, work_id: DeletionWorkId, completion: WorkCompletion) -> bool {
@@ -945,6 +936,12 @@ mod tests {
         }
     }
 
+    fn coordinator_snapshot(work: &DeletionWork) -> crate::scan_coordinator::SchedulerSnapshot {
+        work.coordinator
+            .snapshot()
+            .expect("session coordinator should remain available")
+    }
+
     #[test]
     fn queue_rejects_overlapping_targets_and_enforces_its_capacity() {
         let mut work = DeletionWork::new();
@@ -1001,17 +998,17 @@ mod tests {
             .map(|(_, lease)| lease)
             .expect("planning work should retain its coordinator lease");
         assert_eq!(lease.key().kind(), WorkKind::PlanDeletion);
-        assert_eq!(work.coordinator.snapshot().active_leases(), 1);
+        assert_eq!(coordinator_snapshot(&work).active_leases(), 1);
 
         work.restore_unsubmitted(command);
-        assert_eq!(work.coordinator.snapshot().active_leases(), 0);
-        assert_eq!(work.coordinator.snapshot().pending().foreground(), 1);
+        assert_eq!(coordinator_snapshot(&work).active_leases(), 0);
+        assert_eq!(coordinator_snapshot(&work).pending().foreground(), 1);
 
         let _ = work
             .next_planning_command()
             .expect("requeued planning work should lease again");
         assert!(work.planning_failed(work_id));
-        let snapshot = work.coordinator.snapshot();
+        let snapshot = coordinator_snapshot(&work);
         assert_eq!(snapshot.active_leases(), 0);
         assert_eq!(snapshot.terminal().failed(), 1);
     }

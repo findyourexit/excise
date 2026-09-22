@@ -824,10 +824,7 @@ fn is_ramp_eligible(tile: &Tile) -> bool {
 }
 
 fn is_virtual_summary(tile: &Tile) -> bool {
-    matches!(
-        tile.synthetic_kind,
-        Some(SyntheticKind::Other | SyntheticKind::Shared)
-    )
+    tile.synthetic_kind == Some(SyntheticKind::Shared)
 }
 
 /// Every colour one entry needs, resolved once per frame rather than per cell.
@@ -857,14 +854,13 @@ impl TileInk {
         } else if is_ramp_eligible(tile) {
             palette.tile(size_heat(tile.size), tone)
         } else if is_virtual_summary(tile) {
-            // `Other` and `Shared` represent totals rather than a filesystem
-            // object. Keep them quiet at rest; selection still lifts a grouped
-            // total clearly out of the map.
+            // Shared allocation is a virtual accounting total rather than a
+            // filesystem object, so it stays quiet until selected.
             palette.semantic(theme.text_muted)
         } else if tile.uncertain {
             palette.semantic(theme.state_uncertain)
         } else {
-            palette.semantic(theme.state_aggregated)
+            palette.semantic(theme.state_attention)
         };
         let emphasised = palette.emphasised(source, emphasis);
         let resting = if emphasis == Emphasis::Selected {
@@ -1914,13 +1910,6 @@ fn tile_label(tile: &Tile, ascii: bool) -> Option<TileLabel> {
                 .filter(|value| value.width() <= usize::from(max_width))
                 .unwrap_or(folder)
         }
-        FileType::Synthetic if tile.synthetic_kind == Some(SyntheticKind::Other) => {
-            let grouped = tile.descendants.map_or_else(
-                || "Grouped items".to_string(),
-                |count| format!("Grouped ({count})"),
-            );
-            format!("[{grouped}]")
-        }
         FileType::Synthetic => format!("[{}]", name.text),
     };
     let uncertainty =
@@ -2939,14 +2928,14 @@ mod tests {
     }
 
     #[test]
-    fn grouped_summary_labels_disclose_contained_items() {
-        let mut grouped = tile(0, 0, 20, 4, 1);
-        grouped.file_type = FileType::Synthetic;
-        grouped.synthetic_kind = Some(crate::model::SyntheticKind::Other);
-        grouped.descendants = Some(12);
+    fn shared_summary_labels_remain_explicit() {
+        let mut shared = tile(0, 0, 32, 4, 1);
+        shared.file_type = FileType::Synthetic;
+        shared.synthetic_kind = Some(crate::model::SyntheticKind::Shared);
+        shared.name = OsString::from("Shared allocation");
 
-        let label = tile_label(&grouped, false).expect("grouped tile should have a label");
-        assert_eq!(label.first, "[Grouped (12)]");
+        let label = tile_label(&shared, false).expect("shared tile should have a label");
+        assert_eq!(label.first, "[Shared allocation]");
     }
 
     #[test]
@@ -3341,11 +3330,8 @@ mod tests {
         let mut shared = tile(24, 0, 8, 6, 4);
         shared.size = 1_099_511_627_776;
         shared.synthetic_kind = Some(crate::model::SyntheticKind::Shared);
-        let mut aggregate = tile(32, 0, 8, 6, 5);
-        aggregate.size = 1_125_899_906_842_624;
-        aggregate.synthetic_kind = Some(crate::model::SyntheticKind::Aggregate);
-        let tiles = [cold.clone(), hot.clone(), uncertain, shared, aggregate];
-        let area = Rect::new(0, 0, 40, 3);
+        let tiles = [cold.clone(), hot.clone(), uncertain, shared];
+        let area = Rect::new(0, 0, 32, 3);
         let buffer = render(&tiles, area, None, ThemeId::CatppuccinMocha, false);
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
         let Some(palette) = crate::ui::palette::derived_for(theme).1 else {

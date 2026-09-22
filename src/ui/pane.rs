@@ -997,7 +997,7 @@ mod tests {
                 theme.focus,
                 theme.text_danger,
                 theme.state_complete,
-                theme.state_aggregated,
+                theme.state_attention,
             ] {
                 let area = Rect::new(0, 0, 30, 8);
                 let mut buffer = Buffer::empty(area);

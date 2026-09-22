@@ -27,7 +27,7 @@ use crate::model::{ByteBounds, EntrySnapshot, NodeKind, UnscannedReason};
 use crate::native_path::{NativeIdentity, identity_for};
 use crate::os::physical_size;
 use crate::scan_coordinator::{
-    RelativePath, ScanGeneration, SchedulerSnapshot, WorkCompletion, WorkLease,
+    RelativePath, ScanGeneration, SessionCoordinator, WorkCompletion, WorkLease,
 };
 use crate::scan_session::ScanSessionId;
 use crate::scan_store::identity_observation::IdentityObservation;
@@ -47,6 +47,7 @@ pub struct ScannerOptions {
     pub session: ScanSessionId,
     pub root_identity: Option<NativeIdentity>,
     pub generation: ScanGeneration,
+    pub coordinator: SessionCoordinator,
     pub threads: usize,
     pub cross_filesystems: bool,
     pub exclusions: Vec<String>,
@@ -156,16 +157,6 @@ impl ScannerHandle {
         if let Some(scheduler) = scheduler {
             scheduler.prioritize(path);
         }
-    }
-
-    #[must_use]
-    pub(super) fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
-        let scheduler = self
-            .scheduler
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        scheduler.and_then(|scheduler| scheduler.snapshot())
     }
 
     pub(super) fn request_rebuild(
@@ -307,8 +298,7 @@ fn run_generation(
     let command_capacity = options.threads.saturating_mul(BATCH_SIZE).max(1);
     let (commands, command_receiver) = bounded(command_capacity);
     let (focus, focus_receiver) = bounded(MAX_FOCUS_REQUESTS);
-    let snapshot = Arc::new(Mutex::new(None));
-    let scheduler = SchedulerHandle::new(focus, Arc::clone(&snapshot));
+    let scheduler = SchedulerHandle::new(focus);
     *active_scheduler
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scheduler);
@@ -321,7 +311,6 @@ fn run_generation(
             commands,
             command_receiver,
             focus_receiver,
-            &snapshot,
         );
     }))
     .is_err()
@@ -347,7 +336,6 @@ fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancelled: &Atomic
     let command_capacity = options.threads.saturating_mul(BATCH_SIZE).max(1);
     let (commands, command_receiver) = bounded(command_capacity);
     let (focus, focus_receiver) = bounded(MAX_FOCUS_REQUESTS);
-    let snapshot = Arc::new(Mutex::new(None));
     run_with_scheduler(
         options,
         sender,
@@ -355,7 +343,6 @@ fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancelled: &Atomic
         commands,
         command_receiver,
         focus_receiver,
-        &snapshot,
     );
     drop(focus);
 }
@@ -368,11 +355,11 @@ fn run_with_scheduler(
     scheduler_commands: Sender<SchedulerCommand>,
     scheduler_receiver: Receiver<SchedulerCommand>,
     focus_receiver: Receiver<PathBuf>,
-    scheduler_snapshot: &Arc<Mutex<Option<SchedulerSnapshot>>>,
 ) {
     let ScannerOptions {
         session,
         generation,
+        coordinator,
         root,
         root_identity,
         threads,
@@ -559,7 +546,7 @@ fn run_with_scheduler(
         let scheduler_failed = &scan_failed;
         let scheduler_root_invalid = &root_invalid;
         let scheduler_events = sender;
-        let scheduler_snapshot = Arc::clone(scheduler_snapshot);
+        let scheduler_coordinator = coordinator.clone();
         let scheduler = match thread::Builder::new()
             .name("excise-scan-coordinator".to_string())
             .spawn_scoped(scope, move || {
@@ -568,6 +555,7 @@ fn run_with_scheduler(
                     scheduler_root,
                     session,
                     generation,
+                    scheduler_coordinator,
                     scheduler_receiver,
                     focus_receiver,
                     assignment_senders,
@@ -576,7 +564,6 @@ fn run_with_scheduler(
                     scheduler_failed,
                     scheduler_root_invalid,
                     scheduler_events,
-                    scheduler_snapshot.as_ref(),
                 );
             }) {
             Ok(handle) => handle,
@@ -1750,6 +1737,11 @@ mod tests {
             ScannerOptions {
                 session: ScanSessionId::from_bytes([4; 16]),
                 generation: ScanGeneration::initial(),
+                coordinator: SessionCoordinator::start(
+                    ScanSessionId::from_bytes([4; 16]),
+                    ScanGeneration::initial(),
+                )
+                .expect("scanner coordinator should start"),
                 root: root.path().to_path_buf(),
                 root_identity: None,
                 threads: 1,
@@ -1815,6 +1807,8 @@ mod tests {
             ScannerOptions {
                 session: store.session(),
                 generation: input_runs.generation(),
+                coordinator: SessionCoordinator::start(store.session(), input_runs.generation())
+                    .expect("scanner coordinator should start"),
                 root: root.path().to_path_buf(),
                 root_identity: None,
                 threads: 1,
@@ -1934,6 +1928,8 @@ mod tests {
             ScannerOptions {
                 session: store.session(),
                 generation: input_runs.generation(),
+                coordinator: SessionCoordinator::start(store.session(), input_runs.generation())
+                    .expect("scanner coordinator should start"),
                 root: root.to_path_buf(),
                 root_identity: None,
                 threads,

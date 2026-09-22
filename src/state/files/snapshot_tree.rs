@@ -400,7 +400,7 @@ impl SnapshotTree {
                     NodeKind::Synthetic(SyntheticKind::Shared) => {
                         (Some(0), FileType::Synthetic, Some(SyntheticKind::Shared))
                     }
-                    NodeKind::Root | NodeKind::Synthetic(_) => {
+                    NodeKind::Root => {
                         unreachable!(
                             "snapshot pages contain only direct concrete entries or shared totals"
                         )
@@ -459,7 +459,7 @@ impl SnapshotTree {
     }
 
     /// Builds a deletion target only for a directly observed item on the active
-    /// live page. Aggregate and inferred preview nodes are deliberately rejected.
+    /// provisional page. Shared summaries and inferred preview nodes are deliberately rejected.
     pub(crate) fn deletion_target_from_preview(
         &self,
         node_id: NodeId,
