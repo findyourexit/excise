@@ -75,10 +75,10 @@ fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> 
 }
 
 #[test]
-fn hard_cancel_restores_terminal_and_uses_exit_130() -> anyhow::Result<()> {
-    let (status, output, _) = run_pty_interaction(b"\x03", None)?;
-    if status.exit_code() != 130 {
-        bail!("hard cancel exited with {status}; captured {output:?}");
+fn control_c_exit_prompt_never_forces_a_worker_detach() -> anyhow::Result<()> {
+    let (status, output, _) = run_pty_interaction(b"\x03y", None)?;
+    if !status.success() {
+        bail!("safe control-C exit failed with {status}; captured {output:?}");
     }
     Ok(())
 }

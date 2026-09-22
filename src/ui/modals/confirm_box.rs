@@ -1,32 +1,51 @@
+use std::sync::atomic::Ordering;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 
+use crate::app::ExitWork;
 use crate::theme::Theme;
-use crate::ui::pane::{readable_text_on, render_modal};
+use crate::ui::pane::{ModalChrome, readable_text_on, render_modal};
 
-pub struct ConfirmBox {
+pub struct ConfirmBox<'a> {
     save_preferences: bool,
+    work: &'a ExitWork,
     theme: Theme,
     ascii: bool,
+    chrome: ModalChrome,
 }
 
-impl ConfirmBox {
-    pub const fn new(save_preferences: bool, theme: Theme, ascii: bool) -> Self {
+impl<'a> ConfirmBox<'a> {
+    pub(crate) const fn with_chrome(
+        save_preferences: bool,
+        work: &'a ExitWork,
+        theme: Theme,
+        ascii: bool,
+        chrome: ModalChrome,
+    ) -> Self {
         Self {
             save_preferences,
+            work,
             theme,
             ascii,
+            chrome,
         }
     }
 }
 
-impl Widget for ConfirmBox {
+impl Widget for ConfirmBox<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
-        let width = area.width.saturating_sub(4).clamp(30, 64).min(area.width);
-        let height = if self.save_preferences { 10 } else { 8 }.min(area.height);
+        let width = area.width.saturating_sub(4).clamp(30, 68).min(area.width);
+        let height = match self.work {
+            ExitWork::Active { .. } | ExitWork::Stopping { .. } => 11,
+            ExitWork::Pending { .. } | ExitWork::Cancelling { .. } => 9,
+            ExitWork::None if self.save_preferences => 10,
+            ExitWork::None => 8,
+        }
+        .min(area.height);
         let rect = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
@@ -40,67 +59,124 @@ impl Widget for ConfirmBox {
             self.theme,
             self.theme.focus,
             self.ascii,
+            self.chrome,
         );
-        let lines = if self.save_preferences {
-            vec![
-                Line::from("Save interface preferences before quitting?"),
-                Line::from(""),
-                Line::styled(
-                    "[s] Save and quit",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Line::styled(
-                    "[d] Quit without saving",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Line::from("[Esc/q/n] Keep working"),
-            ]
-        } else {
-            vec![
-                Line::from("Quit Excise?"),
-                Line::from(""),
-                Line::styled("[y] Quit", Style::default().add_modifier(Modifier::BOLD)),
-                Line::from("[Esc/q/n] Keep working"),
-            ]
-        };
-        Paragraph::new(lines)
+        Paragraph::new(exit_lines(self.save_preferences, self.work))
             .style(Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)))
             .alignment(Alignment::Center)
             .render(inner, buffer);
     }
 }
 
+fn exit_lines(save_preferences: bool, work: &ExitWork) -> Vec<Line<'static>> {
+    match work {
+        ExitWork::None if save_preferences => vec![
+            Line::from("Safe UI preferences changed this session."),
+            Line::from("Save interface preferences before quitting?"),
+            Line::from(""),
+            Line::styled(
+                "[s] Save and quit",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "[d] Quit without saving",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from("[Esc/q/n] Keep working"),
+        ],
+        ExitWork::None => vec![
+            Line::from("Quit Excise?"),
+            Line::from(""),
+            Line::styled("[y] Quit", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from("[Esc/q/n] Keep working"),
+        ],
+        ExitWork::Pending { count } => vec![
+            Line::from(format!("{count} deletion check(s) are waiting.")),
+            Line::from("No filesystem mutation has started."),
+            Line::from(""),
+            Line::styled(
+                "[c] Cancel checks and quit",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from("[w/Esc/q/n] Keep working"),
+        ],
+        ExitWork::Cancelling { count } => vec![
+            Line::from(format!("Cancelling {count} deletion check(s).")),
+            Line::from("No filesystem mutation will start."),
+            Line::from("Waiting for cancellation acknowledgement."),
+        ],
+        ExitWork::Active {
+            planned_entries,
+            completed,
+            pending,
+        } => vec![
+            Line::from(format!(
+                "{} of {planned_entries} items processed.",
+                completed.load(Ordering::Relaxed)
+            )),
+            Line::from(format!(
+                "{pending} additional deletion check(s) are waiting."
+            )),
+            Line::from("The active removal cannot be detached."),
+            Line::styled(
+                "[s] Stop after current item and quit",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from("[w/Esc/q/n] Keep working"),
+        ],
+        ExitWork::Stopping {
+            planned_entries,
+            completed,
+        } => vec![
+            Line::from(format!(
+                "{} of {planned_entries} items processed.",
+                completed.load(Ordering::Relaxed)
+            )),
+            Line::from("Stopping after the current item."),
+            Line::from("Waiting for the serial deletion worker to finish."),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use ratatui::widgets::Widget;
-
-    use crate::theme::ThemeId;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     use super::*;
 
-    fn rendered_quit_dialog(save_preferences: bool) -> String {
-        let area = Rect::new(0, 0, 64, 10);
-        let mut buffer = Buffer::empty(area);
-        ConfirmBox::new(save_preferences, Theme::for_id(ThemeId::ExciseDark), false)
-            .render(area, &mut buffer);
-        buffer.content.iter().fold(String::new(), |mut text, cell| {
-            text.push_str(cell.symbol());
+    fn text(lines: &[Line<'_>]) -> String {
+        lines.iter().fold(String::new(), |mut text, line| {
+            for span in &line.spans {
+                text.push_str(span.content.as_ref());
+            }
+            text.push('\n');
             text
         })
     }
 
     #[test]
-    fn quit_dialogs_show_only_the_actions_available_for_the_current_choice() {
-        let save = rendered_quit_dialog(true);
-        assert!(save.contains("QUIT"));
-        assert!(save.contains("Save interface preferences before quitting?"));
-        assert!(save.contains("[s] Save and quit"));
-        assert!(save.contains("[d] Quit without saving"));
-        assert!(save.contains("[Esc/q/n] Keep working"));
+    fn active_exit_requires_an_explicit_safe_stop_or_wait() {
+        let lines = exit_lines(
+            false,
+            &ExitWork::Active {
+                planned_entries: 12,
+                completed: Arc::new(AtomicU64::new(7)),
+                pending: 2,
+            },
+        );
+        let rendered = text(&lines);
+        assert!(rendered.contains("7 of 12 items processed."));
+        assert!(rendered.contains("The active removal cannot be detached."));
+        assert!(rendered.contains("[s] Stop after current item and quit"));
+        assert!(rendered.contains("[w/Esc/q/n] Keep working"));
+    }
 
-        let plain = rendered_quit_dialog(false);
-        assert!(plain.contains("Quit Excise?"));
-        assert!(plain.contains("[y] Quit"));
-        assert!(!plain.contains("Save and quit"));
+    #[test]
+    fn pending_exit_can_cancel_without_claiming_mutation_started() {
+        let rendered = text(&exit_lines(false, &ExitWork::Pending { count: 3 }));
+        assert!(rendered.contains("3 deletion check(s) are waiting."));
+        assert!(rendered.contains("No filesystem mutation has started."));
+        assert!(rendered.contains("[c] Cancel checks and quit"));
     }
 }

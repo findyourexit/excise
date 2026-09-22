@@ -4,39 +4,40 @@
 
 ## Problem
 
-Deletion planning, revalidation, and execution can block on the file system. The owner loop must remain the only writer of application and terminal state, while a confirmed operation must be able to continue independently from whichever modal or map view the reader later chooses.
+Primary scanning, focused exploration, deletion planning, final revalidation, and mutation can block on the file system. The owner loop must remain the only writer of application and terminal state while the reader can continue navigating the map.
 
 ## Decision
 
-The application owns a bounded `DeletionWork` queue separately from `UiMode`. The initial implementation accepts the existing `FileToDelete` contract only; it does not treat aggregate or synthetic model nodes as eligible targets. `UiMode` continues to carry current confirmation and result views until a later interface change consumes the operation summary, but the queue owns the operation's identity, plan, cancellation reservation, and retained shared progress counter.
+The application owns a bounded `DeletionWork` rail separately from `UiMode`. Each retained item has a monotonic work identifier, a concrete componentwise path, an escaped display label, and exactly one state:
 
-Each item carries a monotonic work identifier and moves through these states:
+1. queued planning or planning;
+2. awaiting or foreground confirmation;
+3. queued execution or serial execution;
+4. refreshing or focused rescanning after a stale plan; or
+5. cancellation acknowledgement, rejection, or completion.
 
-1. queued planning
-2. planning in the deletion worker
-3. awaiting explicit confirmation
-4. queued and in-flight identity revalidation
-5. queued and in-flight execution
-6. completed, cancelled, or rejected
+The planner and executor use separate bounded command lanes. At most one planner builds an identity-bound plan, while at most one executor performs final revalidation and filesystem mutation. Final revalidation and execution occur in the same executor operation, so no queue turn can open a gap between a successful revalidation and the first mutation. A planner may prepare a non-overlapping target while an executor is active; it never receives mutation authority.
 
-The owner loop submits at most one tagged deletion command to a single-slot worker channel. Submission is nonblocking. If the channel is unexpectedly occupied, the work item is restored and the owner reports an invariant failure instead of blocking or dropping it. The deletion worker processes commands serially, so no two filesystem mutations can overlap.
+A compacted aggregate directory keeps a verified concrete backing path and identity, so it can enter the same live deletion planner immediately. The planner's no-follow walk, not the bounded display model, reviews a directory's descendants. `Other` and `Shared` summaries remain virtual, noninteractive totals.
 
-A successful revalidation transitions its item directly to execution at the head of the queue. No later planning or revalidation command may be dispatched between that result and its execution command. The existing `revalidate_plan_cancellable` and `execute_plan_counted` APIs remain responsible for the live identity check immediately before the mutation and the per-entry checks during it.
+Planning, refresh, queueing, execution, and completion remain in the work rail. A ready plan becomes the normal confirmation dialog only when the foreground mode can present it. Accepted consent returns immediately to normal map navigation; the serial worker continues its final checks and mutation in the background.
+
+The primary scanner is breadth-first. Entering a visible directory promotes its queued task ahead of unrelated work; a bounded deferred request handles the small race before that task is queued. On-demand focused scans stream through separate events and staging, so they can populate a selected summarized directory without diverting primary scan results.
 
 ## Bounds and Target Conflicts
 
-- `MAX_DELETION_WORK_ITEMS` caps all retained operations, including an active item and one awaiting confirmation.
-- The worker command channel has capacity one; the owner queue is the only retained sequence of work.
-- Deletion history keeps both its existing byte budget and a fixed report-count cap. A zero-byte or undersized report cannot make history grow without bound.
-- A new item is rejected when its componentwise target path equals, contains, or is contained by any retained target. This rejects duplicate, ancestor, and descendant operations before they can race.
-- A cancelled planner or revalidator keeps its worker reservation until that worker reports completion. The scheduler cannot issue a replacement command into that interval.
+- `MAX_DELETION_WORK_ITEMS` caps every retained operation, including active work, confirmations, refreshes, and planner cancellation reservations.
+- Planner, executor, focused-rescan, and event channels have fixed capacities. Owner-loop submission is nonblocking; a rejected submission restores its item rather than dropping it.
+- A new item is rejected when its componentwise target path equals, contains, or is contained by a retained target. This prevents ancestor, descendant, and duplicate operations from racing.
+- A cancelled in-flight planner retains its reservation until its acknowledgement arrives. A stale-plan refresh retains its operation until scan completion or cancellation.
+- Deletion history has both a byte limit and a fixed report-count cap. Summaries retain only fixed-size counters and an atomic progress value; reports stream directly from bounded resident or authenticated spill storage.
 
-## View Seam
+## Exit and Reconciliation
 
-`DeletionWorkSummary` contains only aggregate pending/mutating state and the live count for the serial mutation. It deliberately contains no path text or plan data, so a UI can render a background indicator without owning untrusted paths or copying plans. A later UI worker may move the reader back to normal navigation after confirmation while the owner loop continues to advance the state machine from these summaries.
+The exit dialog distinguishes no work, cancellable pending work, and active mutation. Pending work can be cancelled before quitting or left running while the reader returns to the map. Active mutation can only be stopped at an entry boundary or awaited; the worker is never detached silently.
 
-Exit behavior remains unchanged; deletion work is not yet an exit-policy input.
+A completed report is reconciled through `FileTree::try_apply_deletion_report`. Retained matching nodes are removed, while successfully deleted descendants absent from the bounded model need no fabricated placeholder. During a still-active primary scan, results below a confirmed removed target are ignored so stale scanner events cannot revive it. Board replacement then selects a surviving actionable entry, clears an empty view, or restores the nearest valid folder.
 
 ## Consequences
 
-The current input bindings and modal rendering remain unchanged during this foundation change. Future task types, concurrent planners, different queue capacities, report retention policies, or any change to serial mutation and exit semantics require public architecture review before implementation.
+The visible work rail makes bounded background activity and progress explicit without copying plans or reports into frame state. The foreground dialog remains limited to an irreversible consent decision, and report formats retain their existing precise or uncertain semantics. Any change to target overlap rules, queue capacities, serial mutation, no-follow validation, report retention, or exit behavior requires public architecture review.

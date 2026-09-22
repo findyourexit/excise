@@ -2,24 +2,31 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::theme::Theme;
 use crate::ui::format::display_text;
-use crate::ui::pane::{readable_text_on, render_modal};
+use crate::ui::pane::{ModalChrome, readable_text_on, render_modal};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 pub struct ErrorBox<'a> {
     error_message: &'a str,
     theme: Theme,
     ascii: bool,
+    chrome: ModalChrome,
 }
 
 impl<'a> ErrorBox<'a> {
-    pub const fn new(error_message: &'a str, theme: Theme, ascii: bool) -> Self {
+    pub(crate) const fn with_chrome(
+        error_message: &'a str,
+        theme: Theme,
+        ascii: bool,
+        chrome: ModalChrome,
+    ) -> Self {
         Self {
             error_message,
             theme,
             ascii,
+            chrome,
         }
     }
 }
@@ -41,6 +48,7 @@ impl Widget for ErrorBox<'_> {
             self.theme,
             self.theme.text_danger,
             self.ascii,
+            self.chrome,
         );
         Paragraph::new(vec![
             Line::from(display_text(self.error_message)),
@@ -69,10 +77,11 @@ mod tests {
     fn hostile_error_text_is_escaped_and_marked() {
         let area = Rect::new(0, 0, 40, 9);
         let mut buffer = Buffer::empty(area);
-        ErrorBox::new(
+        ErrorBox::with_chrome(
             "permission denied: bad\n\u{202e}name\u{1b}[31m",
             Theme::for_id(ThemeId::ExciseDark),
             false,
+            ModalChrome::new(std::time::Duration::ZERO, false, false),
         )
         .render(area, &mut buffer);
         let text = buffer.content.iter().fold(String::new(), |mut text, cell| {

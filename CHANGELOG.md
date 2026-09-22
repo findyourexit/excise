@@ -6,6 +6,13 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+### Changed
+
+* Replaced the cyclic theme toggle with a keyboard preview picker. `Enter` keeps the selected session theme, while `Esc` restores the prior theme; normal safe-preference saving remains unchanged.
+* Moved deletion planning, refresh, queueing, progress, and results into a bounded background work rail. Accepted confirmation returns to the map, and a backed summarized folder is freshly materialized before it can re-enter the ordinary review flow.
+* Made pending and active deletion exit choices explicit, restored a valid map selection after reconciliation, and clarified virtual-summary and scan-state guidance.
+* Added frame-only modal attention chrome on capable terminals while keeping reduced-motion, ASCII, monochrome, and high-contrast output static.
+
 ## [1.2.4] - 2026-09-12
 
 ### Changed

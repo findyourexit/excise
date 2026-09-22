@@ -9,10 +9,11 @@ use crossterm::event::{
 use ratatui::backend::Backend;
 
 use crate::App;
+use crate::app::{EnterAction, ExitWork};
 use crate::config::{KeyPreset, is_supported_custom_movement_key};
-use crate::deletion::DeletionPlan;
 use crate::error::AppError;
-use crate::state::FileToDelete;
+use crate::state::{DeletionWorkId, FileToDelete};
+use crate::theme::ThemeId;
 
 pub enum InputEvent {
     Terminal(Event),
@@ -60,17 +61,26 @@ pub(crate) enum InputCommand {
     PathError,
     StartRescan(PathBuf),
     CancelRescan,
-    PlanDeletion(Box<FileToDelete>),
-    CancelDeletionPlan,
-    RevalidateDeletion(Box<DeletionPlan>),
+    RequestDeletion(Box<FileToDelete>),
+    CancelDeletionConfirmation,
+    ConfirmDeletion {
+        work_id: DeletionWorkId,
+        target: Box<FileToDelete>,
+    },
     ExportScan,
     ExportDeletionHistory,
-    CycleTheme,
+    OpenThemePicker,
+    PreviewTheme(ThemeId),
+    CommitTheme {
+        original: ThemeId,
+        selected: ThemeId,
+    },
+    RestoreTheme(ThemeId),
+    PromptExit,
+    CancelPendingWorkAndExit,
+    StopDeletionAndExit,
     SavePreferencesAndExit,
     DiscardPreferencesAndExit,
-    SoftCancelDeletion,
-    ResumeDeletion,
-    HardCancel,
 }
 
 macro_rules! key {
@@ -112,28 +122,30 @@ pub(crate) fn handle_keypress<B: Backend>(evt: &Event, app: &mut App<B>) -> Inpu
         crate::UiMode::FilterInput { .. } => handle_keypress_filter_mode(evt, app),
         crate::UiMode::Help => handle_keypress_help_mode(evt, app),
         crate::UiMode::ScreenTooSmall => handle_keypress_screen_too_small(evt, app),
-        crate::UiMode::PlanningDeletion(_) => handle_keypress_planning_mode(evt, app),
+        crate::UiMode::ThemePicker { .. } => handle_keypress_theme_picker_mode(evt, app),
         crate::UiMode::DeleteConfirm { .. } => handle_keypress_delete_confirm_mode(evt, app),
-        crate::UiMode::Deleting { .. } => handle_keypress_deleting_mode(evt, app),
-        crate::UiMode::DeletionCancel { .. } => handle_keypress_deletion_cancel_mode(evt, app),
-        crate::UiMode::DeletionResult { .. } => handle_keypress_deletion_result_mode(evt, app),
         crate::UiMode::ErrorMessage(_) => handle_keypress_error_message(evt, app),
         crate::UiMode::Exiting { .. } => handle_keypress_exiting_mode(evt, app),
         crate::UiMode::Notice(_) => handle_keypress_notice_mode(evt, app),
         crate::UiMode::WarningMessage => {
-            app.reset_ui_mode();
+            app.normal_mode();
             InputCommand::None
         }
     }
 }
 
+fn deletion_request<B: Backend>(app: &mut App<B>) -> InputCommand {
+    app.request_deletion().map_or(InputCommand::None, |target| {
+        InputCommand::RequestDeletion(Box::new(target))
+    })
+}
+
 fn handle_keypress_loading_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+    if matches!(evt, key!(char 't')) {
+        return InputCommand::OpenThemePicker;
+    }
     if matches!(evt, key!(Backspace)) {
-        return app
-            .prompt_file_deletion()
-            .map_or(InputCommand::None, |target| {
-                InputCommand::PlanDeletion(Box::new(target))
-            });
+        return deletion_request(app);
     }
     handle_navigation(evt, app, true)
 }
@@ -150,15 +162,14 @@ fn handle_keypress_normal_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> Inp
     if matches!(evt, key!(char 'e')) {
         return InputCommand::ExportScan;
     }
+    if matches!(evt, key!(shift 'E')) {
+        return InputCommand::ExportDeletionHistory;
+    }
     if matches!(evt, key!(char 't')) {
-        return InputCommand::CycleTheme;
+        return InputCommand::OpenThemePicker;
     }
     if matches!(evt, key!(Backspace)) {
-        return app
-            .prompt_file_deletion()
-            .map_or(InputCommand::None, |target| {
-                InputCommand::PlanDeletion(Box::new(target))
-            });
+        return deletion_request(app);
     }
     handle_navigation(evt, app, false)
 }
@@ -166,10 +177,7 @@ fn handle_keypress_normal_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> Inp
 #[allow(clippy::too_many_lines)]
 fn handle_navigation<B: Backend>(evt: &Event, app: &mut App<B>, loading: bool) -> InputCommand {
     match evt {
-        key!(ctrl 'c') | key!(char 'q') => {
-            app.prompt_exit();
-            InputCommand::None
-        }
+        key!(ctrl 'c') | key!(char 'q') => InputCommand::PromptExit,
         key!(Right) => {
             app.move_selected_right();
             InputCommand::Navigation
@@ -254,9 +262,11 @@ fn handle_navigation<B: Backend>(evt: &Event, app: &mut App<B>, loading: bool) -
             app.reset_zoom();
             InputCommand::Navigation
         }
-        key!(char '\n') | key!(Enter) => app
-            .handle_enter()
-            .map_or(InputCommand::Drill, InputCommand::StartRescan),
+        key!(char '\n') | key!(Enter) => match app.handle_enter_action() {
+            EnterAction::None => InputCommand::None,
+            EnterAction::Drill => InputCommand::Drill,
+            EnterAction::Rescan(path) => InputCommand::StartRescan(path),
+        },
         key!(Backspace) if loading => {
             app.show_warning_modal();
             InputCommand::None
@@ -288,13 +298,16 @@ fn handle_navigation<B: Backend>(evt: &Event, app: &mut App<B>, loading: bool) -
 }
 
 fn handle_keypress_rescanning_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
-    if matches!(evt, key!(Esc)) {
+    if matches!(evt, key!(char 't')) {
+        InputCommand::OpenThemePicker
+    } else if matches!(evt, key!(Backspace)) {
+        deletion_request(app)
+    } else if matches!(evt, key!(Esc)) {
         InputCommand::CancelRescan
     } else {
         handle_navigation(evt, app, true)
     }
 }
-
 fn handle_keypress_filter_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
     match evt {
         key!(Esc) => {
@@ -320,27 +333,22 @@ fn handle_keypress_filter_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> Inp
         _ => InputCommand::None,
     }
 }
-fn handle_keypress_planning_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+fn handle_keypress_theme_picker_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
     match evt {
-        key!(Esc) => {
-            app.normal_mode();
-            InputCommand::CancelDeletionPlan
-        }
-        key!(ctrl 'c') => {
-            app.exit();
-            InputCommand::HardCancel
-        }
-        key!(char 'q') => {
-            app.prompt_exit();
-            InputCommand::None
-        }
-        // Pre-arm deletion so it fires automatically once planning completes,
-        // but only for single-key challenges (files, or reduced-guardrails dirs).
-        // Silently no-ops for directories requiring a typed name.
-        key!(Enter) => {
-            app.arm_deletion_enter();
-            InputCommand::None
-        }
+        key!(Up) | key!(char 'k') => app
+            .move_theme_picker(true)
+            .map_or(InputCommand::None, InputCommand::PreviewTheme),
+        key!(Down) | key!(char 'j') => app
+            .move_theme_picker(false)
+            .map_or(InputCommand::None, InputCommand::PreviewTheme),
+        key!(Enter) => app
+            .commit_theme_picker()
+            .map_or(InputCommand::None, |(original, selected)| {
+                InputCommand::CommitTheme { original, selected }
+            }),
+        key!(Esc) | key!(char 'q') => app
+            .cancel_theme_picker()
+            .map_or(InputCommand::None, InputCommand::RestoreTheme),
         _ => InputCommand::None,
     }
 }
@@ -352,28 +360,26 @@ fn handle_keypress_help_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> Input
     InputCommand::None
 }
 
+fn cancel_deletion_confirmation<B: Backend>(app: &mut App<B>) -> InputCommand {
+    if app.cancel_deletion_confirmation() {
+        InputCommand::CancelDeletionConfirmation
+    } else {
+        InputCommand::None
+    }
+}
+
 fn handle_keypress_delete_confirm_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
     match evt {
-        key!(ctrl 'c') | key!(char 'q') | key!(Esc) => {
-            app.normal_mode();
-            InputCommand::None
-        }
-        key!(char 'n') if app.confirmation_is_single_key() => {
-            app.normal_mode();
-            InputCommand::None
-        }
+        key!(ctrl 'c') => InputCommand::PromptExit,
+        key!(char 'q') | key!(Esc) | key!(char 'n') => cancel_deletion_confirmation(app),
         key!(Backspace) => {
             app.pop_confirmation_character();
             InputCommand::None
         }
-        // For single-key challenges (ConfirmFile / ReducedGuard), Enter acts as
-        // a primary confirm key by auto-filling the expected 'y' before
-        // delegating to take_confirmed_deletion_plan. For TypeName/TypePhrase,
-        // Enter confirms if and only if the typed input already matches.
-        key!(Enter) => app
-            .arm_and_confirm_deletion_plan()
-            .map_or(InputCommand::None, |plan| {
-                InputCommand::RevalidateDeletion(Box::new(plan))
+        key!(Enter) | key!(char 'y') => app
+            .arm_and_confirm_deletion_target()
+            .map_or(InputCommand::None, |(work_id, target)| {
+                InputCommand::ConfirmDeletion { work_id, target }
             }),
         Event::Key(KeyEvent {
             code: KeyCode::Char(character),
@@ -381,54 +387,6 @@ fn handle_keypress_delete_confirm_mode<B: Backend>(evt: &Event, app: &mut App<B>
             ..
         }) if modifiers.is_empty() || *modifiers == KeyModifiers::SHIFT => {
             app.push_confirmation_character(*character);
-            if app.confirmation_is_single_key() {
-                app.take_confirmed_deletion_plan()
-                    .map_or(InputCommand::None, |plan| {
-                        InputCommand::RevalidateDeletion(Box::new(plan))
-                    })
-            } else {
-                InputCommand::None
-            }
-        }
-        _ => InputCommand::None,
-    }
-}
-
-fn handle_keypress_deleting_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
-    if matches!(&app.ui_mode, crate::UiMode::Deleting { stopping: true, .. }) {
-        if matches!(evt, key!(ctrl 'c') | key!(char 'h')) {
-            app.exit();
-            return InputCommand::HardCancel;
-        }
-        return InputCommand::None;
-    }
-    if matches!(evt, key!(ctrl 'c') | key!(char 'q') | key!(Esc)) {
-        app.prompt_deletion_cancel();
-    }
-    InputCommand::None
-}
-
-fn handle_keypress_deletion_cancel_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
-    match evt {
-        key!(char 's') => InputCommand::SoftCancelDeletion,
-        key!(ctrl 'c') | key!(char 'h') => {
-            app.exit();
-            InputCommand::HardCancel
-        }
-        key!(Esc) | key!(char 'b') => InputCommand::ResumeDeletion,
-        _ => InputCommand::None,
-    }
-}
-
-fn handle_keypress_deletion_result_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
-    match evt {
-        key!(char 'e') => InputCommand::ExportDeletionHistory,
-        key!(ctrl 'c') => {
-            app.prompt_exit();
-            InputCommand::None
-        }
-        key!(Enter) | key!(Esc) | key!(char 'q') => {
-            app.normal_mode();
             InputCommand::None
         }
         _ => InputCommand::None,
@@ -450,25 +408,56 @@ fn handle_keypress_notice_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> Inp
 }
 
 fn handle_keypress_screen_too_small<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
-    if matches!(evt, key!(ctrl 'c') | key!(char 'q')) {
-        app.exit();
+    if !matches!(evt, key!(ctrl 'c') | key!(char 'q')) {
+        return InputCommand::None;
     }
-    InputCommand::None
+    if app.can_exit_immediately() {
+        app.exit();
+        InputCommand::None
+    } else {
+        InputCommand::PromptExit
+    }
 }
 
 fn handle_keypress_exiting_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
     match evt {
-        key!(ctrl 'c') => {
-            app.exit();
-            InputCommand::HardCancel
-        }
-        key!(char 'q') | key!(Esc) | key!(char 'n') => {
-            app.reset_ui_mode();
+        key!(char 'q') | key!(Esc) | key!(char 'n')
+            if matches!(
+                app.exit_work(),
+                Some(ExitWork::None | ExitWork::Pending { .. } | ExitWork::Active { .. })
+            ) =>
+        {
+            app.dismiss_exit();
             InputCommand::None
         }
-        key!(char 's') if app.preferences_dirty() => InputCommand::SavePreferencesAndExit,
-        key!(char 'd') if app.preferences_dirty() => InputCommand::DiscardPreferencesAndExit,
-        key!(char 'y') if !app.preferences_dirty() => {
+        key!(char 'w')
+            if matches!(
+                app.exit_work(),
+                Some(ExitWork::Pending { .. } | ExitWork::Active { .. })
+            ) =>
+        {
+            app.dismiss_exit();
+            InputCommand::None
+        }
+        key!(char 'c') if matches!(app.exit_work(), Some(ExitWork::Pending { .. })) => {
+            InputCommand::CancelPendingWorkAndExit
+        }
+        key!(char 's') if matches!(app.exit_work(), Some(ExitWork::Active { .. })) => {
+            InputCommand::StopDeletionAndExit
+        }
+        key!(char 's')
+            if app.preferences_dirty() && matches!(app.exit_work(), Some(ExitWork::None)) =>
+        {
+            InputCommand::SavePreferencesAndExit
+        }
+        key!(char 'd')
+            if app.preferences_dirty() && matches!(app.exit_work(), Some(ExitWork::None)) =>
+        {
+            InputCommand::DiscardPreferencesAndExit
+        }
+        key!(char 'y')
+            if !app.preferences_dirty() && matches!(app.exit_work(), Some(ExitWork::None)) =>
+        {
             app.exit();
             InputCommand::None
         }
@@ -507,76 +496,96 @@ mod tests {
     }
 
     #[test]
-    fn deletion_cancel_keys_defer_state_changes_to_runtime() {
+    fn theme_picker_previews_and_restores_without_committing() {
         let (_root, mut app) = app();
-        app.ui_mode = UiMode::DeletionCancel {
-            planned_entries: 1,
-            completed: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        app.loaded = true;
+        app.ui_mode = UiMode::Normal;
+        assert!(matches!(
+            handle_keypress(&key(KeyCode::Char('t'), KeyModifiers::NONE), &mut app),
+            InputCommand::OpenThemePicker
+        ));
+
+        app.open_theme_picker(ThemeId::ExciseDark);
+        assert!(matches!(
+            handle_keypress(&key(KeyCode::Char('t'), KeyModifiers::NONE), &mut app),
+            InputCommand::None
+        ));
+        assert!(matches!(
+            handle_keypress(&key(KeyCode::Down, KeyModifiers::NONE), &mut app),
+            InputCommand::PreviewTheme(ThemeId::ExciseLight)
+        ));
+        assert!(matches!(
+            handle_keypress(&key(KeyCode::Esc, KeyModifiers::NONE), &mut app),
+            InputCommand::RestoreTheme(ThemeId::ExciseDark)
+        ));
+        assert!(matches!(app.ui_mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn small_screen_exit_still_uses_the_safe_exit_prompt() {
+        let (_root, mut app) = app();
+        app.ui_mode = UiMode::ScreenTooSmall;
+        app.preferences_changed();
+
+        let command = handle_keypress(&key(KeyCode::Char('q'), KeyModifiers::NONE), &mut app);
+
+        assert!(matches!(command, InputCommand::PromptExit));
+        assert!(app.is_running);
+    }
+
+    #[test]
+    fn active_exit_offers_safe_stop_without_forced_detach() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        let (_root, mut app) = app();
+        app.ui_mode = UiMode::Exiting {
+            save_preferences: false,
+            work: ExitWork::Active {
+                planned_entries: 1,
+                completed: Arc::new(AtomicU64::new(0)),
+                pending: 0,
+            },
+            return_to: crate::app::ThemePickerReturn::Normal,
         };
 
         let command = handle_keypress(&key(KeyCode::Char('s'), KeyModifiers::NONE), &mut app);
-        assert!(matches!(command, InputCommand::SoftCancelDeletion));
-        assert!(matches!(
-            &app.ui_mode,
-            UiMode::DeletionCancel {
-                planned_entries: 1,
-                ..
-            }
-        ));
-
-        let command = handle_keypress(&key(KeyCode::Char('b'), KeyModifiers::NONE), &mut app);
-        assert!(matches!(command, InputCommand::ResumeDeletion));
-        assert!(matches!(
-            &app.ui_mode,
-            UiMode::DeletionCancel {
-                planned_entries: 1,
-                ..
-            }
-        ));
+        assert!(matches!(command, InputCommand::StopDeletionAndExit));
+        let command = handle_keypress(&key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut app);
+        assert!(matches!(command, InputCommand::None));
+        assert!(app.is_running);
     }
 
     #[test]
-    fn deletion_cancel_hard_key_still_exits() {
+    fn confirmation_escape_returns_its_job_to_runtime() {
         let (_root, mut app) = app();
-        app.ui_mode = UiMode::DeletionCancel {
-            planned_entries: 1,
-            completed: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        app.loaded = true;
+        app.ui_mode = UiMode::DeleteConfirm {
+            work_id: DeletionWorkId::for_test(7),
+            target: Box::new(FileToDelete {
+                node_id: crate::model::NodeId(1),
+                synthetic: false,
+                path_in_filesystem: std::path::PathBuf::from("/scan-root"),
+                path_to_file: vec![std::ffi::OsString::from("target")],
+                file_type: crate::state::tiles::FileType::File,
+                num_descendants: None,
+                size: 0,
+                expected_snapshot: crate::model::EntrySnapshot {
+                    identity: None,
+                    kind: crate::model::NodeKind::File,
+                    apparent_bytes: 0,
+                    allocated_bytes: None,
+                    modified_nanos: None,
+                },
+                reviewed_entries: Vec::new(),
+            }),
+            challenge: crate::deletion::ConfirmationChallenge::ConfirmFile,
+            input: String::new(),
+            return_to: crate::app::ThemePickerReturn::Normal,
         };
 
-        let command = handle_keypress(&key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut app);
-        assert!(matches!(command, InputCommand::HardCancel));
-        assert!(!app.is_running);
-    }
-
-    #[test]
-    fn planning_escape_cancels_pending_plan() {
-        use crate::model::{EntrySnapshot, NodeId, NodeKind};
-        use crate::state::FileToDelete;
-        use crate::state::tiles::FileType;
-
-        let (root, mut app) = app();
-        // Mark loaded so normal_mode() returns Normal, not Loading.
-        app.loaded = true;
-        app.ui_mode = UiMode::PlanningDeletion(Box::new(FileToDelete {
-            node_id: NodeId(1),
-            synthetic: false,
-            path_in_filesystem: root.path().to_path_buf(),
-            path_to_file: vec!["target".into()],
-            file_type: FileType::File,
-            num_descendants: None,
-            size: 0,
-            expected_snapshot: EntrySnapshot {
-                identity: None,
-                kind: NodeKind::File,
-                apparent_bytes: 0,
-                allocated_bytes: None,
-                modified_nanos: None,
-            },
-            reviewed_entries: Vec::new(),
-        }));
-
         let command = handle_keypress(&key(KeyCode::Esc, KeyModifiers::NONE), &mut app);
-        assert!(matches!(command, InputCommand::CancelDeletionPlan));
+        assert!(matches!(command, InputCommand::CancelDeletionConfirmation));
         assert!(matches!(app.ui_mode, UiMode::Normal));
     }
 }

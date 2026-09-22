@@ -1,6 +1,6 @@
 use crate::model::NodeId;
 use ::std::ffi::OsString;
-use ::std::path::{Path, PathBuf};
+use ::std::path::PathBuf;
 
 use crate::state::tiles::FileType;
 
@@ -41,53 +41,4 @@ impl FileToDelete {
             reviewed_entries: Vec::new(),
         }
     }
-}
-
-/// A memory-compacted concrete directory that must be scanned again before it
-/// can become a deletion target.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DirectoryMaterialization {
-    node_id: NodeId,
-    path: PathBuf,
-    expected_identity: crate::native_path::NativeIdentity,
-}
-
-impl DirectoryMaterialization {
-    pub(crate) fn new(
-        node_id: NodeId,
-        path: PathBuf,
-        expected_identity: crate::native_path::NativeIdentity,
-    ) -> Self {
-        Self {
-            node_id,
-            path,
-            expected_identity,
-        }
-    }
-
-    #[must_use]
-    pub const fn node_id(&self) -> NodeId {
-        self.node_id
-    }
-
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    #[must_use]
-    pub fn expected_identity(&self) -> &crate::native_path::NativeIdentity {
-        &self.expected_identity
-    }
-}
-
-/// The deletion action available for a retained model entry.
-///
-/// [`Self::RequiresMaterialization`] is not deletion authorization. Its path
-/// and identity must root a fresh no-follow scan, after which callers ask the
-/// [`crate::state::files::FileTree`] for eligibility again.
-#[derive(Clone, Debug)]
-pub enum DeletionEligibility {
-    Ready(FileToDelete),
-    RequiresMaterialization(DirectoryMaterialization),
 }

@@ -2,7 +2,7 @@
 
 ## Ownership Model
 
-One main loop owns application state, terminal state, layout, rendering, and visual effects. Scanner and deletion workers perform blocking file system work in the background. They send typed events through queues with fixed limits.
+One main loop owns application state, terminal state, layout, rendering, and visual effects. Scanner, focused-rescan, deletion-planner, and serial deletion-executor workers perform blocking file system work in the background. They send typed events through queues with fixed limits.
 
 Visual effects run after the interface has prepared its content. They never own product state and never decide whether an operation is safe.
 
@@ -14,11 +14,11 @@ Excise reads and validates command-line options, environment variables, and the 
 
 ### Terminal Session
 
-A terminal session guard owns raw input mode, the separate screen, cursor visibility, colors, and optional mouse capture. It restores the terminal after normal return, a typed error, a panic, or a forced cancellation.
+A terminal session guard owns raw input mode, the separate screen, cursor visibility, colors, and optional mouse capture. It restores the terminal after normal return, a typed error, a panic, or a boundary-safe cancellation.
 
 ### Main Loop
 
-The main loop polls terminal input with a bounded timeout. It renders each folder drill before it resumes queued scanner work, applies staged scan batches one entry per input poll, and uses bounded-channel backpressure while treemap geometry is moving. It redraws only when state has changed. It limits active effects to 30 frames per second and drops overdue frames. A new transition replaces an older transition with the same purpose.
+The main loop polls terminal input with a bounded timeout. It renders each folder drill before it resumes queued scanner work, applies staged scan batches one entry per input poll, and uses bounded-channel backpressure while treemap geometry is moving. It redraws only when state has changed, except for a live atomic deletion progress counter and frame-only chrome. It limits active effects to 30 frames per second and drops overdue frames. A new transition replaces an older transition with the same purpose.
 
 ### Scanner
 
@@ -40,7 +40,7 @@ The identity table counts files with more than one name once within the scan sco
 
 ### Deletion
 
-The main loop builds and reviews a complete deletion plan. Large directory plans retain a bounded resident prefix and use authenticated temporary storage outside the selected target for later plan and outcome records before consent. Platform code works relative to the confirmed parent and does not follow links. It validates each decoded plan path as a componentwise descendant of the selected target, checks the file identity, type, size, allocation, and modification state before each deletion, and skips changed entries. Newly observed entries are never added to the consented plan; a plan that cannot retain every identity and outcome is rejected before confirmation.
+The main loop retains at most four non-overlapping interactive deletion requests. A separate planner can build the next identity plan while the single executor performs a confirmed target's final full-plan revalidation and serial mutation. Large directory plans retain a bounded resident prefix and use authenticated temporary storage outside the selected target for later plan and outcome records before consent. Platform code works relative to the confirmed parent and does not follow links. It validates each decoded plan path as a componentwise descendant of the selected target, checks the file identity, type, size, allocation, and modification state before each deletion, and skips changed entries. Newly observed entries are never added to the consented plan; a plan that cannot retain every identity and outcome is rejected before confirmation.
 
 The [background task system decision](background-tasks.md) defines the bounded deletion-work foundation and the review required before adding other task kinds.
 

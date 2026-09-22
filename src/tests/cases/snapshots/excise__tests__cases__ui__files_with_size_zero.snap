@@ -44,7 +44,7 @@ expression: normalized
 ▟▐ SELECTED ITEM ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏file1                                                                                                                                                                                       ▕
 ▏◆ COMPLETE · file                                                                                                                                                                           ▕
-▏Enter open · Backspace delete                                                                                                                                                               ▕
+▏Backspace delete                                                                                                                                                                            ▕
 ▏Can reclaim #B · Space used #B                                                                                                                                                              ▕
 ▏Content size 0B · 0 items                                                                                                                                                                   ▕
 ▏Item check: Inode { device_id: ########, inode_number: ######## }                                                                                                                           ▕

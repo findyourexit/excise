@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::Rect;
@@ -9,6 +11,7 @@ use unicode_width::UnicodeWidthStr as _;
 
 use crate::model::SyntheticKind;
 use crate::native_path::SafeDisplayPath;
+use crate::state::deletion_work::{DeletionWork, WorkRailItem, WorkRailStatus};
 use crate::state::tiles::{FileType, HALF_ROWS_PER_CELL, MapOverflow, Tile};
 use crate::theme::Theme;
 use crate::ui::format::{DisplaySize, display_os_str_info, truncate_marked, truncate_middle};
@@ -58,6 +61,10 @@ pub struct MapLayout<'a> {
     pub transitioning: bool,
     /// Whether an empty layout has been confirmed by the model as truly empty.
     pub show_empty_label: bool,
+    /// Whether this empty surface is still receiving scan results.
+    pub scanning: bool,
+    /// Deletion state for displayed identities, retained outside the map model.
+    pub deletion_work: Option<&'a DeletionWork>,
 }
 
 /// A densely tessellated treemap.
@@ -79,6 +86,8 @@ pub struct DenseRectangleGrid<'a> {
     monochrome: bool,
     transitioning: bool,
     show_empty_label: bool,
+    scanning: bool,
+    deletion_work: Option<&'a DeletionWork>,
 }
 
 impl<'a> DenseRectangleGrid<'a> {
@@ -94,6 +103,8 @@ impl<'a> DenseRectangleGrid<'a> {
             monochrome,
             transitioning: layout.transitioning,
             show_empty_label: layout.show_empty_label,
+            scanning: layout.scanning,
+            deletion_work: layout.deletion_work,
         }
     }
 
@@ -120,8 +131,83 @@ impl<'a> DenseRectangleGrid<'a> {
         palette: MapPalette,
         emphasis: Emphasis,
         scale: HeatScale,
+        work_status: Option<WorkRailStatus>,
     ) -> TileInk {
-        TileInk::resolve(tile, self.theme, palette, emphasis, scale)
+        TileInk::resolve(tile, self.theme, palette, emphasis, scale, work_status)
+    }
+
+    fn work_item(&self, tile: &Tile) -> Option<WorkRailItem<'_>> {
+        self.deletion_work
+            .and_then(|work| work.rail_item_for_node(tile.node_id))
+    }
+
+    fn work_status(&self, tile: &Tile) -> Option<WorkRailStatus> {
+        self.work_item(tile).map(|work| work.status)
+    }
+
+    fn draw_composited_work_indicators(
+        &self,
+        buffer: &mut Buffer,
+        area: Rect,
+        palette: MapPalette,
+        scale: HeatScale,
+        selected_last: Option<usize>,
+    ) {
+        if self.transitioning {
+            return;
+        }
+        for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
+            let Some(work) = self.work_item(tile) else {
+                continue;
+            };
+            let ink = self.ink(
+                tile,
+                palette,
+                self.emphasis(index),
+                scale,
+                Some(work.status),
+            );
+            let style = Style::default()
+                .fg(ink.text)
+                .bg(ink.fill)
+                .add_modifier(Modifier::BOLD);
+            draw_work_indicator(buffer, area, tile, work, style, self.ascii);
+        }
+    }
+
+    fn draw_shaded_work_indicators(
+        &self,
+        buffer: &mut Buffer,
+        area: Rect,
+        surface: Color,
+        selected_last: Option<usize>,
+    ) {
+        if self.transitioning {
+            return;
+        }
+        for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
+            let Some(work) = self.work_item(tile) else {
+                continue;
+            };
+            let selected = self.selected_rect_index == Some(index);
+            let background = if selected {
+                self.theme.surface_selection
+            } else {
+                surface
+            };
+            let foreground = if selected {
+                self.theme.text_inverse
+            } else {
+                self.theme.text_primary
+            };
+            shade_work_tile(buffer, area, tile);
+            let style = Style::default()
+                .fg(foreground)
+                .bg(background)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::REVERSED);
+            draw_work_indicator(buffer, area, tile, work, style, self.ascii);
+        }
     }
 
     fn render_composited(
@@ -149,20 +235,32 @@ impl<'a> DenseRectangleGrid<'a> {
         if self.transitioning {
             let mut covered = HalfRowCoverage::new();
             for (index, tile) in tile_paint_order(self.rectangles, selected_last).rev() {
-                let ink = self.ink(tile, palette, self.emphasis(index), scale);
+                let ink = self.ink(
+                    tile,
+                    palette,
+                    self.emphasis(index),
+                    scale,
+                    self.work_status(tile),
+                );
                 paint_visible_tile(buffer, area, tile, &ink, &mut covered);
             }
             for tile in self.departing.iter().rev() {
-                let ink = self.ink(tile, palette, Emphasis::Unselected, departing_scale);
+                let ink = self.ink(tile, palette, Emphasis::Unselected, departing_scale, None);
                 paint_visible_tile(buffer, area, tile, &ink, &mut covered);
             }
         } else {
             for tile in self.departing {
-                let ink = self.ink(tile, palette, Emphasis::Unselected, departing_scale);
+                let ink = self.ink(tile, palette, Emphasis::Unselected, departing_scale, None);
                 paint_tile(buffer, area, tile, &ink);
             }
             for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
-                let ink = self.ink(tile, palette, self.emphasis(index), scale);
+                let ink = self.ink(
+                    tile,
+                    palette,
+                    self.emphasis(index),
+                    scale,
+                    self.work_status(tile),
+                );
                 paint_tile(buffer, area, tile, &ink);
             }
         }
@@ -180,12 +278,24 @@ impl<'a> DenseRectangleGrid<'a> {
                 let Some(label) = labels[index].as_ref() else {
                     continue;
                 };
-                let ink = self.ink(tile, palette, self.emphasis(index), scale);
+                let ink = self.ink(
+                    tile,
+                    palette,
+                    self.emphasis(index),
+                    scale,
+                    self.work_status(tile),
+                );
                 draw_prepared_tile_label(
                     buffer, area, tile, label, ink.fill, ink.text, ink.detail, false,
                 );
             } else {
-                let ink = self.ink(tile, palette, self.emphasis(index), scale);
+                let ink = self.ink(
+                    tile,
+                    palette,
+                    self.emphasis(index),
+                    scale,
+                    self.work_status(tile),
+                );
                 draw_tile_label(
                     buffer, area, tile, ink.fill, ink.text, ink.detail, self.ascii, false,
                 );
@@ -204,6 +314,7 @@ impl<'a> DenseRectangleGrid<'a> {
                 self.ascii,
             );
         }
+        self.draw_composited_work_indicators(buffer, area, palette, scale, selected_last);
     }
 
     /// Fallback for monochrome, high-contrast, and ASCII presentation, where a
@@ -341,6 +452,97 @@ impl<'a> DenseRectangleGrid<'a> {
                 self.ascii,
             );
         }
+        self.draw_shaded_work_indicators(buffer, area, surface, selected_last);
+    }
+}
+
+fn draw_work_indicator(
+    buffer: &mut Buffer,
+    area: Rect,
+    tile: &Tile,
+    work: WorkRailItem<'_>,
+    style: Style,
+    ascii: bool,
+) {
+    if !can_draw_tile_label(tile) {
+        return;
+    }
+    let (_, bottom) = fully_owned_label_rows(tile);
+    let row = bottom.saturating_sub(1);
+    if tile.width >= 3 {
+        let x = tile.x.saturating_add(tile.width).saturating_sub(1);
+        if let Ok(y) = u16::try_from(row)
+            && x >= area.x
+            && x < area.right()
+            && y >= area.y
+            && y < area.bottom()
+            && let Some(cell) = buffer.cell_mut((x, y))
+        {
+            cell.set_symbol(work_marker(work.status, ascii))
+                .set_style(style);
+        }
+    }
+    let label = work_label(work, ascii);
+    let label = truncate_middle(label.as_ref(), label_max_width(tile));
+    draw_line(buffer, area, tile, row, &label, style);
+}
+
+fn work_marker(status: WorkRailStatus, ascii: bool) -> &'static str {
+    match (status, ascii) {
+        (WorkRailStatus::AwaitingConfirmation, _) => "!",
+        (WorkRailStatus::Planning, true) => "~",
+        (WorkRailStatus::Planning, false) => "◌",
+        (WorkRailStatus::Queued, true) => "+",
+        (WorkRailStatus::Queued, false) => "◍",
+        (WorkRailStatus::Executing, true) => "*",
+        (WorkRailStatus::Executing, false) => "◉",
+    }
+}
+
+fn work_label(work: WorkRailItem<'_>, ascii: bool) -> Cow<'static, str> {
+    match (work.status, ascii) {
+        (WorkRailStatus::AwaitingConfirmation, _) => Cow::Borrowed("! Awaiting confirmation"),
+        (WorkRailStatus::Planning, true) => Cow::Borrowed("~ Checking deletion"),
+        (WorkRailStatus::Planning, false) => Cow::Borrowed("◌ Checking deletion"),
+        (WorkRailStatus::Queued, true) => Cow::Borrowed("+ Queued for deletion"),
+        (WorkRailStatus::Queued, false) => Cow::Borrowed("◍ Queued for deletion"),
+        (WorkRailStatus::Executing, true) => {
+            let completed = work
+                .completed
+                .map_or(0, |progress| progress.load(Ordering::Acquire));
+            work.planned_entries.map_or_else(
+                || Cow::Owned(format!("* Deleting {completed}")),
+                |planned| Cow::Owned(format!("* Deleting {completed}/{planned}")),
+            )
+        }
+        (WorkRailStatus::Executing, false) => {
+            let completed = work
+                .completed
+                .map_or(0, |progress| progress.load(Ordering::Acquire));
+            work.planned_entries.map_or_else(
+                || Cow::Owned(format!("◉ Deleting {completed}")),
+                |planned| Cow::Owned(format!("◉ Deleting {completed}/{planned}")),
+            )
+        }
+    }
+}
+
+fn shade_work_tile(buffer: &mut Buffer, area: Rect, tile: &Tile) {
+    let left = tile.x.max(area.x);
+    let right = tile.x.saturating_add(tile.width).min(area.right());
+    let (top, bottom) = fully_owned_label_rows(tile);
+    for row in top..bottom {
+        let Ok(y) = u16::try_from(row) else {
+            break;
+        };
+        if y < area.y || y >= area.bottom() {
+            continue;
+        }
+        for x in left..right {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.modifier.insert(Modifier::REVERSED);
+            }
+        }
     }
 }
 
@@ -368,6 +570,7 @@ impl Widget for DenseRectangleGrid<'_> {
                 palette,
                 self.ascii,
                 self.show_empty_label,
+                self.scanning,
             );
             return;
         }
@@ -407,6 +610,13 @@ fn is_ramp_eligible(tile: &Tile) -> bool {
     !tile.uncertain && tile.synthetic_kind.is_none()
 }
 
+fn is_virtual_summary(tile: &Tile) -> bool {
+    matches!(
+        tile.synthetic_kind,
+        Some(SyntheticKind::Other | SyntheticKind::Shared)
+    )
+}
+
 /// Every colour one entry needs, resolved once per frame rather than per cell.
 struct TileInk {
     fill: Color,
@@ -424,17 +634,23 @@ impl TileInk {
         palette: MapPalette,
         emphasis: Emphasis,
         scale: HeatScale,
+        work_status: Option<WorkRailStatus>,
     ) -> Self {
         let tone = match tile.file_type {
             FileType::Folder => TileTone::Folder,
             FileType::File | FileType::Synthetic => TileTone::File,
         };
-        let resting = if is_ramp_eligible(tile) {
+        let resting = if let Some(status) = work_status {
+            palette.semantic(work_status_color(theme, status))
+        } else if is_ramp_eligible(tile) {
             palette.tile(scale.of(tile.size), tone)
+        } else if is_virtual_summary(tile) {
+            // `Other` and `Shared` represent totals rather than a filesystem
+            // object. Keep them deliberately quiet, including when a pointer
+            // passes over their geometry.
+            palette.semantic(theme.text_muted)
         } else if tile.uncertain {
             palette.semantic(theme.state_uncertain)
-        } else if tile.synthetic_kind == Some(SyntheticKind::Shared) {
-            palette.semantic(theme.state_shared)
         } else {
             palette.semantic(theme.state_aggregated)
         };
@@ -462,6 +678,15 @@ impl TileInk {
             text,
             detail,
         }
+    }
+}
+
+fn work_status_color(theme: Theme, status: WorkRailStatus) -> Color {
+    match status {
+        WorkRailStatus::AwaitingConfirmation => theme.focus,
+        WorkRailStatus::Planning => theme.state_scanning,
+        WorkRailStatus::Queued => theme.state_rescanning,
+        WorkRailStatus::Executing => theme.text_danger,
     }
 }
 
@@ -1565,7 +1790,8 @@ fn draw_empty_surface(
     theme: Theme,
     palette: Option<MapPalette>,
     ascii: bool,
-    show_label: bool,
+    show_empty_label: bool,
+    scanning: bool,
 ) {
     let backdrop = palette.map_or_else(|| theme.map_surface(), MapPalette::backdrop);
     for position in area.positions() {
@@ -1573,10 +1799,20 @@ fn draw_empty_surface(
             .set_symbol(if ascii { "." } else { "·" })
             .set_style(Style::default().fg(theme.text_muted).bg(backdrop));
     }
-    if !show_label {
+    let label = if show_empty_label {
+        Some("Folder is empty")
+    } else if scanning {
+        Some(if ascii {
+            "Scanning folder..."
+        } else {
+            "Scanning folder…"
+        })
+    } else {
+        None
+    };
+    let Some(label) = label else {
         return;
-    }
-    let label = "Folder is empty";
+    };
     if area.width >= label.width() as u16 && area.height > 0 {
         let x = u32::from(area.x) + u32::from(area.width.saturating_sub(label.width() as u16)) / 2;
         let y = u32::from(area.y) + u32::from(area.height) / 2;
@@ -1601,12 +1837,14 @@ fn draw_empty_surface(
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::path::PathBuf;
 
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::widgets::Widget;
 
-    use crate::model::NodeId;
+    use crate::model::{EntrySnapshot, NodeId, NodeKind};
+    use crate::state::FileToDelete;
     use crate::theme::ThemeId;
     use crate::ui::palette::Oklch;
 
@@ -1629,6 +1867,26 @@ mod tests {
             file_type: FileType::File,
             synthetic_kind: None,
             uncertain: false,
+        }
+    }
+
+    fn deletion_target(node_id: NodeId) -> FileToDelete {
+        FileToDelete {
+            node_id,
+            synthetic: false,
+            path_in_filesystem: PathBuf::from("/scan-root"),
+            path_to_file: vec![OsString::from("entry")],
+            file_type: FileType::File,
+            num_descendants: None,
+            size: 1024,
+            expected_snapshot: EntrySnapshot {
+                identity: None,
+                kind: NodeKind::File,
+                apparent_bytes: 1024,
+                allocated_bytes: None,
+                modified_nanos: None,
+            },
+            reviewed_entries: Vec::new(),
         }
     }
 
@@ -1659,6 +1917,8 @@ mod tests {
                 selected_rect_index: selected,
                 transitioning: false,
                 show_empty_label: true,
+                deletion_work: None,
+                scanning: false,
             },
             Theme::for_id(theme),
             ascii,
@@ -1688,6 +1948,8 @@ mod tests {
                 selected_rect_index: selected,
                 transitioning: true,
                 show_empty_label: true,
+                deletion_work: None,
+                scanning: false,
             },
             Theme::for_id(theme),
             ascii,
@@ -1761,6 +2023,8 @@ mod tests {
                 selected_rect_index: None,
                 transitioning: false,
                 show_empty_label: true,
+                deletion_work: None,
+                scanning: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -2211,8 +2475,8 @@ mod tests {
             panic!("the Catppuccin fixture needs a truecolour palette");
         };
         let scale = HeatScale::for_tiles(&[cold.clone(), hot.clone()]);
-        let expected_cold = TileInk::resolve(&cold, theme, palette, Emphasis::Resting, scale);
-        let expected_hot = TileInk::resolve(&hot, theme, palette, Emphasis::Resting, scale);
+        let expected_cold = TileInk::resolve(&cold, theme, palette, Emphasis::Resting, scale, None);
+        let expected_hot = TileInk::resolve(&hot, theme, palette, Emphasis::Resting, scale, None);
         assert_eq!(
             buffer[(1, 1)].bg,
             expected_cold.fill,
@@ -2238,7 +2502,7 @@ mod tests {
             .collect();
         let scale = HeatScale::for_tiles(&tiles);
         for entry in &tiles {
-            let ink = TileInk::resolve(entry, theme, palette, Emphasis::Resting, scale);
+            let ink = TileInk::resolve(entry, theme, palette, Emphasis::Resting, scale, None);
             assert_ne!(ink.fill, theme.text_danger);
             assert_ne!(ink.fill, theme.surface_danger);
         }
@@ -2324,6 +2588,7 @@ mod tests {
                 palette,
                 Emphasis::Resting,
                 HeatScale::for_tiles(&tiles),
+                None,
             );
             assert_eq!(
                 buffer[(tile.x + 2, 1)].bg,
@@ -2572,8 +2837,8 @@ mod tests {
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
         let palette = MapPalette::for_theme(theme).expect("mocha is truecolour");
         let scale = HeatScale::for_ramp_tiles(&tiles);
-        let under_ink = TileInk::resolve(&under, theme, palette, Emphasis::Resting, scale);
-        let over_ink = TileInk::resolve(&over, theme, palette, Emphasis::Resting, scale);
+        let under_ink = TileInk::resolve(&under, theme, palette, Emphasis::Resting, scale, None);
+        let over_ink = TileInk::resolve(&over, theme, palette, Emphasis::Resting, scale, None);
 
         let mut culled = Buffer::empty(area);
         let mut coverage = HalfRowCoverage::new();
@@ -2840,6 +3105,82 @@ mod tests {
     }
 
     #[test]
+    fn active_deletion_tints_the_target_and_names_its_state() {
+        let area = Rect::new(0, 0, 30, 5);
+        let mut entry = tile(0, 0, 30, 10, 1);
+        entry.file_type = FileType::Folder;
+        let resting = render(
+            std::slice::from_ref(&entry),
+            area,
+            None,
+            ThemeId::CatppuccinMocha,
+            false,
+        );
+        let mut work = DeletionWork::new();
+        work.enqueue_confirmation(deletion_target(entry.node_id), true, 1024)
+            .expect("background work should retain the target");
+        let mut active = Buffer::empty(area);
+        DenseRectangleGrid::new(
+            MapLayout {
+                rectangles: std::slice::from_ref(&entry),
+                departing: &[],
+                overflow: None,
+                selected_rect_index: None,
+                transitioning: false,
+                show_empty_label: false,
+                scanning: false,
+                deletion_work: Some(&work),
+            },
+            Theme::for_id(ThemeId::CatppuccinMocha),
+            false,
+            false,
+        )
+        .render(area, &mut active);
+        assert_eq!(active[(29, 4)].symbol(), "◌");
+        assert!(text_of(&active).contains("Checking deletion"));
+        assert_ne!(active[(1, 3)].bg, resting[(1, 3)].bg);
+    }
+
+    #[test]
+    fn executing_deletion_label_reports_progress() {
+        let progress = std::sync::atomic::AtomicU64::new(3);
+        let item = WorkRailItem {
+            path: "target",
+            status: WorkRailStatus::Executing,
+            planned_entries: Some(8),
+            completed: Some(&progress),
+        };
+        assert_eq!(work_label(item, false).as_ref(), "◉ Deleting 3/8");
+        progress.store(4, Ordering::Release);
+        assert_eq!(work_label(item, true).as_ref(), "* Deleting 4/8");
+    }
+
+    #[test]
+    fn empty_scanning_surface_names_progress_without_claiming_empty() {
+        let area = Rect::new(0, 0, 24, 4);
+        let mut buffer = Buffer::empty(area);
+        DenseRectangleGrid::new(
+            MapLayout {
+                rectangles: &[],
+                departing: &[],
+                overflow: None,
+                selected_rect_index: None,
+                transitioning: false,
+                show_empty_label: false,
+                scanning: true,
+                deletion_work: None,
+            },
+            Theme::for_id(ThemeId::CatppuccinMocha),
+            false,
+            false,
+        )
+        .render(area, &mut buffer);
+        let rendered = text_of(&buffer);
+        assert!(rendered.contains("Scanning folder…"));
+        assert!(!rendered.contains("Folder is empty"));
+    }
+
+    #[test]
     fn an_empty_folder_says_so() {
         let area = Rect::new(0, 0, 24, 4);
         let buffer = render(&[], area, None, ThemeId::CatppuccinMocha, false);
@@ -2858,6 +3199,8 @@ mod tests {
                 selected_rect_index: None,
                 transitioning: false,
                 show_empty_label: false,
+                deletion_work: None,
+                scanning: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,

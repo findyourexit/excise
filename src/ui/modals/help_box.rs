@@ -6,13 +6,14 @@ use ratatui::widgets::{Paragraph, Widget};
 
 use crate::config::{CustomKeyBindings, KeyPreset};
 use crate::theme::Theme;
-use crate::ui::pane::{readable_text_on, render_modal};
+use crate::ui::pane::{ModalChrome, readable_text_on, render_modal};
 
 pub struct HelpBox<'a> {
     keymap: KeyPreset,
     custom_keys: Option<&'a CustomKeyBindings>,
     theme: Theme,
     ascii: bool,
+    chrome: ModalChrome,
 }
 
 enum MovementKeyLabel {
@@ -46,23 +47,25 @@ fn custom_movement_line(bindings: &CustomKeyBindings) -> String {
         movement_key_label(bindings.right)
     )
 }
-/// The complete Help layout needs sixteen inner rows and fifty-three inner columns.
-/// Its widest safety row is fifty-three columns, so it must never be truncated.
+/// The complete Help layout needs sixteen inner rows and fifty-five inner columns.
+/// Its widest export row is fifty-five columns, so it must never be truncated.
 const FULL_HELP_CONTENT_ROWS: u16 = 16;
-const FULL_HELP_CONTENT_COLUMNS: u16 = 53;
+const FULL_HELP_CONTENT_COLUMNS: u16 = 55;
 
 impl<'a> HelpBox<'a> {
-    pub const fn new(
+    pub(crate) const fn with_chrome(
         keymap: KeyPreset,
         custom_keys: Option<&'a CustomKeyBindings>,
         theme: Theme,
         ascii: bool,
+        chrome: ModalChrome,
     ) -> Self {
         Self {
             keymap,
             custom_keys,
             theme,
             ascii,
+            chrome,
         }
     }
 }
@@ -88,6 +91,7 @@ impl Widget for HelpBox<'_> {
             self.theme,
             self.theme.focus,
             self.ascii,
+            self.chrome,
         );
         let full =
             inner.height >= FULL_HELP_CONTENT_ROWS && inner.width >= FULL_HELP_CONTENT_COLUMNS;
@@ -110,13 +114,13 @@ impl Widget for HelpBox<'_> {
                 Line::from("  +  -  0                zoom in / out / reset"),
                 Line::from("  /                      filter items"),
                 Line::from("  e                      export report"),
-                Line::from("  t                      change theme"),
-                Line::from(""),
+                Line::from("  t                      preview themes"),
                 Line::styled("Delete safely", heading),
-                Line::from("  Backspace              plan permanent deletion"),
+                Line::from("  Backspace              queue permanent deletion"),
                 Line::from("  q / Ctrl-c             quit / interruption options"),
-                Line::from("  summary items          cannot be deleted"),
-                Line::from("  new/changed items      skipped before deletion"),
+                Line::from("  virtual summaries      cannot be deleted"),
+                Line::from("  summarized folders     open or delete directly"),
+                Line::from("  changed/new entries    skipped before deletion"),
                 Line::styled(
                     "[Esc/?/q] close help",
                     Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)),
@@ -158,12 +162,13 @@ impl Widget for HelpBox<'_> {
                     "[Esc/?/q] close help",
                     Style::default().fg(readable_text_on(self.theme, self.theme.surface_raised)),
                 ),
-                Line::from("  summary: cannot delete"),
-                Line::from("  new/changed: skipped"),
+                Line::from("  virtual: cannot delete"),
+                Line::from("  summary folder: open / delete"),
+                Line::from("  changed/new: skipped"),
                 Line::from("  Enter: open / rescan"),
                 Line::from("  Esc: back / cancel"),
                 Line::from("  +/-/0: zoom"),
-                Line::from("  / filter; e export; t theme"),
+                Line::from("  / filter; e scan; E history; t themes"),
             ]);
             content.truncate(usize::from(inner.height));
             content
@@ -190,11 +195,12 @@ mod tests {
         custom_keys: Option<&CustomKeyBindings>,
     ) -> String {
         let mut buffer = Buffer::empty(area);
-        HelpBox::new(
+        HelpBox::with_chrome(
             keymap,
             custom_keys,
             Theme::for_id(ThemeId::ExciseDark),
             false,
+            ModalChrome::new(std::time::Duration::ZERO, false, false),
         )
         .render(area, &mut buffer);
         buffer.content.iter().fold(String::new(), |mut text, cell| {
@@ -221,10 +227,11 @@ mod tests {
         assert!(rendered.contains("HELP"));
         assert!(rendered.contains("Navigate"));
         assert!(rendered.contains("export report"));
-        assert!(rendered.contains("change theme"));
+        assert!(rendered.contains("preview themes"));
         assert!(rendered.contains("Delete safely"));
-        assert!(rendered.contains("plan permanent deletion"));
-        assert!(rendered.contains("cannot be deleted"));
+        assert!(rendered.contains("queue permanent deletion"));
+        assert!(rendered.contains("virtual summaries"));
+        assert!(rendered.contains("summarized folders"));
         assert!(rendered.contains("skipped before deletion"));
         assert!(rendered.contains("[Esc/?/q] close help"));
     }
@@ -234,14 +241,14 @@ mod tests {
 
         assert!(rendered.contains("Backspace: permanent delete"));
         assert!(rendered.contains("q / Ctrl-c: quit / interrupt"));
-        assert!(rendered.contains("summary: cannot delete"));
-        assert!(rendered.contains("new/changed: skipped"));
+        assert!(rendered.contains("virtual: cannot delete"));
+        assert!(rendered.contains("changed/new: skipped"));
         assert!(rendered.contains("[Esc/?/q] close help"));
     }
 
     #[test]
-    fn help_stays_compact_at_56_through_58_columns() {
-        for width in 56..=58 {
+    fn help_stays_compact_at_56_through_60_columns() {
+        for width in 56..=60 {
             let rendered = rendered_help_in(Rect::new(0, 0, width, 20), KeyPreset::Vim, None);
 
             assert!(
@@ -250,13 +257,12 @@ mod tests {
             );
             assert!(
                 rendered.contains("q / Ctrl-c: quit / interrupt"),
-                "{width}-column help clipped the compact interruption guidance: {rendered:?}"
+                "{width}-column help clipped the compact exit guidance: {rendered:?}"
             );
         }
 
-        let rendered = rendered_help_in(Rect::new(0, 0, 59, 20), KeyPreset::Vim, None);
-        assert!(rendered.contains("q / Ctrl-c"));
-        assert!(rendered.contains("quit / interruption options"));
+        let rendered = rendered_help_in(Rect::new(0, 0, 61, 20), KeyPreset::Vim, None);
+        assert!(rendered.contains("q / Ctrl-c             quit / interruption options"));
     }
 
     #[test]
@@ -281,7 +287,7 @@ mod tests {
         let rendered = rendered_help_in(Rect::new(0, 0, 32, 8), KeyPreset::Custom, Some(&bindings));
 
         assert!(rendered.contains("L:a D:s U:w R:d"));
-        assert!(rendered.contains("summary: cannot delete"));
+        assert!(rendered.contains("virtual: cannot delete"));
     }
     #[test]
     fn preset_help_lists_preset_movement_bindings() {

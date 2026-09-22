@@ -56,7 +56,7 @@ pub(crate) const NORMAL_MODE_RESERVED_CUSTOM_MOVEMENT_KEYS: &[(char, &str)] = &[
     ('/', "filter"),
     ('?', "help"),
     ('e', "export"),
-    ('t', "theme"),
+    ('t', "theme picker"),
     ('q', "quit"),
     ('+', "zoom in"),
     ('-', "zoom out"),

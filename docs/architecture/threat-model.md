@@ -61,7 +61,7 @@ Store file paths without losing their original bytes. Show a reversible escaped 
 
 ### Terminal Restoration
 
-Validate the terminal before entering raw input mode. Restore it automatically on normal exit, errors, panics, and cancellation. Test failures and panics through a pseudo-terminal. A forced cancellation restores the terminal before exit and reports that the final deletion state may be unknown.
+Validate the terminal before entering raw input mode. Restore it automatically on normal exit, errors, panics, and cancellation. Test failures and panics through a pseudo-terminal. An active deletion only stops at an entry boundary and its worker is always joined before the terminal session ends.
 
 ## Abuse Cases
 
@@ -74,5 +74,5 @@ Validate the terminal before entering raw input mode. Restore it automatically o
 | A metadata query fails | Mark the value unknown and do not substitute file length |
 | A flat directory exceeds the memory limit | Keep the largest entries and an exact `Other` summary |
 | Focus changes repeat quickly | Replace the earlier visual effect and keep memory bounded |
-| The user quits during deletion | Offer a soft cancel, a forced cancel, or a return to deletion |
+| The user quits during deletion | Cancel pending plans, safely stop after the current entry, or return to wait; never detach an active filesystem mutation |
 

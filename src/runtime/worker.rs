@@ -1,11 +1,7 @@
 use std::fs::Metadata;
-#[cfg(all(test, unix))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(all(test, unix))]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -25,13 +21,12 @@ use crate::native_path::DECEPTIVE_DISPLAY_MARKER;
 #[cfg(all(test, unix))]
 use crate::native_path::safe_display_path_text;
 use crate::native_path::{NativeIdentity, safe_display_text};
-use crate::state::deletion_work::{DeletionWorkCommand, DeletionWorkId};
+use crate::state::deletion_work::{DeletionWorkCommand, DeletionWorkId, MAX_DELETION_WORK_ITEMS};
 use crate::temporary_storage::TemporaryStorage;
 
 use super::scanner::{self, ScannerOptions};
 
 const CHANNEL_RETRY: Duration = Duration::from_millis(25);
-const WORKER_COMMAND_CAPACITY: usize = 1;
 
 pub struct ScannedEntry {
     pub metadata: Metadata,
@@ -58,13 +53,31 @@ pub(super) enum WorkerEvent {
     ScanFinished {
         cancelled: bool,
     },
+    FocusedScanBatch {
+        entries: Vec<ScannedEntry>,
+    },
+    FocusedScanDirectoryComplete {
+        path: PathBuf,
+        identity: Option<NativeIdentity>,
+    },
+    FocusedScanUnscanned {
+        path: PathBuf,
+        reason: crate::model::UnscannedReason,
+    },
+    FocusedScanFailed {
+        path: Option<PathBuf>,
+        message: String,
+    },
+    FocusedScanFinished {
+        cancelled: bool,
+    },
     DeletionPlanned {
         work_id: DeletionWorkId,
         result: Result<Box<DeletionPlan>, DeletionPlanError>,
     },
-    DeletionRevalidated {
+    DeletionExecutionRejected {
         work_id: DeletionWorkId,
-        result: Result<Box<DeletionPlan>, (Box<DeletionPlan>, DeletionPlanError)>,
+        error: DeletionPlanError,
     },
     DeletionFinished {
         work_id: DeletionWorkId,
@@ -72,8 +85,24 @@ pub(super) enum WorkerEvent {
     },
 }
 
-enum WorkerCommand {
-    Deletion(DeletionWorkCommand),
+enum PlannerCommand {
+    Plan {
+        work_id: DeletionWorkId,
+        target: Box<crate::state::FileToDelete>,
+        reduced_guardrails: bool,
+        maximum_bytes: usize,
+    },
+}
+
+enum ExecutorCommand {
+    Execute {
+        work_id: DeletionWorkId,
+        plan: Box<DeletionPlan>,
+        progress: Arc<AtomicU64>,
+    },
+}
+
+enum RescanCommand {
     Rescan(ScannerOptions),
 }
 
@@ -82,71 +111,136 @@ pub(crate) enum DeletionWorkSubmissionError {
     Disconnected,
 }
 
+/// The planner can build one non-mutating identity plan while the executor owns
+/// the only revalidate-and-mutate lane. All command and event queues are bounded.
 pub struct WorkerPool {
     events: Receiver<WorkerEvent>,
-    commands: Sender<WorkerCommand>,
+    planner_commands: Sender<PlannerCommand>,
+    executor_commands: Sender<ExecutorCommand>,
+    rescan_commands: Sender<RescanCommand>,
     cancelled: Arc<AtomicBool>,
     deletion_plan_cancelled: Arc<AtomicBool>,
     deletion_soft_cancelled: Arc<AtomicBool>,
     rescan_cancelled: Arc<AtomicBool>,
+    scanner_control: Arc<scanner::ScannerControl>,
     scanner_handle: thread::JoinHandle<()>,
-    deletion_handle: thread::JoinHandle<()>,
+    planner_handle: thread::JoinHandle<()>,
+    rescan_handle: thread::JoinHandle<()>,
+    executor_handle: thread::JoinHandle<()>,
 }
 
 impl WorkerPool {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each worker has an explicit startup and cleanup path to preserve bounded ownership"
+    )]
     pub fn start(scanner_options: ScannerOptions, event_capacity: usize) -> Result<Self, AppError> {
         let (event_sender, events) = bounded(event_capacity);
-        let (commands, command_receiver) = bounded(WORKER_COMMAND_CAPACITY);
+        let (planner_commands, planner_receiver) = bounded(MAX_DELETION_WORK_ITEMS);
+        let (executor_commands, executor_receiver) = bounded(1);
+        let (rescan_commands, rescan_receiver) = bounded(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let deletion_plan_cancelled = Arc::new(AtomicBool::new(false));
-        let rescan_cancelled = Arc::new(AtomicBool::new(false));
         let deletion_soft_cancelled = Arc::new(AtomicBool::new(false));
+        let rescan_cancelled = Arc::new(AtomicBool::new(false));
         let scan_root = scanner_options.root.clone();
         let scan_root_identity = scanner_options.root_identity.clone();
         let temporary_storage = scanner_options.temporary_storage.clone();
 
-        let scanner = scanner::spawn(scanner_options, event_sender.clone(), cancelled.clone())
-            .map_err(|error| AppError::io("could not spawn scanner worker", error))?;
-
-        let worker_cancelled = cancelled.clone();
-        let worker_plan_cancelled = deletion_plan_cancelled.clone();
-        let worker_rescan_cancelled = rescan_cancelled.clone();
-        let worker_soft_cancelled = deletion_soft_cancelled.clone();
-        let deletion = match thread::Builder::new()
-            .name("excise-deletion".to_string())
-            .spawn(move || {
-                deletion_worker(
-                    &scan_root,
-                    scan_root_identity.as_ref(),
-                    &temporary_storage,
-                    &command_receiver,
-                    &event_sender,
-                    &worker_plan_cancelled,
-                    &worker_soft_cancelled,
-                    &worker_rescan_cancelled,
-                    &worker_cancelled,
-                );
+        let (scanner, scanner_control) = scanner::spawn(
+            scanner_options,
+            event_sender.clone(),
+            Arc::clone(&cancelled),
+        )
+        .map_err(|error| AppError::io("could not spawn scanner worker", error))?;
+        let planner = match thread::Builder::new()
+            .name("excise-deletion-planner".to_string())
+            .spawn({
+                let sender = event_sender.clone();
+                let cancelled = Arc::clone(&cancelled);
+                let plan_cancelled = Arc::clone(&deletion_plan_cancelled);
+                let root = scan_root.clone();
+                let root_identity = scan_root_identity.clone();
+                let temporary_storage = temporary_storage.clone();
+                move || {
+                    planning_worker(
+                        &root,
+                        root_identity.as_ref(),
+                        &temporary_storage,
+                        &planner_receiver,
+                        &sender,
+                        &plan_cancelled,
+                        &cancelled,
+                    );
+                }
             }) {
             Ok(handle) => handle,
             Err(error) => {
                 cancelled.store(true, Ordering::Release);
                 drop(events);
-                scanner
-                    .join()
-                    .map_err(|_| AppError::Worker("scanner thread panicked".to_string()))?;
-                return Err(AppError::io("could not spawn deletion worker", error));
+                let _ = scanner.join();
+                return Err(AppError::io("could not spawn deletion planner", error));
+            }
+        };
+        let rescanner = match thread::Builder::new()
+            .name("excise-focused-rescan".to_string())
+            .spawn({
+                let sender = event_sender.clone();
+                let cancelled = Arc::clone(&cancelled);
+                let rescan_cancelled = Arc::clone(&rescan_cancelled);
+                move || rescan_worker(&rescan_receiver, &sender, &rescan_cancelled, &cancelled)
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                cancelled.store(true, Ordering::Release);
+                drop(events);
+                let _ = scanner.join();
+                let _ = planner.join();
+                return Err(AppError::io("could not spawn focused rescan worker", error));
+            }
+        };
+        let executor = match thread::Builder::new()
+            .name("excise-deletion-executor".to_string())
+            .spawn({
+                let sender = event_sender;
+                let cancelled = Arc::clone(&cancelled);
+                let soft_cancelled = Arc::clone(&deletion_soft_cancelled);
+                let root = scan_root;
+                move || {
+                    execution_worker(
+                        &root,
+                        &executor_receiver,
+                        &sender,
+                        &soft_cancelled,
+                        &cancelled,
+                    );
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                cancelled.store(true, Ordering::Release);
+                drop(events);
+                let _ = scanner.join();
+                let _ = planner.join();
+                let _ = rescanner.join();
+                return Err(AppError::io("could not spawn deletion executor", error));
             }
         };
 
         Ok(Self {
             events,
-            commands,
+            planner_commands,
+            executor_commands,
+            rescan_commands,
             cancelled,
             deletion_plan_cancelled,
             deletion_soft_cancelled,
             rescan_cancelled,
+            scanner_control,
             scanner_handle: scanner,
-            deletion_handle: deletion,
+            planner_handle: planner,
+            rescan_handle: rescanner,
+            executor_handle: executor,
         })
     }
 
@@ -155,38 +249,83 @@ impl WorkerPool {
         &self.events
     }
 
+    /// Promotes a visible directory ahead of unrelated queued scan work.
+    pub fn prioritize_scan(&self, path: &Path) -> Result<(), AppError> {
+        self.scanner_control
+            .prioritize(path)
+            .map_err(|error| AppError::io("could not prioritize visible scanner directory", error))
+    }
+
     pub(crate) fn submit_deletion_work(
         &self,
         command: DeletionWorkCommand,
     ) -> Result<(), DeletionWorkSubmissionError> {
-        match &command {
-            DeletionWorkCommand::Plan { .. } => {
+        match command {
+            DeletionWorkCommand::Plan {
+                work_id,
+                target,
+                reduced_guardrails,
+                maximum_bytes,
+            } => {
                 self.deletion_plan_cancelled.store(false, Ordering::Release);
+                match self.planner_commands.try_send(PlannerCommand::Plan {
+                    work_id,
+                    target,
+                    reduced_guardrails,
+                    maximum_bytes,
+                }) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(PlannerCommand::Plan {
+                        work_id,
+                        target,
+                        reduced_guardrails,
+                        maximum_bytes,
+                    })) => Err(DeletionWorkSubmissionError::Busy(Box::new(
+                        DeletionWorkCommand::Plan {
+                            work_id,
+                            target,
+                            reduced_guardrails,
+                            maximum_bytes,
+                        },
+                    ))),
+                    Err(TrySendError::Disconnected(_)) => {
+                        Err(DeletionWorkSubmissionError::Disconnected)
+                    }
+                }
             }
-            DeletionWorkCommand::Revalidate { .. } => {
+            DeletionWorkCommand::Execute {
+                work_id,
+                plan,
+                progress,
+            } => {
                 self.deletion_soft_cancelled.store(false, Ordering::Release);
-            }
-            DeletionWorkCommand::Execute { .. } => {}
-        }
-        match self.commands.try_send(WorkerCommand::Deletion(command)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(WorkerCommand::Deletion(command))) => {
-                Err(DeletionWorkSubmissionError::Busy(Box::new(command)))
-            }
-
-            Err(TrySendError::Disconnected(WorkerCommand::Deletion(_))) => {
-                Err(DeletionWorkSubmissionError::Disconnected)
-            }
-            Err(
-                TrySendError::Full(WorkerCommand::Rescan(_))
-                | TrySendError::Disconnected(WorkerCommand::Rescan(_)),
-            ) => {
-                unreachable!("only deletion commands are submitted through this method")
+                match self.executor_commands.try_send(ExecutorCommand::Execute {
+                    work_id,
+                    plan,
+                    progress,
+                }) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(ExecutorCommand::Execute {
+                        work_id,
+                        plan,
+                        progress,
+                    })) => Err(DeletionWorkSubmissionError::Busy(Box::new(
+                        DeletionWorkCommand::Execute {
+                            work_id,
+                            plan,
+                            progress,
+                        },
+                    ))),
+                    Err(TrySendError::Disconnected(_)) => {
+                        Err(DeletionWorkSubmissionError::Disconnected)
+                    }
+                }
             }
         }
     }
 
-    pub fn soft_cancel_deletion(&self) {
+    /// Stops only at an entry boundary. The executor is always joined by shutdown.
+    pub fn safely_stop_deletion(&self) {
         self.deletion_soft_cancelled.store(true, Ordering::Release);
     }
 
@@ -194,20 +333,16 @@ impl WorkerPool {
         self.deletion_plan_cancelled.store(true, Ordering::Release);
     }
 
-    pub fn resume_deletion(&self) {
-        self.deletion_soft_cancelled.store(false, Ordering::Release);
-    }
-
     pub fn request_rescan(&self, options: ScannerOptions) -> Result<(), AppError> {
         self.rescan_cancelled.store(false, Ordering::Release);
-        self.commands
-            .try_send(WorkerCommand::Rescan(options))
+        self.rescan_commands
+            .try_send(RescanCommand::Rescan(options))
             .map_err(|error| match error {
                 TrySendError::Full(_) => {
-                    AppError::Invariant("worker command queue is full".to_string())
+                    AppError::Invariant("focused rescan queue is full".to_string())
                 }
                 TrySendError::Disconnected(_) => {
-                    AppError::Worker("deletion worker disconnected".to_string())
+                    AppError::Worker("focused rescan worker disconnected".to_string())
                 }
             })
     }
@@ -217,46 +352,56 @@ impl WorkerPool {
     }
 
     pub fn shutdown(self) -> Result<(), AppError> {
-        self.stop(false)
-    }
-
-    pub fn hard_shutdown(self) -> Result<(), AppError> {
-        self.stop(true)
-    }
-
-    fn stop(self, detach_deletion: bool) -> Result<(), AppError> {
-        self.cancelled.store(true, Ordering::Release);
-        self.deletion_plan_cancelled.store(true, Ordering::Release);
-        self.deletion_soft_cancelled.store(true, Ordering::Release);
-        self.rescan_cancelled.store(true, Ordering::Release);
-        drop(self.events);
-        drop(self.commands);
-        if detach_deletion {
-            drop(self.scanner_handle);
-            drop(self.deletion_handle);
-            return Ok(());
-        }
-        self.scanner_handle
+        let Self {
+            events,
+            planner_commands,
+            executor_commands,
+            rescan_commands,
+            cancelled,
+            deletion_plan_cancelled,
+            deletion_soft_cancelled,
+            rescan_cancelled,
+            scanner_control,
+            scanner_handle,
+            planner_handle,
+            rescan_handle,
+            executor_handle,
+        } = self;
+        cancelled.store(true, Ordering::Release);
+        deletion_plan_cancelled.store(true, Ordering::Release);
+        deletion_soft_cancelled.store(true, Ordering::Release);
+        rescan_cancelled.store(true, Ordering::Release);
+        drop(events);
+        drop(planner_commands);
+        drop(executor_commands);
+        drop(rescan_commands);
+        drop(scanner_control);
+        scanner_handle
             .join()
             .map_err(|_| AppError::Worker("scanner thread panicked".to_string()))?;
-        self.deletion_handle
+        planner_handle
             .join()
-            .map_err(|_| AppError::Worker("deletion thread panicked".to_string()))
+            .map_err(|_| AppError::Worker("deletion planner thread panicked".to_string()))?;
+        rescan_handle
+            .join()
+            .map_err(|_| AppError::Worker("focused rescan thread panicked".to_string()))?;
+        executor_handle
+            .join()
+            .map_err(|_| AppError::Worker("deletion executor thread panicked".to_string()))
     }
 }
+
 #[allow(
     clippy::too_many_arguments,
-    reason = "The worker receives each independent bounded command, cancellation, and filesystem capability explicitly."
+    reason = "planner inputs stay explicit at the identity and capacity boundary"
 )]
-fn deletion_worker(
+fn planning_worker(
     scan_root: &std::path::Path,
     scan_root_identity: Option<&NativeIdentity>,
     temporary_storage: &TemporaryStorage,
-    commands: &Receiver<WorkerCommand>,
+    commands: &Receiver<PlannerCommand>,
     sender: &Sender<WorkerEvent>,
     plan_cancelled: &AtomicBool,
-    soft_cancelled: &AtomicBool,
-    rescan_cancelled: &Arc<AtomicBool>,
     cancelled: &AtomicBool,
 ) {
     loop {
@@ -268,48 +413,66 @@ fn deletion_worker(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        let event = match command {
-            WorkerCommand::Deletion(DeletionWorkCommand::Plan {
-                work_id,
-                target,
+        let PlannerCommand::Plan {
+            work_id,
+            target,
+            reduced_guardrails,
+            maximum_bytes,
+        } = command;
+        let result = if let Some(identity) = scan_root_identity {
+            build_plan_cancellable_with_root_identity_and_temporary_storage(
+                scan_root,
+                identity.clone(),
+                *target,
                 reduced_guardrails,
+                plan_cancelled,
                 maximum_bytes,
-            }) => {
-                let result = if let Some(identity) = scan_root_identity {
-                    build_plan_cancellable_with_root_identity_and_temporary_storage(
-                        scan_root,
-                        identity.clone(),
-                        *target,
-                        reduced_guardrails,
-                        plan_cancelled,
-                        maximum_bytes,
-                        temporary_storage,
-                    )
-                } else {
-                    build_plan_cancellable_with_temporary_storage(
-                        scan_root,
-                        *target,
-                        reduced_guardrails,
-                        plan_cancelled,
-                        maximum_bytes,
-                        temporary_storage,
-                    )
-                }
-                .map(Box::new);
-                WorkerEvent::DeletionPlanned { work_id, result }
-            }
-            WorkerCommand::Deletion(DeletionWorkCommand::Revalidate { work_id, plan }) => {
-                let result = match revalidate_plan_cancellable(scan_root, &plan, soft_cancelled) {
-                    Ok(()) => Ok(plan),
-                    Err(error) => Err((plan, error)),
-                };
-                WorkerEvent::DeletionRevalidated { work_id, result }
-            }
-            WorkerCommand::Deletion(DeletionWorkCommand::Execute {
-                work_id,
-                plan,
-                progress,
-            }) => WorkerEvent::DeletionFinished {
+                temporary_storage,
+            )
+        } else {
+            build_plan_cancellable_with_temporary_storage(
+                scan_root,
+                *target,
+                reduced_guardrails,
+                plan_cancelled,
+                maximum_bytes,
+                temporary_storage,
+            )
+        }
+        .map(Box::new);
+        if !send_event(
+            sender,
+            WorkerEvent::DeletionPlanned { work_id, result },
+            cancelled,
+        ) {
+            return;
+        }
+    }
+}
+
+fn execution_worker(
+    scan_root: &std::path::Path,
+    commands: &Receiver<ExecutorCommand>,
+    sender: &Sender<WorkerEvent>,
+    soft_cancelled: &AtomicBool,
+    cancelled: &AtomicBool,
+) {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let command = match commands.recv_timeout(CHANNEL_RETRY) {
+            Ok(command) => command,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        let ExecutorCommand::Execute {
+            work_id,
+            plan,
+            progress,
+        } = command;
+        let event = match revalidate_plan_cancellable(scan_root, &plan, soft_cancelled) {
+            Ok(()) => WorkerEvent::DeletionFinished {
                 work_id,
                 report: execute_plan_counted(
                     scan_root,
@@ -319,16 +482,85 @@ fn deletion_worker(
                     &progress,
                 ),
             },
-            WorkerCommand::Rescan(options) => {
-                scanner::run(options, sender, rescan_cancelled.as_ref());
-                continue;
-            }
+            Err(error) => WorkerEvent::DeletionExecutionRejected { work_id, error },
         };
         if !send_event(sender, event, cancelled) {
             return;
         }
     }
 }
+fn rescan_worker(
+    commands: &Receiver<RescanCommand>,
+    sender: &Sender<WorkerEvent>,
+    rescan_cancelled: &AtomicBool,
+    cancelled: &AtomicBool,
+) {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let command = match commands.recv_timeout(CHANNEL_RETRY) {
+            Ok(command) => command,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        let RescanCommand::Rescan(options) = command;
+        let (scan_sender, scan_events) = bounded(1);
+        let scanner_sender = scan_sender.clone();
+        let root = options.root.clone();
+        thread::scope(|scope| {
+            let scanner =
+                scope.spawn(move || scanner::run(options, &scanner_sender, rescan_cancelled));
+            drop(scan_sender);
+            while let Ok(event) = scan_events.recv() {
+                let finished = matches!(event, WorkerEvent::ScanFinished { .. });
+                let event = match event {
+                    WorkerEvent::ScanBatch { entries } => WorkerEvent::FocusedScanBatch { entries },
+                    WorkerEvent::ScanDirectoryComplete { path, identity } => {
+                        WorkerEvent::FocusedScanDirectoryComplete { path, identity }
+                    }
+                    WorkerEvent::ScanUnscanned { path, reason } => {
+                        WorkerEvent::FocusedScanUnscanned { path, reason }
+                    }
+                    WorkerEvent::ScanFailed { path, message } => {
+                        WorkerEvent::FocusedScanFailed { path, message }
+                    }
+                    WorkerEvent::ScanFinished { cancelled } => {
+                        WorkerEvent::FocusedScanFinished { cancelled }
+                    }
+                    WorkerEvent::FocusedScanBatch { .. }
+                    | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                    | WorkerEvent::FocusedScanUnscanned { .. }
+                    | WorkerEvent::FocusedScanFailed { .. }
+                    | WorkerEvent::FocusedScanFinished { .. }
+                    | WorkerEvent::DeletionPlanned { .. }
+                    | WorkerEvent::DeletionExecutionRejected { .. }
+                    | WorkerEvent::DeletionFinished { .. } => {
+                        unreachable!("scanner must emit only primary scan events")
+                    }
+                };
+                if !send_event(sender, event, cancelled) {
+                    rescan_cancelled.store(true, Ordering::Release);
+                    break;
+                }
+                if finished {
+                    break;
+                }
+            }
+            if scanner.join().is_err() {
+                let _ = send_event(
+                    sender,
+                    WorkerEvent::FocusedScanFailed {
+                        path: Some(root),
+                        message: "focused scanner thread panicked".to_string(),
+                    },
+                    cancelled,
+                );
+            }
+        });
+    }
+}
+
 #[cfg(all(test, unix))]
 fn safe_worker_path(path: &Path) -> String {
     safe_display_path_text(path)
@@ -374,22 +606,36 @@ fn sanitize_worker_event(event: WorkerEvent) -> WorkerEvent {
             path,
             message: safe_worker_text(&message),
         },
+        WorkerEvent::FocusedScanFailed { path, message } => WorkerEvent::FocusedScanFailed {
+            path,
+            message: safe_worker_text(&message),
+        },
         WorkerEvent::ScanUnscanned { path, reason } => WorkerEvent::ScanUnscanned {
             path,
-            reason: match reason {
-                crate::model::UnscannedReason::Excluded(pattern) => {
-                    crate::model::UnscannedReason::Excluded(safe_worker_text(&pattern))
-                }
-                crate::model::UnscannedReason::Metadata(message) => {
-                    crate::model::UnscannedReason::Metadata(safe_worker_text(&message))
-                }
-                crate::model::UnscannedReason::Replacement(message) => {
-                    crate::model::UnscannedReason::Replacement(safe_worker_text(&message))
-                }
-                reason => reason,
-            },
+            reason: sanitize_unscanned_reason(reason),
+        },
+        WorkerEvent::FocusedScanUnscanned { path, reason } => WorkerEvent::FocusedScanUnscanned {
+            path,
+            reason: sanitize_unscanned_reason(reason),
         },
         event => event,
+    }
+}
+
+fn sanitize_unscanned_reason(
+    reason: crate::model::UnscannedReason,
+) -> crate::model::UnscannedReason {
+    match reason {
+        crate::model::UnscannedReason::Excluded(pattern) => {
+            crate::model::UnscannedReason::Excluded(safe_worker_text(&pattern))
+        }
+        crate::model::UnscannedReason::Metadata(message) => {
+            crate::model::UnscannedReason::Metadata(safe_worker_text(&message))
+        }
+        crate::model::UnscannedReason::Replacement(message) => {
+            crate::model::UnscannedReason::Replacement(safe_worker_text(&message))
+        }
+        reason => reason,
     }
 }
 
@@ -412,7 +658,6 @@ pub(super) fn send_event(
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -488,77 +733,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn soft_cancel_wins_over_queued_revalidation_success() {
+    fn executor_revalidates_before_first_mutation() {
         let root = tempfile::tempdir().expect("deletion root should exist");
         let (path, plan) = single_file_plan(root.path());
         let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
-        assert!(
-            workers
-                .submit_deletion_work(DeletionWorkCommand::Revalidate {
-                    work_id: DeletionWorkId(1),
-                    plan: Box::new(plan),
-                })
-                .is_ok(),
-            "revalidation should be queued"
-        );
-
-        let plan = loop {
-            match workers
-                .events()
-                .recv_timeout(Duration::from_secs(5))
-                .expect("worker should report revalidation")
-            {
-                WorkerEvent::DeletionRevalidated {
-                    result: Ok(plan), ..
-                } => break *plan,
-                WorkerEvent::DeletionRevalidated { result: Err(_), .. } => {
-                    panic!("revalidation should succeed")
-                }
-                _ => {}
-            }
-        };
-
-        workers.soft_cancel_deletion();
+        std::fs::write(&path, b"replacement-after-confirmation")
+            .expect("target should be replaced before execution");
         assert!(
             workers
                 .submit_deletion_work(DeletionWorkCommand::Execute {
-                    work_id: DeletionWorkId(1),
+                    work_id: DeletionWorkId::for_test(1),
                     plan: Box::new(plan),
                     progress: Arc::new(AtomicU64::new(0)),
                 })
                 .is_ok(),
-            "execution should be queued after cancellation"
+            "execution should be queued"
         );
-        let report = loop {
+
+        let error = loop {
             match workers
                 .events()
                 .recv_timeout(Duration::from_secs(5))
-                .expect("worker should report deletion")
+                .expect("worker should report execution revalidation")
             {
-                WorkerEvent::DeletionFinished { report, .. } => break report,
-                WorkerEvent::ScanBatch { .. }
-                | WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::ScanUnscanned { .. }
-                | WorkerEvent::ScanFailed { .. }
-                | WorkerEvent::ScanFinished { .. }
-                | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. } => {}
+                WorkerEvent::DeletionExecutionRejected { error, .. } => break error,
+                WorkerEvent::DeletionFinished { .. } => {
+                    panic!("changed target must not be removed")
+                }
+                _ => {}
             }
         };
-        assert!(report.soft_cancelled);
-        assert_eq!(report.unattempted_entries(), 1);
-        assert!(path.exists());
+        assert!(error.is_stale());
+        assert!(path.exists(), "stale target must not be mutated");
         workers.shutdown().expect("workers should stop");
     }
 
     #[cfg(unix)]
     #[test]
-    fn resume_deletion_clears_soft_cancel_before_execution() {
+    fn executor_runs_a_confirmed_plan_serially() {
         let root = tempfile::tempdir().expect("deletion root should exist");
         let (path, plan) = single_file_plan(root.path());
         let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
-        workers.soft_cancel_deletion();
-        workers.resume_deletion();
         assert!(
             workers
                 .submit_deletion_work(DeletionWorkCommand::Execute {
@@ -582,8 +797,13 @@ mod tests {
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::ScanFailed { .. }
                 | WorkerEvent::ScanFinished { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. } => {}
+                | WorkerEvent::DeletionExecutionRejected { .. } => {}
             }
         };
         assert!(!report.soft_cancelled);
@@ -623,7 +843,12 @@ mod tests {
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -653,22 +878,93 @@ mod tests {
                     .expect("scan pass should complete")
                 {
                     WorkerEvent::ScanBatch { entries } => {
+                        assert_eq!(pass, 0, "focused scan must not leak as primary data");
                         saw_file |= entries.iter().any(|entry| entry.path == file);
                     }
-                    WorkerEvent::ScanFinished { cancelled: false } => break,
-                    WorkerEvent::ScanFinished { cancelled: true } => {
+                    WorkerEvent::FocusedScanBatch { entries } => {
+                        assert_eq!(pass, 1, "initial scan must not be tagged as focused");
+                        saw_file |= entries.iter().any(|entry| entry.path == file);
+                    }
+                    WorkerEvent::ScanFinished { cancelled: false } => {
+                        assert_eq!(pass, 0, "focused scan must keep its own terminal event");
+                        break;
+                    }
+                    WorkerEvent::FocusedScanFinished { cancelled: false } => {
+                        assert_eq!(pass, 1, "initial scan must keep its own terminal event");
+                        break;
+                    }
+                    WorkerEvent::ScanFinished { cancelled: true }
+                    | WorkerEvent::FocusedScanFinished { cancelled: true } => {
                         panic!("scan pass was cancelled")
                     }
-                    WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                    WorkerEvent::ScanFailed { message, .. }
+                    | WorkerEvent::FocusedScanFailed { message, .. } => {
+                        panic!("scan failed: {message}")
+                    }
                     WorkerEvent::ScanDirectoryComplete { .. }
                     | WorkerEvent::ScanUnscanned { .. }
+                    | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                    | WorkerEvent::FocusedScanUnscanned { .. }
                     | WorkerEvent::DeletionPlanned { .. }
-                    | WorkerEvent::DeletionRevalidated { .. }
+                    | WorkerEvent::DeletionExecutionRejected { .. }
                     | WorkerEvent::DeletionFinished { .. } => {}
                 }
             }
             assert!(saw_file);
         }
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[test]
+    fn focused_rescan_streams_while_primary_scan_is_active() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let file = root.path().join("file");
+        std::fs::write(&file, b"payload").expect("fixture file should be written");
+        let scanner_options = options(root.path(), 1);
+        let workers = WorkerPool::start(scanner_options.clone(), 1).expect("workers should start");
+        workers
+            .request_rescan(scanner_options)
+            .expect("focused scan should queue before the primary scan completes");
+
+        let mut primary_finished = false;
+        let mut focused_finished = false;
+        let mut primary_saw_file = false;
+        let mut focused_saw_file = false;
+        while !primary_finished || !focused_finished {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both scans should make progress")
+            {
+                WorkerEvent::ScanBatch { entries } => {
+                    primary_saw_file |= entries.iter().any(|entry| entry.path == file);
+                }
+                WorkerEvent::FocusedScanBatch { entries } => {
+                    focused_saw_file |= entries.iter().any(|entry| entry.path == file);
+                }
+                WorkerEvent::ScanFinished { cancelled: false } => primary_finished = true,
+                WorkerEvent::FocusedScanFinished { cancelled: false } => focused_finished = true,
+                WorkerEvent::ScanFinished { cancelled: true }
+                | WorkerEvent::FocusedScanFinished { cancelled: true } => {
+                    panic!("scan should not be cancelled")
+                }
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::FocusedScanFailed { message, .. } => {
+                    panic!("scan failed: {message}")
+                }
+                WorkerEvent::ScanDirectoryComplete { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. } => {}
+                WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::DeletionFinished { .. } => {
+                    panic!("scan fixture must not emit deletion work")
+                }
+            }
+        }
+        assert!(primary_saw_file);
+        assert!(focused_saw_file);
         workers.shutdown().expect("workers should stop");
     }
 
@@ -703,7 +999,12 @@ mod tests {
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -741,7 +1042,12 @@ mod tests {
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -791,7 +1097,12 @@ mod tests {
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -837,7 +1148,12 @@ mod tests {
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -881,7 +1197,12 @@ mod tests {
                 WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -934,7 +1255,12 @@ mod tests {
                 | WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -993,7 +1319,12 @@ mod tests {
                 WorkerEvent::ScanDirectoryComplete { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionRevalidated { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::FocusedScanBatch { .. }
+                | WorkerEvent::FocusedScanDirectoryComplete { .. }
+                | WorkerEvent::FocusedScanUnscanned { .. }
+                | WorkerEvent::FocusedScanFailed { .. }
+                | WorkerEvent::FocusedScanFinished { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
             }
         }
@@ -1010,125 +1341,6 @@ mod tests {
             "scanner must not follow the replacement root"
         );
         workers.shutdown().expect("workers should stop");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn final_plan_revalidation_runs_in_cancellable_worker() {
-        use std::os::unix::fs::MetadataExt as _;
-        use std::time::UNIX_EPOCH;
-
-        use crate::deletion::{
-            PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan, current_scan_root_identity,
-        };
-        use crate::native_path::identity_for;
-        use crate::state::FileToDelete;
-        use crate::state::tiles::FileType;
-
-        let root = tempfile::tempdir().expect("scan root should exist");
-        let path = root.path().join("target");
-        std::fs::write(&path, b"original").expect("target should be written");
-        let metadata = std::fs::symlink_metadata(&path).expect("target metadata should exist");
-        let identity = identity_for(&path, &metadata)
-            .expect("target identity should be readable")
-            .expect("target identity should be available");
-        let snapshot = PlannedSnapshot {
-            identity: identity.clone(),
-            kind: PlannedKind::File,
-            apparent_bytes: u128::from(metadata.len()),
-            allocated_bytes: Some(u128::from(metadata.blocks()).saturating_mul(512)),
-            modified_nanos: metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos()),
-        };
-        let target = FileToDelete {
-            node_id: crate::model::NodeId(1),
-            synthetic: false,
-            path_in_filesystem: root.path().to_path_buf(),
-            path_to_file: vec![std::ffi::OsString::from("target")],
-            file_type: FileType::File,
-            num_descendants: None,
-            size: snapshot.apparent_bytes,
-            expected_snapshot: crate::model::EntrySnapshot {
-                identity: Some(identity),
-                kind: crate::model::NodeKind::File,
-                apparent_bytes: snapshot.apparent_bytes,
-                allocated_bytes: snapshot.allocated_bytes,
-                modified_nanos: snapshot.modified_nanos,
-            },
-            reviewed_entries: vec![ReviewedEntry {
-                relative_path: std::path::PathBuf::from("target"),
-                snapshot: snapshot.clone(),
-            }],
-        };
-        let plan = build_plan(root.path(), target, false).expect("deletion plan should build");
-        let root_identity =
-            current_scan_root_identity(root.path()).expect("scan root identity should be readable");
-        let mut scanner_options = options(root.path(), 1);
-        scanner_options.root_identity = Some(root_identity);
-        let workers = WorkerPool::start(scanner_options, 16).expect("workers should start");
-        std::fs::write(&path, b"replacement-after-confirmation")
-            .expect("replacement should be written");
-        assert!(
-            workers
-                .submit_deletion_work(DeletionWorkCommand::Revalidate {
-                    work_id: DeletionWorkId(3),
-                    plan: Box::new(plan),
-                })
-                .is_ok(),
-            "revalidation should be queued"
-        );
-
-        let result = loop {
-            match workers
-                .events()
-                .recv_timeout(Duration::from_secs(5))
-                .expect("worker should report revalidation")
-            {
-                WorkerEvent::DeletionRevalidated { result, .. } => break result,
-                WorkerEvent::ScanBatch { .. }
-                | WorkerEvent::ScanDirectoryComplete { .. }
-                | WorkerEvent::ScanUnscanned { .. }
-                | WorkerEvent::ScanFailed { .. }
-                | WorkerEvent::ScanFinished { .. }
-                | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionFinished { .. } => {}
-            }
-        };
-        let (returned, error) = result.expect_err("changed confirmation should be rejected");
-        assert_eq!(returned.planned_entries(), 1);
-        assert!(error.is_stale());
-        workers.shutdown().expect("workers should stop");
-    }
-    #[test]
-    fn hard_shutdown_does_not_join_blocked_workers() {
-        let (_event_sender, events) = bounded::<WorkerEvent>(1);
-        let (commands, command_receiver) = bounded::<WorkerCommand>(1);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let deletion_soft_cancelled = Arc::new(AtomicBool::new(false));
-        let rescan_cancelled = Arc::new(AtomicBool::new(false));
-        let scanner_handle = thread::spawn(|| {});
-        let deletion_handle = thread::spawn(|| thread::sleep(Duration::from_secs(2)));
-        drop(command_receiver);
-        let pool = WorkerPool {
-            events,
-            commands,
-            cancelled: cancelled.clone(),
-            deletion_plan_cancelled: Arc::new(AtomicBool::new(false)),
-            deletion_soft_cancelled,
-            rescan_cancelled,
-            scanner_handle,
-            deletion_handle,
-        };
-
-        let started = std::time::Instant::now();
-        pool.hard_shutdown()
-            .expect("hard shutdown should detach blocked workers");
-
-        assert!(started.elapsed() < Duration::from_millis(500));
-        assert!(cancelled.load(Ordering::Acquire));
     }
 
     #[test]

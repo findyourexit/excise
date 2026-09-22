@@ -384,15 +384,21 @@ impl Board {
     fn fill_from_selected(&mut self, selected: Option<NodeId>) {
         self.list_layout = self.area.width < 72;
         let selected = selected
-            .filter(|id| self.files.iter().any(|file| file.node_id == *id))
-            .or_else(|| self.files.first().map(|file| file.node_id));
+            .filter(|id| {
+                self.files
+                    .iter()
+                    .any(|file| file.node_id == *id && file.is_interactive())
+            })
+            .or_else(|| {
+                self.files
+                    .iter()
+                    .find(|file| file.is_interactive())
+                    .map(|file| file.node_id)
+            });
         self.tiles = self.lay_out_tiles(selected);
         self.selected_index =
             selected.and_then(|id| self.tiles.iter().position(|tile| tile.node_id == id));
-        // The map always holds a cursor while it has entries to hold one on. A
-        // folder whose contents were just replaced would otherwise come up with
-        // Nothing is selected, so the inspector is empty and the reader must hunt
-        // for the entry that matters. It is the biggest one at index zero.
+        // The map holds a cursor only while an actionable entry is available.
         if self.selected_index.is_none() {
             self.select_largest();
         }
@@ -696,9 +702,11 @@ impl Board {
                     .filter(|(index, _)| Some(*index) != selected_on_top)
                     .find(|(_, tile)| contains(tile))
             });
-        let selected = rendered.and_then(|(rendered_index, rendered)| {
-            self.target_index_for_rendered(rendered_index, rendered)
-        });
+        let selected = rendered
+            .and_then(|(rendered_index, rendered)| {
+                self.target_index_for_rendered(rendered_index, rendered)
+            })
+            .filter(|index| self.tiles.get(*index).is_some_and(Tile::is_interactive));
         if let Some(index) = selected {
             self.selected_index = Some(index);
             true
@@ -714,9 +722,8 @@ impl Board {
             .tiles
             .iter()
             .enumerate()
-            .filter(|(_, tile)| tile.file_type == FileType::Folder)
-            .map(|(index, _)| index)
-            .next();
+            .find(|(_, tile)| tile.file_type == FileType::Folder && tile.is_interactive())
+            .map(|(index, _)| index);
 
         if let Some(index) = next_index {
             self.set_selected_index(index);
@@ -729,9 +736,10 @@ impl Board {
                     .tiles
                     .iter()
                     .enumerate()
-                    .filter(|(_, c)| {
-                        c.is_directly_right_of(currently_selected)
-                            && c.horizontally_overlaps_with(currently_selected)
+                    .filter(|(_, candidate)| {
+                        candidate.is_interactive()
+                            && candidate.is_directly_right_of(currently_selected)
+                            && candidate.horizontally_overlaps_with(currently_selected)
                     })
                     // get the index of the tile with the most overlap with currently selected
                     .max_by_key(|(_, c)| c.get_horizontal_overlap_with(currently_selected))
@@ -753,9 +761,10 @@ impl Board {
                     .tiles
                     .iter()
                     .enumerate()
-                    .filter(|(_, c)| {
-                        c.is_directly_left_of(currently_selected)
-                            && c.horizontally_overlaps_with(currently_selected)
+                    .filter(|(_, candidate)| {
+                        candidate.is_interactive()
+                            && candidate.is_directly_left_of(currently_selected)
+                            && candidate.horizontally_overlaps_with(currently_selected)
                     })
                     // get the index of the tile with the most overlap with currently selected
                     .max_by_key(|(_, c)| c.get_horizontal_overlap_with(currently_selected))
@@ -782,7 +791,8 @@ impl Board {
                     .iter()
                     .enumerate()
                     .filter(|(_, candidate)| {
-                        candidate.is_directly_below(currently_selected)
+                        candidate.is_interactive()
+                            && candidate.is_directly_below(currently_selected)
                             && candidate.vertically_overlaps_with(currently_selected)
                     })
                     .max_by_key(|(_, candidate)| {
@@ -809,7 +819,8 @@ impl Board {
                     .iter()
                     .enumerate()
                     .filter(|(_, candidate)| {
-                        candidate.is_directly_above(currently_selected)
+                        candidate.is_interactive()
+                            && candidate.is_directly_above(currently_selected)
                             && candidate.vertically_overlaps_with(currently_selected)
                     })
                     .max_by_key(|(_, candidate)| {
@@ -830,12 +841,28 @@ impl Board {
                 .iter()
                 .position(|file| file.node_id == tile.node_id)
         });
-        let next = current.map_or(0, |index| index.saturating_add_signed(delta));
-        // The list holds its cursor at both ends for the same reason the map
-        // does: running past the last row is not a reason to select nothing.
-        if next >= self.files.len() {
+        let next = match (current, delta.is_negative()) {
+            (Some(index), false) => self
+                .files
+                .iter()
+                .enumerate()
+                .skip(index.saturating_add(1))
+                .find(|(_, file)| file.is_interactive())
+                .map(|(index, _)| index),
+            (Some(index), true) => self
+                .files
+                .iter()
+                .enumerate()
+                .take(index)
+                .rev()
+                .find(|(_, file)| file.is_interactive())
+                .map(|(index, _)| index),
+            (None, false) => self.files.iter().position(FileMetadata::is_interactive),
+            (None, true) => self.files.iter().rposition(FileMetadata::is_interactive),
+        };
+        let Some(next) = next else {
             return;
-        }
+        };
         let visible = usize::from(self.area.height).max(1);
         if next < self.list_offset {
             self.list_offset = next;
@@ -846,21 +873,30 @@ impl Board {
         self.fill();
         self.selected_index = self.tiles.iter().position(|tile| tile.node_id == id);
     }
-    /// Selects the biggest entry in the folder.
+    /// Selects the biggest actionable entry in the folder.
     ///
-    /// The treemap is laid out largest first, so index zero is both the entry
-    /// occupying the most space and the one most worth looking at.
+    /// The treemap is laid out largest first, so the first interactive entry is
+    /// both the largest actionable entry and the one most worth looking at.
     pub fn select_largest(&mut self) {
-        self.selected_index = (!self.tiles.is_empty()).then_some(0);
+        self.selected_index = self.tiles.iter().position(Tile::is_interactive);
     }
 
     /// Selects `node`, revealing it first when a narrow list has paged it away.
     pub fn select_node(&mut self, node: NodeId) -> bool {
-        if let Some(index) = self.tiles.iter().position(|tile| tile.node_id == node) {
+        if let Some(index) = self
+            .tiles
+            .iter()
+            .position(|tile| tile.node_id == node && tile.is_interactive())
+        {
             self.selected_index = Some(index);
             return true;
         }
-        if self.list_layout && self.files.iter().any(|file| file.node_id == node) {
+        if self.list_layout
+            && self
+                .files
+                .iter()
+                .any(|file| file.node_id == node && file.is_interactive())
+        {
             // `lay_out_tiles` resolves list identities against the full dataset,
             // moves the page window, and lets `fill_from_selected` resolve a
             // pending return pivot only after this identity is selected.
@@ -1021,7 +1057,7 @@ mod tests {
     use std::ffi::OsString;
 
     use super::*;
-    use crate::model::NodeId;
+    use crate::model::{NodeId, SyntheticKind};
 
     fn file(id: u32, percentage: f64) -> FileMetadata {
         file_with_size(id, 100, percentage)
@@ -1039,6 +1075,30 @@ mod tests {
             synthetic_kind: None,
             uncertain: false,
         }
+    }
+
+    #[test]
+    fn virtual_summaries_stay_visible_but_never_take_selection() {
+        let mut summary = file(1, 0.7);
+        summary.file_type = FileType::Synthetic;
+        summary.synthetic_kind = Some(SyntheticKind::Other);
+        let mut aggregate = file(2, 0.3);
+        aggregate.file_type = FileType::Folder;
+        aggregate.synthetic_kind = Some(SyntheticKind::Aggregate);
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files(vec![summary, aggregate]);
+
+        assert_eq!(
+            board.currently_selected().map(|tile| tile.node_id),
+            Some(NodeId(2))
+        );
+        assert!(!board.select_node(NodeId(1)));
+        board.move_selected_left();
+        assert_eq!(
+            board.currently_selected().map(|tile| tile.node_id),
+            Some(NodeId(2))
+        );
     }
 
     fn reordered_board_mid_tween() -> Board {

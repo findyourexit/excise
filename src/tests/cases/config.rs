@@ -303,7 +303,7 @@ fn custom_keymap_requires_distinct_reachable_bindings() {
         ('/', "filter"),
         ('?', "help"),
         ('e', "export"),
-        ('t', "theme"),
+        ('t', "theme picker"),
         ('q', "quit"),
         ('+', "zoom in"),
         ('-', "zoom out"),
