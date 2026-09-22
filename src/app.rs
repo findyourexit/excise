@@ -342,6 +342,14 @@ where
         let has_selection = self.board.currently_selected().is_some();
         // Rendering lays out the board and can establish or clear its selection.
         let selection_changed = self.ui_mode.allows_motion() && selection_before != has_selection;
+        let animate_selected_map = self.ui_mode.allows_motion()
+            && has_selection
+            && !self.board.is_list_layout()
+            && !ascii
+            && !monochrome
+            && !reduced_motion
+            && ColorCycle::can_animate(theme.focus);
+
         let animate_modal = self.ui_mode.has_modal_attention()
             && !ascii
             && !monochrome
@@ -352,11 +360,17 @@ where
             && !reduced_motion
             && ColorCycle::can_animate(theme.focus)
             && self.deletion_work.has_checker_animation(now);
-        // Only dialogs retain persistent chrome animation. Map selection and
-        // short-lived deletion feedback add their own activity requests.
+        // Modal, selected-map, and deletion feedback animate at the 30 fps
+        // cadence needed for a one-cell-per-frame perimeter gradient.
         animation.set_activity_with_cadence(
-            animate_modal || animate_deletion_checker || self.ui_effects.has_deletion_departure(),
-            animate_deletion_checker || self.ui_effects.has_deletion_departure(),
+            animate_selected_map
+                || animate_modal
+                || animate_deletion_checker
+                || self.ui_effects.has_deletion_departure(),
+            animate_selected_map
+                || animate_modal
+                || animate_deletion_checker
+                || self.ui_effects.has_deletion_departure(),
         );
         // The map transition runs on wall-clock time, so the loop has to keep waking up
         // until it settles. Nothing else in the frame would ask for those frames.
@@ -1648,6 +1662,59 @@ mod tests {
         assert!(matches!(app.ui_mode, UiMode::Loading));
         assert!(app.board.currently_selected().is_some());
         assert_eq!(animation.next_frame_at(), None);
+    }
+
+    #[test]
+    fn modal_and_selected_map_request_fast_animation_frames() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            crate::model::MIN_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.loaded = true;
+        app.ui_mode = UiMode::Normal;
+        app.board.change_files(vec![map_entry(1, 1.0)]);
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+
+        app.render_if_dirty(
+            &mut animation,
+            Duration::ZERO,
+            "test",
+            Theme::for_id(crate::theme::ThemeId::CatppuccinMocha),
+            false,
+            false,
+            false,
+        )
+        .expect("normal map should render");
+        assert!(app.board.currently_selected().is_some());
+        assert_eq!(
+            animation.next_frame_at(),
+            Some(crate::animation::ACTIVE_FRAME_INTERVAL)
+        );
+
+        app.ui_mode = UiMode::Help;
+        app.mark_dirty();
+        app.render_if_dirty(
+            &mut animation,
+            Duration::from_millis(1),
+            "test",
+            Theme::for_id(crate::theme::ThemeId::CatppuccinMocha),
+            false,
+            false,
+            false,
+        )
+        .expect("modal should render");
+        assert_eq!(
+            animation.next_frame_at(),
+            Some(Duration::from_millis(1) + crate::animation::ACTIVE_FRAME_INTERVAL)
+        );
     }
 
     #[test]

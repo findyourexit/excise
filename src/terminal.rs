@@ -17,6 +17,100 @@ use crate::error::AppError;
 
 type PanicHook = Box<dyn for<'a> Fn(&PanicHookInfo<'a>) + Send + Sync + 'static>;
 
+/// Writes terminal output while splitting the paired truecolour SGR command
+/// emitted by `CrosstermBackend`. Each colour command is otherwise unchanged.
+/// Some terminal renderers parse the foreground half but display the paired
+/// background parameters as text, so equivalent sequential commands are safer.
+pub(crate) struct SplitColorWriter<W> {
+    inner: W,
+    pending_csi: Vec<u8>,
+}
+
+impl<W> SplitColorWriter<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self {
+            inner,
+            pending_csi: Vec::with_capacity(48),
+        }
+    }
+
+    fn write_pending_csi(&mut self) -> io::Result<()>
+    where
+        W: io::Write,
+    {
+        if let Some(background_start) = combined_truecolour_background_start(&self.pending_csi) {
+            // The separator before the background belongs to neither new
+            // command: terminate the foreground, then begin a new CSI.
+            self.inner
+                .write_all(&self.pending_csi[..background_start - 1])?;
+            self.inner.write_all(b"m\x1b[")?;
+            self.inner
+                .write_all(&self.pending_csi[background_start..])?;
+        } else {
+            self.inner.write_all(&self.pending_csi)?;
+        }
+        self.pending_csi.clear();
+        Ok(())
+    }
+}
+
+impl<W> io::Write for SplitColorWriter<W>
+where
+    W: io::Write,
+{
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let mut offset = 0;
+        while offset < buffer.len() {
+            if self.pending_csi.is_empty() {
+                let Some(escape_offset) = buffer[offset..].iter().position(|&byte| byte == b'\x1b')
+                else {
+                    self.inner.write_all(&buffer[offset..])?;
+                    break;
+                };
+                let escape = offset + escape_offset;
+                self.inner.write_all(&buffer[offset..escape])?;
+                self.pending_csi.push(b'\x1b');
+                offset = escape + 1;
+                continue;
+            }
+
+            self.pending_csi.push(buffer[offset]);
+            offset += 1;
+            let complete_csi = self.pending_csi.len() > 2
+                && self
+                    .pending_csi
+                    .last()
+                    .is_some_and(|byte| (b'@'..=b'~').contains(byte));
+            if (self.pending_csi.len() == 2 && self.pending_csi[1] != b'[')
+                || complete_csi
+                || self.pending_csi.len() >= 64
+            {
+                self.write_pending_csi()?;
+            }
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.write_pending_csi()?;
+        self.inner.flush()
+    }
+}
+
+/// Locates the truecolour background parameter after a complete truecolour
+/// foreground parameter. Counting the three foreground components prevents a
+/// red component with the value `48` from being mistaken for a background SGR.
+fn combined_truecolour_background_start(sequence: &[u8]) -> Option<usize> {
+    let mut remainder = sequence.strip_prefix(b"\x1b[38;2;")?;
+    for _ in 0..3 {
+        let delimiter = remainder.iter().position(|&byte| byte == b';')?;
+        remainder = &remainder[delimiter + 1..];
+    }
+    remainder
+        .starts_with(b"48;2;")
+        .then_some(sequence.len() - remainder.len())
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TerminalState {
     #[default]
@@ -221,5 +315,26 @@ fn restore_commands(mouse_capture: bool) -> io::Result<()> {
             EnableLineWrap,
             LeaveAlternateScreen
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::SplitColorWriter;
+
+    #[test]
+    fn split_color_writer_keeps_truecolour_commands_separate_across_writes() {
+        let mut writer = SplitColorWriter::new(Vec::new());
+        writer
+            .write_all(b"\x1b[38;2;48;192;149;48")
+            .expect("first ANSI fragment should write");
+        writer
+            .write_all(b";2;30;30;46mX")
+            .expect("second ANSI fragment should write");
+        writer.flush().expect("ANSI output should flush");
+
+        assert_eq!(writer.inner, b"\x1b[38;2;48;192;149m\x1b[48;2;30;30;46mX");
     }
 }

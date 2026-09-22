@@ -16,7 +16,7 @@ use crate::native_path::safe_display_os_str_text;
 use crate::native_path::{ResolvedRoot, safe_display_text};
 use crate::report::{ReportError, ScanReport};
 use crate::runtime::{RuntimeSettings, SystemClock, run, scan_headless};
-use crate::terminal::{TerminalSession, validate_terminal};
+use crate::terminal::{SplitColorWriter, TerminalSession, validate_terminal};
 use crate::theme::ThemeId;
 
 #[allow(clippy::too_many_lines)]
@@ -112,7 +112,7 @@ pub(crate) fn run_main() -> i32 {
         }
         return report_error(&error);
     }
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = CrosstermBackend::new(SplitColorWriter::new(io::stdout()));
     let run_result = run(
         backend,
         Box::new(TerminalEvents),

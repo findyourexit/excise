@@ -49,9 +49,9 @@ pub(crate) fn dissolve_deletion_departure(
 
 /// Effects left in the scheduler are one-shot acknowledgements of an event the
 /// interface cannot otherwise show, and they are painted over the header band
-/// alone. Navigation deliberately has no effect: the map's own motion, the
-/// selection's brightness, and the active pane's border are the feedback, and a
-/// colour wash over the whole terminal only obscures the surface being read.
+/// alone. Navigation deliberately has no full-screen effect: map geometry and
+/// the selected tile's own travelling edge supply movement without obscuring
+/// the surface being read.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum EffectKey {
     #[default]

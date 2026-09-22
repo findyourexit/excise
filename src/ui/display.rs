@@ -126,18 +126,9 @@ where
                         .constraints([
                             Constraint::Length(3),
                             Constraint::Min(5),
-                            Constraint::Length(2),
+                            Constraint::Length(1),
                         ])
                         .split(full_screen);
-                    render_instrument_header(
-                        frame.buffer_mut(),
-                        shell[0],
-                        file_tree,
-                        ui_mode,
-                        theme,
-                        ascii,
-                        monochrome,
-                    );
 
                     let has_selection =
                         ui_mode.allows_motion() && board.currently_selected().is_some();
@@ -210,23 +201,41 @@ where
                             now,
                         );
                     }
-                    render_status(
-                        frame.buffer_mut(),
-                        shell[2],
+                    let header_status = header_status_line(
                         file_tree,
                         board,
                         ui_mode,
                         ui_effects,
                         deletion_work,
-                        theme,
                         theme_name,
-                        keymap,
-                        custom_keys,
                         mouse_enabled,
                         reduced_guardrails,
                         elevated,
                         reduced_motion,
                         ascii,
+                        shell[0].width,
+                        theme,
+                    );
+                    render_instrument_header(
+                        frame.buffer_mut(),
+                        shell[0],
+                        InstrumentHeader {
+                            file_tree,
+                            ui_mode,
+                            theme,
+                            ascii,
+                            monochrome,
+                            status: header_status,
+                        },
+                    );
+
+                    render_control_hints(
+                        frame.buffer_mut(),
+                        shell[2],
+                        ui_mode,
+                        keymap,
+                        custom_keys,
+                        theme,
                     );
                 }
                 if requires_legacy_theme_normalization {
@@ -539,15 +548,25 @@ fn render_safety_banner(
         .render(line, buffer);
 }
 
-fn render_instrument_header(
-    buffer: &mut Buffer,
-    area: Rect,
-    file_tree: &FileTree,
-    ui_mode: &UiMode,
+struct InstrumentHeader<'a> {
+    file_tree: &'a FileTree,
+    ui_mode: &'a UiMode,
     theme: Theme,
     ascii: bool,
     monochrome: bool,
-) {
+    status: Line<'static>,
+}
+
+fn render_instrument_header(buffer: &mut Buffer, area: Rect, header: InstrumentHeader<'_>) {
+    let InstrumentHeader {
+        file_tree,
+        ui_mode,
+        theme,
+        ascii,
+        monochrome,
+        status,
+    } = header;
+
     fill_pane(buffer, area, theme);
     let current = file_tree.current_node();
     let total = file_tree.total_node();
@@ -591,14 +610,7 @@ fn render_instrument_header(
         theme,
         ascii,
     );
-    Paragraph::new(vec![title, detail]).render(area, buffer);
-    let rule_y = area.y.saturating_add(area.height.saturating_sub(1));
-    for x in area.x..area.right() {
-        if let Some(cell) = buffer.cell_mut((x, rule_y)) {
-            cell.set_symbol(if ascii { "-" } else { "▔" })
-                .set_style(Style::default().fg(theme.border));
-        }
-    }
+    Paragraph::new(vec![title, detail, status]).render(area, buffer);
 }
 
 fn storage_summary(
@@ -1331,28 +1343,31 @@ fn render_inspector_with_work(
     clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "status composition must evaluate all runtime and safety flags without precedence loss"
+    reason = "header status must evaluate runtime, safety, and storage state without precedence loss"
 )]
-fn render_status(
-    buffer: &mut Buffer,
-    area: Rect,
+fn header_status_line(
     file_tree: &FileTree,
     board: &Board,
     ui_mode: &UiMode,
     ui_effects: &UiEffects,
     deletion_work: &DeletionWork,
-    theme: Theme,
     theme_name: &str,
-    keymap: KeyPreset,
-    custom_keys: Option<&CustomKeyBindings>,
     mouse_enabled: bool,
     reduced_guardrails: bool,
     elevated: bool,
     reduced_motion: bool,
     ascii: bool,
-) {
+    width: u16,
+    theme: Theme,
+) -> Line<'static> {
     let separator = if ascii { "." } else { "·" };
     let (used, limit, spilled) = file_tree.model_stats();
+    let memory = format!(
+        "mem {}/{}",
+        DisplaySize(used as f64),
+        DisplaySize(limit as f64)
+    );
+    let context_width = header_status_context_width(&memory, width, ascii);
     let mut flags = vec![theme_name];
     if reduced_guardrails {
         flags.push("! REDUCED DELETE GUARD");
@@ -1372,8 +1387,6 @@ fn render_status(
     if spilled {
         flags.push("IDENTITY SPILL");
     }
-    let movement = movement_hint(keymap, custom_keys);
-    let command = command_hint(&movement, used, limit, area.width);
     let mode_status = match ui_mode {
         UiMode::FilterInput { input, error } => Some(error.as_ref().map_or_else(
             || format!("/ {}_  [Enter] apply  [Esc] cancel", display_text(input)),
@@ -1387,11 +1400,11 @@ fn render_status(
             } else {
                 " · [Esc] cancel"
             },
-            area.width,
+            context_width,
         )),
         UiMode::Loading => Some(ui_effects.last_read_path.as_ref().map_or_else(
             || "~ SCANNING".to_string(),
-            |path| status_with_path("~ SCANNING ", path, "", area.width),
+            |path| status_with_path("~ SCANNING ", path, "", context_width),
         )),
         _ => None,
     };
@@ -1427,22 +1440,77 @@ fn render_status(
     })
     .or_else(|| ui_effects.last_deletion_notice.map(str::to_owned));
     let status = transient_status.map_or_else(
-        || baseline_status(&flags, reduced_guardrails, elevated, area.width, ascii),
-        |status| status_with_safety(status, reduced_guardrails, elevated, area.width, ascii),
+        || baseline_status(&flags, reduced_guardrails, elevated, context_width, ascii),
+        |status| status_with_safety(status, reduced_guardrails, elevated, context_width, ascii),
     );
-    Paragraph::new(vec![
-        Line::styled(command, Style::default().fg(theme.text_secondary)),
-        Line::styled(
-            status,
-            Style::default().fg(if reduced_guardrails || elevated {
-                theme.text_danger
-            } else {
-                theme.text_muted
-            }),
-        ),
-    ])
-    .alignment(Alignment::Left)
-    .render(area, buffer);
+    let status = append_header_memory(&status, &memory, width, ascii);
+
+    Line::styled(
+        status,
+        Style::default().fg(if reduced_guardrails || elevated {
+            theme.text_danger
+        } else {
+            theme.text_muted
+        }),
+    )
+}
+
+fn header_status_context_width(memory: &str, width: u16, ascii: bool) -> u16 {
+    let separator = if ascii { " . " } else { " · " };
+    let available =
+        usize::from(width).saturating_sub(memory.width().saturating_add(separator.width()));
+    u16::try_from(available).unwrap_or(u16::MAX)
+}
+
+fn append_header_memory(status: &str, memory: &str, width: u16, ascii: bool) -> String {
+    let available = usize::from(width);
+    if available == 0 {
+        return String::new();
+    }
+    let separator = if ascii { " . " } else { " · " };
+    let reserved = memory.width().saturating_add(separator.width());
+    if reserved >= available {
+        return truncate_middle(memory, width);
+    }
+    let context_width = u16::try_from(available.saturating_sub(reserved)).unwrap_or(u16::MAX);
+    let status = truncate_middle(status, context_width);
+
+    if status.is_empty() {
+        return truncate_middle(memory, width);
+    }
+    format!("{status}{separator}{memory}")
+}
+
+fn render_control_hints(
+    buffer: &mut Buffer,
+    area: Rect,
+    ui_mode: &UiMode,
+    keymap: KeyPreset,
+    custom_keys: Option<&CustomKeyBindings>,
+    theme: Theme,
+) {
+    if matches!(ui_mode, UiMode::FilterInput { .. }) {
+        Paragraph::new(filter_control_hint_line(theme))
+            .alignment(Alignment::Left)
+            .render(area, buffer);
+    } else {
+        let movement = movement_hint(keymap, custom_keys);
+        Paragraph::new(command_hint_line(&movement, area.width, theme))
+            .alignment(Alignment::Left)
+            .render(area, buffer);
+    }
+}
+
+fn filter_control_hint_line(theme: Theme) -> Line<'static> {
+    let apply = ControlHint {
+        key: "Enter",
+        detail: "apply",
+    };
+    let cancel = ControlHint {
+        key: "Esc",
+        detail: "cancel",
+    };
+    styled_control_hints(&[&apply, &cancel], true, theme)
 }
 
 fn deletion_work_status(item: WorkRailItem<'_>, total: usize, ascii: bool) -> String {
@@ -1495,70 +1563,127 @@ fn deletion_summary_status(summary: crate::state::DeletionSummary, ascii: bool) 
         summary.deleted, summary.changed, summary.missing, summary.failed, summary.unattempted,
     )
 }
-fn command_hint(movement: &str, used: usize, limit: usize, width: u16) -> String {
-    const MOVE: &str = " move";
-    const OPEN_RESCAN: &str = "  Enter open/rescan";
-    const FILTER: &str = "  / filter";
-    const EXPORT: &str = "  e export";
-    const THEME: &str = "  t theme";
-    const DELETE: &str = "  Backspace delete";
-    const HELP: &str = "  ? help";
+#[derive(Clone, Copy)]
+struct ControlHint<'a> {
+    key: &'a str,
+    detail: &'static str,
+}
 
+fn command_hint_line(movement: &str, width: u16, theme: Theme) -> Line<'_> {
+    let hints = [
+        ControlHint {
+            key: movement,
+            detail: "move",
+        },
+        ControlHint {
+            key: "Enter",
+            detail: "open/rescan",
+        },
+        ControlHint {
+            key: "/",
+            detail: "filter",
+        },
+        ControlHint {
+            key: "e",
+            detail: "export",
+        },
+        ControlHint {
+            key: "t",
+            detail: "theme",
+        },
+        ControlHint {
+            key: "Backspace",
+            detail: "delete",
+        },
+        ControlHint {
+            key: "?",
+            detail: "help",
+        },
+    ];
+    let movement_only = ControlHint {
+        key: movement,
+        detail: "",
+    };
+    let all = [
+        &hints[0], &hints[1], &hints[2], &hints[3], &hints[4], &hints[5], &hints[6],
+    ];
+    let without_delete = [
+        &hints[0], &hints[1], &hints[2], &hints[3], &hints[4], &hints[6],
+    ];
+    let without_theme = [&hints[0], &hints[1], &hints[2], &hints[3], &hints[6]];
+    let with_filter = [&hints[0], &hints[1], &hints[2], &hints[6]];
+    let basic = [&hints[0], &hints[1], &hints[6]];
+    let movement_and_help = [&hints[0], &hints[6]];
+    let movement_only_and_help = [&movement_only, &hints[6]];
+    let help = [&hints[6]];
     let available = usize::from(width);
-    let movement_width = " ".width().saturating_add(movement.width());
-    let basic_width = movement_width
-        .saturating_add(MOVE.width())
-        .saturating_add(OPEN_RESCAN.width())
-        .saturating_add(HELP.width());
-    let filter_width = basic_width.saturating_add(FILTER.width());
-    let export_width = filter_width.saturating_add(EXPORT.width());
-    let theme_width = export_width.saturating_add(THEME.width());
-    let delete_width = theme_width.saturating_add(DELETE.width());
-
-    if delete_width <= available {
-        let memory = format!(
-            "  mem {}/{}",
-            DisplaySize(used as f64),
-            DisplaySize(limit as f64)
-        );
-        if delete_width.saturating_add(memory.width()) <= available {
-            return format!(
-                " {movement}{MOVE}{OPEN_RESCAN}{FILTER}{EXPORT}{THEME}{DELETE}{HELP}{memory}"
-            );
+    for hints in [
+        all.as_slice(),
+        without_delete.as_slice(),
+        without_theme.as_slice(),
+        with_filter.as_slice(),
+        basic.as_slice(),
+        movement_and_help.as_slice(),
+        movement_only_and_help.as_slice(),
+    ] {
+        if control_hint_width(hints, true) <= available {
+            return styled_control_hints(hints, true, theme);
         }
-        return format!(" {movement}{MOVE}{OPEN_RESCAN}{FILTER}{EXPORT}{THEME}{DELETE}{HELP}");
     }
-
-    if theme_width <= available {
-        return format!(" {movement}{MOVE}{OPEN_RESCAN}{FILTER}{EXPORT}{THEME}{HELP}");
-    }
-    if export_width <= available {
-        return format!(" {movement}{MOVE}{OPEN_RESCAN}{FILTER}{EXPORT}{HELP}");
-    }
-    if filter_width <= available {
-        return format!(" {movement}{MOVE}{OPEN_RESCAN}{FILTER}{HELP}");
-    }
-    if basic_width <= available {
-        return format!(" {movement}{MOVE}{OPEN_RESCAN}{HELP}");
-    }
-
-    let movement_and_action_width = movement_width
-        .saturating_add(MOVE.width())
-        .saturating_add(HELP.width());
-    if movement_and_action_width <= available {
-        return format!(" {movement}{MOVE}{HELP}");
-    }
-    let movement_and_help_width = movement_width.saturating_add(HELP.width());
-    if movement_and_help_width <= available {
-        return format!(" {movement}{HELP}");
-    }
-    if "? help".width() <= available {
-        return "? help".to_string();
+    if control_hint_width(&help, false) <= available {
+        return styled_control_hints(&help, false, theme);
     }
     if available > 0 {
-        return "?".to_string();
+        return Line::styled(
+            "?",
+            Style::default()
+                .fg(theme.focus)
+                .add_modifier(Modifier::BOLD),
+        );
     }
-    String::new()
+    Line::from("")
+}
+
+fn control_hint_width(hints: &[&ControlHint<'_>], leading: bool) -> usize {
+    hints
+        .iter()
+        .enumerate()
+        .fold(0_usize, |width, (index, hint)| {
+            let separator = if index == 0 { usize::from(leading) } else { 2 };
+            let detail_width = if hint.detail.is_empty() {
+                0
+            } else {
+                1usize.saturating_add(hint.detail.width())
+            };
+            width
+                .saturating_add(separator)
+                .saturating_add(hint.key.width())
+                .saturating_add(detail_width)
+        })
+}
+
+fn styled_control_hints<'a>(hints: &[&ControlHint<'a>], leading: bool, theme: Theme) -> Line<'a> {
+    let key_style = Style::default()
+        .fg(theme.focus)
+        .add_modifier(Modifier::BOLD);
+    let detail_style = Style::default().fg(theme.text_secondary);
+    let mut spans = Vec::with_capacity(hints.len().saturating_mul(3).saturating_add(1));
+    for (index, hint) in hints.iter().enumerate() {
+        let separator = if index == 0 {
+            leading.then_some(" ")
+        } else {
+            Some("  ")
+        };
+        if let Some(separator) = separator {
+            spans.push(Span::styled(separator, detail_style));
+        }
+        spans.push(Span::styled(hint.key, key_style));
+        if !hint.detail.is_empty() {
+            spans.push(Span::styled(" ", detail_style));
+            spans.push(Span::styled(hint.detail, detail_style));
+        }
+    }
+    Line::from(spans)
 }
 
 enum MovementKeyLabel {
@@ -1867,9 +1992,10 @@ mod tests {
 
     #[test]
     fn command_hints_keep_complete_movement_at_each_tier_boundary() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
         for movement in ["arrows/hjkl", "arrows/Ctrl-b/n/p/f"] {
             for width in [49, 50, 71, 72, 111, 112] {
-                let command = command_hint(movement, 0, 0, width);
+                let command = line_text(&command_hint_line(movement, width, theme));
                 assert!(command.width() <= usize::from(width),);
                 assert!(
                     !command.contains("[.."),
@@ -1885,6 +2011,7 @@ mod tests {
 
     #[test]
     fn thirty_two_column_command_hints_keep_complete_bindings() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
         let custom = CustomKeyBindings {
             left: ' ',
             down: 's',
@@ -1897,10 +2024,118 @@ mod tests {
             ("arrows/Ctrl-b/n/p/f", " arrows/Ctrl-b/n/p/f  ? help"),
             (custom_movement.as_str(), " arrows/Space/s/w/d move  ? help"),
         ] {
-            let command = command_hint(movement, 0, 0, 32);
+            let command = line_text(&command_hint_line(movement, 32, theme));
             assert_eq!(command, expected);
             assert!(command.width() <= 32);
         }
+    }
+
+    #[test]
+    fn footer_control_bindings_are_visually_distinct_from_actions() {
+        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
+        let command = command_hint_line("arrows/hjkl", 120, theme);
+        let enter = command
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "Enter")
+            .expect("wide footer should include Enter");
+        let action = command
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "open/rescan")
+            .expect("wide footer should include the Enter action");
+
+        assert_eq!(enter.style.fg, Some(theme.focus));
+        assert!(enter.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(action.style.fg, Some(theme.text_secondary));
+        assert!(!action.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!line_text(&command).contains("mem "));
+    }
+
+    #[test]
+    fn filter_footer_only_advertises_filter_controls() {
+        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
+        let footer = filter_control_hint_line(theme);
+        let footer_text = line_text(&footer);
+
+        assert_eq!(footer_text, " Enter apply  Esc cancel");
+        assert!(!footer_text.contains("mem "));
+        assert!(!footer_text.contains("open/rescan"));
+        for key in ["Enter", "Esc"] {
+            let span = footer
+                .spans
+                .iter()
+                .find(|span| span.content.as_ref() == key)
+                .expect("filter footer should name its control");
+            assert_eq!(span.style.fg, Some(theme.focus));
+            assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn header_status_holds_memory_and_read_failures_above_controls() {
+        let root = tempfile::tempdir().expect("status root should exist");
+        let mut tree = FileTree::new(root.path().to_path_buf(), false, MIN_PROCESS_MIB)
+            .expect("status tree should initialize");
+        tree.increment_failed_to_read();
+        tree.increment_failed_to_read();
+        let board = Board::new();
+        let effects = UiEffects::new();
+        let deletion_work = DeletionWork::new();
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+
+        let status = header_status_line(
+            &tree,
+            &board,
+            &UiMode::Normal,
+            &effects,
+            &deletion_work,
+            "Excise Dark",
+            false,
+            false,
+            false,
+            false,
+            false,
+            120,
+            theme,
+        );
+        let footer = command_hint_line("arrows/hjkl", 120, theme);
+        let status = line_text(&status);
+        let footer = line_text(&footer);
+
+        assert!(status.contains("2 entries could not be read"));
+        assert!(status.contains("mem "));
+        assert!(!footer.contains("entries could not be read"));
+        assert!(!footer.contains("mem "));
+    }
+
+    #[test]
+    fn instrument_header_renders_status_on_its_third_row() {
+        let root = tempfile::tempdir().expect("header root should exist");
+        let tree = FileTree::new(root.path().to_path_buf(), false, MIN_PROCESS_MIB)
+            .expect("header tree should initialize");
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+        let area = Rect::new(0, 0, 80, 3);
+        let mut buffer = Buffer::empty(area);
+
+        render_instrument_header(
+            &mut buffer,
+            area,
+            InstrumentHeader {
+                file_tree: &tree,
+                ui_mode: &UiMode::Normal,
+                theme,
+                ascii: false,
+                monochrome: false,
+                status: Line::from("STATUS · mem 0B/384.0M"),
+            },
+        );
+
+        let status = (area.x..area.right()).fold(String::new(), |mut row, x| {
+            row.push_str(buffer[(x, area.y + 2)].symbol());
+            row
+        });
+        assert!(status.contains("STATUS · mem"));
     }
 
     #[test]
@@ -1910,9 +2145,10 @@ mod tests {
 
     #[test]
     fn command_hints_never_advertise_an_unnamed_delete_key() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
         let mut saw_named_delete = false;
         for width in 72_u16..112 {
-            let command = command_hint("arrows/hjkl", 0, 0, width);
+            let command = line_text(&command_hint_line("arrows/hjkl", width, theme));
             if command.contains("delete") {
                 assert!(
                     command.contains("Backspace delete"),
@@ -1928,28 +2164,31 @@ mod tests {
     }
 
     #[test]
-    fn command_hints_keep_rescan_when_memory_does_not_fit() {
+    fn command_hints_reserve_the_entire_footer_for_controls() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
         let movement = "arrows/hjkl";
         let expected = " arrows/hjkl move  Enter open/rescan  / filter  e export  t theme  Backspace delete  ? help";
-        let width = u16::try_from(expected.width()).expect("rescan hint should fit u16");
+        let width = u16::try_from(expected.width()).expect("control hints should fit u16");
 
-        let command = command_hint(movement, 1_024, 2_048, width);
+        let command = line_text(&command_hint_line(movement, width, theme));
 
         assert_eq!(command, expected);
         assert!(!command.contains(" mem "));
     }
 
+    #[test]
     fn medium_width_command_hints_keep_theme_picker_command() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
         let movement = "arrows/hjkl";
         for width in [44, 54, 64, 73, 80, 90] {
-            let command = command_hint(movement, 0, 0, width);
+            let command = line_text(&command_hint_line(movement, width, theme));
             assert!(
                 command.contains("Enter open/rescan"),
                 "wrong Enter action at width {width}: {command:?}"
             );
             assert!(command.width() <= usize::from(width));
         }
-        assert!(command_hint(movement, 112, 256, 120).contains("t theme"));
+        assert!(line_text(&command_hint_line(movement, 120, theme)).contains("t theme"));
     }
 
     #[test]

@@ -4,8 +4,8 @@ expression: normalized
 ---
  EXCISE  /tmp/excise_[...]e_a_long_name  ◆ COMPLETE         
  Used ##.#K · Can reclaim ##.#K · Content 16.0K · 4 items   
-▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
-▟▐ LIST ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+Excise · REDUCED MOTION · mem 96.0M/384.0M                  
+▟ LIST ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏▌  file1                                8.0K  100.0%      ▕
 ▏                                                          ▕
 ▏                                                          ▕
@@ -23,7 +23,7 @@ expression: normalized
 ▏                                                          ▕
 ▏                                                          ▕
 ▏                                                          ▕
-▏ ▟▐ QUIT ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜ ▕
+▏ ▟ QUIT ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜ ▕
 ▏ ▏                     Quit Excise?                     ▕ ▕
 ▏ ▏                                                      ▕ ▕
 ▏ ▏                       [y] Quit                       ▕ ▕
@@ -39,9 +39,10 @@ expression: normalized
 ▏                                                          ▕
 ▏                                                          ▕
 ▏                                                          ▕
+▏                                                          ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
                                                             
-▟▐ SELECTED ITEM ▌▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
+▟ SELECTED ITEM ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▜
 ▏file1                                                     ▕
 ▏◆ COMPLETE · file                                         ▕
 ▏Actions unavailable                                       ▕
@@ -50,5 +51,4 @@ expression: normalized
 ▏Item check: Inode { device_id: ########, inode_number: ##…▕
 ▏Scan result: included                                     ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
- arrows/hjkl move  Enter open/rescan  / filter  ? help      
-Excise · REDUCED MOTION
+ arrows/hjkl move  Enter open/rescan  / filter  ? help

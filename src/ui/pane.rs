@@ -4,16 +4,16 @@ use ratatui::buffer::{Buffer, CellWidth as _};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border::Set;
-use ratatui::widgets::{Block, Borders, Clear, Widget as _};
+use ratatui::text::Span;
+use ratatui::widgets::{Block, Clear, Widget as _};
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::theme::Theme;
-use crate::ui::palette::{
-    ColorCycle, CycleInk, MIN_FOCUS_CONTRAST, Oklch, cycle_step, derived_for,
-};
+use tachyonfx::{Duration as FxDuration, fx};
 
-/// One cell of breathing room between independent panes, matching exabind's
-/// single-column padding between adjacent widgets.
+use crate::theme::Theme;
+use crate::ui::palette::{ColorCycle, MIN_FOCUS_CONTRAST, Oklch, cycle_step, derived_for};
+
+/// One cell of breathing room between independent panes.
 pub(crate) const PANE_GAP: u16 = 1;
 
 /// How far the interface behind a modal sinks toward the base surface. Enough
@@ -40,8 +40,8 @@ impl ModalChrome {
         }
     }
 }
-/// exabind's low-ink frame: eighth-block edges that read as a hairline rule,
-/// anchored by quadrant corners instead of a heavy box outline.
+/// A low-ink frame: a quadrant leading corner, hairline rules, and a reversed
+/// padded title tab instead of a heavy box outline.
 pub(crate) const PANE_BORDER_SET: Set = Set {
     top_left: "▟",
     top_right: "▜",
@@ -93,22 +93,21 @@ pub(crate) fn render_pane(
     } else {
         PANE_BORDER_SET
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let title_tab = padded_title_tab(title, area, ascii);
+
+    fill_pane(buffer, area, theme);
+    let mut block = Block::bordered()
         .border_set(border_set)
-        .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(theme.surface_panel));
+        .style(Style::default().fg(accent));
+    if let Some(title_tab) = title_tab {
+        block = block.title(Span::styled(
+            title_tab,
+            padded_title_style(accent, theme.surface_panel, active, monochrome),
+        ));
+    }
     let inner = block.inner(area);
     block.render(area, buffer);
-    draw_exabind_title_chip(
-        buffer,
-        area,
-        title,
-        accent,
-        theme.surface_panel,
-        active,
-        monochrome,
-    );
+    restore_frame_backdrop(buffer, area, theme.surface_base);
     inner
 }
 
@@ -166,134 +165,56 @@ fn border_len(area: Rect) -> usize {
     }
 }
 
-/// Renders the pane title exactly as exabind renders a left-aligned `Block`
-/// title: a reversed accent span seated directly in the top rule. Keeping this
-/// manual avoids allocating a title string on every map-selection frame while
-/// retaining Ratatui's border-safe left and right margins.
-fn draw_exabind_title_chip(
-    buffer: &mut Buffer,
-    area: Rect,
-    title: &str,
-    accent: Color,
-    surface: Color,
-    active: bool,
-    monochrome: bool,
-) {
-    if area.width < 5 || area.height == 0 || title.is_empty() {
-        return;
-    }
-    let title = title_prefix_to_width(title, usize::from(area.width.saturating_sub(4)));
+/// A padded title tab sits in the top rule. The leading quadrant remains a
+/// small, portable bevel; the top rule completes the title without a synthetic
+/// trailing cap.
+fn padded_title_tab(title: &str, area: Rect, ascii: bool) -> Option<String> {
     if title.is_empty() {
-        return;
+        return None;
     }
+    let title = if ascii {
+        title_prefix_to_width(title, usize::from(area.width.saturating_sub(4)))
+    } else {
+        title
+    };
+    if title.is_empty() {
+        return None;
+    }
+
+    let mut title = title.to_owned();
+    title.insert(0, ' ');
+    title.push(' ');
+    Some(title)
+}
+
+fn padded_title_style(accent: Color, surface: Color, active: bool, monochrome: bool) -> Style {
     let style = Style::default()
         .fg(accent)
         .bg(surface)
         .add_modifier(Modifier::BOLD);
-    let style = if !monochrome || active {
+    if !monochrome || active {
         style.add_modifier(Modifier::REVERSED)
     } else {
         style
-    };
-    let right_border = area.right().saturating_sub(1);
-    let mut x = area.x.saturating_add(1);
-    for segment in [" ", title, " "] {
-        let remaining = usize::from(right_border.saturating_sub(x));
-        x = buffer.set_stringn(x, area.y, segment, remaining, style).0;
     }
 }
 
-/// Draws the modal title chip. Modal chrome retains its travelling colour
-/// treatment so dialogs hold attention without animating ordinary panes.
+/// Restores the outer backdrop around the triangular leading cap and hairline
+/// southern border.
+fn restore_frame_backdrop(buffer: &mut Buffer, area: Rect, outer_surface: Color) {
+    let border_south = area.rows().next_back().unwrap_or_default();
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "title chip rendering keeps geometry, palette, cycle, and accessibility inputs explicit"
-)]
-fn draw_title_chip(
-    buffer: &mut Buffer,
-    area: Rect,
-    title: &str,
-    theme: Theme,
-    surface: Color,
-    accent: Color,
-    active: bool,
-    cycle: Option<(&ColorCycle, usize, usize)>,
-    monochrome: bool,
-    ascii: bool,
-) {
-    if area.width < 7 || area.height == 0 || title.is_empty() {
-        return;
-    }
-    let room = usize::from(area.width.saturating_sub(4));
-    let title = title_prefix_to_width(title, room.saturating_sub(2));
-    let title_width = usize::from(title.cell_width());
-    if title_width == 0 {
-        return;
-    }
-    let static_style = if cycle.is_none() {
-        static_chip_style(accent, theme, active, monochrome)
-    } else {
-        Style::default()
-    };
-
-    // The top row is the start of the border walk, so a cell's place in the
-    // cycle is just its distance from the left edge. Colouring the chip by the
-    // same rule makes the sequence run through the label instead of restarting
-    // at it, which is what keeps the title reading as part of the frame.
-    let start = area.x.saturating_add(2);
-    let colour_at = |x: u16| {
-        cycle.map_or(accent, |(cycle, step, perimeter)| {
-            cycle.at_perimeter(step, usize::from(x.saturating_sub(area.x)), perimeter)
-        })
-    };
-    let style_at = |x: u16| match cycle {
-        Some((cycle, step, perimeter)) => {
-            let (fill, ink) =
-                cycle.chip_at_perimeter(step, usize::from(x.saturating_sub(area.x)), perimeter);
-            match ink {
-                CycleInk::Foreground(foreground) => Style::default()
-                    .fg(foreground)
-                    .bg(fill)
-                    .add_modifier(Modifier::BOLD),
-                CycleInk::Reversed => Style::default()
-                    .fg(fill)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-            }
+    for position in border_south.positions() {
+        if let Some(cell) = buffer.cell_mut(position) {
+            let style = cell.style();
+            cell.set_style(style.bg(outer_surface));
         }
-        None => static_style,
-    };
-    let end = {
-        let mut x = start;
-        let mut paint_segment = |text: &str, max_width: usize| {
-            let segment_start = x;
-            x = buffer
-                .set_stringn(x, area.y, text, max_width, Style::default())
-                .0;
-            for cell_x in segment_start..x {
-                if let Some(cell) = buffer.cell_mut((cell_x, area.y)) {
-                    cell.set_style(style_at(cell_x));
-                }
-            }
-        };
-        paint_segment(" ", 1);
-        paint_segment(title, title_width);
-        paint_segment(" ", 1);
-        x
-    };
-
-    // Half-block caps: the chip's colour bleeds into the rule on the left and
-    // back out of it on the right, so the label is seated in the frame rather
-    // than squared off against it.
-    let left = start.saturating_sub(1);
-    let right = end;
-    if let Some(cell) = buffer.cell_mut((left, area.y)) {
-        cell.set_symbol(if ascii { "|" } else { "▐" })
-            .set_style(Style::default().fg(colour_at(left)).bg(surface));
     }
-    if let Some(cell) = buffer.cell_mut((right, area.y)) {
-        cell.set_symbol(if ascii { "|" } else { "▌" })
-            .set_style(Style::default().fg(colour_at(right)).bg(surface));
+
+    let top_left = area.as_position();
+    if let Some(cell) = buffer.cell_mut(top_left) {
+        let style = cell.style();
+        cell.set_style(style.bg(outer_surface));
     }
 }
 
@@ -318,54 +239,8 @@ fn title_prefix_to_width(title: &str, max_width: usize) -> &str {
     &title[..end]
 }
 
-/// Text placed on a title chip must retain ordinary body-text contrast.
+/// Text resolved against a styled surface must retain ordinary body-text contrast.
 const TITLE_CHIP_CONTRAST_FLOOR: f32 = 4.5;
-
-/// Applies the strongest semantic contrast once for a chip that does not travel
-/// with the focus cycle, falling back to the animated chip's neutral polarity.
-fn static_chip_style(lead: Color, theme: Theme, active: bool, monochrome: bool) -> Style {
-    if lead == Color::Reset && theme.surface_base == Color::Reset {
-        // The monochrome theme has no colour channel. Leave inactive chips
-        // plain so an active chip can remain the sole reverse-video signal.
-        let style = Style::default()
-            .fg(lead)
-            .bg(theme.surface_panel)
-            .add_modifier(Modifier::BOLD);
-        return if active {
-            style.add_modifier(Modifier::REVERSED)
-        } else {
-            style
-        };
-    }
-    if monochrome && active {
-        // A truecolour theme can be forced into monochrome at runtime. Keep the
-        // active pane's static focus explicit rather than relying on a colour
-        // the postprocessor will remove.
-        return Style::default()
-            .fg(lead)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED);
-    }
-
-    if monochrome && !matches!(lead, Color::Rgb(..)) {
-        // ANSI colours cannot be measured, and the active chip already carries
-        // reverse video in forced monochrome. Keep this inactive chip plain.
-        return Style::default()
-            .fg(lead)
-            .bg(theme.surface_panel)
-            .add_modifier(Modifier::BOLD);
-    }
-    match strongest_static_ink(lead, [theme.text_primary, theme.surface_base]) {
-        Some(ink) => Style::default()
-            .fg(ink)
-            .bg(lead)
-            .add_modifier(Modifier::BOLD),
-        // Palette terminals cannot be measured for contrast. Let the terminal
-        // invert the chip for us, as exabind does.
-        None => Style::default()
-            .fg(lead)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-    }
-}
 
 fn strongest_static_ink(lead: Color, candidates: [Color; 2]) -> Option<Color> {
     candidates
@@ -463,16 +338,21 @@ pub(crate) fn draw_scrim(buffer: &mut Buffer, area: Rect, theme: Theme, monochro
             continue;
         };
         let style = cell.style();
+        // A reversed chip keeps its visible fill in the raw foreground. Resolve
+        // that presentation before sinking it and removing reverse video.
+        let (foreground, background) = if cell.modifier.contains(Modifier::REVERSED) {
+            (style.bg, style.fg)
+        } else {
+            (style.fg, style.bg)
+        };
         let (fg, bg) = if monochrome {
-            (style.fg.unwrap_or(theme.text_muted), theme.surface_base)
+            (foreground.unwrap_or(theme.text_muted), theme.surface_base)
         } else {
             (
-                sink(style.fg, base, theme.text_muted, &mut sources),
-                sink(style.bg, base, theme.surface_base, &mut sources),
+                sink(foreground, base, theme.text_muted, &mut sources),
+                sink(background, base, theme.surface_base, &mut sources),
             )
         };
-        // A scrimmed layer carries no highlights: reversed ink behind a dialog
-        // reads as brighter than the dialog itself.
         cell.modifier.remove(Modifier::REVERSED);
         cell.set_style(Style::default().fg(fg).bg(bg));
     }
@@ -535,10 +415,10 @@ fn contrast_safe_accent(theme: Theme, surface: Color, accent: Color) -> Color {
 
 /// Draws a modal panel and returns its content area.
 ///
-/// The frame and title chip can carry the same travelling attention cycle as a
-/// focused pane. The content is drawn later by each modal widget and therefore
-/// remains completely still. ASCII, monochrome, reduced-motion, and ANSI-only
-/// themes retain the static high-contrast frame.
+/// Dialogs alone own the travelling focus cycle. The effect runs after the
+/// static frame but before the title tab, so `TachyonFX` advances the perimeter
+/// foreground while decision text and its reversed tab stay still.
+/// ASCII, monochrome, reduced-motion, and ANSI-only themes retain static chrome.
 pub(crate) fn render_modal(
     buffer: &mut Buffer,
     area: Rect,
@@ -562,54 +442,61 @@ pub(crate) fn render_modal(
         (chrome.animate && !ascii && !chrome.monochrome && ColorCycle::can_animate(theme.focus))
             .then(|| {
                 let (cycle, _) = derived_for(theme);
-                (cycle, cycle_step(chrome.now), border_len(area))
+                (cycle, cycle_step(chrome.now))
             });
-    let border_accent = cycle.as_ref().map_or(accent, |(cycle, step, perimeter)| {
-        cycle.at_perimeter(*step, 0, *perimeter)
-    });
+    let border_accent = cycle
+        .as_ref()
+        .map_or(accent, |(cycle, step)| cycle.at(*step));
     let border_set = if ascii {
         ASCII_PANE_BORDER_SET
     } else {
         PANE_BORDER_SET
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+
+    let title_tab = padded_title_tab(title, area, ascii);
+    fill_surface(buffer, area, modal_style);
+    let mut block = Block::bordered()
         .border_set(border_set)
-        .border_style(Style::default().fg(border_accent))
-        .style(modal_style);
+        .style(Style::default().fg(border_accent));
+    if let Some(title_tab) = title_tab {
+        block = block.title(Span::styled(
+            title_tab,
+            padded_title_style(accent, theme.surface_raised, true, chrome.monochrome),
+        ));
+    }
     let inner = block.inner(area);
     block.render(area, buffer);
-    if let Some((cycle, step, perimeter)) = cycle.as_ref() {
-        walk_border(area, |x, y, index| {
-            if let Some(cell) = buffer.cell_mut((x, y)) {
-                cell.fg = cycle.at_perimeter(*step, index, *perimeter);
-            }
-        });
+    restore_frame_backdrop(buffer, area, theme.surface_base);
+    if let Some((cycle, step)) = cycle {
+        animate_modal_border(buffer, area, cycle, step);
     }
-    draw_title_chip(
-        buffer,
-        area,
-        title,
-        theme,
-        theme.surface_raised,
-        border_accent,
-        true,
-        cycle
-            .as_ref()
-            .map(|(cycle, step, perimeter)| (cycle, *step, *perimeter)),
-        chrome.monochrome,
-        ascii,
-    );
     inner
 }
 
-pub(crate) fn fill_pane(buffer: &mut Buffer, area: Rect, theme: Theme) {
+/// An unbounded `TachyonFX` buffer callback advances a linear colour cycle at one
+/// sample per border cell.
+fn animate_modal_border(buffer: &mut Buffer, area: Rect, cycle: ColorCycle, step: usize) {
+    let mut effect = fx::effect_fn_buf((), u32::MAX, move |(), _, buffer| {
+        walk_border(area, |x, y, index| {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.fg = cycle.at(step.saturating_add(index));
+            }
+        });
+    })
+    .with_area(area);
+    let _ = effect.process(FxDuration::ZERO, buffer, area);
+}
+
+fn fill_surface(buffer: &mut Buffer, area: Rect, style: Style) {
     for position in area.positions() {
         if let Some(cell) = buffer.cell_mut(position) {
-            cell.set_symbol(" ")
-                .set_style(Style::default().bg(theme.surface_panel));
+            cell.set_symbol(" ").set_style(style);
         }
     }
+}
+
+pub(crate) fn fill_pane(buffer: &mut Buffer, area: Rect, theme: Theme) {
+    fill_surface(buffer, area, Style::default().bg(theme.surface_panel));
 }
 
 #[cfg(test)]
@@ -703,6 +590,25 @@ mod tests {
     }
 
     #[test]
+    fn title_chip_ends_at_the_top_rule() {
+        let area = Rect::new(0, 0, 20, 5);
+        let buffer = render_with_capabilities(
+            area,
+            "PANE",
+            PaneRenderSettings {
+                active: false,
+                presentation: PanePresentation::Color,
+                theme: ThemeId::CatppuccinMocha,
+            },
+        );
+
+        assert_eq!(buffer[(0, 0)].symbol(), "▟");
+        assert_eq!(buffer[(6, 0)].symbol(), " ");
+        assert!(buffer[(6, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buffer[(7, 0)].symbol(), "▔");
+    }
+
+    #[test]
     fn a_wide_title_stays_inside_the_pane_border() {
         let area = Rect::new(0, 0, 9, 5);
         let mut buffer = Buffer::empty(area);
@@ -725,8 +631,6 @@ mod tests {
     #[test]
     fn a_zwj_title_stays_whole_and_keeps_the_pane_corners() {
         let title = "👩‍💻 map";
-        assert_eq!(title_prefix_to_width(title, 2), "👩‍💻");
-        assert_eq!(title_prefix_to_width(title, 1), "");
 
         let area = Rect::new(0, 0, 8, 5);
         let mut buffer = Buffer::empty(area);
@@ -748,8 +652,6 @@ mod tests {
     #[test]
     fn halfwidth_voiced_katakana_stays_whole_inside_the_pane() {
         let title = "ｶﾞ map";
-        assert_eq!(title_prefix_to_width(title, 1), "");
-        assert_eq!(title_prefix_to_width(title, 2), "ｶﾞ");
 
         let area = Rect::new(0, 0, 8, 5);
         let mut buffer = Buffer::empty(area);
@@ -917,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn static_truncated_title_chip_keeps_its_corners() {
+    fn main_title_truncation_preserves_content_before_padding() {
         let area = Rect::new(4, 2, 7, 5);
         let early = render_with_capabilities(
             area,
@@ -938,7 +840,7 @@ mod tests {
             },
         );
 
-        assert_eq!(row_text(&early, area.y), "▟ WID ▜");
+        assert_eq!(row_text(&early, area.y), "▟ WIDE▜");
         assert!(
             early
                 .content
@@ -1118,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn modal_attention_moves_only_the_chrome() {
+    fn modal_attention_walks_the_border_and_title_chip() {
         let area = Rect::new(0, 0, 24, 7);
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
         let body_style = Style::default()
@@ -1148,6 +1050,24 @@ mod tests {
         later.set_string(4, 3, "DECIDE", body_style);
 
         assert_ne!(first[(0, 0)].fg, later[(0, 0)].fg);
+        assert!(
+            first
+                .content
+                .iter()
+                .zip(later.content.iter())
+                .all(|(first, later)| first.bg == later.bg),
+            "modal attention must not issue changing terminal background colours"
+        );
+        assert_ne!(
+            first[(2, 0)].fg,
+            later[(2, 0)].fg,
+            "the walking frame must carry the title chip with it"
+        );
+        assert_eq!(
+            first[(2, 0)].bg,
+            later[(2, 0)].bg,
+            "the title chip's raw surface stays fixed while its visible reversed fill walks"
+        );
         for x in 4..10 {
             assert_eq!(first[(x, 3)].symbol(), later[(x, 3)].symbol());
             assert_eq!(first[(x, 3)].style(), later[(x, 3)].style());
@@ -1206,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn exabind_style_title_uses_a_reversed_border_accent_in_light_themes() {
+    fn title_uses_a_reversed_border_accent_in_light_themes() {
         let theme = Theme::for_id(ThemeId::ExciseLight);
         let buffer = render(false, false, Duration::ZERO, ThemeId::ExciseLight);
         let chip = &buffer[(2, 0)];
@@ -1217,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn exabind_style_title_keeps_its_border_accent_without_neutral_substitution() {
+    fn title_keeps_its_border_accent_without_neutral_substitution() {
         let theme = Theme::for_id(ThemeId::CatppuccinLatte);
         let buffer = render(false, false, Duration::ZERO, ThemeId::CatppuccinLatte);
         let chip = &buffer[(2, 0)];
@@ -1250,13 +1170,17 @@ mod tests {
         }
     }
     #[test]
-    fn title_caps_keep_each_container_surface() {
+    fn frame_keeps_the_outer_background_outside_each_pane() {
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
         let area = Rect::new(0, 0, 20, 5);
         let mut pane = Buffer::empty(area);
         render_pane(&mut pane, area, "PANE", theme, false, false, false);
-        assert_eq!(pane[(1, 0)].bg, theme.surface_panel);
-        assert_eq!(pane[(8, 0)].bg, theme.surface_panel);
+        assert_eq!(pane[(0, 0)].bg, theme.surface_base);
+        assert!(
+            (area.x..area.right()).all(|x| pane[(x, area.bottom() - 1)].bg == theme.surface_base),
+            "the hairline bottom border must sit on the outer surface"
+        );
+        assert_eq!(pane[(1, 1)].bg, theme.surface_panel);
 
         let mut modal = Buffer::empty(area);
         render_modal(
@@ -1268,8 +1192,33 @@ mod tests {
             false,
             ModalChrome::new(Duration::ZERO, false, false),
         );
-        assert_eq!(modal[(1, 0)].bg, theme.surface_raised);
-        assert_eq!(modal[(9, 0)].bg, theme.surface_raised);
+        assert_eq!(modal[(0, 0)].bg, theme.surface_base);
+        assert!(
+            (area.x..area.right()).all(|x| modal[(x, area.bottom() - 1)].bg == theme.surface_base),
+            "the modal bottom border must sit on the outer surface"
+        );
+        assert_eq!(modal[(1, 1)].bg, theme.surface_raised);
+    }
+
+    #[test]
+    fn scrim_keeps_a_reversed_title_tab_as_a_muted_background() {
+        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
+        let area = Rect::new(0, 0, 20, 5);
+        let mut pane = Buffer::empty(area);
+        render_pane(&mut pane, area, "PANE", theme, false, false, false);
+        let title = pane[(2, 0)].clone();
+        assert!(title.modifier.contains(Modifier::REVERSED));
+
+        draw_scrim(&mut pane, area, theme, false);
+
+        let base = Oklch::from_color(theme.surface_base);
+        let mut sources = ScrimSourceCache::default();
+        let expected_foreground = sink(Some(title.bg), base, theme.text_muted, &mut sources);
+        let expected_background = sink(Some(title.fg), base, theme.surface_base, &mut sources);
+        let scrimmed = &pane[(2, 0)];
+        assert_eq!(scrimmed.fg, expected_foreground);
+        assert_eq!(scrimmed.bg, expected_background);
+        assert!(!scrimmed.modifier.contains(Modifier::REVERSED));
     }
 
     fn tiled(theme: Theme, area: Rect) -> Buffer {

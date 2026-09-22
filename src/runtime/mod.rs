@@ -805,7 +805,6 @@ where
         self.summary.model_bytes = used;
         self.summary.model_limit_bytes = limit;
         self.summary.identity_spilled = spilled;
-        self.animation.schedule_completion();
         Ok(())
     }
 
@@ -1802,6 +1801,101 @@ mod tests {
         assert_eq!(next_target.full_path(), survivor_path);
     }
 
+    #[test]
+    fn focused_scan_lifecycle_does_not_schedule_header_completion() {
+        let root = tempfile::tempdir().expect("focused scan root should exist");
+        let root_metadata = std::fs::symlink_metadata(root.path())
+            .expect("focused scan root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("focused scan root identity should be readable")
+            .expect("focused scan root should not be a link");
+        let mut app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("focused scan app should initialize");
+        app.begin_rescan(root.path().to_path_buf())
+            .expect("focused scan should start");
+        let scan_view_root = app.current_folder_path();
+        let mut owner = OwnerLoop {
+            app,
+            input: Box::new(PendingInput),
+            workers: None,
+            clock: Box::new(VirtualClock::new()),
+            animation: AnimationScheduler::new(false, false, Duration::ZERO),
+            settings: RuntimeSettings {
+                root: root.path().to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: false,
+                monochrome: false,
+                animate_loading: false,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: false,
+            },
+            temporary_storage: TemporaryStorage::default(),
+            summary: RunSummary::default(),
+            scan_active: true,
+            primary_scan_active: false,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries: VecDeque::new(),
+            pending_focused_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            rescan_active: true,
+            rescan_target: Some(root.path().to_path_buf()),
+            cancelled_while_scanning: false,
+            exit_after_work: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: Duration::ZERO,
+            next_deletion_progress_frame: Duration::ZERO,
+            last_deletion_progress: None,
+        };
+
+        owner
+            .finish_focused_scan(true)
+            .expect("cancelled focused scan should settle");
+        assert_eq!(
+            owner.animation.pending_slots(),
+            0,
+            "cancelling a focused scan must not flash completion through the header"
+        );
+
+        owner
+            .app
+            .begin_rescan(root.path().to_path_buf())
+            .expect("second focused scan should start");
+        owner.rescan_active = true;
+        owner.rescan_target = Some(root.path().to_path_buf());
+        owner.scan_active = true;
+        owner
+            .finish_focused_scan(false)
+            .expect("completed focused scan should settle");
+        assert_eq!(
+            owner.animation.pending_slots(),
+            0,
+            "finishing navigation work must not flash completion through the header"
+        );
+    }
     #[test]
     fn unchanged_deletion_progress_does_not_request_another_map_frame() {
         let mut previous = None;

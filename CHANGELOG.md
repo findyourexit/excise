@@ -14,10 +14,17 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 * Added frame-only modal attention chrome on capable terminals while keeping reduced-motion, ASCII, monochrome, and high-contrast output static.
 
 * Changed storage-map colour scaling from per-folder relative rank to fixed absolute size landmarks: blue through red from 4 KiB to 64 GiB, using the selected allocated-space or apparent-size measure.
+* Kept workspace pane frames static, moved their title chips to a reversed-accent treatment, and made only dialog chrome run a truecolour TachyonFX perimeter cycle.
+* Added a travelling gradient to the selected tree-map entry's dimensional edge, preserving its size colour and depth while making the cursor unambiguous.
+* Moved scan, model, and deletion status plus model-memory usage into the header; the bottom row now contains only visually distinct control keys and their hints.
+* Removed the visually awkward synthetic trailing title cap; the padded tab now ends cleanly at the top rule.
+
 
 ### Fixed
 
 * Scans no longer terminate when a spilled identity database reaches its temporary-storage limit during later identity reads. Excise releases the private cache and finishes with explicit uncertain allocation and reclaimability bounds.
+* Split paired truecolour foreground/background terminal commands before output, preventing renderers that parse only the foreground from displaying the `48;2;…m` tail inside an animated map.
+* Focused rescans now remain quiet navigation work: returning from or cancelling one no longer flashes the header completion colour.
 
 ## [1.2.4] - 2026-09-12
 
