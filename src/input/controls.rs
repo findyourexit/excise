@@ -176,6 +176,15 @@ fn handle_keypress_normal_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> Inp
 fn handle_navigation<B: Backend>(evt: &Event, app: &mut App<B>, loading: bool) -> InputCommand {
     match evt {
         key!(ctrl 'c') | key!(char 'q') => InputCommand::PromptExit,
+        key!(PageDown) => {
+            app.next_snapshot_page();
+            InputCommand::Navigation
+        }
+        key!(PageUp) => {
+            app.previous_snapshot_page();
+            InputCommand::Navigation
+        }
+
         key!(Right) => {
             app.move_selected_right();
             InputCommand::Navigation

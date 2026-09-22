@@ -1277,6 +1277,10 @@ mod tests {
         let outside = parent.path().join("outside-root");
         std::fs::create_dir(&scan_root).expect("scan root should be created");
         std::fs::create_dir(&outside).expect("replacement root should be created");
+        let child = scan_root.join("child");
+        std::fs::create_dir(&child).expect("child directory should be created");
+        std::fs::write(child.join("original"), b"original")
+            .expect("child fixture should be written");
         for index in 0..256 {
             std::fs::write(scan_root.join(format!("original-{index}")), b"original")
                 .expect("original fixture should be written");
@@ -1309,6 +1313,13 @@ mod tests {
                 }
                 WorkerEvent::ScanFailed { message, .. } => {
                     saw_root_change |= message.contains("during traversal");
+                }
+                WorkerEvent::ScanUnscanned {
+                    path,
+                    reason: UnscannedReason::Replacement(_),
+                    ..
+                } if path == scan_root => {
+                    saw_root_change = true;
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => {

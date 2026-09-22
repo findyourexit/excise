@@ -44,6 +44,8 @@ use crate::ui::palette::ColorCycle;
 const MIB: usize = 1024 * 1024;
 const MINIMUM_PLAN_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_DELETION_REPORTS: usize = 32;
+const SNAPSHOT_PAGE_ENTRIES: usize = 512;
+const MAX_SNAPSHOT_PAGE_HISTORY: usize = 32;
 
 pub(crate) fn emit_pty_test_marker(label: &str) {
     if std::env::var_os("EXCISE_PTY_TEST_MARKERS").is_none() {
@@ -178,6 +180,8 @@ where
     scan_store_available: bool,
     scan_store_rescan_active: bool,
     scan_store_rescan_target: Option<RelativePath>,
+    snapshot_page_after: Option<RelativePath>,
+    snapshot_page_history: Vec<(RelativePath, Option<RelativePath>)>,
     display: Display<B>,
     ui_effects: UiEffects,
     pub(crate) deletion_work: DeletionWork,
@@ -314,6 +318,8 @@ where
             scan_store_available: true,
             scan_store_rescan_active: false,
             scan_store_rescan_target: None,
+            snapshot_page_after: None,
+            snapshot_page_history: Vec::with_capacity(MAX_SNAPSHOT_PAGE_HISTORY),
             display,
             ui_mode: UiMode::Loading,
             suspended_ui_mode: None,
@@ -553,6 +559,7 @@ where
         path: &Path,
         identity: Option<&NativeIdentity>,
         coverage: Coverage,
+        scan_snapshot: Option<EntrySnapshot>,
     ) {
         if !self.scan_store_available {
             return;
@@ -574,44 +581,52 @@ where
         } else {
             PathEntryKind::File
         };
-        let coverage = if kind != PathEntryKind::Directory && identity.is_none() {
+        let expected_kind = match kind {
+            PathEntryKind::Directory => NodeKind::Directory,
+            PathEntryKind::File => NodeKind::File,
+            PathEntryKind::Link => NodeKind::Link,
+        };
+        let snapshot = scan_snapshot.unwrap_or_else(|| EntrySnapshot {
+            identity: identity.cloned(),
+            kind: expected_kind,
+            apparent_bytes: if kind == PathEntryKind::Directory {
+                0
+            } else {
+                u128::from(metadata.len())
+            },
+            allocated_bytes: (kind != PathEntryKind::Directory)
+                .then(|| physical_size(path, metadata).ok().map(u128::from))
+                .flatten(),
+            modified_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+        });
+        if snapshot.kind != expected_kind {
+            self.abandon_scan_store_generation();
+            return;
+        }
+        let coverage = if kind != PathEntryKind::Directory && snapshot.identity.is_none() {
             Coverage::Uncertain
         } else {
             coverage
         };
-        let apparent_bytes = if kind == PathEntryKind::Directory {
-            0
-        } else {
-            u128::from(metadata.len())
-        };
-        let allocated_bytes = (kind != PathEntryKind::Directory)
-            .then(|| physical_size(path, metadata).ok().map(u128::from))
-            .flatten();
-        let modified_nanos = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos());
-        let snapshot_identity = identity.cloned();
+        let snapshot_identity = snapshot.identity.clone();
+        let allocated_bytes = snapshot.allocated_bytes;
         self.scan_store_paths.push(PathObservation::with_snapshot(
             relative.clone(),
             kind,
-            SummaryMetrics::leaf(apparent_bytes, ByteBounds::exact(0), ByteBounds::exact(0)),
+            SummaryMetrics::leaf(
+                snapshot.apparent_bytes,
+                ByteBounds::exact(0),
+                ByteBounds::exact(0),
+            ),
             coverage,
-            Some(EntrySnapshot {
-                identity: snapshot_identity,
-                kind: match kind {
-                    PathEntryKind::Directory => NodeKind::Directory,
-                    PathEntryKind::File => NodeKind::File,
-                    PathEntryKind::Link => NodeKind::Link,
-                },
-                apparent_bytes,
-                allocated_bytes,
-                modified_nanos,
-            }),
+            Some(snapshot),
         ));
         if kind != PathEntryKind::Directory
-            && let Some(identity) = identity
+            && let Some(identity) = snapshot_identity
         {
             self.scan_store_identities.push(IdentityObservation {
                 path: relative,
@@ -645,7 +660,7 @@ where
         } else {
             Coverage::Uncertain
         };
-        self.record_scan_store_entry(&metadata, path, identity.as_ref(), coverage);
+        self.record_scan_store_entry(&metadata, path, identity.as_ref(), coverage, None);
     }
 
     fn flush_scan_store_batch(&mut self) {
@@ -682,25 +697,91 @@ where
             self.abandon_scan_store_generation();
             return;
         }
-        if self.load_snapshot_page(RelativePath::root()).is_err() {
+        if self.load_snapshot_page(&RelativePath::root()).is_err() {
             self.snapshot_tree = None;
             self.scan_store_available = false;
         }
     }
 
-    fn load_snapshot_page(&mut self, folder: RelativePath) -> Result<(), AppError> {
+    fn load_snapshot_page(&mut self, folder: &RelativePath) -> Result<(), AppError> {
+        self.snapshot_page_history.clear();
+        self.load_snapshot_page_after(folder, None)
+    }
+
+    fn load_snapshot_page_after(
+        &mut self,
+        folder: &RelativePath,
+        after: Option<RelativePath>,
+    ) -> Result<(), AppError> {
+        let request = after.as_ref().map_or_else(
+            || PageRequest::first(folder.clone(), SNAPSHOT_PAGE_ENTRIES),
+            |after| PageRequest::after(folder.clone(), after.clone(), SNAPSHOT_PAGE_ENTRIES),
+        );
         let page = self
             .scan_store
             .published_mut()
             .ok_or_else(|| AppError::Model("scan generation was not published".to_string()))?
-            .page(PageRequest::first(folder, 4_096))
+            .page(request)
             .map_err(|error| AppError::Model(error.to_string()))?;
         let model_stats = self.file_tree.model_stats();
         self.snapshot_tree = Some(
             SnapshotTree::from_page(self.file_tree.path_in_filesystem.clone(), page, model_stats)
                 .map_err(model_error)?,
         );
+        self.snapshot_page_after = after;
         Ok(())
+    }
+
+    pub(crate) fn next_snapshot_page(&mut self) -> bool {
+        if !self.uses_snapshot_view() {
+            return false;
+        }
+        let (folder, next_after) = self
+            .snapshot_tree
+            .as_ref()
+            .map(|snapshot| {
+                (
+                    snapshot.current_relative().clone(),
+                    snapshot.next_after().cloned(),
+                )
+            })
+            .expect("snapshot use was checked above");
+        let Some(next_after) = next_after else {
+            return false;
+        };
+        let prior = (folder.clone(), self.snapshot_page_after.clone());
+        if self
+            .load_snapshot_page_after(&folder, Some(next_after))
+            .is_err()
+        {
+            return false;
+        }
+        if self.snapshot_page_history.len() == MAX_SNAPSHOT_PAGE_HISTORY {
+            self.snapshot_page_history.remove(0);
+        }
+        self.snapshot_page_history.push(prior);
+        self.board.reset_selected_index();
+        self.render_and_update_board();
+        true
+    }
+
+    pub(crate) fn previous_snapshot_page(&mut self) -> bool {
+        if !self.uses_snapshot_view() {
+            return false;
+        }
+        let Some((folder, after)) = self.snapshot_page_history.pop() else {
+            return false;
+        };
+        if self
+            .load_snapshot_page_after(&folder, after.clone())
+            .is_ok()
+        {
+            self.board.reset_selected_index();
+            self.render_and_update_board();
+            return true;
+        }
+        self.snapshot_page_history.push((folder, after));
+        false
     }
 
     fn refresh_snapshot_after_deletion(&mut self, report: &DeletionReport) {
@@ -752,7 +833,8 @@ where
             self.snapshot_tree = None;
             return;
         }
-        if self.load_snapshot_page(desired).is_err() && self.load_snapshot_page(fallback).is_err() {
+        if self.load_snapshot_page(&desired).is_err() && self.load_snapshot_page(&fallback).is_err()
+        {
             self.scan_store_available = false;
             self.snapshot_tree = None;
         }
@@ -782,7 +864,7 @@ where
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
             _ => return false,
         };
-        if self.load_snapshot_page(relative.clone()).is_err()
+        if self.load_snapshot_page(&relative).is_err()
             || self
                 .scan_store
                 .begin_overlay_generation(next_generation, &relative)
@@ -795,7 +877,13 @@ where
         self.scan_store_rescan_target = Some(relative.clone());
         if !relative.is_root() {
             let identity = identity_for(target, &metadata).ok().flatten();
-            self.record_scan_store_entry(&metadata, target, identity.as_ref(), Coverage::Complete);
+            self.record_scan_store_entry(
+                &metadata,
+                target,
+                identity.as_ref(),
+                Coverage::Complete,
+                None,
+            );
         }
         self.scan_store_available
     }
@@ -850,17 +938,20 @@ where
         &mut self,
         file_metadata: &Metadata,
         entry_path: PathBuf,
-        identity: NativeIdentity,
+        identity: &NativeIdentity,
     ) -> Result<(), AppError> {
+        let node = self
+            .file_tree
+            .add_primary_entry(file_metadata, &entry_path, identity)
+            .map_err(model_error)?;
+        let snapshot = node.and_then(|node| self.file_tree.entry_snapshot(node));
         self.record_scan_store_entry(
             file_metadata,
             &entry_path,
-            Some(&identity),
+            Some(identity),
             Coverage::Complete,
+            snapshot,
         );
-        self.file_tree
-            .add_primary_entry(file_metadata, &entry_path, identity)
-            .map_err(model_error)?;
         self.ui_effects.record_loading_entry(entry_path);
         Ok(())
     }
@@ -869,14 +960,15 @@ where
         &mut self,
         file_metadata: &Metadata,
         entry_path: PathBuf,
-        identity: NativeIdentity,
+        identity: &NativeIdentity,
     ) -> Result<(), AppError> {
         if self.scan_store_rescan_active {
             self.record_scan_store_entry(
                 file_metadata,
                 &entry_path,
-                Some(&identity),
+                Some(identity),
                 Coverage::Complete,
+                None,
             );
         } else {
             self.file_tree
@@ -1166,7 +1258,7 @@ where
             let Some(folder) = folder else {
                 return;
             };
-            if let Err(error) = self.load_snapshot_page(folder) {
+            if let Err(error) = self.load_snapshot_page(&folder) {
                 self.show_error(format!("Could not open this scan page: {error}"));
                 return;
             }
@@ -1198,7 +1290,7 @@ where
                 .as_ref()
                 .map(|snapshot| (snapshot.current_id(), snapshot.parent_folder()))
                 .expect("snapshot use was checked above");
-            let succeeded = parent.is_some_and(|parent| self.load_snapshot_page(parent).is_ok());
+            let succeeded = parent.is_some_and(|parent| self.load_snapshot_page(&parent).is_ok());
             if let Some(zoom_level) = self.board.pop_previous_zoom_level() {
                 self.board.set_zoom_index(zoom_level);
             }
@@ -1855,8 +1947,8 @@ where
             self.flush_scan_store_batch();
             self.scan_store_rescan_active = false;
             if self.scan_store_available && self.scan_store.publish().is_ok() {
-                if self.load_snapshot_page(current).is_err() {
-                    let _ = self.load_snapshot_page(target);
+                if self.load_snapshot_page(&current).is_err() {
+                    let _ = self.load_snapshot_page(&target);
                 }
             } else {
                 self.scan_store.discard_active();
@@ -2047,7 +2139,7 @@ mod tests {
         let identity = crate::native_path::identity_for(path, &metadata)
             .expect("fixture identity should be readable")
             .expect("fixture should not be a link");
-        app.add_entry_to_base_folder(&metadata, path.to_path_buf(), identity)
+        app.add_entry_to_base_folder(&metadata, path.to_path_buf(), &identity)
             .expect("fixture entry should be added");
     }
 
@@ -3122,7 +3214,7 @@ mod tests {
         let identity = identity_for(&new, &metadata)
             .expect("replacement identity should resolve")
             .expect("replacement should be concrete");
-        app.add_entry_to_focused_folder(&metadata, new.clone(), identity)
+        app.add_entry_to_focused_folder(&metadata, new.clone(), &identity)
             .expect("focused entry should enter ScanStore");
         app.finish_rescan()
             .expect("focused snapshot scan should publish");
@@ -3147,5 +3239,115 @@ mod tests {
                 std::ffi::OsString::from("sibling"),
             ]
         );
+    }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn completed_deletion_republishes_the_snapshot_without_the_removed_target() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let target_path = root.path().join("target");
+        let survivor_path = root.path().join("survivor");
+        std::fs::write(&target_path, b"target").expect("target fixture should exist");
+        std::fs::write(&survivor_path, b"survivor").expect("survivor fixture should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        for path in [target_path.as_path(), survivor_path.as_path()] {
+            add_fixture_entry(&mut app, path);
+        }
+        app.complete_directory(root.path(), None)
+            .expect("root should complete");
+        app.finalize_scan().expect("initial scan should finalize");
+        let target_id = app
+            .files_in_current_view(0)
+            .into_iter()
+            .find(|file| file.name == "target")
+            .expect("target should be visible")
+            .node_id;
+        let target = app
+            .snapshot_tree
+            .as_ref()
+            .expect("published page should be materialized")
+            .deletion_target_for_id(target_id, false)
+            .expect("target should retain its scan snapshot");
+        let plan = crate::deletion::build_plan(root.path(), target, false)
+            .expect("target plan should build");
+        let report = crate::deletion::execute_plan(
+            root.path(),
+            plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(report.target_was_removed());
+        assert!(
+            app.try_complete_deletion(report)
+                .expect("snapshot should republish after deletion")
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(1))
+        );
+        assert_eq!(
+            app.files_in_current_view(0)
+                .into_iter()
+                .map(|file| file.name)
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("survivor")]
+        );
+    }
+    #[test]
+    fn snapshot_page_controls_reach_every_concrete_child_without_an_aggregate() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            true,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        for index in 0..=SNAPSHOT_PAGE_ENTRIES {
+            let path = root.path().join(format!("entry-{index:03}"));
+            std::fs::write(&path, b"x").expect("fixture entry should exist");
+            add_fixture_entry(&mut app, &path);
+        }
+        app.complete_directory(root.path(), None)
+            .expect("root should complete");
+        app.finalize_scan().expect("scan should publish a snapshot");
+        let first_page = app.files_in_current_view(0);
+        assert_eq!(first_page.len(), SNAPSHOT_PAGE_ENTRIES);
+        assert!(!first_page.iter().any(|file| file.name == "entry-512"));
+
+        let command = crate::input::handle_keypress(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageDown,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut app,
+        );
+        assert!(matches!(command, crate::input::InputCommand::Navigation));
+        let second_page = app.files_in_current_view(0);
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].name, "entry-512");
+
+        let command = crate::input::handle_keypress(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageUp,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut app,
+        );
+        assert!(matches!(command, crate::input::InputCommand::Navigation));
+        assert_eq!(app.files_in_current_view(0).len(), SNAPSHOT_PAGE_ENTRIES);
     }
 }

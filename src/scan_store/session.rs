@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 
 use thiserror::Error;
@@ -11,6 +12,7 @@ use super::identity_observation::{
 use super::manifest::{
     ManifestError, ManifestState, RunManifestEntry, ScanManifest, ScanSessionId,
 };
+use super::page::{PageRequest, ScanPage};
 use super::path_observation::{
     PathObservationRunError, append_path_observation, decode_path_observation,
 };
@@ -28,6 +30,10 @@ const RUN_BLOCK_BYTES: usize = 64 * 1024;
 /// Scanner workers emit bounded batches. Keep this input cap below the event
 /// channel's worst-case payload so the owner never needs an unbounded sort.
 pub(crate) const MAX_OBSERVATIONS_PER_BATCH: usize = 128;
+
+/// The current and immediately prior pages cover ordinary down/up navigation
+/// without giving a large scan an unbounded resident cache.
+const MAX_CACHED_PAGES: usize = 2;
 
 #[derive(Debug, Error)]
 pub(crate) enum ScanStoreError {
@@ -77,6 +83,12 @@ pub(crate) struct PublishedGeneration {
     identity_observations: SealedRun,
     allocation_contributions: SealedRun,
     directory_summaries: SealedRun,
+    page_cache: VecDeque<CachedPage>,
+}
+
+struct CachedPage {
+    request: PageRequest,
+    page: ScanPage,
 }
 
 impl PublishedGeneration {
@@ -149,6 +161,24 @@ impl PublishedGeneration {
         E: From<RunError>,
     {
         with_run_reader(&mut self.directory_summaries, visit)
+    }
+
+    pub(crate) fn cached_page(&mut self, request: &PageRequest) -> Option<ScanPage> {
+        let index = self
+            .page_cache
+            .iter()
+            .position(|cached| cached.request == *request)?;
+        let cached = self.page_cache.remove(index)?;
+        let page = cached.page.clone();
+        self.page_cache.push_back(cached);
+        Some(page)
+    }
+
+    pub(crate) fn cache_page(&mut self, request: PageRequest, page: ScanPage) {
+        if self.page_cache.len() == MAX_CACHED_PAGES {
+            let _ = self.page_cache.pop_front();
+        }
+        self.page_cache.push_back(CachedPage { request, page });
     }
 }
 
@@ -519,6 +549,7 @@ impl ScanStore {
                     identity_observations,
                     allocation_contributions,
                     directory_summaries,
+                    page_cache: VecDeque::with_capacity(MAX_CACHED_PAGES),
                 });
                 Ok(generation)
             }
@@ -966,5 +997,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![path("alpha/new")]
         );
+    }
+    #[test]
+    fn shuffled_batches_publish_identical_tree_map_pages() {
+        let paths = [
+            path_observation("alpha", PathEntryKind::Directory, 0),
+            path_observation("alpha/first", PathEntryKind::File, 3),
+            path_observation("beta", PathEntryKind::Directory, 0),
+            path_observation("beta/second", PathEntryKind::File, 5),
+        ];
+        let shared = file_id::FileId::new_inode(256, 2);
+        let identities = [
+            IdentityObservation {
+                path: path("alpha/first"),
+                file_id: shared,
+                declared_links: Some(2),
+                allocated_bytes: ByteBounds::exact(8),
+            },
+            IdentityObservation {
+                path: path("beta/second"),
+                file_id: shared,
+                declared_links: Some(2),
+                allocated_bytes: ByteBounds::exact(8),
+            },
+        ];
+        let mut first = store(TemporaryStorage::with_limit_bytes(128 * 1024));
+        first
+            .append_observation_batch(
+                vec![
+                    paths[3].clone(),
+                    paths[0].clone(),
+                    paths[2].clone(),
+                    paths[1].clone(),
+                ],
+                vec![identities[1].clone(), identities[0].clone()],
+            )
+            .expect("shuffled batch should be accepted");
+        first.publish().expect("first generation should publish");
+
+        let mut second = store(TemporaryStorage::with_limit_bytes(128 * 1024));
+        second
+            .append_observation_batch(
+                vec![paths[2].clone(), paths[3].clone()],
+                vec![identities[1].clone()],
+            )
+            .expect("first shuffled chunk should be accepted");
+        second
+            .append_observation_batch(
+                vec![paths[1].clone(), paths[0].clone()],
+                vec![identities[0].clone()],
+            )
+            .expect("second shuffled chunk should be accepted");
+        second.publish().expect("second generation should publish");
+
+        let first_root = first
+            .published_mut()
+            .expect("first generation should be retained")
+            .page(PageRequest::first(RelativePath::root(), 8))
+            .expect("first root page should load");
+        let second_root = second
+            .published_mut()
+            .expect("second generation should be retained")
+            .page(PageRequest::first(RelativePath::root(), 8))
+            .expect("second root page should load");
+        assert_eq!(first_root, second_root);
+        let first_alpha = first
+            .published_mut()
+            .expect("first generation should be retained")
+            .page(PageRequest::first(path("alpha"), 8))
+            .expect("first nested page should load");
+        let second_alpha = second
+            .published_mut()
+            .expect("second generation should be retained")
+            .page(PageRequest::first(path("alpha"), 8))
+            .expect("second nested page should load");
+        assert_eq!(first_alpha, second_alpha);
     }
 }

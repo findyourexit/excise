@@ -1,9 +1,6 @@
 use thiserror::Error;
 
 use super::path_key::{PathKeyError, decode_path_key, encode_path_key_into};
-#[cfg(test)]
-#[cfg(test)]
-use super::path_reducer::{Coverage, SummaryMetrics};
 use super::path_reducer::{PathEntryKind, PathObservation, coverage_code, coverage_from_code};
 use super::run_file::{RunError, RunKind, RunReader, RunWriter};
 use super::summary_metrics::{
@@ -64,7 +61,12 @@ pub(crate) fn encode_path_observation_into(
     encode_path_key_into(&observation.path, key)?;
     let mut flags = summary_metrics_flags(observation.metrics);
     if let Some(snapshot) = observation.snapshot.as_ref() {
-        if snapshot.kind != node_kind_for_entry(observation.kind) {
+        if snapshot.kind != node_kind_for_entry(observation.kind)
+            || snapshot.apparent_bytes != observation.metrics.apparent_bytes
+            || snapshot.identity.as_ref().is_some_and(|identity| {
+                identity.reparse_point != (observation.kind == PathEntryKind::Link)
+            })
+        {
             return Err(PathObservationCodecError::SnapshotKindMismatch);
         }
         flags |= SNAPSHOT_PRESENT;
@@ -164,6 +166,12 @@ pub(crate) fn decode_path_observation(
                 reparse_point: flags & SNAPSHOT_REPARSE_POINT != 0,
             })
         };
+        if identity
+            .as_ref()
+            .is_some_and(|identity| identity.reparse_point != (kind == PathEntryKind::Link))
+        {
+            return Err(PathObservationCodecError::Malformed);
+        }
         let allocated_bytes = (flags & SNAPSHOT_ALLOCATED_PRESENT != 0)
             .then(|| take_u128(&mut value))
             .transpose()?;
@@ -288,6 +296,7 @@ mod tests {
     use super::*;
     use crate::model::ByteBounds;
     use crate::scan_coordinator::{RelativePath, ScanGeneration};
+    use crate::scan_store::path_reducer::{Coverage, SummaryMetrics};
     use crate::scan_store::run_file::{RunDescriptor, RunWriter};
     use crate::temporary_storage::TemporaryStorage;
 

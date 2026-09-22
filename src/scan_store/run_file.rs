@@ -348,7 +348,7 @@ struct RunOpenError {
 /// Sequential reader for a sealed run with one reusable decoded block.
 pub(crate) struct RunReader {
     reader: BufReader<File>,
-    _reservation: TemporaryStorageReservation,
+    reservation: TemporaryStorageReservation,
     descriptor: RunDescriptor,
     bytes: u64,
     block_capacity: usize,
@@ -382,7 +382,7 @@ impl RunReader {
         };
         Ok(Self {
             reader,
-            _reservation: reservation,
+            reservation,
             descriptor,
             bytes,
             block_capacity,
@@ -411,7 +411,7 @@ impl RunReader {
     pub(crate) fn into_sealed(self) -> SealedRun {
         let Self {
             reader,
-            _reservation: reservation,
+            reservation,
             descriptor,
             bytes,
             ..

@@ -2,8 +2,6 @@ use thiserror::Error;
 
 use super::path_key::{PathKeyError, append_path_key, decode_path_key};
 use super::path_observation::{PathObservationCodecError, decode_path_observation};
-#[cfg(test)]
-use super::path_reducer::Coverage;
 use super::path_reducer::{
     DirectorySummary, PathReductionError, coverage_code, coverage_from_code,
     reduce_sorted_path_stream,
@@ -256,6 +254,7 @@ mod tests {
     use crate::model::ByteBounds;
     use crate::scan_coordinator::{RelativePath, ScanGeneration};
     use crate::scan_store::path_observation::append_path_observation;
+    use crate::scan_store::path_reducer::Coverage;
     use crate::scan_store::path_reducer::{PathEntryKind, PathObservation, SummaryMetrics};
     use crate::scan_store::run_file::RunDescriptor;
     use crate::temporary_storage::TemporaryStorage;

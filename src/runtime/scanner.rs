@@ -1521,7 +1521,7 @@ mod tests {
 
         let mut tree = FileTree::new(root.path().to_path_buf(), true, MIN_PROCESS_MIB)
             .expect("file tree should be created");
-        tree.add_entry(&metadata, &descendant, identity.clone())
+        tree.add_entry(&metadata, &descendant, &identity)
             .expect("descendant should be represented");
 
         let (queue, _) = TaskQueue::new(
@@ -1564,7 +1564,7 @@ mod tests {
             match event {
                 WorkerEvent::ScanBatch { entries } => {
                     for entry in entries {
-                        tree.add_entry(&entry.metadata, &entry.path, entry.identity)
+                        tree.add_entry(&entry.metadata, &entry.path, &entry.identity)
                             .expect("scanned entry should be represented");
                     }
                 }
