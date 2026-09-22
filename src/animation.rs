@@ -21,6 +21,8 @@ pub const ROUTINE_MOTION: Duration = Duration::from_millis(160);
 /// is replaced: the eye needs the extra frames to follow the entry it chose into
 /// its contents, or back out of them.
 pub const NAVIGATION_MOTION: Duration = Duration::from_millis(260);
+/// How long the measured map surface takes to emerge from the scan field.
+pub const SCAN_REVEAL_MOTION: Duration = Duration::from_millis(280);
 /// Stable seed keeps the target's checkerboard departure coherent between redraws.
 const DELETION_DISSOLVE_SEED: u32 = 0x0D3E_1E7E;
 

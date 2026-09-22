@@ -80,7 +80,8 @@ pub struct UiEffects {
     pub current_path_is_red: bool,
     pub deletion_in_progress: bool,
     pub deletion_work: DeletionWorkSummary,
-    pub loading_progress_indicator: u64,
+    /// Entries that reached the model during the active scan, with no guessed total.
+    pub loading_entries_indexed: u64,
     pub last_read_path: Option<PathBuf>,
     pub last_deletion_summary: Option<DeletionSummary>,
     /// Concise outcome for a background operation that could not proceed.
@@ -94,7 +95,7 @@ impl UiEffects {
             flash_space_freed: false,
             current_path_is_red: false,
             deletion_in_progress: false,
-            loading_progress_indicator: 0,
+            loading_entries_indexed: 0,
             last_read_path: None,
             deletion_work: DeletionWorkSummary::new(),
             last_deletion_summary: None,
@@ -152,10 +153,14 @@ impl UiEffects {
         self.last_deletion_notice = Some(notice);
     }
 
-    pub const fn increment_loading_progress_indicator(&mut self) {
-        // increasing and decreasing this number will increase
-        // the scanning text animation speed
-        self.loading_progress_indicator += 3;
+    pub(crate) fn reset_loading_activity(&mut self) {
+        self.loading_entries_indexed = 0;
+        self.last_read_path = None;
+    }
+
+    pub(crate) fn record_loading_entry(&mut self, path: PathBuf) {
+        self.loading_entries_indexed = self.loading_entries_indexed.saturating_add(1);
+        self.last_read_path = Some(path);
     }
 }
 

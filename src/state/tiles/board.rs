@@ -94,6 +94,11 @@ pub struct Board {
     /// `transition_origin` once the incoming layout exists.
     pending_pivot: Option<Pivot>,
     pending_pivot_geometry: Option<TileGeometry>,
+    /// A scan field must be seen empty before it may reveal the first measured
+    /// map. This prevents a focused rescan from animating the folder being left.
+    scan_reveal_armed: bool,
+    scan_reveal_observed_empty: bool,
+    scan_reveal_started: Option<Duration>,
 }
 
 impl Board {
@@ -125,6 +130,9 @@ impl Board {
             transition_span: crate::animation::ROUTINE_MOTION,
             pending_pivot: None,
             pending_pivot_geometry: None,
+            scan_reveal_armed: false,
+            scan_reveal_observed_empty: false,
+            scan_reveal_started: None,
         }
     }
     #[cfg(test)]
@@ -556,6 +564,57 @@ impl Board {
             }
         }
         self.transition_last_frame = Some(now);
+    }
+
+    /// Arms a one-shot field-to-map reveal for a scan that starts on this board.
+    pub(crate) fn arm_scan_reveal(&mut self) {
+        self.scan_reveal_armed = true;
+        self.scan_reveal_observed_empty = self.rendered_tiles.is_empty();
+        self.scan_reveal_started = None;
+    }
+
+    /// Drops a pending or active scan reveal when its scan is abandoned.
+    pub(crate) fn disarm_scan_reveal(&mut self) {
+        self.scan_reveal_armed = false;
+        self.scan_reveal_observed_empty = false;
+        self.scan_reveal_started = None;
+    }
+
+    /// Advances the scan reveal independently of map geometry: ordinary map
+    /// movement still works in monochrome while this decorative transition does not.
+    pub(crate) fn advance_scan_reveal(&mut self, now: Duration, animate: bool) {
+        if !animate || self.list_layout {
+            self.disarm_scan_reveal();
+            return;
+        }
+        if self.scan_reveal_armed && self.rendered_tiles.is_empty() {
+            self.scan_reveal_observed_empty = true;
+        }
+        if self.scan_reveal_armed
+            && self.scan_reveal_observed_empty
+            && !self.rendered_tiles.is_empty()
+        {
+            self.scan_reveal_armed = false;
+            self.scan_reveal_started = Some(now);
+        }
+        if self.scan_reveal_started.is_some_and(|started| {
+            now.saturating_sub(started) >= crate::animation::SCAN_REVEAL_MOTION
+        }) {
+            self.scan_reveal_started = None;
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn scan_reveal_progress(&self, now: Duration) -> Option<f32> {
+        self.scan_reveal_started.map(|started| {
+            let elapsed = now.saturating_sub(started).as_secs_f32();
+            (elapsed / crate::animation::SCAN_REVEAL_MOTION.as_secs_f32()).min(1.0)
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn has_scan_reveal(&self) -> bool {
+        self.scan_reveal_started.is_some()
     }
 
     fn clear_motion_state(&mut self) {
@@ -2223,5 +2282,41 @@ mod tests {
             .map(TileGeometry::from_tile)
             .expect("the later entry should be rendered");
         assert_eq!(late, pivot);
+    }
+
+    #[test]
+    fn scan_reveal_waits_for_a_blank_surface_and_expires() {
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files(vec![file(1, 1.0)]);
+        board.advance_geometry(Duration::ZERO, true);
+
+        board.arm_scan_reveal();
+        board.advance_scan_reveal(Duration::ZERO, true);
+        assert!(
+            board.scan_reveal_progress(Duration::ZERO).is_none(),
+            "a focused scan must not animate the folder it is leaving"
+        );
+
+        board.change_files(Vec::new());
+        board.advance_scan_reveal(Duration::from_millis(10), true);
+        board.change_files(vec![file(2, 1.0)]);
+        board.advance_scan_reveal(Duration::from_millis(20), true);
+        assert_eq!(
+            board.scan_reveal_progress(Duration::from_millis(20)),
+            Some(0.0),
+            "the first measured tiles must begin beneath a complete scan field"
+        );
+
+        board.advance_scan_reveal(
+            Duration::from_millis(20).saturating_add(crate::animation::SCAN_REVEAL_MOTION),
+            true,
+        );
+        assert!(
+            board
+                .scan_reveal_progress(Duration::from_millis(300))
+                .is_none(),
+            "the final map must settle once the reveal reaches its deadline"
+        );
     }
 }

@@ -46,8 +46,29 @@ const MONOCHROME_SELECTED_SHADE: &str = " ";
 const CROWN_LIFT: f32 = TILE_CROWN_LIFT;
 const BASE_DROP: f32 = TILE_BASE_DROP;
 const EDGE_DROP: f32 = TILE_EDGE_DROP;
+/// A selected fill stays visibly lifted without inheriting the outline's full brightness.
+const SELECTED_FILL_EMPHASIS: f32 = 0.5;
+/// The focused fill occupies the perceptual middle between its bright and dim contours.
+const FOCUSED_FILL_TOWARD_TILE: f32 = 0.42;
+/// Receding faces keep the travelling phase but settle close to the tile surface.
+const FOCUSED_DIM_TOWARD_TILE: f32 = 0.84;
 /// Columns an entry needs before it is worth labelling.
 const MINIMUM_LABEL_WIDTH: u16 = 6;
+
+/// Live scan state that owns the empty-map field and its one-shot reveal.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanVisual {
+    /// The scanner is still discovering the map rather than just revealing it.
+    pub scanning: bool,
+    /// A focused rescan uses its own semantic accent and copy.
+    pub rescanning: bool,
+    /// Entries that have actually reached the model; this intentionally has no denominator.
+    pub entries_indexed: u64,
+    /// Accessibility and presentation capability allow motion for this field.
+    pub animated: bool,
+    /// A map-local field-to-tiles transition, from `0.0` through `1.0`.
+    pub reveal_progress: Option<f32>,
+}
 
 /// The geometry one frame of the map is drawn from.
 ///
@@ -69,8 +90,8 @@ pub struct MapLayout<'a> {
     pub transitioning: bool,
     /// Whether an empty layout has been confirmed by the model as truly empty.
     pub show_empty_label: bool,
-    /// Whether this empty surface is still receiving scan results.
-    pub scanning: bool,
+    /// Live scan state for the empty surface and its transition into measured tiles.
+    pub scan: Option<ScanVisual>,
     /// Deletion state for displayed identities, retained outside the map model.
     pub deletion_work: Option<&'a DeletionWork>,
     /// A copied target that dissolves beneath the immediate incoming map reflow.
@@ -100,7 +121,7 @@ pub struct DenseRectangleGrid<'a> {
     monochrome: bool,
     transitioning: bool,
     show_empty_label: bool,
-    scanning: bool,
+    scan: Option<ScanVisual>,
     deletion_work: Option<&'a DeletionWork>,
     deletion_departure: Option<&'a DeletionDeparture>,
     now: Duration,
@@ -120,7 +141,7 @@ impl<'a> DenseRectangleGrid<'a> {
             monochrome,
             transitioning: layout.transitioning,
             show_empty_label: layout.show_empty_label,
-            scanning: layout.scanning,
+            scan: layout.scan,
             deletion_work: layout.deletion_work,
             deletion_departure: layout.deletion_departure,
             now: layout.now,
@@ -231,55 +252,64 @@ impl<'a> DenseRectangleGrid<'a> {
         }
     }
 
-    /// Paints a travelling focus trace across the selected tile's upper
-    /// half-cell perimeter. Its static lower bevel retains the full dimensional
-    /// edge without changing terminal background colours.
-    fn draw_composited_selection_pulse(
+    fn selected_focus(
         &self,
-        buffer: &mut Buffer,
         area: Rect,
+        palette: MapPalette,
         selected_last: Option<usize>,
-    ) {
+    ) -> Option<SelectionFocus> {
         if self.ascii
             || self.monochrome
             || !ColorCycle::can_animate(self.theme.focus)
             || self.transitioning
         {
-            return;
+            return None;
         }
-        let Some(index) = selected_last else {
-            return;
-        };
-        let Some(tile) = self.rectangles.get(index) else {
-            return;
-        };
+        let index = selected_last?;
+        let tile = self.rectangles.get(index)?;
         if self.is_deletion_departure(tile) {
-            return;
+            return None;
         }
-        let Some(outline) = visible_tile_outline(tile, area) else {
-            return;
-        };
+        let outline = visible_tile_outline(tile, area)?;
+        let ink = self.ink(tile, palette, Emphasis::Selected, self.work_status(tile));
         let (cycle, _) = derived_for(self.theme);
         let step = cycle_step(self.now);
+        let fill = cycle
+            .blended_toward(ink.fill, FOCUSED_FILL_TOWARD_TILE)
+            .at(step);
+        let (text, detail) = Oklch::from_color(fill).map_or((ink.text, ink.detail), Oklch::inks);
+        Some(SelectionFocus {
+            index,
+            outline,
+            cycle,
+            dim_cycle: cycle.blended_toward(ink.fill, FOCUSED_DIM_TOWARD_TILE),
+            step,
+            fill,
+            text,
+            detail,
+        })
+    }
+
+    /// Keeps the selected map entry dimensional: its leading faces carry the
+    /// bright travelling cycle, while its trailing faces and interior recede.
+    fn draw_composited_selection_focus(&self, buffer: &mut Buffer, focus: &SelectionFocus) {
+        if focus.index >= self.rectangles.len() {
+            return;
+        }
+        paint_focused_tile_fill(buffer, focus.outline, focus.fill);
         let half_rows = u32::from(HALF_ROWS_PER_CELL);
-        walk_tile_outline(outline, |x, half, edge_index| {
-            // A changing lower half would update the terminal background SGR
-            // on every frame. Some terminal renderers expose that sequence as
-            // text during large map redraws, so the travelling trace owns only
-            // the foreground half while the fixed lower bevel completes the edge.
-            if half % half_rows != 0 {
-                return;
-            }
+        walk_tile_outline(focus.outline, |x, half, edge_index| {
+            let bright = half == focus.outline.top
+                || (x == focus.outline.left && half != focus.outline.bottom.saturating_sub(1));
+            let colour = if bright {
+                focus.cycle.at(focus.step.saturating_add(edge_index))
+            } else {
+                focus.dim_cycle.at(focus.step.saturating_add(edge_index))
+            };
             let Ok(y) = u16::try_from(half / half_rows) else {
                 return;
             };
-            paint_half(
-                buffer,
-                x,
-                y,
-                true,
-                cycle.at(step.saturating_add(edge_index)),
-            );
+            paint_half(buffer, x, y, half % half_rows == 0, colour);
         });
     }
 
@@ -318,6 +348,7 @@ impl<'a> DenseRectangleGrid<'a> {
         area: Rect,
         palette: MapPalette,
         selected_last: Option<usize>,
+        focus: Option<&SelectionFocus>,
     ) {
         if self.transitioning {
             return;
@@ -330,9 +361,10 @@ impl<'a> DenseRectangleGrid<'a> {
                 continue;
             };
             let ink = self.ink(tile, palette, self.emphasis(index), Some(work.status));
+            let (fill, text, _) = focused_tile_ink(index, &ink, focus);
             let style = Style::default()
-                .fg(ink.text)
-                .bg(ink.fill)
+                .fg(text)
+                .bg(fill)
                 .add_modifier(Modifier::BOLD);
             draw_work_indicator(buffer, area, tile, work, style, self.ascii);
         }
@@ -386,6 +418,7 @@ impl<'a> DenseRectangleGrid<'a> {
         selected_last: Option<usize>,
     ) {
         let backdrop = palette.backdrop();
+        let focus = self.selected_focus(area, palette, selected_last);
         for position in area.positions() {
             buffer[position]
                 .set_symbol(HALF_CELL)
@@ -422,9 +455,11 @@ impl<'a> DenseRectangleGrid<'a> {
             .overflow
             .and_then(|overflow| overflow_region(area, overflow));
         collapse_flat_cells(buffer, area, overflow_area, palette.grain(), backdrop);
+        if let Some(focus) = focus.as_ref() {
+            self.draw_composited_selection_focus(buffer, focus);
+        }
         self.draw_composited_confirmation_checkers(buffer, area, palette, selected_last);
         self.draw_composited_execution_progress(buffer, area, palette, selected_last);
-        self.draw_composited_selection_pulse(buffer, area, selected_last);
 
         for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
             if self.is_deletion_departure(tile) {
@@ -433,19 +468,15 @@ impl<'a> DenseRectangleGrid<'a> {
             if label_occlusions.is_some_and(|occlusions| occlusions[index]) {
                 continue;
             }
+            let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
+            let (fill, text, detail) = focused_tile_ink(index, &ink, focus.as_ref());
             if let Some(labels) = prepared_labels {
                 let Some(label) = labels[index].as_ref() else {
                     continue;
                 };
-                let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
-                draw_prepared_tile_label(
-                    buffer, area, tile, label, ink.fill, ink.text, ink.detail, false,
-                );
+                draw_prepared_tile_label(buffer, area, tile, label, fill, text, detail, false);
             } else {
-                let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
-                draw_tile_label(
-                    buffer, area, tile, ink.fill, ink.text, ink.detail, self.ascii, false,
-                );
+                draw_tile_label(buffer, area, tile, fill, text, detail, self.ascii, false);
             }
         }
 
@@ -461,7 +492,7 @@ impl<'a> DenseRectangleGrid<'a> {
                 self.ascii,
             );
         }
-        self.draw_composited_work_indicators(buffer, area, palette, selected_last);
+        self.draw_composited_work_indicators(buffer, area, palette, selected_last, focus.as_ref());
     }
 
     /// Fallback for monochrome, high-contrast, and ASCII presentation, where a
@@ -727,15 +758,7 @@ impl Widget for DenseRectangleGrid<'_> {
             && self.deletion_departure.is_none()
             && self.overflow.is_none()
         {
-            draw_empty_surface(
-                buffer,
-                area,
-                self.theme,
-                palette,
-                self.ascii,
-                self.show_empty_label,
-                self.scanning,
-            );
+            self.draw_empty_surface(buffer, area, palette);
             return;
         }
         let selected_last = self.selected_paint_index();
@@ -765,6 +788,7 @@ impl Widget for DenseRectangleGrid<'_> {
                 selected_last,
             ),
         }
+        self.draw_scan_reveal(buffer, area, palette);
     }
 }
 
@@ -803,7 +827,7 @@ impl TileInk {
             FileType::Folder => TileTone::Folder,
             FileType::File | FileType::Synthetic => TileTone::File,
         };
-        let resting = if let Some(status) = work_status {
+        let source = if let Some(status) = work_status {
             palette.semantic(work_status_color(theme, status))
         } else if is_ramp_eligible(tile) {
             palette.tile(size_heat(tile.size), tone)
@@ -817,7 +841,12 @@ impl TileInk {
         } else {
             palette.semantic(theme.state_aggregated)
         };
-        let resting = palette.emphasised(resting, emphasis);
+        let emphasised = palette.emphasised(source, emphasis);
+        let resting = if emphasis == Emphasis::Selected {
+            source.towards(emphasised, SELECTED_FILL_EMPHASIS)
+        } else {
+            emphasised
+        };
         let (text, detail) = resting.inks();
         let fill = resting.to_color();
         let (crown, base, edge) = if emphasis == Emphasis::Selected {
@@ -1143,6 +1172,29 @@ struct VisibleTileOutline {
     bottom: u32,
 }
 
+/// One selected tile's bright leading, normal middle, and dim trailing contour.
+struct SelectionFocus {
+    index: usize,
+    outline: VisibleTileOutline,
+    cycle: ColorCycle,
+    dim_cycle: ColorCycle,
+    step: usize,
+    fill: Color,
+    text: Color,
+    detail: Color,
+}
+
+fn focused_tile_ink(
+    index: usize,
+    ink: &TileInk,
+    focus: Option<&SelectionFocus>,
+) -> (Color, Color, Color) {
+    match focus {
+        Some(focus) if focus.index == index => (focus.fill, focus.text, focus.detail),
+        _ => (ink.fill, ink.text, ink.detail),
+    }
+}
+
 fn visible_tile_outline(tile: &Tile, area: Rect) -> Option<VisibleTileOutline> {
     let left = tile.x.max(area.x);
     let right = tile.x.saturating_add(tile.width).min(area.right());
@@ -1195,6 +1247,42 @@ fn walk_tile_outline(outline: VisibleTileOutline, mut visit: impl FnMut(u16, u32
     for half in (outline.top.saturating_add(1)..outline.bottom.saturating_sub(1)).rev() {
         visit(outline.left, half, index);
         index = index.saturating_add(1);
+    }
+}
+
+/// Fills only the selected tile's interior. Its outline is painted afterwards,
+/// retaining a bright leading edge and a darker receding contour.
+fn paint_focused_tile_fill(buffer: &mut Buffer, outline: VisibleTileOutline, fill: Color) {
+    let left = outline.left.saturating_add(1);
+    let right = outline.right.saturating_sub(1);
+    let top = outline.top.saturating_add(1);
+    let bottom = outline.bottom.saturating_sub(1);
+    if left >= right || top >= bottom {
+        return;
+    }
+    let half_rows = u32::from(HALF_ROWS_PER_CELL);
+    for half in top..bottom {
+        let Ok(y) = u16::try_from(half / half_rows) else {
+            continue;
+        };
+        for x in left..right {
+            paint_half(buffer, x, y, half % half_rows == 0, fill);
+        }
+    }
+    let first_row = top / half_rows;
+    let last_row = bottom.saturating_sub(1) / half_rows;
+    for row in first_row..=last_row {
+        let Ok(y) = u16::try_from(row) else {
+            continue;
+        };
+        for x in left..right {
+            let Some(cell) = buffer.cell_mut((x, y)) else {
+                continue;
+            };
+            if cell.symbol() == HALF_CELL && cell.fg == cell.bg {
+                cell.set_symbol(" ");
+            }
+        }
     }
 }
 
@@ -2083,54 +2171,254 @@ fn overflow_detail_line(overflow: MapOverflow, width: usize, ascii: bool) -> Opt
         .find(|candidate| candidate.width() <= width)
 }
 
-fn draw_empty_surface(
-    buffer: &mut Buffer,
-    area: Rect,
-    theme: Theme,
-    palette: Option<MapPalette>,
-    ascii: bool,
-    show_empty_label: bool,
-    scanning: bool,
-) {
-    let backdrop = palette.map_or_else(|| theme.map_surface(), MapPalette::backdrop);
-    for position in area.positions() {
-        buffer[position]
-            .set_symbol(if ascii { "." } else { "·" })
-            .set_style(Style::default().fg(theme.text_muted).bg(backdrop));
-    }
-    let label = if show_empty_label {
-        Some("Folder is empty")
-    } else if scanning {
-        Some(if ascii {
-            "Scanning folder..."
-        } else {
-            "Scanning folder…"
-        })
-    } else {
-        None
-    };
-    let Some(label) = label else {
-        return;
-    };
-    if area.width >= label.width() as u16 && area.height > 0 {
-        let x = u32::from(area.x) + u32::from(area.width.saturating_sub(label.width() as u16)) / 2;
-        let y = u32::from(area.y) + u32::from(area.height) / 2;
-        let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) else {
-            return;
-        };
-        if buffer.cell_mut((x, y)).is_none() {
+const SCAN_FIELD_PERIOD: u32 = 56;
+const SCAN_REVEAL_FRONT_DEPTH: u32 = 10;
+const INDEXED_ENTRIES_SUFFIX: &str = " entries indexed";
+
+impl DenseRectangleGrid<'_> {
+    fn draw_empty_surface(&self, buffer: &mut Buffer, area: Rect, palette: Option<MapPalette>) {
+        let backdrop = palette.map_or_else(|| self.theme.map_surface(), MapPalette::backdrop);
+        if let Some(scan) = self.scan.filter(|scan| scan.scanning) {
+            let mut field = ScanField {
+                buffer,
+                area,
+                theme: self.theme,
+                backdrop,
+                ascii: self.ascii,
+                scan,
+                phase: scan_field_phase(self.now, scan.animated),
+                accent: if scan.rescanning {
+                    self.theme.state_rescanning
+                } else {
+                    self.theme.state_scanning
+                },
+            };
+            field.draw(None);
             return;
         }
+        for position in area.positions() {
+            buffer[position]
+                .set_symbol(if self.ascii { "." } else { "·" })
+                .set_style(Style::default().fg(self.theme.text_muted).bg(backdrop));
+        }
+        let Some(label) = self.show_empty_label.then_some("Folder is empty") else {
+            return;
+        };
+        let label_width = u16::try_from(label.width()).unwrap_or(u16::MAX);
+        let Some((x, y)) = centered_position(area, label_width) else {
+            return;
+        };
         buffer.set_string(
             x,
             y,
             label,
             Style::default()
-                .fg(theme.text_primary)
+                .fg(self.theme.text_primary)
                 .bg(backdrop)
                 .add_modifier(Modifier::BOLD),
         );
     }
+
+    fn draw_scan_reveal(&self, buffer: &mut Buffer, area: Rect, palette: Option<MapPalette>) {
+        let Some((scan, reveal_progress)) = self
+            .scan
+            .and_then(|scan| scan.reveal_progress.map(|progress| (scan, progress)))
+        else {
+            return;
+        };
+        if reveal_progress >= 1.0 {
+            return;
+        }
+        let backdrop = palette.map_or_else(|| self.theme.map_surface(), MapPalette::backdrop);
+        let mut field = ScanField {
+            buffer,
+            area,
+            theme: self.theme,
+            backdrop,
+            ascii: self.ascii,
+            scan,
+            phase: scan_field_phase(self.now, scan.animated),
+            accent: if scan.rescanning {
+                self.theme.state_rescanning
+            } else {
+                self.theme.state_scanning
+            },
+        };
+        field.draw(Some(reveal_progress.clamp(0.0, 1.0)));
+    }
+}
+
+/// Draws a quiet, deterministic field with a moving diagonal measuring front.
+/// It uses foreground ink only, so the map's background never flickers on parsers
+/// that handle truecolour foreground and background sequences differently.
+struct ScanField<'a> {
+    buffer: &'a mut Buffer,
+    area: Rect,
+    theme: Theme,
+    backdrop: Color,
+    ascii: bool,
+    scan: ScanVisual,
+    phase: u32,
+    accent: Color,
+}
+
+impl ScanField<'_> {
+    fn draw(&mut self, reveal_progress: Option<f32>) {
+        let front = reveal_progress.map(|progress| scan_reveal_front(self.area, progress));
+        for position in self.area.positions() {
+            if front.is_some_and(|front| {
+                f64::from(scan_coordinate(self.area, position.x, position.y))
+                    <= front - f64::from(scan_grain(position.x, position.y) % 4)
+            }) {
+                continue;
+            }
+            self.paint_cell(position.x, position.y);
+        }
+        let title = if reveal_progress.is_some() {
+            "MATERIALIZING MAP"
+        } else if self.scan.rescanning {
+            "REFRESHING FOLDER"
+        } else {
+            "SCANNING FOLDER"
+        };
+        if reveal_progress.is_none_or(|progress| progress < 0.58) {
+            self.draw_copy(title);
+        }
+    }
+
+    fn paint_cell(&mut self, x: u16, y: u16) {
+        let ridge = scan_coordinate(self.area, x, y).wrapping_add(self.phase) % SCAN_FIELD_PERIOD;
+        let grain = scan_grain(x, y);
+        let (symbol, foreground) = match ridge {
+            0..=1 => (if self.ascii { "#" } else { "▓" }, self.accent),
+            2..=4 => (if self.ascii { "+" } else { "▒" }, self.theme.focus),
+            5..=9 => (
+                if self.ascii { "." } else { "░" },
+                self.theme.text_secondary,
+            ),
+            _ if grain.is_multiple_of(7) => {
+                (if self.ascii { "." } else { "·" }, self.theme.text_muted)
+            }
+            _ => (" ", self.theme.text_muted),
+        };
+        if let Some(cell) = self.buffer.cell_mut((x, y)) {
+            cell.set_symbol(symbol)
+                .set_style(Style::default().fg(foreground).bg(self.backdrop));
+        }
+    }
+
+    fn draw_copy(&mut self, title: &str) {
+        let title_width = u16::try_from(title.width()).unwrap_or(u16::MAX);
+        let detail_width = if self.scan.entries_indexed == 0 {
+            u16::try_from("Measuring directory".width()).unwrap_or(u16::MAX)
+        } else {
+            decimal_width(self.scan.entries_indexed)
+                .saturating_add(u16::try_from(INDEXED_ENTRIES_SUFFIX.width()).unwrap_or(u16::MAX))
+        };
+        let show_detail = self.area.height >= 3 && self.area.width >= detail_width;
+        let title_y = self
+            .area
+            .y
+            .saturating_add(self.area.height / 2)
+            .saturating_sub(u16::from(show_detail));
+        let Some(title_x) = centered_x(self.area, title_width) else {
+            return;
+        };
+        let title_style = Style::default()
+            .fg(self.accent)
+            .bg(self.backdrop)
+            .add_modifier(Modifier::BOLD);
+        self.buffer.set_string(title_x, title_y, title, title_style);
+        if !show_detail {
+            return;
+        }
+        let detail_y = title_y.saturating_add(1);
+        let detail_style = Style::default()
+            .fg(self.theme.text_secondary)
+            .bg(self.backdrop);
+        if self.scan.entries_indexed == 0 {
+            let detail = "Measuring directory";
+            if let Some(x) = centered_x(self.area, detail_width) {
+                self.buffer.set_string(x, detail_y, detail, detail_style);
+            }
+            return;
+        }
+        self.draw_indexed_entries(detail_y, detail_style);
+    }
+
+    fn draw_indexed_entries(&mut self, y: u16, style: Style) {
+        let number_width = decimal_width(self.scan.entries_indexed);
+        let width = number_width
+            .saturating_add(u16::try_from(INDEXED_ENTRIES_SUFFIX.width()).unwrap_or(u16::MAX));
+        let Some(x) = centered_x(self.area, width) else {
+            return;
+        };
+        let mut digits = [b'0'; 20];
+        let mut value = self.scan.entries_indexed;
+        let mut start = digits.len();
+        loop {
+            start = start
+                .checked_sub(1)
+                .expect("u64 fits in twenty decimal digits");
+            let digit = u8::try_from(value % 10).expect("a decimal digit fits in u8");
+            digits[start] = b'0' + digit;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        let number = std::str::from_utf8(&digits[start..]).expect("decimal digits are valid ASCII");
+        self.buffer.set_string(x, y, number, style);
+        self.buffer.set_string(
+            x.saturating_add(number_width),
+            y,
+            INDEXED_ENTRIES_SUFFIX,
+            style,
+        );
+    }
+}
+
+fn scan_field_phase(now: Duration, animated: bool) -> u32 {
+    if animated {
+        u32::try_from(now.as_millis() / 33).unwrap_or(u32::MAX)
+    } else {
+        0
+    }
+}
+
+fn scan_coordinate(area: Rect, x: u16, y: u16) -> u32 {
+    u32::from(x.saturating_sub(area.x))
+        .saturating_mul(3)
+        .saturating_add(u32::from(y.saturating_sub(area.y)).saturating_mul(2))
+}
+
+fn scan_grain(x: u16, y: u16) -> u32 {
+    u32::from(x).wrapping_mul(73) ^ u32::from(y).wrapping_mul(151).rotate_left(7)
+}
+
+fn scan_reveal_front(area: Rect, progress: f32) -> f64 {
+    let span = u32::from(area.width)
+        .saturating_mul(3)
+        .saturating_add(u32::from(area.height).saturating_mul(2));
+    let depth = f64::from(SCAN_REVEAL_FRONT_DEPTH);
+    -depth + f64::from(progress) * (f64::from(span) + depth * 2.0)
+}
+
+fn decimal_width(mut value: u64) -> u16 {
+    let mut width = 1;
+    while value >= 10 {
+        value /= 10;
+        width += 1;
+    }
+    width
+}
+
+fn centered_position(area: Rect, width: u16) -> Option<(u16, u16)> {
+    centered_x(area, width).map(|x| (x, area.y.saturating_add(area.height / 2)))
+}
+
+fn centered_x(area: Rect, width: u16) -> Option<u16> {
+    (area.width >= width).then(|| area.x.saturating_add(area.width.saturating_sub(width) / 2))
 }
 
 #[cfg(test)]
@@ -2238,7 +2526,7 @@ mod tests {
                 transitioning: false,
                 show_empty_label: true,
                 deletion_work: None,
-                scanning: false,
+                scan: None,
                 deletion_departure: None,
                 now,
                 animate_deletion_checker: false,
@@ -2246,6 +2534,35 @@ mod tests {
             Theme::for_id(theme),
             ascii,
             monochrome,
+        )
+        .render(area, &mut buffer);
+        buffer
+    }
+
+    fn render_scan_visual(
+        tiles: &[Tile],
+        area: Rect,
+        scan: Option<ScanVisual>,
+        now: Duration,
+    ) -> Buffer {
+        let mut buffer = Buffer::empty(area);
+        DenseRectangleGrid::new(
+            MapLayout {
+                rectangles: tiles,
+                departing: &[],
+                overflow: None,
+                selected_rect_index: None,
+                transitioning: false,
+                show_empty_label: false,
+                scan,
+                deletion_work: None,
+                deletion_departure: None,
+                now,
+                animate_deletion_checker: false,
+            },
+            Theme::for_id(ThemeId::CatppuccinMocha),
+            false,
+            false,
         )
         .render(area, &mut buffer);
         buffer
@@ -2272,7 +2589,7 @@ mod tests {
                 transitioning: true,
                 show_empty_label: true,
                 deletion_work: None,
-                scanning: false,
+                scan: None,
                 deletion_departure: None,
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
@@ -2350,7 +2667,7 @@ mod tests {
                 transitioning: false,
                 show_empty_label: true,
                 deletion_work: None,
-                scanning: false,
+                scan: None,
                 deletion_departure: None,
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
@@ -2690,11 +3007,16 @@ mod tests {
     }
 
     #[test]
-    fn selected_tile_has_a_travelling_outline_without_flattening_depth() {
+    fn selected_tile_walks_a_full_contour_with_midpoint_fill() {
         let selected = tile(0, 0, 12, 8, 1);
         let area = Rect::new(0, 0, 12, 4);
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
-        let (cycle, _) = derived_for(theme);
+        let (cycle, map) = derived_for(theme);
+        let palette = map.expect("mocha should supply a truecolour map palette");
+        let ink = TileInk::resolve(&selected, theme, palette, Emphasis::Selected, None);
+        let midpoint_cycle = cycle.blended_toward(ink.fill, FOCUSED_FILL_TOWARD_TILE);
+        let dim_cycle = cycle.blended_toward(ink.fill, FOCUSED_DIM_TOWARD_TILE);
+        let outline = visible_tile_outline(&selected, area).expect("tile should be visible");
         let first = render_presentation_at(
             std::slice::from_ref(&selected),
             area,
@@ -2714,25 +3036,39 @@ mod tests {
             Duration::from_millis(34),
         );
 
-        assert_eq!(first[(0, 0)].fg, cycle.at(cycle_step(Duration::ZERO)));
-        assert_eq!(first[(1, 0)].fg, cycle.at(cycle_step(Duration::ZERO) + 1));
-        assert_eq!(
-            later[(0, 0)].fg,
-            cycle.at(cycle_step(Duration::from_millis(34)))
-        );
-        assert_ne!(first[(0, 0)].fg, later[(0, 0)].fg);
-        assert_eq!(
-            first[(5, 1)].bg,
-            later[(5, 1)].bg,
-            "only the selected outline should pulse; the dimensional tile body stays stable"
-        );
+        let assert_outline = |buffer: &Buffer, step: usize| {
+            walk_tile_outline(outline, |x, half, edge_index| {
+                let bright = half == outline.top
+                    || (x == outline.left && half != outline.bottom.saturating_sub(1));
+                let expected = if bright {
+                    cycle.at(step.saturating_add(edge_index))
+                } else {
+                    dim_cycle.at(step.saturating_add(edge_index))
+                };
+                let y = u16::try_from(half / u32::from(HALF_ROWS_PER_CELL))
+                    .expect("outline should fit the test buffer");
+                let actual = if half % u32::from(HALF_ROWS_PER_CELL) == 0 {
+                    buffer[(x, y)].fg
+                } else {
+                    buffer[(x, y)].bg
+                };
+                assert_eq!(actual, expected, "outline half {half} at column {x}");
+            });
+        };
+        let first_step = cycle_step(Duration::ZERO);
+        let later_step = cycle_step(Duration::from_millis(34));
+        assert_outline(&first, first_step);
+        assert_outline(&later, later_step);
+        assert_eq!(first[(5, 1)].bg, midpoint_cycle.at(first_step));
+        assert_eq!(later[(5, 1)].bg, midpoint_cycle.at(later_step));
+        assert_ne!(first[(5, 1)].bg, later[(5, 1)].bg);
+        assert_ne!(first[(5, 3)].bg, later[(5, 3)].bg);
+        assert_ne!(first[(11, 1)].fg, later[(11, 1)].fg);
         assert!(
-            first
-                .content
-                .iter()
-                .zip(later.content.iter())
-                .all(|(first, later)| first.bg == later.bg),
-            "the moving selection trace must not issue changing background colours"
+            lightness_of(cycle.at(first_step)) > lightness_of(midpoint_cycle.at(first_step))
+                && lightness_of(midpoint_cycle.at(first_step))
+                    > lightness_of(dim_cycle.at(first_step)),
+            "the focused fill must sit between its leading and receding contour brightness"
         );
     }
 
@@ -3536,7 +3872,7 @@ mod tests {
                 selected_rect_index: None,
                 transitioning: false,
                 show_empty_label: false,
-                scanning: false,
+                scan: None,
                 deletion_work: Some(&work),
                 deletion_departure: None,
                 now: Duration::ZERO,
@@ -3569,7 +3905,7 @@ mod tests {
                     selected_rect_index: None,
                     transitioning: false,
                     show_empty_label: false,
-                    scanning: false,
+                    scan: None,
                     deletion_work: Some(&work),
                     deletion_departure: None,
                     now,
@@ -3685,7 +4021,7 @@ mod tests {
                 selected_rect_index: Some(0),
                 transitioning: false,
                 show_empty_label: false,
-                scanning: false,
+                scan: None,
                 deletion_work: None,
                 deletion_departure: Some(&departure),
                 now: Duration::ZERO,
@@ -3719,7 +4055,7 @@ mod tests {
                 selected_rect_index: None,
                 transitioning: true,
                 show_empty_label: true,
-                scanning: false,
+                scan: None,
                 deletion_work: None,
                 deletion_departure: Some(&departure),
                 now: Duration::ZERO,
@@ -3751,31 +4087,148 @@ mod tests {
     }
 
     #[test]
-    fn empty_scanning_surface_names_progress_without_claiming_empty() {
+    fn empty_scanning_surface_presents_factual_live_activity() {
         let area = Rect::new(0, 0, 24, 4);
-        let mut buffer = Buffer::empty(area);
-        DenseRectangleGrid::new(
-            MapLayout {
-                rectangles: &[],
-                departing: &[],
-                overflow: None,
-                selected_rect_index: None,
-                transitioning: false,
-                show_empty_label: false,
+        let buffer = render_scan_visual(
+            &[],
+            area,
+            Some(ScanVisual {
                 scanning: true,
-                deletion_work: None,
-                deletion_departure: None,
-                now: Duration::ZERO,
-                animate_deletion_checker: false,
-            },
-            Theme::for_id(ThemeId::CatppuccinMocha),
-            false,
-            false,
-        )
-        .render(area, &mut buffer);
+                rescanning: false,
+                entries_indexed: 42,
+                animated: false,
+                reveal_progress: None,
+            }),
+            Duration::ZERO,
+        );
         let rendered = text_of(&buffer);
-        assert!(rendered.contains("Scanning folder…"));
+        assert!(rendered.contains("SCANNING FOLDER"));
+        assert!(rendered.contains("42 entries indexed"));
+        assert!(rendered.contains('▓'));
         assert!(!rendered.contains("Folder is empty"));
+    }
+
+    #[test]
+    fn focused_rescan_field_names_its_live_refresh() {
+        let buffer = render_scan_visual(
+            &[],
+            Rect::new(0, 0, 32, 4),
+            Some(ScanVisual {
+                scanning: true,
+                rescanning: true,
+                entries_indexed: 356_299,
+                animated: false,
+                reveal_progress: None,
+            }),
+            Duration::ZERO,
+        );
+
+        let rendered = text_of(&buffer);
+        assert!(rendered.contains("REFRESHING FOLDER"));
+        assert!(rendered.contains("356299 entries indexed"));
+    }
+
+    #[test]
+    fn scan_field_moves_without_repainting_its_background() {
+        let area = Rect::new(0, 0, 32, 8);
+        let scan = Some(ScanVisual {
+            scanning: true,
+            rescanning: false,
+            entries_indexed: 0,
+            animated: true,
+            reveal_progress: None,
+        });
+        let first = render_scan_visual(&[], area, scan, Duration::ZERO);
+        let later = render_scan_visual(&[], area, scan, Duration::from_millis(33));
+
+        assert!(
+            first
+                .content
+                .iter()
+                .zip(later.content.iter())
+                .any(|(first, later)| first.symbol() != later.symbol() || first.fg != later.fg),
+            "the measuring front must move through the map surface"
+        );
+        assert!(
+            first
+                .content
+                .iter()
+                .zip(later.content.iter())
+                .all(|(first, later)| first.bg == later.bg),
+            "the scan field must not issue changing terminal background colours"
+        );
+    }
+
+    #[test]
+    fn static_scan_field_respects_reduced_motion() {
+        let area = Rect::new(0, 0, 32, 8);
+        let scan = Some(ScanVisual {
+            scanning: true,
+            rescanning: false,
+            entries_indexed: 0,
+            animated: false,
+            reveal_progress: None,
+        });
+        let first = render_scan_visual(&[], area, scan, Duration::ZERO);
+        let later = render_scan_visual(&[], area, scan, Duration::from_secs(1));
+
+        assert_eq!(first.content, later.content);
+    }
+
+    #[test]
+    fn scan_field_materializes_the_real_map_behind_its_front() {
+        let area = Rect::new(0, 0, 32, 6);
+        let tile = tile(
+            0,
+            0,
+            area.width,
+            u32::from(area.height) * u32::from(HALF_ROWS_PER_CELL),
+            1,
+        );
+        let tiles = std::slice::from_ref(&tile);
+        let target = render_scan_visual(tiles, area, None, Duration::ZERO);
+        let initial = render_scan_visual(
+            tiles,
+            area,
+            Some(ScanVisual {
+                scanning: true,
+                rescanning: false,
+                entries_indexed: 8,
+                animated: true,
+                reveal_progress: Some(0.0),
+            }),
+            Duration::ZERO,
+        );
+        let middle = render_scan_visual(
+            tiles,
+            area,
+            Some(ScanVisual {
+                scanning: true,
+                rescanning: false,
+                entries_indexed: 8,
+                animated: true,
+                reveal_progress: Some(0.5),
+            }),
+            Duration::ZERO,
+        );
+        let complete = render_scan_visual(
+            tiles,
+            area,
+            Some(ScanVisual {
+                scanning: true,
+                rescanning: false,
+                entries_indexed: 8,
+                animated: true,
+                reveal_progress: Some(1.0),
+            }),
+            Duration::ZERO,
+        );
+
+        assert!(text_of(&initial).contains("MATERIALIZING MAP"));
+        assert_ne!(initial[(0, 0)].symbol(), target[(0, 0)].symbol());
+        assert_eq!(middle[(0, 0)].symbol(), target[(0, 0)].symbol());
+        assert_eq!(middle[(31, 5)].symbol(), initial[(31, 5)].symbol());
+        assert_eq!(complete.content, target.content);
     }
 
     #[test]
@@ -3798,7 +4251,7 @@ mod tests {
                 transitioning: false,
                 show_empty_label: false,
                 deletion_work: None,
-                scanning: false,
+                scan: None,
                 deletion_departure: None,
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
