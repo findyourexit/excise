@@ -38,7 +38,7 @@ impl Widget for WarningBox {
             rect,
             "SCAN IN PROGRESS",
             self.theme,
-            self.theme.state_rescanning,
+            self.theme.state_rebuilding,
             self.ascii,
             self.chrome,
         );
@@ -67,7 +67,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rescan_warning_explains_that_deletion_is_unavailable() {
+    fn generation_rebuild_warning_explains_that_deletion_is_unavailable() {
         let area = Rect::new(0, 0, 48, 9);
         let mut buffer = Buffer::empty(area);
         WarningBox::with_chrome(

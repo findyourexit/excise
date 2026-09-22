@@ -75,7 +75,7 @@ pub struct Board {
     departing_from: Vec<TileGeometry>,
     /// Origin geometry for each target entry still moving, plus retained entries
     /// held at their landing rectangle during an active drill. It is keyed by
-    /// node and sorted for binary search so a frame never rescans the previous
+    /// node and sorted for binary search so a frame never reprocesses the prior
     /// layout.
     transition_from: Vec<(NodeId, TileGeometry)>,
     /// Reused output storage while refreshes resolve visible geometry into the
@@ -95,7 +95,7 @@ pub struct Board {
     pending_pivot: Option<Pivot>,
     pending_pivot_geometry: Option<TileGeometry>,
     /// A scan field must be seen empty before it may reveal the first measured
-    /// map. This prevents a focused rescan from animating the folder being left.
+    /// map. This prevents a generation rebuild from animating the folder being left.
     scan_reveal_armed: bool,
     scan_reveal_observed_empty: bool,
     scan_reveal_started: Option<Duration>,
@@ -2295,7 +2295,7 @@ mod tests {
         board.advance_scan_reveal(Duration::ZERO, true);
         assert!(
             board.scan_reveal_progress(Duration::ZERO).is_none(),
-            "a focused scan must not animate the folder it is leaving"
+            "a generation rebuild must not animate the folder it is leaving"
         );
 
         board.change_files(Vec::new());

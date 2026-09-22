@@ -51,4 +51,4 @@ Small entries are a viewport summary · use / filter or zoom · store #.#K/#.#G
 ▏Item check: Inode { device_id: ########, inode_number: ######## }                                                                                                                           ▕
 ▏Scan result: included                                                                                                                                                                       ▕
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
- arrows/hjkl move  Enter open/rescan  / filter  e export  t theme  Backspace delete  ? help
+ arrows/hjkl move  Enter open  / filter  e export  t theme  Backspace delete  ? help

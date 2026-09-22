@@ -58,7 +58,7 @@ pub(crate) enum InputCommand {
     Drill,
     Navigation,
     PathError,
-    CancelRescan,
+    CancelGenerationRebuild,
     RequestDeletion(Box<FileToDelete>),
     CancelDeletionConfirmation,
     ConfirmDeletion {
@@ -114,7 +114,7 @@ pub(crate) fn handle_keypress<B: Backend>(evt: &Event, app: &mut App<B>) -> Inpu
     match &app.ui_mode {
         crate::UiMode::Loading => handle_keypress_loading_mode(evt, app),
         crate::UiMode::Normal => handle_keypress_normal_mode(evt, app),
-        crate::UiMode::Rescanning { .. } => handle_keypress_rescanning_mode(evt, app),
+        crate::UiMode::Rebuilding { .. } => handle_keypress_generation_rebuild_mode(evt, app),
         crate::UiMode::FilterInput { .. } => handle_keypress_filter_mode(evt, app),
         crate::UiMode::Help => handle_keypress_help_mode(evt, app),
         crate::UiMode::ScreenTooSmall => handle_keypress_screen_too_small(evt, app),
@@ -304,14 +304,17 @@ fn handle_navigation<B: Backend>(evt: &Event, app: &mut App<B>, loading: bool) -
     }
 }
 
-fn handle_keypress_rescanning_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+fn handle_keypress_generation_rebuild_mode<B: Backend>(
+    evt: &Event,
+    app: &mut App<B>,
+) -> InputCommand {
     if matches!(evt, key!(char 't')) {
         InputCommand::OpenThemePicker
     } else if matches!(evt, key!(Backspace)) {
         deletion_request(app)
     } else if matches!(evt, key!(Esc)) {
         app.go_up();
-        InputCommand::CancelRescan
+        InputCommand::CancelGenerationRebuild
     } else {
         handle_navigation(evt, app, true)
     }

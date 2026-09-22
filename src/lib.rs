@@ -161,6 +161,14 @@ pub mod fuzz {
         pub use crate::model::{ByteBounds, DEFAULT_PROCESS_MIB, EntrySnapshot, NodeId, NodeKind};
     }
 
+    pub mod scan_store {
+        /// Reduces generated identity facts through the canonical streaming reducer.
+        #[must_use]
+        pub fn reduce_identity_bytes(data: &[u8]) -> usize {
+            crate::scan_store::identity_observation::fuzz_reduce_identity_bytes(data)
+        }
+    }
+
     pub mod native_path {
         pub use crate::native_path::{NativeIdentity, NativePath, identity_for};
     }
@@ -204,7 +212,8 @@ pub(crate) fn start<B>(
         exclusions: Vec::new(),
         memory_mib: crate::model::DEFAULT_PROCESS_MIB,
         temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
-        scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+        scan_store_mib: Some(4_096),
+        scan_store_reserve_mib: None,
         scan_store_dir: None,
         apparent_size: show_apparent_size,
         disable_delete_confirmation,

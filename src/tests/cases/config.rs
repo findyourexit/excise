@@ -93,6 +93,20 @@ fn scan_store_limit_must_be_at_least_two_mib() {
 }
 
 #[test]
+fn absent_scan_store_limit_uses_adaptive_scratch_budget() {
+    let config = RuntimeConfig::from_layers(
+        cli(&["excise"]),
+        None,
+        EnvironmentOverrides::default(),
+        PathBuf::from("cwd"),
+        None,
+    )
+    .expect("default configuration should resolve");
+
+    assert_eq!(config.scan_store_mib, None);
+}
+
+#[test]
 fn precedence_is_cli_then_environment_then_file_then_default() {
     let config = RuntimeConfig::from_layers(
         cli(&[
@@ -111,6 +125,8 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
             "4",
             "--scan-store-mib",
             "5",
+            "--scan-store-reserve-mib",
+            "6",
             "--scan-store-dir",
             "cli-scan-store",
             "cli-root",
@@ -131,6 +147,7 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
                 process_memory_mib: Some(crate::model::DEFAULT_PROCESS_MIB),
                 temporary_storage_mib: Some(2),
                 scan_store_mib: Some(2),
+                scan_store_reserve_mib: Some(2),
                 scan_store_dir: Some(PathBuf::from("file-scan-store")),
             },
         }),
@@ -146,6 +163,7 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
             memory_mib: Some(crate::model::DEFAULT_PROCESS_MIB),
             temporary_storage_mib: Some(3),
             scan_store_mib: Some(3),
+            scan_store_reserve_mib: Some(3),
             scan_store_dir: Some(PathBuf::from("env-scan-store")),
             theme: None,
             ascii: None,
@@ -164,7 +182,8 @@ fn precedence_is_cli_then_environment_then_file_then_default() {
     assert_eq!(config.event_buffer, 64);
     assert_eq!(config.scan_store_dir, Some(PathBuf::from("cli-scan-store")));
     assert_eq!(config.temporary_storage_mib, 4);
-    assert_eq!(config.scan_store_mib, 5);
+    assert_eq!(config.scan_store_mib, Some(5));
+    assert_eq!(config.scan_store_reserve_mib, Some(6));
     assert!(config.apparent_size);
     assert!(config.reduced_motion);
     assert!(config.monochrome);

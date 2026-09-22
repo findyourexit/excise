@@ -69,7 +69,7 @@ pub(crate) fn emit_pty_test_marker(label: &str) {
 pub enum UiMode {
     Loading,
     Normal,
-    Rescanning {
+    Rebuilding {
         target: PathBuf,
     },
     FilterInput {
@@ -140,7 +140,7 @@ pub enum ExitWork {
 pub enum ThemePickerReturn {
     Loading,
     Normal,
-    Rescanning { target: PathBuf },
+    Rebuilding { target: PathBuf },
 }
 
 impl ThemePickerReturn {
@@ -148,7 +148,7 @@ impl ThemePickerReturn {
         match self {
             Self::Loading => UiMode::Loading,
             Self::Normal => UiMode::Normal,
-            Self::Rescanning { target } => UiMode::Rescanning { target },
+            Self::Rebuilding { target } => UiMode::Rebuilding { target },
         }
     }
 }
@@ -156,7 +156,7 @@ impl ThemePickerReturn {
 impl UiMode {
     #[must_use]
     pub const fn allows_motion(&self) -> bool {
-        matches!(self, Self::Loading | Self::Normal | Self::Rescanning { .. })
+        matches!(self, Self::Loading | Self::Normal | Self::Rebuilding { .. })
     }
 
     #[must_use]
@@ -176,7 +176,7 @@ impl UiMode {
 
     #[must_use]
     pub const fn can_present_deletion_confirmation(&self) -> bool {
-        matches!(self, Self::Loading | Self::Normal | Self::Rescanning { .. })
+        matches!(self, Self::Loading | Self::Normal | Self::Rebuilding { .. })
     }
 }
 
@@ -201,8 +201,8 @@ where
     scan_store_available: bool,
     generation_rebuild_required: bool,
     scan_store_failure: Option<String>,
-    scan_store_rescan_active: bool,
-    scan_store_rescan_target: Option<RelativePath>,
+    generation_rebuild_active: bool,
+    generation_rebuild_target: Option<RelativePath>,
     snapshot_page_history: Vec<(RelativePath, Option<PageCursor>)>,
 
     display: Display<B>,
@@ -360,8 +360,8 @@ where
             scan_store_available: true,
             generation_rebuild_required: false,
             scan_store_failure: None,
-            scan_store_rescan_active: false,
-            scan_store_rescan_target: None,
+            generation_rebuild_active: false,
+            generation_rebuild_target: None,
             snapshot_page_history: Vec::with_capacity(MAX_SNAPSHOT_PAGE_HISTORY),
             display,
             ui_mode: UiMode::Loading,
@@ -465,7 +465,7 @@ where
             && ColorCycle::can_animate(theme.focus)
             && self.deletion_work.has_checker_animation(now);
         let animate_loading_surface = animate_loading_visual
-            && matches!(self.ui_mode, UiMode::Loading | UiMode::Rescanning { .. })
+            && matches!(self.ui_mode, UiMode::Loading | UiMode::Rebuilding { .. })
             && !self.board.is_list_layout()
             && self.board.rendered_tiles().is_empty();
         let animate_scan_reveal = animate_loading_visual && self.board.has_scan_reveal();
@@ -604,7 +604,7 @@ where
     fn uses_provisional_scan_page(&self) -> bool {
         self.scan_store_available
             && self.scan_store.active_generation().is_some()
-            && (!self.loaded || self.scan_store_rescan_active)
+            && (!self.loaded || self.generation_rebuild_active)
     }
 
     fn files_in_current_view(&self, offset: usize) -> Vec<crate::state::tiles::FileMetadata> {
@@ -710,7 +710,7 @@ where
             .as_deref()
             .is_some_and(|failure| failure.contains("scan store capacity exhausted"))
         {
-            return "The scan completed with a summary only. The detailed map and deletion controls are unavailable because the scan-store budget was reached. Run Excise again with a larger --scan-store-mib value.".to_string();
+            return "Not enough scratch space for the full scan. The detailed map and deletion controls are unavailable. Choose a roomier --scan-store-dir, lower --scan-store-reserve-mib, or raise an explicit --scan-store-mib cap, then run again.".to_string();
         }
         "Excise could not build a complete folder map. Run it again.".to_string()
     }
@@ -1040,7 +1040,7 @@ where
     /// Starts a fresh root generation after a partial deletion invalidated its
     /// prior immutable snapshot. Returns false when no rebuild is pending.
     pub(crate) fn begin_generation_rebuild(&mut self) -> Result<bool, AppError> {
-        if !self.generation_rebuild_required || self.scan_store_rescan_active {
+        if !self.generation_rebuild_required || self.generation_rebuild_active {
             return Ok(false);
         }
         let next_generation = self
@@ -1052,13 +1052,13 @@ where
             .map_err(scan_store_error)?;
         self.scan_store_available = true;
         self.scan_store_failure = None;
-        self.scan_store_rescan_active = true;
-        self.scan_store_rescan_target = Some(RelativePath::root());
+        self.generation_rebuild_active = true;
+        self.generation_rebuild_target = Some(RelativePath::root());
         self.generation_rebuild_required = false;
         let target = self.scan_root.clone();
         self.ui_effects.reset_loading_activity();
         self.board.arm_scan_reveal();
-        self.replace_ui_mode(UiMode::Rescanning { target });
+        self.replace_ui_mode(UiMode::Rebuilding { target });
         self.render_and_update_board();
         Ok(true)
     }
@@ -1239,7 +1239,7 @@ where
         let previous = std::mem::replace(&mut self.ui_mode, UiMode::Loading);
         let return_to = match &previous {
             UiMode::Loading => ThemePickerReturn::Loading,
-            UiMode::Rescanning { target } => ThemePickerReturn::Rescanning {
+            UiMode::Rebuilding { target } => ThemePickerReturn::Rebuilding {
                 target: target.clone(),
             },
             _ => ThemePickerReturn::Normal,
@@ -1675,7 +1675,7 @@ where
         let return_to = match &self.ui_mode {
             UiMode::Loading => ThemePickerReturn::Loading,
             UiMode::Normal => ThemePickerReturn::Normal,
-            UiMode::Rescanning { target } => ThemePickerReturn::Rescanning {
+            UiMode::Rebuilding { target } => ThemePickerReturn::Rebuilding {
                 target: target.clone(),
             },
             _ => return false,
@@ -1927,7 +1927,7 @@ where
         let return_to = match &self.ui_mode {
             UiMode::Loading => ThemePickerReturn::Loading,
             UiMode::Normal => ThemePickerReturn::Normal,
-            UiMode::Rescanning { target } => ThemePickerReturn::Rescanning {
+            UiMode::Rebuilding { target } => ThemePickerReturn::Rebuilding {
                 target: target.clone(),
             },
             _ => return,
@@ -2000,18 +2000,18 @@ where
         self.render_and_update_board();
     }
 
-    pub fn finish_rescan(&mut self) -> Result<(), AppError> {
-        let target = self.scan_store_rescan_target.take().ok_or_else(|| {
+    pub fn finish_generation_rebuild(&mut self) -> Result<(), AppError> {
+        let target = self.generation_rebuild_target.take().ok_or_else(|| {
             AppError::Invariant("scan rebuild finished without an active revision".to_string())
         })?;
         let current = self.snapshot_page_cache.as_ref().map_or_else(
             || target.clone(),
             |cache| cache.current().current_relative().clone(),
         );
-        let rescan_invalidated = !self.scan_store_available && self.generation_rebuild_required;
-        self.scan_store_rescan_active = false;
-        self.generation_rebuild_required = rescan_invalidated;
-        if rescan_invalidated {
+        let rebuild_invalidated = !self.scan_store_available && self.generation_rebuild_required;
+        self.generation_rebuild_active = false;
+        self.generation_rebuild_required = rebuild_invalidated;
+        if rebuild_invalidated {
             // A deletion discarded this generation while its worker was still
             // draining. Its terminal event merely releases that stale worker;
             // the owner will start a strictly newer root generation next.
@@ -2029,10 +2029,10 @@ where
                 .map_err(|error| AppError::Model(error.to_string()))?;
             self.scan_store_available = false;
         }
-        if matches!(self.ui_mode, UiMode::Rescanning { .. }) {
+        if matches!(self.ui_mode, UiMode::Rebuilding { .. }) {
             self.ui_mode = self.navigation_mode();
         } else if let UiMode::ThemePicker { return_to, .. } = &mut self.ui_mode
-            && matches!(return_to, ThemePickerReturn::Rescanning { .. })
+            && matches!(return_to, ThemePickerReturn::Rebuilding { .. })
         {
             *return_to = if self.loaded {
                 ThemePickerReturn::Normal
@@ -2042,7 +2042,7 @@ where
         }
         if let Some(suspended) = self.suspended_ui_mode.as_mut() {
             match suspended {
-                UiMode::Rescanning { .. } => {
+                UiMode::Rebuilding { .. } => {
                     *suspended = if self.loaded {
                         UiMode::Normal
                     } else {
@@ -2050,7 +2050,7 @@ where
                     };
                 }
                 UiMode::ThemePicker { return_to, .. }
-                    if matches!(return_to, ThemePickerReturn::Rescanning { .. }) =>
+                    if matches!(return_to, ThemePickerReturn::Rebuilding { .. }) =>
                 {
                     *return_to = if self.loaded {
                         ThemePickerReturn::Normal
@@ -2065,14 +2065,14 @@ where
         Ok(())
     }
 
-    pub fn cancel_rescan(&mut self) -> Result<(), AppError> {
-        let rebuild_cancelled = self.scan_store_rescan_active && self.uses_provisional_scan_page();
-        if self.scan_store_rescan_active {
+    pub fn cancel_generation_rebuild(&mut self) -> Result<(), AppError> {
+        let rebuild_cancelled = self.generation_rebuild_active && self.uses_provisional_scan_page();
+        if self.generation_rebuild_active {
             self.scan_store
                 .cancel_active()
                 .map_err(|error| AppError::Model(error.to_string()))?;
-            self.scan_store_rescan_active = false;
-            self.scan_store_rescan_target = None;
+            self.generation_rebuild_active = false;
+            self.generation_rebuild_target = None;
             if rebuild_cancelled {
                 self.snapshot_filter = None;
                 self.snapshot_page_history.clear();
@@ -2633,7 +2633,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_storage_failure_names_the_scan_store_budget() {
+    fn canonical_storage_failure_names_scratch_remedy() {
         let root = tempfile::tempdir().expect("app root should exist");
         let mut app = App::new(
             TestBackend::new(80, 24),
@@ -2656,9 +2656,10 @@ mod tests {
         assert!(matches!(
             &app.ui_mode,
             UiMode::ScanResultsUnavailable(message)
-                if message.contains("summary only")
+                if message.contains("Not enough scratch space")
                     && message.contains("deletion controls")
-                    && message.contains("--scan-store-mib")
+                    && message.contains("--scan-store-dir")
+                    && message.contains("--scan-store-reserve-mib")
         ));
     }
 
@@ -3382,7 +3383,7 @@ mod tests {
     }
 
     #[test]
-    fn dismissing_exit_returns_to_an_active_rescan() {
+    fn dismissing_exit_returns_to_an_active_generation_rebuild() {
         let root = tempfile::tempdir().expect("app root should exist");
         let target = root.path().join("refreshing");
         let mut app = App::new(
@@ -3397,7 +3398,7 @@ mod tests {
         )
         .expect("app should initialize");
         app.loaded = true;
-        app.ui_mode = UiMode::Rescanning {
+        app.ui_mode = UiMode::Rebuilding {
             target: target.clone(),
         };
 
@@ -3406,7 +3407,7 @@ mod tests {
 
         assert!(matches!(
             &app.ui_mode,
-            UiMode::Rescanning { target: current } if current == &target
+            UiMode::Rebuilding { target: current } if current == &target
         ));
     }
     #[cfg(any(unix, windows))]
@@ -3583,11 +3584,11 @@ mod tests {
         );
 
         app.invalidate_snapshot_view_for_live_mutation();
-        assert!(app.scan_store_rescan_active);
+        assert!(app.generation_rebuild_active);
         assert!(app.generation_rebuild_required);
-        app.finish_rescan()
+        app.finish_generation_rebuild()
             .expect("stale rebuild completion should settle without publication");
-        assert!(!app.scan_store_rescan_active);
+        assert!(!app.generation_rebuild_active);
         assert!(app.generation_rebuild_required);
 
         assert!(

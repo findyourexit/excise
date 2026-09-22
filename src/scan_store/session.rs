@@ -102,6 +102,26 @@ pub(crate) enum ScanStoreError {
     DuplicateInputRun,
 }
 
+/// Logical sealed-run I/O used by the internal benchmark harness.
+///
+/// The counters measure serialized run bytes rather than operating-system
+/// syscalls, so they stay deterministic across page-cache behavior.
+#[cfg(feature = "internal")]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the serialized-I/O unit must remain explicit at every metric call site"
+)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ScanStoreIoMetrics {
+    pub(crate) input_written_bytes: u64,
+    pub(crate) merge_read_bytes: u64,
+    pub(crate) merge_written_bytes: u64,
+    pub(crate) reduction_read_bytes: u64,
+    pub(crate) reduction_written_bytes: u64,
+    pub(crate) publication_read_bytes: u64,
+    pub(crate) publication_written_bytes: u64,
+}
+
 /// A coherent, immutable scan generation retained after successful reduction.
 ///
 /// The sparse child-query run is the sole retained scan representation. It
@@ -427,6 +447,8 @@ pub(crate) struct ScanStore {
     published: Option<PublishedGeneration>,
     summary_only: Option<SummaryOnlyGeneration>,
     retired_generation: Option<ScanGeneration>,
+    #[cfg(feature = "internal")]
+    io_metrics: ScanStoreIoMetrics,
 }
 
 impl ScanStore {
@@ -468,7 +490,37 @@ impl ScanStore {
             published: None,
             summary_only: None,
             retired_generation: None,
+            #[cfg(feature = "internal")]
+            io_metrics: ScanStoreIoMetrics::default(),
         })
+    }
+
+    #[cfg(feature = "internal")]
+    #[must_use]
+    pub(crate) const fn io_metrics(&self) -> ScanStoreIoMetrics {
+        self.io_metrics
+    }
+
+    #[cfg(feature = "internal")]
+    fn record_publication_io(
+        &mut self,
+        path_observations: &SealedRun,
+        identity_observations: &SealedRun,
+        allocation_contributions: &SealedRun,
+        directory_summaries: &SealedRun,
+        child_queries: &SealedRun,
+    ) {
+        self.io_metrics.publication_read_bytes = self
+            .io_metrics
+            .publication_read_bytes
+            .saturating_add(path_observations.bytes())
+            .saturating_add(identity_observations.bytes())
+            .saturating_add(allocation_contributions.bytes())
+            .saturating_add(directory_summaries.bytes());
+        self.io_metrics.publication_written_bytes = self
+            .io_metrics
+            .publication_written_bytes
+            .saturating_add(child_queries.bytes());
     }
 
     #[allow(
@@ -594,6 +646,8 @@ impl ScanStore {
             }),
             summary_only: None,
             retired_generation: None,
+            #[cfg(feature = "internal")]
+            io_metrics: ScanStoreIoMetrics::default(),
         })
     }
 
@@ -911,6 +965,13 @@ impl ScanStore {
             self.active = Some(active);
             return Err(error);
         }
+        #[cfg(feature = "internal")]
+        {
+            self.io_metrics.input_written_bytes = self
+                .io_metrics
+                .input_written_bytes
+                .saturating_add(run.bytes());
+        }
         active.input_runs_mut(descriptor.kind())?.push(run);
         self.active = Some(active);
         if let Err(error) = self.compact_input_family(descriptor.kind()) {
@@ -1047,6 +1108,7 @@ impl ScanStore {
             Ok(reduced) => reduced,
             Err(error) => return self.finish_incomplete_generation(active, error),
         };
+
         let child_result = (|| -> Result<_, ScanStoreError> {
             let mut child_writer = self.new_writer(generation, RunKind::ChildQuery)?;
             let page_metadata = materialize_child_queries(
@@ -1076,6 +1138,14 @@ impl ScanStore {
             }
             Err(error) => return self.finish_incomplete_generation(active, error),
         };
+        #[cfg(feature = "internal")]
+        self.record_publication_io(
+            &path_observations,
+            &identity_observations,
+            &allocation_contributions,
+            &directory_summaries,
+            &child_queries,
+        );
         let unrecorded_path_count = active.unrecorded_path_count;
         let mut manifest = active.manifest.clone();
         manifest.replace_all_runs(RunManifestEntry {
@@ -1164,25 +1234,67 @@ impl ScanStore {
         let identity_observations =
             self.merge_tiered_family(active, RunKind::IdentityObservation, identity_runs)?;
 
+        #[cfg(feature = "internal")]
+        {
+            self.io_metrics.reduction_read_bytes = self
+                .io_metrics
+                .reduction_read_bytes
+                .saturating_add(path_observations.bytes());
+        }
         let mut path_reader = path_observations.into_reader()?;
         let mut directory_writer = self.new_writer(generation, RunKind::DirectorySummary)?;
         reduce_path_observation_run(&mut path_reader, &mut directory_writer)?;
         let path_observations = path_reader.into_sealed();
         let directory_summaries = directory_writer.seal()?;
+        #[cfg(feature = "internal")]
+        {
+            self.io_metrics.reduction_written_bytes = self
+                .io_metrics
+                .reduction_written_bytes
+                .saturating_add(directory_summaries.bytes());
+        }
         self.persist_added_run(active, &directory_summaries)?;
 
+        #[cfg(feature = "internal")]
+        {
+            self.io_metrics.reduction_read_bytes = self
+                .io_metrics
+                .reduction_read_bytes
+                .saturating_add(path_observations.bytes());
+        }
         let mut catalog_reader = path_observations.into_reader()?;
         let mut catalog_writer = self.new_writer(generation, RunKind::PathCatalog)?;
         build_path_catalog(&mut catalog_reader, &mut catalog_writer)?;
         let path_observations = catalog_reader.into_sealed();
         let path_catalog = catalog_writer.seal()?;
+        #[cfg(feature = "internal")]
+        {
+            self.io_metrics.reduction_written_bytes = self
+                .io_metrics
+                .reduction_written_bytes
+                .saturating_add(path_catalog.bytes());
+        }
         self.persist_added_run(active, &path_catalog)?;
 
+        #[cfg(feature = "internal")]
+        {
+            self.io_metrics.reduction_read_bytes = self
+                .io_metrics
+                .reduction_read_bytes
+                .saturating_add(identity_observations.bytes());
+        }
         let mut identity_reader = identity_observations.into_reader()?;
         let mut allocation_writer = self.new_writer(generation, RunKind::AllocationContribution)?;
         reduce_identity_observations(&mut identity_reader, &mut allocation_writer)?;
         let identity_observations = identity_reader.into_sealed();
         let allocation_contributions = allocation_writer.seal()?;
+        #[cfg(feature = "internal")]
+        {
+            self.io_metrics.reduction_written_bytes = self
+                .io_metrics
+                .reduction_written_bytes
+                .saturating_add(allocation_contributions.bytes());
+        }
         self.persist_added_run(active, &allocation_contributions)?;
 
         Ok((
@@ -1272,6 +1384,10 @@ impl ScanStore {
             }
             1 => Ok(runs.into_iter().next().expect("one run was checked above")),
             _ => {
+                #[cfg(feature = "internal")]
+                let input_bytes = runs
+                    .iter()
+                    .fold(0_u64, |total, run| total.saturating_add(run.bytes()));
                 let descriptors = runs.iter().map(SealedRun::descriptor).collect::<Vec<_>>();
                 let mut readers = Vec::with_capacity(runs.len());
                 for run in runs {
@@ -1280,6 +1396,15 @@ impl ScanStore {
                 let mut output = self.new_writer(generation, kind)?;
                 merge_sorted_runs(&mut readers, &mut output)?;
                 let output = output.seal()?;
+                #[cfg(feature = "internal")]
+                {
+                    self.io_metrics.merge_read_bytes =
+                        self.io_metrics.merge_read_bytes.saturating_add(input_bytes);
+                    self.io_metrics.merge_written_bytes = self
+                        .io_metrics
+                        .merge_written_bytes
+                        .saturating_add(output.bytes());
+                }
                 self.persist_replaced_runs(active, &descriptors, &output)?;
                 drop(readers);
                 Ok(output)

@@ -658,6 +658,89 @@ where
     Ok(value)
 }
 
+/// Exercises the canonical identity-run reducer from the fuzz harness.
+///
+/// The fixture constructs valid, identity-sorted observations with repeated
+/// identities and mixed known/unknown bounds, then round-trips them through
+/// the same run codec and streaming reducer used by a production publication.
+#[cfg(feature = "fuzzing")]
+#[must_use]
+pub(crate) fn fuzz_reduce_identity_bytes(data: &[u8]) -> usize {
+    use std::path::Path;
+
+    use crate::scan_coordinator::ScanGeneration;
+    use crate::scan_store::run_file::RunDescriptor;
+    use crate::temporary_storage::TemporaryStorage;
+
+    let storage = TemporaryStorage::from_mib(2).expect("minimum fuzz storage should fit");
+    let mut observations = Vec::with_capacity(data.len().saturating_add(4) / 5);
+    for (index, chunk) in data.chunks(5).take(64).enumerate() {
+        let device = u64::from(chunk.first().copied().unwrap_or_default() % 4);
+        let inode = u64::from(chunk.get(1).copied().unwrap_or_default() % 16);
+        let lower = u128::from(chunk.get(2).copied().unwrap_or_default());
+        let upper = (chunk.get(3).copied().unwrap_or_default() & 1 == 0)
+            .then(|| lower.saturating_add(u128::from(chunk.get(4).copied().unwrap_or_default())));
+        let declared_links = (chunk.get(4).copied().unwrap_or_default() & 1 == 0)
+            .then_some(u64::from(chunk.get(4).copied().unwrap_or_default() % 8 + 1));
+        let path = format!("branch-{device}/entry-{index}");
+        observations.push(IdentityObservation {
+            path: RelativePath::from_path(Path::new(&path))
+                .expect("generated fuzz path should be relative"),
+            file_id: FileId::new_inode(device, inode),
+            declared_links,
+            allocated_bytes: ByteBounds { lower, upper },
+        });
+    }
+    observations.sort_unstable_by(compare_identity_observations);
+
+    let mut input = RunWriter::new(
+        tempfile::tempfile().expect("fuzz input run should open"),
+        storage
+            .reservation(0)
+            .expect("fuzz input reservation should fit"),
+        RunDescriptor::new(ScanGeneration::initial(), 1, RunKind::IdentityObservation),
+        512,
+    )
+    .expect("fuzz input writer should initialize");
+    let mut key = Vec::new();
+    let mut value = Vec::new();
+    for observation in &observations {
+        append_identity_observation(&mut input, observation, &mut key, &mut value)
+            .expect("generated fuzz observation should append");
+    }
+    let mut input = input
+        .seal()
+        .expect("fuzz input should seal")
+        .into_reader()
+        .expect("fuzz input should reopen");
+    let mut output = RunWriter::new(
+        tempfile::tempfile().expect("fuzz output run should open"),
+        storage
+            .reservation(0)
+            .expect("fuzz output reservation should fit"),
+        RunDescriptor::new(
+            ScanGeneration::initial(),
+            2,
+            RunKind::AllocationContribution,
+        ),
+        512,
+    )
+    .expect("fuzz output writer should initialize");
+    reduce_identity_observations(&mut input, &mut output)
+        .expect("generated fuzz observations should reduce");
+    let mut output = output
+        .seal()
+        .expect("fuzz output should seal")
+        .into_reader()
+        .expect("fuzz output should reopen");
+    let mut contributions = 0_usize;
+    visit_allocation_contributions(&mut output, |_, _| {
+        contributions = contributions.saturating_add(1);
+        Ok::<(), AllocationContributionRunError>(())
+    })
+    .expect("fuzz contributions should decode");
+    contributions
+}
 #[cfg(test)]
 mod tests {
     use std::path::Path;
