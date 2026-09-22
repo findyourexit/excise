@@ -10,7 +10,6 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::theme::Theme;
 use crate::ui::palette::{
     ColorCycle, CycleInk, MIN_FOCUS_CONTRAST, Oklch, cycle_step, derived_for,
-    derived_for_with_monochrome,
 };
 
 /// One cell of breathing room between independent panes, matching exabind's
@@ -66,11 +65,10 @@ pub(crate) const ASCII_PANE_BORDER_SET: Set = Set {
     horizontal_bottom: "-",
 };
 
-/// Draws a pane and returns its content area.
+/// Draws a static workspace pane and returns its content area.
 ///
-/// Frame, then travelling cycle, then title chip, strictly in that order. The
-/// chip is painted last so the animation underneath can never overwrite it,
-/// which is the failure mode of animating a `Block` title in place.
+/// Only decision dialogs animate. A selected map entry carries the moving focus
+/// cue, leaving persistent workspace chrome still and legible.
 #[allow(
     clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
@@ -82,24 +80,14 @@ pub(crate) fn render_pane(
     title: &str,
     theme: Theme,
     active: bool,
-    animate: bool,
     monochrome: bool,
     ascii: bool,
-    now: Duration,
 ) -> Rect {
-    let perimeter = border_len(area);
-    let animated = active
-        && animate
-        && ColorCycle::can_animate_with_capabilities(theme.focus, monochrome, ascii);
-    let active_cycle = active.then(|| derived_for_with_monochrome(theme, monochrome).0);
-    let accent = active_cycle.map_or(theme.border, |cycle| cycle.at(0));
-    let phase = if animated { cycle_step(now) } else { 0 };
-    let border_cycle = active_cycle
-        .filter(|_| animated)
-        .map(|cycle| (cycle, phase, perimeter));
-    let chip_cycle = active_cycle
-        .filter(|_| animated || monochrome)
-        .map(|cycle| (cycle, phase, perimeter));
+    let accent = if active {
+        contrast_safe_accent(theme, theme.surface_panel, theme.focus)
+    } else {
+        theme.border
+    };
     let border_set = if ascii {
         ASCII_PANE_BORDER_SET
     } else {
@@ -112,28 +100,14 @@ pub(crate) fn render_pane(
         .style(Style::default().bg(theme.surface_panel));
     let inner = block.inner(area);
     block.render(area, buffer);
-
-    if let Some((cycle, step, perimeter)) = border_cycle.as_ref() {
-        walk_border(area, |x, y, index| {
-            if let Some(cell) = buffer.cell_mut((x, y)) {
-                cell.fg = cycle.at_perimeter(*step, index, *perimeter);
-            }
-        });
-    }
-
-    draw_title_chip(
+    draw_exabind_title_chip(
         buffer,
         area,
         title,
-        theme,
-        theme.surface_panel,
         accent,
+        theme.surface_panel,
         active,
-        chip_cycle
-            .as_ref()
-            .map(|(cycle, step, perimeter)| (cycle, *step, *perimeter)),
         monochrome,
-        ascii,
     );
     inner
 }
@@ -192,14 +166,46 @@ fn border_len(area: Rect) -> usize {
     }
 }
 
-/// Paints the pane label as a chip seated in the top rule.
-///
-/// exabind styles its title as reversed bold ink laid straight onto the frame,
-/// and lets the perimeter cycle run through the title row, so the label reads as
-/// part of the border rather than as a plaque bolted onto it. Ours does the
-/// same: `cycle` carries the border's colour sequence continuing across the
-/// chip's own cells, and quadrant caps close each end so the block is not left
-/// squared off against the hairline rule.
+/// Renders the pane title exactly as exabind renders a left-aligned `Block`
+/// title: a reversed accent span seated directly in the top rule. Keeping this
+/// manual avoids allocating a title string on every map-selection frame while
+/// retaining Ratatui's border-safe left and right margins.
+fn draw_exabind_title_chip(
+    buffer: &mut Buffer,
+    area: Rect,
+    title: &str,
+    accent: Color,
+    surface: Color,
+    active: bool,
+    monochrome: bool,
+) {
+    if area.width < 5 || area.height == 0 || title.is_empty() {
+        return;
+    }
+    let title = title_prefix_to_width(title, usize::from(area.width.saturating_sub(4)));
+    if title.is_empty() {
+        return;
+    }
+    let style = Style::default()
+        .fg(accent)
+        .bg(surface)
+        .add_modifier(Modifier::BOLD);
+    let style = if !monochrome || active {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    };
+    let right_border = area.right().saturating_sub(1);
+    let mut x = area.x.saturating_add(1);
+    for segment in [" ", title, " "] {
+        let remaining = usize::from(right_border.saturating_sub(x));
+        x = buffer.set_stringn(x, area.y, segment, remaining, style).0;
+    }
+}
+
+/// Draws the modal title chip. Modal chrome retains its travelling colour
+/// treatment so dialogs hold attention without animating ordinary panes.
+
 #[allow(
     clippy::too_many_arguments,
     reason = "title chip rendering keeps geometry, palette, cycle, and accessibility inputs explicit"
@@ -331,6 +337,15 @@ fn static_chip_style(lead: Color, theme: Theme, active: bool, monochrome: bool) 
             style
         };
     }
+    if monochrome && active {
+        // A truecolour theme can be forced into monochrome at runtime. Keep the
+        // active pane's static focus explicit rather than relying on a colour
+        // the postprocessor will remove.
+        return Style::default()
+            .fg(lead)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+    }
+
     if monochrome && !matches!(lead, Color::Rgb(..)) {
         // ANSI colours cannot be measured, and the active chip already carries
         // reverse video in forced monochrome. Keep this inactive chip plain.
@@ -619,9 +634,7 @@ mod tests {
     #[derive(Clone, Copy)]
     struct PaneRenderSettings {
         active: bool,
-        animate: bool,
         presentation: PanePresentation,
-        now: Duration,
         theme: ThemeId,
     }
 
@@ -631,9 +644,9 @@ mod tests {
 
     fn render_with_monochrome(
         active: bool,
-        animate: bool,
+        _animate: bool,
         monochrome: bool,
-        now: Duration,
+        _now: Duration,
         theme: ThemeId,
     ) -> Buffer {
         render_with_capabilities(
@@ -641,13 +654,11 @@ mod tests {
             "STORAGE MAP",
             PaneRenderSettings {
                 active,
-                animate,
                 presentation: if monochrome {
                     PanePresentation::Monochrome
                 } else {
                     PanePresentation::Color
                 },
-                now,
                 theme,
             },
         )
@@ -666,16 +677,14 @@ mod tests {
             title,
             Theme::for_id(settings.theme),
             settings.active,
-            settings.animate,
             monochrome,
             ascii,
-            settings.now,
         );
         buffer
     }
 
     #[test]
-    fn the_title_chip_survives_the_border_animation() {
+    fn title_chip_remains_readable_on_static_pane_chrome() {
         let buffer = render(
             true,
             true,
@@ -694,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_title_uses_terminal_columns_without_overwriting_its_caps() {
+    fn a_wide_title_stays_inside_the_pane_border() {
         let area = Rect::new(0, 0, 9, 5);
         let mut buffer = Buffer::empty(area);
         render_pane(
@@ -705,20 +714,16 @@ mod tests {
             false,
             false,
             false,
-            false,
-            Duration::ZERO,
         );
 
-        assert_eq!(buffer[(1, 0)].symbol(), "▐");
-        assert_eq!(buffer[(3, 0)].symbol(), "地");
-        assert_eq!(buffer[(4, 0)].symbol(), " ");
-        assert_eq!(buffer[(5, 0)].symbol(), " ");
-        assert_eq!(buffer[(6, 0)].symbol(), "▌");
+        assert_eq!(buffer[(0, 0)].symbol(), "▟");
         assert_eq!(buffer[(8, 0)].symbol(), "▜");
+        assert_eq!(buffer[(2, 0)].symbol(), "地");
+        assert_eq!(buffer[(4, 0)].symbol(), "図");
     }
 
     #[test]
-    fn a_zwj_title_stays_whole_and_leaves_room_for_caps() {
+    fn a_zwj_title_stays_whole_and_keeps_the_pane_corners() {
         let title = "👩‍💻 map";
         assert_eq!(title_prefix_to_width(title, 2), "👩‍💻");
         assert_eq!(title_prefix_to_width(title, 1), "");
@@ -733,18 +738,15 @@ mod tests {
             false,
             false,
             false,
-            false,
-            Duration::ZERO,
         );
 
-        assert_eq!(buffer[(1, 0)].symbol(), "▐");
-        assert_eq!(buffer[(3, 0)].symbol(), "👩‍💻");
-        assert_eq!(buffer[(6, 0)].symbol(), "▌");
+        assert_eq!(buffer[(0, 0)].symbol(), "▟");
         assert_eq!(buffer[(7, 0)].symbol(), "▜");
+        assert!(row_text(&buffer, 0).contains("👩‍💻"));
     }
 
     #[test]
-    fn halfwidth_voiced_katakana_uses_ratatui_width_without_splitting_its_grapheme() {
+    fn halfwidth_voiced_katakana_stays_whole_inside_the_pane() {
         let title = "ｶﾞ map";
         assert_eq!(title_prefix_to_width(title, 1), "");
         assert_eq!(title_prefix_to_width(title, 2), "ｶﾞ");
@@ -759,49 +761,40 @@ mod tests {
             false,
             false,
             false,
-            false,
-            Duration::ZERO,
         );
 
-        assert_eq!(buffer[(1, 0)].symbol(), "▐");
-        assert_eq!(buffer[(3, 0)].symbol(), "ｶﾞ");
-        assert_eq!(buffer[(4, 0)].symbol(), " ");
-        assert_eq!(buffer[(5, 0)].symbol(), " ");
-        assert_eq!(buffer[(6, 0)].symbol(), "▌");
+        assert_eq!(buffer[(0, 0)].symbol(), "▟");
         assert_eq!(buffer[(7, 0)].symbol(), "▜");
+        assert!(row_text(&buffer, 0).contains("ｶﾞ"));
     }
 
     #[test]
-    fn the_chip_runs_the_same_colour_cycle_as_the_frame_it_sits_in() {
+    fn active_pane_chip_and_border_stay_static() {
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
-        let cycle = derived_for(theme).0;
-        let now = Duration::from_millis(533);
-        let buffer = render(true, true, now, ThemeId::CatppuccinMocha);
-        let step = cycle_step(now);
-        let perimeter = border_len(buffer.area);
-
-        for x in 2..8u16 {
-            assert_eq!(
-                buffer[(x, 0)].bg,
-                cycle.at_perimeter(step, usize::from(x), perimeter),
-                "chip cell {x} must continue the border's sequence, not restart it"
-            );
-        }
-
-        let later = render(
+        let early = render(true, true, Duration::ZERO, ThemeId::CatppuccinMocha);
+        let late = render(
             true,
             true,
             Duration::from_millis(933),
             ThemeId::CatppuccinMocha,
         );
+
         assert!(
-            buffer[(2, 0)].bg != later[(2, 0)].bg,
-            "the chip travels with the frame instead of anchoring it"
+            early
+                .content
+                .iter()
+                .zip(late.content.iter())
+                .all(|(left, right)| left.style() == right.style()),
+            "ordinary pane chrome must not move when a selection is active"
+        );
+        assert_eq!(
+            early[(0, 4)].fg,
+            contrast_safe_accent(theme, theme.surface_panel, theme.focus)
         );
     }
 
     #[test]
-    fn an_inactive_pane_is_completely_still() {
+    fn inactive_pane_is_completely_still() {
         let early = render(false, true, Duration::ZERO, ThemeId::CatppuccinMocha);
         let late = render(
             false,
@@ -815,35 +808,11 @@ mod tests {
                 .iter()
                 .zip(late.content.iter())
                 .all(|(left, right)| left.fg == right.fg && left.bg == right.bg),
-            "only the focused pane may move"
+            "all ordinary panes must remain still"
         );
         assert_eq!(
             early[(0, 0)].fg,
             Theme::for_id(ThemeId::CatppuccinMocha).border
-        );
-    }
-
-    #[test]
-    fn reduced_motion_pins_the_focused_frame_to_the_focus_accent() {
-        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
-        let early = render(true, false, Duration::ZERO, ThemeId::CatppuccinMocha);
-        let late = render(
-            true,
-            false,
-            Duration::from_millis(900),
-            ThemeId::CatppuccinMocha,
-        );
-
-        assert_eq!(early[(0, 4)].fg, derived_for(theme).0.at(0));
-        assert!(
-            early
-                .content
-                .iter()
-                .zip(late.content.iter())
-                .all(|(left, right)| {
-                    left.fg == right.fg && left.bg == right.bg && left.modifier == right.modifier
-                }),
-            "reduced-motion chrome must not advance its phase"
         );
     }
 
@@ -897,9 +866,7 @@ mod tests {
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
             false,
-            false,
             true,
-            Duration::ZERO,
         );
         assert_eq!(buffer[(0, 0)].symbol(), "+");
         assert!(
@@ -916,10 +883,8 @@ mod tests {
             "WIDE",
             PaneRenderSettings {
                 active: true,
-                animate: true,
                 presentation: PanePresentation::Ascii,
 
-                now: Duration::ZERO,
                 theme: ThemeId::CatppuccinMocha,
             },
         );
@@ -928,10 +893,8 @@ mod tests {
             "WIDE",
             PaneRenderSettings {
                 active: true,
-                animate: true,
                 presentation: PanePresentation::Ascii,
 
-                now: Duration::from_millis(933),
                 theme: ThemeId::CatppuccinMocha,
             },
         );
@@ -944,9 +907,9 @@ mod tests {
                 .all(|(left, right)| {
                     left.fg == right.fg && left.bg == right.bg && left.modifier == right.modifier
                 }),
-            "ASCII chrome must remain static even when the caller requests animation"
+            "ASCII chrome must remain static"
         );
-        assert_eq!(row_text(&early, 0), "+| W |+");
+        assert_eq!(row_text(&early, 0), "+ WID +");
         assert!(
             early.content.iter().all(|cell| cell.symbol().is_ascii()),
             "ASCII chrome emitted a non-ASCII cell"
@@ -954,40 +917,36 @@ mod tests {
     }
 
     #[test]
-    fn animated_truncated_title_chip_keeps_corners_and_its_perimeter_phase() {
+    fn static_truncated_title_chip_keeps_its_corners() {
         let area = Rect::new(4, 2, 7, 5);
-        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
-        let now = Duration::from_millis(533);
-        let cycle = derived_for(theme).0;
-        let step = cycle_step(now);
-        let perimeter = border_len(area);
-        let buffer = render_with_capabilities(
+        let early = render_with_capabilities(
             area,
             "WIDE",
             PaneRenderSettings {
                 active: true,
-                animate: true,
                 presentation: PanePresentation::Color,
-                now,
+                theme: ThemeId::CatppuccinMocha,
+            },
+        );
+        let later = render_with_capabilities(
+            area,
+            "WIDE",
+            PaneRenderSettings {
+                active: true,
+                presentation: PanePresentation::Color,
                 theme: ThemeId::CatppuccinMocha,
             },
         );
 
-        assert_eq!(row_text(&buffer, area.y), "▟▐ W ▌▜");
-        for x in (area.x + 2)..=(area.x + 4) {
-            assert_eq!(
-                buffer[(x, area.y)].bg,
-                cycle.at_perimeter(step, usize::from(x - area.x), perimeter),
-                "chip cell {x} must continue the top-border phase after truncation"
-            );
-        }
-        for x in [area.x, area.x + 1, area.x + 5, area.x + 6] {
-            assert_eq!(
-                buffer[(x, area.y)].fg,
-                cycle.at_perimeter(step, usize::from(x - area.x), perimeter),
-                "corner or cap {x} must preserve its top-border phase"
-            );
-        }
+        assert_eq!(row_text(&early, area.y), "▟ WID ▜");
+        assert!(
+            early
+                .content
+                .iter()
+                .zip(later.content.iter())
+                .all(|(left, right)| left.style() == right.style()),
+            "a truncated ordinary pane chip must stay static"
+        );
     }
 
     #[test]
@@ -1006,48 +965,39 @@ mod tests {
     }
 
     #[test]
-    fn a_non_multiple_perimeter_advances_as_one_closed_cycle() {
+    fn a_non_multiple_pane_perimeter_stays_static() {
         let area = Rect::new(0, 0, 80, 15);
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
-        let cycle = derived_for(theme).0;
-        let now = Duration::from_millis(533);
-        let step = cycle_step(now);
-        let later_now = now + Duration::from_millis(34);
-        let later_step = cycle_step(later_now);
-        let perimeter = border_len(area);
-        let mut early = Buffer::empty(area);
-        render_pane(&mut early, area, "", theme, true, true, false, false, now);
-        let mut later = Buffer::empty(area);
-        render_pane(
-            &mut later, area, "", theme, true, true, false, false, later_now,
+        let early = render_with_capabilities(
+            area,
+            "",
+            PaneRenderSettings {
+                active: true,
+                presentation: PanePresentation::Color,
+                theme: ThemeId::CatppuccinMocha,
+            },
+        );
+        let later = render_with_capabilities(
+            area,
+            "",
+            PaneRenderSettings {
+                active: true,
+                presentation: PanePresentation::Color,
+                theme: ThemeId::CatppuccinMocha,
+            },
         );
 
-        assert_eq!(
-            perimeter, 186,
-            "the fixture must not align with the 44-sample loop"
-        );
-        assert_ne!(step, later_step, "the fixture must cross an animation tick");
-        walk_border(area, |x, y, index| {
-            assert_eq!(
-                early[(x, y)].fg,
-                cycle.at_perimeter(step, index, perimeter),
-                "early phase restarted at border position {index}"
-            );
-            assert_eq!(
-                later[(x, y)].fg,
-                cycle.at_perimeter(later_step, index, perimeter),
-                "later phase restarted at border position {index}"
-            );
-        });
-        assert_ne!(
-            early[(0, 0)].fg,
-            later[(0, 0)].fg,
-            "the moving phase must visibly advance at the start of the perimeter"
+        assert!(
+            early
+                .content
+                .iter()
+                .zip(later.content.iter())
+                .all(|(left, right)| left.style() == right.style()),
+            "an ordinary pane perimeter must not advance with time"
         );
         assert_eq!(
-            cycle.at_perimeter(step, perimeter, perimeter),
             early[(0, 0)].fg,
-            "the virtual cell after the perimeter must join the first"
+            contrast_safe_accent(theme, theme.surface_panel, theme.focus)
         );
     }
 
@@ -1256,29 +1206,25 @@ mod tests {
     }
 
     #[test]
-    fn static_light_theme_chips_use_the_strongest_available_ink() {
+    fn exabind_style_title_uses_a_reversed_border_accent_in_light_themes() {
         let theme = Theme::for_id(ThemeId::ExciseLight);
         let buffer = render(false, false, Duration::ZERO, ThemeId::ExciseLight);
-        let base_contrast = contrast_ratio(theme.border, theme.surface_base).expect("truecolour");
-        let primary_contrast =
-            contrast_ratio(theme.border, theme.text_primary).expect("truecolour");
+        let chip = &buffer[(2, 0)];
 
-        assert!(base_contrast > primary_contrast);
-        assert_eq!(buffer[(2, 0)].fg, theme.surface_base);
+        assert_eq!(chip.fg, theme.border);
+        assert_eq!(chip.bg, theme.surface_panel);
+        assert!(chip.modifier.contains(Modifier::BOLD | Modifier::REVERSED));
     }
 
     #[test]
-    fn sub_floor_latte_static_chips_use_a_neutral_title_ink() {
+    fn exabind_style_title_keeps_its_border_accent_without_neutral_substitution() {
         let theme = Theme::for_id(ThemeId::CatppuccinLatte);
-        let semantic_inks = [theme.text_primary, theme.surface_base];
-        assert!(semantic_inks.into_iter().all(|ink| {
-            contrast_ratio(theme.border, ink).expect("truecolour") < TITLE_CHIP_CONTRAST_FLOOR
-        }));
-
         let buffer = render(false, false, Duration::ZERO, ThemeId::CatppuccinLatte);
         let chip = &buffer[(2, 0)];
-        assert_eq!(chip.fg, Color::Rgb(u8::MAX, u8::MAX, u8::MAX));
-        assert!(contrast_ratio(chip.bg, chip.fg).expect("truecolour") >= TITLE_CHIP_CONTRAST_FLOOR);
+
+        assert_eq!(chip.fg, theme.border);
+        assert_eq!(chip.bg, theme.surface_panel);
+        assert!(chip.modifier.contains(Modifier::BOLD | Modifier::REVERSED));
     }
 
     #[test]
@@ -1308,17 +1254,7 @@ mod tests {
         let theme = Theme::for_id(ThemeId::CatppuccinMocha);
         let area = Rect::new(0, 0, 20, 5);
         let mut pane = Buffer::empty(area);
-        render_pane(
-            &mut pane,
-            area,
-            "PANE",
-            theme,
-            false,
-            false,
-            false,
-            false,
-            Duration::ZERO,
-        );
+        render_pane(&mut pane, area, "PANE", theme, false, false, false);
         assert_eq!(pane[(1, 0)].bg, theme.surface_panel);
         assert_eq!(pane[(8, 0)].bg, theme.surface_panel);
 
