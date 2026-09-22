@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/findyourexit/excise/schemas/scan-report-v1.json",
-  "title": "Excise scan-report v1",
+  "$id": "https://github.com/findyourexit/excise/schemas/scan-report-v3.json",
+  "title": "Excise scan-report v3",
   "type": "object",
   "required": [
     "document_kind",
@@ -16,7 +16,7 @@
   "additionalProperties": false,
   "properties": {
     "document_kind": { "const": "scan-report" },
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 3 },
     "root": { "$ref": "https://github.com/findyourexit/excise/schemas/native-path-v1.json" },
     "display_root": { "type": "string" },
     "state": { "$ref": "#/$defs/scan_state" },
@@ -110,7 +110,7 @@
       }
     },
     "scan_state": {
-      "enum": ["exact", "uncertain", "cancelled"]
+      "enum": ["exact", "uncertain", "summary-only", "cancelled"]
     },
     "node_state": {
       "enum": ["scanning", "complete", "aggregated", "uncertain"]
@@ -159,9 +159,8 @@
         "deletion_missing_entries",
         "deletion_failed_entries",
         "deletion_unattempted_entries",
-        "model_bytes",
-        "model_limit_bytes",
-        "identity_spilled",
+        "scan_store_bytes",
+        "scan_store_limit_bytes",
         "last_unreadable_path",
         "last_unscanned_path",
         "last_unscanned_reason",
@@ -181,9 +180,8 @@
         "deletion_missing_entries": { "$ref": "#/$defs/unsigned" },
         "deletion_failed_entries": { "$ref": "#/$defs/unsigned" },
         "deletion_unattempted_entries": { "$ref": "#/$defs/unsigned" },
-        "model_bytes": { "$ref": "#/$defs/unsigned" },
-        "model_limit_bytes": { "$ref": "#/$defs/unsigned" },
-        "identity_spilled": { "type": "boolean" },
+        "scan_store_bytes": { "$ref": "#/$defs/unsigned" },
+        "scan_store_limit_bytes": { "$ref": "#/$defs/unsigned" },
         "last_unreadable_path": { "type": ["string", "null"] },
         "last_unscanned_path": { "type": ["string", "null"] },
         "last_unscanned_reason": { "type": ["string", "null"] },

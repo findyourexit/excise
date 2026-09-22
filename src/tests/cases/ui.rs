@@ -305,6 +305,7 @@ fn normalize_snapshot(frame: &str) -> String {
             metric_value_range(&line, "Can reclaim "),
             metric_value_range(&line, "Used "),
             metric_value_range(&line, "Reclaim "),
+            metric_value_range(&line, "store "),
             deletion_progress_range(&line),
         ];
         let mut in_identity_or_links_number = false;
@@ -388,6 +389,18 @@ fn user_facing_allocated_space_metrics_are_normalized() {
         normalize_snapshot(rendered),
         " Space used ###.#K · Can reclaim ###.#K\n Used ###.#K · Reclaim ###.#K"
     );
+}
+
+/// Scratch-store encodings can use different native component widths while
+/// representing the same scan, so frame snapshots retain the status without
+/// pinning its physical byte count.
+#[test]
+fn scan_store_usage_is_normalized() {
+    let unix = "store 19.1K/4.0G";
+    let windows = "store 20.1K/4.0G";
+
+    assert_eq!(normalize_snapshot(unix), normalize_snapshot(windows));
+    assert_eq!(normalize_snapshot(unix), "store ##.#K/#.#G");
 }
 
 /// ASCII overlays reuse the map's shades and grain, so they must end an

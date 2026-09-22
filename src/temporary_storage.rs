@@ -114,9 +114,14 @@ fn scratch_volume_available_bytes(scratch: &Path) -> io::Result<u64> {
     disks
         .list()
         .iter()
-        .filter(|disk| scratch.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().components().count())
-        .map(sysinfo::Disk::available_space)
+        .filter_map(|disk| {
+            std::fs::canonicalize(disk.mount_point())
+                .ok()
+                .filter(|mount| scratch.starts_with(mount))
+                .map(|mount| (disk, mount))
+        })
+        .max_by_key(|(_, mount)| mount.components().count())
+        .map(|(disk, _)| disk.available_space())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -450,6 +455,12 @@ mod tests {
     fn scan_store_quota_never_exceeds_scratch_volume_capacity() {
         assert_eq!(scan_store_limit_bytes(8 * MIB, 3 * MIB), 3 * MIB);
         assert_eq!(scan_store_limit_bytes(2 * MIB, 3 * MIB), 2 * MIB);
+    }
+    #[test]
+    fn scan_store_scratch_volume_is_discoverable() {
+        let scratch = tempfile::tempdir().expect("scratch directory should exist");
+        scratch_volume_available_bytes(scratch.path())
+            .expect("scratch directory should resolve to a mounted volume");
     }
 
     #[test]

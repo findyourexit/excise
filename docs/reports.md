@@ -1,6 +1,6 @@
 # Reports & JSON Formats
 
-Excise produces bounded reports. When a scan is uncertain or the interface has grouped entries that no longer fit in memory, the report says so instead of claiming a complete inventory.
+Excise produces bounded reports. When a scan is uncertain, or capacity prevents retaining a navigable map, the report says so instead of claiming a complete inventory.
 
 ## Table Output
 
@@ -19,11 +19,15 @@ excise --format json --output scan.json /path/to/inspect
 
 JSON uses named document types and stable version numbers. The published Draft 2020-12 formats are:
 
-- [`scan-report` version 1](schemas/scan-report.schema.json)
+- [`scan-report` version 3](schemas/scan-report.schema.json)
 - [`deletion-history` version 1](schemas/deletion-history.schema.json)
 - [`native-path` version 1](schemas/native-path.schema.json)
 
+`scan-report` version 3 reports `scan_store_bytes` and `scan_store_limit_bytes` in its summary. They describe the private canonical scan-store reservation at the terminal state; they are not file-system space totals or process-memory measurements.
+
+
 An unknown upper bound is `null`. Excise never replaces it with an apparent file length. `Shared`, `Other`, and other summary records have explicit types and cannot be deletion targets.
+A `summary-only` scan report means the scan-store capacity was reached. It preserves transport counts and terminal status, but deliberately contains no navigable inventory; rerun with a larger `--scan-store-mib` value.
 
 ## Interactive Exports
 

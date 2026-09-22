@@ -1,5 +1,5 @@
 [workspace]
-members = ["excise-core", "xtask"]
+members = ["xtask"]
 exclude = ["fuzz"]
 resolver = "3"
 
@@ -55,7 +55,6 @@ name = "core"
 harness = false
 required-features = ["internal"]
 [dependencies]
-excise-core = { version = "0.1.0", path = "excise-core" }
 
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "std"] }
 crossterm = "0.29"

@@ -764,7 +764,6 @@ dependencies = [
  "crossbeam-channel",
  "crossterm",
  "directories",
- "excise-core",
  "file-id",
  "filesize",
  "getrandom 0.4.3",
@@ -789,13 +788,6 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "excise-core"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.4.3",
 ]
 
 [[package]]

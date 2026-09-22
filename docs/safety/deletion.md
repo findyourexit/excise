@@ -62,7 +62,7 @@ No key silently detaches a mutation worker or claims that a blocked filesystem o
 
 ## Result
 
-Normal completion and soft cancellation report every planned identity as deleted, changed, missing, failed, or unattempted through bounded resident or authenticated outcome-spill storage. Session history has a fixed memory limit and writes directly to the versioned `deletion-history` format. If outcome storage fails after consent, Excise starts no further entries, returns an explicit incomplete result, and requires a focused rescan rather than materializing an unbounded report.
+Normal completion and soft cancellation report every planned identity as deleted, changed, missing, failed, or unattempted through bounded resident or authenticated outcome-spill storage. Session history has a fixed memory limit and writes directly to the versioned `deletion-history` format. If outcome storage fails after consent, Excise starts no further entries, returns an explicit incomplete result, and schedules a root generation rebuild rather than materializing an unbounded report.
 
 ## Required Evidence
 
