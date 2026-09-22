@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::model::ByteBounds;
+use crate::model::{ByteBounds, EntrySnapshot};
 use crate::scan_coordinator::RelativePath;
 
 /// Scanner-facing kind for a canonical path observation.
@@ -87,6 +87,7 @@ pub(crate) struct PathObservation {
     pub(crate) kind: PathEntryKind,
     pub(crate) metrics: SummaryMetrics,
     pub(crate) coverage: Coverage,
+    pub(crate) snapshot: Option<EntrySnapshot>,
 }
 
 impl PathObservation {
@@ -102,6 +103,24 @@ impl PathObservation {
             kind,
             metrics,
             coverage,
+            snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_snapshot(
+        path: RelativePath,
+        kind: PathEntryKind,
+        metrics: SummaryMetrics,
+        coverage: Coverage,
+        snapshot: Option<EntrySnapshot>,
+    ) -> Self {
+        Self {
+            path,
+            kind,
+            metrics,
+            coverage,
+            snapshot,
         }
     }
 }

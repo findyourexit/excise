@@ -819,6 +819,7 @@ where
         if !focused {
             self.scan_view_dirty |= path.is_some_and(|path| path.starts_with(&self.scan_view_root));
         }
+        self.app.record_scan_store_failure();
         let message = safe_display_text(message);
         self.summary.unscanned_entries = self.summary.unscanned_entries.saturating_add(1);
         self.summary.unreadable_entries = self.summary.unreadable_entries.saturating_add(1);

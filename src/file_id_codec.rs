@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::mem::size_of;
 
 use file_id::FileId;
@@ -16,20 +17,29 @@ pub(crate) enum FileIdCodecError {
 /// Encodes a file identity without JSON allocation or platform-dependent text.
 #[must_use]
 pub(crate) fn encode_file_id(file_id: &FileId) -> Vec<u8> {
-    let mut encoded = Vec::new();
-    encode_file_id_into(file_id, &mut encoded);
+    let mut encoded = Vec::with_capacity(file_id_encoded_bytes(file_id));
+    append_file_id(file_id, &mut encoded);
     encoded
 }
 
 /// Reuses `encoded` for one canonical file identity.
 pub(crate) fn encode_file_id_into(file_id: &FileId, encoded: &mut Vec<u8>) {
     encoded.clear();
+    append_file_id(file_id, encoded);
+}
+
+/// Appends one canonical file identity to an existing record value.
+pub(crate) fn append_file_id(file_id: &FileId, encoded: &mut Vec<u8>) {
+    let required = file_id_encoded_bytes(file_id);
+    let available = encoded.capacity().saturating_sub(encoded.len());
+    if available < required {
+        encoded.reserve(required.saturating_sub(available));
+    }
     match *file_id {
         FileId::Inode {
             device_id,
             inode_number,
         } => {
-            encoded.reserve(1 + 2 * size_of::<u64>());
             encoded.push(INODE_TAG);
             encoded.extend_from_slice(&device_id.to_le_bytes());
             encoded.extend_from_slice(&inode_number.to_le_bytes());
@@ -38,7 +48,6 @@ pub(crate) fn encode_file_id_into(file_id: &FileId, encoded: &mut Vec<u8>) {
             volume_serial_number,
             file_index,
         } => {
-            encoded.reserve(1 + size_of::<u32>() + size_of::<u64>());
             encoded.push(LOW_RES_TAG);
             encoded.extend_from_slice(&volume_serial_number.to_le_bytes());
             encoded.extend_from_slice(&file_index.to_le_bytes());
@@ -47,11 +56,77 @@ pub(crate) fn encode_file_id_into(file_id: &FileId, encoded: &mut Vec<u8>) {
             volume_serial_number,
             file_id,
         } => {
-            encoded.reserve(1 + size_of::<u64>() + size_of::<u128>());
             encoded.push(HIGH_RES_TAG);
             encoded.extend_from_slice(&volume_serial_number.to_le_bytes());
             encoded.extend_from_slice(&file_id.to_le_bytes());
         }
+    }
+}
+
+const fn file_id_encoded_bytes(file_id: &FileId) -> usize {
+    match file_id {
+        FileId::Inode { .. } => 1 + 2 * size_of::<u64>(),
+        FileId::LowRes { .. } => 1 + size_of::<u32>() + size_of::<u64>(),
+        FileId::HighRes { .. } => 1 + size_of::<u64>() + size_of::<u128>(),
+    }
+}
+
+/// Compares identities in the exact order used by their canonical byte keys.
+#[must_use]
+pub(crate) fn compare_file_ids_by_encoding(left: &FileId, right: &FileId) -> Ordering {
+    let tag_order = file_id_tag(left).cmp(&file_id_tag(right));
+    if tag_order != Ordering::Equal {
+        return tag_order;
+    }
+    match (left, right) {
+        (
+            FileId::Inode {
+                device_id: left_device,
+                inode_number: left_inode,
+            },
+            FileId::Inode {
+                device_id: right_device,
+                inode_number: right_inode,
+            },
+        ) => left_device
+            .to_le_bytes()
+            .cmp(&right_device.to_le_bytes())
+            .then_with(|| left_inode.to_le_bytes().cmp(&right_inode.to_le_bytes())),
+        (
+            FileId::LowRes {
+                volume_serial_number: left_volume,
+                file_index: left_index,
+            },
+            FileId::LowRes {
+                volume_serial_number: right_volume,
+                file_index: right_index,
+            },
+        ) => left_volume
+            .to_le_bytes()
+            .cmp(&right_volume.to_le_bytes())
+            .then_with(|| left_index.to_le_bytes().cmp(&right_index.to_le_bytes())),
+        (
+            FileId::HighRes {
+                volume_serial_number: left_volume,
+                file_id: left_id,
+            },
+            FileId::HighRes {
+                volume_serial_number: right_volume,
+                file_id: right_id,
+            },
+        ) => left_volume
+            .to_le_bytes()
+            .cmp(&right_volume.to_le_bytes())
+            .then_with(|| left_id.to_le_bytes().cmp(&right_id.to_le_bytes())),
+        _ => unreachable!("equal canonical tags select one file identity variant"),
+    }
+}
+
+const fn file_id_tag(file_id: &FileId) -> u8 {
+    match file_id {
+        FileId::Inode { .. } => INODE_TAG,
+        FileId::LowRes { .. } => LOW_RES_TAG,
+        FileId::HighRes { .. } => HIGH_RES_TAG,
     }
 }
 
@@ -147,6 +222,24 @@ mod tests {
             (file_id, identity_bytes)
         );
         assert_eq!(decode_file_id(&encoded), Err(FileIdCodecError::Malformed));
+    }
+
+    #[test]
+    fn file_identity_order_matches_encoded_key_order() {
+        let identities = [
+            FileId::new_inode(1, 2),
+            FileId::new_inode(256, 1),
+            FileId::new_low_res(3, 4),
+            FileId::new_high_res(5, 6),
+        ];
+        for left in &identities {
+            for right in &identities {
+                assert_eq!(
+                    compare_file_ids_by_encoding(left, right),
+                    encode_file_id(left).cmp(&encode_file_id(right))
+                );
+            }
+        }
     }
 
     #[test]

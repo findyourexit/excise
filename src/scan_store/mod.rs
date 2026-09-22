@@ -6,6 +6,7 @@
 pub(crate) mod directory_summary;
 pub(crate) mod identity_observation;
 pub(crate) mod manifest;
+pub(crate) mod page;
 pub(crate) mod path_key;
 pub(crate) mod path_observation;
 pub(crate) mod path_reducer;

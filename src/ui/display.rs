@@ -20,7 +20,7 @@ use crate::os::is_user_admin;
 use crate::state::deletion_work::{
     DeletionWork, MAX_DELETION_WORK_ITEMS, WorkRailItem, WorkRailStatus,
 };
-use crate::state::files::FileTree;
+use crate::state::files::tree_view::TreeView;
 use crate::state::tiles::{Board, FileType, Tile};
 use crate::state::{DeletionDeparture, UiEffects};
 use crate::theme::Theme;
@@ -82,9 +82,9 @@ where
         clippy::too_many_lines,
         reason = "rendering needs the complete runtime presentation state in one atomic frame"
     )]
-    pub fn render(
+    pub(crate) fn render(
         &mut self,
-        file_tree: &FileTree,
+        file_tree: &dyn TreeView,
         board: &mut Board,
         ui_mode: &UiMode,
         ui_effects: &UiEffects,
@@ -149,7 +149,7 @@ where
                     );
                     debug_assert_eq!(workspace, rendered_workspace);
                     let show_empty_label = file_tree.current_node().state == NodeState::Complete
-                        && file_tree.filter().is_none();
+                        && !file_tree.has_filter();
                     let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. });
                     let scan = scan_presentation(ui_mode, ui_effects, board, now, animate_loading);
                     let animate_deletion_checker = !ascii
@@ -570,7 +570,7 @@ fn render_safety_banner(
 }
 
 struct InstrumentHeader<'a> {
-    file_tree: &'a FileTree,
+    file_tree: &'a dyn TreeView,
     ui_mode: &'a UiMode,
     theme: Theme,
     ascii: bool,
@@ -1093,7 +1093,7 @@ fn inspection_reason_with_value(prefix: &str, value: &str) -> SafeDisplayPath {
 fn render_inspector(
     buffer: &mut Buffer,
     area: Rect,
-    file_tree: &FileTree,
+    file_tree: &dyn TreeView,
     board: &Board,
     ui_mode: &UiMode,
     theme: Theme,
@@ -1114,7 +1114,7 @@ fn render_inspector(
 fn render_inspector_with_work(
     buffer: &mut Buffer,
     area: Rect,
-    file_tree: &FileTree,
+    file_tree: &dyn TreeView,
     board: &Board,
     deletion_work: Option<&DeletionWork>,
     ui_effects: Option<&UiEffects>,
@@ -1367,7 +1367,7 @@ fn render_inspector_with_work(
     reason = "header status must evaluate runtime, safety, and storage state without precedence loss"
 )]
 fn header_status_line(
-    file_tree: &FileTree,
+    file_tree: &dyn TreeView,
     board: &Board,
     ui_mode: &UiMode,
     ui_effects: &UiEffects,
@@ -1438,8 +1438,8 @@ fn header_status_line(
         mode_status.or(deletion_status)
     })
     .or_else(|| {
-        (file_tree.failed_to_read > 0)
-            .then(|| format!("? {} entries could not be read", file_tree.failed_to_read))
+        (file_tree.failed_to_read() > 0)
+            .then(|| format!("? {} entries could not be read", file_tree.failed_to_read()))
     })
     .or_else(|| {
         board.overflow().is_some().then(|| {
@@ -1886,6 +1886,7 @@ mod tests {
 
     use crate::model::{MIN_PROCESS_MIB, NodeId};
     use crate::native_path::identity_for;
+    use crate::state::files::FileTree;
     use crate::theme::ThemeId;
 
     use super::*;
