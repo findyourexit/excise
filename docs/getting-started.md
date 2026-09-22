@@ -100,7 +100,10 @@ The interactive interface requires standard input and output connected to a term
 
 ### Current Map Behavior
 
-The interactive view uses a dense map with static workspace frames and padded title tabs, a travelling foreground gradient along the selected map entry's edge, and animated modal borders on capable truecolour terminals. Modal content and title chip stay still while only its border moves. Scan, deletion, and model status appear in the header; the bottom row is dedicated to visually distinct control keys and their hints. `--ascii`, monochrome mode, high-contrast themes, and reduced motion preserve the same selection, scope, and deletion information with static output.
+The interactive view uses a dense map with static workspace frames and padded title tabs. A selected map entry has a travelling contour with bright top and left faces, dim bottom and right faces, and a midpoint animated fill that preserves the entry's depth. Animated modal borders use the same truecolour-only treatment. Scan, deletion, and model status appear in the header; the bottom row is dedicated to visually distinct control keys and their hints. `--ascii`, monochrome mode, high-contrast themes, and reduced motion preserve the same selection, scope, and deletion information with static output.
+Before measured tiles are available, the map shows a full-surface scan field with the actual number of indexed entries rather than a guessed percentage. Its measuring front becomes a directional reveal when the first tile layout is ready.
+When motion is available, its cadence is maintained independently of scanner batches so sustained scans do not interrupt the field.
+Opening a summarized directory enters this scan field before its staging model is prepared. Capacity preparation yields between frames, and `Esc` can still cancel the focused refresh.
 
 Press `t` in the normal view, while scanning, or during a focused refresh to preview the theme list. Arrow keys or `j`/`k` move the preview; `Enter` immediately saves the selected theme for later TUI sessions, while `Esc` restores the prior theme.
 

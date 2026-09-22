@@ -24,6 +24,17 @@ struct RescanStage {
     filter: Option<FilterPattern>,
     filter_root: Option<PathBuf>,
 }
+
+/// The UI owns this while it exposes the scan field. One cold subtree is
+/// compacted per owner-loop turn before the bounded stage can be allocated.
+struct RescanPreparation {
+    target_id: NodeId,
+    target: PathBuf,
+    filter: Option<FilterPattern>,
+    filter_root: Option<PathBuf>,
+    desired_stage_bytes: usize,
+    pinned: HashSet<NodeId>,
+}
 const MAX_STALE_SCAN_PREFIXES: usize = 32;
 const MIN_FOCUSED_SCAN_MODEL_BYTES: usize = 8 * 1024 * 1024;
 
@@ -38,6 +49,7 @@ pub struct FileTree {
     filter: Option<FilterPattern>,
     filter_root: Option<PathBuf>,
     rescan: Option<RescanStage>,
+    rescan_preparation: Option<RescanPreparation>,
     /// Prefixes removed while the primary scanner may still emit stale entries.
     stale_scan_prefixes: Vec<PathBuf>,
 }
@@ -79,6 +91,7 @@ impl FileTree {
             filter: None,
             filter_root: None,
             rescan: None,
+            rescan_preparation: None,
             stale_scan_prefixes: Vec::with_capacity(MAX_STALE_SCAN_PREFIXES),
         })
     }
@@ -713,12 +726,33 @@ impl FileTree {
         self.filter.as_ref()
     }
 
+    /// Starts a synchronous focused rescan stage for noninteractive callers.
+    /// The interactive owner uses [`Self::begin_rescan_preparation`] and advances
+    /// the compaction incrementally so its loading surface remains responsive.
     pub fn begin_rescan(
         &mut self,
         target: PathBuf,
         filter: Option<FilterPattern>,
     ) -> Result<(), ModelError> {
-        if self.rescan.is_some() {
+        self.begin_rescan_preparation(target, filter)?;
+        loop {
+            match self.advance_rescan_preparation() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    self.rescan_preparation = None;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn begin_rescan_preparation(
+        &mut self,
+        target: PathBuf,
+        filter: Option<FilterPattern>,
+    ) -> Result<(), ModelError> {
+        if self.rescan.is_some() || self.rescan_preparation.is_some() {
             return Err(ModelError::Invariant(
                 "focused rescan is already active".to_string(),
             ));
@@ -743,30 +777,63 @@ impl FileTree {
             .min(self.arena.memory_limit());
         let mut pinned = self.pinned_nodes();
         pinned.insert(target_id);
-        while self
-            .arena
-            .memory_limit()
-            .saturating_sub(self.arena.memory_used())
-            < desired_stage_bytes
-        {
-            if !self.arena.aggregate_cold_subtree(&pinned)? {
-                break;
-            }
-        }
+        self.rescan_preparation = Some(RescanPreparation {
+            target_id,
+            target,
+            filter,
+            filter_root,
+            desired_stage_bytes,
+            pinned,
+        });
+        Ok(())
+    }
+
+    /// Compacts at most one cold subtree and reports when focused scan input may start.
+    pub(crate) fn advance_rescan_preparation(&mut self) -> Result<bool, ModelError> {
+        let preparation = self.rescan_preparation.as_ref().ok_or_else(|| {
+            ModelError::Invariant("focused rescan preparation is not active".to_string())
+        })?;
         let remaining = self
             .arena
             .memory_limit()
             .saturating_sub(self.arena.memory_used());
-        let budget = MemoryBudget::from_model_limit(remaining)?;
-        let stage =
-            Arena::new_with_temporary_storage(target, budget, self.arena.temporary_storage())?;
-        self.rescan = Some(RescanStage {
-            target_id,
-            arena: stage,
-            filter,
-            filter_root,
-        });
-        Ok(())
+        if remaining < preparation.desired_stage_bytes
+            && self.arena.aggregate_cold_subtree(&preparation.pinned)?
+        {
+            return Ok(false);
+        }
+
+        let remaining = self
+            .arena
+            .memory_limit()
+            .saturating_sub(self.arena.memory_used());
+        let preparation = self
+            .rescan_preparation
+            .take()
+            .expect("rescan preparation was checked above");
+        let stage = (|| {
+            let budget = MemoryBudget::from_model_limit(remaining)?;
+            Arena::new_with_temporary_storage(
+                preparation.target.clone(),
+                budget,
+                self.arena.temporary_storage(),
+            )
+        })();
+        match stage {
+            Ok(arena) => {
+                self.rescan = Some(RescanStage {
+                    target_id: preparation.target_id,
+                    arena,
+                    filter: preparation.filter,
+                    filter_root: preparation.filter_root,
+                });
+                Ok(true)
+            }
+            Err(error) => {
+                self.rescan_preparation = Some(preparation);
+                Err(error)
+            }
+        }
     }
 
     pub fn finish_rescan(&mut self) -> Result<(), ModelError> {
@@ -783,7 +850,7 @@ impl FileTree {
     }
 
     pub fn cancel_rescan(&mut self) -> Result<(), ModelError> {
-        if self.rescan.take().is_none() {
+        if self.rescan.take().is_none() && self.rescan_preparation.take().is_none() {
             return Err(ModelError::Invariant(
                 "focused rescan is not active".to_string(),
             ));
@@ -815,7 +882,7 @@ impl FileTree {
     }
 
     pub fn increment_failed_to_read(&mut self) {
-        if self.rescan.is_none() {
+        if self.rescan.is_none() && self.rescan_preparation.is_none() {
             self.failed_to_read = self.failed_to_read.saturating_add(1);
         }
     }
@@ -1256,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_rescan_reclaims_a_cold_sibling_for_visible_exploration() {
+    fn focused_rescan_preparation_yields_after_one_cold_subtree() {
         let root = tempfile::tempdir().expect("rescan root should exist");
         let target = root.path().join("target");
         let target_child = target.join("target-child");
@@ -1294,12 +1361,25 @@ mod tests {
             .consume_remaining_budget_for_test()
             .expect("fixture should fill its model budget");
 
-        tree.begin_rescan(target, None)
-            .expect("visible target should reclaim room from a cold sibling");
+        tree.begin_rescan_preparation(target, None)
+            .expect("visible target should begin staging preparation");
+        assert_eq!(tree.node_kind(cold_id), Some(NodeKind::Directory));
+        assert!(
+            !tree
+                .advance_rescan_preparation()
+                .expect("one cold subtree should compact cleanly"),
+            "preparation must return to the owner loop after one compaction"
+        );
         assert_eq!(
             tree.node_kind(cold_id),
             Some(NodeKind::Synthetic(SyntheticKind::Aggregate))
         );
+        assert!(tree.rescan.is_none());
+        assert!(tree.rescan_preparation.is_some());
+        while !tree
+            .advance_rescan_preparation()
+            .expect("remaining preparation should complete")
+        {}
         tree.cancel_rescan().expect("fixture stage should clean up");
     }
 

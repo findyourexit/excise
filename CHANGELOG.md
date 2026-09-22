@@ -12,10 +12,12 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 * Moved deletion planning, refresh, queueing, progress, and results into a bounded background work rail. Accepted confirmation returns to the map, and a backed summarized folder is freshly materialized before it can re-enter the ordinary review flow.
 * Made pending and active deletion exit choices explicit, restored a valid map selection after reconciliation, and clarified virtual-summary and scan-state guidance.
 * Added frame-only modal attention chrome on capable terminals while keeping reduced-motion, ASCII, monochrome, and high-contrast output static.
+* Replaced the dotted empty scan map with a theme-native measuring field, a truthful indexed-entry counter, and a directional reveal into the first measured tiles.
 
 * Changed storage-map colour scaling from per-folder relative rank to fixed absolute size landmarks: blue through red from 4 KiB to 64 GiB, using the selected allocated-space or apparent-size measure.
 * Kept workspace pane frames static, moved their title chips to a reversed-accent treatment, and made only dialog chrome run a truecolour TachyonFX perimeter cycle.
 * Added a travelling gradient to the selected tree-map entry's dimensional edge, preserving its size colour and depth while making the cursor unambiguous.
+* Reworked selected tree-map entries into a full dimensional contour: bright animated top and left faces, dim animated bottom and right faces, and a midpoint animated fill.
 * Moved scan, model, and deletion status plus model-memory usage into the header; the bottom row now contains only visually distinct control keys and their hints.
 * Removed the visually awkward synthetic trailing title cap; the padded tab now ends cleanly at the top rule.
 
@@ -25,6 +27,9 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 * Scans no longer terminate when a spilled identity database reaches its temporary-storage limit during later identity reads. Excise releases the private cache and finishes with explicit uncertain allocation and reclaimability bounds.
 * Split paired truecolour foreground/background terminal commands before output, preventing renderers that parse only the foreground from displaying the `48;2;…m` tail inside an animated map.
 * Focused rescans now remain quiet navigation work: returning from or cancelling one no longer flashes the header completion colour.
+* Kept the scan field's animation clock independent of busy scanner batches, preventing its visual front from pausing while results are applied.
+* Focused rescans now enter their scan field before reclaiming staging capacity, compacting one cold subtree per owner turn instead of blocking the activating keypress.
+* Completed selected map perimeter traversal across both terminal half-rows, restoring the bottom edge and continuous left and right animation.
 
 ## [1.2.4] - 2026-09-12
 

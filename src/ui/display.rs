@@ -29,7 +29,7 @@ use crate::ui::format::{
     DECEPTIVE_DISPLAY_MARKER, DisplaySize, display_os_str_middle, display_path_info,
     display_path_middle, display_text, display_text_info, truncate_marked, truncate_middle,
 };
-use crate::ui::grid::{DenseRectangleGrid, MapLayout};
+use crate::ui::grid::{DenseRectangleGrid, MapLayout, ScanVisual};
 use crate::ui::modals::{
     ConfirmBox, DeletionSafety, ErrorBox, HelpBox, MessageBox, NoticeBox, ThemePicker, WarningBox,
 };
@@ -100,6 +100,7 @@ where
         mouse_enabled: bool,
         reduced_guardrails: bool,
         reduced_motion: bool,
+        animate_loading: bool,
     ) -> Result<(), AppError> {
         let requires_legacy_theme_normalization = theme_requires_legacy_normalization(theme);
         self.terminal
@@ -136,6 +137,7 @@ where
                     let workspace = workspace_content_area(workspace_area);
                     board.change_area(workspace);
                     board.advance_geometry(now, reduced_motion);
+                    board.advance_scan_reveal(now, animate_loading);
                     let rendered_workspace = render_pane(
                         frame.buffer_mut(),
                         workspace_area,
@@ -149,6 +151,7 @@ where
                     let show_empty_label = file_tree.current_node().state == NodeState::Complete
                         && file_tree.filter().is_none();
                     let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. });
+                    let scan = scan_presentation(ui_mode, ui_effects, board, now, animate_loading);
                     let animate_deletion_checker = !ascii
                         && !monochrome
                         && !reduced_motion
@@ -174,7 +177,7 @@ where
                                     board,
                                     deletion_work,
                                     show_empty_label,
-                                    scanning,
+                                    scan,
                                     deletion_departure,
                                     now,
                                     animate_deletion_checker,
@@ -497,7 +500,7 @@ fn map_layout<'a>(
     board: &'a Board,
     deletion_work: &'a DeletionWork,
     show_empty_label: bool,
-    scanning: bool,
+    scan: Option<ScanVisual>,
     deletion_departure: Option<&'a DeletionDeparture>,
     now: Duration,
     animate_deletion_checker: bool,
@@ -509,12 +512,30 @@ fn map_layout<'a>(
         selected_rect_index: board.selected_index,
         transitioning: board.is_transitioning(),
         show_empty_label,
-        scanning,
+        scan,
         deletion_work: Some(deletion_work),
         deletion_departure,
         now,
         animate_deletion_checker,
     }
+}
+
+fn scan_presentation(
+    ui_mode: &UiMode,
+    ui_effects: &UiEffects,
+    board: &Board,
+    now: Duration,
+    animated: bool,
+) -> Option<ScanVisual> {
+    let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. });
+    let reveal_progress = board.scan_reveal_progress(now);
+    (scanning || reveal_progress.is_some()).then_some(ScanVisual {
+        scanning,
+        rescanning: matches!(ui_mode, UiMode::Rescanning { .. }),
+        entries_indexed: ui_effects.loading_entries_indexed,
+        animated,
+        reveal_progress,
+    })
 }
 
 /// The band effects are allowed to touch: the header, and nothing else.
@@ -1921,6 +1942,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             )
             .expect("display should render");
 
@@ -1980,7 +2002,7 @@ mod tests {
                 &board,
                 &DeletionWork::new(),
                 true,
-                false,
+                None,
                 None,
                 Duration::ZERO,
                 false,
@@ -2535,6 +2557,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             )
             .expect("display should render");
 
@@ -2586,6 +2609,7 @@ mod tests {
                 false,
                 KeyPreset::Vim,
                 None,
+                false,
                 false,
                 false,
                 false,

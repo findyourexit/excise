@@ -53,6 +53,14 @@ fn launches_renders_accepts_input_and_restores_terminal() -> anyhow::Result<()> 
     if !status.success() {
         bail!("Excise exited unsuccessfully: {status}; captured {output:?}");
     }
+    assert!(
+        output.contains("SCANNING FOLDER"),
+        "the initial TUI frame must present the scan field; captured {output:?}"
+    );
+    assert!(
+        output.contains("MATERIALIZING MAP"),
+        "the first measured layout must emerge through the scan field; captured {output:?}"
+    );
     let metrics = metrics.context("normal run did not record PTY metrics")?;
     if std::env::var_os("EXCISE_PTY_BUDGETS").is_some() {
         assert!(
@@ -270,6 +278,7 @@ fn pty_command(root: &std::path::Path, injected_failure: Option<&str>) -> Comman
     command.arg(root);
     command.cwd(root);
     command.env("TERM", "xterm-256color");
+    command.env_remove("NO_COLOR");
     if std::env::consts::OS == "windows" {
         command.env("EXCISE_PTY_TEST_MARKERS", "1");
     }

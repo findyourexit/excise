@@ -174,6 +174,8 @@ where
     custom_keys: Option<CustomKeyBindings>,
     mouse_enabled: bool,
     dirty: bool,
+    /// Runtime owns whether loading animation is enabled; direct app fixtures stay static.
+    loading_animation_enabled: bool,
 }
 
 impl<B> App<B>
@@ -270,7 +272,7 @@ where
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         display: Display<B>,
-        board: Board,
+        mut board: Board,
         file_tree: FileTree,
         disable_delete_confirmation: bool,
         keymap: KeyPreset,
@@ -278,6 +280,7 @@ where
         mouse_enabled: bool,
         process_memory_mib: usize,
     ) -> Self {
+        board.arm_scan_reveal();
         Self {
             is_running: true,
             loaded: false,
@@ -292,6 +295,7 @@ where
             custom_keys,
             mouse_enabled,
             dirty: true,
+            loading_animation_enabled: false,
             deletion_history_bytes: 0,
             deletion_history_limit: process_memory_mib.saturating_mul(MIB) / 8,
             deletion_history: Vec::with_capacity(MAX_RETAINED_DELETION_REPORTS),
@@ -321,6 +325,11 @@ where
             self.enter_screen_too_small();
         }
         let selection_before = self.board.currently_selected().is_some();
+        let animate_loading_visual = self.loading_animation_enabled
+            && !ascii
+            && !monochrome
+            && !reduced_motion
+            && ColorCycle::can_animate(theme.focus);
         self.display.render(
             &self.file_tree,
             &mut self.board,
@@ -338,6 +347,7 @@ where
             self.mouse_enabled,
             self.delete_confirmation_disabled,
             reduced_motion,
+            animate_loading_visual,
         )?;
         let has_selection = self.board.currently_selected().is_some();
         // Rendering lays out the board and can establish or clear its selection.
@@ -360,16 +370,25 @@ where
             && !reduced_motion
             && ColorCycle::can_animate(theme.focus)
             && self.deletion_work.has_checker_animation(now);
+        let animate_loading_surface = animate_loading_visual
+            && matches!(self.ui_mode, UiMode::Loading | UiMode::Rescanning { .. })
+            && !self.board.is_list_layout()
+            && self.board.rendered_tiles().is_empty();
+        let animate_scan_reveal = animate_loading_visual && self.board.has_scan_reveal();
         // Modal, selected-map, and deletion feedback animate at the 30 fps
         // cadence needed for a one-cell-per-frame perimeter gradient.
         animation.set_activity_with_cadence(
             animate_selected_map
                 || animate_modal
                 || animate_deletion_checker
+                || animate_loading_surface
+                || animate_scan_reveal
                 || self.ui_effects.has_deletion_departure(),
             animate_selected_map
                 || animate_modal
                 || animate_deletion_checker
+                || animate_loading_surface
+                || animate_scan_reveal
                 || self.ui_effects.has_deletion_departure(),
         );
         // The map transition runs on wall-clock time, so the loop has to keep waking up
@@ -387,6 +406,10 @@ where
 
     pub const fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    pub(crate) const fn set_loading_animation_enabled(&mut self, enabled: bool) {
+        self.loading_animation_enabled = enabled;
     }
 
     #[must_use]
@@ -441,11 +464,6 @@ where
             .file_tree
             .files_in_current_folder(self.board.zoom_level);
         self.board.change_files_for_view(files, folder, filter)
-    }
-
-    pub const fn increment_loading_progress_indicator(&mut self) {
-        self.ui_effects.increment_loading_progress_indicator();
-        self.mark_dirty();
     }
 
     pub const fn flash_space_freed(&mut self) {
@@ -503,7 +521,7 @@ where
         self.file_tree
             .add_primary_entry(file_metadata, &entry_path, identity)
             .map_err(model_error)?;
-        self.ui_effects.last_read_path = Some(entry_path);
+        self.ui_effects.record_loading_entry(entry_path);
         Ok(())
     }
 
@@ -516,7 +534,7 @@ where
         self.file_tree
             .add_focused_entry(file_metadata, &entry_path, identity)
             .map_err(model_error)?;
-        self.ui_effects.last_read_path = Some(entry_path);
+        self.ui_effects.record_loading_entry(entry_path);
         Ok(())
     }
 
@@ -1338,10 +1356,12 @@ where
         self.render_and_update_board();
     }
 
+    /// Presents the focused scan immediately; the owner incrementally prepares
+    /// its staging arena before handing work to the focused scanner.
     pub fn begin_rescan(&mut self, target: PathBuf) -> Result<(), AppError> {
         let filter = self.file_tree.filter().cloned();
         self.file_tree
-            .begin_rescan(target.clone(), filter)
+            .begin_rescan_preparation(target.clone(), filter)
             .map_err(model_error)?;
         if target != self.current_folder_path() && !self.file_tree.enter_path(&target) {
             self.file_tree.cancel_rescan().map_err(model_error)?;
@@ -1349,9 +1369,17 @@ where
                 "focused scan target disappeared before navigation".to_string(),
             ));
         }
+        self.ui_effects.reset_loading_activity();
+        self.board.arm_scan_reveal();
         self.replace_ui_mode(UiMode::Rescanning { target });
         self.render_and_update_board();
         Ok(())
+    }
+
+    pub(crate) fn advance_rescan_preparation(&mut self) -> Result<bool, AppError> {
+        self.file_tree
+            .advance_rescan_preparation()
+            .map_err(model_error)
     }
 
     pub fn finish_rescan(&mut self) -> Result<(), AppError> {
@@ -1394,6 +1422,7 @@ where
 
     pub fn cancel_rescan(&mut self) -> Result<(), AppError> {
         self.file_tree.cancel_rescan().map_err(model_error)?;
+        self.board.disarm_scan_reveal();
         self.ui_mode = self.navigation_mode();
         self.render_and_update_board();
         Ok(())

@@ -150,6 +150,10 @@ where
     pending_focused_scan_entries: VecDeque<ScannedEntry>,
     scan_cancelled: bool,
     rescan_active: bool,
+    /// Staging capacity is being released incrementally before scanner work starts.
+    rescan_preparing: bool,
+    /// Captured before compaction can replace an aggregate's live identity record.
+    rescan_root_identity: Option<NativeIdentity>,
     /// Root currently owned by the focused scanner, if any.
     rescan_target: Option<PathBuf>,
     cancelled_while_scanning: bool,
@@ -176,7 +180,7 @@ where
     let now = clock.now();
     let temporary_storage = TemporaryStorage::from_mib(settings.temporary_storage_mib)
         .map_err(|error| AppError::Config(error.to_string()))?;
-    let app = App::new_with_root_identity_and_temporary_storage(
+    let mut app = App::new_with_root_identity_and_temporary_storage(
         terminal_backend,
         settings.root.clone(),
         settings.root_identity.clone(),
@@ -188,6 +192,7 @@ where
         settings.mouse,
         temporary_storage.clone(),
     )?;
+    app.set_loading_animation_enabled(settings.animate_loading);
     let workers = WorkerPool::start(
         scanner::ScannerOptions {
             root: settings.root.clone(),
@@ -219,6 +224,8 @@ where
         pending_focused_scan_entries: VecDeque::new(),
         scan_cancelled: false,
         rescan_active: false,
+        rescan_preparing: false,
+        rescan_root_identity: None,
         rescan_target: None,
         cancelled_while_scanning: false,
         exit_after_work: false,
@@ -265,7 +272,10 @@ where
             did_work |= self.process_worker_batch()?;
             did_work |= self.process_deletion_departure(false)?;
             did_work |= self.process_deadlines();
-            did_work |= self.render()?;
+            // Scanner batches can keep the loop busy indefinitely. Service a due
+            // visual frame before rendering so the map's scan field never waits
+            // for the input-poll sleep path to run.
+            did_work |= self.render_due_frame()?;
 
             if !self.app.is_running {
                 break;
@@ -280,8 +290,7 @@ where
                 // a finished scan leaves the map frozen until the next input.
                 self.process_deletion_departure(false)?;
                 self.process_deadlines();
-                self.update_animation_frame();
-                self.render()?;
+                self.render_due_frame()?;
             }
         }
         if !self.app.is_running && self.scan_active {
@@ -386,7 +395,11 @@ where
             }
             InputCommand::CancelRescan => {
                 if self.rescan_active {
-                    self.workers()?.cancel_rescan();
+                    if self.rescan_preparing {
+                        self.cancel_rescan_preparation()?;
+                    } else {
+                        self.workers()?.cancel_rescan();
+                    }
                 }
             }
             InputCommand::RequestDeletion(target) => {
@@ -558,21 +571,55 @@ where
     fn start_manual_rescan(&mut self, target: PathBuf) -> Result<(), AppError> {
         let root_identity = self.app.identity_for_path(&target);
         let focus_target = target.clone();
-        self.app.begin_rescan(target.clone())?;
+        self.app.begin_rescan(target)?;
         self.scan_view_root = self.app.current_folder_path();
-        self.workers()?.request_rescan(scanner::ScannerOptions {
+        self.scan_active = true;
+        self.rescan_active = true;
+        self.rescan_preparing = true;
+        self.rescan_root_identity = root_identity;
+        self.rescan_target = Some(focus_target);
+        self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
+        Ok(())
+    }
+
+    /// Releases one bounded piece of live-model capacity before starting the
+    /// focused worker. The input path has already drawn its scan field by then.
+    fn prepare_focused_rescan(&mut self) -> Result<bool, AppError> {
+        debug_assert!(self.rescan_preparing);
+        if !self.app.advance_rescan_preparation()? {
+            return Ok(true);
+        }
+        let target = self.rescan_target.clone().ok_or_else(|| {
+            AppError::Invariant("focused rescan preparation lost its target".to_string())
+        })?;
+        let options = scanner::ScannerOptions {
             root: target,
-            root_identity,
+            root_identity: self.rescan_root_identity.clone(),
             threads: self.settings.scan_threads,
             cross_filesystems: self.settings.cross_filesystems,
             exclusions: self.settings.exclusions.clone(),
             internal_paths: self.app.internal_scan_paths(),
             temporary_storage: self.temporary_storage.clone(),
-        })?;
-        self.scan_active = true;
-        self.rescan_active = true;
-        self.rescan_target = Some(focus_target);
-        self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
+        };
+        let request = self.workers()?.request_rescan(options);
+        if let Err(error) = request {
+            self.cancel_rescan_preparation()?;
+            return Err(error);
+        }
+        self.rescan_preparing = false;
+        self.rescan_root_identity = None;
+        Ok(true)
+    }
+
+    fn cancel_rescan_preparation(&mut self) -> Result<(), AppError> {
+        self.app.cancel_rescan()?;
+        self.rescan_preparing = false;
+        self.rescan_root_identity = None;
+        self.rescan_active = false;
+        self.rescan_target = None;
+        if !self.primary_scan_active {
+            self.scan_active = false;
+        }
         Ok(())
     }
 
@@ -630,6 +677,9 @@ where
         if self.app.map_is_transitioning() || self.input.poll(Duration::ZERO)? {
             return Ok(false);
         }
+        if self.rescan_preparing {
+            return self.prepare_focused_rescan();
+        }
         if self.process_pending_scan_entries()? {
             return Ok(true);
         }
@@ -657,8 +707,17 @@ where
                 break;
             }
             processed = true;
+            // Each model mutation is a cooperative yield point. A full scan queue
+            // must not defer an already due visual frame until its 32-entry slice ends.
             if self.input.poll(Duration::ZERO)? {
                 break;
+            }
+            if self
+                .animation
+                .next_frame_at()
+                .is_some_and(|deadline| self.clock.now() >= deadline)
+            {
+                self.render_due_frame()?;
             }
         }
         Ok(processed)
@@ -792,6 +851,8 @@ where
 
     fn finish_focused_scan(&mut self, cancelled: bool) -> Result<(), AppError> {
         self.rescan_active = false;
+        self.rescan_preparing = false;
+        self.rescan_root_identity = None;
         self.rescan_target = None;
         if !self.primary_scan_active {
             self.scan_active = false;
@@ -1021,7 +1082,6 @@ where
         self.timed_actions = pending;
 
         if self.settings.animate_loading && self.scan_active && now >= self.next_loading_frame {
-            self.app.increment_loading_progress_indicator();
             if self.scan_view_dirty && self.app.refresh_board_from_scan() {
                 self.scan_view_dirty = false;
             }
@@ -1055,6 +1115,12 @@ where
         {
             self.app.mark_dirty();
         }
+    }
+
+    /// Renders a scheduled visual frame whether or not scan work kept this loop busy.
+    fn render_due_frame(&mut self) -> Result<bool, AppError> {
+        self.update_animation_frame();
+        self.render()
     }
 
     fn render(&mut self) -> Result<bool, AppError> {
@@ -1109,13 +1175,13 @@ where
         'quiescence: loop {
             while self.scan_active || self.app.deletion_work.has_background_activity() {
                 if self.process_pending_scan_entry()? {
-                    self.render()?;
+                    self.render_due_frame()?;
                     continue;
                 }
                 match self.workers()?.events().recv_timeout(WORKER_POLL_INTERVAL) {
                     Ok(event) => {
                         self.handle_worker_event(event)?;
-                        self.render()?;
+                        self.render_due_frame()?;
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => {
@@ -1128,7 +1194,7 @@ where
 
             loop {
                 if self.process_deletion_departure(false)? {
-                    self.render()?;
+                    self.render_due_frame()?;
                 }
                 if self.scan_active || self.app.deletion_work.has_background_activity() {
                     continue 'quiescence;
@@ -1149,8 +1215,7 @@ where
                 }
                 self.process_deletion_departure(false)?;
                 self.process_deadlines();
-                self.update_animation_frame();
-                self.render()?;
+                self.render_due_frame()?;
             }
             break;
         }
@@ -1370,6 +1435,18 @@ mod tests {
         }
     }
 
+    struct IdleInput;
+
+    impl InputSource for IdleInput {
+        fn poll(&mut self, _timeout: Duration) -> Result<bool, AppError> {
+            Ok(false)
+        }
+
+        fn read(&mut self) -> Result<InputEvent, AppError> {
+            panic!("idle input must not be read")
+        }
+    }
+
     struct InputAfterFirstPoll {
         polls: u8,
     }
@@ -1464,6 +1541,8 @@ mod tests {
             pending_focused_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             rescan_active: false,
+            rescan_preparing: false,
+            rescan_root_identity: None,
             rescan_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
@@ -1570,6 +1649,8 @@ mod tests {
             pending_focused_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             rescan_active: false,
+            rescan_preparing: false,
+            rescan_root_identity: None,
             rescan_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
@@ -1601,7 +1682,10 @@ mod tests {
                 .process_worker_batch()
                 .expect("staged scan batch should be applied")
         );
-        assert_eq!(owner.summary.scanned_entries, 1);
+        assert_eq!(
+            owner.summary.scanned_entries, 1,
+            "an input check occurs after each scan entry"
+        );
         assert_eq!(
             owner.pending_scan_entries.len(),
             MAX_SCAN_ENTRIES_PER_SLICE
@@ -1611,6 +1695,139 @@ mod tests {
         );
     }
 
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression constructs a complete active scan frame without a worker thread"
+    )]
+    fn busy_scan_work_keeps_animation_and_focused_startup_responsive() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let entry = root.path().join("entry");
+        std::fs::create_dir(&entry).expect("test directory should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let entry_metadata =
+            std::fs::symlink_metadata(&entry).expect("test entry metadata should exist");
+        let entry_identity = crate::native_path::identity_for(&entry, &entry_metadata)
+            .expect("test entry identity should be readable")
+            .expect("test entry should not be a link");
+        let mut app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.set_loading_animation_enabled(true);
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        assert!(
+            app.render_if_dirty(
+                &mut animation,
+                Duration::ZERO,
+                "test",
+                crate::theme::Theme::for_id(ThemeId::ExciseDark),
+                false,
+                false,
+                false,
+            )
+            .expect("initial scan field should render")
+        );
+        let due_frame = animation
+            .next_frame_at()
+            .expect("animated scan field should schedule a next frame");
+        let clock = VirtualClock::new();
+        clock.advance(due_frame);
+        let scan_view_root = app.current_folder_path();
+        let pending_scan_entries = VecDeque::from([ScannedEntry {
+            metadata: entry_metadata,
+            path: entry.clone(),
+            identity: entry_identity,
+        }]);
+        let mut owner = OwnerLoop {
+            app,
+            input: Box::new(IdleInput),
+            workers: None,
+            clock: Box::new(clock),
+            animation,
+            settings: RuntimeSettings {
+                root: root.path().to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: false,
+                monochrome: false,
+                animate_loading: true,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: false,
+            },
+            temporary_storage: TemporaryStorage::default(),
+            summary: RunSummary::default(),
+            scan_active: true,
+            primary_scan_active: true,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries,
+            pending_focused_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            rescan_active: false,
+            rescan_preparing: false,
+            rescan_root_identity: None,
+            rescan_target: None,
+            cancelled_while_scanning: false,
+            exit_after_work: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: due_frame,
+            next_deletion_progress_frame: due_frame,
+            last_deletion_progress: None,
+        };
+
+        assert!(
+            owner
+                .process_worker_batch()
+                .expect("staged scan work should be processed")
+        );
+        assert_eq!(owner.summary.scanned_entries, 1);
+        assert!(
+            owner
+                .animation
+                .next_frame_at()
+                .is_some_and(|next| next > due_frame),
+            "a due scan field frame must be rendered before the busy scan batch returns"
+        );
+        owner
+            .start_manual_rescan(entry)
+            .expect("focused scan preparation must not require its worker on the input path");
+        assert!(owner.rescan_preparing);
+        assert!(matches!(
+            owner.app.ui_mode,
+            crate::UiMode::Rescanning { .. }
+        ));
+        assert!(
+            owner
+                .render()
+                .expect("the focused scan field should render before staging completes"),
+            "the requested directory must hand off to its scan field immediately"
+        );
+    }
     #[cfg(any(unix, windows))]
     fn completed_deletion_fixture() -> (
         App<TestBackend>,
@@ -1752,6 +1969,8 @@ mod tests {
             pending_focused_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             rescan_active: false,
+            rescan_preparing: false,
+            rescan_root_identity: None,
             rescan_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
@@ -1862,6 +2081,8 @@ mod tests {
             pending_focused_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             rescan_active: true,
+            rescan_preparing: true,
+            rescan_root_identity: None,
             rescan_target: Some(root.path().to_path_buf()),
             cancelled_while_scanning: false,
             exit_after_work: false,
@@ -1884,7 +2105,14 @@ mod tests {
             .app
             .begin_rescan(root.path().to_path_buf())
             .expect("second focused scan should start");
+        assert!(
+            owner
+                .app
+                .advance_rescan_preparation()
+                .expect("second focused scan staging should activate")
+        );
         owner.rescan_active = true;
+        owner.rescan_preparing = false;
         owner.rescan_target = Some(root.path().to_path_buf());
         owner.scan_active = true;
         owner

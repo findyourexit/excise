@@ -593,6 +593,22 @@ impl ColorCycle {
     pub fn at(&self, step: usize) -> Color {
         self.samples[step % CYCLE_LEN]
     }
+
+    /// Softens a moving accent toward a tile surface without losing its phase.
+    /// The selected map contour uses this for its middle fill and receding faces.
+    #[must_use]
+    pub(crate) fn blended_toward(self, destination: Color, amount: f32) -> Self {
+        let Some(destination) = Oklch::from_color(destination) else {
+            return self;
+        };
+        let mut samples = self.samples;
+        for sample in &mut samples {
+            if let Some(source) = Oklch::from_color(*sample) {
+                *sample = source.towards(destination, amount).to_color();
+            }
+        }
+        Self { samples }
+    }
 }
 
 fn constrained_cycle_sample(candidate: Oklch, base: Oklch, accent: Color, panel: Color) -> Color {
