@@ -64,7 +64,7 @@ const MINIMUM_LABEL_WIDTH: u16 = 6;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanActivity {
     Scanning,
-    Rescanning,
+    Rebuilding,
 }
 
 /// Live scan state that owns the empty-map field and its one-shot reveal.
@@ -916,7 +916,7 @@ fn work_status_color(theme: Theme, status: WorkRailStatus) -> Color {
     match status {
         WorkRailStatus::AwaitingConfirmation => theme.focus,
         WorkRailStatus::Planning => theme.state_scanning,
-        WorkRailStatus::Queued => theme.state_rescanning,
+        WorkRailStatus::Queued => theme.state_rebuilding,
         WorkRailStatus::Executing => theme.text_danger,
     }
 }
@@ -2281,8 +2281,8 @@ impl DenseRectangleGrid<'_> {
                 ascii: self.ascii,
                 scan,
                 phase: scan_field_phase(self.now, scan.animated),
-                accent: if scan.activity == ScanActivity::Rescanning {
-                    self.theme.state_rescanning
+                accent: if scan.activity == ScanActivity::Rebuilding {
+                    self.theme.state_rebuilding
                 } else {
                     self.theme.state_scanning
                 },
@@ -2332,8 +2332,8 @@ impl DenseRectangleGrid<'_> {
             ascii: self.ascii,
             scan,
             phase: scan_field_phase(self.now, scan.animated),
-            accent: if scan.activity == ScanActivity::Rescanning {
-                self.theme.state_rescanning
+            accent: if scan.activity == ScanActivity::Rebuilding {
+                self.theme.state_rebuilding
             } else {
                 self.theme.state_scanning
             },
@@ -2373,7 +2373,7 @@ impl ScanField<'_> {
         } else {
             match self.scan.activity {
                 ScanActivity::Scanning => "SCANNING FOLDER",
-                ScanActivity::Rescanning => "REFRESHING FOLDER",
+                ScanActivity::Rebuilding => "REFRESHING FOLDER",
             }
         };
         if reveal_progress.is_none_or(|progress| progress < 0.58) {
@@ -4234,12 +4234,12 @@ mod tests {
     }
 
     #[test]
-    fn focused_rescan_field_names_its_live_refresh() {
+    fn generation_rebuild_field_names_its_live_refresh() {
         let buffer = render_scan_visual(
             &[],
             Rect::new(0, 0, 32, 4),
             Some(ScanVisual {
-                activity: ScanActivity::Rescanning,
+                activity: ScanActivity::Rebuilding,
                 entries_indexed: 356_299,
                 animated: false,
                 reveal_progress: None,

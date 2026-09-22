@@ -63,6 +63,7 @@ pub(crate) fn run_main() -> i32 {
         memory_mib: config.memory_mib,
         temporary_storage_mib: config.temporary_storage_mib,
         scan_store_mib: config.scan_store_mib,
+        scan_store_reserve_mib: config.scan_store_reserve_mib,
         scan_store_dir: config.scan_store_dir,
         apparent_size: config.apparent_size,
         disable_delete_confirmation: config.disable_delete_confirmation,

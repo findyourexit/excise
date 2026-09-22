@@ -44,11 +44,15 @@ impl ScanStoreStorage {
         Self::new_with_quota(parent, |_| Ok(quota))
     }
 
-    /// Creates a private session whose configured budget is bounded by the
-    /// free space on the volume that actually hosts its run files.
-    pub(crate) fn new_for_scan_store_mib(mib: usize, parent: Option<&Path>) -> io::Result<Self> {
+    /// Creates a private session with an explicit limit or an adaptive default
+    /// derived from the scratch volume's safe free capacity.
+    pub(crate) fn new_for_scan_store_mib(
+        mib: Option<usize>,
+        reserve_mib: Option<usize>,
+        parent: Option<&Path>,
+    ) -> io::Result<Self> {
         Self::new_with_quota(parent, |root| {
-            TemporaryStorage::scan_store_from_mib_for_scratch(mib, root)
+            TemporaryStorage::scan_store_from_mib_for_scratch(mib, reserve_mib, root)
         })
     }
 

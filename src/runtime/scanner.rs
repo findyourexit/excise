@@ -13,10 +13,12 @@ use std::time::Duration;
 
 use cap_primitives::ambient_authority;
 use cap_primitives::fs::{self as cap_fs};
-use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
+};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-pub(super) use scheduler::SchedulerHandle;
+use scheduler::SchedulerHandle;
 use scheduler::{LeasedDirectoryTask, SchedulerCommand};
 use task_queue::{DirectoryTask, TASK_QUEUE_PER_WORKER, TaskQueue};
 
@@ -33,16 +35,15 @@ use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, 
 use crate::scan_store::run_file::SealedRun;
 use crate::scan_store::session::ScanInputRunFactory;
 use crate::temporary_storage::TemporaryStorage;
-// The owner consumes each bounded batch before checking input again. Keep the
-// batch small so scanning never makes keyboard feedback wait indefinitely.
+/// The owner consumes each bounded batch before checking input again. Keep the
+/// batch small so scanning never makes keyboard feedback wait indefinitely.
 const MAX_FOCUS_REQUESTS: usize = 32;
 const BATCH_SIZE: usize = 32;
+const SCANNER_COMMAND_RETRY: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug)]
 pub struct ScannerOptions {
     pub root: PathBuf,
-    /// Root used to encode canonical run paths; may contain `root` for a scope.
-    pub canonical_root: PathBuf,
     pub session: ScanSessionId,
     pub root_identity: Option<NativeIdentity>,
     pub generation: ScanGeneration,
@@ -120,34 +121,205 @@ impl Exclusions {
     }
 }
 
-pub fn spawn(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScannerRequestError {
+    Busy,
+    Disconnected,
+}
+
+enum ScannerCommand {
+    Rebuild {
+        options: ScannerOptions,
+        cancelled: Arc<AtomicBool>,
+    },
+}
+
+/// Bounded control for the one persistent scanner worker.
+///
+/// Initial scans and invalidation-triggered root rebuilds execute serially on
+/// the same service. A rebuild has its own cancellation flag so it never
+/// interrupts the application's lifetime or an unrelated generation.
+#[derive(Clone)]
+pub(super) struct ScannerHandle {
+    commands: Sender<ScannerCommand>,
+    scheduler: Arc<Mutex<Option<SchedulerHandle>>>,
+    rebuild_cancellation: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+impl ScannerHandle {
+    pub(super) fn prioritize(&self, path: &Path) {
+        let scheduler = self
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(scheduler) = scheduler {
+            scheduler.prioritize(path);
+        }
+    }
+
+    #[must_use]
+    pub(super) fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
+        let scheduler = self
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        scheduler.and_then(|scheduler| scheduler.snapshot())
+    }
+
+    pub(super) fn request_rebuild(
+        &self,
+        options: ScannerOptions,
+    ) -> Result<(), ScannerRequestError> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut active = self
+            .rebuild_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.is_some() {
+            return Err(ScannerRequestError::Busy);
+        }
+        match self.commands.try_send(ScannerCommand::Rebuild {
+            options,
+            cancelled: Arc::clone(&cancelled),
+        }) {
+            Ok(()) => {
+                *active = Some(cancelled);
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => Err(ScannerRequestError::Busy),
+            Err(TrySendError::Disconnected(_)) => Err(ScannerRequestError::Disconnected),
+        }
+    }
+
+    pub(super) fn cancel_rebuild(&self) {
+        let cancellation = self
+            .rebuild_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(cancellation) = cancellation {
+            cancellation.store(true, Ordering::Release);
+        }
+    }
+
+    pub(super) fn complete_rebuild(&self) {
+        *self
+            .rebuild_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn clear_rebuild_cancellation(&self, completed: &Arc<AtomicBool>) {
+        let mut active = self
+            .rebuild_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, completed))
+        {
+            *active = None;
+        }
+    }
+}
+
+pub(super) fn spawn(
     options: ScannerOptions,
     sender: Sender<WorkerEvent>,
     cancelled: Arc<AtomicBool>,
-) -> Result<(thread::JoinHandle<()>, SchedulerHandle), std::io::Error> {
+) -> Result<(thread::JoinHandle<()>, ScannerHandle), std::io::Error> {
+    let (commands, command_receiver) = bounded(1);
+    let scanner = ScannerHandle {
+        commands,
+        scheduler: Arc::new(Mutex::new(None)),
+        rebuild_cancellation: Arc::new(Mutex::new(None)),
+    };
+    let service = scanner.clone();
+    let handle = thread::Builder::new()
+        .name("excise-scanner".to_string())
+        .spawn(move || {
+            run_generation(
+                options,
+                &sender,
+                cancelled.as_ref(),
+                cancelled.as_ref(),
+                &service.scheduler,
+            );
+            loop {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                let command = match command_receiver.recv_timeout(SCANNER_COMMAND_RETRY) {
+                    Ok(command) => command,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
+                let ScannerCommand::Rebuild {
+                    options,
+                    cancelled: rebuild_cancelled,
+                } = command;
+                run_generation(
+                    options,
+                    &sender,
+                    rebuild_cancelled.as_ref(),
+                    cancelled.as_ref(),
+                    &service.scheduler,
+                );
+                service.clear_rebuild_cancellation(&rebuild_cancelled);
+            }
+        })?;
+    Ok((handle, scanner))
+}
+
+fn run_generation(
+    options: ScannerOptions,
+    sender: &Sender<WorkerEvent>,
+    cancelled: &AtomicBool,
+    service_cancelled: &AtomicBool,
+    active_scheduler: &Mutex<Option<SchedulerHandle>>,
+) {
     let command_capacity = options.threads.saturating_mul(BATCH_SIZE).max(1);
     let (commands, command_receiver) = bounded(command_capacity);
     let (focus, focus_receiver) = bounded(MAX_FOCUS_REQUESTS);
     let snapshot = Arc::new(Mutex::new(None));
     let scheduler = SchedulerHandle::new(focus, Arc::clone(&snapshot));
-    let handle = thread::Builder::new()
-        .name("excise-scanner".to_string())
-        .spawn(move || {
-            run_with_scheduler(
-                options,
-                &sender,
-                cancelled.as_ref(),
-                commands,
-                command_receiver,
-                focus_receiver,
-                &snapshot,
-            );
-        })?;
-    Ok((handle, scheduler))
+    *active_scheduler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scheduler);
+    let root = options.root.clone();
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_with_scheduler(
+            options,
+            sender,
+            cancelled,
+            commands,
+            command_receiver,
+            focus_receiver,
+            &snapshot,
+        );
+    }))
+    .is_err()
+    {
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFailed {
+                path: Some(root),
+                message: "scanner worker panicked".to_string(),
+            },
+            service_cancelled,
+        );
+        let _ = send_event(
+            sender,
+            WorkerEvent::ScanFinished { cancelled: true },
+            service_cancelled,
+        );
+    }
 }
 
-#[allow(clippy::too_many_lines)]
-pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancelled: &AtomicBool) {
+#[cfg(test)]
+fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancelled: &AtomicBool) {
     let command_capacity = options.threads.saturating_mul(BATCH_SIZE).max(1);
     let (commands, command_receiver) = bounded(command_capacity);
     let (focus, focus_receiver) = bounded(MAX_FOCUS_REQUESTS);
@@ -163,6 +335,7 @@ pub(super) fn run(options: ScannerOptions, sender: &Sender<WorkerEvent>, cancell
     );
     drop(focus);
 }
+
 #[allow(clippy::too_many_lines)]
 fn run_with_scheduler(
     options: ScannerOptions,
@@ -177,7 +350,6 @@ fn run_with_scheduler(
         session,
         generation,
         root,
-        canonical_root,
         root_identity,
         threads,
         cross_filesystems,
@@ -186,22 +358,6 @@ fn run_with_scheduler(
         temporary_storage,
         input_runs,
     } = options;
-    if !root.starts_with(&canonical_root) {
-        let _ = send_event(
-            sender,
-            WorkerEvent::ScanFailed {
-                path: Some(root.clone()),
-                message: "focused scan root is outside the canonical scan root".to_string(),
-            },
-            cancelled,
-        );
-        let _ = send_event(
-            sender,
-            WorkerEvent::ScanFinished { cancelled: false },
-            cancelled,
-        );
-        return;
-    }
     if input_runs
         .as_ref()
         .is_some_and(|factory| factory.generation() != generation)
@@ -427,7 +583,6 @@ fn run_with_scheduler(
             let worker_exclusions = &exclusions;
             let worker_root_filesystem = root_filesystem.as_ref();
             let worker_root = &root;
-            let worker_canonical_root = &canonical_root;
             let worker_root_identity = root_identity.as_ref();
             let worker_input_runs = input_runs.as_ref();
             if let Err(error) = thread::Builder::new()
@@ -443,7 +598,6 @@ fn run_with_scheduler(
                         worker_root_invalid,
                         worker_root_directory,
                         worker_root,
-                        worker_canonical_root,
                         worker_root_identity,
                         worker_input_runs,
                         worker_exclusions,
@@ -514,7 +668,6 @@ fn scan_worker(
     root_invalid: &AtomicBool,
     root_directory: &File,
     root: &Path,
-    canonical_root: &Path,
     root_identity: Option<&NativeIdentity>,
     input_runs: Option<&ScanInputRunFactory>,
     exclusions: &Exclusions,
@@ -544,7 +697,6 @@ fn scan_worker(
             root_invalid,
             root_directory,
             root,
-            canonical_root,
             input_runs,
             root_identity,
             exclusions,
@@ -595,7 +747,6 @@ fn scan_directory(
     root_invalid: &AtomicBool,
     root_directory: &File,
     root: &Path,
-    canonical_root: &Path,
     input_runs: Option<&ScanInputRunFactory>,
     root_identity: Option<&NativeIdentity>,
     exclusions: &Exclusions,
@@ -653,14 +804,7 @@ fn scan_directory(
         }
         if frame.batch.len() == BATCH_SIZE {
             if !flush_frame(
-                &mut frame,
-                lease,
-                canonical_root,
-                input_runs,
-                scheduler,
-                sender,
-                cancelled,
-                failed,
+                &mut frame, lease, root, input_runs, scheduler, sender, cancelled, failed,
             ) {
                 return ScanDirectoryOutcome {
                     continue_scanning: false,
@@ -692,7 +836,7 @@ fn scan_directory(
                 process_entry(
                     &mut frame,
                     &entry,
-                    canonical_root,
+                    root,
                     lease,
                     input_runs,
                     sender,
@@ -724,14 +868,7 @@ fn scan_directory(
     }
     if !frame.batch.is_empty()
         && !flush_frame(
-            &mut frame,
-            lease,
-            canonical_root,
-            input_runs,
-            scheduler,
-            sender,
-            cancelled,
-            failed,
+            &mut frame, lease, root, input_runs, scheduler, sender, cancelled, failed,
         )
     {
         return ScanDirectoryOutcome {
@@ -784,7 +921,6 @@ fn scan_directory_with_queue(
         failed,
         root_invalid,
         root_directory,
-        root,
         root,
         None,
         root_identity,
@@ -1203,7 +1339,7 @@ fn identity_from_entry_metadata(metadata: &cap_fs::Metadata) -> io::Result<Optio
     reason = "the boundary event retains its complete scan-time identity and transport context"
 )]
 fn report_unscanned_entry(
-    canonical_root: &Path,
+    root: &Path,
     lease: Option<&WorkLease>,
     factory: Option<&ScanInputRunFactory>,
     metadata: &Metadata,
@@ -1224,7 +1360,7 @@ fn report_unscanned_entry(
         path: path.clone(),
         identity,
     };
-    let input_runs = match seal_scanned_entries(canonical_root, &[entry], coverage, factory) {
+    let input_runs = match seal_scanned_entries(root, &[entry], coverage, factory) {
         Ok(input_runs) => input_runs,
         Err(message) => {
             failed.store(true, Ordering::Release);
@@ -1255,7 +1391,7 @@ fn report_unscanned_entry(
 fn process_entry(
     frame: &mut ScanFrame,
     entry: &cap_fs::DirEntry,
-    canonical_root: &Path,
+    root: &Path,
     lease: Option<&WorkLease>,
     input_runs: Option<&ScanInputRunFactory>,
     sender: &Sender<WorkerEvent>,
@@ -1322,7 +1458,7 @@ fn process_entry(
     let is_dir = metadata.is_dir();
     if let Some(pattern) = exclusions.reason(&path, is_dir) {
         report_unscanned_entry(
-            canonical_root,
+            root,
             lease,
             input_runs,
             &metadata,
@@ -1337,7 +1473,7 @@ fn process_entry(
     }
     if metadata.file_type().is_symlink() || identity.reparse_point {
         report_unscanned_entry(
-            canonical_root,
+            root,
             lease,
             input_runs,
             &metadata,
@@ -1359,15 +1495,7 @@ fn process_entry(
         };
         if let Some(reason) = reason {
             report_unscanned_entry(
-                canonical_root,
-                lease,
-                input_runs,
-                &metadata,
-                path,
-                identity,
-                reason,
-                sender,
-                cancelled,
+                root, lease, input_runs, &metadata, path, identity, reason, sender, cancelled,
                 failed,
             );
             return;
@@ -1394,7 +1522,7 @@ fn process_entry(
 fn flush_frame(
     frame: &mut ScanFrame,
     lease: Option<&WorkLease>,
-    canonical_root: &Path,
+    root: &Path,
     input_runs: Option<&ScanInputRunFactory>,
     scheduler: &Sender<SchedulerCommand>,
     sender: &Sender<WorkerEvent>,
@@ -1402,23 +1530,22 @@ fn flush_frame(
     failed: &AtomicBool,
 ) -> bool {
     let entries = std::mem::replace(&mut frame.batch, Vec::with_capacity(BATCH_SIZE));
-    let input_runs =
-        match seal_scanned_entries(canonical_root, &entries, Coverage::Complete, input_runs) {
-            Ok(input_runs) => input_runs,
-            Err(message) => {
-                failed.store(true, Ordering::Release);
-                frame.directories.clear();
-                let _ = send_event(
-                    sender,
-                    WorkerEvent::ScanFailed {
-                        path: Some(frame.task.path.clone()),
-                        message,
-                    },
-                    cancelled,
-                );
-                return false;
-            }
-        };
+    let input_runs = match seal_scanned_entries(root, &entries, Coverage::Complete, input_runs) {
+        Ok(input_runs) => input_runs,
+        Err(message) => {
+            failed.store(true, Ordering::Release);
+            frame.directories.clear();
+            let _ = send_event(
+                sender,
+                WorkerEvent::ScanFailed {
+                    path: Some(frame.task.path.clone()),
+                    message,
+                },
+                cancelled,
+            );
+            return false;
+        }
+    };
     if !send_event(
         sender,
         WorkerEvent::ScanBatch {
@@ -1600,7 +1727,6 @@ mod tests {
                 session: ScanSessionId::from_bytes([4; 16]),
                 generation: ScanGeneration::initial(),
                 root: root.path().to_path_buf(),
-                canonical_root: root.path().to_path_buf(),
                 root_identity: None,
                 threads: 1,
                 cross_filesystems: false,
@@ -1666,7 +1792,6 @@ mod tests {
                 session: store.session(),
                 generation: input_runs.generation(),
                 root: root.path().to_path_buf(),
-                canonical_root: root.path().to_path_buf(),
                 root_identity: None,
                 threads: 1,
                 cross_filesystems: false,
@@ -1786,7 +1911,6 @@ mod tests {
                 session: store.session(),
                 generation: input_runs.generation(),
                 root: root.to_path_buf(),
-                canonical_root: root.to_path_buf(),
                 root_identity: None,
                 threads,
                 cross_filesystems: false,
@@ -1902,100 +2026,6 @@ mod tests {
                 "worker count {workers} must retain every observed path"
             );
         }
-    }
-
-    #[test]
-    fn focused_scanner_writes_paths_relative_to_the_canonical_root() {
-        use crossbeam_channel::unbounded;
-
-        let root = tempfile::tempdir().expect("canonical root should exist");
-        let target = root.path().join("target");
-        let entry = target.join("entry");
-        fs::create_dir(&target).expect("focused root should exist");
-        fs::write(&entry, b"payload").expect("focused fixture should exist");
-        let storage = TemporaryStorage::scan_store_with_limit_bytes(8 * 1024 * 1024);
-        let mut store =
-            crate::scan_store::session::ScanStore::new(ScanGeneration::initial(), storage.clone())
-                .expect("scan store should initialize");
-        let target_relative =
-            RelativePath::from_path(Path::new("target")).expect("target path should be relative");
-        store
-            .append_observation_batch(
-                vec![PathObservation::new(
-                    target_relative.clone(),
-                    PathEntryKind::Directory,
-                    SummaryMetrics::default(),
-                    Coverage::Complete,
-                )],
-                Vec::new(),
-            )
-            .expect("target directory fact should be admitted");
-        let input_runs = store
-            .input_run_factory()
-            .expect("focused generation should accept input");
-        let (sender, events) = unbounded();
-        let cancelled = AtomicBool::new(false);
-        run(
-            ScannerOptions {
-                session: store.session(),
-                generation: input_runs.generation(),
-                root: target.clone(),
-                canonical_root: root.path().to_path_buf(),
-                root_identity: None,
-                threads: 1,
-                cross_filesystems: false,
-                exclusions: Vec::new(),
-                internal_paths: Vec::new(),
-                temporary_storage: storage,
-                input_runs: Some(input_runs),
-            },
-            &sender,
-            &cancelled,
-        );
-        for event in events.try_iter() {
-            match event {
-                WorkerEvent::ScanBatch {
-                    lease: Some(lease),
-                    input_runs,
-                    ..
-                } => {
-                    for run in input_runs {
-                        assert!(
-                            store
-                                .accept_leased_input_run(&lease, run)
-                                .expect("focused scanner run should be admitted")
-                        );
-                    }
-                }
-                WorkerEvent::ScanBatch { lease: None, .. } => {
-                    panic!("focused scanner sealed an unleased batch")
-                }
-                WorkerEvent::ScanFailed { message, .. } => {
-                    panic!("focused scanner failed: {message}")
-                }
-                WorkerEvent::ScanUnscanned { .. }
-                | WorkerEvent::ScanFinished { .. }
-                | WorkerEvent::DeletionPlanned { .. }
-                | WorkerEvent::DeletionExecutionRejected { .. }
-                | WorkerEvent::DeletionFinished { .. } => {}
-            }
-        }
-        store
-            .publish()
-            .expect("focused canonical generation should publish");
-        let page = store
-            .published_mut()
-            .expect("published generation should exist")
-            .page(crate::scan_store::page::PageRequest::first(
-                target_relative,
-                8,
-            ))
-            .expect("focused canonical page should load");
-        assert_eq!(
-            page.entries[0].path,
-            RelativePath::from_path(Path::new("target/entry"))
-                .expect("focused entry path should remain rooted globally")
-        );
     }
 
     #[cfg(any(unix, windows))]

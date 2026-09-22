@@ -1,18 +1,92 @@
 //! Internal Criterion fixtures for canonical scan-store measurements.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::model::{ByteBounds, EntrySnapshot, NodeKind};
 use crate::native_path::NativeIdentity;
 use crate::scan_coordinator::{RelativePath, ScanGeneration};
-use crate::scan_store::identity_observation::IdentityObservation;
+use crate::scan_store::identity_observation::{
+    IdentityObservation, append_identity_observation, compare_identity_observations,
+};
 use crate::scan_store::page::{PageCursor, PageRequest};
+use crate::scan_store::path_observation::append_path_observation;
 use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, SummaryMetrics};
+use crate::scan_store::run_file::RunKind;
 use crate::scan_store::session::{MAX_OBSERVATIONS_PER_BATCH, ScanStore};
 use crate::temporary_storage::TemporaryStorage;
-
 const STORAGE_MIB: usize = 256;
 const QUERY_PAGE_ENTRIES: usize = 32;
+
+/// A running scanner fixture for Criterion measurements of scheduler behavior.
+pub struct FilesystemScanBenchmark {
+    scan: crate::runtime::BenchmarkScan,
+}
+
+impl FilesystemScanBenchmark {
+    /// Scans one fixture to completion with the selected scanner worker count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scanner reports an error or does not finish in time.
+    #[must_use]
+    pub fn scan_to_completion(root: &Path, threads: usize) -> usize {
+        crate::runtime::BenchmarkScan::scan_to_completion(root, threads)
+            .expect("benchmark scanner should complete")
+    }
+
+    /// Starts an initial scan so a caller can measure bounded focus delivery.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scanner fixture cannot start.
+    #[must_use]
+    pub fn scanning(root: &Path, threads: usize) -> Self {
+        Self {
+            scan: crate::runtime::BenchmarkScan::start(root, threads)
+                .expect("benchmark scanner should start"),
+        }
+    }
+
+    /// Completes an initial scan and retains its scanner service for rebuild cancellation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the initial scanner fixture does not complete.
+    #[must_use]
+    pub fn ready_for_rebuild(root: &Path, threads: usize) -> Self {
+        let benchmark = Self::scanning(root, threads);
+        benchmark
+            .scan
+            .complete_initial_scan()
+            .expect("benchmark initial scan should complete");
+        benchmark
+    }
+
+    /// Returns the time until every requested focus reaches the scanner scheduler.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bounded focus channel cannot process each request while scanning.
+    #[must_use]
+    pub fn focus_latency(&self, paths: &[PathBuf]) -> Duration {
+        self.scan
+            .focus_latency(paths)
+            .expect("benchmark focus requests should be processed")
+    }
+
+    /// Returns the time until a newly requested rebuild acknowledges cancellation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rebuild cannot start or does not acknowledge cancellation.
+    #[must_use]
+    pub fn cancel_rebuild_latency(&self) -> Duration {
+        self.scan
+            .cancel_rebuild_latency()
+            .expect("benchmark rebuild cancellation should complete")
+    }
+}
 
 /// Canonical layouts that exercise distinct storage and query paths.
 #[derive(Clone, Copy, Debug)]
@@ -62,11 +136,31 @@ impl CanonicalWorkload {
     }
 }
 
+/// Deterministic logical I/O and phase timing for one canonical publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalStoreMetrics {
+    pub observations: usize,
+    pub input_written_bytes: u64,
+    pub merge_read_bytes: u64,
+    pub merge_written_bytes: u64,
+    pub reduction_read_bytes: u64,
+    pub reduction_written_bytes: u64,
+    pub publication_read_bytes: u64,
+    pub publication_written_bytes: u64,
+    pub retained_bytes: u64,
+    pub peak_temporary_bytes: u64,
+    pub ingestion_elapsed: Duration,
+    pub publication_elapsed: Duration,
+    pub ingestion_cpu: Option<Duration>,
+    pub publication_cpu: Option<Duration>,
+}
+
 /// A published canonical generation and one representative bounded page query.
 pub struct CanonicalStoreBenchmark {
     store: ScanStore,
     storage: TemporaryStorage,
     query: BenchmarkPageQuery,
+    metrics: CanonicalStoreMetrics,
 }
 
 #[derive(Clone)]
@@ -75,8 +169,60 @@ struct BenchmarkPageQuery {
     after: Option<PageCursor>,
 }
 
+fn benchmark_metrics(
+    store: &ScanStore,
+    storage: &TemporaryStorage,
+    observations: usize,
+    ingestion_elapsed: Duration,
+    publication_elapsed: Duration,
+    ingestion_cpu: Option<Duration>,
+    publication_cpu: Option<Duration>,
+) -> CanonicalStoreMetrics {
+    let io = store.io_metrics();
+    CanonicalStoreMetrics {
+        observations,
+        input_written_bytes: io.input_written_bytes,
+        merge_read_bytes: io.merge_read_bytes,
+        merge_written_bytes: io.merge_written_bytes,
+        reduction_read_bytes: io.reduction_read_bytes,
+        reduction_written_bytes: io.reduction_written_bytes,
+        publication_read_bytes: io.publication_read_bytes,
+        publication_written_bytes: io.publication_written_bytes,
+        retained_bytes: storage.used(),
+        peak_temporary_bytes: storage.peak_used(),
+        ingestion_elapsed,
+        publication_elapsed,
+        ingestion_cpu,
+        publication_cpu,
+    }
+}
+
+#[cfg(unix)]
+fn process_cpu_time() -> Option<Duration> {
+    use nix::sys::resource::{UsageWho, getrusage};
+    use nix::sys::time::TimeValLike as _;
+
+    let usage = getrusage(UsageWho::RUSAGE_SELF).ok()?;
+    let micros = usage
+        .user_time()
+        .num_microseconds()
+        .checked_add(usage.system_time().num_microseconds())?;
+    u64::try_from(micros).ok().map(Duration::from_micros)
+}
+
+#[cfg(not(unix))]
+const fn process_cpu_time() -> Option<Duration> {
+    None
+}
+
+fn elapsed_cpu_since(start: Option<Duration>) -> Option<Duration> {
+    process_cpu_time()
+        .zip(start)
+        .map(|(end, start)| end.saturating_sub(start))
+}
+
 impl CanonicalStoreBenchmark {
-    /// Builds and publishes a deterministic canonical workload.
+    /// Builds and publishes a deterministic workload through bounded scanner batches.
     ///
     /// # Panics
     ///
@@ -84,11 +230,26 @@ impl CanonicalStoreBenchmark {
     /// generated workload or canonical publication fails.
     #[must_use]
     pub fn build(workload: CanonicalWorkload) -> Self {
-        let storage = TemporaryStorage::scan_store_from_mib(STORAGE_MIB)
+        Self::build_with_storage_mib(workload, STORAGE_MIB)
+    }
+
+    /// Builds and publishes a deterministic workload through bounded scanner batches
+    /// with an explicit storage ceiling.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the storage ceiling cannot hold the generated workload or
+    /// canonical publication fails.
+    #[must_use]
+    pub fn build_with_storage_mib(workload: CanonicalWorkload, storage_mib: usize) -> Self {
+        let storage = TemporaryStorage::scan_store_from_mib(storage_mib)
             .expect("benchmark scan-store capacity should be valid");
         let mut store = ScanStore::new(ScanGeneration::initial(), storage.clone())
             .expect("benchmark store should initialize");
         let (paths, identities, query) = observations_for(workload);
+        let observations = paths.len();
+        let ingestion_cpu_started = process_cpu_time();
+        let ingestion_started = Instant::now();
         let mut paths = paths.into_iter();
         let mut identities = identities.into_iter();
         loop {
@@ -107,19 +268,123 @@ impl CanonicalStoreBenchmark {
                 .append_observation_batch(paths, identities)
                 .expect("benchmark facts should append");
         }
+        let ingestion_elapsed = ingestion_started.elapsed();
+        let ingestion_cpu = elapsed_cpu_since(ingestion_cpu_started);
+        let publication_cpu_started = process_cpu_time();
+        let publication_started = Instant::now();
         store
             .publish()
             .expect("benchmark generation should publish");
+        let publication_elapsed = publication_started.elapsed();
+        let publication_cpu = elapsed_cpu_since(publication_cpu_started);
+        let metrics = benchmark_metrics(
+            &store,
+            &storage,
+            observations,
+            ingestion_elapsed,
+            publication_elapsed,
+            ingestion_cpu,
+            publication_cpu,
+        );
         Self {
             store,
             storage,
             query,
+            metrics,
+        }
+    }
+
+    /// Builds a canonical workload from premerged raw runs.
+    ///
+    /// This isolates reduction and query cost at large scale. It preserves the
+    /// canonical result of bounded scanner batches while intentionally excluding
+    /// their fan-in work, which the bounded workload matrix measures separately.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the storage ceiling cannot hold the generated workload or
+    /// canonical publication fails.
+    #[must_use]
+    pub fn build_premerged(workload: CanonicalWorkload, storage_mib: usize) -> Self {
+        let storage = TemporaryStorage::scan_store_from_mib(storage_mib)
+            .expect("benchmark scan-store capacity should be valid");
+        let mut store = ScanStore::new(ScanGeneration::initial(), storage.clone())
+            .expect("benchmark store should initialize");
+        let (mut paths, mut identities, query) = observations_for(workload);
+        let observations = paths.len();
+        let ingestion_cpu_started = process_cpu_time();
+        let ingestion_started = Instant::now();
+        paths.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        if !paths.is_empty() {
+            let mut writer = store
+                .begin_input_run(RunKind::PathObservation)
+                .expect("benchmark path input run should begin");
+            let mut key = Vec::new();
+            let mut value = Vec::new();
+            for observation in &paths {
+                append_path_observation(&mut writer, observation, &mut key, &mut value)
+                    .expect("benchmark path observation should append");
+            }
+            store
+                .accept_input_run(writer.seal().expect("benchmark path run should seal"))
+                .expect("benchmark path run should be accepted");
+        }
+        identities.sort_unstable_by(compare_identity_observations);
+        if !identities.is_empty() {
+            let mut writer = store
+                .begin_input_run(RunKind::IdentityObservation)
+                .expect("benchmark identity input run should begin");
+            let mut key = Vec::new();
+            let mut value = Vec::new();
+            for observation in &identities {
+                append_identity_observation(&mut writer, observation, &mut key, &mut value)
+                    .expect("benchmark identity observation should append");
+            }
+            store
+                .accept_input_run(writer.seal().expect("benchmark identity run should seal"))
+                .expect("benchmark identity run should be accepted");
+        }
+        let ingestion_elapsed = ingestion_started.elapsed();
+        let ingestion_cpu = elapsed_cpu_since(ingestion_cpu_started);
+        let publication_cpu_started = process_cpu_time();
+        let publication_started = Instant::now();
+        store
+            .publish()
+            .expect("benchmark generation should publish");
+        let publication_elapsed = publication_started.elapsed();
+        let publication_cpu = elapsed_cpu_since(publication_cpu_started);
+        let metrics = benchmark_metrics(
+            &store,
+            &storage,
+            observations,
+            ingestion_elapsed,
+            publication_elapsed,
+            ingestion_cpu,
+            publication_cpu,
+        );
+        Self {
+            store,
+            storage,
+            query,
+            metrics,
         }
     }
 
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
         self.storage.used()
+    }
+
+    /// Returns the high-water mark of scan-store temporary storage during publication.
+    #[must_use]
+    pub fn peak_bytes(&self) -> u64 {
+        self.storage.peak_used()
+    }
+
+    /// Returns logical serialized I/O and process CPU time for this publication.
+    #[must_use]
+    pub const fn metrics(&self) -> CanonicalStoreMetrics {
+        self.metrics
     }
 
     /// Reads a representative bounded page without rebuilding the generation.
@@ -372,4 +637,27 @@ fn relative_path(index: usize) -> RelativePath {
 fn branch_path(index: usize) -> RelativePath {
     let name = format!("branch-{index:08}");
     RelativePath::from_path(Path::new(&name)).expect("benchmark path should be relative")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_publication_reports_input_merge_and_publication_metrics() {
+        let entries = MAX_OBSERVATIONS_PER_BATCH.saturating_mul(8);
+        let fixture = CanonicalStoreBenchmark::build(CanonicalWorkload::Flat { entries });
+        let metrics = fixture.metrics();
+
+        assert_eq!(metrics.observations, entries);
+        assert!(metrics.input_written_bytes > 0);
+        assert!(metrics.merge_read_bytes > 0);
+        assert!(metrics.merge_written_bytes > 0);
+        assert!(metrics.reduction_read_bytes > 0);
+        assert!(metrics.reduction_written_bytes > 0);
+        assert!(metrics.publication_read_bytes > 0);
+        assert!(metrics.publication_written_bytes > 0);
+        assert!(metrics.retained_bytes > 0);
+        assert!(metrics.peak_temporary_bytes >= metrics.retained_bytes);
+    }
 }

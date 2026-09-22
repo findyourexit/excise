@@ -82,7 +82,7 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "s
 tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["user", "signal"] }
+nix = { version = "0.31.3", features = ["resource", "signal", "user"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]

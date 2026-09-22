@@ -10,7 +10,6 @@ use sysinfo::Disks;
 use redb::StorageBackend;
 
 pub(crate) const DEFAULT_TEMPORARY_STORAGE_MIB: usize = 4_096;
-pub(crate) const DEFAULT_SCAN_STORE_MIB: usize = 4_096;
 pub(crate) const MIN_SCAN_STORE_MIB: usize = 2;
 pub(crate) const MIN_TEMPORARY_STORAGE_MIB: usize = 2;
 const MIB: u64 = 1024 * 1024;
@@ -26,6 +25,8 @@ struct TemporaryStorageState {
     capacity_name: &'static str,
     increase_flag: &'static str,
     used: AtomicU64,
+    #[cfg(feature = "internal")]
+    peak_used: AtomicU64,
 }
 
 impl Default for TemporaryStorage {
@@ -45,17 +46,23 @@ impl TemporaryStorage {
         Self::from_mib_named(mib, "scan store", "--scan-store-mib")
     }
 
-    /// Bounds the configured scan-store budget by the free space on its
-    /// actual scratch volume.
-    ///
-    /// The storage limit remains a logical per-session cap, but it can never
-    /// claim more bytes than the filesystem hosting its private run files has
-    /// available when the session starts.
-    pub(crate) fn scan_store_from_mib_for_scratch(mib: usize, scratch: &Path) -> io::Result<Self> {
-        let requested = mib_to_bytes(mib, "scan store")?;
+    /// Bounds an explicit scan-store budget by the safe free capacity on the
+    /// volume that hosts its private run files. An absent budget uses the same
+    /// volume's safe capacity directly. An optional reserve overrides the
+    /// default quarter-free-space reserve without consuming the minimum usable
+    /// scan-store capacity.
+    pub(crate) fn scan_store_from_mib_for_scratch(
+        mib: Option<usize>,
+        reserve_mib: Option<usize>,
+        scratch: &Path,
+    ) -> io::Result<Self> {
+        let requested = mib.map(|mib| mib_to_bytes(mib, "scan store")).transpose()?;
+        let reserve = reserve_mib
+            .map(|mib| mib_to_bytes(mib, "scan-store reserve"))
+            .transpose()?;
         let available = scratch_volume_available_bytes(scratch)?;
         Ok(Self::with_limit_bytes_named(
-            scan_store_limit_bytes(requested, available),
+            scan_store_limit_bytes(requested, reserve, available),
             "scan store",
             "--scan-store-mib",
         ))
@@ -87,11 +94,28 @@ fn mib_to_bytes(mib: usize, capacity_name: &str) -> io::Result<u64> {
         })
 }
 
-const fn scan_store_limit_bytes(requested: u64, available: u64) -> u64 {
-    if requested < available {
-        requested
+const SCAN_STORE_FREE_SPACE_RESERVE_DIVISOR: u64 = 4;
+const MIN_SCAN_STORE_BYTES: u64 = MIB * 2;
+
+const fn scan_store_limit_bytes(
+    requested: Option<u64>,
+    reserve: Option<u64>,
+    available: u64,
+) -> u64 {
+    let desired_reserve = match reserve {
+        Some(reserve) => reserve,
+        None => available / SCAN_STORE_FREE_SPACE_RESERVE_DIVISOR,
+    };
+    let maximum_reserve = available.saturating_sub(MIN_SCAN_STORE_BYTES);
+    let effective_reserve = if desired_reserve < maximum_reserve {
+        desired_reserve
     } else {
-        available
+        maximum_reserve
+    };
+    let safe_available = available.saturating_sub(effective_reserve);
+    match requested {
+        Some(requested) if requested < safe_available => requested,
+        Some(_) | None => safe_available,
     }
 }
 
@@ -154,6 +178,8 @@ impl TemporaryStorage {
                 capacity_name,
                 increase_flag,
                 used: AtomicU64::new(0),
+                #[cfg(feature = "internal")]
+                peak_used: AtomicU64::new(0),
             }),
         }
     }
@@ -185,7 +211,11 @@ impl TemporaryStorage {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    #[cfg(feature = "internal")]
+                    self.state.peak_used.fetch_max(required, Ordering::AcqRel);
+                    return Ok(());
+                }
                 Err(current) => used = current,
             }
         }
@@ -204,6 +234,11 @@ impl TemporaryStorage {
         self.state.used.load(Ordering::Acquire)
     }
 
+    #[cfg(feature = "internal")]
+    #[must_use]
+    pub(crate) fn peak_used(&self) -> u64 {
+        self.state.peak_used.load(Ordering::Acquire)
+    }
     #[must_use]
     pub(crate) fn limit(&self) -> u64 {
         self.state.limit
@@ -451,10 +486,43 @@ mod tests {
         drop(reservation);
         assert_eq!(storage.used(), 0);
     }
+
+    #[cfg(feature = "internal")]
     #[test]
-    fn scan_store_quota_never_exceeds_scratch_volume_capacity() {
-        assert_eq!(scan_store_limit_bytes(8 * MIB, 3 * MIB), 3 * MIB);
-        assert_eq!(scan_store_limit_bytes(2 * MIB, 3 * MIB), 2 * MIB);
+    fn peak_usage_survives_reservation_release() {
+        let storage = TemporaryStorage::with_limit_bytes(8);
+        let first = storage
+            .reservation(5)
+            .expect("first reservation should fit");
+        let second = storage
+            .reservation(2)
+            .expect("second reservation should fit");
+        assert_eq!(storage.peak_used(), 7);
+        drop(second);
+        drop(first);
+        assert_eq!(storage.used(), 0);
+        assert_eq!(storage.peak_used(), 7);
+    }
+
+    #[test]
+    fn scan_store_quota_uses_safe_scratch_capacity() {
+        assert_eq!(scan_store_limit_bytes(None, None, 16 * MIB), 12 * MIB);
+        assert_eq!(
+            scan_store_limit_bytes(Some(14 * MIB), None, 16 * MIB),
+            12 * MIB
+        );
+        assert_eq!(
+            scan_store_limit_bytes(Some(2 * MIB), None, 16 * MIB),
+            2 * MIB
+        );
+        assert_eq!(
+            scan_store_limit_bytes(None, Some(8 * MIB), 16 * MIB),
+            8 * MIB
+        );
+        assert_eq!(
+            scan_store_limit_bytes(None, Some(64 * MIB), 16 * MIB),
+            2 * MIB
+        );
     }
     #[test]
     fn scan_store_scratch_volume_is_discoverable() {

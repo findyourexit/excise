@@ -625,7 +625,7 @@ pub(crate) fn materialize_child_queries(
 impl PublishedGeneration {
     /// Reads one bounded direct-child page from the immutable, publication-time
     /// child-query index. Navigation performs a sparse seek plus at most one
-    /// page of record decoding; it never rescans the canonical fact runs.
+    /// page of record decoding; it never rereads the canonical fact runs.
     ///
     /// # Errors
     ///

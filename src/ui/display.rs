@@ -153,7 +153,7 @@ where
                     debug_assert_eq!(workspace, rendered_workspace);
                     let show_empty_label = file_tree.current_node().state == NodeState::Complete
                         && !file_tree.has_filter();
-                    let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. });
+                    let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rebuilding { .. });
                     let scan = scan_presentation(ui_mode, ui_effects, board, now, animate_loading);
                     let animate_deletion_checker = !ascii
                         && !monochrome
@@ -334,7 +334,7 @@ where
                     }
                     UiMode::Loading
                     | UiMode::Normal
-                    | UiMode::Rescanning { .. }
+                    | UiMode::Rebuilding { .. }
                     | UiMode::FilterInput { .. }
                     | UiMode::ScreenTooSmall => {}
                 }
@@ -437,7 +437,7 @@ fn theme_requires_legacy_normalization(theme: Theme) -> bool {
         theme.state_scanning,
         theme.state_complete,
         theme.state_aggregated,
-        theme.state_rescanning,
+        theme.state_rebuilding,
         theme.state_uncertain,
         theme.state_shared,
         theme.state_excluded,
@@ -466,7 +466,7 @@ fn is_semantic_theme_color(color: Color, theme: Theme) -> bool {
         || color == theme.state_scanning
         || color == theme.state_complete
         || color == theme.state_aggregated
-        || color == theme.state_rescanning
+        || color == theme.state_rebuilding
         || color == theme.state_uncertain
         || color == theme.state_shared
         || color == theme.state_excluded
@@ -552,10 +552,10 @@ fn scan_presentation(
     now: Duration,
     animated: bool,
 ) -> Option<ScanVisual> {
-    let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. });
+    let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rebuilding { .. });
     let reveal_progress = board.scan_reveal_progress(now);
-    let activity = if matches!(ui_mode, UiMode::Rescanning { .. }) {
-        ScanActivity::Rescanning
+    let activity = if matches!(ui_mode, UiMode::Rebuilding { .. }) {
+        ScanActivity::Rebuilding
     } else {
         ScanActivity::Scanning
     };
@@ -763,11 +763,11 @@ fn view_state(
     ascii: bool,
     theme: Theme,
 ) -> (&'static str, &'static str, Color) {
-    if matches!(ui_mode, UiMode::Rescanning { .. }) {
+    if matches!(ui_mode, UiMode::Rebuilding { .. }) {
         return (
             if ascii { "~" } else { "◌" },
-            "RESCANNING",
-            theme.state_rescanning,
+            "REBUILDING",
+            theme.state_rebuilding,
         );
     }
     if matches!(ui_mode, UiMode::Loading) {
@@ -1024,7 +1024,7 @@ fn inspector_action(
     has_verified_preview: bool,
     ascii: bool,
 ) -> &'static str {
-    if matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. }) && !has_verified_preview {
+    if matches!(ui_mode, UiMode::Loading | UiMode::Rebuilding { .. }) && !has_verified_preview {
         return match kind {
             NodeKind::Directory => {
                 if ascii {
@@ -1038,7 +1038,7 @@ fn inspector_action(
         };
     }
     match ui_mode {
-        UiMode::Normal | UiMode::Loading | UiMode::Rescanning { .. } => match kind {
+        UiMode::Normal | UiMode::Loading | UiMode::Rebuilding { .. } => match kind {
             NodeKind::Root => "Scan root · cannot delete",
             NodeKind::Directory | NodeKind::Synthetic(SyntheticKind::Aggregate) => {
                 if ascii {
@@ -1473,8 +1473,8 @@ fn header_status_line(
             || format!("/ {}_  [Enter] apply  [Esc] cancel", display_text(input)),
             |error| format!("/ {}_  ERROR: {}", display_text(input), display_text(error)),
         )),
-        UiMode::Rescanning { target } => Some(status_with_path(
-            "~ RESCANNING ",
+        UiMode::Rebuilding { target } => Some(status_with_path(
+            "~ REBUILDING ",
             target,
             if ascii {
                 " . [Esc] cancel"
@@ -1492,7 +1492,7 @@ fn header_status_line(
     let deletion_status = deletion_work
         .foreground_rail_item()
         .map(|item| deletion_work_status(item, deletion_work.len(), ascii));
-    let transient_status = (if matches!(ui_mode, UiMode::Loading | UiMode::Rescanning { .. }) {
+    let transient_status = (if matches!(ui_mode, UiMode::Loading | UiMode::Rebuilding { .. }) {
         deletion_status.or(mode_status)
     } else {
         mode_status.or(deletion_status)
@@ -1659,7 +1659,7 @@ fn command_hint_line(movement: &str, width: u16, theme: Theme) -> Line<'_> {
         },
         ControlHint {
             key: "Enter",
-            detail: "open/rescan",
+            detail: "open",
         },
         ControlHint {
             key: "/",
@@ -1871,8 +1871,8 @@ fn status_with_safety(
     {
         return format!("{DECEPTIVE_DISPLAY_MARKER} {label} {separator} {status}");
     }
-    if let Some(status) = status.strip_prefix("! ~ RESCANNING ") {
-        return format!("! {label} {separator} ~ RESCANNING {status}");
+    if let Some(status) = status.strip_prefix("! ~ REBUILDING ") {
+        return format!("! {label} {separator} ~ REBUILDING {status}");
     }
     if let Some(status) = status.strip_prefix("! ~ SCANNING ") {
         return format!("! {label} {separator} ~ SCANNING {status}");
@@ -2204,7 +2204,7 @@ mod tests {
         let action = command
             .spans
             .iter()
-            .find(|span| span.content.as_ref() == "open/rescan")
+            .find(|span| span.content.as_ref() == "open")
             .expect("wide footer should include the Enter action");
 
         assert_eq!(enter.style.fg, Some(theme.focus));
@@ -2222,7 +2222,7 @@ mod tests {
 
         assert_eq!(footer_text, " Enter apply  Esc cancel");
         assert!(!footer_text.contains("store "));
-        assert!(!footer_text.contains("open/rescan"));
+        assert!(!footer_text.contains("Enter open"));
         for key in ["Enter", "Esc"] {
             let span = footer
                 .spans
@@ -2326,7 +2326,8 @@ mod tests {
     fn command_hints_reserve_the_entire_footer_for_controls() {
         let theme = Theme::for_id(ThemeId::ExciseDark);
         let movement = "arrows/hjkl";
-        let expected = " arrows/hjkl move  Enter open/rescan  / filter  e export  t theme  Backspace delete  ? help";
+        let expected =
+            " arrows/hjkl move  Enter open  / filter  e export  t theme  Backspace delete  ? help";
         let width = u16::try_from(expected.width()).expect("control hints should fit u16");
 
         let command = line_text(&command_hint_line(movement, width, theme));
@@ -2342,7 +2343,7 @@ mod tests {
         for width in [44, 54, 64, 73, 80, 90] {
             let command = line_text(&command_hint_line(movement, width, theme));
             assert!(
-                command.contains("Enter open/rescan"),
+                command.contains("Enter open"),
                 "wrong Enter action at width {width}: {command:?}"
             );
             assert!(command.width() <= usize::from(width));
@@ -2944,7 +2945,7 @@ mod tests {
         );
         assert_eq!(
             inspector_action(
-                &UiMode::Rescanning {
+                &UiMode::Rebuilding {
                     target: std::path::PathBuf::new(),
                 },
                 NodeKind::File,
@@ -3136,7 +3137,7 @@ mod tests {
     fn safety_labels_survive_every_transient_status() {
         for status in [
             "~ SCANNING",
-            "~ RESCANNING /target · deletion locked",
+            "~ REBUILDING /target · deletion locked",
             "/ filter_  [Enter] apply",
             "? 2 unreadable entries",
             "Small entries are a viewport summary",
@@ -3169,7 +3170,7 @@ mod tests {
     fn deceptive_status_marker_stays_visible_when_narrow() {
         let path = Path::new("status-\u{202e}hostile");
         for width in [1, 5, 10, 11, 12, 24] {
-            let rendered = status_with_path("~ RESCANNING ", path, "", width);
+            let rendered = status_with_path("~ REBUILDING ", path, "", width);
             assert!(!rendered.chars().any(char::is_control));
             assert!(!rendered.contains('\u{202e}'));
             assert!(
@@ -3177,10 +3178,10 @@ mod tests {
                 "deception marker lost at width {width}: {rendered:?}"
             );
         }
-        let marked = status_with_path("~ RESCANNING ", path, "", 80);
+        let marked = status_with_path("~ REBUILDING ", path, "", 80);
         let marked_with_safety = status_with_safety(marked, true, true, 80, false);
         assert!(marked_with_safety.starts_with(DECEPTIVE_DISPLAY_MARKER));
-        let compact = status_with_path("~ RESCANNING ", path, "", 5);
+        let compact = status_with_path("~ REBUILDING ", path, "", 5);
         let compact_with_safety = status_with_safety(compact, true, true, 5, false);
         assert!(compact_with_safety.starts_with('!'));
     }

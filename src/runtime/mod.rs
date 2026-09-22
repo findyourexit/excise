@@ -6,6 +6,8 @@ use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[cfg(feature = "internal")]
+use std::time::Instant;
 
 use crossbeam_channel::{RecvTimeoutError, TryRecvError};
 use crossterm::event::Event;
@@ -58,7 +60,8 @@ pub struct RuntimeSettings {
     pub exclusions: Vec<String>,
     pub memory_mib: usize,
     pub temporary_storage_mib: usize,
-    pub scan_store_mib: usize,
+    pub scan_store_mib: Option<usize>,
+    pub scan_store_reserve_mib: Option<usize>,
     pub scan_store_dir: Option<PathBuf>,
     pub apparent_size: bool,
     pub disable_delete_confirmation: bool,
@@ -151,9 +154,9 @@ where
     /// Scanner entries queued for one bounded owner scheduling slice.
     pending_scan_entries: VecDeque<ScannedEntry>,
     scan_cancelled: bool,
-    rescan_active: bool,
+    generation_rebuild_active: bool,
     /// Root currently owned by the scan rebuild, if any.
-    rescan_target: Option<PathBuf>,
+    generation_rebuild_target: Option<PathBuf>,
     cancelled_while_scanning: bool,
     exit_after_work: bool,
     timed_actions: Vec<ScheduledAction>,
@@ -180,6 +183,7 @@ where
         .map_err(|error| AppError::Config(error.to_string()))?;
     let scan_store_session = ScanStoreStorage::new_for_scan_store_mib(
         settings.scan_store_mib,
+        settings.scan_store_reserve_mib,
         settings.scan_store_dir.as_deref(),
     )
     .map_err(|error| AppError::Config(error.to_string()))?;
@@ -203,7 +207,6 @@ where
             session: app.scan_session_id(),
             generation: input_runs.generation(),
             root: settings.root.clone(),
-            canonical_root: settings.root.clone(),
             root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
             cross_filesystems: settings.cross_filesystems,
@@ -233,8 +236,8 @@ where
         scan_view_root,
         pending_scan_entries: VecDeque::new(),
         scan_cancelled: false,
-        rescan_active: false,
-        rescan_target: None,
+        generation_rebuild_active: false,
+        generation_rebuild_target: None,
         cancelled_while_scanning: false,
         exit_after_work: false,
         timed_actions: Vec::new(),
@@ -395,9 +398,9 @@ where
                 self.app.set_path_to_red();
                 self.schedule(now, TimedAction::ResetPathColor, TRANSIENT_STATUS_DURATION);
             }
-            InputCommand::CancelRescan => {
-                if self.rescan_active {
-                    self.workers()?.cancel_rescan();
+            InputCommand::CancelGenerationRebuild => {
+                if self.generation_rebuild_active {
+                    self.workers()?.cancel_generation_rebuild();
                 }
             }
             InputCommand::RequestDeletion(target) => {
@@ -417,12 +420,13 @@ where
             }
             InputCommand::ConfirmDeletion { work_id, target } => {
                 let target_path = target.full_path();
-                let overlaps_scan_rebuild = self.rescan_target.as_ref().is_some_and(|root| {
-                    target_path.starts_with(root) || root.starts_with(&target_path)
-                });
+                let overlaps_scan_rebuild =
+                    self.generation_rebuild_target.as_ref().is_some_and(|root| {
+                        target_path.starts_with(root) || root.starts_with(&target_path)
+                    });
                 if self.app.queue_confirmed_deletion(work_id, target, now) {
                     if overlaps_scan_rebuild {
-                        self.workers()?.cancel_rescan();
+                        self.workers()?.cancel_generation_rebuild();
                     }
                     self.start_next_deletion_planning()?;
                 }
@@ -569,7 +573,7 @@ where
     /// Rebuilds an invalidated canonical generation once no scan scope owns
     /// the scanner. Primary scan outputs remain isolated from this new factory.
     fn start_pending_generation_rebuild(&mut self) -> Result<bool, AppError> {
-        if self.primary_scan_active || self.rescan_active || self.workers.is_none() {
+        if self.primary_scan_active || self.generation_rebuild_active || self.workers.is_none() {
             return Ok(false);
         }
         if !self.app.begin_generation_rebuild()? {
@@ -581,7 +585,6 @@ where
             session: self.app.scan_session_id(),
             generation: input_runs.generation(),
             root: root.clone(),
-            canonical_root: root.clone(),
             root_identity: Some(self.settings.root_identity.clone()),
             threads: self.settings.scan_threads,
             cross_filesystems: self.settings.cross_filesystems,
@@ -590,14 +593,14 @@ where
             temporary_storage: self.scan_store_storage.clone(),
             input_runs: Some(input_runs),
         };
-        if let Err(error) = self.workers()?.request_rescan(options) {
-            self.app.cancel_rescan()?;
+        if let Err(error) = self.workers()?.request_generation_rebuild(options) {
+            self.app.cancel_generation_rebuild()?;
             return Err(error);
         }
         self.scan_view_root.clone_from(&root);
         self.scan_active = true;
-        self.rescan_active = true;
-        self.rescan_target = Some(root);
+        self.generation_rebuild_active = true;
+        self.generation_rebuild_target = Some(root);
         self.next_loading_frame = self.clock.now().saturating_add(LOADING_FRAME_INTERVAL);
         Ok(true)
     }
@@ -642,7 +645,7 @@ where
 
     fn finish_exit_after_work(&mut self) {
         if !self.exit_after_work
-            || self.rescan_active
+            || self.generation_rebuild_active
             || self.app.deletion_work.has_work()
             || self.app.has_deletion_departure()
         {
@@ -751,7 +754,7 @@ where
     ) -> Result<(), AppError> {
         self.admit_coverage_runs(lease, input_runs)?;
         self.scan_view_dirty |= path.starts_with(&self.scan_view_root);
-        if self.rescan_active {
+        if self.generation_rebuild_active {
             return Ok(());
         }
         self.summary.unscanned_entries = self.summary.unscanned_entries.saturating_add(1);
@@ -781,8 +784,8 @@ where
         Ok(())
     }
 
-    fn handle_scan_failure(&mut self, path: Option<&Path>, message: &str, rescan: bool) {
-        if !rescan {
+    fn handle_scan_failure(&mut self, path: Option<&Path>, message: &str, rebuild_active: bool) {
+        if !rebuild_active {
             self.scan_view_dirty |= path.is_some_and(|path| path.starts_with(&self.scan_view_root));
         }
         self.app.record_scan_store_unrecorded_path();
@@ -793,7 +796,7 @@ where
         self.summary.last_unreadable_path = self.summary.last_unscanned_path.clone();
         self.summary.last_unscanned_reason = Some(message.clone());
         self.summary.last_worker_error = Some(message);
-        if !rescan {
+        if !rebuild_active {
             self.app.increment_failed_to_read();
         }
         self.animation.schedule_error();
@@ -802,7 +805,7 @@ where
     fn finish_primary_scan(&mut self, cancelled: bool) -> Result<(), AppError> {
         self.primary_scan_active = false;
         self.scan_view_dirty = false;
-        if !self.rescan_active {
+        if !self.generation_rebuild_active {
             self.scan_active = false;
         }
         self.scan_cancelled = cancelled;
@@ -820,16 +823,19 @@ where
         Ok(())
     }
 
-    fn finish_rescan(&mut self, cancelled: bool) -> Result<(), AppError> {
-        self.rescan_active = false;
-        self.rescan_target = None;
+    fn finish_generation_rebuild(&mut self, cancelled: bool) -> Result<(), AppError> {
+        self.generation_rebuild_active = false;
+        self.generation_rebuild_target = None;
+        if let Some(workers) = self.workers.as_ref() {
+            workers.finish_generation_rebuild();
+        }
         if !self.primary_scan_active {
             self.scan_active = false;
         }
         if cancelled {
-            self.app.cancel_rescan()?;
+            self.app.cancel_generation_rebuild()?;
         } else {
-            self.app.finish_rescan()?;
+            self.app.finish_generation_rebuild()?;
         }
         let (used, limit) = self.app.scan_store_stats();
         self.summary.scan_store_bytes = used;
@@ -871,11 +877,11 @@ where
                 self.handle_primary_unscanned(lease.as_ref(), input_runs, &path, &reason)?;
             }
             WorkerEvent::ScanFailed { path, message } => {
-                self.handle_scan_failure(path.as_deref(), &message, self.rescan_active);
+                self.handle_scan_failure(path.as_deref(), &message, self.generation_rebuild_active);
             }
             WorkerEvent::ScanFinished { cancelled } => {
-                if self.rescan_active {
-                    self.finish_rescan(cancelled)?;
+                if self.generation_rebuild_active {
+                    self.finish_generation_rebuild(cancelled)?;
                 } else {
                     self.finish_primary_scan(cancelled)?;
                 }
@@ -1204,6 +1210,159 @@ where
             .ok_or_else(|| AppError::Invariant("worker pool unavailable".to_string()))
     }
 }
+
+/// Internal scanner probe used only by the Criterion benchmark harness.
+#[cfg(feature = "internal")]
+pub(crate) struct BenchmarkScan {
+    options: scanner::ScannerOptions,
+    workers: Option<WorkerPool>,
+}
+
+#[cfg(feature = "internal")]
+impl BenchmarkScan {
+    const EVENT_CAPACITY: usize = 4_096;
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+
+    pub(crate) fn start(root: &Path, threads: usize) -> Result<Self, AppError> {
+        let options = scanner::ScannerOptions {
+            session: crate::scan_session::ScanSessionId::random().map_err(|error| {
+                AppError::Worker(format!("could not create benchmark scan session: {error}"))
+            })?,
+            generation: ScanGeneration::initial(),
+            root: root.to_path_buf(),
+            root_identity: None,
+            threads,
+            cross_filesystems: false,
+            exclusions: Vec::new(),
+            internal_paths: Vec::new(),
+            temporary_storage: TemporaryStorage::default(),
+            input_runs: None,
+        };
+        let workers = WorkerPool::start_with_deletion_storage(
+            options.clone(),
+            TemporaryStorage::default(),
+            Self::EVENT_CAPACITY,
+        )?;
+        Ok(Self {
+            options,
+            workers: Some(workers),
+        })
+    }
+
+    pub(crate) fn scan_to_completion(root: &Path, threads: usize) -> Result<usize, AppError> {
+        let mut scan = Self::start(root, threads)?;
+        let result = scan.await_scan_finished(false);
+        scan.shutdown()?;
+        result
+    }
+
+    pub(crate) fn complete_initial_scan(&self) -> Result<usize, AppError> {
+        self.await_scan_finished(false)
+    }
+
+    pub(crate) fn focus_latency(&self, paths: &[PathBuf]) -> Result<Duration, AppError> {
+        let workers = self.workers()?;
+        let waiting_started = Instant::now();
+        let snapshot = loop {
+            if let Some(snapshot) = workers.scheduler_snapshot() {
+                break snapshot;
+            }
+            if waiting_started.elapsed() >= Self::COMPLETION_TIMEOUT {
+                return Err(AppError::Worker(
+                    "scanner benchmark did not publish a scheduler snapshot".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        };
+        let initial_epoch = snapshot.focus_epoch();
+        let started = Instant::now();
+        for path in paths {
+            workers.prioritize_scan(path);
+        }
+        let required = u64::try_from(paths.len()).unwrap_or(u64::MAX);
+        loop {
+            if workers.scheduler_snapshot().is_some_and(|snapshot| {
+                snapshot.focus_epoch().wrapping_sub(initial_epoch) >= required
+            }) {
+                return Ok(started.elapsed());
+            }
+            if started.elapsed() >= Self::COMPLETION_TIMEOUT {
+                return Err(AppError::Worker(
+                    "scanner benchmark did not process all focus requests".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+
+    pub(crate) fn cancel_rebuild_latency(&self) -> Result<Duration, AppError> {
+        let workers = self.workers()?;
+        workers.request_generation_rebuild(self.options.clone())?;
+        let started = Instant::now();
+        workers.cancel_generation_rebuild();
+        let result = self.await_scan_finished(true).map(|_| started.elapsed());
+        workers.finish_generation_rebuild();
+        result
+    }
+
+    fn workers(&self) -> Result<&WorkerPool, AppError> {
+        self.workers
+            .as_ref()
+            .ok_or_else(|| AppError::Invariant("scanner benchmark has already stopped".to_string()))
+    }
+
+    fn await_scan_finished(&self, expected_cancelled: bool) -> Result<usize, AppError> {
+        let workers = self.workers()?;
+        let mut entries = 0_usize;
+        loop {
+            match workers.events().recv_timeout(Self::COMPLETION_TIMEOUT) {
+                Ok(WorkerEvent::ScanBatch { entries: batch, .. }) => {
+                    entries = entries.saturating_add(batch.len());
+                }
+                Ok(WorkerEvent::ScanFinished { cancelled }) if cancelled == expected_cancelled => {
+                    return Ok(entries);
+                }
+                Ok(WorkerEvent::ScanFinished { cancelled }) => {
+                    return Err(AppError::Worker(format!(
+                        "scanner benchmark completed with cancelled={cancelled}, expected {expected_cancelled}"
+                    )));
+                }
+                Ok(WorkerEvent::ScanFailed { message, .. }) => {
+                    return Err(AppError::Worker(format!(
+                        "scanner benchmark failed: {message}"
+                    )));
+                }
+                Ok(
+                    WorkerEvent::ScanUnscanned { .. }
+                    | WorkerEvent::DeletionPlanned { .. }
+                    | WorkerEvent::DeletionExecutionRejected { .. }
+                    | WorkerEvent::DeletionFinished { .. },
+                ) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(AppError::Worker(
+                        "scanner benchmark timed out waiting for completion".to_string(),
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(AppError::Worker(
+                        "scanner benchmark worker disconnected".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), AppError> {
+        self.workers.take().map_or(Ok(()), WorkerPool::shutdown)
+    }
+}
+
+#[cfg(feature = "internal")]
+impl Drop for BenchmarkScan {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
 fn export_notice(prefix: &str, path: &Path) -> String {
     format!("{prefix} {}", safe_display_path_text(path))
 }
@@ -1252,6 +1411,7 @@ fn summary_only_scan_outcome(
 pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanReport>, AppError> {
     let scan_store_session = ScanStoreStorage::new_for_scan_store_mib(
         settings.scan_store_mib,
+        settings.scan_store_reserve_mib,
         settings.scan_store_dir.as_deref(),
     )
     .map_err(|error| AppError::Config(error.to_string()))?;
@@ -1287,7 +1447,6 @@ fn scan_headless_with_scan_store_session(
             session: scan_store.session(),
             generation: input_runs.generation(),
             root: settings.root.clone(),
-            canonical_root: settings.root.clone(),
             root_identity: Some(settings.root_identity.clone()),
             threads: settings.scan_threads,
             cross_filesystems: settings.cross_filesystems,
@@ -1601,7 +1760,6 @@ mod tests {
                 session: app.scan_session_id(),
                 generation: ScanGeneration::initial(),
                 root: root.path().to_path_buf(),
-                canonical_root: root.path().to_path_buf(),
                 root_identity: Some(root_identity.clone()),
                 threads: 1,
                 cross_filesystems: false,
@@ -1628,7 +1786,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
-                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_mib: Some(4_096),
+                scan_store_reserve_mib: None,
                 scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
@@ -1643,10 +1802,8 @@ mod tests {
                 config_path: None,
                 monochrome_locked: true,
             },
-            scan_store_storage: TemporaryStorage::scan_store_from_mib(
-                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
-            )
-            .expect("default scan-store capacity should fit"),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(4_096)
+                .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: true,
             scheduler_snapshot: None,
@@ -1655,8 +1812,8 @@ mod tests {
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
             scan_cancelled: false,
-            rescan_active: false,
-            rescan_target: None,
+            generation_rebuild_active: false,
+            generation_rebuild_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
             timed_actions: Vec::new(),
@@ -1739,7 +1896,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
-                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_mib: Some(4_096),
+                scan_store_reserve_mib: None,
                 scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
@@ -1754,10 +1912,8 @@ mod tests {
                 config_path: None,
                 monochrome_locked: true,
             },
-            scan_store_storage: TemporaryStorage::scan_store_from_mib(
-                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
-            )
-            .expect("default scan-store capacity should fit"),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(4_096)
+                .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: true,
             scheduler_snapshot: None,
@@ -1766,8 +1922,8 @@ mod tests {
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
             scan_cancelled: false,
-            rescan_active: false,
-            rescan_target: None,
+            generation_rebuild_active: false,
+            generation_rebuild_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
             timed_actions: Vec::new(),
@@ -1884,7 +2040,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
-                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_mib: Some(4_096),
+                scan_store_reserve_mib: None,
                 scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
@@ -1899,10 +2056,8 @@ mod tests {
                 config_path: None,
                 monochrome_locked: false,
             },
-            scan_store_storage: TemporaryStorage::scan_store_from_mib(
-                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
-            )
-            .expect("default scan-store capacity should fit"),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(4_096)
+                .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: true,
             scheduler_snapshot: None,
@@ -1911,8 +2066,8 @@ mod tests {
             scan_view_root,
             pending_scan_entries,
             scan_cancelled: false,
-            rescan_active: false,
-            rescan_target: None,
+            generation_rebuild_active: false,
+            generation_rebuild_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
             timed_actions: Vec::new(),
@@ -1994,7 +2149,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::MIN_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
-                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_mib: Some(4_096),
+                scan_store_reserve_mib: None,
                 scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
@@ -2009,10 +2165,8 @@ mod tests {
                 config_path: None,
                 monochrome_locked: false,
             },
-            scan_store_storage: TemporaryStorage::scan_store_from_mib(
-                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
-            )
-            .expect("default scan-store capacity should fit"),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(4_096)
+                .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: false,
             scheduler_snapshot: None,
@@ -2021,8 +2175,8 @@ mod tests {
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
             scan_cancelled: false,
-            rescan_active: false,
-            rescan_target: None,
+            generation_rebuild_active: false,
+            generation_rebuild_target: None,
             cancelled_while_scanning: false,
             exit_after_work: false,
             timed_actions: Vec::new(),
@@ -2168,7 +2322,8 @@ mod tests {
                 exclusions: Vec::new(),
                 memory_mib: crate::model::DEFAULT_PROCESS_MIB,
                 temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
-                scan_store_mib: crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
+                scan_store_mib: Some(4_096),
+                scan_store_reserve_mib: None,
                 scan_store_dir: None,
                 apparent_size: false,
                 disable_delete_confirmation: false,
@@ -2183,10 +2338,8 @@ mod tests {
                 config_path: None,
                 monochrome_locked: false,
             },
-            scan_store_storage: TemporaryStorage::scan_store_from_mib(
-                crate::temporary_storage::DEFAULT_SCAN_STORE_MIB,
-            )
-            .expect("default scan-store capacity should fit"),
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(4_096)
+                .expect("default scan-store capacity should fit"),
             summary: RunSummary::default(),
             scan_active: true,
             scheduler_snapshot: None,
@@ -2195,8 +2348,8 @@ mod tests {
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
             scan_cancelled: false,
-            rescan_active: true,
-            rescan_target: Some(root.path().to_path_buf()),
+            generation_rebuild_active: true,
+            generation_rebuild_target: Some(root.path().to_path_buf()),
             cancelled_while_scanning: false,
             exit_after_work: false,
             timed_actions: Vec::new(),
@@ -2221,8 +2374,8 @@ mod tests {
                 .begin_generation_rebuild()
                 .expect("rebuild should restart")
         );
-        owner.rescan_active = true;
-        owner.rescan_target = Some(root.path().to_path_buf());
+        owner.generation_rebuild_active = true;
+        owner.generation_rebuild_target = Some(root.path().to_path_buf());
         owner.scan_active = true;
         owner
             .handle_worker_event(WorkerEvent::ScanFinished { cancelled: false })
@@ -2287,7 +2440,8 @@ mod tests {
             exclusions: Vec::new(),
             memory_mib: crate::model::MIN_PROCESS_MIB,
             temporary_storage_mib: crate::temporary_storage::MIN_TEMPORARY_STORAGE_MIB,
-            scan_store_mib: crate::temporary_storage::MIN_SCAN_STORE_MIB,
+            scan_store_mib: Some(crate::temporary_storage::MIN_SCAN_STORE_MIB),
+            scan_store_reserve_mib: None,
             scan_store_dir: None,
             apparent_size: false,
             disable_delete_confirmation: false,

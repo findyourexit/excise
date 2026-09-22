@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 use crate::native_path::{safe_display_path_text, safe_display_text};
 use crate::temporary_storage::{
-    DEFAULT_SCAN_STORE_MIB, DEFAULT_TEMPORARY_STORAGE_MIB, MIN_SCAN_STORE_MIB,
-    MIN_TEMPORARY_STORAGE_MIB,
+    DEFAULT_TEMPORARY_STORAGE_MIB, MIN_SCAN_STORE_MIB, MIN_TEMPORARY_STORAGE_MIB,
 };
 use crate::theme::ThemeId;
 
@@ -199,6 +198,9 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     /// Parent directory for the private canonical scan-store session
     pub scan_store_dir: Option<PathBuf>,
+    #[arg(long, value_name = "MIB")]
+    /// Scratch space preserved outside scan-store files (default: 25% of free space)
+    pub scan_store_reserve_mib: Option<usize>,
     #[arg(long)]
     /// Disable nonessential motion
     pub reduced_motion: bool,
@@ -257,6 +259,7 @@ pub struct ModelFileConfig {
     pub temporary_storage_mib: Option<usize>,
     pub scan_store_mib: Option<usize>,
     pub scan_store_dir: Option<PathBuf>,
+    pub scan_store_reserve_mib: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -284,6 +287,7 @@ pub struct EnvironmentOverrides {
     pub memory_mib: Option<usize>,
     pub temporary_storage_mib: Option<usize>,
     pub scan_store_mib: Option<usize>,
+    pub scan_store_reserve_mib: Option<usize>,
     pub scan_store_dir: Option<PathBuf>,
     pub monochrome: bool,
     pub theme: Option<ThemeId>,
@@ -304,7 +308,8 @@ pub struct RuntimeConfig {
     pub exclusions: Vec<String>,
     pub memory_mib: usize,
     pub temporary_storage_mib: usize,
-    pub scan_store_mib: usize,
+    pub scan_store_mib: Option<usize>,
+    pub scan_store_reserve_mib: Option<usize>,
     pub scan_store_dir: Option<PathBuf>,
     pub apparent_size: bool,
     pub reduced_motion: bool,
@@ -395,8 +400,11 @@ impl RuntimeConfig {
         let scan_store_mib = cli
             .scan_store_mib
             .or(environment.scan_store_mib)
-            .or_else(|| file_model.and_then(|model| model.scan_store_mib))
-            .unwrap_or(DEFAULT_SCAN_STORE_MIB);
+            .or_else(|| file_model.and_then(|model| model.scan_store_mib));
+        let scan_store_reserve_mib = cli
+            .scan_store_reserve_mib
+            .or(environment.scan_store_reserve_mib)
+            .or_else(|| file_model.and_then(|model| model.scan_store_reserve_mib));
         let scan_store_dir = cli
             .scan_store_dir
             .or(environment.scan_store_dir)
@@ -415,12 +423,22 @@ impl RuntimeConfig {
             MIN_TEMPORARY_STORAGE_MIB,
             MAX_TEMPORARY_STORAGE_MIB,
         )?;
-        validate_range(
-            "scan store",
-            scan_store_mib,
-            MIN_SCAN_STORE_MIB,
-            MAX_TEMPORARY_STORAGE_MIB,
-        )?;
+        if let Some(scan_store_mib) = scan_store_mib {
+            validate_range(
+                "scan store",
+                scan_store_mib,
+                MIN_SCAN_STORE_MIB,
+                MAX_TEMPORARY_STORAGE_MIB,
+            )?;
+        }
+        if let Some(scan_store_reserve_mib) = scan_store_reserve_mib {
+            validate_range(
+                "scan-store reserve",
+                scan_store_reserve_mib,
+                0,
+                MAX_TEMPORARY_STORAGE_MIB,
+            )?;
+        }
 
         let apparent_size = cli.apparent_size
             || environment
@@ -490,6 +508,7 @@ impl RuntimeConfig {
             memory_mib,
             temporary_storage_mib,
             scan_store_mib,
+            scan_store_reserve_mib,
             scan_store_dir,
             apparent_size,
             cross_filesystems,
@@ -542,6 +561,7 @@ impl EnvironmentOverrides {
             memory_mib: parse_usize_env("EXCISE_MEMORY_MIB")?,
             temporary_storage_mib: parse_usize_env("EXCISE_TEMPORARY_STORAGE_MIB")?,
             scan_store_mib: parse_usize_env("EXCISE_SCAN_STORE_MIB")?,
+            scan_store_reserve_mib: parse_usize_env("EXCISE_SCAN_STORE_RESERVE_MIB")?,
             scan_store_dir: env::var_os("EXCISE_SCAN_STORE_DIR")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),

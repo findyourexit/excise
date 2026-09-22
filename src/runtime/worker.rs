@@ -9,7 +9,7 @@ use crossbeam_channel::{
     Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
 };
 
-use super::scanner::{self, ScannerOptions, SchedulerHandle};
+use super::scanner::{self, ScannerHandle, ScannerOptions, ScannerRequestError};
 use crate::deletion::{
     DeletionPlan, DeletionPlanError, DeletionReport,
     build_plan_cancellable_with_root_identity_and_temporary_storage,
@@ -88,10 +88,6 @@ enum ExecutorCommand {
     },
 }
 
-enum RescanCommand {
-    Rescan(ScannerOptions),
-}
-
 pub(crate) enum DeletionWorkSubmissionError {
     Busy(Box<DeletionWorkCommand>),
     Disconnected,
@@ -103,16 +99,13 @@ pub struct WorkerPool {
     events: Receiver<WorkerEvent>,
     planner_commands: Sender<PlannerCommand>,
     executor_commands: Sender<ExecutorCommand>,
-    rescan_commands: Sender<RescanCommand>,
     cancelled: Arc<AtomicBool>,
     deletion_plan_cancelled: Arc<AtomicBool>,
     deletion_soft_cancelled: Arc<AtomicBool>,
-    rescan_cancelled: Arc<AtomicBool>,
-    scheduler: SchedulerHandle,
+    scanner: ScannerHandle,
     scan_session: ScanSessionId,
     scanner_handle: thread::JoinHandle<()>,
     planner_handle: thread::JoinHandle<()>,
-    rescan_handle: thread::JoinHandle<()>,
     executor_handle: thread::JoinHandle<()>,
 }
 
@@ -142,17 +135,15 @@ impl WorkerPool {
         let (event_sender, events) = bounded(event_capacity);
         let (planner_commands, planner_receiver) = bounded(MAX_DELETION_WORK_ITEMS);
         let (executor_commands, executor_receiver) = bounded(1);
-        let (rescan_commands, rescan_receiver) = bounded(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let deletion_plan_cancelled = Arc::new(AtomicBool::new(false));
         let deletion_soft_cancelled = Arc::new(AtomicBool::new(false));
-        let rescan_cancelled = Arc::new(AtomicBool::new(false));
         let scan_root = scanner_options.root.clone();
         let scan_root_identity = scanner_options.root_identity.clone();
         let temporary_storage = deletion_storage;
         let scan_session = scanner_options.session;
 
-        let (scanner, scheduler) = scanner::spawn(
+        let (scanner_handle, scanner) = scanner::spawn(
             scanner_options,
             event_sender.clone(),
             Arc::clone(&cancelled),
@@ -183,25 +174,8 @@ impl WorkerPool {
             Err(error) => {
                 cancelled.store(true, Ordering::Release);
                 drop(events);
-                let _ = scanner.join();
+                let _ = scanner_handle.join();
                 return Err(AppError::io("could not spawn deletion planner", error));
-            }
-        };
-        let rescanner = match thread::Builder::new()
-            .name("excise-scan-rebuild".to_string())
-            .spawn({
-                let sender = event_sender.clone();
-                let cancelled = Arc::clone(&cancelled);
-                let rescan_cancelled = Arc::clone(&rescan_cancelled);
-                move || rescan_worker(&rescan_receiver, &sender, &rescan_cancelled, &cancelled)
-            }) {
-            Ok(handle) => handle,
-            Err(error) => {
-                cancelled.store(true, Ordering::Release);
-                drop(events);
-                let _ = scanner.join();
-                let _ = planner.join();
-                return Err(AppError::io("could not spawn scan rebuild worker", error));
             }
         };
         let executor = match thread::Builder::new()
@@ -225,9 +199,8 @@ impl WorkerPool {
             Err(error) => {
                 cancelled.store(true, Ordering::Release);
                 drop(events);
-                let _ = scanner.join();
+                let _ = scanner_handle.join();
                 let _ = planner.join();
-                let _ = rescanner.join();
                 return Err(AppError::io("could not spawn deletion executor", error));
             }
         };
@@ -236,16 +209,13 @@ impl WorkerPool {
             events,
             planner_commands,
             executor_commands,
-            rescan_commands,
             cancelled,
             deletion_plan_cancelled,
             deletion_soft_cancelled,
-            rescan_cancelled,
-            scheduler,
+            scanner,
             scan_session,
-            scanner_handle: scanner,
+            scanner_handle,
             planner_handle: planner,
-            rescan_handle: rescanner,
             executor_handle: executor,
         })
     }
@@ -257,13 +227,13 @@ impl WorkerPool {
 
     /// Prioritizes a visible directory through the bounded scheduler control channel.
     pub fn prioritize_scan(&self, path: &Path) {
-        self.scheduler.prioritize(path);
+        self.scanner.prioritize(path);
     }
 
     /// Returns the latest coalesced scan scheduler state without consuming a worker event.
     #[must_use]
     pub(crate) fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
-        self.scheduler.snapshot()
+        self.scanner.scheduler_snapshot()
     }
 
     pub(crate) fn submit_deletion_work(
@@ -343,23 +313,26 @@ impl WorkerPool {
         self.deletion_plan_cancelled.store(true, Ordering::Release);
     }
 
-    pub fn request_rescan(&self, mut options: ScannerOptions) -> Result<(), AppError> {
+    pub fn request_generation_rebuild(&self, mut options: ScannerOptions) -> Result<(), AppError> {
         options.session = self.scan_session;
-        self.rescan_cancelled.store(false, Ordering::Release);
-        self.rescan_commands
-            .try_send(RescanCommand::Rescan(options))
+        self.scanner
+            .request_rebuild(options)
             .map_err(|error| match error {
-                TrySendError::Full(_) => {
+                ScannerRequestError::Busy => {
                     AppError::Invariant("scan rebuild queue is full".to_string())
                 }
-                TrySendError::Disconnected(_) => {
-                    AppError::Worker("scan rebuild worker disconnected".to_string())
+                ScannerRequestError::Disconnected => {
+                    AppError::Worker("scanner worker disconnected".to_string())
                 }
             })
     }
 
-    pub fn cancel_rescan(&self) {
-        self.rescan_cancelled.store(true, Ordering::Release);
+    pub fn cancel_generation_rebuild(&self) {
+        self.scanner.cancel_rebuild();
+    }
+
+    pub fn finish_generation_rebuild(&self) {
+        self.scanner.complete_rebuild();
     }
 
     pub fn shutdown(self) -> Result<(), AppError> {
@@ -367,36 +340,29 @@ impl WorkerPool {
             events,
             planner_commands,
             executor_commands,
-            rescan_commands,
             cancelled,
             deletion_plan_cancelled,
             deletion_soft_cancelled,
-            rescan_cancelled,
-            scheduler,
+            scanner,
             scan_session: _,
             scanner_handle,
             planner_handle,
-            rescan_handle,
             executor_handle,
         } = self;
         cancelled.store(true, Ordering::Release);
         deletion_plan_cancelled.store(true, Ordering::Release);
         deletion_soft_cancelled.store(true, Ordering::Release);
-        rescan_cancelled.store(true, Ordering::Release);
+        scanner.cancel_rebuild();
         drop(events);
         drop(planner_commands);
         drop(executor_commands);
-        drop(scheduler);
-        drop(rescan_commands);
+        drop(scanner);
         scanner_handle
             .join()
             .map_err(|_| AppError::Worker("scanner thread panicked".to_string()))?;
         planner_handle
             .join()
             .map_err(|_| AppError::Worker("deletion planner thread panicked".to_string()))?;
-        rescan_handle
-            .join()
-            .map_err(|_| AppError::Worker("scan rebuild thread panicked".to_string()))?;
         executor_handle
             .join()
             .map_err(|_| AppError::Worker("deletion executor thread panicked".to_string()))
@@ -498,44 +464,6 @@ fn execution_worker(
         };
         if !send_event(sender, event, cancelled) {
             return;
-        }
-    }
-}
-fn rescan_worker(
-    commands: &Receiver<RescanCommand>,
-    sender: &Sender<WorkerEvent>,
-    rescan_cancelled: &AtomicBool,
-    cancelled: &AtomicBool,
-) {
-    loop {
-        if cancelled.load(Ordering::Acquire) {
-            return;
-        }
-        let command = match commands.recv_timeout(CHANNEL_RETRY) {
-            Ok(command) => command,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return,
-        };
-        let RescanCommand::Rescan(options) = command;
-        let root = options.root.clone();
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scanner::run(options, sender, rescan_cancelled);
-        }))
-        .is_err()
-        {
-            let _ = send_event(
-                sender,
-                WorkerEvent::ScanFailed {
-                    path: Some(root),
-                    message: "scan rebuild worker panicked".to_string(),
-                },
-                cancelled,
-            );
-            let _ = send_event(
-                sender,
-                WorkerEvent::ScanFinished { cancelled: true },
-                cancelled,
-            );
         }
     }
 }
@@ -650,7 +578,6 @@ mod tests {
     fn options(root: &std::path::Path, threads: usize) -> ScannerOptions {
         ScannerOptions {
             root: root.to_path_buf(),
-            canonical_root: root.to_path_buf(),
             session: ScanSessionId::from_bytes([3; 16]),
             generation: ScanGeneration::initial(),
             root_identity: None,
@@ -874,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn rescan_reuses_bounded_worker_channel() {
+    fn generation_rebuild_reuses_persistent_scanner() {
         let root = tempfile::tempdir().expect("scan root should exist");
         let file = root.path().join("file");
         std::fs::write(&file, b"x").expect("fixture should be written");
@@ -884,7 +811,7 @@ mod tests {
         for pass in 0..2 {
             if pass == 1 {
                 workers
-                    .request_rescan(scanner_options.clone())
+                    .request_generation_rebuild(scanner_options.clone())
                     .expect("scan rebuild should start");
             }
             let mut saw_file = false;
@@ -910,6 +837,85 @@ mod tests {
             }
             assert!(saw_file);
         }
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[test]
+    fn cancelled_rebuild_leaves_scanner_ready_for_next_generation() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let file = root.path().join("file");
+        std::fs::write(&file, b"x").expect("fixture file should be written");
+        let scanner_options = options(root.path(), 1);
+        let workers = WorkerPool::start(scanner_options.clone(), 1).expect("workers should start");
+
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("initial scan should complete")
+            {
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => {
+                    panic!("initial scan was cancelled")
+                }
+                WorkerEvent::ScanFailed { message, .. } => panic!("initial scan failed: {message}"),
+                WorkerEvent::ScanBatch { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+
+        workers
+            .request_generation_rebuild(scanner_options.clone())
+            .expect("scan rebuild should start");
+        workers.cancel_generation_rebuild();
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cancelled rebuild should complete")
+            {
+                WorkerEvent::ScanFinished { cancelled: true } => break,
+                WorkerEvent::ScanFinished { cancelled: false } => {
+                    panic!("rebuild should observe its cancellation")
+                }
+                WorkerEvent::ScanFailed { message, .. } => panic!("rebuild failed: {message}"),
+                WorkerEvent::ScanBatch { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        workers.finish_generation_rebuild();
+
+        workers
+            .request_generation_rebuild(scanner_options)
+            .expect("next scan rebuild should start");
+        let mut saw_file = false;
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("next rebuild should complete")
+            {
+                WorkerEvent::ScanBatch { entries, .. } => {
+                    saw_file |= entries.iter().any(|entry| entry.path == file);
+                }
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => {
+                    panic!("next rebuild was unexpectedly cancelled")
+                }
+                WorkerEvent::ScanFailed { message, .. } => panic!("next rebuild failed: {message}"),
+                WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+        assert!(saw_file);
         workers.shutdown().expect("workers should stop");
     }
 
