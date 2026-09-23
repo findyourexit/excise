@@ -110,14 +110,19 @@ pub(super) fn run(
     }
 
     let mut active = vec![None; assignments.len()];
+    let mut root_invalidated = false;
 
     loop {
         if root_invalid.load(Ordering::Acquire) {
-            coordinator.invalidate_scan_work();
-            if let Err(error) = forward_active_events(&worker_events, &active, events, cancelled) {
-                fail(&coordinator, events, cancelled, failed, error);
+            if !root_invalidated {
+                coordinator.invalidate_scan_work();
+                root_invalidated = true;
             }
-            return;
+            // The invalidating worker publishes its failure after setting this flag.
+            // Keep its receiver alive until that worker completes its active lease.
+            if active.iter().all(Option::is_none) {
+                return;
+            }
         }
         if cancelled.load(Ordering::Acquire) {
             coordinator.cancel_scan_work();
@@ -128,22 +133,24 @@ pub(super) fn run(
             return;
         }
 
-        if let Err(error) = dispatch_ready(
-            &queue,
-            root,
-            &coordinator,
-            &assignments,
-            &mut active,
-            cancelled,
-            failed,
-            root_invalid,
-        ) {
-            fail(&coordinator, events, cancelled, failed, error);
-            return;
-        }
+        if !root_invalidated {
+            if let Err(error) = dispatch_ready(
+                &queue,
+                root,
+                &coordinator,
+                &assignments,
+                &mut active,
+                cancelled,
+                failed,
+                root_invalid,
+            ) {
+                fail(&coordinator, events, cancelled, failed, error);
+                return;
+            }
 
-        if queue.is_idle() && active.iter().all(Option::is_none) {
-            return;
+            if queue.is_idle() && active.iter().all(Option::is_none) {
+                return;
+            }
         }
 
         let mut select = Select::new();
@@ -338,20 +345,6 @@ fn forward_pending_events(
 ) -> Result<(), String> {
     for event in receiver.try_iter() {
         forward_worker_event(worker, active, events, event, cancelled)?;
-    }
-    Ok(())
-}
-
-fn forward_active_events(
-    worker_events: &[Receiver<WorkerEvent>],
-    active: &[Option<WorkLease>],
-    events: &Sender<WorkerEvent>,
-    cancelled: &AtomicBool,
-) -> Result<(), String> {
-    for (worker, receiver) in worker_events.iter().enumerate() {
-        if active.get(worker).is_some_and(Option::is_some) {
-            forward_pending_events(receiver, worker, active, events, cancelled)?;
-        }
     }
     Ok(())
 }
