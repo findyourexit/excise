@@ -1,6 +1,6 @@
 # Release Process
 
-The current stable package version is `1.2.4`. This runbook defines the current v1 release procedure; the dated approval records below are historical evidence, not instructions for a new publication.
+The current stable package version is `1.3.0`. This runbook defines the current v1 release procedure; the dated approval records below are historical evidence, not instructions for a new publication.
 
 ## The 0.1.1 Contract (Historical)
 

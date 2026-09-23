@@ -42,12 +42,12 @@ nix build
 ./result/bin/excise /path/to/inspect
 ```
 
-## Install 1.2.4 From a Release Channel
+## Install 1.3.0 From a Release Channel
 
-The `1.2.4` release is published on crates.io and GitHub Releases. Install the crate with:
+The `1.3.0` release is published on crates.io and GitHub Releases. Install the crate with:
 
 ```console
-cargo install excise --version 1.2.4 --locked
+cargo install excise --version 1.3.0 --locked
 excise --version
 ```
 
