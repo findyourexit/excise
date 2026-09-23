@@ -6,6 +6,8 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-23
+
 ### Changed
 
 * Replaced the former in-memory scan-truth and focused-staging paths with a session-local canonical `ScanStore`. Completed maps and reports now read immutable direct-child pages; no filesystem child is collapsed into an undeletable aggregate.

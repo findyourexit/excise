@@ -19,6 +19,7 @@ fuzz_target!(|data: &[u8]| {
             memory_mib: None,
             temporary_storage_mib: None,
             scan_store_mib: None,
+            scan_store_reserve_mib: None,
             scan_store_dir: None,
             reduced_motion: false,
             theme: None,
