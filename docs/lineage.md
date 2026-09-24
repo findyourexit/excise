@@ -1,11 +1,42 @@
 # Project Lineage
 
-Excise descends from [Diskonaut](https://github.com/imsnif/diskonaut), which was created by Aram Drevekenin and improved by its contributors.
+!!! abstract "Independent successor"
 
-The repository preserves Diskonaut's complete commit history through `65cd829` and its historical `0.1.0` through `0.11.0` tags. Those tags continue to describe Diskonaut releases. Excise does not reuse them.
+    Excise descends from [Diskonaut](https://github.com/imsnif/diskonaut), created by Aram Drevekenin and improved by its contributors. It preserves technical ancestry while maintaining an independent name, release line, safety model, architecture, interface, maintenance policy, and distribution channels.
 
-The first Excise development line also contains selected modernization work from [`diskonaut-x`](https://github.com/kfkonrad/diskonaut) with its original authorship retained. This keeps useful technical ancestry visible instead of presenting the successor as an unattributed source dump.
+## At a Glance
 
-Excise is otherwise an independent project. Its name, release line, safety model, architecture, interface, maintenance policy, and distribution channels are separate from Diskonaut and other forks. Preserving history does not imply endorsement or maintenance responsibility by earlier contributors.
+Diskonaut
+:   The upstream project whose history is preserved through commit `65cd829`.
 
-For exact attribution, use `git log`, `git shortlog`, and the historical tags. The MIT license and copyright notices remain in [LICENSE](../LICENSE).
+Historical tags
+:   Diskonaut releases `0.1.0` through `0.11.0`. They remain historical records and are never Excise releases.
+
+Selected modernization work
+:   The first Excise development line includes selected work from [`diskonaut-x`](https://github.com/kfkonrad/diskonaut), with original authorship retained.
+
+Excise
+:   An otherwise independent project. Preserving history does not imply endorsement by, or maintenance responsibility for, earlier contributors.
+
+!!! warning "Do not reuse historical tags"
+
+    Tags `0.1.0` through `0.11.0` describe Diskonaut releases. Do not move, reuse, or treat them as an Excise installation. Excise releases use their own tags, such as `v0.1.1` and the stable v1 line.
+
+## Attribution and History
+
+The repository preserves Diskonaut’s complete commit history through `65cd829`. Keeping that history visible preserves authorship and makes technical ancestry auditable; it does **not** merge the projects’ support or release obligations.
+
+Use the repository history when exact attribution matters:
+
+```console
+# Inspect authorship and the preserved release history.
+git log
+git shortlog
+git tag --list '0.*'
+```
+
+The MIT license and historical copyright notices remain in [LICENSE](../LICENSE).
+
+??? info "Why the boundary matters"
+
+    A preserved source history can explain where a design came from. It cannot establish a support promise, safety contract, release identity, or maintenance relationship for a later project. Those obligations are defined by Excise’s own documentation and release process.

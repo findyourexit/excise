@@ -256,6 +256,7 @@ The current main demonstration is generated with `cargo demo`. See [Development]
 
 ## Documentation
 
+- [Documentation website](https://tomlarcher.com/excise/)
 - [Getting Started](docs/getting-started.md)
 - [Configuration](docs/configuration.md)
 - [Reports and JSON Formats](docs/reports.md)

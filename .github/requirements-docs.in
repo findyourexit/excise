@@ -1,0 +1,3 @@
+# Direct documentation-site dependency. The generated lockfile retains all transitive hashes.
+# Regenerate with: python -m piptools compile --generate-hashes --output-file=.github/requirements-docs.txt --strip-extras .github/requirements-docs.in
+zensical==0.0.62
