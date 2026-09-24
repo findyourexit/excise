@@ -166,7 +166,7 @@ fn border_len(area: Rect) -> usize {
 }
 
 /// A padded title tab sits in the top rule. The leading quadrant remains a
-/// small, portable bevel; the top rule completes the title without a synthetic
+/// small, portable bevel. The top rule completes the title without a synthetic
 /// trailing cap.
 fn padded_title_tab(title: &str, area: Rect, ascii: bool) -> Option<String> {
     if title.is_empty() {

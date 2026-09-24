@@ -275,8 +275,8 @@ pub(crate) fn visit_identity_observations(
 
 /// Reuses record buffers to encode one identity-unique allocation contribution.
 ///
-/// The key is exactly the contributing canonical file identity; the value holds
-/// its destination path and accounting outcome.
+/// The key is the contributing file identity. The value holds its destination
+/// path and accounting outcome.
 ///
 /// # Errors
 ///

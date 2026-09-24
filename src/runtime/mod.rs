@@ -146,7 +146,7 @@ where
     scan_store_storage: TemporaryStorage,
     summary: RunSummary,
     scan_active: bool,
-    /// Latest coalesced session scheduler state; never an event backlog.
+    /// Latest combined session scheduler state. This is not an event backlog.
     scheduler_snapshot: Option<SchedulerSnapshot>,
     /// The primary breadth-first generation remains active while a versioned refresh may run.
     primary_scan_active: bool,
@@ -166,7 +166,7 @@ where
     next_loading_frame: Duration,
     /// Live mutation progress needs redraws even when accessibility disables animation.
     next_deletion_progress_frame: Duration,
-    /// Last rendered counter snapshot; unchanged counters do not redraw the map.
+    /// Last counters rendered. Unchanged counters do not redraw the map.
     last_deletion_progress: Option<(u64, u64)>,
 }
 

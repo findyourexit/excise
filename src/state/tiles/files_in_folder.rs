@@ -23,7 +23,7 @@ pub struct FileMetadata {
 }
 
 impl FileMetadata {
-    /// Grouped totals are selectable for explanation; only a shared allocation
+    /// Grouped totals are selectable for explanation. Only a shared allocation
     /// total has no useful item-specific detail to inspect.
     #[must_use]
     pub const fn is_interactive(&self) -> bool {

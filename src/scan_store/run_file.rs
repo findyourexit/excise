@@ -471,8 +471,8 @@ impl SealedRun {
     /// Starts a checksum-validating read near `lower_bound` using a sparse
     /// block index captured while this immutable child-query run was written.
     ///
-    /// The reader may return records before `lower_bound` from the preceding
-    /// block; callers compare keys before consuming them.
+    /// The reader may return records from the preceding block before `lower_bound`.
+    /// Callers compare keys before consuming records.
     ///
     /// # Errors
     ///

@@ -9,8 +9,8 @@ use tachyonfx::{Effect, Interpolation, SimpleRng, fx, pattern::CheckerboardPatte
 pub const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const MEDIUM_FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const LARGE_FRAME_INTERVAL: Duration = Duration::from_millis(66);
-/// Persistent focus and modal chrome redraw at this cadence; short effects and
-/// geometry keep the higher cadence needed to look continuous.
+/// Persistent focus and modal chrome redraw at this cadence. Short effects and
+/// geometry use a higher cadence so they look continuous.
 const PERSISTENT_ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(125);
 const SMALL_SURFACE_CELLS: u32 = 4_000;
 const MEDIUM_SURFACE_CELLS: u32 = 12_000;

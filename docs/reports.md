@@ -1,6 +1,6 @@
 # Reports & JSON Formats
 
-Excise produces bounded reports. When a scan is uncertain, or capacity prevents retaining a navigable map, the report says so instead of claiming a complete inventory.
+Excise produces bounded reports. When a scan is uncertain or capacity prevents retaining a navigable map, the report says so instead of claiming a complete inventory.
 
 ## Table Output
 
@@ -23,14 +23,15 @@ JSON uses named document types and stable version numbers. The published Draft 2
 - [`deletion-history` version 1](schemas/deletion-history.schema.json)
 - [`native-path` version 1](schemas/native-path.schema.json)
 
-`scan-report` version 3 reports `scan_store_bytes` and `scan_store_limit_bytes` in its summary. They describe the private canonical scan-store reservation at the terminal state; they are not file-system space totals or process-memory measurements.
+`scan-report` version 3 reports `scan_store_bytes` and `scan_store_limit_bytes` in its summary. They describe the private scan-storage reservation at the terminal state. They are not file-system space totals or process-memory measurements.
 
 An unknown upper bound is `null`. Excise never replaces it with an apparent file length. The `Shared` allocation summary has an explicit type and cannot be a deletion target.
-A `summary-only` scan report means the scan-store capacity was reached after deterministic directory reduction. It retains the terminal summary and root metrics, but deliberately contains no navigable entry inventory; rerun with a larger `--scan-store-mib` value.
+
+A `summary-only` scan report means scan-storage capacity was reached after directory reduction. It retains the terminal summary and root metrics. It deliberately contains no navigable entry inventory. Run again with a larger `--scan-store-mib` value.
 
 ## Interactive Exports
 
-Press `e` in the normal view to export the current scan. Press `E` in the normal view to export the bounded deletion history; no result modal is required. Excise writes the first available filename in the current directory:
+Press `e` in the normal view to export the current scan. Press `E` in the normal view to export the bounded deletion history. No result modal is required. Excise writes the first available filename in the current directory:
 
 - `excise-scan-report.json`, then `excise-scan-report-1.json`, and so on
 - `excise-deletion-history.json`, then `excise-deletion-history-1.json`, and so on

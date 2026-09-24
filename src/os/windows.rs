@@ -75,8 +75,8 @@ pub(crate) fn create_private_temporary_file(directory: &Path) -> io::Result<File
             bInheritHandle: 0,
         };
         // SAFETY: the path and security descriptor stay live during the call. CREATE_NEW
-        // makes the random name atomic; zero sharing bars any second handle, including one
-        // opened by the current user, until the delete-on-close handle is released.
+        // creates the random name without a race. With no sharing, no second handle can
+        // open it, including one from the current user, until the delete-on-close handle closes.
         let handle = unsafe {
             CreateFileW(
                 wide_path.as_ptr(),

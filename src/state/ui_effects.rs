@@ -6,9 +6,9 @@ use super::tiles::Tile;
 use crate::deletion::DeletionReport;
 use crate::scan_coordinator::RelativePath;
 
-/// Human-facing counters from the last reconciled deletion. The report itself
-/// remains the source of exact history; this fixed-size summary keeps normal
-/// navigation informed without retaining another report-sized buffer.
+/// Human-facing counters from the last reconciled deletion. The report remains
+/// the source of exact history. This fixed-size summary keeps normal navigation
+/// informed without retaining another report-sized buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeletionSummary {
     pub deleted: u64,

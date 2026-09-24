@@ -546,8 +546,8 @@ const MIN_CURSOR_CONTRAST: f32 = 3.0;
 ///
 /// The layout never depends on selection: showing or clearing a selection must
 /// not relayout the map beneath it. The map keeps every available column so
-/// people can compare space before acting; its details are always stacked
-/// below it when the supported viewport has room for both panes.
+/// people can compare space before acting. Its details are stacked below it
+/// when the supported viewport has room for both panes.
 fn body_areas(area: Rect) -> (Rect, Option<Rect>) {
     if area.width >= 32 && area.height >= MINIMUM_WORKSPACE_HEIGHT + INSPECTOR_HEIGHT + PANE_GAP {
         let workspace_height = area.height.saturating_sub(INSPECTOR_HEIGHT + PANE_GAP);

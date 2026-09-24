@@ -550,7 +550,7 @@ impl ColorCycle {
 
     /// Returns whether a presentation can show the moving focus phase.
     ///
-    /// Palette-only and ASCII output stay still; callers use this gate before
+    /// Palette-only and ASCII output stay still. Callers use this gate before
     /// requesting another frame for focus chrome.
     #[must_use]
     pub(crate) const fn can_animate_with_capabilities(

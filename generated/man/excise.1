@@ -18,7 +18,7 @@ Show apparent file sizes instead of allocated bytes
 Scanner worker count (1\-32)
 .TP
 \fB\-\-event\-buffer\fR \fI<COUNT>\fR
-Bounded worker\-event capacity (16\-4096)
+Maximum queued worker events (16 to 4096)
 .TP
 \fB\-\-cross\-filesystems\fR
 Permit traversal across filesystem boundaries
@@ -27,25 +27,25 @@ Permit traversal across filesystem boundaries
 Ordered gitignore\-style exclusion pattern
 .TP
 \fB\-\-memory\-mib\fR \fI<MIB>\fR
-Whole\-process memory envelope in MiB
+Whole\-process memory limit in MiB
 .TP
 \fB\-\-temporary\-storage\-mib\fR \fI<MIB>\fR
-Directory\-plan and deletion\-result storage limit per session (2+)
+Directory\-plan and deletion\-result storage limit per session (at least 2 MiB)
 .TP
 \fB\-\-scan\-store\-mib\fR \fI<MIB>\fR
-Canonical scanner journal, scan\-run, and page\-index storage upper limit per session (2+; capped by scratch\-volume free space)
+Private scan data and page\-index storage limit per session (at least 2 MiB, capped by scratch\-volume free space)
 .TP
 \fB\-\-scan\-store\-dir\fR \fI<DIR>\fR
-Parent directory for the private canonical scan\-store session
+Parent directory for the private scan\-storage session
 .TP
 \fB\-\-scan\-store\-reserve\-mib\fR \fI<MIB>\fR
-Scratch space preserved outside scan\-store files (default: 25% of free space)
+Scratch space kept outside scan\-storage files (defaults to 25 percent of free space)
 .TP
 \fB\-\-reduced\-motion\fR
 Disable nonessential motion
 .TP
 \fB\-\-theme\fR \fI<THEME>\fR
-Built\-in semantic color theme
+Built\-in color theme
 .br
 
 .br
@@ -105,7 +105,7 @@ emacs
 .RE
 .TP
 \fB\-\-format\fR \fI<FORMAT>\fR
-Output mode. Table and JSON never acquire a terminal
+Output mode. Table and JSON modes do not require a terminal
 .br
 
 .br

@@ -5,6 +5,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Render the README hero, feature demos, or both
+        required: false
+        default: hero
+        type: choice
+        options:
+          - hero
+          - features
+          - all
 
 permissions:
   contents: read
@@ -17,9 +27,11 @@ concurrency:
 # artifact and is never committed or pushed by this workflow.
 jobs:
   record:
-    name: Render VHS hero tape
+    name: Render VHS demos
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      DEMO_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'hero' }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -71,19 +83,67 @@ jobs:
           echo "$bin_dir" >> "$GITHUB_PATH"
           printf 'CI=\nCOLORTERM=truecolor\n' >> "$GITHUB_ENV"
           fc-cache --force
-      - name: Render demo GIF
-        run: cargo demo
+      - name: Render demo GIFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$DEMO_MODE" in
+            hero) cargo demo ;;
+            features) cargo demo-features ;;
+            all)
+              cargo demo
+              cargo demo-features
+              ;;
+            *) echo "unknown demo mode: $DEMO_MODE" >&2; exit 64 ;;
+          esac
 
       - name: Verify generated media
         shell: bash
         run: |
           set -euo pipefail
-          test -s assets/demo-main.gif
+          case "$DEMO_MODE" in
+            hero) test -s assets/demo-main.gif ;;
+            features)
+              shopt -s nullglob
+              feature_gifs=(assets/features/*.gif)
+              test "${#feature_gifs[@]}" -eq 8
+              for gif in "${feature_gifs[@]}"; do test -s "$gif"; done
+              ;;
+            all)
+              test -s assets/demo-main.gif
+              shopt -s nullglob
+              feature_gifs=(assets/features/*.gif)
+              test "${#feature_gifs[@]}" -eq 8
+              for gif in "${feature_gifs[@]}"; do test -s "$gif"; done
+              ;;
+          esac
+      - name: Stage selected demo media
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/excise-demo"
+          rm -rf -- "$artifact_dir"
+          mkdir -p "$artifact_dir"
+          case "$DEMO_MODE" in
+            hero)
+              cp -- assets/demo-main.gif "$artifact_dir/"
+              ;;
+            features)
+              mkdir -p "$artifact_dir/features"
+              cp -- assets/features/*.gif "$artifact_dir/features/"
+              ;;
+            all)
+              cp -- assets/demo-main.gif "$artifact_dir/"
+              mkdir -p "$artifact_dir/features"
+              cp -- assets/features/*.gif "$artifact_dir/features/"
+              ;;
+            *) echo "unknown demo mode: $DEMO_MODE" >&2; exit 64 ;;
+          esac
 
       - name: Upload demo artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: excise-demo-${{ github.sha }}
-          path: assets/demo-main.gif
+          name: excise-demo-${{ github.sha }}-${{ env.DEMO_MODE }}
+          path: ${{ runner.temp }}/excise-demo
           if-no-files-found: error
           retention-days: 7

@@ -14,7 +14,7 @@ The project is independent from Diskonaut. Tags `0.1.0` through `0.11.0` are pre
 - A terminal with color and separate-screen support for the interactive interface
 - Linux, macOS, or Windows
 
-The repository pins Rust 1.98 in `rust-toolchain.toml`; release binaries do not require a local Rust installation.
+The repository pins Rust 1.98 in `rust-toolchain.toml`. Release binaries do not require a local Rust installation.
 
 Under the stable v1 support policy, x86_64 Linux, AArch64 macOS, and x86_64 Windows have been tested on the target systems and are fully supported. x86_64 macOS, AArch64 Linux, and AArch64 Windows have release artifacts but remain build-only and best effort until they have been tested on the target systems. File system limitations are documented in [Support](../SUPPORT.md).
 
@@ -86,11 +86,11 @@ excise /tmp/excise-demo
 
 Use a temporary directory appropriate to your platform on Windows.
 
-Keep the default confirmation enabled for first use. As soon as a real file or directory appears in the map, including while the initial scan continues, select it and press `Backspace` to begin a permanent deletion plan. While the initial scan is active, `Enter` opens a represented directory through a bounded provisional canonical page and prioritizes its existing work. After publication, opening reads immutable direct-child pages immediately. The scan root, a file system or drive root, and the virtual `Shared` allocation summary cannot be deletion targets. An incomplete map or approximate space estimate does not weaken or block the planner's live identity checks.
+Keep the default confirmation enabled for first use. As soon as a real file or directory appears in the map, select it and press `Backspace` to begin a permanent deletion plan. While the first scan is active, `Enter` opens a directory that already has a partial page of stored results and gives its current scan work priority. Once the scan publishes a complete result, opening a directory reads a fixed page of its direct contents immediately. The scan root, a file system or drive root, and the virtual `Shared` allocation summary cannot be deletion targets. An incomplete map or approximate space estimate does not weaken or block the planner's live identity checks.
 
-Files and safe printable directories confirm with `Enter` or `y`. Planning happens in a bounded background rail, and confirmation stays in front of the map until you accept or cancel it. After acceptance the map remains available while the serial worker immediately revalidates then deletes each reviewed entry. Hostile or untypeable names require a generated challenge. `--disable-delete-confirmation` enables a visible, session-only reduced confirmation mode that accepts `Enter` or `y` for all entries except hostile names.
+Files and directories with safe printable names accept `Enter` or `y`. Planning runs in the background with a fixed limit, while confirmation stays in front of the map until you accept or cancel it. After acceptance, the map remains available while one worker rechecks and deletes each reviewed entry. Hostile or untypeable names require a generated challenge. `--disable-delete-confirmation` enables a visible, session-only reduced confirmation mode that accepts `Enter` or `y` for all entries except hostile names.
 
-Every planned entry is listed independently and checked again immediately before deletion. Changed, replaced, missing, or newly created entries are never silently deleted. The exit prompt lets pending plans be cancelled or awaited; an active deletion can only stop at an entry boundary or be awaited. A run can therefore be partial. There is no trash or undo.
+Every planned entry is listed independently and checked again immediately before deletion. Changed, replaced, missing, or newly created entries are never silently deleted. The exit prompt lets pending plans be cancelled or awaited. An active deletion can stop only at an entry boundary or be awaited. A run can therefore be partial. There is no trash or undo.
 
 The default view uses allocated space. Pass `--apparent-size` when logical file length is the intended comparison.
 
@@ -100,14 +100,17 @@ The interactive interface requires standard input and output connected to a term
 
 ### Current Map Behavior
 
-The interactive view uses a dense map with static workspace frames and padded title tabs. A selected map entry has a travelling contour with bright top and left faces, dim bottom and right faces, and a slow diagonal midpoint fill wave that preserves the entry's depth. Animated modal borders use the same truecolour-only treatment. The header names scan, deletion, and model status and reports active or queued background work from one coalesced scheduler snapshot; the bottom row is dedicated to visually distinct control keys and their hints. `--ascii`, monochrome mode, high-contrast themes, and reduced motion preserve the same selection, scope, and deletion information with static output.
-Before measured tiles are available, the map shows a full-surface scan field with the actual number of indexed entries rather than a guessed percentage. Its measuring front becomes a directional reveal when the first tile layout is ready.
-When motion is available, its cadence is maintained independently of scanner batches so sustained scans do not interrupt the field.
-Opening or leaving a directory never creates a separate scanner or mutable model. Before a generation publishes, navigation reads provisional canonical pages; focus changes only reprioritize existing work. A partial deletion can trigger one root generation rebuild, shown in the scan field until it publishes or is cancelled. Press `Esc` to cancel that rebuild and return to normal navigation.
+The interactive view uses a dense map inside fixed workspace panes with padded title tabs. A selected entry has a three-dimensional outline with bright top and left edges, darker bottom and right edges, and a slow diagonal fill. Animated modal borders use the same treatment only when full color is available. The header shows scan, deletion, and model status, plus active or queued background work. The bottom row pairs each key with its hint. `--ascii`, monochrome mode, high-contrast themes, and reduced motion keep the same selection, scope, and deletion information in a static form.
 
-Press `t` in the normal view, while scanning, or during a generation rebuild to preview the theme list. Arrow keys or `j`/`k` move the preview; `Enter` immediately saves the selected theme for later TUI sessions, while `Esc` restores the prior theme.
+Before tiles are ready, the map shows a full-map scan field with the actual number of indexed entries instead of a guessed percentage. The field becomes a directional reveal when the first layout is ready.
 
-In a color-capable map, ordinary entry color carries the current space measure on one fixed absolute scale: 4 KiB and below are blue, 16 MiB is midpoint green, 1 GiB is yellow, and 64 GiB and above are red. The default measure is allocated space; `--apparent-size` uses logical file length instead. Unreadable entries retain distinct state colors; the virtual shared-allocation summary stays subdued and does not affect the size scale.
+When animation is available, its timing stays independent of scan batches, so an active scan does not interrupt it.
+
+Opening or leaving a directory never starts another scanner or creates a second mutable model. Before a scan publishes its result, navigation reads the available partial stored pages and only reprioritizes existing work. A partial deletion can start one root rescan, which appears in the scan field until it publishes or is cancelled. Press `Esc` to cancel that rescan and return to normal navigation.
+
+Press `t` in the normal view, while scanning, or during a root rescan to preview the theme list. Arrow keys or `j` and `k` move the preview. Press `Enter` to save the selected theme for later TUI sessions. Press `Esc` to restore the prior theme.
+
+In a color-capable map, ordinary entry color carries the current space measure on one fixed absolute scale. Entries at 4 KiB and below are blue, 16 MiB is midpoint green, 1 GiB is yellow, and 64 GiB and above are red. The default measure is allocated space. `--apparent-size` uses logical file length instead. Unreadable entries retain distinct state colors. The virtual shared-allocation summary stays subdued and does not affect the size scale.
 
 Entries that do not fit in the final map view are collected into one `MapOverflow` summary. When there is enough room, the renderer shows that summary as a textured region with count and weight labels. When there is not enough room, the summary remains available in the report without drawing a misleading region.
 

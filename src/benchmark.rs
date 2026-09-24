@@ -1,4 +1,4 @@
-//! Internal Criterion fixtures for canonical scan-store measurements.
+//! Internal Criterion fixtures for repeatable scan-store measurements.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -102,7 +102,7 @@ impl FilesystemScanBenchmark {
     }
 }
 
-/// Canonical layouts that exercise distinct storage and query paths.
+/// Repeatable layouts that exercise distinct storage and query paths.
 #[derive(Clone, Copy, Debug)]
 pub enum CanonicalWorkload {
     Flat {
@@ -150,7 +150,7 @@ impl CanonicalWorkload {
     }
 }
 
-/// Deterministic logical I/O and phase timing for one canonical publication.
+/// Deterministic logical I/O and phase timing for one published scan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreMetrics {
     pub observations: usize,
@@ -169,7 +169,7 @@ pub struct CanonicalStoreMetrics {
     pub publication_cpu: Option<Duration>,
 }
 
-/// A published canonical generation and one representative bounded page query.
+/// A published scan and one representative bounded page query.
 pub struct CanonicalStoreBenchmark {
     store: ScanStore,
     storage: TemporaryStorage,
@@ -241,7 +241,7 @@ impl CanonicalStoreBenchmark {
     /// # Panics
     ///
     /// Panics when the benchmark's fixed scan-store budget cannot hold its
-    /// generated workload or canonical publication fails.
+    /// generated workload or publishing fails.
     #[must_use]
     pub fn build(workload: CanonicalWorkload) -> Self {
         Self::build_with_storage_mib(workload, STORAGE_MIB)
@@ -253,7 +253,7 @@ impl CanonicalStoreBenchmark {
     /// # Panics
     ///
     /// Panics when the storage ceiling cannot hold the generated workload or
-    /// canonical publication fails.
+    /// publishing fails.
     #[must_use]
     pub fn build_with_storage_mib(workload: CanonicalWorkload, storage_mib: usize) -> Self {
         let storage = TemporaryStorage::scan_store_from_mib(storage_mib)
@@ -308,16 +308,16 @@ impl CanonicalStoreBenchmark {
         }
     }
 
-    /// Builds a canonical workload from premerged raw runs.
+    /// Builds a repeatable workload from already merged raw runs.
     ///
     /// This isolates reduction and query cost at large scale. It preserves the
-    /// canonical result of bounded scanner batches while intentionally excluding
-    /// their fan-in work, which the bounded workload matrix measures separately.
+    /// final result of bounded scanner batches while leaving out the work of
+    /// combining input runs, which the bounded workload matrix measures separately.
     ///
     /// # Panics
     ///
     /// Panics when the storage ceiling cannot hold the generated workload or
-    /// canonical publication fails.
+    /// publishing fails.
     #[must_use]
     pub fn build_premerged(workload: CanonicalWorkload, storage_mib: usize) -> Self {
         let storage = TemporaryStorage::scan_store_from_mib(storage_mib)

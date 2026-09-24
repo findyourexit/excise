@@ -17,7 +17,7 @@ const ACTOR_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Bounded UI-to-actor focus control.
 ///
-/// The session coordinator exposes coalesced status directly; this handle only
+/// The session coordinator exposes combined status directly. This handle only
 /// carries best-effort focus requests into the scanner's private task journal.
 #[derive(Clone)]
 pub(crate) struct SchedulerHandle {
@@ -54,9 +54,9 @@ pub(super) struct LeasedDirectoryTask {
 /// Owns bounded directory scheduling for one scanner generation.
 ///
 /// The actor is the only caller that touches the persistent task journal. The
-/// session coordinator actor owns every work key and lease; scanner workers
-/// receive an exact lease, return their results through bounded channels, and
-/// never mutate either ledger directly.
+/// session coordinator owns every work key and lease. Scanner workers receive
+/// an exact lease, return results through fixed-size channels, and never
+/// mutate either record directly.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,

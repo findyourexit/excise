@@ -14,11 +14,11 @@ None currently.
 
 Maintainers are expected to:
 
-- protect deletion, terminal, accounting, privacy, and schema contracts;
-- require evidence appropriate to the risk of each change;
-- preserve contributor attribution and authorship records;
-- keep dependencies, workflows, and release inputs reviewable and pinned;
-- avoid commitments beyond current maintainer capacity; and
-- disclose conflicts of interest relevant to dependencies or distribution.
+- Protect deletion, terminal, accounting, privacy, and schema contracts.
+- Require evidence appropriate to the risk of each change.
+- Preserve contributor attribution and authorship records.
+- Keep dependencies, workflows, and release inputs reviewable and pinned.
+- Avoid commitments beyond current maintainer capacity.
+- Disclose conflicts of interest relevant to dependencies or distribution.
 
 Authority changes follow [GOVERNANCE.md](GOVERNANCE.md).

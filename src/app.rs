@@ -220,7 +220,7 @@ where
     custom_keys: Option<CustomKeyBindings>,
     mouse_enabled: bool,
     dirty: bool,
-    /// Runtime owns whether loading animation is enabled; direct app fixtures stay static.
+    /// The runtime decides whether to animate loading. Direct app fixtures stay static.
     loading_animation_enabled: bool,
 }
 
@@ -2067,8 +2067,8 @@ where
         self.generation_rebuild_required = rebuild_invalidated;
         if rebuild_invalidated {
             // A deletion discarded this generation while its worker was still
-            // draining. Its terminal event merely releases that stale worker;
-            // the owner will start a strictly newer root generation next.
+            // draining. Its terminal event only releases the stale worker. The
+            // owner starts a newer root generation next.
         } else if self.scan_store_available && self.scan_store.publish().is_ok() {
             self.snapshot_page_cache = None;
             self.snapshot_page_is_provisional = false;

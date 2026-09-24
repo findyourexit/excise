@@ -108,9 +108,10 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
         Some("render-homebrew") => render_homebrew_formula(),
         Some("dist-local") => build_local_dist(),
         Some("demo") => render_demo(),
+        Some("demo-features") => render_feature_demos(args),
         Some("create-release-tag") => create_release_tag(args),
         _ => Err(io::Error::other(
-            "usage: cargo xtask <verify|fuzz-toolchain|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|create-release-tag>",
+            "usage: cargo xtask <verify|fuzz-toolchain|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|demo-features [NAME...]|create-release-tag>",
         )
         .into()),
     }
@@ -369,26 +370,100 @@ const DEMO_MIN_DURATION_SECONDS: f64 = 10.0;
 const DEMO_MIN_FRAMES: u64 = 160;
 
 /// The current `main` README hero.
-///
-/// `assets/demo.gif` intentionally remains the published `0.1.2` recording,
-/// because the release README references that path through the moving `main`
-/// branch URL.
 const DEMO_CURRENT_MAIN_GIF: &str = "assets/demo-main.gif";
-/// Staging output from `vhs`.
-///
-/// The tape writes directly to this transient path, so a failed recording
-/// cannot overwrite the published current-main asset.
-const DEMO_RENDERED: &str = "assets/demo-main.rendered.gif";
-/// Intermediate for the palette pass.
-///
-/// The extension is load-bearing: `ffmpeg` picks its muxer from it.
-const DEMO_INTERMEDIATE: &str = "assets/demo-main.palette.gif";
-/// Staging output from `gifsicle`.
-///
-/// Quantisation must finish and satisfy the download budget before this file
-/// replaces the published current-main GIF.
-const DEMO_QUANTISED: &str = "assets/demo-main.quantised.gif";
 const DEMO_TAPE: &str = "tapes/demo.tape";
+
+#[derive(Clone, Copy)]
+struct DemoArtifact {
+    name: &'static str,
+    tape: &'static str,
+    asset: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct RecordingCriteria {
+    minimum_duration_seconds: f64,
+    minimum_frames: u64,
+}
+
+#[derive(Clone, Copy)]
+struct DemoEncoding {
+    framerate: u32,
+    colors: u32,
+    lossy: u32,
+    maximum_bytes: u64,
+    criteria: RecordingCriteria,
+}
+
+const HERO_DEMO: DemoArtifact = DemoArtifact {
+    name: "README hero",
+    tape: DEMO_TAPE,
+    asset: DEMO_CURRENT_MAIN_GIF,
+};
+const HERO_DEMO_ENCODING: DemoEncoding = DemoEncoding {
+    framerate: DEMO_FRAMERATE,
+    colors: DEMO_COLORS,
+    lossy: DEMO_LOSSY,
+    maximum_bytes: DEMO_MAX_BYTES,
+    criteria: RecordingCriteria {
+        minimum_duration_seconds: DEMO_MIN_DURATION_SECONDS,
+        minimum_frames: DEMO_MIN_FRAMES,
+    },
+};
+
+const FEATURE_DEMO_ENCODING: DemoEncoding = DemoEncoding {
+    framerate: 16,
+    colors: 48,
+    lossy: 60,
+    maximum_bytes: 393_216,
+    criteria: RecordingCriteria {
+        minimum_duration_seconds: 2.5,
+        minimum_frames: 40,
+    },
+};
+
+const FEATURE_DEMOS: [DemoArtifact; 8] = [
+    DemoArtifact {
+        name: "storage-map",
+        tape: "tapes/features/storage-map.tape",
+        asset: "assets/features/storage-map.gif",
+    },
+    DemoArtifact {
+        name: "space-accounting",
+        tape: "tapes/features/space-accounting.tape",
+        asset: "assets/features/space-accounting.gif",
+    },
+    DemoArtifact {
+        name: "scoped-scanning",
+        tape: "tapes/features/scoped-scanning.tape",
+        asset: "assets/features/scoped-scanning.gif",
+    },
+    DemoArtifact {
+        name: "reviewed-deletion",
+        tape: "tapes/features/reviewed-deletion.tape",
+        asset: "assets/features/reviewed-deletion.gif",
+    },
+    DemoArtifact {
+        name: "background-work",
+        tape: "tapes/features/background-work.tape",
+        asset: "assets/features/background-work.gif",
+    },
+    DemoArtifact {
+        name: "reports",
+        tape: "tapes/features/reports.tape",
+        asset: "assets/features/reports.gif",
+    },
+    DemoArtifact {
+        name: "terminal-sessions",
+        tape: "tapes/features/terminal-sessions.tape",
+        asset: "assets/features/terminal-sessions.gif",
+    },
+    DemoArtifact {
+        name: "accessibility",
+        tape: "tapes/features/accessibility.tape",
+        asset: "assets/features/accessibility.gif",
+    },
+];
 
 /// Renders the README hero recording and shrinks it to publishable weight.
 ///
@@ -397,17 +472,63 @@ const DEMO_TAPE: &str = "tapes/demo.tape";
 /// cells into per-pixel noise that no frame differ can compress, so the
 /// optimisation pass rebuilds the palette without it before quantising.
 fn render_demo() -> Result<(), Box<dyn Error>> {
-    let _cleanup = DemoArtifactCleanup::install();
-    DemoArtifactCleanup::clear_stale()?;
+    render_recording(&HERO_DEMO, HERO_DEMO_ENCODING)
+}
 
-    run(OsStr::new("vhs"), "validate tape", &["validate", DEMO_TAPE])?;
-    run_vhs("render tape", &["--output", DEMO_RENDERED, DEMO_TAPE])?;
+/// Renders every README feature recording, or only the requested names.
+fn render_feature_demos(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    for demo in selected_feature_demos(args)? {
+        render_recording(&demo, FEATURE_DEMO_ENCODING)?;
+    }
+    Ok(())
+}
 
-    let rendered = created_recording_len(DemoArtifactCleanup::rendered(), "render tape")?;
+fn selected_feature_demos(args: impl Iterator<Item = String>) -> io::Result<Vec<DemoArtifact>> {
+    let requested = args.collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Ok(FEATURE_DEMOS.to_vec());
+    }
+
+    requested
+        .into_iter()
+        .map(|name| {
+            FEATURE_DEMOS
+                .iter()
+                .copied()
+                .find(|demo| demo.name == name.as_str())
+                .ok_or_else(|| {
+                    let available = FEATURE_DEMOS
+                        .iter()
+                        .map(|demo| demo.name)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    io::Error::other(format!(
+                        "unknown feature demo {name}; choose one of: {available}"
+                    ))
+                })
+        })
+        .collect()
+}
+
+/// Renders one tape, verifies its recording, and atomically promotes its GIF.
+fn render_recording(demo: &DemoArtifact, encoding: DemoEncoding) -> Result<(), Box<dyn Error>> {
+    let asset = Path::new(demo.asset);
+    let cleanup = DemoArtifactCleanup::install(asset)?;
+    cleanup.clear_stale()?;
+
+    let validate_label = format!("validate {} tape", demo.name);
+    run(OsStr::new("vhs"), &validate_label, &["validate", demo.tape])?;
+
+    let rendered_path = cleanup.rendered().to_string_lossy().into_owned();
+    let render_label = format!("render {} tape", demo.name);
+    run_vhs(&render_label, &["--output", &rendered_path, demo.tape])?;
+    let rendered = created_recording_len(cleanup.rendered(), &render_label, encoding.criteria)?;
 
     let filter = format!(
-        "fps={DEMO_FRAMERATE},split[a][b];[a]palettegen=max_colors={DEMO_COLORS}[p];[b][p]paletteuse=dither=none"
+        "fps={},split[a][b];[a]palettegen=max_colors={}[p];[b][p]paletteuse=dither=none",
+        encoding.framerate, encoding.colors
     );
+    let intermediate_path = cleanup.intermediate().to_string_lossy().into_owned();
     run(
         OsStr::new("ffmpeg"),
         "reduce palette",
@@ -416,73 +537,100 @@ fn render_demo() -> Result<(), Box<dyn Error>> {
             "error",
             "-y",
             "-i",
-            DEMO_RENDERED,
+            &rendered_path,
             "-filter_complex",
             &filter,
-            DEMO_INTERMEDIATE,
+            &intermediate_path,
         ],
     )?;
 
-    let lossy = format!("--lossy={DEMO_LOSSY}");
+    let lossy = format!("--lossy={}", encoding.lossy);
+    let quantised_path = cleanup.quantised().to_string_lossy().into_owned();
     run(
         OsStr::new("gifsicle"),
         "quantise frames",
-        &["-O3", &lossy, DEMO_INTERMEDIATE, "-o", DEMO_QUANTISED],
+        &["-O3", &lossy, &intermediate_path, "-o", &quantised_path],
     )?;
 
-    let published = created_output_len(DemoArtifactCleanup::quantised(), "quantise frames")?;
-    if published > DEMO_MAX_BYTES {
+    let published = created_output_len(cleanup.quantised(), "quantise frames")?;
+    if published > encoding.maximum_bytes {
         return Err(io::Error::other(format!(
-            "{DEMO_CURRENT_MAIN_GIF} is {published} bytes, above the {DEMO_MAX_BYTES} byte ceiling"
+            "{} is {published} bytes, above the {} byte ceiling",
+            asset.display(),
+            encoding.maximum_bytes
         ))
         .into());
     }
 
-    DemoArtifactCleanup::clear_transients()?;
-    fs::rename(DemoArtifactCleanup::quantised(), DEMO_CURRENT_MAIN_GIF)?;
-    println!("\n{DEMO_CURRENT_MAIN_GIF}: {rendered} bytes rendered, {published} bytes published");
+    cleanup.clear_transients()?;
+    fs::rename(cleanup.quantised(), asset)?;
+    println!(
+        "\n{}: {rendered} bytes rendered, {published} bytes published",
+        asset.display()
+    );
     Ok(())
 }
 
-/// Removes disposable demo artifacts whenever the render pipeline exits.
+/// Removes disposable staging artifacts whenever a recording pipeline exits.
 ///
-/// The checked-in GIF stays outside this guard so failures leave the last
+/// The checked-in GIF stays outside this guard so failures leave the prior
 /// published recording untouched.
-struct DemoArtifactCleanup;
+struct DemoArtifactCleanup {
+    rendered: PathBuf,
+    intermediate: PathBuf,
+    quantised: PathBuf,
+}
 
 impl DemoArtifactCleanup {
-    fn install() -> Self {
-        Self
+    fn install(asset: &Path) -> io::Result<Self> {
+        let parent = asset.parent().ok_or_else(|| {
+            io::Error::other(format!(
+                "demo asset has no parent directory: {}",
+                asset.display()
+            ))
+        })?;
+        let stem = asset.file_stem().and_then(OsStr::to_str).ok_or_else(|| {
+            io::Error::other(format!(
+                "demo asset has no UTF-8 file stem: {}",
+                asset.display()
+            ))
+        })?;
+        fs::create_dir_all(parent)?;
+        Ok(Self {
+            rendered: parent.join(format!("{stem}.rendered.gif")),
+            intermediate: parent.join(format!("{stem}.palette.gif")),
+            quantised: parent.join(format!("{stem}.quantised.gif")),
+        })
     }
 
-    fn rendered() -> &'static Path {
-        Path::new(DEMO_RENDERED)
+    fn rendered(&self) -> &Path {
+        &self.rendered
     }
 
-    fn intermediate() -> &'static Path {
-        Path::new(DEMO_INTERMEDIATE)
+    fn intermediate(&self) -> &Path {
+        &self.intermediate
     }
 
-    fn quantised() -> &'static Path {
-        Path::new(DEMO_QUANTISED)
+    fn quantised(&self) -> &Path {
+        &self.quantised
     }
 
-    fn clear_stale() -> io::Result<()> {
-        Self::clear_all()
+    fn clear_stale(&self) -> io::Result<()> {
+        self.clear_all()
     }
 
-    fn clear_transients() -> io::Result<()> {
-        remove_demo_files(&[Self::rendered(), Self::intermediate()])
+    fn clear_transients(&self) -> io::Result<()> {
+        remove_demo_files(&[self.rendered(), self.intermediate()])
     }
 
-    fn clear_all() -> io::Result<()> {
-        remove_demo_files(&[Self::rendered(), Self::intermediate(), Self::quantised()])
+    fn clear_all(&self) -> io::Result<()> {
+        remove_demo_files(&[self.rendered(), self.intermediate(), self.quantised()])
     }
 }
 
 impl Drop for DemoArtifactCleanup {
     fn drop(&mut self) {
-        if let Err(error) = Self::clear_all() {
+        if let Err(error) = self.clear_all() {
             eprintln!("could not clean demo staging artifacts: {error}");
         }
     }
@@ -543,9 +691,9 @@ fn created_output_len(path: &Path, stage: &str) -> io::Result<u64> {
     }
     Ok(len)
 }
-/// Verifies that the staged GIF contains the complete demo rather than a
-/// non-empty prefix left behind by a failed VHS encoder.
-fn created_recording_len(path: &Path, stage: &str) -> io::Result<u64> {
+
+/// Verifies that the staged GIF contains a complete recording.
+fn created_recording_len(path: &Path, stage: &str, criteria: RecordingCriteria) -> io::Result<u64> {
     let len = created_output_len(path, stage)?;
     let output = Command::new("ffprobe")
         .args([
@@ -606,7 +754,7 @@ fn created_recording_len(path: &Path, stage: &str) -> io::Result<u64> {
                 path.display()
             ))
         })?;
-    validate_demo_recording_metrics(duration, frames).map_err(|error| {
+    validate_demo_recording_metrics(duration, frames, criteria).map_err(|error| {
         io::Error::other(format!(
             "{stage} output {} is incomplete: {error}",
             path.display()
@@ -615,15 +763,21 @@ fn created_recording_len(path: &Path, stage: &str) -> io::Result<u64> {
     Ok(len)
 }
 
-fn validate_demo_recording_metrics(duration: f64, frames: u64) -> io::Result<()> {
-    if !duration.is_finite() || duration < DEMO_MIN_DURATION_SECONDS {
+fn validate_demo_recording_metrics(
+    duration: f64,
+    frames: u64,
+    criteria: RecordingCriteria,
+) -> io::Result<()> {
+    if !duration.is_finite() || duration < criteria.minimum_duration_seconds {
         return Err(io::Error::other(format!(
-            "duration {duration:.3}s is below the {DEMO_MIN_DURATION_SECONDS:.3}s minimum"
+            "duration {duration:.3}s is below the {}s minimum",
+            criteria.minimum_duration_seconds
         )));
     }
-    if frames < DEMO_MIN_FRAMES {
+    if frames < criteria.minimum_frames {
         return Err(io::Error::other(format!(
-            "{frames} frames are below the {DEMO_MIN_FRAMES}-frame minimum"
+            "{frames} frames are below the {} frame minimum",
+            criteria.minimum_frames
         )));
     }
     Ok(())
@@ -2062,9 +2216,35 @@ mod tests {
 
     #[test]
     fn demo_recording_metrics_reject_truncated_captures() {
-        assert!(validate_demo_recording_metrics(10.4, 177).is_ok());
-        assert!(validate_demo_recording_metrics(9.9, 177).is_err());
-        assert!(validate_demo_recording_metrics(10.4, 159).is_err());
+        assert!(validate_demo_recording_metrics(10.4, 177, HERO_DEMO_ENCODING.criteria).is_ok());
+        assert!(validate_demo_recording_metrics(9.9, 177, HERO_DEMO_ENCODING.criteria).is_err());
+        assert!(validate_demo_recording_metrics(10.4, 159, HERO_DEMO_ENCODING.criteria).is_err());
+        assert!(validate_demo_recording_metrics(2.5, 40, FEATURE_DEMO_ENCODING.criteria).is_ok());
+        assert!(validate_demo_recording_metrics(2.4, 40, FEATURE_DEMO_ENCODING.criteria).is_err());
+    }
+
+    #[test]
+    fn feature_demo_manifest_has_unique_names_tapes_and_assets() {
+        for (index, demo) in FEATURE_DEMOS.iter().enumerate() {
+            assert!(demo.tape.starts_with("tapes/features/"));
+            assert!(demo.asset.starts_with("assets/features/"));
+            for prior in &FEATURE_DEMOS[..index] {
+                assert_ne!(demo.name, prior.name);
+                assert_ne!(demo.tape, prior.tape);
+                assert_ne!(demo.asset, prior.asset);
+            }
+        }
+    }
+
+    #[test]
+    fn feature_demo_selection_supports_names_and_rejects_unknown_values() {
+        let selected =
+            selected_feature_demos(["reports".to_owned(), "storage-map".to_owned()].into_iter())
+                .expect("known feature demos should select");
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].name, "reports");
+        assert_eq!(selected[1].name, "storage-map");
+        assert!(selected_feature_demos(["missing".to_owned()].into_iter()).is_err());
     }
     const TEST_VERSION: &str = "1.2.3";
 

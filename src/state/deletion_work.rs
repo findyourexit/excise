@@ -129,7 +129,7 @@ struct DeletionWorkItem {
     path: PathBuf,
     relative_path: RelativePath,
     label: Box<str>,
-    /// A lightweight stale-refresh seed; planner input itself is moved to the worker.
+    /// A lightweight stale-refresh seed. The planner input is moved to the worker.
     target: Option<FileToDelete>,
     plan: Option<Box<DeletionPlan>>,
     stage: DeletionWorkStage,
