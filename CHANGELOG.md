@@ -6,6 +6,10 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+### Added
+
+* Added a Zensical documentation site with searchable project guides, source links, and GitHub Pages deployment.
+
 ## [1.3.0] - 2026-09-24
 
 ### Changed

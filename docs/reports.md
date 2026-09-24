@@ -1,42 +1,58 @@
 # Reports & JSON Formats
 
-Excise produces bounded reports. When a scan is uncertain or capacity prevents retaining a navigable map, the report says so instead of claiming a complete inventory.
+Excise produces **bounded** reports. When a scan is uncertain, incomplete, or unable to retain a navigable map, the report says so instead of claiming a complete inventory.
 
-## Table Output
+!!! info "Choose the consumer first"
 
-```console
-excise --format table /path/to/inspect
-```
+    Use table output for people and shell pipelines. Use JSON for software. A nonzero exit can still carry a useful bounded report, so consumers must inspect both the exit code and the document state.
 
-Table output is written for people and shell pipelines. Its headings, column order, and layout can change between releases. Use JSON when another program needs to read the result. Table mode does not initialize a terminal. Paths are escaped for safe display.
+## Choose an Output Format
 
-## JSON Output
+=== "Human-readable table"
 
-```console
-excise --format json /path/to/inspect
-excise --format json --output scan.json /path/to/inspect
-```
+    ```console
+    excise --format table /path/to/inspect
+    ```
 
-JSON uses named document types and stable version numbers. The published Draft 2020-12 formats are:
+    Table output never initializes a terminal and escapes paths for safe display. Its headings, column order, and layout are presentation details that may change between releases.
 
-- [`scan-report` version 3](schemas/scan-report.schema.json)
-- [`deletion-history` version 1](schemas/deletion-history.schema.json)
-- [`native-path` version 1](schemas/native-path.schema.json)
+=== "Versioned JSON"
 
-`scan-report` version 3 reports `scan_store_bytes` and `scan_store_limit_bytes` in its summary. They describe the private scan-storage reservation at the terminal state. They are not file-system space totals or process-memory measurements.
+    ```console
+    excise --format json /path/to/inspect
+    excise --format json --output scan.json /path/to/inspect
+    ```
 
-An unknown upper bound is `null`. Excise never replaces it with an apparent file length. The `Shared` allocation summary has an explicit type and cannot be a deletion target.
+    JSON uses named document types and stable version numbers. `--output FILE` writes the document instead of standard output and is available only in table or JSON mode.
 
-A `summary-only` scan report means scan-storage capacity was reached after directory reduction. It retains the terminal summary and root metrics. It deliberately contains no navigable entry inventory. Run again with a larger `--scan-store-mib` value.
+!!! warning "Do not parse table layout"
+
+    Table output is intentionally human-facing. Programs must consume the versioned JSON documents and validate them against their published schemas.
+
+## Published JSON Contracts
+
+| Document | Stable version | Purpose |
+|---|---:|---|
+| [`scan-report`](schemas/scan-report.schema.json) | 3 | Bounded scan result and terminal scan-store reservation |
+| [`deletion-history`](schemas/deletion-history.schema.json) | 1 | Bounded result of reviewed deletion work |
+| [`native-path`](schemas/native-path.schema.json) | 1 | Lossless platform-specific path encoding |
+
+`scan-report` version 3 includes `scan_store_bytes` and `scan_store_limit_bytes` in its summary. They describe the private scan-storage reservation at terminal state; they are neither file-system space totals nor process-memory measurements.
+
+???+ info "Read document state before interpreting totals"
+
+    An unknown upper bound is `null`. Excise never substitutes an apparent file length for it. The `Shared` allocation summary has an explicit type and cannot be a deletion target.
+
+    A `summary-only` scan report means scan-storage capacity was reached after directory reduction. The report retains terminal summary and root metrics, but deliberately has no navigable entry inventory. Run again with a larger `--scan-store-mib` value when a detailed retained map is required.
 
 ## Interactive Exports
 
-Press `e` in the normal view to export the current scan. Press `E` in the normal view to export the bounded deletion history. No result modal is required. Excise writes the first available filename in the current directory:
+In the normal view, press ++e++ to export the current scan and ++shift+e++ to export bounded deletion history. No result modal is required. Excise selects the first available filename in the current directory and never overwrites an existing file.
 
-- `excise-scan-report.json`, then `excise-scan-report-1.json`, and so on
-- `excise-deletion-history.json`, then `excise-deletion-history-1.json`, and so on
-
-Automatic export naming never overwrites an existing file.
+| Export | First filename | Later filenames |
+|---|---|---|
+| Scan report | `excise-scan-report.json` | `excise-scan-report-1.json`, then increasing suffixes |
+| Deletion history | `excise-deletion-history.json` | `excise-deletion-history-1.json`, then increasing suffixes |
 
 ## Exit Codes
 
@@ -51,8 +67,13 @@ Automatic export naming never overwrites an existing file.
 | `78` | Configuration failure |
 | `130` | Interrupted operation |
 
-An uncertain or partial exit can still include a useful report. Consumers should inspect both the exit code and the document state.
+!!! tip "Safe consumer pattern"
+
+    - [ ] Check the process exit code.
+    - [ ] Validate JSON against the named schema and version.
+    - [ ] Read the document state and uncertainty fields.
+    - [ ] Treat `null`, `summary-only`, and partial outcomes as explicit limits, not missing defaults.
 
 ## Space Accounting
 
-The main space measure counts each file once, even when it has more than one name, and reports the allocated space. Physical storage shared by copy-on-write files, clones, compression, or file system deduplication is not measured exactly. See [Space Accounting](safety/accounting.md).
+The main measure reports allocated space counted once for each file identity, even when it has more than one name. Physical storage shared by copy-on-write files, clones, compression, or file-system deduplication is not measured exactly. See [Space Accounting](safety/accounting.md) for the full contract.

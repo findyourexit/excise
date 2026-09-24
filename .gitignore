@@ -12,6 +12,10 @@ vendor/
 vendor.tar
 **/*.rs.bk
 dist/
+
+# Zensical
+.venv/
+site/
 /excise-scan-report*.json
 /excise-deletion-history*.json
 

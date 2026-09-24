@@ -2,7 +2,7 @@
 
 ## Stable v1 Support Policy
 
-The stable v1 line defines the command-line tool, configuration, and versioned JSON report formats. Deletion remains permanent with no trash or undo. Start with [Getting Started](docs/getting-started.md), use a disposable fixture first, and report safety or release-integrity defects privately under [SECURITY.md](SECURITY.md).
+The stable v1 line defines the command-line tool, configuration, and versioned JSON report formats. Deletion remains permanent with no trash or undo. Start with the [Getting Started guide](https://tomlarcher.com/excise/getting-started/), use a disposable fixture first, and report safety or release-integrity defects privately under [SECURITY.md](SECURITY.md).
 
 The `0.3.x` releases were early testing and are superseded. They remain in the changelog and release history as historical records.
 
@@ -10,14 +10,14 @@ The `0.3.x` releases were early testing and are superseded. They remain in the c
 
 The stable platform support set is:
 
-| Target | Stable v1 status | Evidence |
-|---|---|---|
-| x86_64 Linux (`x86_64-unknown-linux-gnu`) | Supported | Testing on Linux, terminal testing, and release archive |
-| AArch64 macOS (`aarch64-apple-darwin`) | Supported | Testing on macOS, terminal testing, and release archive |
-| x86_64 Windows (`x86_64-pc-windows-msvc`) | Supported | Testing on Windows, terminal testing, and release archive |
-| x86_64 macOS (`x86_64-apple-darwin`) | Build-only and best effort | Release compilation and archive only |
-| AArch64 Linux (`aarch64-unknown-linux-gnu`) | Build-only and best effort | Release compilation and archive only |
-| AArch64 Windows (`aarch64-pc-windows-msvc`) | Build-only and best effort | Release compilation and archive only |
+| Target                                      | Support Status | Details                                                   |
+|---------------------------------------------|----------------|-----------------------------------------------------------|
+| x86_64 Linux (`x86_64-unknown-linux-gnu`)   | ✅ Supported   | Testing on Linux, terminal testing, and release archive   |
+| AArch64 macOS (`aarch64-apple-darwin`)      | ✅ Supported   | Testing on macOS, terminal testing, and release archive   |
+| x86_64 Windows (`x86_64-pc-windows-msvc`)   | ✅ Supported   | Testing on Windows, terminal testing, and release archive |
+| x86_64 macOS (`x86_64-apple-darwin`)        | 🟡 Best effort | Release compilation and archive only                      |
+| AArch64 Linux (`aarch64-unknown-linux-gnu`) | 🟡 Best effort | Release compilation and archive only                      |
+| AArch64 Windows (`aarch64-pc-windows-msvc`) | 🟡 Best effort | Release compilation and archive only                      |
 
 The three build-only archives remain available for experimentation. A successful download or compilation does not prove that the program runs correctly on that target.
 
@@ -25,7 +25,7 @@ Behavior can vary with file system types, access rules, network file systems, fi
 
 ## Usage Questions
 
-Search the [Documentation](docs/README.md) and existing discussions first. Use [GitHub Discussions](https://github.com/findyourexit/excise/discussions) for installation, configuration, and usage questions.
+Search the [Documentation](https://tomlarcher.com/excise/) and existing discussions first. Use [GitHub Discussions](https://github.com/findyourexit/excise/discussions) for installation, configuration, and usage questions.
 
 ## Troubleshooting
 

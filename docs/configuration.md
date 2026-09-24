@@ -1,25 +1,47 @@
 # Configuration
 
-Excise reads configuration in this order:
+Excise resolves configuration from the highest-precedence source that supplies a value. It rejects unknown keys, unsupported versions, invalid ranges, invalid choices, and conflicting custom keys.
 
-1. Command-line options
-2. Environment variables
-3. A versioned TOML file
-4. Built-in defaults
+```mermaid
+flowchart TD
+    CLI[Command-line options] -->|override| ENV[Environment variables]
+    ENV -->|override| FILE[Versioned TOML file]
+    FILE -->|override| DEFAULTS[Built-in defaults]
+```
 
-Unknown keys, unsupported versions, invalid ranges, invalid choices, and conflicting custom keys cause a configuration error.
+!!! tip "Start with the defaults"
 
-## Select A File
+    Configure only values that express a real preference or resource boundary. Omitted limits retain the adaptive budgets that leave capacity for the rest of the process and the user’s system.
 
-Use `--config FILE` or `EXCISE_CONFIG` to choose a file. Without either, Excise reads `config.toml` from the operating system's standard per-user configuration directory when that file exists.
+## Choose a Configuration File
+
+=== "Command line"
+
+    ```console
+    excise --config /path/to/config.toml /path/to/inspect
+    ```
+
+    An explicit `--config FILE` selects the file for that invocation.
+
+=== "Environment"
+
+    ```console
+    EXCISE_CONFIG=/path/to/config.toml excise /path/to/inspect
+    ```
+
+    `EXCISE_CONFIG` selects the file when the command line does not.
+
+=== "Platform default"
+
+    Without either selector, Excise reads `config.toml` from the operating system’s standard per-user configuration directory when that file exists.
 
 ## TOML File
 
 ```toml
-version = 1
+version = 1 # (1)!
 
 [scanner]
-threads = 8
+threads = 8 # (2)!
 event_buffer = 256
 apparent_size = false
 cross_filesystems = false
@@ -29,9 +51,10 @@ exclusions = [".git/", "target/"]
 process_memory_mib = 512
 temporary_storage_mib = 4096
 # Omit these optional limits to use the adaptive scratch-space budget.
-# scan_store_mib = 8192
+# scan_store_mib = 8192 # (3)!
 # scan_store_reserve_mib = 4096
-scan_store_dir = "/var/tmp/excise"
+scan_store_dir = "/var/tmp/excise" # (4)!
+
 [runtime]
 reduced_motion = false
 theme = "excise-dark"
@@ -41,7 +64,14 @@ keymap = "vim"
 format = "tui"
 ```
 
-Custom movement requires four different, unmodified printable ASCII keys. The keys must not replace normal commands:
+1. `version = 1` is required. Unsupported versions are rejected rather than silently reinterpreted.
+2. A configured worker count must be between one and 32. By default, Excise uses all but one detected processor, bounded to one through eight workers.
+3. `scan_store_mib` and `scan_store_reserve_mib` are optional limits. Omit them to retain the adaptive scan-store budget.
+4. `scan_store_dir` names the parent directory for private, automatically cleaned per-session scan data. It must be writable.
+
+### Custom Movement Keys
+
+Custom movement requires four different, unmodified printable ASCII keys. They cannot replace normal commands.
 
 ```toml
 [runtime]
@@ -68,7 +98,7 @@ right = "d"
 | `model.process_memory_mib` | Whole-process memory limit | At least 128 MiB and no more than detected memory |
 | `model.temporary_storage_mib` | Directory-plan and deletion-result storage per session | At least 2 MiB |
 | `model.scan_store_mib` | Optional upper limit for private scan data and page indexes | At least 2 MiB, capped by safe free space on its scratch volume |
-| `model.scan_store_reserve_mib` | Scratch space kept outside scan-store files | At least 0 MiB, defaults to 25 percent of free scratch space |
+| `model.scan_store_reserve_mib` | Scratch space kept outside scan-store files | At least 0 MiB; defaults to 25 percent of free scratch space |
 | `model.scan_store_dir` | Parent directory for private scan-storage session data | A writable path |
 | `runtime.reduced_motion` | Disable nonessential transitions | true or false |
 | `runtime.theme` | Built-in color theme | See `excise --help` for names |
@@ -78,13 +108,15 @@ right = "d"
 | `runtime.format` | Output mode | `tui`, `table`, or `json` |
 | `runtime.output` | Report destination for noninteractive output | A path |
 
-The default memory limit is 512 MiB or the detected available memory when that is lower. Excise reserves 25 percent as process headroom and limits working data to the remaining 75 percent.
+???+ info "Memory and scratch-space budgets"
 
-The interactive `t` picker previews existing `runtime.theme` values without changing configuration. Press `Enter` to save the selected theme for later TUI sessions. Press `Esc` to restore the original value without writing a preference.
+    The default process memory limit is 512 MiB or the detected available memory when that is lower. Excise reserves 25 percent as process headroom and limits working data to the remaining 75 percent.
 
-The default temporary-storage limit is 4 GiB per session. The scan-store budget adapts to the scratch volume. It uses up to 75 percent of its safe free space and reserves the other 25 percent for the user and other processes. `model.scan_store_mib`, `EXCISE_SCAN_STORE_MIB`, and `--scan-store-mib` set an optional upper limit. `model.scan_store_reserve_mib`, `EXCISE_SCAN_STORE_RESERVE_MIB`, and `--scan-store-reserve-mib` replace the default reserve. When the volume permits it, the effective budget still leaves the minimum usable scan-store capacity. `model.scan_store_dir`, `EXCISE_SCAN_STORE_DIR`, and `--scan-store-dir` select the parent of the private, automatically cleaned session directory that holds durable scan data and completed page indexes.
+    Temporary storage defaults to 4 GiB per session. The scan-store budget adapts to its scratch volume: it uses up to 75 percent of safe free space and reserves the remaining 25 percent for the user and other processes. `model.scan_store_mib`, `EXCISE_SCAN_STORE_MIB`, and `--scan-store-mib` set an optional upper limit. `model.scan_store_reserve_mib`, `EXCISE_SCAN_STORE_RESERVE_MIB`, and `--scan-store-reserve-mib` replace the default reserve.
 
-By default, Excise uses all but one detected processor, with one to eight workers, so interactive input keeps a processor when possible.
+    When the volume permits it, the effective budget still leaves the minimum usable scan-store capacity. The scan-store directory contains durable scan data and completed page indexes only for the private active session.
+
+The interactive ++t++ picker previews existing `runtime.theme` values without changing configuration. Press ++enter++ to save the selected theme for later TUI sessions, or ++esc++ to restore the original value without writing a preference.
 
 ## Environment Variables
 
@@ -115,4 +147,6 @@ Boolean environment values accept `true`, `false`, `yes`, `no`, `on`, `off`, `1`
 
 ## Deletion Confirmation
 
-`--disable-delete-confirmation` does not remove deletion safeguards. It enables a visible, session-only reduced confirmation mode. It is intentionally unavailable in the persistent configuration file and environment.
+!!! warning "Reduced confirmation is intentionally nonpersistent"
+
+    `--disable-delete-confirmation` does not remove deletion safeguards. It enables a visible, session-only reduced confirmation mode. It is intentionally unavailable in both the persistent configuration file and the environment.
