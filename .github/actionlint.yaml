@@ -1,0 +1,5 @@
+# actionlint v1.7.12 predates the hosted Ubuntu 26.04 label.
+paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+      - 'label "ubuntu-26\.04" is unknown'
