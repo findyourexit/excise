@@ -1,13 +1,13 @@
 complete -c excise -l config -d 'Read configuration from FILE' -r -F
 complete -c excise -l scan-threads -d 'Scanner worker count (1-32)' -r
-complete -c excise -l event-buffer -d 'Bounded worker-event capacity (16-4096)' -r
+complete -c excise -l event-buffer -d 'Maximum queued worker events (16 to 4096)' -r
 complete -c excise -l exclude -d 'Ordered gitignore-style exclusion pattern' -r
-complete -c excise -l memory-mib -d 'Whole-process memory envelope in MiB' -r
-complete -c excise -l temporary-storage-mib -d 'Directory-plan and deletion-result storage limit per session (2+)' -r
-complete -c excise -l scan-store-mib -d 'Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)' -r
-complete -c excise -l scan-store-dir -d 'Parent directory for the private canonical scan-store session' -r -F
-complete -c excise -l scan-store-reserve-mib -d 'Scratch space preserved outside scan-store files (default: 25% of free space)' -r
-complete -c excise -l theme -d 'Built-in semantic color theme' -r -f -a "excise-dark\t''
+complete -c excise -l memory-mib -d 'Whole-process memory limit in MiB' -r
+complete -c excise -l temporary-storage-mib -d 'Directory-plan and deletion-result storage limit per session (at least 2 MiB)' -r
+complete -c excise -l scan-store-mib -d 'Private scan data and page-index storage limit per session (at least 2 MiB, capped by scratch-volume free space)' -r
+complete -c excise -l scan-store-dir -d 'Parent directory for the private scan-storage session' -r -F
+complete -c excise -l scan-store-reserve-mib -d 'Scratch space kept outside scan-storage files (defaults to 25 percent of free space)' -r
+complete -c excise -l theme -d 'Built-in color theme' -r -f -a "excise-dark\t''
 excise-light\t''
 high-contrast\t''
 monochrome\t''
@@ -25,7 +25,7 @@ monokai\t''"
 complete -c excise -l keymap -d 'Keyboard preset. Arrows and safety keys always work' -r -f -a "vim\t''
 custom\t''
 emacs\t''"
-complete -c excise -l format -d 'Output mode. Table and JSON never acquire a terminal' -r -f -a "tui\t''
+complete -c excise -l format -d 'Output mode. Table and JSON modes do not require a terminal' -r -f -a "tui\t''
 table\t''
 json\t''"
 complete -c excise -l output -d 'Write a noninteractive report to FILE instead of stdout' -r -F

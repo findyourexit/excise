@@ -6,7 +6,7 @@
 - [Configuration](configuration.md)
 - [Reports & JSON Formats](reports.md)
 
-## Understand The System
+## Understand the System
 
 - [Architecture](architecture/overview.md)
 - [Threat Model](architecture/threat-model.md)

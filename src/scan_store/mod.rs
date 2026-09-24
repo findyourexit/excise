@@ -1,7 +1,7 @@
-//! Canonical, session-local scan persistence.
+//! Private, per-session scan storage.
 //!
-//! This module owns durable scan facts and lossless reduction inputs. The
-//! mutable UI model must only cache queries derived from this store.
+//! This module holds durable scan facts and the data used to combine them. The
+//! mutable UI model may cache only queries derived from this store.
 
 pub(crate) mod directory_summary;
 pub(crate) mod identity_observation;

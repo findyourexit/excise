@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 const MAX_FOCUS_PATHS: usize = 32;
 const FOREGROUND_LEASE_BURST: u8 = 4;
 
-/// Monotonic identifier for one coherent scan result generation.
+/// Increasing identifier for one complete scan result.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ScanGeneration(u64);
 
@@ -411,7 +411,7 @@ impl WorkCounts {
     }
 }
 
-/// Coalesced scheduler state suitable for a bounded UI status snapshot.
+/// Combined scheduler state for a fixed-size UI status summary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchedulerSnapshot {
     pub(crate) session: ScanSessionId,
@@ -676,13 +676,12 @@ impl ScanCoordinator {
         self.generation
     }
 
-    /// Advances to a newer canonical scan generation while retaining
-    /// independent deletion work until its planner or executor reports a
-    /// terminal result.
+    /// Moves to a newer stored scan result while keeping independent deletion
+    /// work until its planner or executor reports a final result.
     ///
-    /// Scan-store recovery may retire incomplete generations before opening a
-    /// later one, so the coordinator accepts a strictly newer identifier rather
-    /// than assuming every visible generation number is consecutive.
+    /// Scan-store recovery can retire incomplete results before opening a later
+    /// one, so the coordinator accepts any strictly newer identifier instead of
+    /// requiring consecutive numbers.
     pub fn advance_to(&mut self, generation: ScanGeneration) -> bool {
         if generation <= self.generation {
             return false;
@@ -696,7 +695,7 @@ impl ScanCoordinator {
         true
     }
 
-    /// Advances to the immediately following canonical scan generation.
+    /// Moves to the immediately following scan result identifier.
     ///
     /// Returns `None` only after the generation identifier is exhausted.
     pub fn advance_generation(&mut self) -> Option<ScanGeneration> {
@@ -752,14 +751,14 @@ impl ScanCoordinator {
         self.focus_epoch = self.focus_epoch.wrapping_add(1);
     }
 
-    /// Grants the next deterministic eligible lease, if any work is ready.
+    /// Grants the next deterministic eligible work claim when work is ready.
     pub fn lease_next(&mut self) -> Option<WorkLease> {
         let (queued, focused) = self.next_queued()?;
         self.lease_queued(queued, focused)
     }
 
-    /// Grants the next focused and fair scanner lease selected by the central
-    /// work ledger. The caller then retrieves its durable payload by path.
+    /// Grants the next focused and fair scanner work claim selected by the
+    /// central work records. The caller then retrieves its durable payload by path.
     pub fn lease_next_scan(&mut self) -> Option<WorkLease> {
         let (queued, focused) = self.next_scan_queued()?;
         self.lease_queued(queued, focused)
@@ -768,8 +767,8 @@ impl ScanCoordinator {
     /// Grants the exact pending key after its physical work queue selected it.
     ///
     /// The scanner journal owns durable task payloads while this coordinator
-    /// owns the authoritative lifecycle. Keeping the two admissions separate
-    /// avoids exposing the queue to worker threads.
+    /// owns the full lifecycle. Keeping the two admissions separate avoids
+    /// exposing the queue to worker threads.
     pub fn lease_exact(&mut self, key: &WorkKey) -> Option<WorkLease> {
         let pending = self.pending.get(key)?;
         if pending.queued.key.kind == WorkKind::ExecuteDeletion

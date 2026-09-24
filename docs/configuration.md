@@ -67,9 +67,9 @@ right = "d"
 | `scanner.exclusions` | Ordered gitignore-style patterns | An array of strings |
 | `model.process_memory_mib` | Whole-process memory limit | At least 128 MiB and no more than detected memory |
 | `model.temporary_storage_mib` | Directory-plan and deletion-result storage per session | At least 2 MiB |
-| `model.scan_store_mib` | Optional upper bound for scanner journal, canonical scan runs, and page indexes | At least 2 MiB; capped by safe free space on its scratch volume |
-| `model.scan_store_reserve_mib` | Scratch space held outside scan-store files | At least 0 MiB; defaults to 25 percent of free scratch space |
-| `model.scan_store_dir` | Parent directory for a private canonical scan-store session | A writable path |
+| `model.scan_store_mib` | Optional upper limit for private scan data and page indexes | At least 2 MiB, capped by safe free space on its scratch volume |
+| `model.scan_store_reserve_mib` | Scratch space kept outside scan-store files | At least 0 MiB, defaults to 25 percent of free scratch space |
+| `model.scan_store_dir` | Parent directory for private scan-storage session data | A writable path |
 | `runtime.reduced_motion` | Disable nonessential transitions | true or false |
 | `runtime.theme` | Built-in color theme | See `excise --help` for names |
 | `runtime.ascii` | Use ASCII symbols and borders | true or false |
@@ -79,9 +79,12 @@ right = "d"
 | `runtime.output` | Report destination for noninteractive output | A path |
 
 The default memory limit is 512 MiB or the detected available memory when that is lower. Excise reserves 25 percent as process headroom and limits working data to the remaining 75 percent.
-The interactive `t` picker previews these existing `runtime.theme` values without changing configuration. Pressing `Enter` immediately saves the selected theme for later TUI sessions, while `Esc` restores the original value without writing a preference.
-The default temporary-storage limit is 4 GiB per session. The default scan-store budget is adaptive: it uses the safe 75 percent share of free space on the selected scratch volume, preserving the remaining 25 percent for the user and other process needs. `model.scan_store_mib`, `EXCISE_SCAN_STORE_MIB`, and `--scan-store-mib` set an optional upper bound. `model.scan_store_reserve_mib`, `EXCISE_SCAN_STORE_RESERVE_MIB`, and `--scan-store-reserve-mib` replace the default scratch reserve; the effective budget still retains at least the minimum usable scan-store capacity when the volume permits it. `model.scan_store_dir`, `EXCISE_SCAN_STORE_DIR`, and `--scan-store-dir` select the parent of the private, auto-cleaned session directory containing the durable generation manifest. Both budgets grow only as their session needs them. Page publication consumes raw fact runs phase by phase and retains only its compact query indexes after publication.
-By default, Excise uses one less than the detected available processor count, clamped from one through eight workers, so interactive input retains a processor when possible.
+
+The interactive `t` picker previews existing `runtime.theme` values without changing configuration. Press `Enter` to save the selected theme for later TUI sessions. Press `Esc` to restore the original value without writing a preference.
+
+The default temporary-storage limit is 4 GiB per session. The scan-store budget adapts to the scratch volume. It uses up to 75 percent of its safe free space and reserves the other 25 percent for the user and other processes. `model.scan_store_mib`, `EXCISE_SCAN_STORE_MIB`, and `--scan-store-mib` set an optional upper limit. `model.scan_store_reserve_mib`, `EXCISE_SCAN_STORE_RESERVE_MIB`, and `--scan-store-reserve-mib` replace the default reserve. When the volume permits it, the effective budget still leaves the minimum usable scan-store capacity. `model.scan_store_dir`, `EXCISE_SCAN_STORE_DIR`, and `--scan-store-dir` select the parent of the private, automatically cleaned session directory that holds durable scan data and completed page indexes.
+
+By default, Excise uses all but one detected processor, with one to eight workers, so interactive input keeps a processor when possible.
 
 ## Environment Variables
 

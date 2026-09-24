@@ -6,7 +6,7 @@
 # limited to those generated paths.
 #
 # Regenerate from the repository root after building the pinned binary:
-#   cargo +1.88.0 build --release --locked && cargo demo
+#   cargo +1.98.0 build --release --locked && cargo demo
 # Requires vhs, ttyd, ffmpeg, ffprobe, and gifsicle on PATH.
 #
 # `vhs tapes/demo.tape` alone renders a correct but much heavier GIF. The xtask
@@ -81,12 +81,17 @@ Right@350ms 1
 Wait+Screen /Content size 3\.2M · 1 item/
 Sleep 1.1s
 
-# Surface the contextual command help before the final hidden exit.
-Type "?"
-Wait+Screen /HELP/
+# Show the redesigned modal chrome and immediate palette preview without
+# persisting a preference in the disposable fixture.
+Type "t"
+Wait+Screen /> Excise Dark/
+Sleep 700ms
+Down@300ms 1
+Wait+Screen /> Excise Light/
 Sleep 1.1s
-Type "?"
-Sleep 600ms
+Escape
+Wait+Screen /Content size 3\.2M · 1 item/
+Sleep 700ms
 
 # Quit inside a hidden block so the shell and cleanup are never recorded.
 Hide

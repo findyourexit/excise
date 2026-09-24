@@ -48,8 +48,8 @@ pub(crate) enum DirectorySummaryRunError {
 
 /// Reuses record buffers to encode one post-order directory summary.
 ///
-/// The key is a monotonic big-endian post-order ordinal. The value owns the
-/// path so streaming reduction can preserve its natural post-order without a
+/// The key is an increasing big-endian post-order number. The value owns the
+/// path so streaming reduction preserves its natural post-order without a
 /// second unbounded sort.
 ///
 /// # Errors

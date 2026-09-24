@@ -70,10 +70,10 @@ pub struct ScanReportEntry {
     pub unscanned_reason: Option<String>,
 }
 
-/// The owned, serializable scan-report document used for decoding and contract validation.
+/// Owned, serializable scan-report document used for decoding and contract validation.
 ///
-/// Production export deliberately uses [`ScanReport`] instead: it streams the immutable
-/// canonical generation instead of cloning every entry into this document.
+/// Production export uses [`ScanReport`] instead. It streams the immutable
+/// published scan instead of cloning every entry into this document.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanReportDocument {
@@ -87,9 +87,9 @@ pub struct ScanReportDocument {
     pub entries: Vec<ScanReportEntry>,
 }
 
-/// An owned canonical generation serialized directly to its output sink.
+/// An owned published scan serialized directly to its output sink.
 ///
-/// The report retains the published scan facts, not the bounded live model, so
+/// The report retains published scan facts, not the limited live model, so
 /// noninteractive output cannot silently diverge from the tree-map source.
 pub struct ScanReport {
     root: PathBuf,

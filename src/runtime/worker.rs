@@ -239,7 +239,7 @@ impl WorkerPool {
         self.scanner.prioritize(path);
     }
 
-    /// Returns the latest coalesced session scheduler state without consuming a worker event.
+    /// Returns the latest combined session scheduler state without consuming a worker event.
     #[must_use]
     pub(crate) fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
         self.coordinator.snapshot().ok()

@@ -178,7 +178,7 @@ pub struct Cli {
     /// Scanner worker count (1-32)
     pub scan_threads: Option<usize>,
     #[arg(long, value_name = "COUNT")]
-    /// Bounded worker-event capacity (16-4096)
+    /// Maximum queued worker events (16 to 4096)
     pub event_buffer: Option<usize>,
     #[arg(long)]
     /// Permit traversal across filesystem boundaries
@@ -187,25 +187,25 @@ pub struct Cli {
     /// Ordered gitignore-style exclusion pattern
     pub exclusions: Vec<String>,
     #[arg(long, value_name = "MIB")]
-    /// Whole-process memory envelope in MiB
+    /// Whole-process memory limit in MiB
     pub memory_mib: Option<usize>,
     #[arg(long, value_name = "MIB")]
-    /// Directory-plan and deletion-result storage limit per session (2+)
+    /// Directory-plan and deletion-result storage limit per session (at least 2 MiB)
     pub temporary_storage_mib: Option<usize>,
     #[arg(long, value_name = "MIB")]
-    /// Canonical scanner journal, scan-run, and page-index storage upper limit per session (2+; capped by scratch-volume free space)
+    /// Private scan data and page-index storage limit per session (at least 2 MiB, capped by scratch-volume free space)
     pub scan_store_mib: Option<usize>,
     #[arg(long, value_name = "DIR")]
-    /// Parent directory for the private canonical scan-store session
+    /// Parent directory for the private scan-storage session
     pub scan_store_dir: Option<PathBuf>,
     #[arg(long, value_name = "MIB")]
-    /// Scratch space preserved outside scan-store files (default: 25% of free space)
+    /// Scratch space kept outside scan-storage files (defaults to 25 percent of free space)
     pub scan_store_reserve_mib: Option<usize>,
     #[arg(long)]
     /// Disable nonessential motion
     pub reduced_motion: bool,
     #[arg(long, value_enum, value_name = "THEME")]
-    /// Built-in semantic color theme
+    /// Built-in color theme
     pub theme: Option<ThemeId>,
     #[arg(long)]
     /// Use ASCII-only symbols and borders
@@ -217,7 +217,7 @@ pub struct Cli {
     /// Keyboard preset. Arrows and safety keys always work.
     pub keymap: Option<KeyPreset>,
     #[arg(long, value_enum)]
-    /// Output mode. Table and JSON never acquire a terminal.
+    /// Output mode. Table and JSON modes do not require a terminal.
     pub format: Option<OutputFormat>,
     #[arg(long, value_name = "FILE")]
     /// Write a noninteractive report to FILE instead of stdout

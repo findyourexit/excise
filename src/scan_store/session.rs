@@ -813,7 +813,7 @@ impl ScanStore {
 
     /// Starts a newer generation by rebuilding every fact outside
     /// `replaced_prefix` from the compact published child-query run. Callers
-    /// may then publish a deletion overlay or add authoritative replacement facts.
+    /// may then publish a deletion overlay or add replacement facts from live data.
     ///
     /// # Errors
     ///
@@ -1014,9 +1014,9 @@ impl ScanStore {
 
     /// Sorts and persists one bounded scanner batch in both raw fact families.
     ///
-    /// Physical bytes belong only to the identity observations. Path metrics
-    /// retain hierarchy, apparent size, and coverage; publishing derives the
-    /// once-per-identity physical totals from the companion run.
+    /// Physical bytes belong only to identity observations. Path metrics retain
+    /// hierarchy, apparent size, and coverage. Publishing derives once-per-
+    /// identity physical totals from the companion run.
     ///
     /// # Errors
     ///

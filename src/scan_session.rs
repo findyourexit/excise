@@ -1,8 +1,8 @@
 use getrandom::Error as RandomError;
 
-/// Opaque identity for one private, canonical scan session.
+/// Opaque identity for one private scan session.
 ///
-/// It distinguishes independently created sessions even when their generation
+/// It distinguishes independently created sessions even when their scan-result
 /// counters have the same value.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ScanSessionId([u8; 16]);
@@ -30,12 +30,12 @@ impl ScanSessionId {
     }
 }
 
-/// Lifecycle of one deterministic canonical scan generation.
+/// Lifecycle of one deterministic scan result.
 ///
-/// Terminal states describe the whole generation. A partial scanner-input
-/// prefix is never represented as complete: capacity exhaustion before
-/// canonical reduction is `Incomplete`. `SummaryOnly` is reserved for a
-/// capacity failure after a complete deterministic directory reduction.
+/// Terminal states describe the whole result. A partial scanner-input prefix
+/// is never represented as complete. Capacity exhaustion before directory
+/// reduction is `Incomplete`. `SummaryOnly` is reserved for a capacity failure
+/// after complete deterministic directory reduction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ScanGenerationState {

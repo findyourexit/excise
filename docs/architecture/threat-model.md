@@ -46,9 +46,9 @@ Store file paths without losing their original bytes. Show a reversible escaped 
 
 - Limit worker counts and queues.
 - Enforce a hard memory limit for page views and a separate scan-store quota.
-- Keep exact totals in the bounded canonical store and immutable page queries.
+- Keep exact totals in private stored scan data and immutable page queries.
 - Use loops for traversal, layout, and deletion.
-- Store canonical scan data in private bounded session files.
+- Store scan data in private files with fixed limits.
 - Replace repeated visual effects by purpose and avoid an idle animation loop.
 
 ### Misleading Output
@@ -72,7 +72,7 @@ Validate the terminal before entering raw input mode. Restore it automatically o
 | A symbolic link points outside the selected root | Display the link and never traverse or delete its target |
 | A name contains an escape sequence | Display an escaped name and leave terminal state unchanged |
 | A metadata query fails | Mark the value unknown and do not substitute file length |
-| The scan store reaches capacity | Publish a deterministic summary-only result; do not expose a detailed map or deletion controls |
+| The scan store reaches capacity | Publish a deterministic summary-only result. Do not expose a detailed map or deletion controls. |
 | Focus changes repeat quickly | Replace the earlier visual effect and keep memory bounded |
-| The user quits during deletion | Cancel pending plans, safely stop after the current entry, or return to wait; never detach an active filesystem mutation |
+| The user quits during deletion | Cancel pending plans, safely stop after the current entry, or return to the map and wait. Never detach an active file-system change. |
 

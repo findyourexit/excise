@@ -15,7 +15,7 @@ rustup target add \
   x86_64-pc-windows-msvc
 ```
 
-The published target set has separate native-behavior and release-artifact evidence. The stable v1 support policy is runtime-evidence first: only native behavioral targets are fully supported.
+The published targets have separate evidence for native behavior and release archives. Only targets with native runtime evidence are fully supported in stable v1.
 
 ## Target evidence
 
@@ -28,7 +28,7 @@ The published target set has separate native-behavior and release-artifact evide
 | `aarch64-unknown-linux-gnu` (AArch64 Linux) | Build-only and best effort | Hosted release archive |
 | `aarch64-pc-windows-msvc` (AArch64 Windows) | Build-only and best effort | Hosted release archive |
 
-The native behavioral rows are the complete stable-v1 runtime support set. The release pipeline continues to publish all six archives, but the three compile-only targets carry no native runtime guarantee and remain best-effort until promoted by native evidence. A successful hosted build or archive demonstrates release compilation and packaging, not native runtime compatibility.
+Only the rows marked Supported have native runtime evidence. The release pipeline still publishes all six archives, but the three build-only targets have no native runtime guarantee until native evidence supports them. A hosted build or archive proves release compilation and packaging, not runtime compatibility.
 
 The target rows and workflow matrices are checked by `cargo run --locked --package xtask -- check-support-matrix` and are included in `cargo verify`.
 
@@ -69,9 +69,9 @@ Each stable release preserves the CLI, configuration, and report contract establ
 )
 ```
 
-The candidate aliases used above in `.cargo/config.toml` map `cargo verify`, `cargo check-generated`, and `cargo dist-local` to locked `xtask` commands. `cargo package --locked --list` exposes the exact crates.io file set; `cargo publish --locked --dry-run` validates packaging without uploading. `xtask dist-local` owns the local `dist/` staging path and writes the host archive, `dist/checksums.sha256`, and `dist/homebrew/excise.rb`; it neither publishes them nor authorizes a release.
+The candidate aliases above in `.cargo/config.toml` map `cargo verify`, `cargo check-generated`, and `cargo dist-local` to locked `xtask` commands. `cargo package --locked --list` shows the exact crates.io file set. `cargo publish --locked --dry-run` validates packaging without uploading. `xtask dist-local` owns the local `dist/` staging path and writes the host archive, `dist/checksums.sha256`, and `dist/homebrew/excise.rb`. It does not publish them or authorize a release.
 
-`cargo verify` passes `--allow-dirty` only to its local package-content listing, so it can verify the package contents of an in-progress working tree without resolving the private workspace-only `excise-core` crate through crates.io. The explicit release-candidate `cargo package --locked --list` and `cargo publish --locked --dry-run` commands remain strict and require the reviewed checkout to be clean.
+`cargo verify` uses `--allow-dirty` only for its local package-content listing. This lets it inspect a worktree with local changes. The explicit release-candidate `cargo package --locked --list` and `cargo publish --locked --dry-run` commands remain strict and require the reviewed checkout to be clean.
 
 
 For the hosted candidate, dispatch the workflow only from the exact protected `main` commit and pass the manifest version, reviewed commit SHA, and a unique dispatch ID explicitly:
@@ -196,17 +196,17 @@ cargo create-release-tag "$version" "$source_sha" "$run_id"
 git push origin "v$version"
 ```
 
-The push-triggered workflow requires that exact annotated-tag candidate ID; never substitute a different candidate run or a lightweight tag.
+The push-triggered workflow requires that exact annotated-tag candidate ID. Never substitute a different candidate run or a lightweight tag.
 
 ## Full verification
 
 `cargo verify` runs the complete local suite. It expects:
 
-- Cargo Deny 0.20.2;
-- actionlint 1.7.12;
-- lychee 0.24.2;
-- Node.js/npm for Renovate 44.34.0 validation;
-- cargo-fuzz 0.13.2 with the pinned fuzz toolchain; and
+- Cargo Deny 0.20.2,
+- actionlint 1.7.12,
+- lychee 0.24.2,
+- Node.js/npm for Renovate 44.34.0 validation,
+- cargo-fuzz 0.13.2 with the pinned fuzz toolchain, and
 - all host-installable targets listed above.
 
 ```console
@@ -228,7 +228,7 @@ Commit generated changes with the source contract that produced them.
 
 ### Current-main demo pipeline
 
-The `cargo demo` alias is current `main` development behavior rather than a release-package command. It delegates to `xtask demo`; refresh the VHS demonstration after user-visible CLI or TUI changes and review the output before a release:
+The `cargo demo` alias supports current `main` development rather than release packaging. It delegates to `xtask demo`. Refresh the VHS demonstration after user-visible CLI or TUI changes and review the output before a release.
 
 ```console
 (
@@ -238,13 +238,25 @@ The `cargo demo` alias is current `main` development behavior rather than a rele
 )
 ```
 
-Run the tape from the repository root. `xtask demo` validates `tapes/demo.tape`, renders it at the tape's 24 fps, then resamples it to 20 fps while rebuilding a 64-colour palette without dithering and applying lossy GIF quantisation. It owns the `assets/demo-main.rendered.gif`, `assets/demo-main.palette.gif`, and `assets/demo-main.quantised.gif` staging paths and atomically promotes the last to `assets/demo-main.gif` only after it passes the published GIF's weight ceiling; a failure leaves the committed current-main asset untouched and never changes `assets/demo.gif`, the historical `0.1.2` recording. It needs `vhs`, `ttyd`, `ffmpeg`, `ffprobe`, and `gifsicle` on `PATH`, plus a Unix-like `bash` and core utilities: the tape explicitly selects `bash`, creates its fixture under `/tmp`, and invokes utilities including `head`, `mkdir`, and `rm`.
+Run the tape from the repository root. `xtask demo` validates `tapes/demo.tape`, captures it at 24 fps, then resamples it to 20 fps with a non-dithered 64-color palette and lossy GIF compression.
 
-Invoking `vhs tapes/demo.tape` directly writes an unoptimised 24 fps sequence to `assets/demo-main.gif` and skips the 20 fps resampling, palette rebuild, quantisation, and size gate, so it must not be used to refresh the committed current-main hero.
+It owns the `assets/demo-main.rendered.gif`, `assets/demo-main.palette.gif`, and `assets/demo-main.quantised.gif` staging paths. It promotes the last file to `assets/demo-main.gif` only after it passes the published weight limit. If any stage fails, the committed current-main asset remains untouched.
+
+The command needs `vhs`, `ttyd`, `ffmpeg`, `ffprobe`, and `gifsicle` on `PATH`, plus a Unix-like `bash` and core utilities. The tape explicitly selects `bash`, creates its fixture under `/tmp`, and uses `head`, `mkdir`, and `rm`.
+
+Invoking `vhs tapes/demo.tape` directly writes an unoptimized 24 fps recording to `assets/demo-main.rendered.gif`. It skips the 20 fps resampling, palette rebuild, compression, and weight check. Do not use it to refresh the committed current-main hero.
+
+The `Demo recording` workflow renders the tape on pull requests and `main` with its pinned Linux toolchain. It uploads the GIF for review but never writes or commits source files. Review and explicitly commit a validated `assets/demo-main.gif` refresh.
+
+### README feature demos
+
+The feature tapes in `tapes/features/` correspond to the eight README feature entries. They share a guarded fixture builder and keep every generated file inside a disposable fixture. After building the release binary, render every feature GIF with `cargo demo-features` or render selected demos with `cargo demo-features storage-map reports`. The command writes the reviewed GIFs to `assets/features/` and promotes each one only after it passes its own duration, frame-count, and size checks.
+
+The Demo recording workflow keeps pull requests and `main` on the lightweight `hero` mode. Use its manual `features` mode to render the full feature suite on the pinned Linux toolchain, or `all` to render the hero and every feature demo together.
 
 ## Fuzzing
 
-The `fuzz` package is intentionally outside the main workspace. `cargo verify` and hosted fuzzing query the same toolchain selector from `xtask`, so update only `FUZZ_TOOLCHAIN` when rolling the pinned nightly. List and run targets with cargo-fuzz:
+The `fuzz` package is intentionally outside the main workspace. `cargo verify` and hosted fuzzing use the same toolchain selector from `xtask`. Update only `FUZZ_TOOLCHAIN` when changing the pinned nightly. List and run targets with cargo-fuzz:
 
 ```console
 fuzz_toolchain="$(cargo run --quiet --locked --package xtask -- fuzz-toolchain)"
@@ -265,7 +277,7 @@ cargo +1.98.0 bench --bench tachyonfx --features internal --locked -- --noplot
 cargo +1.98.0 bench --bench core --features internal --locked -- --noplot
 ```
 
-The hosted workflow runs the one-million-tiny-file scale probe and the bounded-batch fan-in probe once with `--profile-time 1`. The premerged probe isolates canonical reduction and late-page query cost; the bounded probe exercises production fan-in. Both use explicit private scan-store ceilings and remain reproducible locally with the commands below.
+The hosted workflow runs the one-million-tiny-file scale probe and the bounded-batch fan-in probe once with `--profile-time 1`. The premerged probe isolates reduction and late-page lookup cost. The bounded probe exercises production fan-in. Both use explicit private scan-store limits and can be reproduced locally with the commands below.
 
 ```console
 EXCISE_BENCH_MILLION=1 cargo +1.98.0 bench --bench core --features internal --locked -- scan-store/million-tiny-files --noplot --profile-time 1
@@ -277,9 +289,9 @@ Measure the real bounded-batch million-file fan-in separately:
 EXCISE_BENCH_MILLION=1 EXCISE_BENCH_MILLION_FANIN=1 cargo +1.98.0 bench --bench core --features internal --locked -- scan-store/million-tiny-files/bounded-fan-in --noplot --profile-time 1
 ```
 
-Both probes print deterministic logical serialized read/write bytes, per-observation ratios, merge write amplification, retained and peak temporary bytes, phase wall time, and Unix process CPU time. `--profile-time 1` performs one scale smoke; omit it on provisioned comparable hardware when collecting Criterion samples.
+Both probes print deterministic logical read and write bytes, per-observation ratios, merge write amplification, retained and peak temporary bytes, phase wall time, and Unix process CPU time. `--profile-time 1` performs one scale smoke. Omit it on provisioned comparable hardware when collecting Criterion samples.
 
-`core` measures bounded-batch canonical publication and late-page queries across flat, fanout, deep, and shared-link workloads (`scan-store/publication/*` and `scan-store/page-query/*`). With `EXCISE_BENCH_MILLION=1`, it adds premerged one-million-file publication and late-page probes; `EXCISE_BENCH_MILLION_FANIN=1` additionally exercises the production bounded fan-in path. It also measures a fixed 16,512-entry real filesystem walk at one, two, and eight workers (`scanner/filesystem-walk/workers/*`), delivery of sixteen focus requests during an active scan (`scanner/focus-delivery/*`), and rebuild-cancellation acknowledgement (`scanner/rebuild-cancellation/*`). `tachyonfx` measures completion-frame processing at `80x24`, `160x50`, and `200x80`.
+`core` measures publication and late-page queries across flat, wide, deep, and shared-link workloads (`scan-store/publication/*` and `scan-store/page-query/*`). With `EXCISE_BENCH_MILLION=1`, it adds one-million-file publication and late-page probes. `EXCISE_BENCH_MILLION_FANIN=1` also exercises the production bounded fan-in path. It measures a fixed 16,512-entry file-system walk at one, two, and eight workers, delivery of sixteen focus requests during an active scan, and rebuild-cancellation acknowledgement. `tachyonfx` measures completion-frame processing at `80x24`, `160x50`, and `200x80`.
 
 To assess a reported regression, obtain the reference and candidate run IDs from their checks, download both evidence artifacts, and inspect their contexts before comparing measurements:
 

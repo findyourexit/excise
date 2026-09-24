@@ -1,6 +1,6 @@
 # Release Process
 
-The current stable package version is `1.3.0`. This runbook defines the current v1 release procedure; the dated approval records below are historical evidence, not instructions for a new publication.
+The current stable package version is `1.3.0`. This runbook defines the current v1 release procedure. The dated approval records below are historical evidence, not instructions for a new publication.
 
 ## The 0.1.1 Contract (Historical)
 
@@ -32,7 +32,7 @@ The approved `0.2.0` publication used:
 - Immutable publication workflow run: https://github.com/findyourexit/excise/actions/runs/33045511141
 - Annotated tag: `v0.2.0`, pointing to the exact source commit.
 - Successful native verification: https://github.com/findyourexit/excise/actions/runs/33044958150
-- published GitHub Release assets, crates.io package, first-party Homebrew Tap, cargo-binstall metadata, and tagged Nix flake.
+- Published GitHub Release assets, crates.io package, first-party Homebrew Tap, cargo-binstall metadata, and tagged Nix flake.
 
 ## The 0.3.0 Early-Testing Release
 
@@ -88,7 +88,8 @@ The approved patch publication used:
 - Publication workflow run: https://github.com/findyourexit/excise/actions/runs/33408563018
 - GitHub Release: https://github.com/findyourexit/excise/releases/tag/v1.0.2
 
-The published bundle contains six target archives, `checksums.sha256`, and `excise.spdx.json`. All checksums, archives, and SBOM verified. crates.io and Homebrew tap updated.
+The published bundle contains six target archives, `checksums.sha256`, and `excise.spdx.json`. All checksums, archives, and SBOM data were verified. crates.io and the Homebrew tap were updated.
+
 ## Preconditions & Clean Tree
 
 Only a maintainer may start publication. Before creating a tag, dispatching a candidate, or using a publication credential:
@@ -328,7 +329,7 @@ gh workflow run release.yml \
 
 The recovery gate verifies that protected `main` has not moved during dispatch, that the immutable tag still targets `source_sha`, and that `run_id` is the successful candidate for that exact source before reusing its artifacts.
 
-If a deletion-safety or release-integrity defect is found, stop promotion and mark the affected channel unavailable while preserving the candidate evidence. Do not move, delete, or overwrite an existing tag or GitHub asset. A rollback cannot undo filesystem deletion and must not ask users to rerun a destructive command. After the fix is reviewed, publish a new corrective version, such as `0.2.1`, then update each channel to that immutable version. A crates.io yank only prevents new dependency resolution. It does not erase an already downloaded crate.
+If a deletion-safety or release-integrity defect is found, stop promotion and mark the affected channel unavailable while preserving the candidate evidence. Do not move, delete, or overwrite an existing tag or GitHub asset. A rollback cannot undo filesystem deletion and must not ask users to rerun a destructive command. After the fix is reviewed, publish a new corrective version, such as `1.3.1`, then update each channel to that immutable version. A crates.io yank only prevents new dependency resolution. It does not erase an already downloaded crate.
 
 ## v1.0.0 Readiness Gate
 
@@ -349,7 +350,7 @@ The `1.0.0` release is the first stable line and is authorized only after the pu
 | Platforms | Fully support only targets tested on the actual system. Keep build-only targets clearly marked until they have runtime evidence. | Three targets are supported. Three archives remain published for best-effort use. |
 | Distribution and governance | Require exact protected-commit artifacts, checksums, a software bill of materials, origin records, rollback, and an explicit release authority. | Artifact identity and rollback are operational. The lead maintainer authority is explicit in `GOVERNANCE.md`, with an additional maintainer review when one is appointed. |
 
-The table above is the normative `1.0.0` public-contract decision record. Maintain it through reviewed pull requests. Any implementation change that affects a row requires that row to be reviewed again before release authorization. The lead maintainer listed in `MAINTAINERS.md` owns final product, safety, and release decisions and may authorize publication only after this gate, protected-main ruleset checks, and publication-environment approval. When a second maintainer is appointed, the additional requirements in `GOVERNANCE.md` apply.
+The table above is the `1.0.0` public-contract decision record. Keep it current through reviewed pull requests. Any implementation change that affects a row requires that row to be reviewed again before release authorization. The lead maintainer listed in `MAINTAINERS.md` owns final product, safety, and release decisions and may authorize publication only after this gate, protected-main ruleset checks, and publication-environment approval. When a second maintainer is appointed, the additional requirements in `GOVERNANCE.md` apply.
 
 The release candidate must also record the exact source commit, candidate run, artifact checksums, software bill of materials, attestations, package-channel results, and reviewer decision against this table. A passing automated check is evidence for its scope. It is not approval for a different scope.
 

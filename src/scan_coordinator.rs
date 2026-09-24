@@ -31,10 +31,10 @@ impl fmt::Display for SessionCoordinatorError {
 
 impl std::error::Error for SessionCoordinatorError {}
 
-/// Bounded client for the one actor that owns a session's work ledger.
+/// Bounded client for the single actor that owns a session's work records.
 ///
 /// Scanner workers, the UI owner loop, and deletion lanes communicate through
-/// this handle; none receives direct mutable access to queue or lease state.
+/// this handle. None can directly mutate queue or lease state.
 #[derive(Clone)]
 pub(crate) struct SessionCoordinator {
     inner: Arc<SessionCoordinatorInner>,

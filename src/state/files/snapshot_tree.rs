@@ -26,7 +26,7 @@ use crate::state::tiles::{FileMetadata, FileType};
 /// A small materialized view of one immutable `ScanStore` page.
 ///
 /// It owns only one folder's direct entries and its ancestor chain. The
-/// underlying generation remains in the `ScanStore`; a bounded page cache may
+/// underlying generation remains in `ScanStore`. A bounded page cache can
 /// retain this view for quick backtracking without building a full memory tree.
 pub(crate) struct SnapshotTree {
     root_path: PathBuf,

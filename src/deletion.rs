@@ -1583,8 +1583,9 @@ pub(crate) fn build_plan_cancellable_with_root_identity_and_temporary_storage(
     target
         .reviewed_entries
         .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    // Directory targets ordinarily have no retained model review: their fresh live walk above is
-    // authoritative. If a caller supplied one, compare it without materializing spilled records.
+    // Directory targets ordinarily have no retained model review. The planner
+    // relies on the fresh live walk above. If a caller supplied one, compare it
+    // without materializing spilled records.
     if !target.reviewed_entries.is_empty() {
         let reviewed_len = u64::try_from(target.reviewed_entries.len()).unwrap_or(u64::MAX);
         if entries.len() != reviewed_len {
@@ -2678,7 +2679,7 @@ fn is_mount_root(path: &Path) -> io::Result<bool> {
 
 /// Recognises Linux bind mounts as well as mounts that change device ID.
 ///
-/// `STATX_ATTR_MOUNT_ROOT` is an authoritative kernel answer where available.
+/// `STATX_ATTR_MOUNT_ROOT` is a kernel-supplied mount-root answer where available.
 /// Older kernels omit it, so `/proc/self/mountinfo` remains a fail-closed fallback.
 #[cfg(target_os = "linux")]
 fn linux_mount_root(canonical: &Path) -> io::Result<bool> {

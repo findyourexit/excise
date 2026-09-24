@@ -6,22 +6,22 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
-## [1.3.0] - 2026-09-23
+## [1.3.0] - 2026-09-24
 
 ### Changed
 
-* Replaced the former in-memory scan-truth and focused-staging paths with a session-local canonical `ScanStore`. Completed maps and reports now read immutable direct-child pages; no filesystem child is collapsed into an undeletable aggregate.
-* Unified scanner traversal, reduction, refresh, and deletion planning/execution under one session coordinator. The interactive header now reports coalesced active and queued background work without exposing queue internals.
-* Kept only the intentional noninteractive shared-allocation summary. Removed legacy `Other`, aggregate, aggregation-state, and compatibility paths from the map, reports, schemas, and user guidance.
+* Replaced the old in-memory scan state and focused staging paths with a session-local `ScanStore`. Completed maps and reports read immutable pages that list direct children. No file system child is collapsed into an undeletable summary.
+* Unified scanning, result reduction, refreshes, and deletion work under one session coordinator. The interactive header now reports combined active and queued background work without exposing queue internals.
+* Retained only the shared-allocation summary, which cannot be selected. Removed old aggregate and compatibility paths from the map, reports, schemas, and user guidance.
 * Replaced the cyclic theme toggle with a keyboard preview picker. `Enter` persists the selected theme for later TUI sessions, while `Esc` restores the prior theme.
-* Made deletion confirmation foreground-only and planning/execution background work. Accepted confirmation returns immediately to map navigation; explicit exit choices cover pending plans and active mutations.
-* Reworked terminal presentation with padded pane title tabs, dimensional selected-entry contours, truecolour modal attention chrome, a truthful scan field, and fixed absolute storage-map colour landmarks.
-* Added hosted one-million-file and bounded-fan-in benchmark evidence, including logical I/O, CPU, retention, and temporary-overlap metrics.
+* Made deletion confirmation foreground-only and moved planning and execution into the background. Accepted confirmation returns immediately to map navigation. Explicit exit choices cover pending plans and active mutations.
+* Reworked terminal presentation with padded pane titles, a raised outline for the selected entry, full-color modal borders when available, an honest scan field, and a fixed absolute color scale for the storage map.
+* Added hosted benchmark evidence for a one-million-file scan and bounded merge behavior, including logical I/O, CPU, retention, and temporary-overlap metrics.
 
 ### Fixed
 
-* Scan-store capacity failures now preserve explicit incomplete or deterministic `summary-only` outcomes rather than claiming a complete detailed map or deletion-ready inventory.
-* Scan and deletion refreshes no longer accept stale work from retired generations; monotonic generation gaps are handled safely while independent deletion revalidation remains authoritative.
+* When scan storage reaches capacity, Excise now preserves an explicit incomplete or deterministic `summary-only` outcome instead of claiming a complete detailed map or deletion-ready inventory.
+* Scan and deletion refreshes no longer accept stale work from retired scan versions. Gaps between scan versions are handled safely. The independent deletion recheck remains the final safety check.
 * Terminal rendering keeps truecolour foreground and background commands separate, preventing parsers that only read foreground sequences from displaying colour-control tails as text.
 
 ## [1.2.4] - 2026-09-12
@@ -48,10 +48,10 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ### Fixed
 
-* Scanner directory-task, identity, and directory-deletion-plan/result spill files now share a fixed per-session temporary-storage limit. Deletion plan and outcome records are authenticated with a process-private key and, on Windows, held in atomically created exclusive files outside the selected target; capacity or storage-read failures produce a safe incomplete outcome instead of an unbounded report, while an unretainable directory plan stops before confirmation without deleting an entry.
+* Scanner task, identity, and directory-deletion plan and result spill files now share a fixed per-session temporary-storage limit. Deletion plan and outcome records use a process-private key. On Windows, they are held in atomically created exclusive files outside the selected target. Capacity or storage-read failures produce a safe incomplete outcome instead of an unbounded report. An unretainable directory plan stops before confirmation without deleting an entry.
 * Scanner directory-completion events that arrive after model compaction now safely no-op instead of terminating a long root scan with an invalid-model-path error.
 * Full-system scans now release an exhausted private identity spill database and continue with explicit unknown physical-allocation and reclaimability bounds, instead of terminating after the bounded temporary-storage limit is reached.
-* Full-system scans no longer fail when compaction aggregates an unreadable entry at the configured model-memory limit; the aggregate reuses an already billed summary slot instead of requiring a new allocation.
+* Full-system scans no longer fail when compaction aggregates an unreadable entry at the configured model-memory limit. The aggregate reuses an already billed summary slot instead of requiring a new allocation.
 * Repeated hard-link observations are coalesced through compaction and remapping, keeping participant storage bounded while preserving exact link accounting.
 * Model-memory compaction preserves collapsed subtree and ancestor metrics incrementally instead of rebuilding global metrics for every cap-limited insertion retry.
 
@@ -59,7 +59,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ### Fixed
 
-* The tagged Nix flake now derives its package version from `Cargo.toml`. The immutable `v1.2.0` flake built the correct executable but exposed `1.0.0`; this corrective release exposes `1.2.1`.
+* The tagged Nix flake now derives its package version from `Cargo.toml`. The immutable `v1.2.0` flake built the correct executable but exposed `1.0.0`. This corrective release exposes `1.2.1`.
 
 ## [1.2.0] - 2026-09-02
 
@@ -78,7 +78,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ### Fixed
 
-* Directory deletion now works correctly regardless of whether the initial scan is still running or whether directory contents were evicted from the bounded in-memory model due to memory pressure. The previous release required a complete in-memory snapshot of every file in the subtree before allowing a deletion plan to proceed; this blocked deletion of any directory whose descendants were still scanning or had been aggregated, even when the directory's own node was fully scanned. The planning worker now builds the deletion plan from its own fresh live filesystem walk, matching the approach used by Diskonaut. File and link deletion retains per-entry identity snapshots for targeted single-entry safety.
+* Directory deletion now works regardless of whether the first scan is still running or directory contents were evicted from the bounded in-memory model because of memory pressure. The previous release required a complete in-memory snapshot of every file in the subtree before allowing a deletion plan. This blocked deletion when descendants were still scanning or had been aggregated, even when the directory itself was complete. The planner now builds the deletion plan from a fresh live file-system walk, matching Diskonaut's approach. File and link deletion retains per-entry identity snapshots for targeted safety.
 
 ### Changed
 
@@ -88,13 +88,13 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ### Changed
 
-* Deletion is no longer locked until the initial scan completes. Entries that have been fully examined are now deletable while scanning continues. Previously, pressing `Backspace` during a scan showed a blocking warning; now it proceeds immediately when the selected entry is complete and is refused with a clear error when it is not.
+* Deletion is no longer locked until the first scan completes. Entries that have been fully examined are now deletable while scanning continues. Previously, pressing `Backspace` during a scan showed a blocking warning. It now proceeds immediately when the selected entry is complete and gives a clear error when it is not.
 
-* `Enter` is now the primary confirmation key for file deletions and for directory deletions under `--disable-delete-confirmation`. Previously these required typing `y`. Both keys work; `Enter` is now displayed first in the confirm dialog.
+* `Enter` is now the primary confirmation key for file deletions and directory deletions under `--disable-delete-confirmation`. Previously these required typing `y`. Both keys work. `Enter` is now displayed first in the confirmation dialog.
 
 * Pressing `Enter` during the identity plan build phase pre-arms confirmation for single-key challenges. When the plan completes, deletion begins immediately without a separate confirm step. This reduces the file deletion flow to `Backspace` → `Enter`, matching the speed users expect from interactive storage navigators.
 
-* Updated the warning shown when deletion is attempted during a rescan. The message previously implied the initial scan was also a barrier; it now correctly states that deletion is locked only during rescanning.
+* Updated the warning shown when deletion is attempted during a rescan. The message previously implied that the first scan was also a barrier. It now correctly states that deletion is locked only during rescanning.
 
 ## [1.0.2] - 2026-09-01
 
@@ -106,7 +106,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 * Replaced the blocking disk enumeration in the mount-root check with two direct filesystem stat calls. The previous implementation called `sysinfo::Disks::new_with_refreshed_list`, which on macOS queries every mounted volume for its available capacity via Apple's storage framework. That call can block indefinitely when a volume is in certain APFS snapshot states. The new implementation compares the device identifiers of a path and its parent using `lstat`, which is a direct kernel call with no involvement from CoreFoundation or StorageKit.
 
-* Arena nodes are now stored directly inside the arena vector rather than behind individual heap allocations. Each `Box<Node>` was a separate small allocation; inlining the node data reduces allocator pressure and improves cache locality when traversing large trees.
+* Arena nodes are now stored directly inside the arena vector rather than behind individual heap allocations. Each `Box<Node>` was a separate small allocation. Inlining the node data reduces allocator pressure and improves cache locality when traversing large trees.
 
 ## [1.0.1] - 2026-08-28
 
@@ -116,7 +116,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 * Reworded the safety, support, configuration, architecture, and release documentation in plain English without changing product behavior.
 
-* Removed the Developer Certificate of Origin sign-off requirement for contributors. No contributor license agreement or copyright assignment has ever been required; historical authorship records are unchanged.
+* Removed the Developer Certificate of Origin sign-off requirement for contributors. No contributor license agreement or copyright assignment has ever been required. Historical authorship records are unchanged.
 
 ## [1.0.0] - 2026-08-27
 
@@ -140,7 +140,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ### Added
 
-* Added the `cargo demo` alias and its `xtask demo` command. `xtask demo` validates `tapes/demo.tape`, stages its rendering under `assets/demo-main.*.gif`, resamples the tape's 24 fps GIF to 20 fps while rebuilding a non-dithered 64-colour palette and applying lossy GIF quantisation, and atomically promotes `assets/demo-main.gif` only after the size gate passes. `assets/demo.gif` remains the historical `0.1.2` recording for the README. The hosted demo workflow now uses it. The tape and current-main README hero asset were refreshed.
+* Added the `cargo demo` alias and its `xtask demo` command. `xtask demo` validates `tapes/demo.tape`, stages its rendering under `assets/demo-main.*.gif`, resamples the tape's 24 fps GIF to 20 fps while rebuilding a non-dithered 64-colour palette and applying lossy GIF quantisation, and atomically promotes `assets/demo-main.gif` only after the size gate passes. The hosted demo workflow uses the same pipeline. The tape and current-main README hero asset were refreshed.
 
 * Added the public `geometry::MapOverflow` and `TreeMap::overflow` interfaces. They summarize entries omitted from the final map viewport, retaining their count, byte total, and lower-bound uncertainty even when the layout cannot draw an overflow region.
 

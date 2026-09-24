@@ -161,16 +161,15 @@ pub(crate) struct ScanPage {
     pub(crate) entries: Vec<ScanPageEntry>,
     pub(crate) next_after: Option<PageCursor>,
     pub(crate) shared_allocation: Option<SharedAllocationSummary>,
-    /// Paths omitted from the canonical hierarchy, reported outside node state.
+    /// Paths omitted from the stored hierarchy, reported outside node state.
     pub(crate) unrecorded_path_count: u64,
 }
 
-/// Bounded live projection of one folder while its scan generation remains open.
+/// Limited live view of one folder while its scan remains open.
 ///
-/// It retains only the strongest observed direct children. The canonical raw
-/// runs remain authoritative and are re-read if the user changes folders.
-/// This prevents a live map from growing with the scan while preserving exact
-/// final publication semantics.
+/// It retains only the strongest observed direct children. The original stored
+/// runs are reread when the user changes folders. This keeps the live map from
+/// growing with the scan while preserving exact final publication semantics.
 pub(crate) struct ProvisionalPage {
     generation: ScanGeneration,
     folder: RelativePath,
@@ -583,9 +582,9 @@ struct EntryEncodingScratch {
 }
 
 /// Builds a query-ready child run while publication owns all derived facts.
-/// The temporary database is only a bounded build accumulator; it consumes
-/// every raw source run and leaves the sealed, sparse-indexed `ChildQuery` run
-/// as the sole retained generation representation.
+/// The temporary database is a bounded build accumulator. It consumes every
+/// raw source run and leaves the sealed, sparse-indexed `ChildQuery` run as
+/// the only retained generation representation.
 ///
 /// # Errors
 ///
@@ -624,8 +623,8 @@ pub(crate) fn materialize_child_queries(
 
 impl PublishedGeneration {
     /// Reads one bounded direct-child page from the immutable, publication-time
-    /// child-query index. Navigation performs a sparse seek plus at most one
-    /// page of record decoding; it never rereads the canonical fact runs.
+    /// child-query index. Navigation performs sparse seeks and decodes at most one
+    /// page of records. It never rereads the canonical fact runs.
     ///
     /// # Errors
     ///
@@ -870,8 +869,8 @@ fn flush_directory_summary_batch(
         let mut encoding = EntryEncodingScratch::default();
         for summary in batch.drain(..) {
             let path = summary.path;
-            // Single-link leaf allocations already live in the path summary;
-            // grouped identities are added below from contribution records.
+            // Single-link leaf allocations already live in the path summary.
+            // Contribution records add grouped identities below.
             let metrics = summary.metrics;
             page_header_key_into(&path, &mut header_key)?;
             encode_stored_header_into(
@@ -1431,7 +1430,7 @@ fn take_record_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], PageR
     Ok(output)
 }
 
-/// Visits every canonical fact retained in a published child-query run.
+/// Visits every fact retained in a published child-query run.
 ///
 /// The query records preserve each original path observation and its optional
 /// identity fact. Overlay publication re-sorts these bounded batches instead

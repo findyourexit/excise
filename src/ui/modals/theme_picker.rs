@@ -6,9 +6,9 @@ use ratatui::widgets::Widget;
 use crate::theme::{Theme, ThemeId};
 use crate::ui::pane::{ModalChrome, readable_text_on, render_modal};
 
-/// A keyboard-only list of built-in themes. Selection previews immediately;
-/// committing persists the selected theme immediately, while restoring leaves
-/// the saved preference untouched.
+/// A keyboard-only list of built-in themes. Selection previews immediately.
+/// Committing saves the selected theme immediately. Restoring leaves the saved
+/// preference untouched.
 pub struct ThemePicker {
     selected: ThemeId,
     theme: Theme,

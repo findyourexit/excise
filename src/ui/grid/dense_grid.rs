@@ -72,7 +72,7 @@ pub enum ScanActivity {
 #[derive(Clone, Copy, Debug)]
 pub struct ScanVisual {
     pub activity: ScanActivity,
-    /// Entries that have actually reached the model; this intentionally has no denominator.
+    /// Entries that have reached the model. There is intentionally no denominator.
     pub entries_indexed: u64,
     /// Accessibility and presentation capability allow motion for this field.
     pub animated: bool,
@@ -2536,7 +2536,7 @@ mod tests {
 
     use super::*;
 
-    /// Defaults are deliberately small; individual tests assign byte sizes for
+    /// Defaults are deliberately small. Individual tests assign byte sizes for
     /// the fixed absolute heat landmarks they need to exercise.
     fn tile(x: u16, y: u32, width: u16, height: u32, node_id: u32) -> Tile {
         Tile {
