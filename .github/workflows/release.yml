@@ -46,7 +46,7 @@ permissions:
 jobs:
   release-gate:
     name: Verify release source identity
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     environment:
       name: release-validation
@@ -379,7 +379,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.mode == 'candidate'
     name: Checksums, SBOM, and provenance
     needs: [archive, release-gate]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -474,7 +474,7 @@ jobs:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing')
     name: Promote reviewed candidate bundle
     needs: release-gate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       actions: read
@@ -558,7 +558,7 @@ jobs:
     name: Create GitHub Release
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing')
     needs: [release-gate, promote-candidate]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     environment:
       name: release
@@ -818,7 +818,7 @@ jobs:
     name: Publish crate to crates.io
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing')
     needs: [release-gate, release]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     environment:
       name: crates-io
@@ -925,7 +925,7 @@ jobs:
     name: Update first-party Homebrew tap
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish-existing')
     needs: [release-gate, release]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     concurrency:
       group: homebrew-tap-publication

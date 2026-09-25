@@ -28,7 +28,7 @@ concurrency:
 jobs:
   record:
     name: Render VHS demos
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       DEMO_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'hero' }}
