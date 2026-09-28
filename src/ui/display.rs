@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr as _;
 
 use crate::UiMode;
 use crate::animation::AnimationScheduler;
+use crate::app::ThemePickerReturn;
 use crate::config::{CustomKeyBindings, KeyPreset};
 use crate::error::AppError;
 use crate::model::{ByteBounds, NodeKind, NodeState, SyntheticKind, UnscannedReason};
@@ -20,7 +21,7 @@ use crate::os::is_user_admin;
 use crate::scan_coordinator::SchedulerSnapshot;
 use crate::state::UiEffects;
 use crate::state::deletion_work::{
-    DeletionWork, MAX_DELETION_WORK_ITEMS, WorkRailItem, WorkRailStatus,
+    DeletionWork, DeletionWorkPhaseSnapshot, MAX_DELETION_WORK_ITEMS, WorkRailItem, WorkRailStatus,
 };
 use crate::state::files::tree_view::TreeView;
 use crate::state::tiles::{Board, FileType, Tile};
@@ -151,6 +152,7 @@ where
         reduced_motion: bool,
         animate_loading: bool,
     ) -> Result<(), AppError> {
+        let deletion_phase = deletion_work.presentation_snapshot();
         let requires_legacy_theme_normalization = theme_requires_legacy_normalization(theme);
         self.terminal
             .draw(|frame| {
@@ -170,7 +172,7 @@ where
                         elevated,
                         ascii,
                     );
-                } else if matches!(ui_mode, UiMode::ScanResultsUnavailable(_)) {
+                } else if presentation_is_unavailable(ui_mode) {
                     board.settle_geometry();
                     clear_scan_results_surface(frame.buffer_mut(), theme);
                 } else {
@@ -202,7 +204,8 @@ where
                     debug_assert_eq!(workspace, rendered_workspace);
                     let show_empty_label = file_tree.current_node().state == NodeState::Complete
                         && !file_tree.has_filter();
-                    let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rebuilding { .. });
+                    let scanning =
+                        presentation_is_loading(ui_mode) || presentation_is_rebuilding(ui_mode);
                     let scan = scan_presentation(ui_mode, ui_effects, board, now, animate_loading);
                     let animate_deletion_checker = !ascii
                         && !monochrome
@@ -216,6 +219,7 @@ where
                             board,
                             Some(file_tree),
                             Some(deletion_work),
+                            deletion_phase,
                             theme,
                             ascii,
                             now,
@@ -225,7 +229,7 @@ where
                         );
                     } else {
                         frame.render_widget(
-                            DenseRectangleGrid::new(
+                            DenseRectangleGrid::new_with_phase_snapshot(
                                 MapLayout {
                                     rectangles: board.rendered_tiles(),
                                     departing: board.departing_tiles(),
@@ -243,6 +247,7 @@ where
                                 theme,
                                 ascii,
                                 monochrome,
+                                deletion_phase,
                             ),
                             rendered_workspace,
                         );
@@ -254,6 +259,7 @@ where
                             file_tree,
                             board,
                             Some(deletion_work),
+                            deletion_phase,
                             Some(ui_effects),
                             ui_mode,
                             theme,
@@ -268,6 +274,7 @@ where
                         ui_mode,
                         ui_effects,
                         deletion_work,
+                        deletion_phase,
                         scheduler_snapshot,
                         theme_name,
                         mouse_enabled,
@@ -346,7 +353,7 @@ where
                             full_screen,
                         );
                     }
-                    UiMode::ErrorMessage(message) => {
+                    UiMode::ErrorMessage { message, .. } => {
                         frame.render_widget(
                             ErrorBox::with_chrome(message, theme, ascii, chrome),
                             full_screen,
@@ -364,7 +371,7 @@ where
                             full_screen,
                         );
                     }
-                    UiMode::Notice(message) => {
+                    UiMode::Notice { message, .. } => {
                         frame.render_widget(
                             NoticeBox::with_chrome(message, theme, ascii, chrome),
                             full_screen,
@@ -372,7 +379,13 @@ where
                     }
                     UiMode::Exiting { work, .. } => {
                         frame.render_widget(
-                            ConfirmBox::with_chrome(work, theme, ascii, chrome),
+                            ConfirmBox::with_chrome(
+                                work,
+                                deletion_phase.execution_mutation_started(),
+                                theme,
+                                ascii,
+                                chrome,
+                            ),
                             full_screen,
                         );
                     }
@@ -391,6 +404,7 @@ where
                     UiMode::Loading
                     | UiMode::Normal
                     | UiMode::Rebuilding { .. }
+                    | UiMode::StaleSnapshot
                     | UiMode::FilterInput { .. }
                     | UiMode::ScreenTooSmall => {}
                 }
@@ -577,6 +591,48 @@ fn workspace_title(board: &Board) -> &'static str {
     }
 }
 
+fn presentation_return(ui_mode: &UiMode) -> Option<&ThemePickerReturn> {
+    match ui_mode {
+        UiMode::ThemePicker { return_to, .. }
+        | UiMode::Exiting { return_to, .. }
+        | UiMode::ErrorMessage { return_to, .. }
+        | UiMode::Notice { return_to, .. } => Some(return_to),
+        _ => None,
+    }
+}
+
+fn presentation_is_loading(ui_mode: &UiMode) -> bool {
+    matches!(ui_mode, UiMode::Loading)
+        || matches!(
+            presentation_return(ui_mode),
+            Some(ThemePickerReturn::Loading)
+        )
+}
+
+fn presentation_is_rebuilding(ui_mode: &UiMode) -> bool {
+    matches!(ui_mode, UiMode::Rebuilding { .. })
+        || matches!(
+            presentation_return(ui_mode),
+            Some(ThemePickerReturn::Rebuilding { .. })
+        )
+}
+
+fn presentation_is_stale(ui_mode: &UiMode) -> bool {
+    matches!(ui_mode, UiMode::StaleSnapshot)
+        || matches!(
+            presentation_return(ui_mode),
+            Some(ThemePickerReturn::StaleSnapshot)
+        )
+}
+
+fn presentation_is_unavailable(ui_mode: &UiMode) -> bool {
+    matches!(ui_mode, UiMode::ScanResultsUnavailable(_))
+        || matches!(
+            presentation_return(ui_mode),
+            Some(ThemePickerReturn::ScanResultsUnavailable(_))
+        )
+}
+
 fn scan_presentation(
     ui_mode: &UiMode,
     ui_effects: &UiEffects,
@@ -584,9 +640,9 @@ fn scan_presentation(
     now: Duration,
     animated: bool,
 ) -> Option<ScanVisual> {
-    let scanning = matches!(ui_mode, UiMode::Loading | UiMode::Rebuilding { .. });
+    let scanning = presentation_is_loading(ui_mode) || presentation_is_rebuilding(ui_mode);
     let reveal_progress = board.scan_reveal_progress(now);
-    let activity = if matches!(ui_mode, UiMode::Rebuilding { .. }) {
+    let activity = if presentation_is_rebuilding(ui_mode) {
         ScanActivity::Rebuilding
     } else {
         ScanActivity::Scanning
@@ -795,14 +851,17 @@ fn view_state(
     ascii: bool,
     theme: Theme,
 ) -> (&'static str, &'static str, Color) {
-    if matches!(ui_mode, UiMode::Rebuilding { .. }) {
+    if presentation_is_rebuilding(ui_mode) {
         return (
             if ascii { "~" } else { "◌" },
             "REBUILDING",
             theme.state_rebuilding,
         );
     }
-    if matches!(ui_mode, UiMode::Loading) {
+    if presentation_is_stale(ui_mode) {
+        return ("!", "STALE MAP", theme.text_danger);
+    }
+    if presentation_is_loading(ui_mode) {
         return (
             if ascii { "~" } else { "◌" },
             "SCANNING",
@@ -884,6 +943,7 @@ fn render_list(
         board,
         None,
         None,
+        DeletionWorkPhaseSnapshot::empty(),
         theme,
         ascii,
         now,
@@ -904,6 +964,7 @@ fn render_list_with_work(
     board: &Board,
     file_tree: Option<&dyn TreeView>,
     deletion_work: Option<&DeletionWork>,
+    deletion_phase: DeletionWorkPhaseSnapshot,
     theme: Theme,
     ascii: bool,
     now: Duration,
@@ -942,7 +1003,7 @@ fn render_list_with_work(
         if index >= usize::from(area.height) {
             break;
         }
-        let marker = list_item_marker(tile, file_tree, deletion_work, ascii);
+        let marker = list_item_marker(tile, file_tree, deletion_work, deletion_phase, ascii);
         let name_width = area.width.saturating_sub(28);
         let name = display_os_str_middle(&tile.name, name_width);
         let size = if tile.uncertain && tile.size == 0 {
@@ -991,8 +1052,11 @@ fn render_list_with_work(
     }
 }
 
-fn work_status_marker(status: WorkRailStatus, ascii: bool) -> &'static str {
-    match (status, ascii) {
+fn work_status_marker(work: WorkRailItem<'_>, ascii: bool) -> &'static str {
+    if matches!(work.status, WorkRailStatus::Executing) && work.is_preparing() {
+        return if ascii { "~" } else { "◌" };
+    }
+    match (work.status, ascii) {
         (WorkRailStatus::AwaitingConfirmation, _) => "!",
         (WorkRailStatus::Planning, true) => "~",
         (WorkRailStatus::Planning, false) => "◌",
@@ -1007,21 +1071,26 @@ fn work_item_for_tile<'a>(
     tile: &Tile,
     file_tree: Option<&dyn TreeView>,
     deletion_work: Option<&'a DeletionWork>,
+    deletion_phase: DeletionWorkPhaseSnapshot,
 ) -> Option<WorkRailItem<'a>> {
     let file_tree = file_tree?;
     let relative_path = file_tree.relative_path_for_id(tile.node_id)?;
-    deletion_work?.rail_item_for_relative_path(file_tree.scan_root(), relative_path)
+    deletion_work?.rail_item_for_relative_path_with_phase_snapshot(
+        file_tree.scan_root(),
+        relative_path,
+        Some(deletion_phase),
+    )
 }
 
 fn list_item_marker(
     tile: &Tile,
     file_tree: Option<&dyn TreeView>,
     deletion_work: Option<&DeletionWork>,
+    deletion_phase: DeletionWorkPhaseSnapshot,
     ascii: bool,
 ) -> &'static str {
-    if let Some(status) = work_item_for_tile(tile, file_tree, deletion_work).map(|work| work.status)
-    {
-        return work_status_marker(status, ascii);
+    if let Some(work) = work_item_for_tile(tile, file_tree, deletion_work, deletion_phase) {
+        return work_status_marker(work, ascii);
     }
     match (tile.file_type, tile.synthetic_kind) {
         (FileType::Folder, _) => {
@@ -1056,7 +1125,44 @@ fn inspector_action(
     has_verified_preview: bool,
     ascii: bool,
 ) -> &'static str {
-    if matches!(ui_mode, UiMode::Loading | UiMode::Rebuilding { .. }) && !has_verified_preview {
+    if presentation_is_rebuilding(ui_mode) {
+        return match kind {
+            NodeKind::Directory => {
+                if ascii {
+                    "Enter open . Refreshing map . deletion unavailable"
+                } else {
+                    "Enter open · Refreshing map · deletion unavailable"
+                }
+            }
+            _ => {
+                if ascii {
+                    "Refreshing map . deletion unavailable"
+                } else {
+                    "Refreshing map · deletion unavailable"
+                }
+            }
+        };
+    }
+
+    if presentation_is_stale(ui_mode) {
+        return match kind {
+            NodeKind::Directory => {
+                if ascii {
+                    "Enter open . Map stale . deletion unavailable"
+                } else {
+                    "Enter open · Map stale · deletion unavailable"
+                }
+            }
+            _ => {
+                if ascii {
+                    "Map stale . deletion unavailable"
+                } else {
+                    "Map stale · deletion unavailable"
+                }
+            }
+        };
+    }
+    if presentation_is_loading(ui_mode) && !has_verified_preview {
         return match kind {
             NodeKind::Directory => {
                 if ascii {
@@ -1070,7 +1176,7 @@ fn inspector_action(
         };
     }
     match ui_mode {
-        UiMode::Normal | UiMode::Loading | UiMode::Rebuilding { .. } => match kind {
+        UiMode::Normal | UiMode::Loading => match kind {
             NodeKind::Root => "Scan root · cannot delete",
             NodeKind::Directory => {
                 if ascii {
@@ -1115,8 +1221,11 @@ fn deletion_completion_label(summary: crate::state::DeletionSummary) -> String {
     }
 }
 
-fn deletion_activity_label(status: WorkRailStatus) -> &'static str {
-    match status {
+fn deletion_activity_label(work: WorkRailItem<'_>) -> &'static str {
+    if matches!(work.status, WorkRailStatus::Executing) && work.is_preparing() {
+        return "Deletion: performing final safety check";
+    }
+    match work.status {
         WorkRailStatus::Planning => "Deletion: checking current files in background",
         WorkRailStatus::AwaitingConfirmation => "Deletion: waiting for confirmation",
         WorkRailStatus::Queued => "Deletion: queued behind active work",
@@ -1173,7 +1282,18 @@ fn render_inspector(
     now: Duration,
 ) {
     render_inspector_with_work(
-        buffer, area, file_tree, board, None, None, ui_mode, theme, ascii, monochrome, now,
+        buffer,
+        area,
+        file_tree,
+        board,
+        None,
+        DeletionWorkPhaseSnapshot::empty(),
+        None,
+        ui_mode,
+        theme,
+        ascii,
+        monochrome,
+        now,
     );
 }
 
@@ -1188,6 +1308,7 @@ fn render_inspector_with_work(
     file_tree: &dyn TreeView,
     board: &Board,
     deletion_work: Option<&DeletionWork>,
+    deletion_phase: DeletionWorkPhaseSnapshot,
     ui_effects: Option<&UiEffects>,
     ui_mode: &UiMode,
     theme: Theme,
@@ -1282,14 +1403,15 @@ fn render_inspector_with_work(
             .fg(theme.text_muted)
             .add_modifier(Modifier::BOLD),
     );
-    let activity_line = work_item_for_tile(tile, Some(file_tree), deletion_work).map(|work| {
-        Line::styled(
-            truncate_middle(deletion_activity_label(work.status), inner.width),
-            Style::default()
-                .fg(theme.focus)
-                .add_modifier(Modifier::BOLD),
-        )
-    });
+    let activity_line = work_item_for_tile(tile, Some(file_tree), deletion_work, deletion_phase)
+        .map(|work| {
+            Line::styled(
+                truncate_middle(deletion_activity_label(work), inner.width),
+                Style::default()
+                    .fg(theme.focus)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
     let completion_line = ui_effects
         .and_then(|effects| effects.last_deletion_summary)
         .map(|summary| {
@@ -1394,6 +1516,7 @@ fn header_status_line(
     ui_mode: &UiMode,
     ui_effects: &UiEffects,
     deletion_work: &DeletionWork,
+    deletion_phase: DeletionWorkPhaseSnapshot,
     scheduler_snapshot: Option<SchedulerSnapshot>,
     theme_name: &str,
     mouse_enabled: bool,
@@ -1442,7 +1565,23 @@ fn header_status_line(
             || format!("/ {}_  [Enter] apply  [Esc] cancel", display_text(input)),
             |error| format!("/ {}_  ERROR: {}", display_text(input), display_text(error)),
         )),
-        UiMode::Rebuilding { target } => Some(status_with_path(
+        UiMode::Rebuilding { target }
+        | UiMode::ThemePicker {
+            return_to: ThemePickerReturn::Rebuilding { target },
+            ..
+        }
+        | UiMode::Exiting {
+            return_to: ThemePickerReturn::Rebuilding { target },
+            ..
+        }
+        | UiMode::ErrorMessage {
+            return_to: ThemePickerReturn::Rebuilding { target },
+            ..
+        }
+        | UiMode::Notice {
+            return_to: ThemePickerReturn::Rebuilding { target },
+            ..
+        } => Some(status_with_path(
             "~ REBUILDING ",
             target,
             if ascii {
@@ -1452,7 +1591,44 @@ fn header_status_line(
             },
             context_width,
         )),
-        UiMode::Loading => Some(ui_effects.last_read_path.as_ref().map_or_else(
+        UiMode::StaleSnapshot
+        | UiMode::ThemePicker {
+            return_to: ThemePickerReturn::StaleSnapshot,
+            ..
+        }
+        | UiMode::Exiting {
+            return_to: ThemePickerReturn::StaleSnapshot,
+            ..
+        }
+        | UiMode::ErrorMessage {
+            return_to: ThemePickerReturn::StaleSnapshot,
+            ..
+        }
+        | UiMode::Notice {
+            return_to: ThemePickerReturn::StaleSnapshot,
+            ..
+        } => Some(if ascii {
+            "! MAP REFRESH CANCELLED . deletion/export unavailable".to_string()
+        } else {
+            "! MAP REFRESH CANCELLED · deletion/export unavailable".to_string()
+        }),
+        UiMode::Loading
+        | UiMode::ThemePicker {
+            return_to: ThemePickerReturn::Loading,
+            ..
+        }
+        | UiMode::Exiting {
+            return_to: ThemePickerReturn::Loading,
+            ..
+        }
+        | UiMode::ErrorMessage {
+            return_to: ThemePickerReturn::Loading,
+            ..
+        }
+        | UiMode::Notice {
+            return_to: ThemePickerReturn::Loading,
+            ..
+        } => Some(ui_effects.last_read_path.as_ref().map_or_else(
             || "~ SCANNING".to_string(),
             |path| status_with_path("~ SCANNING ", path, "", context_width),
         )),
@@ -1463,36 +1639,37 @@ fn header_status_line(
         (status, _) => status,
     };
     let deletion_status = deletion_work
-        .foreground_rail_item()
+        .foreground_rail_item_with_phase_snapshot(Some(deletion_phase))
         .map(|item| deletion_work_status(item, deletion_work.len(), ascii));
-    let transient_status = (if matches!(ui_mode, UiMode::Loading | UiMode::Rebuilding { .. }) {
-        deletion_status.or(mode_status)
-    } else {
-        mode_status.or(deletion_status)
-    })
-    .or_else(|| {
-        (unreadable_path_count > 0).then(|| scan_gap_status(unreadable_path_count, separator))
-    })
-    .or_else(|| {
-        board.overflow().is_some().then(|| {
-            format!("Small entries are a viewport summary {separator} use / filter or zoom")
+    let transient_status =
+        (if presentation_is_loading(ui_mode) || presentation_is_rebuilding(ui_mode) {
+            deletion_status.or(mode_status)
+        } else {
+            mode_status.or(deletion_status)
         })
-    })
-    .or_else(|| {
-        (board.is_list_layout() && board.hidden_list_entries() > 0).then(|| {
-            format!(
-                "{} more entries below {separator} use arrows to scroll",
-                board.hidden_list_entries()
-            )
+        .or_else(|| {
+            (unreadable_path_count > 0).then(|| scan_gap_status(unreadable_path_count, separator))
         })
-    })
-    .or_else(|| {
-        ui_effects
-            .last_deletion_summary
-            .map(|summary| deletion_summary_status(summary, ascii))
-    })
-    .or_else(|| ui_effects.last_deletion_notice.map(str::to_owned))
-    .or(scheduler_status);
+        .or_else(|| {
+            board.overflow().is_some().then(|| {
+                format!("Small entries are a viewport summary {separator} use / filter or zoom")
+            })
+        })
+        .or_else(|| {
+            (board.is_list_layout() && board.hidden_list_entries() > 0).then(|| {
+                format!(
+                    "{} more entries below {separator} use arrows to scroll",
+                    board.hidden_list_entries()
+                )
+            })
+        })
+        .or_else(|| {
+            ui_effects
+                .last_deletion_summary
+                .map(|summary| deletion_summary_status(summary, ascii))
+        })
+        .or_else(|| ui_effects.last_deletion_notice.map(str::to_owned))
+        .or(scheduler_status);
     let status = transient_status.map_or_else(
         || baseline_status(&flags, reduced_guardrails, elevated, context_width, ascii),
         |status| status_with_safety(status, reduced_guardrails, elevated, context_width, ascii),
@@ -1564,7 +1741,14 @@ fn render_control_hints(
             .render(area, buffer);
     } else {
         let movement = movement_hint(keymap, custom_keys);
-        Paragraph::new(command_hint_line(&movement, area.width, theme))
+        let hints = if presentation_is_rebuilding(ui_mode) {
+            non_destructive_command_hint_line(&movement, area.width, theme)
+        } else if presentation_is_stale(ui_mode) {
+            stale_snapshot_command_hint_line(&movement, area.width, theme)
+        } else {
+            command_hint_line(&movement, area.width, theme)
+        };
+        Paragraph::new(hints)
             .alignment(Alignment::Left)
             .render(area, buffer);
     }
@@ -1585,6 +1769,12 @@ fn filter_control_hint_line(theme: Theme) -> Line<'static> {
 fn deletion_work_status(item: WorkRailItem<'_>, total: usize, ascii: bool) -> String {
     let separator = if ascii { "." } else { "·" };
     let waiting = total.saturating_sub(1);
+    if matches!(item.status, WorkRailStatus::Executing) && item.is_preparing() {
+        return format!(
+            "Verifying deletion: {} {separator} {waiting} waiting",
+            item.path
+        );
+    }
     match item.status {
         WorkRailStatus::Planning => format!(
             "Checking deletion: {} {separator} {total}/{} work slots",
@@ -1639,6 +1829,69 @@ struct ControlHint<'a> {
 }
 
 fn command_hint_line(movement: &str, width: u16, theme: Theme) -> Line<'_> {
+    command_hint_line_with_delete(movement, width, theme, true)
+}
+
+fn non_destructive_command_hint_line(movement: &str, width: u16, theme: Theme) -> Line<'_> {
+    read_only_command_hint_line(movement, width, theme, "cancel")
+}
+
+fn stale_snapshot_command_hint_line(movement: &str, width: u16, theme: Theme) -> Line<'_> {
+    read_only_command_hint_line(movement, width, theme, "up")
+}
+
+fn read_only_command_hint_line<'a>(
+    movement: &'a str,
+    width: u16,
+    theme: Theme,
+    escape_detail: &'static str,
+) -> Line<'a> {
+    let movement = ControlHint {
+        key: movement,
+        detail: "move",
+    };
+    let open = ControlHint {
+        key: "Enter",
+        detail: "open",
+    };
+    let theme_picker = ControlHint {
+        key: "t",
+        detail: "theme",
+    };
+    let escape = ControlHint {
+        key: "Esc",
+        detail: escape_detail,
+    };
+    let movement_only = ControlHint {
+        key: movement.key,
+        detail: "",
+    };
+    let all = [&movement, &open, &theme_picker, &escape];
+    let navigation = [&movement, &open, &escape];
+    let movement_and_escape = [&movement, &escape];
+    let movement_only_and_escape = [&movement_only, &escape];
+    let escape_only = [&escape];
+    let available = usize::from(width);
+    for hints in [
+        all.as_slice(),
+        navigation.as_slice(),
+        movement_and_escape.as_slice(),
+        movement_only_and_escape.as_slice(),
+        escape_only.as_slice(),
+    ] {
+        if control_hint_width(hints, true) <= available {
+            return styled_control_hints(hints, true, theme);
+        }
+    }
+    Line::from("")
+}
+
+fn command_hint_line_with_delete(
+    movement: &str,
+    width: u16,
+    theme: Theme,
+    include_delete: bool,
+) -> Line<'_> {
     let hints = [
         ControlHint {
             key: movement,
@@ -1684,9 +1937,7 @@ fn command_hint_line(movement: &str, width: u16, theme: Theme) -> Line<'_> {
     let basic = [&hints[0], &hints[1], &hints[6]];
     let movement_and_help = [&hints[0], &hints[6]];
     let movement_only_and_help = [&movement_only, &hints[6]];
-    let help = [&hints[6]];
-    let available = usize::from(width);
-    for hints in [
+    let all_tiers = [
         all.as_slice(),
         without_delete.as_slice(),
         without_theme.as_slice(),
@@ -1694,7 +1945,23 @@ fn command_hint_line(movement: &str, width: u16, theme: Theme) -> Line<'_> {
         basic.as_slice(),
         movement_and_help.as_slice(),
         movement_only_and_help.as_slice(),
-    ] {
+    ];
+    let non_destructive_tiers = [
+        without_delete.as_slice(),
+        without_theme.as_slice(),
+        with_filter.as_slice(),
+        basic.as_slice(),
+        movement_and_help.as_slice(),
+        movement_only_and_help.as_slice(),
+    ];
+    let tiers = if include_delete {
+        all_tiers.as_slice()
+    } else {
+        non_destructive_tiers.as_slice()
+    };
+    let help = [&hints[6]];
+    let available = usize::from(width);
+    for hints in tiers {
         if control_hint_width(hints, true) <= available {
             return styled_control_hints(hints, true, theme);
         }
@@ -2244,6 +2511,7 @@ mod tests {
             &UiMode::Normal,
             &effects,
             &deletion_work,
+            DeletionWorkPhaseSnapshot::empty(),
             None,
             "Excise Dark",
             false,
@@ -2307,6 +2575,7 @@ mod tests {
             &UiMode::Normal,
             &UiEffects::new(),
             &DeletionWork::new(),
+            DeletionWorkPhaseSnapshot::empty(),
             Some(snapshot),
             "Excise Dark",
             false,
@@ -2371,6 +2640,107 @@ mod tests {
             saw_named_delete,
             "the wide tier should retain the delete binding"
         );
+    }
+
+    #[test]
+    fn rebuild_command_hints_keep_navigation_without_destructive_actions() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+        let command = line_text(&non_destructive_command_hint_line(
+            "arrows/hjkl",
+            120,
+            theme,
+        ));
+
+        assert!(command.contains("arrows/hjkl move"));
+        assert!(command.contains("Enter open"));
+        assert!(command.contains("Esc cancel"));
+        assert!(!command.contains("delete"));
+        assert!(!command.contains("filter"));
+        assert!(!command.contains("export"));
+    }
+
+    #[test]
+    fn narrow_rebuild_command_hints_keep_the_movement_binding() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+        let command = line_text(&non_destructive_command_hint_line(
+            "arrows/Ctrl-b/n/p/f",
+            32,
+            theme,
+        ));
+
+        assert!(command.contains("arrows/Ctrl-b/n/p/f"));
+        assert!(command.contains("Esc cancel"));
+        assert!(!command.contains("delete"));
+        assert!(command.width() <= 32);
+    }
+
+    #[test]
+    fn stale_snapshot_command_hints_keep_navigation_without_delete_or_export() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+        let command = line_text(&stale_snapshot_command_hint_line("arrows/hjkl", 120, theme));
+
+        assert!(command.contains("arrows/hjkl move"));
+        assert!(command.contains("Enter open"));
+        assert!(command.contains("Esc up"));
+        assert!(!command.contains("delete"));
+        assert!(!command.contains("export"));
+    }
+
+    #[test]
+    fn stale_theme_picker_keeps_read_only_footer_hints() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buffer = Buffer::empty(area);
+        let picker = UiMode::ThemePicker {
+            original: ThemeId::ExciseDark,
+            selected: ThemeId::ExciseLight,
+            return_to: ThemePickerReturn::StaleSnapshot,
+        };
+
+        render_control_hints(&mut buffer, area, &picker, KeyPreset::Vim, None, theme);
+        let footer = buffer.content.iter().map(Cell::symbol).collect::<String>();
+
+        assert!(footer.contains("Esc up"));
+        assert!(!footer.contains("delete"));
+        assert!(!footer.contains("export"));
+    }
+
+    #[test]
+    fn stale_exit_dialog_keeps_read_only_footer_hints() {
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buffer = Buffer::empty(area);
+        let exiting = UiMode::Exiting {
+            work: crate::app::ExitWork::None,
+            return_to: ThemePickerReturn::StaleSnapshot,
+        };
+
+        render_control_hints(&mut buffer, area, &exiting, KeyPreset::Vim, None, theme);
+        let footer = buffer.content.iter().map(Cell::symbol).collect::<String>();
+
+        assert!(footer.contains("Esc up"));
+        assert!(!footer.contains("delete"));
+        assert!(!footer.contains("export"));
+        let unavailable = UiMode::Exiting {
+            work: crate::app::ExitWork::None,
+            return_to: ThemePickerReturn::ScanResultsUnavailable("scan failed".to_string()),
+        };
+        assert!(presentation_is_unavailable(&unavailable));
+    }
+
+    #[test]
+    fn transient_modals_keep_restricted_presentation_targets() {
+        let stale_notice = UiMode::Notice {
+            message: "deletion unavailable".to_string(),
+            return_to: ThemePickerReturn::StaleSnapshot,
+        };
+        let unavailable_error = UiMode::ErrorMessage {
+            message: "theme save failed".to_string(),
+            return_to: ThemePickerReturn::ScanResultsUnavailable("scan failed".to_string()),
+        };
+
+        assert!(presentation_is_stale(&stale_notice));
+        assert!(presentation_is_unavailable(&unavailable_error));
     }
 
     #[test]
@@ -2834,7 +3204,10 @@ mod tests {
             .render(
                 &file_tree,
                 &mut board,
-                &UiMode::ErrorMessage(message.to_string()),
+                &UiMode::ErrorMessage {
+                    message: message.to_string(),
+                    return_to: ThemePickerReturn::Normal,
+                },
                 &effects,
                 &deletion_work,
                 &mut animation,
@@ -2994,7 +3367,27 @@ mod tests {
                 true,
                 false,
             ),
-            "Backspace delete"
+            "Refreshing map · deletion unavailable"
+        );
+        assert_eq!(
+            inspector_action(
+                &UiMode::Rebuilding {
+                    target: std::path::PathBuf::new(),
+                },
+                NodeKind::Directory,
+                true,
+                false,
+            ),
+            "Enter open · Refreshing map · deletion unavailable"
+        );
+
+        assert_eq!(
+            inspector_action(&UiMode::StaleSnapshot, NodeKind::File, true, false),
+            "Map stale · deletion unavailable"
+        );
+        assert_eq!(
+            inspector_action(&UiMode::StaleSnapshot, NodeKind::Directory, true, false),
+            "Enter open · Map stale · deletion unavailable"
         );
         assert_eq!(
             inspector_action(&UiMode::Loading, NodeKind::File, true, false),
@@ -3087,6 +3480,7 @@ mod tests {
             &tree,
             &board,
             Some(&work),
+            DeletionWorkPhaseSnapshot::empty(),
             Some(&effects),
             &UiMode::Normal,
             Theme::for_id(ThemeId::ExciseDark),
@@ -3100,6 +3494,104 @@ mod tests {
             .map(Cell::symbol)
             .collect::<String>();
         assert!(active_text.contains("Deletion: checking current files in background"));
+    }
+
+    #[test]
+    fn deletion_phase_snapshot_aligns_list_inspector_and_header() {
+        let root = tempfile::tempdir().expect("display root should exist");
+        let path = root.path().join("selected-entry");
+        fs::write(&path, b"selected contents").expect("fixture should be written");
+        let metadata = fs::symlink_metadata(&path).expect("fixture metadata should exist");
+        let identity = identity_for(&path, &metadata)
+            .expect("fixture identity should be readable")
+            .expect("fixture should not be a link");
+        let (tree, entry) = concrete_file_tree(root.path(), &path, &metadata, &identity);
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 10));
+        board.change_files(tree.files_in_current_folder(0, true));
+        board.set_selected_index(0);
+        let relative = entry.path.clone();
+        let target = SnapshotTree::deletion_target_from_entry(
+            root.path().to_path_buf(),
+            NodeId(1),
+            &relative,
+            entry,
+            true,
+        )
+        .expect("selected file should retain a deletion target");
+        let mut work = DeletionWork::new();
+        let work_id = work
+            .enqueue_confirmation(target, true, 1024, Duration::ZERO)
+            .expect("background deletion should retain the selected target");
+        let progress = work.set_execution_for_test(work_id, 8);
+        let deletion_phase = work.presentation_snapshot();
+        progress.begin_mutation();
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+
+        let list_area = Rect::new(0, 0, 80, 1);
+        let mut list_buffer = Buffer::empty(list_area);
+        render_list_with_work(
+            &mut list_buffer,
+            list_area,
+            &board,
+            Some(&tree),
+            Some(&work),
+            deletion_phase,
+            theme,
+            false,
+            Duration::ZERO,
+            false,
+            false,
+            false,
+        );
+        let list_text = list_buffer
+            .content
+            .iter()
+            .map(Cell::symbol)
+            .collect::<String>();
+        assert!(list_text.contains("◌"));
+
+        let inspector_area = Rect::new(0, 0, 80, INSPECTOR_HEIGHT);
+        let mut inspector_buffer = Buffer::empty(inspector_area);
+        render_inspector_with_work(
+            &mut inspector_buffer,
+            inspector_area,
+            &tree,
+            &board,
+            Some(&work),
+            deletion_phase,
+            Some(&UiEffects::new()),
+            &UiMode::Normal,
+            theme,
+            false,
+            false,
+            Duration::ZERO,
+        );
+        let inspector_text = inspector_buffer
+            .content
+            .iter()
+            .map(Cell::symbol)
+            .collect::<String>();
+        assert!(inspector_text.contains("performing final safety check"));
+
+        let header = header_status_line(
+            &tree,
+            &board,
+            &UiMode::Normal,
+            &UiEffects::new(),
+            &work,
+            deletion_phase,
+            None,
+            "Excise Dark",
+            false,
+            false,
+            false,
+            false,
+            false,
+            120,
+            theme,
+        );
+        assert!(line_text(&header).contains("Verifying deletion"));
     }
 
     #[test]

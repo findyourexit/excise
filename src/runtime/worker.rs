@@ -2,7 +2,7 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -31,10 +31,27 @@ use crate::scan_coordinator::{
 };
 use crate::scan_session::ScanSessionId;
 use crate::scan_store::run_file::SealedRun;
-use crate::state::deletion_work::{DeletionWorkCommand, DeletionWorkId, MAX_DELETION_WORK_ITEMS};
+use crate::state::deletion_work::{
+    DeletionExecutionProgress, DeletionWorkCommand, DeletionWorkId, MAX_DELETION_WORK_ITEMS,
+};
 use crate::temporary_storage::TemporaryStorage;
 
 const CHANNEL_RETRY: Duration = Duration::from_millis(25);
+
+fn clear_active_deletion_progress(
+    active: &Mutex<Option<Arc<DeletionExecutionProgress>>>,
+    progress: &Arc<DeletionExecutionProgress>,
+) {
+    let mut active = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if active
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, progress))
+    {
+        *active = None;
+    }
+}
 
 pub struct ScannedEntry {
     pub metadata: Metadata,
@@ -88,7 +105,7 @@ enum ExecutorCommand {
     Execute {
         work_id: DeletionWorkId,
         plan: Box<DeletionPlan>,
-        progress: Arc<AtomicU64>,
+        progress: Arc<DeletionExecutionProgress>,
     },
 }
 
@@ -106,6 +123,7 @@ pub struct WorkerPool {
     cancelled: Arc<AtomicBool>,
     deletion_plan_cancelled: Arc<AtomicBool>,
     deletion_soft_cancelled: Arc<AtomicBool>,
+    active_deletion_progress: Arc<Mutex<Option<Arc<DeletionExecutionProgress>>>>,
     scanner: ScannerHandle,
     scan_session: ScanSessionId,
     coordinator: SessionCoordinator,
@@ -144,6 +162,7 @@ impl WorkerPool {
         let cancelled = Arc::new(AtomicBool::new(false));
         let deletion_plan_cancelled = Arc::new(AtomicBool::new(false));
         let deletion_soft_cancelled = Arc::new(AtomicBool::new(false));
+        let active_deletion_progress = Arc::new(Mutex::new(None));
         let scan_root = scanner_options.root.clone();
         let scan_root_identity = scanner_options.root_identity.clone();
         let temporary_storage = deletion_storage;
@@ -191,6 +210,7 @@ impl WorkerPool {
                 let sender = event_sender;
                 let cancelled = Arc::clone(&cancelled);
                 let soft_cancelled = Arc::clone(&deletion_soft_cancelled);
+                let active_progress = Arc::clone(&active_deletion_progress);
                 let root = scan_root;
                 move || {
                     execution_worker(
@@ -198,6 +218,7 @@ impl WorkerPool {
                         &executor_receiver,
                         &sender,
                         &soft_cancelled,
+                        &active_progress,
                         &cancelled,
                     );
                 }
@@ -219,6 +240,7 @@ impl WorkerPool {
             cancelled,
             deletion_plan_cancelled,
             deletion_soft_cancelled,
+            active_deletion_progress,
             scanner,
             scan_session,
             coordinator,
@@ -287,6 +309,12 @@ impl WorkerPool {
                 plan,
                 progress,
             } => {
+                let active_progress = Arc::clone(&progress);
+                *self
+                    .active_deletion_progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Arc::clone(&active_progress));
                 self.deletion_soft_cancelled.store(false, Ordering::Release);
                 match self.executor_commands.try_send(ExecutorCommand::Execute {
                     work_id,
@@ -298,14 +326,24 @@ impl WorkerPool {
                         work_id,
                         plan,
                         progress,
-                    })) => Err(DeletionWorkSubmissionError::Busy(Box::new(
-                        DeletionWorkCommand::Execute {
-                            work_id,
-                            plan,
-                            progress,
-                        },
-                    ))),
+                    })) => {
+                        clear_active_deletion_progress(
+                            &self.active_deletion_progress,
+                            &active_progress,
+                        );
+                        Err(DeletionWorkSubmissionError::Busy(Box::new(
+                            DeletionWorkCommand::Execute {
+                                work_id,
+                                plan,
+                                progress,
+                            },
+                        )))
+                    }
                     Err(TrySendError::Disconnected(_)) => {
+                        clear_active_deletion_progress(
+                            &self.active_deletion_progress,
+                            &active_progress,
+                        );
                         Err(DeletionWorkSubmissionError::Disconnected)
                     }
                 }
@@ -342,9 +380,18 @@ impl WorkerPool {
         Ok(())
     }
 
-    /// Stops only at an entry boundary. The executor is always joined by shutdown.
+    /// Stops at a claim or entry boundary. The executor is always joined by shutdown.
     pub fn safely_stop_deletion(&self) {
         self.deletion_soft_cancelled.store(true, Ordering::Release);
+        let progress = self
+            .active_deletion_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone);
+        if let Some(progress) = progress {
+            let _ = progress.request_stop();
+        }
     }
 
     pub fn cancel_deletion_plan(&self) {
@@ -432,6 +479,7 @@ impl WorkerPool {
             cancelled,
             deletion_plan_cancelled,
             deletion_soft_cancelled,
+            active_deletion_progress: _,
             scanner,
             scan_session: _,
             coordinator,
@@ -525,6 +573,7 @@ fn execution_worker(
     commands: &Receiver<ExecutorCommand>,
     sender: &Sender<WorkerEvent>,
     soft_cancelled: &AtomicBool,
+    active_progress: &Mutex<Option<Arc<DeletionExecutionProgress>>>,
     cancelled: &AtomicBool,
 ) {
     loop {
@@ -549,11 +598,14 @@ fn execution_worker(
                     *plan,
                     soft_cancelled,
                     cancelled,
-                    &progress,
+                    progress.completed(),
+                    || !cancelled.load(Ordering::Acquire) && progress.try_claim_mutation(),
+                    || !cancelled.load(Ordering::Acquire) && progress.try_begin_mutation(),
                 ),
             },
             Err(error) => WorkerEvent::DeletionExecutionRejected { work_id, error },
         };
+        clear_active_deletion_progress(active_progress, &progress);
         if !send_event(sender, event, cancelled) {
             return;
         }
@@ -744,12 +796,13 @@ mod tests {
         let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
         std::fs::write(&path, b"replacement-after-confirmation")
             .expect("target should be replaced before execution");
+        let progress = Arc::new(DeletionExecutionProgress::new());
         assert!(
             workers
                 .submit_deletion_work(DeletionWorkCommand::Execute {
                     work_id: DeletionWorkId::for_test(1),
                     plan: Box::new(plan),
-                    progress: Arc::new(AtomicU64::new(0)),
+                    progress: Arc::clone(&progress),
                 })
                 .is_ok(),
             "execution should be queued"
@@ -769,6 +822,10 @@ mod tests {
             }
         };
         assert!(error.is_stale());
+        assert!(
+            !progress.has_started_mutation(),
+            "a rejected final safety check must not mark the target as mutating"
+        );
         assert!(path.exists(), "stale target must not be mutated");
         workers.shutdown().expect("workers should stop");
     }
@@ -779,12 +836,13 @@ mod tests {
         let root = tempfile::tempdir().expect("deletion root should exist");
         let (path, plan) = single_file_plan(root.path());
         let workers = WorkerPool::start(options(root.path(), 1), 16).expect("workers should start");
+        let progress = Arc::new(DeletionExecutionProgress::new());
         assert!(
             workers
                 .submit_deletion_work(DeletionWorkCommand::Execute {
                     work_id: DeletionWorkId(2),
                     plan: Box::new(plan),
-                    progress: Arc::new(AtomicU64::new(0)),
+                    progress: Arc::clone(&progress),
                 })
                 .is_ok(),
             "execution should be queued after resuming"
@@ -805,6 +863,10 @@ mod tests {
                 | WorkerEvent::DeletionExecutionRejected { .. } => {}
             }
         };
+        assert!(
+            progress.has_started_mutation(),
+            "a successfully revalidated command must mark mutation before reporting progress"
+        );
         assert!(!report.soft_cancelled);
         assert_eq!(report.deleted_entries(), 1);
         assert!(!path.exists());

@@ -91,13 +91,14 @@ struct ScheduledAction {
     action: TimedAction,
 }
 
-/// Records one rendered deletion counter and reports whether the map changed.
+/// Records one rendered deletion lifecycle state and reports whether the map changed.
 fn deletion_progress_changed(
-    previous: &mut Option<(u64, u64)>,
+    previous: &mut Option<(u64, u64, bool)>,
     planned: u64,
     completed: u64,
+    mutation_started: bool,
 ) -> bool {
-    let current = (planned, completed);
+    let current = (planned, completed, mutation_started);
     if *previous == Some(current) {
         return false;
     }
@@ -166,8 +167,8 @@ where
     next_loading_frame: Duration,
     /// Live mutation progress needs redraws even when accessibility disables animation.
     next_deletion_progress_frame: Duration,
-    /// Last counters rendered. Unchanged counters do not redraw the map.
-    last_deletion_progress: Option<(u64, u64)>,
+    /// Last rendered deletion lifecycle state. Unchanged state does not redraw the map.
+    last_deletion_progress: Option<(u64, u64, bool)>,
 }
 
 /// # Errors
@@ -405,6 +406,7 @@ where
             InputCommand::CancelGenerationRebuild => {
                 if self.generation_rebuild_active {
                     self.workers()?.cancel_generation_rebuild();
+                    self.app.suppress_generation_rebuild_restart();
                 }
             }
             InputCommand::RequestDeletion(target) => {
@@ -533,10 +535,10 @@ where
     }
 
     fn exit_work(&self) -> ExitWork {
-        if let Some((planned_entries, completed)) = self.app.deletion_work.active_progress() {
+        if let Some((planned_entries, progress)) = self.app.deletion_work.active_progress() {
             return ExitWork::Active {
                 planned_entries,
-                completed,
+                progress,
                 pending: self.app.deletion_work.pending_count(),
             };
         }
@@ -554,11 +556,11 @@ where
         self.flush_deletion_plan_cancellation()?;
         self.exit_after_work = true;
         let work = if stop_active {
-            if let Some((planned_entries, completed)) = self.app.deletion_work.active_progress() {
+            if let Some((planned_entries, progress)) = self.app.deletion_work.active_progress() {
                 self.workers()?.safely_stop_deletion();
                 ExitWork::Stopping {
                     planned_entries,
-                    completed,
+                    progress,
                 }
             } else {
                 ExitWork::Cancelling {
@@ -859,7 +861,9 @@ where
     fn handle_worker_event(&mut self, event: WorkerEvent) -> Result<(), AppError> {
         let exit_work_may_change = matches!(
             &event,
-            WorkerEvent::DeletionPlanned { .. }
+            WorkerEvent::ScanBatch { .. }
+                | WorkerEvent::ScanUnscanned { .. }
+                | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
                 | WorkerEvent::DeletionFinished { .. }
                 | WorkerEvent::ScanFinished { .. }
@@ -1007,15 +1011,15 @@ where
                 }
             }
         }
+        if !self.exit_after_work {
+            self.start_next_deletion_planning()?;
+            self.start_next_deletion_execution()?;
+        }
         if exit_work_may_change
             && !self.exit_after_work
             && matches!(self.app.ui_mode, crate::UiMode::Exiting { .. })
         {
             self.app.prompt_exit(self.exit_work());
-        }
-        if !self.exit_after_work {
-            self.start_next_deletion_planning()?;
-            self.start_next_deletion_execution()?;
         }
         self.finish_exit_after_work();
         Ok(())
@@ -1083,7 +1087,10 @@ where
                 if deletion_progress_changed(
                     &mut self.last_deletion_progress,
                     planned,
-                    progress.load(std::sync::atomic::Ordering::Acquire),
+                    progress
+                        .completed()
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    progress.has_started_mutation(),
                 ) {
                     self.app.mark_dirty();
                     processed = true;
@@ -2538,10 +2545,15 @@ mod tests {
     #[test]
     fn unchanged_deletion_progress_does_not_request_another_map_frame() {
         let mut previous = None;
-        assert!(deletion_progress_changed(&mut previous, 8, 0));
-        assert!(!deletion_progress_changed(&mut previous, 8, 0));
-        assert!(deletion_progress_changed(&mut previous, 8, 1));
-        assert!(deletion_progress_changed(&mut previous, 16, 1));
+        assert!(deletion_progress_changed(&mut previous, 8, 0, false));
+        assert!(!deletion_progress_changed(&mut previous, 8, 0, false));
+        assert!(
+            deletion_progress_changed(&mut previous, 8, 0, true),
+            "starting mutation must refresh verification presentation even before progress advances"
+        );
+        assert!(!deletion_progress_changed(&mut previous, 8, 0, true));
+        assert!(deletion_progress_changed(&mut previous, 8, 1, true));
+        assert!(deletion_progress_changed(&mut previous, 16, 1, true));
     }
 
     #[test]

@@ -14,7 +14,8 @@ use crate::model::SyntheticKind;
 use crate::native_path::SafeDisplayPath;
 use crate::state::DeletionDeparture;
 use crate::state::deletion_work::{
-    DELETION_CHECKER_COVER_DURATION, DeletionWork, WorkRailItem, WorkRailStatus,
+    DELETION_CHECKER_COVER_DURATION, DeletionWork, DeletionWorkPhaseSnapshot, WorkRailItem,
+    WorkRailStatus,
 };
 use crate::state::files::tree_view::TreeView;
 use crate::state::tiles::{FileType, HALF_ROWS_PER_CELL, MapOverflow, Tile};
@@ -136,14 +137,28 @@ pub struct DenseRectangleGrid<'a> {
     scan: Option<ScanVisual>,
     file_tree: Option<&'a dyn TreeView>,
     deletion_work: Option<&'a DeletionWork>,
+    deletion_phase: DeletionWorkPhaseSnapshot,
     deletion_departure: Option<&'a DeletionDeparture>,
     now: Duration,
     animate_deletion_checker: bool,
 }
 
 impl<'a> DenseRectangleGrid<'a> {
-    #[must_use]
-    pub const fn new(layout: MapLayout<'a>, theme: Theme, ascii: bool, monochrome: bool) -> Self {
+    pub fn new(layout: MapLayout<'a>, theme: Theme, ascii: bool, monochrome: bool) -> Self {
+        let deletion_phase = layout.deletion_work.map_or_else(
+            DeletionWorkPhaseSnapshot::empty,
+            DeletionWork::presentation_snapshot,
+        );
+        Self::new_with_phase_snapshot(layout, theme, ascii, monochrome, deletion_phase)
+    }
+
+    pub(crate) fn new_with_phase_snapshot(
+        layout: MapLayout<'a>,
+        theme: Theme,
+        ascii: bool,
+        monochrome: bool,
+        deletion_phase: DeletionWorkPhaseSnapshot,
+    ) -> Self {
         Self {
             rectangles: layout.rectangles,
             departing: layout.departing,
@@ -157,6 +172,7 @@ impl<'a> DenseRectangleGrid<'a> {
             scan: layout.scan,
             file_tree: layout.file_tree,
             deletion_work: layout.deletion_work,
+            deletion_phase,
             deletion_departure: layout.deletion_departure,
             now: layout.now,
             animate_deletion_checker: layout.animate_deletion_checker,
@@ -185,12 +201,12 @@ impl<'a> DenseRectangleGrid<'a> {
         tile: &Tile,
         palette: MapPalette,
         emphasis: Emphasis,
-        work_status: Option<WorkRailStatus>,
+        work: Option<WorkRailItem<'_>>,
     ) -> TileInk {
         if self.is_deletion_departure(tile) {
             return TileInk::departure(self.theme, palette);
         }
-        TileInk::resolve(tile, self.theme, palette, emphasis, work_status)
+        TileInk::resolve(tile, self.theme, palette, emphasis, work)
     }
 
     fn current_deletion_departure(&self) -> Option<&DeletionDeparture> {
@@ -208,14 +224,11 @@ impl<'a> DenseRectangleGrid<'a> {
         let file_tree = self.file_tree?;
         let relative_path = file_tree.relative_path_for_id(tile.node_id)?;
         self.deletion_work?
-            .rail_item_for_relative_path(file_tree.scan_root(), relative_path)
-    }
-
-    fn work_status(&self, tile: &Tile) -> Option<WorkRailStatus> {
-        (!self.is_deletion_departure(tile))
-            .then(|| self.work_item(tile))
-            .flatten()
-            .map(|work| work.status)
+            .rail_item_for_relative_path_with_phase_snapshot(
+                file_tree.scan_root(),
+                relative_path,
+                Some(self.deletion_phase),
+            )
     }
 
     fn confirmation_checker_elapsed(&self, tile: &Tile) -> Option<Duration> {
@@ -224,7 +237,7 @@ impl<'a> DenseRectangleGrid<'a> {
             return None;
         }
         let work = self.work_item(tile)?;
-        if !has_confirmation_checker_status(work.status) {
+        if !has_confirmation_checker_coverage(work) {
             return None;
         }
         let confirmed_at = work.confirmed_at?;
@@ -293,7 +306,7 @@ impl<'a> DenseRectangleGrid<'a> {
             return None;
         }
         let outline = visible_tile_outline(tile, area)?;
-        let ink = self.ink(tile, palette, Emphasis::Selected, self.work_status(tile));
+        let ink = self.ink(tile, palette, Emphasis::Selected, self.work_item(tile));
         let (cycle, _) = derived_for(self.theme);
         let step = cycle_step(self.now);
         let base_fill = ink.fill;
@@ -398,7 +411,7 @@ impl<'a> DenseRectangleGrid<'a> {
             let Some(work) = self.work_item(tile) else {
                 continue;
             };
-            let ink = self.ink(tile, palette, self.emphasis(index), Some(work.status));
+            let ink = self.ink(tile, palette, self.emphasis(index), Some(work));
             let (fill, text, _) = focused_tile_ink(index, &ink, focus);
             let style = Style::default()
                 .fg(text)
@@ -471,7 +484,7 @@ impl<'a> DenseRectangleGrid<'a> {
         if self.transitioning {
             let mut covered = HalfRowCoverage::new();
             for (index, tile) in tile_paint_order(self.rectangles, selected_last).rev() {
-                let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
+                let ink = self.ink(tile, palette, self.emphasis(index), self.work_item(tile));
                 paint_visible_tile(buffer, area, tile, &ink, &mut covered);
             }
             for tile in self.departing.iter().rev() {
@@ -484,7 +497,7 @@ impl<'a> DenseRectangleGrid<'a> {
                 paint_tile(buffer, area, tile, &ink);
             }
             for (index, tile) in tile_paint_order(self.rectangles, selected_last) {
-                let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
+                let ink = self.ink(tile, palette, self.emphasis(index), self.work_item(tile));
                 paint_tile(buffer, area, tile, &ink);
             }
         }
@@ -506,7 +519,7 @@ impl<'a> DenseRectangleGrid<'a> {
             if label_occlusions.is_some_and(|occlusions| occlusions[index]) {
                 continue;
             }
-            let ink = self.ink(tile, palette, self.emphasis(index), self.work_status(tile));
+            let ink = self.ink(tile, palette, self.emphasis(index), self.work_item(tile));
             let (fill, text, detail) = focused_tile_ink(index, &ink, focus.as_ref());
             if let Some(labels) = prepared_labels {
                 let Some(label) = labels[index].as_ref() else {
@@ -666,8 +679,8 @@ impl<'a> DenseRectangleGrid<'a> {
     }
 }
 
-fn has_confirmation_checker_status(status: WorkRailStatus) -> bool {
-    matches!(status, WorkRailStatus::Planning | WorkRailStatus::Queued)
+fn has_confirmation_checker_coverage(work: WorkRailItem<'_>) -> bool {
+    work.is_preparing()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -677,7 +690,7 @@ struct ExecutionProgress {
 }
 
 fn execution_progress(work: WorkRailItem<'_>) -> Option<ExecutionProgress> {
-    if work.status != WorkRailStatus::Executing {
+    if work.status != WorkRailStatus::Executing || work.is_preparing() {
         return None;
     }
     let planned = work.planned_entries?;
@@ -707,8 +720,7 @@ fn draw_work_indicator(
             && y < area.bottom()
             && let Some(cell) = buffer.cell_mut((x, y))
         {
-            cell.set_symbol(work_marker(work.status, ascii))
-                .set_style(style);
+            cell.set_symbol(work_marker(work, ascii)).set_style(style);
         }
     }
     let label = work_label(work, ascii);
@@ -716,8 +728,11 @@ fn draw_work_indicator(
     draw_line(buffer, area, tile, row, &label, style);
 }
 
-fn work_marker(status: WorkRailStatus, ascii: bool) -> &'static str {
-    match (status, ascii) {
+fn work_marker(work: WorkRailItem<'_>, ascii: bool) -> &'static str {
+    if matches!(work.status, WorkRailStatus::Executing) && work.is_preparing() {
+        return if ascii { "~" } else { "◌" };
+    }
+    match (work.status, ascii) {
         (WorkRailStatus::AwaitingConfirmation, _) => "!",
         (WorkRailStatus::Planning, true) => "~",
         (WorkRailStatus::Planning, false) => "◌",
@@ -729,6 +744,13 @@ fn work_marker(status: WorkRailStatus, ascii: bool) -> &'static str {
 }
 
 fn work_label(work: WorkRailItem<'_>, ascii: bool) -> Cow<'static, str> {
+    if matches!(work.status, WorkRailStatus::Executing) && work.is_preparing() {
+        return Cow::Borrowed(if ascii {
+            "~ Verifying deletion"
+        } else {
+            "◌ Verifying deletion"
+        });
+    }
     match (work.status, ascii) {
         (WorkRailStatus::AwaitingConfirmation, _) => Cow::Borrowed("! Awaiting confirmation"),
         (WorkRailStatus::Planning, true) => Cow::Borrowed("~ Checking deletion"),
@@ -856,14 +878,14 @@ impl TileInk {
         theme: Theme,
         palette: MapPalette,
         emphasis: Emphasis,
-        work_status: Option<WorkRailStatus>,
+        work: Option<WorkRailItem<'_>>,
     ) -> Self {
         let tone = match tile.file_type {
             FileType::Folder => TileTone::Folder,
             FileType::File | FileType::Synthetic => TileTone::File,
         };
-        let source = if let Some(status) = work_status {
-            palette.semantic(work_status_color(theme, status))
+        let source = if let Some(work) = work {
+            palette.semantic(work_color(theme, work))
         } else if is_ramp_eligible(tile) {
             palette.tile(size_heat(tile.size), tone)
         } else if is_virtual_summary(tile) {
@@ -921,8 +943,11 @@ impl TileInk {
     }
 }
 
-fn work_status_color(theme: Theme, status: WorkRailStatus) -> Color {
-    match status {
+fn work_color(theme: Theme, work: WorkRailItem<'_>) -> Color {
+    if matches!(work.status, WorkRailStatus::Executing) && work.is_preparing() {
+        return theme.state_scanning;
+    }
+    match work.status {
         WorkRailStatus::AwaitingConfirmation => theme.focus,
         WorkRailStatus::Planning => theme.state_scanning,
         WorkRailStatus::Queued => theme.state_rebuilding,
@@ -4187,13 +4212,85 @@ mod tests {
     }
 
     #[test]
-    fn checker_staging_continues_while_execution_is_queued() {
-        assert!(has_confirmation_checker_status(WorkRailStatus::Planning));
-        assert!(has_confirmation_checker_status(WorkRailStatus::Queued));
-        assert!(!has_confirmation_checker_status(
-            WorkRailStatus::AwaitingConfirmation
-        ));
-        assert!(!has_confirmation_checker_status(WorkRailStatus::Executing));
+    fn execution_verification_snapshot_keeps_checker_and_scanning_tint_until_next_frame() {
+        let area = Rect::new(0, 0, 30, 5);
+        let entry = tile(0, 0, 30, 10, 1);
+        let mut work = DeletionWork::new();
+        let work_id = work
+            .enqueue_confirmation(deletion_target(entry.node_id), true, 1024, Duration::ZERO)
+            .expect("confirmed target should enter planning");
+        let progress = work.set_execution_for_test(work_id, 8);
+        let page = TestPage::new(entry.node_id, "", "entry");
+        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
+        let layout_at = |now| MapLayout {
+            rectangles: std::slice::from_ref(&entry),
+            departing: &[],
+            overflow: None,
+            selected_rect_index: None,
+            transitioning: false,
+            show_empty_label: false,
+            scan: None,
+            file_tree: Some(&page),
+            deletion_work: Some(&work),
+            deletion_departure: None,
+            now,
+            animate_deletion_checker: true,
+        };
+
+        let verification_work = work
+            .rail_item(0)
+            .expect("verification work should remain visible");
+        assert_eq!(work_color(theme, verification_work), theme.state_scanning);
+        let verification_fill = TileInk::resolve(
+            &entry,
+            theme,
+            MapPalette::for_theme(theme).expect("mocha should supply a truecolour palette"),
+            Emphasis::Resting,
+            Some(verification_work),
+        )
+        .fill;
+        let verification_grid =
+            DenseRectangleGrid::new(layout_at(Duration::from_millis(300)), theme, false, false);
+        progress.begin_mutation();
+        progress.completed().store(8, Ordering::Release);
+        let mut verifying = Buffer::empty(area);
+        verification_grid.render(area, &mut verifying);
+
+        assert!(text_of(&verifying).contains("Verifying deletion"));
+        assert_ne!(
+            verifying[(1, 0)].bg,
+            verifying[(2, 0)].bg,
+            "verification should paint the checker across the tile interior"
+        );
+        assert_eq!(
+            verifying[(2, 0)].bg,
+            verification_fill,
+            "snapshotted verification must not paint live execution progress"
+        );
+
+        assert_eq!(
+            work_color(
+                theme,
+                work.rail_item(0)
+                    .expect("mutating work should remain visible"),
+            ),
+            theme.text_danger
+        );
+        let mut mutating = Buffer::empty(area);
+        DenseRectangleGrid::new(layout_at(Duration::from_millis(300)), theme, false, false)
+            .render(area, &mut mutating);
+
+        assert!(text_of(&mutating).contains("Deleting 8/8"));
+        assert_eq!(
+            mutating[(1, 0)].bg,
+            mutating[(2, 0)].bg,
+            "the next frame should remove the confirmation checker"
+        );
+        assert_ne!(
+            verifying[(2, 0)].bg,
+            mutating[(2, 0)].bg,
+            "the next frame should adopt the destructive tile tint"
+        );
     }
 
     #[test]
@@ -4336,17 +4433,28 @@ mod tests {
 
     #[test]
     fn executing_deletion_label_reports_progress() {
-        let progress = std::sync::atomic::AtomicU64::new(3);
-        let item = WorkRailItem {
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let verifying = WorkRailItem {
             path: "target",
             status: WorkRailStatus::Executing,
             planned_entries: Some(8),
             completed: Some(&progress),
+            mutation_started: Some(false),
             confirmed_at: None,
         };
-        assert_eq!(work_label(item, false).as_ref(), "◉ Deleting 3/8");
+        assert_eq!(
+            work_label(verifying, false).as_ref(),
+            "◌ Verifying deletion"
+        );
+        assert_eq!(work_marker(verifying, true), "~");
+        let mutating = WorkRailItem {
+            mutation_started: Some(true),
+            ..verifying
+        };
+        progress.store(3, Ordering::Release);
+        assert_eq!(work_label(mutating, false).as_ref(), "◉ Deleting 3/8");
         progress.store(4, Ordering::Release);
-        assert_eq!(work_label(item, true).as_ref(), "* Deleting 4/8");
+        assert_eq!(work_label(mutating, true).as_ref(), "* Deleting 4/8");
     }
 
     #[test]

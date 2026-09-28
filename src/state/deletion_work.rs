@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::FileToDelete;
@@ -82,6 +82,132 @@ impl DeletionWorkError {
         }
     }
 }
+const MUTATION_PREPARING: u8 = 0;
+const MUTATION_CLAIMED: u8 = 1;
+const MUTATION_STARTED: u8 = 2;
+const MUTATION_STOP_REQUESTED: u8 = 3;
+
+#[derive(Debug)]
+pub(crate) struct DeletionExecutionProgress {
+    completed: AtomicU64,
+    mutation_state: AtomicU8,
+}
+
+impl DeletionExecutionProgress {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            completed: AtomicU64::new(0),
+            mutation_state: AtomicU8::new(MUTATION_PREPARING),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn completed(&self) -> &AtomicU64 {
+        &self.completed
+    }
+
+    pub(crate) fn try_claim_mutation(&self) -> bool {
+        loop {
+            match self.mutation_state.load(Ordering::Acquire) {
+                MUTATION_PREPARING => {
+                    if self
+                        .mutation_state
+                        .compare_exchange(
+                            MUTATION_PREPARING,
+                            MUTATION_CLAIMED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                MUTATION_CLAIMED | MUTATION_STARTED => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    pub(crate) fn try_begin_mutation(&self) -> bool {
+        loop {
+            match self.mutation_state.load(Ordering::Acquire) {
+                MUTATION_CLAIMED => {
+                    if self
+                        .mutation_state
+                        .compare_exchange(
+                            MUTATION_CLAIMED,
+                            MUTATION_STARTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                MUTATION_STARTED => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    pub(crate) fn request_stop(&self) -> bool {
+        loop {
+            match self.mutation_state.load(Ordering::Acquire) {
+                MUTATION_PREPARING | MUTATION_CLAIMED => {
+                    let current = self.mutation_state.load(Ordering::Acquire);
+                    if !matches!(current, MUTATION_PREPARING | MUTATION_CLAIMED) {
+                        continue;
+                    }
+                    if self
+                        .mutation_state
+                        .compare_exchange(
+                            current,
+                            MUTATION_STOP_REQUESTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    pub(crate) fn begin_mutation(&self) {
+        self.mutation_state
+            .store(MUTATION_STARTED, Ordering::Release);
+    }
+
+    #[must_use]
+    pub(crate) fn has_started_mutation(&self) -> bool {
+        self.mutation_state.load(Ordering::Acquire) == MUTATION_STARTED
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeletionWorkPhaseSnapshot {
+    execution_mutation_started: Option<bool>,
+}
+
+impl DeletionWorkPhaseSnapshot {
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            execution_mutation_started: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn execution_mutation_started(self) -> Option<bool> {
+        self.execution_mutation_started
+    }
+}
 
 /// Commands are separated by capability: planning never gains filesystem mutation authority.
 pub(crate) enum DeletionWorkCommand {
@@ -94,7 +220,7 @@ pub(crate) enum DeletionWorkCommand {
     Execute {
         work_id: DeletionWorkId,
         plan: Box<DeletionPlan>,
-        progress: Arc<AtomicU64>,
+        progress: Arc<DeletionExecutionProgress>,
     },
 }
 
@@ -121,7 +247,20 @@ pub(crate) struct WorkRailItem<'a> {
     pub status: WorkRailStatus,
     pub planned_entries: Option<u64>,
     pub completed: Option<&'a AtomicU64>,
+    pub mutation_started: Option<bool>,
     pub confirmed_at: Option<Duration>,
+}
+
+impl WorkRailItem<'_> {
+    /// The executor is still performing its final all-entry safety check.
+    #[must_use]
+    pub(crate) fn is_preparing(self) -> bool {
+        match self.status {
+            WorkRailStatus::Planning | WorkRailStatus::Queued => true,
+            WorkRailStatus::Executing => self.mutation_started.is_none_or(|started| !started),
+            WorkRailStatus::AwaitingConfirmation => false,
+        }
+    }
 }
 
 struct DeletionWorkItem {
@@ -155,7 +294,7 @@ enum DeletionWorkStage {
     QueuedExecution,
     Executing {
         planned_entries: u64,
-        progress: Arc<AtomicU64>,
+        progress: Arc<DeletionExecutionProgress>,
     },
     CancellingPlanning,
 }
@@ -332,7 +471,7 @@ impl DeletionWork {
             let _ = self.items.remove(index);
             return None;
         }
-        let progress = Arc::new(AtomicU64::new(0));
+        let progress = Arc::new(DeletionExecutionProgress::new());
         let planned_entries = plan.planned_entries();
         self.items[index].stage = DeletionWorkStage::Executing {
             planned_entries,
@@ -343,6 +482,25 @@ impl DeletionWork {
             plan,
             progress,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_execution_for_test(
+        &mut self,
+        work_id: DeletionWorkId,
+        planned_entries: u64,
+    ) -> Arc<DeletionExecutionProgress> {
+        let progress = Arc::new(DeletionExecutionProgress::new());
+        let item = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == work_id)
+            .expect("test deletion work should exist");
+        item.stage = DeletionWorkStage::Executing {
+            planned_entries,
+            progress: Arc::clone(&progress),
+        };
+        progress
     }
 
     /// Restores a command only when its worker lane did not accept it.
@@ -646,15 +804,10 @@ impl DeletionWork {
     #[must_use]
     pub(crate) fn has_checker_animation(&self, now: Duration) -> bool {
         self.items.iter().any(|item| {
-            matches!(
-                item.stage,
-                DeletionWorkStage::QueuedPlanning { .. }
-                    | DeletionWorkStage::Planning
-                    | DeletionWorkStage::QueuedExecution
-                    | DeletionWorkStage::CancellingPlanning
-            ) && item.confirmed_at.is_some_and(|confirmed_at| {
-                now.saturating_sub(confirmed_at) < DELETION_CHECKER_COVER_DURATION
-            })
+            work_rail_item(item).is_preparing()
+                && item.confirmed_at.is_some_and(|confirmed_at| {
+                    now.saturating_sub(confirmed_at) < DELETION_CHECKER_COVER_DURATION
+                })
         })
     }
 
@@ -664,7 +817,7 @@ impl DeletionWork {
     }
 
     #[must_use]
-    pub(crate) fn active_progress(&self) -> Option<(u64, Arc<AtomicU64>)> {
+    pub(crate) fn active_progress(&self) -> Option<(u64, Arc<DeletionExecutionProgress>)> {
         self.items.iter().find_map(|item| {
             let DeletionWorkStage::Executing {
                 planned_entries,
@@ -677,6 +830,23 @@ impl DeletionWork {
         })
     }
 
+    #[must_use]
+    pub(crate) fn execution_mutation_started(&self) -> Option<bool> {
+        self.items.iter().find_map(|item| {
+            let DeletionWorkStage::Executing { progress, .. } = &item.stage else {
+                return None;
+            };
+            Some(progress.has_started_mutation())
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn presentation_snapshot(&self) -> DeletionWorkPhaseSnapshot {
+        DeletionWorkPhaseSnapshot {
+            execution_mutation_started: self.execution_mutation_started(),
+        }
+    }
+
     /// Returns presentation data only when the scan root and relative target path match.
     ///
     /// Snapshot page node IDs are page-local, so they cannot identify work after navigation.
@@ -686,6 +856,16 @@ impl DeletionWork {
         scan_root: &Path,
         relative_path: &RelativePath,
     ) -> Option<WorkRailItem<'_>> {
+        self.rail_item_for_relative_path_with_phase_snapshot(scan_root, relative_path, None)
+    }
+
+    #[must_use]
+    pub(crate) fn rail_item_for_relative_path_with_phase_snapshot(
+        &self,
+        scan_root: &Path,
+        relative_path: &RelativePath,
+        phase_snapshot: Option<DeletionWorkPhaseSnapshot>,
+    ) -> Option<WorkRailItem<'_>> {
         self.items
             .iter()
             .find(|item| {
@@ -694,7 +874,7 @@ impl DeletionWork {
                     .is_some_and(|target| target.path_in_filesystem.as_path() == scan_root)
                     && item.relative_path == *relative_path
             })
-            .map(work_rail_item)
+            .map(|item| work_rail_item_with_phase_snapshot(item, phase_snapshot))
     }
 
     #[must_use]
@@ -709,11 +889,21 @@ impl DeletionWork {
 
     #[must_use]
     pub(crate) fn foreground_rail_item(&self) -> Option<WorkRailItem<'_>> {
+        self.foreground_rail_item_with_phase_snapshot(None)
+    }
+
+    #[must_use]
+    pub(crate) fn foreground_rail_item_with_phase_snapshot(
+        &self,
+        phase_snapshot: Option<DeletionWorkPhaseSnapshot>,
+    ) -> Option<WorkRailItem<'_>> {
         let active = self
             .items
             .iter()
             .position(|item| matches!(item.stage, DeletionWorkStage::Executing { .. }));
-        self.rail_item(active.unwrap_or(0))
+        self.items
+            .get(active.unwrap_or(0))
+            .map(|item| work_rail_item_with_phase_snapshot(item, phase_snapshot))
     }
 
     #[must_use]
@@ -727,7 +917,7 @@ impl DeletionWork {
                 } => {
                     summary.mutating = true;
                     summary.planned_entries = Some(*planned_entries);
-                    summary.completed_entries = Some(progress.load(Ordering::Acquire));
+                    summary.completed_entries = Some(progress.completed().load(Ordering::Acquire));
                 }
                 _ => {
                     summary.pending_operations = summary.pending_operations.saturating_add(1);
@@ -841,22 +1031,34 @@ impl DeletionWork {
 }
 
 fn work_rail_item(item: &DeletionWorkItem) -> WorkRailItem<'_> {
-    let (status, planned_entries, completed) = match &item.stage {
+    work_rail_item_with_phase_snapshot(item, None)
+}
+
+fn work_rail_item_with_phase_snapshot(
+    item: &DeletionWorkItem,
+    phase_snapshot: Option<DeletionWorkPhaseSnapshot>,
+) -> WorkRailItem<'_> {
+    let (status, planned_entries, completed, mutation_started) = match &item.stage {
         DeletionWorkStage::Executing {
             planned_entries,
             progress,
         } => (
             WorkRailStatus::Executing,
             Some(*planned_entries),
-            Some(progress.as_ref()),
+            Some(progress.completed()),
+            phase_snapshot.map_or_else(
+                || Some(progress.has_started_mutation()),
+                |snapshot| snapshot.execution_mutation_started,
+            ),
         ),
-        stage => (work_rail_status(stage), None, None),
+        stage => (work_rail_status(stage), None, None, None),
     };
     WorkRailItem {
         path: &item.label,
         status,
         planned_entries,
         completed,
+        mutation_started,
         confirmed_at: item.confirmed_at,
     }
 }
@@ -882,7 +1084,6 @@ mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     use crate::model::{EntrySnapshot, NodeId, NodeKind};
@@ -1013,7 +1214,7 @@ mod tests {
             .expect("first item should remain retained");
         item.stage = DeletionWorkStage::Executing {
             planned_entries: 1,
-            progress: Arc::new(AtomicU64::new(0)),
+            progress: Arc::new(DeletionExecutionProgress::new()),
         };
 
         assert_eq!(target.full_path(), PathBuf::from("/scan-root/first"));
@@ -1080,6 +1281,14 @@ mod tests {
     }
 
     #[test]
+    fn unmutated_progress_keeps_the_execution_in_verification() {
+        let progress = DeletionExecutionProgress::new();
+        progress.completed().store(1, Ordering::Release);
+
+        assert!(!progress.has_started_mutation());
+    }
+
+    #[test]
     fn path_rail_item_exposes_execution_progress() {
         let mut work = DeletionWork::new();
         let target = target(&["target"]);
@@ -1090,7 +1299,7 @@ mod tests {
         let _ = work
             .next_planning_command()
             .expect("planner command should start");
-        let progress = Arc::new(AtomicU64::new(3));
+        let progress = Arc::new(DeletionExecutionProgress::new());
         let item = work
             .items
             .iter_mut()
@@ -1101,13 +1310,27 @@ mod tests {
             progress: Arc::clone(&progress),
         };
 
-        let rail = work
+        let preparing = work
             .rail_item_for_relative_path(Path::new("/scan-root"), &target_path)
             .expect("target path should retain its execution state");
-        assert_eq!(rail.status, WorkRailStatus::Executing);
-        assert_eq!(rail.planned_entries, Some(8));
+        assert_eq!(preparing.status, WorkRailStatus::Executing);
+        assert_eq!(preparing.planned_entries, Some(8));
+        assert!(
+            preparing.is_preparing(),
+            "the executor remains in final verification before it starts mutation"
+        );
+        progress.begin_mutation();
+        let mutating = work
+            .rail_item_for_relative_path(Path::new("/scan-root"), &target_path)
+            .expect("target path should retain its execution state");
+        assert!(
+            !mutating.is_preparing(),
+            "the mutation signal, not completed progress, ends final verification"
+        );
+        progress.completed().store(3, Ordering::Release);
         assert_eq!(
-            rail.completed
+            mutating
+                .completed
                 .map(|completed| completed.load(std::sync::atomic::Ordering::Acquire)),
             Some(3)
         );

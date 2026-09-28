@@ -3,7 +3,6 @@ use std::fs::Metadata;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
@@ -40,7 +39,9 @@ use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, 
 use crate::scan_store::run_file::SealedRun;
 use crate::scan_store::session::{ScanInputRunFactory, ScanStore, ScanStoreError};
 use crate::scan_store::storage::ScanStoreStorage;
-use crate::state::deletion_work::{DeletionWork, DeletionWorkCommand, DeletionWorkId};
+use crate::state::deletion_work::{
+    DeletionExecutionProgress, DeletionWork, DeletionWorkCommand, DeletionWorkId,
+};
 use crate::state::files::snapshot_page_cache::SnapshotPageCache;
 use crate::state::files::snapshot_tree::SnapshotTree;
 use crate::state::files::tree_view::TreeView;
@@ -72,6 +73,8 @@ pub enum UiMode {
     Rebuilding {
         target: PathBuf,
     },
+    /// Last verified map retained after an explicit refresh cancellation.
+    StaleSnapshot,
     FilterInput {
         input: String,
         error: Option<String>,
@@ -90,9 +93,15 @@ pub enum UiMode {
         input: String,
         return_to: ThemePickerReturn,
     },
-    ErrorMessage(String),
+    ErrorMessage {
+        message: String,
+        return_to: ThemePickerReturn,
+    },
     ScanResultsUnavailable(String),
-    Notice(String),
+    Notice {
+        message: String,
+        return_to: ThemePickerReturn,
+    },
     Exiting {
         work: ExitWork,
         return_to: ThemePickerReturn,
@@ -126,12 +135,12 @@ pub enum ExitWork {
     },
     Active {
         planned_entries: u64,
-        completed: Arc<AtomicU64>,
+        progress: Arc<DeletionExecutionProgress>,
         pending: usize,
     },
     Stopping {
         planned_entries: u64,
-        completed: Arc<AtomicU64>,
+        progress: Arc<DeletionExecutionProgress>,
     },
 }
 
@@ -141,6 +150,8 @@ pub enum ThemePickerReturn {
     Loading,
     Normal,
     Rebuilding { target: PathBuf },
+    StaleSnapshot,
+    ScanResultsUnavailable(String),
 }
 
 impl ThemePickerReturn {
@@ -149,6 +160,8 @@ impl ThemePickerReturn {
             Self::Loading => UiMode::Loading,
             Self::Normal => UiMode::Normal,
             Self::Rebuilding { target } => UiMode::Rebuilding { target },
+            Self::StaleSnapshot => UiMode::StaleSnapshot,
+            Self::ScanResultsUnavailable(message) => UiMode::ScanResultsUnavailable(message),
         }
     }
 }
@@ -156,7 +169,10 @@ impl ThemePickerReturn {
 impl UiMode {
     #[must_use]
     pub const fn allows_motion(&self) -> bool {
-        matches!(self, Self::Loading | Self::Normal | Self::Rebuilding { .. })
+        matches!(
+            self,
+            Self::Loading | Self::Normal | Self::Rebuilding { .. } | Self::StaleSnapshot
+        )
     }
 
     #[must_use]
@@ -165,9 +181,9 @@ impl UiMode {
             self,
             Self::ThemePicker { .. }
                 | Self::DeleteConfirm { .. }
-                | Self::ErrorMessage(_)
+                | Self::ErrorMessage { .. }
                 | Self::ScanResultsUnavailable(_)
-                | Self::Notice(_)
+                | Self::Notice { .. }
                 | Self::Exiting { .. }
                 | Self::WarningMessage
                 | Self::Help
@@ -176,7 +192,7 @@ impl UiMode {
 
     #[must_use]
     pub const fn can_present_deletion_confirmation(&self) -> bool {
-        matches!(self, Self::Loading | Self::Normal | Self::Rebuilding { .. })
+        matches!(self, Self::Loading | Self::Normal)
     }
 }
 
@@ -203,6 +219,9 @@ where
     generation_rebuild_required: bool,
     scan_store_failure: Option<String>,
     generation_rebuild_active: bool,
+    /// Explicit cancellation preserves the stale map without retrying it automatically.
+    generation_rebuild_restart_suppressed: bool,
+    generation_rebuild_invalidated: bool,
     generation_rebuild_target: Option<RelativePath>,
     snapshot_page_history: Vec<(RelativePath, Option<PageCursor>)>,
     scheduler_snapshot: Option<SchedulerSnapshot>,
@@ -366,6 +385,8 @@ where
             generation_rebuild_required: false,
             scan_store_failure: None,
             generation_rebuild_active: false,
+            generation_rebuild_restart_suppressed: false,
+            generation_rebuild_invalidated: false,
             generation_rebuild_target: None,
             snapshot_page_history: Vec::with_capacity(MAX_SNAPSHOT_PAGE_HISTORY),
             scheduler_snapshot: None,
@@ -610,9 +631,22 @@ where
     }
 
     fn uses_provisional_scan_page(&self) -> bool {
-        self.scan_store_available
+        self.snapshot_page_is_provisional
+            && self.scan_store_available
             && self.scan_store.active_generation().is_some()
             && (!self.loaded || self.generation_rebuild_active)
+    }
+
+    fn can_retain_published_snapshot(&self) -> bool {
+        !self.snapshot_page_is_provisional
+            && self.snapshot_page_cache.is_some()
+            && self.scan_store.published().is_some()
+    }
+
+    fn deletion_is_blocked(&self) -> bool {
+        !self.scan_store_available
+            || self.generation_rebuild_required
+            || self.generation_rebuild_active
     }
 
     fn files_in_current_view(&self, offset: usize) -> Vec<crate::state::tiles::FileMetadata> {
@@ -723,9 +757,43 @@ where
         "Excise could not build a complete folder map. Run it again.".to_string()
     }
 
+    fn update_suspended_scan_results_unavailable(&mut self, message: &str) -> bool {
+        let Some(suspended) = self.suspended_ui_mode.as_mut() else {
+            return false;
+        };
+        match suspended {
+            UiMode::ThemePicker { return_to, .. }
+            | UiMode::Exiting { return_to, .. }
+            | UiMode::ErrorMessage { return_to, .. }
+            | UiMode::Notice { return_to, .. } => {
+                *return_to = ThemePickerReturn::ScanResultsUnavailable(message.to_string());
+            }
+            UiMode::ScreenTooSmall => {}
+            _ => *suspended = UiMode::ScanResultsUnavailable(message.to_string()),
+        }
+        true
+    }
+
     fn show_scan_results_unavailable(&mut self, message: impl Into<String>) {
         self.snapshot_filter = None;
-        self.replace_ui_mode(UiMode::ScanResultsUnavailable(message.into()));
+        let message = message.into();
+        let suspended_updated = self.update_suspended_scan_results_unavailable(&message);
+        match &mut self.ui_mode {
+            UiMode::ThemePicker { return_to, .. }
+            | UiMode::Exiting { return_to, .. }
+            | UiMode::ErrorMessage { return_to, .. }
+            | UiMode::Notice { return_to, .. } => {
+                *return_to = ThemePickerReturn::ScanResultsUnavailable(message);
+                self.mark_dirty();
+                return;
+            }
+            UiMode::ScreenTooSmall if suspended_updated => {
+                self.mark_dirty();
+                return;
+            }
+            _ => {}
+        }
+        self.replace_ui_mode(UiMode::ScanResultsUnavailable(message));
         self.mark_dirty();
     }
 
@@ -968,15 +1036,21 @@ where
         true
     }
     fn invalidate_snapshot_view_for_live_mutation(&mut self) {
-        self.snapshot_filter = None;
-        self.snapshot_page_history.clear();
         if let Err(error) = self.scan_store.discard_active() {
             self.scan_store_failure
                 .get_or_insert_with(|| error.to_string());
         }
-        self.scan_store_available = false;
+        let retains_published_snapshot = self.can_retain_published_snapshot();
+        self.scan_store_available = retains_published_snapshot;
+        self.generation_rebuild_invalidated |= self.generation_rebuild_active;
+        self.generation_rebuild_restart_suppressed = false;
         self.generation_rebuild_required = true;
-        self.reset_loading_snapshot();
+        self.cancel_pending_deletion_work_and_dismiss_confirmation();
+        if !retains_published_snapshot {
+            self.snapshot_filter = None;
+            self.snapshot_page_history.clear();
+            self.reset_loading_snapshot();
+        }
     }
 
     fn invalidate_cached_pages_for_overlay(&mut self, removed_prefix: &RelativePath) {
@@ -1056,9 +1130,13 @@ where
     /// Starts a fresh root generation after a partial deletion invalidated its
     /// prior immutable snapshot. Returns false when no rebuild is pending.
     pub(crate) fn begin_generation_rebuild(&mut self) -> Result<bool, AppError> {
-        if !self.generation_rebuild_required || self.generation_rebuild_active {
+        if !self.generation_rebuild_required
+            || self.generation_rebuild_active
+            || self.generation_rebuild_restart_suppressed
+        {
             return Ok(false);
         }
+        let retains_published_snapshot = self.can_retain_published_snapshot();
         let next_generation = self
             .scan_store
             .next_generation()
@@ -1072,14 +1150,24 @@ where
         self.scan_store_available = true;
         self.scan_store_failure = None;
         self.generation_rebuild_active = true;
+        self.generation_rebuild_invalidated = false;
         self.generation_rebuild_target = Some(RelativePath::root());
         self.generation_rebuild_required = false;
         let target = self.scan_root.clone();
         self.ui_effects.reset_loading_activity();
-        self.board.arm_scan_reveal();
+        if retains_published_snapshot {
+            self.board.disarm_scan_reveal();
+        } else {
+            self.board.arm_scan_reveal();
+        }
         self.replace_ui_mode(UiMode::Rebuilding { target });
         self.render_and_update_board();
         Ok(true)
+    }
+
+    /// Prevents an explicit cancellation from immediately restarting the same stale refresh.
+    pub(crate) fn suppress_generation_rebuild_restart(&mut self) {
+        self.generation_rebuild_restart_suppressed = true;
     }
 
     #[cfg(test)]
@@ -1108,21 +1196,24 @@ where
     }
     pub fn start_ui(&mut self) {
         self.loaded = true;
+        self.retarget_completed_scan_transient_modals();
         if matches!(self.ui_mode, UiMode::Loading) {
             self.ui_mode = UiMode::Normal;
             self.render_and_update_board();
-        } else if let UiMode::ThemePicker { return_to, .. } = &mut self.ui_mode {
+        } else if let UiMode::ThemePicker { return_to, .. } | UiMode::Exiting { return_to, .. } =
+            &mut self.ui_mode
+        {
             if matches!(return_to, ThemePickerReturn::Loading) {
                 *return_to = ThemePickerReturn::Normal;
             }
             self.render_and_update_board();
         } else {
-            self.mark_dirty();
+            self.render_and_update_board();
         }
         if let Some(suspended) = self.suspended_ui_mode.as_mut() {
             match suspended {
                 UiMode::Loading => *suspended = UiMode::Normal,
-                UiMode::ThemePicker { return_to, .. }
+                UiMode::ThemePicker { return_to, .. } | UiMode::Exiting { return_to, .. }
                     if matches!(return_to, ThemePickerReturn::Loading) =>
                 {
                     *return_to = ThemePickerReturn::Normal;
@@ -1232,11 +1323,79 @@ where
     }
 
     fn navigation_mode(&self) -> UiMode {
-        if self.loaded {
-            UiMode::Normal
-        } else {
-            UiMode::Loading
+        if !self.loaded {
+            return UiMode::Loading;
         }
+        if !self.scan_store_available {
+            return UiMode::ScanResultsUnavailable(self.scan_results_unavailable_message());
+        }
+        if self.generation_rebuild_required
+            && !self.generation_rebuild_active
+            && self.can_retain_published_snapshot()
+        {
+            return UiMode::StaleSnapshot;
+        }
+        UiMode::Normal
+    }
+
+    fn completed_scan_return_target(&self) -> ThemePickerReturn {
+        match self.navigation_mode() {
+            UiMode::Loading => ThemePickerReturn::Loading,
+            UiMode::Rebuilding { target } => ThemePickerReturn::Rebuilding { target },
+            UiMode::StaleSnapshot => ThemePickerReturn::StaleSnapshot,
+            UiMode::ScanResultsUnavailable(message) => {
+                ThemePickerReturn::ScanResultsUnavailable(message)
+            }
+            _ => ThemePickerReturn::Normal,
+        }
+    }
+
+    fn retarget_completed_scan_transient_modals(&mut self) {
+        let target = self.completed_scan_return_target();
+        let retarget = |mode: &mut UiMode| match mode {
+            UiMode::ErrorMessage { return_to, .. } | UiMode::Notice { return_to, .. }
+                if matches!(
+                    return_to,
+                    ThemePickerReturn::Loading | ThemePickerReturn::Rebuilding { .. }
+                ) =>
+            {
+                *return_to = target.clone();
+            }
+            _ => {}
+        };
+        retarget(&mut self.ui_mode);
+        if let Some(suspended) = self.suspended_ui_mode.as_mut() {
+            retarget(suspended);
+        }
+    }
+
+    fn modal_return_target(&self) -> ThemePickerReturn {
+        match &self.ui_mode {
+            UiMode::Loading => ThemePickerReturn::Loading,
+            UiMode::Rebuilding { target } => ThemePickerReturn::Rebuilding {
+                target: target.clone(),
+            },
+            UiMode::StaleSnapshot => ThemePickerReturn::StaleSnapshot,
+            UiMode::ScanResultsUnavailable(message) => {
+                ThemePickerReturn::ScanResultsUnavailable(message.clone())
+            }
+            UiMode::ThemePicker { return_to, .. }
+            | UiMode::Exiting { return_to, .. }
+            | UiMode::ErrorMessage { return_to, .. }
+            | UiMode::Notice { return_to, .. } => return_to.clone(),
+            _ => ThemePickerReturn::Normal,
+        }
+    }
+
+    pub fn dismiss_transient_modal(&mut self) {
+        let return_to = match &self.ui_mode {
+            UiMode::ErrorMessage { return_to, .. } | UiMode::Notice { return_to, .. } => {
+                return_to.clone()
+            }
+            _ => return,
+        };
+        self.ui_mode = return_to.into_mode();
+        self.mark_dirty();
     }
     fn replace_ui_mode(&mut self, mode: UiMode) {
         self.cancel_foreground_deletion_modal();
@@ -1273,6 +1432,11 @@ where
             UiMode::Rebuilding { target } => ThemePickerReturn::Rebuilding {
                 target: target.clone(),
             },
+            UiMode::StaleSnapshot => ThemePickerReturn::StaleSnapshot,
+            UiMode::ScanResultsUnavailable(message) => {
+                ThemePickerReturn::ScanResultsUnavailable(message.clone())
+            }
+            UiMode::Exiting { return_to, .. } => return_to.clone(),
             _ => ThemePickerReturn::Normal,
         };
         if let UiMode::DeleteConfirm {
@@ -1430,6 +1594,9 @@ where
 
     /// Returns the identity-bound target represented by the rendered tile.
     pub(crate) fn request_deletion(&mut self) -> Option<FileToDelete> {
+        if self.deletion_is_blocked() {
+            return None;
+        }
         if self
             .display
             .size()
@@ -1539,6 +1706,9 @@ where
         maximum_bytes: usize,
         now: Duration,
     ) -> bool {
+        if self.deletion_is_blocked() {
+            return false;
+        }
         match self.deletion_work.enqueue_confirmation(
             target,
             reduced_guardrails,
@@ -1558,6 +1728,10 @@ where
 
     #[must_use]
     pub(crate) fn next_deletion_planning_work(&mut self) -> Option<DeletionWorkCommand> {
+        if self.deletion_is_blocked() {
+            self.cancel_pending_deletion_work_and_dismiss_confirmation();
+            return None;
+        }
         let command = self.deletion_work.next_planning_command();
         self.sync_deletion_work_summary();
         command
@@ -1565,6 +1739,10 @@ where
 
     #[must_use]
     pub(crate) fn next_deletion_execution_work(&mut self) -> Option<DeletionWorkCommand> {
+        if self.deletion_is_blocked() {
+            self.cancel_pending_deletion_work_and_dismiss_confirmation();
+            return None;
+        }
         let command = self.deletion_work.next_execution_command();
         self.sync_deletion_work_summary();
         command
@@ -1723,15 +1901,12 @@ where
     }
 
     pub(crate) fn show_next_deletion_confirmation(&mut self) -> bool {
-        if !self.ui_mode.can_present_deletion_confirmation() {
+        if self.deletion_is_blocked() || !self.ui_mode.can_present_deletion_confirmation() {
             return false;
         }
         let return_to = match &self.ui_mode {
             UiMode::Loading => ThemePickerReturn::Loading,
             UiMode::Normal => ThemePickerReturn::Normal,
-            UiMode::Rebuilding { target } => ThemePickerReturn::Rebuilding {
-                target: target.clone(),
-            },
             _ => return false,
         };
         let Some((work_id, target)) = self.deletion_work.take_next_confirmation() else {
@@ -1775,6 +1950,10 @@ where
         target: Box<FileToDelete>,
         now: Duration,
     ) -> bool {
+        if self.deletion_is_blocked() {
+            self.cancel_pending_deletion_work_and_dismiss_confirmation();
+            return false;
+        }
         if !self.deletion_work.queue_confirmation(work_id, target, now) {
             self.show_error("Deletion confirmation did not match pending work");
             return false;
@@ -1791,6 +1970,18 @@ where
         self.cancel_foreground_deletion_modal();
         self.deletion_plan_cancellation_requested |= self.deletion_work.cancel_pending();
         self.sync_deletion_work_summary();
+    }
+
+    fn cancel_pending_deletion_work_and_dismiss_confirmation(&mut self) {
+        let return_to = match &self.ui_mode {
+            UiMode::DeleteConfirm { return_to, .. } => Some(return_to.clone()),
+            _ => None,
+        };
+        self.cancel_pending_deletion_work();
+        if let Some(return_to) = return_to {
+            self.ui_mode = return_to.into_mode();
+            self.mark_dirty();
+        }
     }
 
     fn sync_deletion_work_summary(&mut self) {
@@ -1832,6 +2023,10 @@ where
     pub fn take_confirmed_deletion_target(
         &mut self,
     ) -> Option<(DeletionWorkId, Box<FileToDelete>)> {
+        if self.deletion_is_blocked() {
+            self.cancel_pending_deletion_work_and_dismiss_confirmation();
+            return None;
+        }
         let confirmed = matches!(
             &self.ui_mode,
             UiMode::DeleteConfirm {
@@ -1920,8 +2115,13 @@ where
         self.mark_dirty();
     }
 
-    #[must_use]
     pub fn scan_is_uncertain(&self, summary: &RunSummary) -> bool {
+        if !self.scan_store_available
+            || self.generation_rebuild_required
+            || self.generation_rebuild_active
+        {
+            return true;
+        }
         self.scan_store.published().is_none_or(|published| {
             canonical_scan_report_state(published, summary, false)
                 == crate::report::ScanReportState::Uncertain
@@ -1933,6 +2133,15 @@ where
         summary: &RunSummary,
         writer: impl Write,
     ) -> Result<(), ReportError> {
+        if !self.scan_store_available
+            || self.generation_rebuild_required
+            || self.generation_rebuild_active
+        {
+            return Err(ReportError::Invariant(
+                "scan export is unavailable while a complete current map is unavailable"
+                    .to_string(),
+            ));
+        }
         let root = self.scan_root.clone();
         let published = self.scan_store.published_mut().ok_or_else(|| {
             ReportError::Invariant(
@@ -1960,7 +2169,11 @@ where
     }
 
     pub fn show_notice(&mut self, message: impl Into<String>) {
-        self.replace_ui_mode(UiMode::Notice(message.into()));
+        let return_to = self.modal_return_target();
+        self.replace_ui_mode(UiMode::Notice {
+            message: message.into(),
+            return_to,
+        });
         self.mark_dirty();
     }
 
@@ -1984,6 +2197,7 @@ where
             UiMode::Rebuilding { target } => ThemePickerReturn::Rebuilding {
                 target: target.clone(),
             },
+            UiMode::StaleSnapshot => ThemePickerReturn::StaleSnapshot,
             _ => return,
         };
         self.ui_mode = UiMode::ThemePicker {
@@ -2045,7 +2259,11 @@ where
     }
 
     pub fn show_error(&mut self, message: impl Into<String>) {
-        self.replace_ui_mode(UiMode::ErrorMessage(message.into()));
+        let return_to = self.modal_return_target();
+        self.replace_ui_mode(UiMode::ErrorMessage {
+            message: message.into(),
+            return_to,
+        });
         self.mark_dirty();
     }
 
@@ -2062,14 +2280,38 @@ where
             || target.clone(),
             |cache| cache.current().current_relative().clone(),
         );
-        let rebuild_invalidated = !self.scan_store_available && self.generation_rebuild_required;
+        let rebuild_invalidated = self.generation_rebuild_invalidated;
+        self.generation_rebuild_invalidated = false;
         self.generation_rebuild_active = false;
         self.generation_rebuild_required = rebuild_invalidated;
         if rebuild_invalidated {
             // A deletion discarded this generation while its worker was still
             // draining. Its terminal event only releases the stale worker. The
             // owner starts a newer root generation next.
-        } else if self.scan_store_available && self.scan_store.publish().is_ok() {
+        } else {
+            let publication_failure = if self.scan_store_available {
+                match self.scan_store.publish() {
+                    Ok(_) if self.scan_store.is_summary_only() => {
+                        Some("scan store capacity exhausted".to_string())
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(error.to_string()),
+                }
+            } else {
+                self.scan_store_failure.clone().or_else(|| {
+                    Some(
+                        "scan store was unavailable before the replacement map could publish"
+                            .to_string(),
+                    )
+                })
+            };
+            if let Some(failure) = publication_failure {
+                self.abandon_scan_store_generation_with_failure(failure);
+                self.show_scan_results_unavailable(self.scan_results_unavailable_message());
+                self.render_and_update_board();
+                return Ok(());
+            }
+            self.generation_rebuild_restart_suppressed = false;
             self.snapshot_page_cache = None;
             self.snapshot_page_is_provisional = false;
             self.snapshot_page_history.clear();
@@ -2077,15 +2319,12 @@ where
             if self.load_snapshot_page(&current).is_err() {
                 let _ = self.load_snapshot_page(&target);
             }
-        } else {
-            self.scan_store
-                .discard_active()
-                .map_err(|error| AppError::Model(error.to_string()))?;
-            self.scan_store_available = false;
         }
+        self.retarget_completed_scan_transient_modals();
         if matches!(self.ui_mode, UiMode::Rebuilding { .. }) {
             self.ui_mode = self.navigation_mode();
-        } else if let UiMode::ThemePicker { return_to, .. } = &mut self.ui_mode
+        } else if let UiMode::ThemePicker { return_to, .. } | UiMode::Exiting { return_to, .. } =
+            &mut self.ui_mode
             && matches!(return_to, ThemePickerReturn::Rebuilding { .. })
         {
             *return_to = if self.loaded {
@@ -2103,7 +2342,7 @@ where
                         UiMode::Loading
                     };
                 }
-                UiMode::ThemePicker { return_to, .. }
+                UiMode::ThemePicker { return_to, .. } | UiMode::Exiting { return_to, .. }
                     if matches!(return_to, ThemePickerReturn::Rebuilding { .. }) =>
                 {
                     *return_to = if self.loaded {
@@ -2119,24 +2358,58 @@ where
         Ok(())
     }
 
+    fn retain_snapshot_mode_after_rebuild_cancellation(&mut self) {
+        let replace_mode = match &mut self.ui_mode {
+            UiMode::ThemePicker { return_to, .. }
+            | UiMode::Exiting { return_to, .. }
+            | UiMode::ErrorMessage { return_to, .. }
+            | UiMode::Notice { return_to, .. } => {
+                *return_to = ThemePickerReturn::StaleSnapshot;
+                false
+            }
+            UiMode::ScreenTooSmall => false,
+            _ => true,
+        };
+        if replace_mode {
+            self.ui_mode = self.navigation_mode();
+        }
+        if let Some(suspended) = self.suspended_ui_mode.as_mut() {
+            match suspended {
+                UiMode::Rebuilding { .. } => *suspended = UiMode::StaleSnapshot,
+                UiMode::ThemePicker { return_to, .. }
+                | UiMode::Exiting { return_to, .. }
+                | UiMode::ErrorMessage { return_to, .. }
+                | UiMode::Notice { return_to, .. } => {
+                    *return_to = ThemePickerReturn::StaleSnapshot;
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn cancel_generation_rebuild(&mut self) -> Result<(), AppError> {
-        let rebuild_cancelled = self.generation_rebuild_active && self.uses_provisional_scan_page();
         if self.generation_rebuild_active {
             self.scan_store
                 .cancel_active()
                 .map_err(|error| AppError::Model(error.to_string()))?;
             self.generation_rebuild_active = false;
+            self.generation_rebuild_invalidated = false;
             self.generation_rebuild_target = None;
-            if rebuild_cancelled {
+            self.generation_rebuild_required = true;
+            self.scan_store_available =
+                self.scan_store_available && self.can_retain_published_snapshot();
+            if !self.scan_store_available {
                 self.snapshot_filter = None;
                 self.snapshot_page_history.clear();
-                self.scan_store_available = false;
-                self.generation_rebuild_required = true;
                 self.reset_loading_snapshot();
             }
         }
         self.board.disarm_scan_reveal();
-        self.ui_mode = self.navigation_mode();
+        if self.scan_store_available {
+            self.retain_snapshot_mode_after_rebuild_cancellation();
+        } else {
+            self.show_scan_results_unavailable(self.scan_results_unavailable_message());
+        }
         self.render_and_update_board();
         Ok(())
     }
@@ -2508,7 +2781,7 @@ mod tests {
         assert!(app.request_deletion().is_none());
         assert!(matches!(
             &app.ui_mode,
-            UiMode::Notice(message)
+            UiMode::Notice { message, .. }
                 if message == "Wait for this item to receive a verified scan preview before deleting"
         ));
     }
@@ -3464,6 +3737,283 @@ mod tests {
             UiMode::Rebuilding { target: current } if current == &target
         ));
     }
+
+    #[test]
+    fn dismissing_exit_returns_to_unavailable_scan_results() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.loaded = true;
+        app.scan_store_available = false;
+        app.ui_mode = UiMode::ScanResultsUnavailable("scan failed".to_string());
+
+        app.prompt_exit(ExitWork::None);
+        app.dismiss_exit();
+
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+    }
+
+    #[test]
+    fn initial_scan_completion_updates_an_open_exit_target() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+
+        app.prompt_exit(ExitWork::None);
+        app.start_ui();
+        app.dismiss_exit();
+
+        assert!(matches!(app.ui_mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn refreshing_exit_prompt_keeps_its_stale_return_target() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.loaded = true;
+        app.ui_mode = UiMode::StaleSnapshot;
+
+        app.prompt_exit(ExitWork::None);
+        app.prompt_exit(ExitWork::None);
+        app.dismiss_exit();
+
+        assert!(matches!(app.ui_mode, UiMode::StaleSnapshot));
+    }
+
+    #[test]
+    fn unavailable_rebuild_failure_preserves_exit_overlay() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.loaded = true;
+        app.ui_mode = UiMode::Exiting {
+            work: ExitWork::None,
+            return_to: ThemePickerReturn::Rebuilding {
+                target: root.path().to_path_buf(),
+            },
+        };
+
+        app.show_scan_results_unavailable("rebuild publication failed");
+
+        assert!(matches!(
+            &app.ui_mode,
+            UiMode::Exiting {
+                return_to: ThemePickerReturn::ScanResultsUnavailable(message),
+                ..
+            } if message == "rebuild publication failed"
+        ));
+        app.dismiss_exit();
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+    }
+
+    #[test]
+    fn unavailable_failure_updates_a_suspended_exit_destination() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.loaded = true;
+        app.ui_mode = UiMode::Exiting {
+            work: ExitWork::None,
+            return_to: ThemePickerReturn::Normal,
+        };
+        app.suspended_ui_mode = Some(UiMode::Loading);
+
+        app.show_scan_results_unavailable("scan failed");
+        app.dismiss_exit();
+        app.reset_ui_mode();
+
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+    }
+
+    #[test]
+    fn transient_modals_restore_stale_and_unavailable_targets() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.loaded = true;
+
+        app.ui_mode = UiMode::StaleSnapshot;
+        app.show_notice("deletion unavailable");
+        app.dismiss_transient_modal();
+        assert!(matches!(app.ui_mode, UiMode::StaleSnapshot));
+
+        app.ui_mode = UiMode::ScanResultsUnavailable("scan failed".to_string());
+        app.show_error("theme save failed");
+        app.dismiss_transient_modal();
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+    }
+
+    #[test]
+    fn initial_completion_retargets_an_open_error_modal() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.ui_mode = UiMode::ErrorMessage {
+            message: "theme save failed".to_string(),
+            return_to: ThemePickerReturn::Loading,
+        };
+
+        app.start_ui();
+        app.dismiss_transient_modal();
+
+        assert!(matches!(app.ui_mode, UiMode::Normal));
+    }
+
+    #[test]
+    fn transient_modals_survive_unavailable_and_cancelled_rebuilds() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.loaded = true;
+        app.ui_mode = UiMode::ErrorMessage {
+            message: "theme save failed".to_string(),
+            return_to: ThemePickerReturn::Normal,
+        };
+
+        app.show_scan_results_unavailable("scan failed");
+        assert!(matches!(
+            app.ui_mode,
+            UiMode::ErrorMessage {
+                return_to: ThemePickerReturn::ScanResultsUnavailable(_),
+                ..
+            }
+        ));
+        app.dismiss_transient_modal();
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+
+        app.scan_store_available = true;
+        app.ui_mode = UiMode::Notice {
+            message: "theme save failed".to_string(),
+            return_to: ThemePickerReturn::Rebuilding {
+                target: root.path().to_path_buf(),
+            },
+        };
+        app.retain_snapshot_mode_after_rebuild_cancellation();
+        assert!(matches!(
+            app.ui_mode,
+            UiMode::Notice {
+                return_to: ThemePickerReturn::StaleSnapshot,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cancelling_rebuild_preserves_a_theme_picker_overlay() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let target_path = root.path().join("target");
+        std::fs::write(&target_path, b"payload").expect("fixture target should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &target_path);
+        app.finalize_scan();
+        app.start_ui();
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        draw(&mut app, &mut animation, 0);
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("rebuild should start with the retained map")
+        );
+        app.open_theme_picker(ThemeId::ExciseDark);
+        assert_eq!(app.move_theme_picker(false), Some(ThemeId::ExciseLight));
+
+        app.cancel_generation_rebuild()
+            .expect("retained rebuild should cancel cleanly");
+
+        assert!(matches!(
+            app.ui_mode,
+            UiMode::ThemePicker {
+                original: ThemeId::ExciseDark,
+                selected: ThemeId::ExciseLight,
+                return_to: ThemePickerReturn::StaleSnapshot,
+            }
+        ));
+        assert_eq!(app.cancel_theme_picker(), Some(ThemeId::ExciseDark));
+        assert!(matches!(app.ui_mode, UiMode::StaleSnapshot));
+    }
     #[cfg(any(unix, windows))]
     #[test]
     fn completed_deletion_republishes_the_snapshot_without_the_removed_target() {
@@ -3542,8 +4092,7 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
-    #[test]
-    fn partial_deletion_invalidates_the_published_generation() {
+    fn app_after_partial_deletion() -> (tempfile::TempDir, App<TestBackend>, PathBuf) {
         let root = tempfile::tempdir().expect("app root should exist");
         let target_path = root.path().join("target");
         let deleted = target_path.join("deleted");
@@ -3566,6 +4115,9 @@ mod tests {
             add_fixture_entry(&mut app, path);
         }
         app.finalize_scan();
+        app.start_ui();
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        draw(&mut app, &mut animation, 0);
         let target_id = app
             .files_in_current_view(0)
             .into_iter()
@@ -3602,16 +4154,320 @@ mod tests {
         assert!(report.deleted_entries() > 0);
         assert!(!report.target_was_removed());
         assert!(app.complete_deletion(report));
-        assert!(!app.scan_store_available);
+        (root, app, target_path)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn partial_deletion_invalidates_the_published_generation() {
+        let (_root, mut app, target_path) = app_after_partial_deletion();
+        assert!(
+            app.scan_store_available,
+            "the last published map must remain available while rebuilding"
+        );
+        assert_eq!(
+            app.files_in_current_view(0)
+                .into_iter()
+                .map(|file| file.name)
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("target")]
+        );
+        assert!(
+            app.request_deletion().is_none(),
+            "a pending rebuild must lock deletion before its worker starts"
+        );
         assert!(
             app.begin_generation_rebuild()
                 .expect("invalidated generation should start a root rebuild")
         );
+        assert!(matches!(app.ui_mode, UiMode::Rebuilding { .. }));
+        assert!(
+            !app.snapshot_page_is_provisional,
+            "rebuild must retain the prior verified page instead of replacing it with a scan field"
+        );
+        assert!(
+            app.request_deletion().is_none(),
+            "destructive actions must stay disabled while the displayed page is stale"
+        );
+        assert_eq!(
+            app.handle_enter_action(),
+            EnterAction::Drill,
+            "the retained page must still permit drill navigation"
+        );
+        assert_eq!(app.current_folder_path(), target_path);
         assert_eq!(
             app.scan_store.active_generation(),
             Some(ScanGeneration::from_value(1))
         );
+        app.suppress_generation_rebuild_restart();
+        app.cancel_generation_rebuild()
+            .expect("retained rebuild should cancel cleanly");
+        assert!(app.generation_rebuild_required);
+        assert!(
+            !app.begin_generation_rebuild()
+                .expect("cancelled rebuild state should remain readable"),
+            "an explicit cancellation must suppress automatic rebuild retry"
+        );
+        assert!(
+            app.request_deletion().is_none(),
+            "cancelling a rebuild must preserve the deletion lock"
+        );
+        assert!(matches!(app.ui_mode, UiMode::StaleSnapshot));
+        assert!(app.scan_is_uncertain(&RunSummary::default()));
+        let mut exported = Vec::new();
+        assert!(matches!(
+            app.write_scan_report(&RunSummary::default(), &mut exported),
+            Err(ReportError::Invariant(message))
+                if message.contains("complete current map is unavailable")
+        ));
+        assert!(exported.is_empty());
     }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn rebuild_invalidation_cancels_an_outstanding_deletion_confirmation() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let target_path = root.path().join("target");
+        std::fs::write(&target_path, b"payload").expect("fixture target should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &target_path);
+        app.finalize_scan();
+        app.start_ui();
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        draw(&mut app, &mut animation, 0);
+        let target = app
+            .request_deletion()
+            .expect("verified target should be deletable before invalidation");
+        assert!(app.queue_deletion_confirmation(target, false, 1024, Duration::ZERO));
+        assert!(app.show_next_deletion_confirmation());
+        assert!(matches!(app.ui_mode, UiMode::DeleteConfirm { .. }));
+
+        app.invalidate_snapshot_view_for_live_mutation();
+
+        assert!(app.generation_rebuild_required);
+        assert!(!app.deletion_work_summary().has_work());
+        assert!(!matches!(app.ui_mode, UiMode::DeleteConfirm { .. }));
+        assert!(!app.show_next_deletion_confirmation());
+        assert!(app.next_deletion_planning_work().is_none());
+        assert!(app.next_deletion_execution_work().is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn blocked_deletion_dispatch_dismisses_the_confirmation() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let target_path = root.path().join("target");
+        std::fs::write(&target_path, b"payload").expect("fixture target should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &target_path);
+        app.finalize_scan();
+        app.start_ui();
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        draw(&mut app, &mut animation, 0);
+        let target = app
+            .request_deletion()
+            .expect("verified target should be deletable before the store fails");
+        assert!(app.queue_deletion_confirmation(target, false, 1024, Duration::ZERO));
+        assert!(app.show_next_deletion_confirmation());
+        assert!(matches!(app.ui_mode, UiMode::DeleteConfirm { .. }));
+
+        app.abandon_scan_store_generation_with_failure("test scan-store failure");
+
+        assert!(app.next_deletion_planning_work().is_none());
+        assert!(!app.deletion_work_summary().has_work());
+        assert!(!matches!(app.ui_mode, UiMode::DeleteConfirm { .. }));
+    }
+
+    #[test]
+    fn failed_rebuild_publication_hides_the_stale_map_and_locks_deletion() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let target_path = root.path().join("target");
+        std::fs::write(&target_path, b"payload").expect("fixture target should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &target_path);
+        app.finalize_scan();
+        app.start_ui();
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        draw(&mut app, &mut animation, 0);
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("rebuild should begin before publication fails")
+        );
+        app.scan_store
+            .discard_active()
+            .expect("test should make the replacement generation unavailable");
+
+        app.finish_generation_rebuild()
+            .expect("failed publication should settle into the unavailable state");
+
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+        assert!(!app.scan_store_available);
+        assert!(app.request_deletion().is_none());
+
+        assert!(app.scan_is_uncertain(&RunSummary::default()));
+        let mut exported = Vec::new();
+        assert!(matches!(
+            app.write_scan_report(&RunSummary::default(), &mut exported),
+            Err(ReportError::Invariant(message))
+                if message.contains("complete current map is unavailable")
+        ));
+        assert!(exported.is_empty());
+    }
+
+    #[test]
+    fn failed_rebuild_publication_preserves_a_theme_picker_preview() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let target_path = root.path().join("target");
+        std::fs::write(&target_path, b"payload").expect("fixture target should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &target_path);
+        app.finalize_scan();
+        app.start_ui();
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("rebuild should begin before publication fails")
+        );
+        app.open_theme_picker(ThemeId::ExciseDark);
+        assert_eq!(app.move_theme_picker(false), Some(ThemeId::ExciseLight));
+        app.scan_store
+            .discard_active()
+            .expect("test should make the replacement generation unavailable");
+
+        app.finish_generation_rebuild()
+            .expect("failed publication should preserve the theme picker");
+
+        assert!(matches!(
+            &app.ui_mode,
+            UiMode::ThemePicker {
+                original: ThemeId::ExciseDark,
+                selected: ThemeId::ExciseLight,
+                return_to: ThemePickerReturn::ScanResultsUnavailable(message),
+            } if message.contains("could not build a complete folder map")
+        ));
+        assert_eq!(
+            app.commit_theme_picker(),
+            Some((ThemeId::ExciseDark, ThemeId::ExciseLight))
+        );
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+        app.show_error("theme preference could not be saved");
+        app.normal_mode();
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+    }
+
+    #[test]
+    fn rebuild_capacity_failure_keeps_the_scratch_remedy() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.finalize_scan();
+        app.start_ui();
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("rebuild should begin before the store fails")
+        );
+        app.abandon_scan_store_generation_with_failure(
+            "scan store capacity exhausted while publishing",
+        );
+
+        app.finish_generation_rebuild()
+            .expect("capacity failure should settle into the unavailable state");
+
+        assert!(matches!(
+            &app.ui_mode,
+            UiMode::ScanResultsUnavailable(message)
+                if message.contains("Not enough scratch space")
+                    && message.contains("--scan-store-dir")
+                    && message.contains("--scan-store-reserve-mib")
+                    && message.contains("--scan-store-mib")
+        ));
+    }
+
+    #[test]
+    fn cancelling_a_rebuild_without_a_verified_map_shows_unavailable() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.abandon_scan_store_generation();
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("rebuild should start without a published map")
+        );
+        app.suppress_generation_rebuild_restart();
+
+        app.cancel_generation_rebuild()
+            .expect("mapless rebuild cancellation should settle safely");
+
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+        assert!(!app.scan_store_available);
+        assert!(app.generation_rebuild_required);
+        assert!(
+            !app.begin_generation_rebuild()
+                .expect("suppressed rebuild retry should remain readable")
+        );
+    }
+
     #[test]
     fn invalidated_rebuild_waits_for_its_stale_worker_and_uses_a_new_generation() {
         let root = tempfile::tempdir().expect("app root should exist");
@@ -3652,6 +4508,39 @@ mod tests {
         assert_eq!(
             app.scan_store.active_generation(),
             Some(ScanGeneration::from_value(2))
+        );
+    }
+
+    #[test]
+    fn explicit_cancellation_survives_invalidated_rebuild_completion() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.finalize_scan();
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("rebuild should begin before invalidation")
+        );
+        app.invalidate_snapshot_view_for_live_mutation();
+        app.suppress_generation_rebuild_restart();
+
+        app.finish_generation_rebuild()
+            .expect("stale rebuild completion should settle safely");
+
+        assert!(app.generation_rebuild_required);
+        assert!(
+            !app.begin_generation_rebuild()
+                .expect("explicit cancellation should still suppress retry")
         );
     }
 
@@ -3958,7 +4847,7 @@ mod tests {
         assert!(app.board.select_node(child_id));
         app.enter_selected();
         assert_eq!(app.current_folder_path(), child);
-        assert!(!matches!(app.ui_mode, UiMode::ErrorMessage(_)));
+        assert!(!matches!(app.ui_mode, UiMode::ErrorMessage { .. }));
 
         assert!(app.go_up());
         assert_eq!(app.current_folder_path(), folder);

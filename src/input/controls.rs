@@ -115,17 +115,18 @@ pub(crate) fn handle_keypress<B: Backend>(evt: &Event, app: &mut App<B>) -> Inpu
         crate::UiMode::Loading => handle_keypress_loading_mode(evt, app),
         crate::UiMode::Normal => handle_keypress_normal_mode(evt, app),
         crate::UiMode::Rebuilding { .. } => handle_keypress_generation_rebuild_mode(evt, app),
+        crate::UiMode::StaleSnapshot => handle_keypress_stale_snapshot_mode(evt, app),
         crate::UiMode::FilterInput { .. } => handle_keypress_filter_mode(evt, app),
         crate::UiMode::Help => handle_keypress_help_mode(evt, app),
         crate::UiMode::ScreenTooSmall => handle_keypress_screen_too_small(evt, app),
         crate::UiMode::ThemePicker { .. } => handle_keypress_theme_picker_mode(evt, app),
         crate::UiMode::DeleteConfirm { .. } => handle_keypress_delete_confirm_mode(evt, app),
-        crate::UiMode::ErrorMessage(_) => handle_keypress_error_message(evt, app),
+        crate::UiMode::ErrorMessage { .. } => handle_keypress_error_message(evt, app),
         crate::UiMode::ScanResultsUnavailable(_) => {
             handle_keypress_scan_results_unavailable(evt, app)
         }
         crate::UiMode::Exiting { .. } => handle_keypress_exiting_mode(evt, app),
-        crate::UiMode::Notice(_) => handle_keypress_notice_mode(evt, app),
+        crate::UiMode::Notice { .. } => handle_keypress_notice_mode(evt, app),
         crate::UiMode::WarningMessage => {
             app.normal_mode();
             InputCommand::None
@@ -313,10 +314,25 @@ fn handle_keypress_generation_rebuild_mode<B: Backend>(
     } else if matches!(evt, key!(Backspace)) {
         deletion_request(app)
     } else if matches!(evt, key!(Esc)) {
-        app.go_up();
         InputCommand::CancelGenerationRebuild
     } else {
         handle_navigation(evt, app, true)
+    }
+}
+
+fn handle_keypress_stale_snapshot_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
+    if matches!(evt, key!(char 't')) {
+        InputCommand::OpenThemePicker
+    } else if matches!(evt, key!(Backspace)) {
+        app.show_notice("Map refresh was cancelled; deletion remains unavailable.");
+        InputCommand::None
+    } else if matches!(evt, key!(char 'e')) {
+        app.show_notice("Map refresh was cancelled; scan export remains unavailable.");
+        InputCommand::None
+    } else if matches!(evt, key!(shift 'E')) {
+        InputCommand::ExportDeletionHistory
+    } else {
+        handle_navigation(evt, app, false)
     }
 }
 fn handle_keypress_filter_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
@@ -406,7 +422,7 @@ fn handle_keypress_delete_confirm_mode<B: Backend>(evt: &Event, app: &mut App<B>
 
 fn handle_keypress_error_message<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
     if matches!(evt, key!(ctrl 'c') | key!(char 'q') | key!(Esc)) {
-        app.normal_mode();
+        app.dismiss_transient_modal();
     }
     InputCommand::None
 }
@@ -428,7 +444,7 @@ fn handle_keypress_scan_results_unavailable<B: Backend>(
 
 fn handle_keypress_notice_mode<B: Backend>(evt: &Event, app: &mut App<B>) -> InputCommand {
     if matches!(evt, key!(Enter) | key!(Esc) | key!(char 'q')) {
-        app.normal_mode();
+        app.dismiss_transient_modal();
     }
     InputCommand::None
 }
@@ -540,6 +556,83 @@ mod tests {
     }
 
     #[test]
+    fn stale_snapshot_explains_disabled_deletion_and_export() {
+        let (_root, mut app) = app();
+        app.loaded = true;
+        app.ui_mode = UiMode::StaleSnapshot;
+
+        assert!(matches!(
+            handle_keypress(&key(KeyCode::Char('e'), KeyModifiers::NONE), &mut app),
+            InputCommand::None
+        ));
+        assert!(matches!(
+            &app.ui_mode,
+            UiMode::Notice {
+                message,
+                return_to: crate::app::ThemePickerReturn::StaleSnapshot,
+            } if message.contains("scan export remains unavailable")
+        ));
+
+        app.ui_mode = UiMode::StaleSnapshot;
+        assert!(matches!(
+            handle_keypress(&key(KeyCode::Backspace, KeyModifiers::NONE), &mut app),
+            InputCommand::None
+        ));
+        assert!(matches!(
+            &app.ui_mode,
+            UiMode::Notice {
+                message,
+                return_to: crate::app::ThemePickerReturn::StaleSnapshot,
+            } if message.contains("deletion remains unavailable")
+        ));
+    }
+
+    #[test]
+    fn cancelling_a_rebuild_keeps_the_retained_folder_open() {
+        let (root, mut app) = app();
+        let folder = root.path().join("folder");
+        let leaf = folder.join("leaf");
+        std::fs::create_dir(&folder).expect("fixture folder should exist");
+        std::fs::write(&leaf, b"payload").expect("fixture leaf should be written");
+        for path in [&folder, &leaf] {
+            let metadata = std::fs::symlink_metadata(path).expect("fixture metadata should exist");
+            let identity = crate::native_path::identity_for(path, &metadata)
+                .expect("fixture identity should resolve")
+                .expect("fixture should be concrete");
+            app.append_scan_store_entry_for_test(&metadata, path, &identity);
+        }
+        app.finalize_scan();
+        app.start_ui();
+        let mut animation = AnimationScheduler::new(true, true, Duration::ZERO);
+        app.render_if_dirty(
+            &mut animation,
+            Duration::ZERO,
+            "test",
+            Theme::for_id(ThemeId::ExciseDark),
+            false,
+            false,
+            true,
+        )
+        .expect("published page should render");
+        assert!(matches!(
+            handle_keypress(&key(KeyCode::Enter, KeyModifiers::NONE), &mut app),
+            InputCommand::Drill
+        ));
+        assert_eq!(app.current_folder_path(), folder);
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("retained map should start a rebuild")
+        );
+
+        assert!(matches!(
+            handle_keypress(&key(KeyCode::Esc, KeyModifiers::NONE), &mut app),
+            InputCommand::CancelGenerationRebuild
+        ));
+        assert_eq!(app.current_folder_path(), folder);
+    }
+
+    #[test]
     fn loading_navigation_drills_into_a_live_canonical_page() {
         let (root, mut app) = app();
         let folder = root.path().join("folder");
@@ -589,13 +682,13 @@ mod tests {
     #[test]
     fn active_exit_offers_safe_stop_without_forced_detach() {
         use std::sync::Arc;
-        use std::sync::atomic::AtomicU64;
 
+        use crate::state::deletion_work::DeletionExecutionProgress;
         let (_root, mut app) = app();
         app.ui_mode = UiMode::Exiting {
             work: ExitWork::Active {
                 planned_entries: 1,
-                completed: Arc::new(AtomicU64::new(0)),
+                progress: Arc::new(DeletionExecutionProgress::new()),
                 pending: 0,
             },
             return_to: crate::app::ThemePickerReturn::Normal,
