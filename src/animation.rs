@@ -4,7 +4,7 @@ use std::time::Duration;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-use tachyonfx::{Effect, Interpolation, SimpleRng, fx, pattern::CheckerboardPattern};
+use tachyonfx::{Effect, Interpolation, SimpleRng, fx};
 
 pub const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const MEDIUM_FRAME_INTERVAL: Duration = Duration::from_millis(50);
@@ -23,10 +23,10 @@ pub const ROUTINE_MOTION: Duration = Duration::from_millis(160);
 pub const NAVIGATION_MOTION: Duration = Duration::from_millis(260);
 /// How long the measured map surface takes to emerge from the scan field.
 pub const SCAN_REVEAL_MOTION: Duration = Duration::from_millis(280);
-/// Stable seed keeps the target's checkerboard departure coherent between redraws.
+/// Stable seed keeps the randomized departure coherent between redraws.
 const DELETION_DISSOLVE_SEED: u32 = 0x0D3E_1E7E;
 
-/// Applies the deterministic departure dissolve to a freshly painted map layer.
+/// Applies a deterministic randomized departure dissolve to a freshly painted map layer.
 pub(crate) fn dissolve_deletion_departure(
     now: Duration,
     started_at: Duration,
@@ -44,7 +44,6 @@ pub(crate) fn dissolve_deletion_departure(
         tachyonfx::Duration::from_millis(u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX));
     let mut effect = fx::dissolve_to(destination, (duration, Interpolation::SineOut))
         .with_area(area)
-        .with_pattern(CheckerboardPattern::new(1, 0.5))
         .with_rng(SimpleRng::new(DELETION_DISSOLVE_SEED));
     effect.process(elapsed, buffer, area);
 }
@@ -296,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn departure_checkerboard_dissolves_to_the_canvas_by_its_deadline() {
+    fn departure_dissolves_to_the_canvas_by_its_deadline() {
         let area = Rect::new(0, 0, 12, 6);
         let canvas = Style::default().fg(Color::Green).bg(Color::Green);
 

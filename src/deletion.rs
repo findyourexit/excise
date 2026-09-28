@@ -1671,7 +1671,15 @@ pub fn execute_plan(
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
 ) -> DeletionReport {
-    execute_plan_windows(scan_root, plan, soft_cancelled, hard_cancelled, None)
+    execute_plan_windows(
+        scan_root,
+        plan,
+        soft_cancelled,
+        hard_cancelled,
+        None,
+        || true,
+        || true,
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
@@ -1691,50 +1699,72 @@ pub fn execute_plan(
     )
 }
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-pub(crate) fn execute_plan_counted(
+pub(crate) fn execute_plan_counted<C, M>(
     scan_root: &Path,
     plan: DeletionPlan,
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
     progress: &AtomicU64,
-) -> DeletionReport {
-    execute_plan_unix_with_hooks(
+    try_claim_mutation: C,
+    try_begin_mutation: M,
+) -> DeletionReport
+where
+    C: FnMut() -> bool,
+    M: FnMut() -> bool,
+{
+    execute_plan_unix_with_mutation_gate(
         scan_root,
         plan,
         soft_cancelled,
         hard_cancelled,
+        try_claim_mutation,
+        try_begin_mutation,
         || {},
         |_| {
-            progress.fetch_add(1, Ordering::Relaxed);
+            progress.fetch_add(1, Ordering::Release);
         },
     )
 }
 
 #[cfg(windows)]
-pub(crate) fn execute_plan_counted(
+pub(crate) fn execute_plan_counted<C, M>(
     scan_root: &Path,
     plan: DeletionPlan,
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
     progress: &AtomicU64,
-) -> DeletionReport {
+    try_claim_mutation: C,
+    try_begin_mutation: M,
+) -> DeletionReport
+where
+    C: FnMut() -> bool,
+    M: FnMut() -> bool,
+{
     execute_plan_windows(
         scan_root,
         plan,
         soft_cancelled,
         hard_cancelled,
         Some(progress),
+        try_claim_mutation,
+        try_begin_mutation,
     )
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
-pub(crate) fn execute_plan_counted(
+pub(crate) fn execute_plan_counted<C, M>(
     scan_root: &Path,
     plan: DeletionPlan,
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
     _progress: &AtomicU64,
-) -> DeletionReport {
+    _try_claim_mutation: C,
+    _try_begin_mutation: M,
+) -> DeletionReport
+where
+    C: FnMut() -> bool,
+    M: FnMut() -> bool,
+{
     execute_plan(scan_root, plan, soft_cancelled, hard_cancelled)
 }
 
@@ -1772,13 +1802,46 @@ where
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn execute_plan_unix_with_hooks<F, G>(
     scan_root: &Path,
+    plan: DeletionPlan,
+    soft_cancelled: &AtomicBool,
+    hard_cancelled: &AtomicBool,
+    after_isolation: F,
+    after_inspection: G,
+) -> DeletionReport
+where
+    F: FnMut(),
+    G: FnMut(&OsStr),
+{
+    execute_plan_unix_with_mutation_gate(
+        scan_root,
+        plan,
+        soft_cancelled,
+        hard_cancelled,
+        || true,
+        || true,
+        after_isolation,
+        after_inspection,
+    )
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the executor needs cancellation flags and four allocation-free mutation hooks"
+)]
+fn execute_plan_unix_with_mutation_gate<C, M, F, G>(
+    scan_root: &Path,
     mut plan: DeletionPlan,
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
+    mut try_claim_mutation: C,
+    mut try_begin_mutation: M,
     mut after_isolation: F,
     mut after_inspection: G,
 ) -> DeletionReport
 where
+    C: FnMut() -> bool,
+    M: FnMut() -> bool,
     F: FnMut(),
     G: FnMut(&OsStr),
 {
@@ -1828,9 +1891,16 @@ where
         let outcome = execute_unix_entry(
             &root,
             &mut entry,
+            soft_cancelled,
+            &mut try_claim_mutation,
+            &mut try_begin_mutation,
             &mut after_isolation,
             &mut after_inspection,
         );
+        if matches!(outcome, DeletionEntryOutcome::Unattempted) {
+            stopped = true;
+            soft_cancelled.store(true, Ordering::Release);
+        }
         if matches!(outcome, DeletionEntryOutcome::Deleted) {
             note_deleted_link(&mut entry);
         }
@@ -1856,13 +1926,18 @@ where
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[allow(clippy::too_many_lines)]
-fn execute_unix_entry<F, G>(
+fn execute_unix_entry<C, M, F, G>(
     root: &File,
     entry: &mut PlannedEntry,
+    soft_cancelled: &AtomicBool,
+    try_claim_mutation: &mut C,
+    try_begin_mutation: &mut M,
     after_isolation: &mut F,
     after_inspection: &mut G,
 ) -> DeletionEntryOutcome
 where
+    C: FnMut() -> bool,
+    M: FnMut() -> bool,
     F: FnMut(),
     G: FnMut(&OsStr),
 {
@@ -1878,10 +1953,24 @@ where
         }
         Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
     };
+    if !try_claim_mutation() {
+        return DeletionEntryOutcome::Unattempted;
+    }
     let (detached_name, placeholder) = match create_placeholder(&parent) {
         Ok(value) => value,
         Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
     };
+    if !try_begin_mutation() {
+        soft_cancelled.store(true, Ordering::Release);
+        return remove_verified_placeholder(&parent, &detached_name, &placeholder).map_or_else(
+            |error| {
+                DeletionEntryOutcome::Failed(format!(
+                    "cancellation placeholder cleanup failed: {error}"
+                ))
+            },
+            |()| DeletionEntryOutcome::Unattempted,
+        );
+    }
     if let Err(error) = exchange_names(&parent, &original_name, &detached_name) {
         let disappeared = error.kind() == io::ErrorKind::NotFound;
         let cleanup = remove_verified_placeholder(&parent, &detached_name, &placeholder);
@@ -1902,7 +1991,6 @@ where
         };
     }
     after_isolation();
-
     let actual = match inspect_child(&parent, &detached_name, &entry.relative_path) {
         Ok((snapshot, handle)) => {
             drop(handle);
@@ -2088,13 +2176,19 @@ where
 }
 
 #[cfg(windows)]
-fn execute_plan_windows(
+fn execute_plan_windows<C, M>(
     scan_root: &Path,
     mut plan: DeletionPlan,
     soft_cancelled: &AtomicBool,
     hard_cancelled: &AtomicBool,
     progress: Option<&AtomicU64>,
-) -> DeletionReport {
+    mut try_claim_mutation: C,
+    mut try_begin_mutation: M,
+) -> DeletionReport
+where
+    C: FnMut() -> bool,
+    M: FnMut() -> bool,
+{
     let result_storage = std::mem::replace(&mut plan.result_storage, PlannedResultStorage::new(0));
     let root_relative_path = plan.root_relative_path.clone();
     let mut results = result_storage.into_collector(root_relative_path.clone());
@@ -2138,12 +2232,23 @@ fn execute_plan_windows(
             }
             continue;
         }
-        let outcome = execute_windows_entry(&root, &mut entry);
+        let outcome = execute_windows_entry(
+            &root,
+            &mut entry,
+            &mut try_claim_mutation,
+            &mut try_begin_mutation,
+        );
+        if matches!(outcome, DeletionEntryOutcome::Unattempted) {
+            stopped = true;
+            soft_cancelled.store(true, Ordering::Release);
+        }
         if matches!(outcome, DeletionEntryOutcome::Deleted) {
             note_deleted_link(&mut entry);
         }
-        if let Some(progress) = progress {
-            progress.fetch_add(1, Ordering::Relaxed);
+        if !matches!(outcome, DeletionEntryOutcome::Unattempted)
+            && let Some(progress) = progress
+        {
+            progress.fetch_add(1, Ordering::Release);
         }
         let result = DeletionEntryResult { entry, outcome };
         if let Err(error) = results.push(result) {
@@ -2166,7 +2271,16 @@ fn execute_plan_windows(
 }
 
 #[cfg(windows)]
-fn execute_windows_entry(root: &File, entry: &mut PlannedEntry) -> DeletionEntryOutcome {
+fn execute_windows_entry<C, M>(
+    root: &File,
+    entry: &mut PlannedEntry,
+    try_claim_mutation: &mut C,
+    try_begin_mutation: &mut M,
+) -> DeletionEntryOutcome
+where
+    C: FnMut() -> bool,
+    M: FnMut() -> bool,
+{
     use cap_primitives::fs::{_WindowsByHandle as _, OpenOptionsExt as _};
 
     const DELETE: u32 = 0x0001_0000;
@@ -2226,6 +2340,9 @@ fn execute_windows_entry(root: &File, entry: &mut PlannedEntry) -> DeletionEntry
         return DeletionEntryOutcome::Changed(
             "identity, type, size, allocation, or modification changed".to_string(),
         );
+    }
+    if !try_claim_mutation() || !try_begin_mutation() {
+        return DeletionEntryOutcome::Unattempted;
     }
     match remove_open_handle(&handle) {
         Ok(()) => DeletionEntryOutcome::Deleted,
@@ -3519,6 +3636,109 @@ mod tests {
         assert!(report.soft_cancelled);
         assert_eq!(report.unattempted_entries(), 1);
         assert!(path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    #[test]
+    fn counted_execution_stops_when_the_mutation_gate_rejects_the_first_entry() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let soft_cancelled = AtomicBool::new(false);
+        let gate_attempted = AtomicBool::new(false);
+
+        let report = execute_plan_counted(
+            root.path(),
+            plan,
+            &soft_cancelled,
+            &AtomicBool::new(false),
+            &progress,
+            || {
+                gate_attempted.store(true, std::sync::atomic::Ordering::Release);
+                false
+            },
+            || panic!("a rejected mutation gate must not publish mutation"),
+        );
+
+        assert!(gate_attempted.load(std::sync::atomic::Ordering::Acquire));
+        assert!(soft_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(report.soft_cancelled);
+        assert_eq!(report.unattempted_entries(), 1);
+        assert_eq!(progress.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    #[test]
+    fn counted_execution_stops_when_mutation_commit_is_rejected() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let soft_cancelled = AtomicBool::new(false);
+        let commit_attempted = AtomicBool::new(false);
+
+        let report = execute_plan_counted(
+            root.path(),
+            plan,
+            &soft_cancelled,
+            &AtomicBool::new(false),
+            &progress,
+            || true,
+            || {
+                commit_attempted.store(true, std::sync::atomic::Ordering::Release);
+                false
+            },
+        );
+
+        assert!(commit_attempted.load(std::sync::atomic::Ordering::Acquire));
+        assert!(soft_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(report.soft_cancelled);
+        assert_eq!(report.unattempted_entries(), 1);
+        assert_eq!(progress.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn counted_windows_execution_keeps_changed_entries_before_mutation() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"original").expect("target should be written");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("file plan should build");
+        std::fs::write(&path, b"changed content").expect("target should change");
+        let progress = std::sync::atomic::AtomicU64::new(0);
+
+        let report = execute_plan_counted(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &progress,
+            || panic!("a changed entry must not claim mutation"),
+            || panic!("a changed entry must not publish mutation"),
+        );
+
+        assert_eq!(report.changed_entries(), 1);
+        assert_eq!(progress.load(std::sync::atomic::Ordering::Acquire), 1);
     }
 
     #[test]

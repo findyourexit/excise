@@ -2142,14 +2142,25 @@ fn delete_file() {
         SHOW_APPARENT_SIZE,
         DELETE_CONFIRMATION_ENABLED,
     );
-    let terminal_draw_events_mirror = terminal_draw_events
-        .lock()
-        .expect("could not acquire lock on terminal events");
 
     assert_terminal_lifecycle(
         &terminal_events
             .lock()
             .expect("could not acquire lock on terminal_events"),
+    );
+
+    let terminal_draw_events = terminal_draw_events
+        .lock()
+        .expect("could not acquire lock on terminal draw events");
+    assert!(
+        terminal_draw_events.iter().any(|frame| {
+            frame.contains("STORAGE MAP")
+                && (frame.contains("Verifying deletion")
+                    || frame.contains("Queued deletion")
+                    || frame.contains("Deleting "))
+                && !frame.contains("PERMANENT FILE DELETION")
+        }),
+        "accepted deletion must return to the map with visible staged or active work"
     );
     assert!(
         std::fs::metadata(&file_2_path).is_err(),
@@ -2166,14 +2177,6 @@ fn delete_file() {
     assert!(
         std::fs::metadata(&file_3_path).is_ok(),
         "second different file was untouched"
-    );
-    assert!(
-        terminal_draw_events_mirror.iter().any(|frame| {
-            frame.contains("STORAGE MAP")
-                && (frame.contains("Queued deletion") || frame.contains("Deleting "))
-                && !frame.contains("PERMANENT FILE DELETION")
-        }),
-        "accepted deletion must return to the map while bounded work remains visible"
     );
     drop(temp_dir_path);
 }
