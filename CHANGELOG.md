@@ -15,6 +15,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 * Confirmed deletion targets remain visibly staged through the final all-entry safety check; progress counters begin only after mutation starts, and removed map entries use an organic randomized dissolve animation.
 * A deletion that requires a full map rebuild now retains the prior verified map for navigation while refreshing and disables further deletion until the replacement snapshot publishes.
 * Cancelling a retained-map refresh now labels the map as stale and blocks deletion and exact scan export until a verified replacement publishes.
+* On Windows, the interactive map no longer stalls after a key release. It previously waited for the next input before redrawing, applying scan results, or showing the quit dialog.
 
 ## [1.3.0] - 2026-09-24
 

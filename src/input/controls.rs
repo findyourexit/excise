@@ -1,9 +1,10 @@
 #![allow(clippy::unnested_or_patterns)]
 
-use std::time::Duration;
+use std::io;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind, poll, read,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::backend::Backend;
 
@@ -20,6 +21,9 @@ pub enum InputEvent {
 }
 
 pub trait InputSource {
+    /// Waits up to `timeout` for input. `true` promises that the next `read` returns
+    /// without waiting for more input; the owner loop polls before every read.
+    ///
     /// # Errors
     /// Returns an input I/O error when terminal readiness cannot be queried.
     fn poll(&mut self, timeout: Duration) -> Result<bool, AppError>;
@@ -28,24 +32,93 @@ pub trait InputSource {
     fn read(&mut self) -> Result<InputEvent, AppError>;
 }
 
-#[derive(Clone)]
-pub struct TerminalEvents;
+/// Reads the real terminal and hands the owner loop every event except key releases.
+///
+/// crossterm reports key releases on Windows, and Excise acts only on presses. `poll`
+/// reads ahead past releases, so readiness always names an event that `read` returns at once.
+#[derive(Clone, Default)]
+pub struct TerminalEvents {
+    /// The event `poll` read ahead for the next `read`.
+    pending: Option<Event>,
+}
 
 impl InputSource for TerminalEvents {
     fn poll(&mut self, timeout: Duration) -> Result<bool, AppError> {
-        poll(timeout).map_err(|error| AppError::io("could not poll terminal input", error))
+        poll_skipping_releases(&mut self.pending, &mut CrosstermEvents, timeout)
+            .map_err(|error| AppError::io("could not poll terminal input", error))
     }
 
     fn read(&mut self) -> Result<InputEvent, AppError> {
-        loop {
-            let event =
-                read().map_err(|error| AppError::io("could not read terminal input", error))?;
-            if let Event::Key(key_event) = &event
-                && key_event.kind == KeyEventKind::Release
-            {
-                continue;
-            }
-            return Ok(InputEvent::Terminal(event));
+        read_skipping_releases(&mut self.pending, &mut CrosstermEvents)
+            .map(InputEvent::Terminal)
+            .map_err(|error| AppError::io("could not read terminal input", error))
+    }
+}
+
+/// Raw terminal events, before key releases are dropped.
+trait EventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+/// crossterm's process-wide terminal reader.
+struct CrosstermEvents;
+
+impl EventSource for CrosstermEvents {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        crossterm::event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        crossterm::event::read()
+    }
+}
+
+fn is_key_release(event: &Event) -> bool {
+    matches!(event, Event::Key(key_event) if key_event.kind == KeyEventKind::Release)
+}
+
+/// Waits up to `timeout` for an event other than a key release and holds it in `pending`.
+///
+/// Releases are dropped here rather than in `read`. Reporting readiness for a release would
+/// send the owner loop into a `read` that blocks until the next real input, and rendering and
+/// scan ingestion would stop until then.
+fn poll_skipping_releases(
+    pending: &mut Option<Event>,
+    source: &mut impl EventSource,
+    timeout: Duration,
+) -> io::Result<bool> {
+    if pending.is_some() {
+        return Ok(true);
+    }
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        let remaining = deadline.map_or(timeout, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        if !source.poll(remaining)? {
+            return Ok(false);
+        }
+        let event = source.read()?;
+        if !is_key_release(&event) {
+            *pending = Some(event);
+            return Ok(true);
+        }
+    }
+}
+
+/// Returns the event `poll` held, or blocks for the next event other than a key release.
+fn read_skipping_releases(
+    pending: &mut Option<Event>,
+    source: &mut impl EventSource,
+) -> io::Result<Event> {
+    if let Some(event) = pending.take() {
+        return Ok(event);
+    }
+    loop {
+        let event = source.read()?;
+        if !is_key_release(&event) {
+            return Ok(event);
         }
     }
 }
@@ -732,5 +805,111 @@ mod tests {
         let command = handle_keypress(&key(KeyCode::Esc, KeyModifiers::NONE), &mut app);
         assert!(matches!(command, InputCommand::CancelDeletionConfirmation));
         assert!(matches!(app.ui_mode, UiMode::Normal));
+    }
+
+    /// A scripted terminal. `poll` reports whether an event is queued, and `read` fails
+    /// instead of blocking when none is.
+    struct ScriptedEvents(std::collections::VecDeque<Event>);
+
+    impl EventSource for ScriptedEvents {
+        fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+            Ok(!self.0.is_empty())
+        }
+
+        fn read(&mut self) -> io::Result<Event> {
+            self.0
+                .pop_front()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "read would block"))
+        }
+    }
+
+    fn scripted(events: impl IntoIterator<Item = Event>) -> ScriptedEvents {
+        ScriptedEvents(events.into_iter().collect())
+    }
+
+    fn char_key(character: char, kind: KeyEventKind) -> Event {
+        Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+            kind,
+        ))
+    }
+
+    #[test]
+    fn a_trailing_key_release_does_not_report_input_as_ready() -> io::Result<()> {
+        let press = char_key('q', KeyEventKind::Press);
+        let mut source = scripted([press.clone(), char_key('q', KeyEventKind::Release)]);
+        let mut pending = None;
+
+        assert!(poll_skipping_releases(
+            &mut pending,
+            &mut source,
+            Duration::ZERO
+        )?);
+        assert_eq!(read_skipping_releases(&mut pending, &mut source)?, press);
+        // The owner loop polls again before it renders. Readiness here would send it into a
+        // read that waits for the next key, and nothing would redraw until then.
+        assert!(!poll_skipping_releases(
+            &mut pending,
+            &mut source,
+            Duration::ZERO
+        )?);
+        assert!(source.0.is_empty(), "the release should be consumed");
+        Ok(())
+    }
+
+    #[test]
+    fn releases_are_skipped_and_other_events_arrive_in_order() -> io::Result<()> {
+        let press = char_key('a', KeyEventKind::Press);
+        let resize = Event::Resize(80, 24);
+        let repeat = char_key('b', KeyEventKind::Repeat);
+        let mut source = scripted([
+            press.clone(),
+            char_key('a', KeyEventKind::Release),
+            resize.clone(),
+            char_key('x', KeyEventKind::Release),
+            char_key('y', KeyEventKind::Release),
+            repeat.clone(),
+        ]);
+        let mut pending = None;
+
+        let mut delivered = Vec::new();
+        while poll_skipping_releases(&mut pending, &mut source, Duration::ZERO)? {
+            delivered.push(read_skipping_releases(&mut pending, &mut source)?);
+        }
+        assert_eq!(delivered, [press, resize, repeat]);
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_holds_its_event_until_read() -> io::Result<()> {
+        // The owner loop also polls without reading to decide whether to defer scan work.
+        let first = char_key('a', KeyEventKind::Press);
+        let second = char_key('b', KeyEventKind::Press);
+        let mut source = scripted([first.clone(), second.clone()]);
+        let mut pending = None;
+
+        assert!(poll_skipping_releases(
+            &mut pending,
+            &mut source,
+            Duration::ZERO
+        )?);
+        assert!(poll_skipping_releases(
+            &mut pending,
+            &mut source,
+            Duration::ZERO
+        )?);
+        assert_eq!(read_skipping_releases(&mut pending, &mut source)?, first);
+        assert_eq!(read_skipping_releases(&mut pending, &mut source)?, second);
+        Ok(())
+    }
+
+    #[test]
+    fn a_read_without_readiness_skips_releases() -> io::Result<()> {
+        let press = char_key('y', KeyEventKind::Press);
+        let mut source = scripted([char_key('q', KeyEventKind::Release), press.clone()]);
+
+        assert_eq!(read_skipping_releases(&mut None, &mut source)?, press);
+        Ok(())
     }
 }
