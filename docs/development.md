@@ -313,9 +313,29 @@ The hosted `benchmark.yml` retains the `criterion-benchmark-evidence` artifact f
     EXCISE_BENCH_MILLION=1 EXCISE_BENCH_MILLION_FANIN=1 cargo +1.98.0 bench --bench core --features internal --locked -- scan-store/million-tiny-files/bounded-fan-in --noplot --profile-time 1
     ```
 
-    Both probes print deterministic logical read and write bytes, per-observation ratios, merge write amplification, retained and peak temporary bytes, phase wall time, and Unix process CPU time. `--profile-time 1` performs one scale smoke; omit it on provisioned comparable hardware when collecting Criterion samples.
+    Both probes print deterministic logical read and write bytes, per-observation ratios, merge write amplification, `durable_syncs` and `manifest_persists`, retained and peak temporary bytes, phase wall time, and Unix process CPU time. `durable_syncs` is the exact number of completed `sync_data` calls on scan-store run and manifest files, including those made on scanner worker threads. `manifest_persists` is the exact number of completed manifest commits (temporary write, `sync_data`, rename). Both count per scan session. The canonical fixtures keep the manifest in memory, so their `manifest_persists` stays zero while `durable_syncs` counts sealed runs. `--profile-time 1` performs one scale smoke; omit it on provisioned comparable hardware when collecting Criterion samples.
 
-    `core` measures publication and late-page queries across flat, wide, deep, and shared-link workloads (`scan-store/publication/*` and `scan-store/page-query/*`). With `EXCISE_BENCH_MILLION=1`, it adds one-million-file publication and late-page probes. `EXCISE_BENCH_MILLION_FANIN=1` also exercises production bounded fan-in. It measures a fixed 16,512-entry filesystem walk at one, two, and eight workers, delivery of sixteen focus requests during an active scan, and rebuild-cancellation acknowledgement. `tachyonfx` measures completion-frame processing at `80x24`, `160x50`, and `200x80`.
+    `core` measures publication and late-page queries across flat, wide, deep, and shared-link workloads (`scan-store/publication/*` and `scan-store/page-query/*`). With `EXCISE_BENCH_MILLION=1`, it adds one-million-file publication and late-page probes. `EXCISE_BENCH_MILLION_FANIN=1` also exercises production bounded fan-in. It measures a fixed 16,512-entry filesystem walk at one, two, and eight workers, delivery of sixteen focus requests during an active scan, and rebuild-cancellation acknowledgement. It also runs the production owner loop over a 597-entry tree (`owner-loop/scan-ingestion/*`, below). `tachyonfx` measures completion-frame processing at `80x24`, `160x50`, and `200x80`.
+
+    `owner-loop/scan-ingestion` runs the production owner loop (`runtime::run`) until its scan completes, then quits it with `Ctrl-C` and `y`. The tree is a deterministic `node_modules` shape: fan-out 4, depth 3, and eight one-byte files per leaf directory, 597 entries in all. The run uses an in-memory `TestBackend`, the system clock, and explicit scanner-thread, reduced-motion, and loading-animation settings, so it measures the loop's own work and not a terminal's write speed. It runs twice, as `reduced-motion` and `default-motion`, because map animation and scan ingestion share the loop's scheduling; comparing the two `time_to_complete_ms` and `entries_per_second` values shows whether animation defers scan work. Each run has a wall-clock cap (30 s for reduced motion, 10 s for default motion). A scan still running at its cap is cancelled and reported with `complete=false`, so the group cannot hang.
+
+    ```console
+    cargo +1.98.0 bench --bench core --features internal --locked -- owner-loop --noplot
+    ```
+
+    After Criterion's timing for each case, the probe report of that case's last sample is printed to standard error: one summary line, one line for each phase, and one line for each worker-event kind that occurred.
+
+    ```text
+    owner-loop/<case>: complete=…, fixture_entries=…, entries_handled=…, entries_per_second=…, wall_ms=…, time_to_complete_ms=…, frames=…, runs_admitted=…, durable_syncs=…, manifest_persists=…, worker_events={scan_batch=…,scan_unscanned=…,…}
+    owner-loop/<case>/phase/<phase>: count=…, total=…, max=…, p99_bucket=…, p99_bucket_upper_bound=…
+    owner-loop/<case>/worker_event/<kind>: count=…, total=…, max=…, p99_bucket=…, p99_bucket_upper_bound=…
+    ```
+
+    In the summary line, `entries_handled` is the number of scanned entries the loop applied to its model, and `entries_per_second` divides it by `time_to_complete_ms`, or by the whole run when the scan did not finish. `wall_ms` covers the whole run: startup, scan, quit, and worker shutdown. `time_to_complete_ms` ends when the loop has handled the scan-finished event. `frames` counts frames drawn (`render` calls that drew), and `runs_admitted` counts sealed scanner runs handed to the scan store. `durable_syncs` and `manifest_persists` are the session totals described above, read after the workers stop, and `worker_events` counts events handled by kind.
+
+    Every phase and worker-event line reports the sample `count`, the summed `total`, and the exact `max`. A phase sample is the wall time of one occurrence, measured with real `Instant`s and never the loop's logical clock: `input` is one input event, `render` one frame drawn, `admission` one handoff of sealed runs to the scan store, and `publication` the publication of the primary scan generation, including its first page. A worker-event sample times the whole handler, so `admission` runs inside `scan_batch` and `scan_unscanned`, and `publication` inside `scan_finished`.
+
+    Durations live in fixed-size histograms of 64 power-of-two nanosecond buckets, so memory stays constant however long a run lasts. `p99_bucket` is the index `i` of the bucket `[2^i, 2^(i+1))` ns that holds the 99th-percentile sample. `p99_bucket_upper_bound` is that bucket's upper edge, tightened to `max`: a bound the 99th-percentile sample does not exceed.
 
 === "Compare hosted evidence"
 
