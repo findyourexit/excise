@@ -30,6 +30,15 @@ pub trait InputSource {
     /// # Errors
     /// Returns an input I/O error when the next terminal event cannot be read.
     fn read(&mut self) -> Result<InputEvent, AppError>;
+
+    /// Internal benchmark seam: the probe that should record the owner loop this
+    /// source drives. The loop asks at each measured phase, so a source that
+    /// returns `None` costs a virtual call and builds without `internal` have no
+    /// seam at all.
+    #[cfg(feature = "internal")]
+    fn owner_loop_probe(&self) -> Option<&crate::runtime::OwnerLoopProbe> {
+        None
+    }
 }
 
 /// Reads the real terminal and hands the owner loop every event except key releases.

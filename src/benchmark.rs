@@ -3,8 +3,15 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::backend::TestBackend;
+
+use crate::error::AppError;
+use crate::input::{InputEvent, InputSource};
 use crate::model::{ByteBounds, EntrySnapshot, NodeKind};
-use crate::native_path::NativeIdentity;
+use crate::native_path::{NativeIdentity, identity_for};
+use crate::outcome::{OperationOutcome, RunSummary};
+use crate::runtime::{OwnerLoopProbe, RuntimeSettings, SystemClock};
 use crate::scan_coordinator::{RelativePath, ScanGeneration};
 use crate::scan_store::identity_observation::{
     IdentityObservation, append_identity_observation, compare_identity_observations,
@@ -15,6 +22,11 @@ use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, 
 use crate::scan_store::run_file::RunKind;
 use crate::scan_store::session::{MAX_OBSERVATIONS_PER_BATCH, ScanStore};
 use crate::temporary_storage::TemporaryStorage;
+
+pub use crate::runtime::{
+    HISTOGRAM_BUCKETS, OwnerLoopReport, OwnerPhase, PhaseHistogram, WorkerEventKind,
+};
+
 const STORAGE_MIB: usize = 256;
 const QUERY_PAGE_ENTRIES: usize = 32;
 
@@ -102,6 +114,224 @@ impl FilesystemScanBenchmark {
     }
 }
 
+/// Terminal size of the in-memory backend that the owner-loop probe draws into.
+const OWNER_LOOP_COLUMNS: u16 = 120;
+const OWNER_LOOP_ROWS: u16 = 40;
+/// The scanner event buffer a default `excise` run uses.
+const OWNER_LOOP_EVENT_CAPACITY: usize = 256;
+/// One input poll sleeps at most this long, so completion and the cap are noticed promptly.
+const OWNER_LOOP_MAX_POLL: Duration = Duration::from_millis(50);
+/// A quit that did not end the loop is offered again after this long.
+const OWNER_LOOP_QUIT_RETRY: Duration = Duration::from_millis(250);
+/// The longest wall-clock cap a run honors. It keeps every deadline representable.
+const OWNER_LOOP_MAX_CAP: Duration = Duration::from_hours(24);
+
+/// Settings for one owner-loop scan. Every field is explicit so two runs differ
+/// only where the caller says they do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnerLoopScanOptions {
+    /// Scanner worker threads.
+    pub scan_threads: usize,
+    /// Mirrors `--reduced-motion`: the map snaps to each new layout instead of tweening.
+    pub reduced_motion: bool,
+    /// Mirrors the command-line tool, which always animates loading; only
+    /// `reduced_motion` and the theme quiet it.
+    pub animate_loading: bool,
+    /// The longest the run may take. A scan unfinished by then is cancelled and
+    /// the run reports itself incomplete instead of hanging.
+    pub wall_clock_cap: Duration,
+}
+
+/// The outcome of one probed owner-loop scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerLoopScanRun {
+    /// Wall time of the whole owner-loop run: startup, scan, quit, and worker shutdown.
+    pub wall: Duration,
+    /// Phase timings and counters the owner loop recorded about itself.
+    pub report: OwnerLoopReport,
+    /// The loop's own result. A run capped before its scan finished is `Cancelled`.
+    pub outcome: OperationOutcome<RunSummary>,
+}
+
+impl OwnerLoopScanRun {
+    /// Returns whether the scan finished before the wall-clock cap.
+    #[must_use]
+    pub const fn complete(&self) -> bool {
+        self.report.time_to_scan_complete().is_some()
+    }
+
+    /// Returns scanned entries handled per second: over the time to completion
+    /// for a finished scan, over the whole capped run otherwise.
+    #[must_use]
+    pub fn entries_per_second(&self) -> u64 {
+        let window = self
+            .report
+            .time_to_scan_complete()
+            .unwrap_or(self.wall)
+            .as_nanos();
+        let per_second = u128::from(self.report.scan_entries_handled())
+            .saturating_mul(1_000_000_000)
+            .checked_div(window)
+            .unwrap_or(0);
+        u64::try_from(per_second).unwrap_or(u64::MAX)
+    }
+}
+
+/// Runs the production owner loop against a directory tree and measures it.
+pub struct OwnerLoopScanBenchmark;
+
+impl OwnerLoopScanBenchmark {
+    /// Runs the real owner loop until its scan completes, then quits.
+    ///
+    /// The run calls `runtime::run` with an in-memory ratatui backend, the system
+    /// clock, and an input source that sends nothing until the loop has handled
+    /// the scan's completion, then Ctrl-C and `y`. If the scan has not finished by
+    /// `wall_clock_cap`, the same quit cancels it, so the call always returns;
+    /// check [`OwnerLoopScanRun::complete`]. Scan-store files live in a private
+    /// temporary directory that is removed before this returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `root` cannot be inspected or the owner loop rejects
+    /// it as a scan root (a symbolic link, for one), or when the loop itself fails.
+    pub fn run(root: &Path, options: OwnerLoopScanOptions) -> Result<OwnerLoopScanRun, AppError> {
+        let metadata = std::fs::symlink_metadata(root).map_err(|error| {
+            AppError::io("could not inspect the owner-loop benchmark root", error)
+        })?;
+        let root_identity = identity_for(root, &metadata)
+            .map_err(|error| {
+                AppError::io("could not identify the owner-loop benchmark root", error)
+            })?
+            .ok_or_else(|| {
+                AppError::Config("the owner-loop benchmark root must not be a link".to_string())
+            })?;
+        let scan_store_dir = tempfile::Builder::new()
+            .prefix("excise-owner-loop-")
+            .tempdir()
+            .map_err(|error| {
+                AppError::io(
+                    "could not create the owner-loop scan-store directory",
+                    error,
+                )
+            })?;
+        let settings = RuntimeSettings {
+            root: root.to_path_buf(),
+            root_identity,
+            scan_threads: options.scan_threads,
+            event_capacity: OWNER_LOOP_EVENT_CAPACITY,
+            cross_filesystems: false,
+            exclusions: Vec::new(),
+            memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+            temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+            scan_store_mib: Some(STORAGE_MIB),
+            scan_store_reserve_mib: None,
+            scan_store_dir: Some(scan_store_dir.path().to_path_buf()),
+            apparent_size: false,
+            disable_delete_confirmation: false,
+            reduced_motion: options.reduced_motion,
+            monochrome: false,
+            animate_loading: options.animate_loading,
+            theme: crate::theme::ThemeId::default(),
+            ascii: false,
+            mouse: false,
+            keymap: crate::config::KeyPreset::default(),
+            custom_keys: None,
+            config_path: None,
+            monochrome_locked: false,
+        };
+        let probe = OwnerLoopProbe::new();
+        let input =
+            QuitAfterScan::new(probe.clone(), options.wall_clock_cap, OWNER_LOOP_QUIT_RETRY);
+        let started = Instant::now();
+        let outcome = crate::runtime::run(
+            TestBackend::new(OWNER_LOOP_COLUMNS, OWNER_LOOP_ROWS),
+            Box::new(input),
+            settings,
+            Box::new(SystemClock::new()),
+        )?;
+        let wall = started.elapsed();
+        Ok(OwnerLoopScanRun {
+            wall,
+            report: probe.report(),
+            outcome,
+        })
+    }
+}
+
+/// The key of the quit sequence that `read` delivers next.
+#[derive(Clone, Copy)]
+enum QuitKey {
+    Interrupt,
+    Confirm,
+}
+
+/// Drives the owner loop like a user who waits out the scan: it sends nothing
+/// until the loop has handled the scan's completion or the wall-clock cap
+/// passes, then Ctrl-C and `y`. A quit that leaves the loop running is offered
+/// again after `retry`, so a modal that swallowed it cannot stall the run.
+struct QuitAfterScan {
+    probe: OwnerLoopProbe,
+    deadline: Instant,
+    retry: Duration,
+    next_key: QuitKey,
+    resume_at: Option<Instant>,
+}
+
+impl QuitAfterScan {
+    fn new(probe: OwnerLoopProbe, wall_clock_cap: Duration, retry: Duration) -> Self {
+        Self {
+            probe,
+            deadline: Instant::now() + wall_clock_cap.min(OWNER_LOOP_MAX_CAP),
+            retry,
+            next_key: QuitKey::Interrupt,
+            resume_at: None,
+        }
+    }
+
+    fn quit_due(&self, now: Instant) -> bool {
+        (self.probe.scan_complete() || now >= self.deadline)
+            && self.resume_at.is_none_or(|resume| now >= resume)
+    }
+}
+
+impl InputSource for QuitAfterScan {
+    fn poll(&mut self, timeout: Duration) -> Result<bool, AppError> {
+        if self.quit_due(Instant::now()) {
+            return Ok(true);
+        }
+        if timeout.is_zero() {
+            return Ok(false);
+        }
+        // Wait the way a terminal poll would, but wake for the cap and for completion.
+        let until_deadline = self.deadline.saturating_duration_since(Instant::now());
+        let mut nap = timeout.min(OWNER_LOOP_MAX_POLL);
+        if !until_deadline.is_zero() {
+            nap = nap.min(until_deadline);
+        }
+        std::thread::sleep(nap);
+        Ok(self.quit_due(Instant::now()))
+    }
+
+    fn read(&mut self) -> Result<InputEvent, AppError> {
+        let key = match self.next_key {
+            QuitKey::Interrupt => {
+                self.next_key = QuitKey::Confirm;
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            }
+            QuitKey::Confirm => {
+                self.next_key = QuitKey::Interrupt;
+                self.resume_at = Some(Instant::now() + self.retry);
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            }
+        };
+        Ok(InputEvent::Terminal(Event::Key(key)))
+    }
+
+    fn owner_loop_probe(&self) -> Option<&OwnerLoopProbe> {
+        Some(&self.probe)
+    }
+}
+
 /// Repeatable layouts that exercise distinct storage and query paths.
 #[derive(Clone, Copy, Debug)]
 pub enum CanonicalWorkload {
@@ -150,7 +380,11 @@ impl CanonicalWorkload {
     }
 }
 
-/// Deterministic logical I/O and phase timing for one published scan.
+/// Deterministic logical I/O, durable-operation counts, and phase timing for one published scan.
+///
+/// `durable_syncs` and `manifest_persists` are exact completed-operation totals
+/// for the store's quota. Canonical fixtures keep the manifest in memory, so
+/// their `manifest_persists` stays zero while `durable_syncs` counts run seals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreMetrics {
     pub observations: usize,
@@ -161,6 +395,8 @@ pub struct CanonicalStoreMetrics {
     pub reduction_written_bytes: u64,
     pub publication_read_bytes: u64,
     pub publication_written_bytes: u64,
+    pub durable_syncs: u64,
+    pub manifest_persists: u64,
     pub retained_bytes: u64,
     pub peak_temporary_bytes: u64,
     pub ingestion_elapsed: Duration,
@@ -202,6 +438,8 @@ fn benchmark_metrics(
         reduction_written_bytes: io.reduction_written_bytes,
         publication_read_bytes: io.publication_read_bytes,
         publication_written_bytes: io.publication_written_bytes,
+        durable_syncs: io.durable_syncs,
+        manifest_persists: io.manifest_persists,
         retained_bytes: storage.used(),
         peak_temporary_bytes: storage.peak_used(),
         ingestion_elapsed,
@@ -659,7 +897,8 @@ mod tests {
 
     #[test]
     fn bounded_publication_reports_input_merge_and_publication_metrics() {
-        let entries = MAX_OBSERVATIONS_PER_BATCH.saturating_mul(8);
+        let batches = 8;
+        let entries = MAX_OBSERVATIONS_PER_BATCH.saturating_mul(batches);
         let fixture = CanonicalStoreBenchmark::build(CanonicalWorkload::Flat { entries });
         let metrics = fixture.metrics();
 
@@ -673,5 +912,178 @@ mod tests {
         assert!(metrics.publication_written_bytes > 0);
         assert!(metrics.retained_bytes > 0);
         assert!(metrics.peak_temporary_bytes >= metrics.retained_bytes);
+        assert!(
+            metrics.durable_syncs >= u64::try_from(batches).unwrap_or(u64::MAX),
+            "every input batch is sealed durably before the store reads it"
+        );
+        assert_eq!(
+            metrics.manifest_persists, 0,
+            "canonical fixtures keep the manifest in memory"
+        );
+    }
+
+    fn tree(directories: usize, files_per_directory: usize) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("owner-loop fixture root should exist");
+        for directory in 0..directories {
+            let path = root.path().join(format!("dir-{directory}"));
+            std::fs::create_dir(&path).expect("fixture directory should be created");
+            for file in 0..files_per_directory {
+                std::fs::write(path.join(format!("file-{file}")), b"x")
+                    .expect("fixture file should be written");
+            }
+        }
+        root
+    }
+
+    fn options(reduced_motion: bool, wall_clock_cap: Duration) -> OwnerLoopScanOptions {
+        OwnerLoopScanOptions {
+            scan_threads: 2,
+            reduced_motion,
+            animate_loading: true,
+            wall_clock_cap,
+        }
+    }
+
+    #[test]
+    fn a_probed_run_records_admission_publication_and_frames() {
+        let (directories, files_per_directory) = (3, 6);
+        let root = tree(directories, files_per_directory);
+        let entries = u64::try_from(directories * (files_per_directory + 1))
+            .expect("fixture size fits in u64");
+        let run = OwnerLoopScanBenchmark::run(root.path(), options(true, Duration::from_secs(120)))
+            .expect("the owner loop should run");
+        let report = &run.report;
+
+        assert!(run.complete());
+        let OperationOutcome::Exact(summary) = &run.outcome else {
+            panic!("a finished scan should be exact: {:?}", run.outcome);
+        };
+        assert_eq!(report.scan_entries_handled(), entries);
+        assert_eq!(
+            summary.scanned_entries, entries,
+            "the probe agrees with the loop's own summary"
+        );
+        assert!(run.entries_per_second() > 0);
+        assert!(
+            report
+                .time_to_scan_complete()
+                .is_some_and(|elapsed| elapsed <= run.wall)
+        );
+
+        assert!(report.frames_rendered() >= 1);
+        assert_eq!(report.phase(OwnerPhase::Publication).count(), 1);
+        assert_eq!(
+            report.worker_event(WorkerEventKind::ScanFinished).count(),
+            1
+        );
+        assert_eq!(
+            report.phase(OwnerPhase::Input).count(),
+            2,
+            "the quit is Ctrl-C then y and nothing before"
+        );
+        let admissions = report.phase(OwnerPhase::Admission).count();
+        assert!(admissions >= 1);
+        assert!(report.scan_runs_admitted() >= admissions);
+        assert!(report.worker_event(WorkerEventKind::ScanBatch).count() >= admissions);
+
+        // Every admitted run was sealed once and committed to the manifest once, and
+        // the session's first manifest and its publication commit more.
+        assert!(report.manifest_persists() > report.scan_runs_admitted());
+        assert!(report.durable_syncs() >= report.manifest_persists() + report.scan_runs_admitted());
+    }
+
+    #[test]
+    fn an_expired_cap_cancels_the_scan_and_reports_it_incomplete() {
+        let root = tree(3, 6);
+        let run = OwnerLoopScanBenchmark::run(root.path(), options(true, Duration::ZERO))
+            .expect("a capped run should still return");
+
+        assert!(!run.complete());
+        assert!(
+            matches!(
+                run.outcome,
+                OperationOutcome::Cancelled { precise: true, .. }
+            ),
+            "the capped scan is cancelled: {:?}",
+            run.outcome
+        );
+        assert_eq!(run.report.time_to_scan_complete(), None);
+        assert_eq!(run.report.phase(OwnerPhase::Publication).count(), 0);
+        assert_eq!(run.report.phase(OwnerPhase::Input).count(), 2);
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_inspected_is_an_error_not_a_hang() {
+        let parent = tree(1, 1);
+        let error = OwnerLoopScanBenchmark::run(
+            &parent.path().join("missing"),
+            options(true, Duration::from_secs(120)),
+        )
+        .expect_err("a missing root cannot be scanned");
+        assert!(matches!(error, AppError::Io { .. }), "{error}");
+    }
+
+    fn quit_key(input: &mut QuitAfterScan) -> KeyEvent {
+        match input.read().expect("the quit source should always read") {
+            InputEvent::Terminal(Event::Key(key)) => key,
+            _ => panic!("the quit source sends only key events"),
+        }
+    }
+
+    #[test]
+    fn the_quit_source_waits_for_completion_then_offers_the_quit_until_it_lands() {
+        let probe = OwnerLoopProbe::new();
+        let mut input = QuitAfterScan::new(
+            probe.clone(),
+            Duration::from_secs(3_600),
+            Duration::from_millis(1),
+        );
+        assert!(!input.poll(Duration::ZERO).expect("poll should succeed"));
+        assert!(
+            !input
+                .poll(Duration::from_millis(1))
+                .expect("poll should succeed"),
+            "a scan in progress is not an input event"
+        );
+
+        probe.mark_scan_complete_for_test();
+        assert!(input.poll(Duration::ZERO).expect("poll should succeed"));
+        let interrupt = quit_key(&mut input);
+        assert_eq!(
+            (interrupt.code, interrupt.modifiers),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL)
+        );
+        assert!(
+            input.poll(Duration::ZERO).expect("poll should succeed"),
+            "the confirmation follows at once"
+        );
+        let confirm = quit_key(&mut input);
+        assert_eq!(
+            (confirm.code, confirm.modifiers),
+            (KeyCode::Char('y'), KeyModifiers::NONE)
+        );
+        assert!(
+            !input.poll(Duration::ZERO).expect("poll should succeed"),
+            "a delivered quit is not repeated at once"
+        );
+
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(
+            input.poll(Duration::ZERO).expect("poll should succeed"),
+            "a quit that left the loop running is offered again"
+        );
+        assert_eq!(quit_key(&mut input).code, KeyCode::Char('c'));
+    }
+
+    #[test]
+    fn the_quit_source_quits_at_the_cap_without_a_completed_scan() {
+        let probe = OwnerLoopProbe::new();
+        let mut input = QuitAfterScan::new(probe.clone(), Duration::ZERO, OWNER_LOOP_QUIT_RETRY);
+        assert!(!probe.scan_complete());
+        assert!(
+            input.poll(Duration::ZERO).expect("poll should succeed"),
+            "a cap that has passed ends the run"
+        );
+        assert_eq!(quit_key(&mut input).code, KeyCode::Char('c'));
     }
 }

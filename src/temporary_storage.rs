@@ -27,6 +27,12 @@ struct TemporaryStorageState {
     used: AtomicU64,
     #[cfg(feature = "internal")]
     peak_used: AtomicU64,
+    /// Completed durable `sync_data` calls on scan-store run and manifest files.
+    #[cfg(feature = "internal")]
+    durable_syncs: AtomicU64,
+    /// Completed manifest commits: a synced temporary file renamed over the manifest.
+    #[cfg(feature = "internal")]
+    manifest_persists: AtomicU64,
 }
 
 impl Default for TemporaryStorage {
@@ -180,6 +186,10 @@ impl TemporaryStorage {
                 used: AtomicU64::new(0),
                 #[cfg(feature = "internal")]
                 peak_used: AtomicU64::new(0),
+                #[cfg(feature = "internal")]
+                durable_syncs: AtomicU64::new(0),
+                #[cfg(feature = "internal")]
+                manifest_persists: AtomicU64::new(0),
             }),
         }
     }
@@ -239,6 +249,37 @@ impl TemporaryStorage {
     pub(crate) fn peak_used(&self) -> u64 {
         self.state.peak_used.load(Ordering::Acquire)
     }
+
+    /// Notes one completed durable `sync_data` on a scan-store run or manifest file.
+    ///
+    /// Every writer, sealed run, and manifest of one scan session reaches this
+    /// shared quota, so scanner worker threads and the owner count into the same
+    /// per-session total without a process-wide static.
+    #[cfg(feature = "internal")]
+    pub(crate) fn record_durable_sync(&self) {
+        self.state.durable_syncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Notes one completed manifest commit: temporary write, sync, and rename.
+    #[cfg(feature = "internal")]
+    pub(crate) fn record_manifest_persist(&self) {
+        self.state.manifest_persists.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the completed durable syncs recorded through this quota.
+    #[cfg(feature = "internal")]
+    #[must_use]
+    pub(crate) fn durable_syncs(&self) -> u64 {
+        self.state.durable_syncs.load(Ordering::Relaxed)
+    }
+
+    /// Returns the completed manifest commits recorded through this quota.
+    #[cfg(feature = "internal")]
+    #[must_use]
+    pub(crate) fn manifest_persists(&self) -> u64 {
+        self.state.manifest_persists.load(Ordering::Relaxed)
+    }
+
     #[must_use]
     pub(crate) fn limit(&self) -> u64 {
         self.state.limit
@@ -290,6 +331,12 @@ impl TemporaryStorageReservation {
         }
         self.storage.release(self.bytes - bytes);
         self.bytes = bytes;
+    }
+
+    /// Notes one completed durable sync on the file this reservation charges.
+    #[cfg(feature = "internal")]
+    pub(crate) fn record_durable_sync(&self) {
+        self.storage.record_durable_sync();
     }
 }
 

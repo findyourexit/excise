@@ -5,6 +5,8 @@ use std::hint::black_box;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use excise::benchmark::{
     CanonicalStoreBenchmark, CanonicalStoreMetrics, CanonicalWorkload, FilesystemScanBenchmark,
+    OwnerLoopScanBenchmark, OwnerLoopScanOptions, OwnerLoopScanRun, OwnerPhase, PhaseHistogram,
+    WorkerEventKind,
 };
 use excise::geometry::{FileMetadata, FileType, TreeMap};
 use excise::model::NodeId;
@@ -77,13 +79,15 @@ fn report_canonical_metrics(label: &str, metrics: CanonicalStoreMetrics) {
         .checked_div(metrics.input_written_bytes)
         .unwrap_or(0);
     eprintln!(
-        "{label}: observations={}, logical_read_bytes={}, logical_written_bytes={}, read_bytes_per_observation_milli={}, written_bytes_per_observation_milli={}, merge_write_amplification_milli={}, retained_bytes={}, peak_temporary_bytes={}, ingestion_elapsed_ms={}, publication_elapsed_ms={}, ingestion_cpu_us={:?}, publication_cpu_us={:?}",
+        "{label}: observations={}, logical_read_bytes={}, logical_written_bytes={}, read_bytes_per_observation_milli={}, written_bytes_per_observation_milli={}, merge_write_amplification_milli={}, durable_syncs={}, manifest_persists={}, retained_bytes={}, peak_temporary_bytes={}, ingestion_elapsed_ms={}, publication_elapsed_ms={}, ingestion_cpu_us={:?}, publication_cpu_us={:?}",
         metrics.observations,
         logical_read_bytes,
         logical_written_bytes,
         per_observation_milli(logical_read_bytes, metrics.observations),
         per_observation_milli(logical_written_bytes, metrics.observations),
         merge_write_amplification_milli,
+        metrics.durable_syncs,
+        metrics.manifest_persists,
         metrics.retained_bytes,
         metrics.peak_temporary_bytes,
         metrics.ingestion_elapsed.as_millis(),
@@ -163,6 +167,130 @@ fn benchmark_scanner(c: &mut Criterion) {
     });
     cancellation.finish();
 }
+
+/// A `node_modules`-shaped tree: each package directory holds `OWNER_LOOP_FAN_OUT`
+/// children down to `OWNER_LOOP_DEPTH` levels, and every deepest directory holds
+/// `OWNER_LOOP_FILES_PER_LEAF` one-byte files (597 entries).
+const OWNER_LOOP_FAN_OUT: usize = 4;
+const OWNER_LOOP_DEPTH: usize = 3;
+const OWNER_LOOP_FILES_PER_LEAF: usize = 8;
+const OWNER_LOOP_SCAN_THREADS: usize = 4;
+/// Reduced motion is the reference run: it finishes in about a second, so a
+/// scan still running after this is a fault the report names as incomplete.
+const OWNER_LOOP_REDUCED_MOTION_CAP: Duration = Duration::from_secs(30);
+/// Default motion lets map animation defer scan ingestion, so a scan can stall
+/// here. The cap is tight enough to bound `cargo verify`, which runs each case
+/// eleven times, when one does.
+const OWNER_LOOP_DEFAULT_MOTION_CAP: Duration = Duration::from_secs(10);
+
+/// Builds the owner-loop fixture and returns it with its entry count.
+fn owner_loop_fixture() -> (tempfile::TempDir, usize) {
+    let root = tempfile::tempdir().expect("owner-loop benchmark root should exist");
+    let modules = root.path().join("node_modules");
+    fs::create_dir(&modules).expect("owner-loop benchmark package root should be created");
+    let mut entries = 1_usize;
+    let mut level = vec![modules];
+    for _ in 0..OWNER_LOOP_DEPTH {
+        let mut deeper = Vec::new();
+        for parent in &level {
+            for child in 0..OWNER_LOOP_FAN_OUT {
+                let directory = parent.join(format!("pkg{child}"));
+                fs::create_dir(&directory)
+                    .expect("owner-loop benchmark package directory should be created");
+                entries += 1;
+                deeper.push(directory);
+            }
+        }
+        level = deeper;
+    }
+    for leaf in &level {
+        for file in 0..OWNER_LOOP_FILES_PER_LEAF {
+            fs::write(leaf.join(format!("m{file}.js")), b"x")
+                .expect("owner-loop benchmark module file should be written");
+            entries += 1;
+        }
+    }
+    (root, entries)
+}
+
+fn report_phase(label: &str, group: &str, name: &str, histogram: &PhaseHistogram) {
+    eprintln!(
+        "owner-loop/{label}/{group}/{name}: count={}, total={:?}, max={:?}, p99_bucket={:?}, p99_bucket_upper_bound={:?}",
+        histogram.count(),
+        histogram.sum(),
+        histogram.max(),
+        histogram.p99_bucket(),
+        histogram.p99_upper_bound(),
+    );
+}
+
+fn report_owner_loop(label: &str, fixture_entries: usize, run: &OwnerLoopScanRun) {
+    let report = &run.report;
+    let worker_events = WorkerEventKind::ALL
+        .iter()
+        .map(|kind| format!("{}={}", kind.label(), report.worker_event(*kind).count()))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "owner-loop/{label}: complete={}, fixture_entries={fixture_entries}, entries_handled={}, entries_per_second={}, wall_ms={}, time_to_complete_ms={:?}, frames={}, runs_admitted={}, durable_syncs={}, manifest_persists={}, worker_events={{{worker_events}}}",
+        run.complete(),
+        report.scan_entries_handled(),
+        run.entries_per_second(),
+        run.wall.as_millis(),
+        report
+            .time_to_scan_complete()
+            .map(|elapsed| elapsed.as_millis()),
+        report.frames_rendered(),
+        report.scan_runs_admitted(),
+        report.durable_syncs(),
+        report.manifest_persists(),
+    );
+    for phase in OwnerPhase::ALL {
+        report_phase(label, "phase", phase.label(), report.phase(phase));
+    }
+    for kind in WorkerEventKind::ALL {
+        if report.worker_event(kind).count() > 0 {
+            report_phase(
+                label,
+                "worker_event",
+                kind.label(),
+                report.worker_event(kind),
+            );
+        }
+    }
+}
+
+fn benchmark_owner_loop(c: &mut Criterion) {
+    let (fixture, fixture_entries) = owner_loop_fixture();
+    let mut group = c.benchmark_group("owner-loop/scan-ingestion");
+    group.sample_size(10);
+    for (label, reduced_motion, wall_clock_cap) in [
+        ("reduced-motion", true, OWNER_LOOP_REDUCED_MOTION_CAP),
+        ("default-motion", false, OWNER_LOOP_DEFAULT_MOTION_CAP),
+    ] {
+        let options = OwnerLoopScanOptions {
+            scan_threads: OWNER_LOOP_SCAN_THREADS,
+            reduced_motion,
+            animate_loading: true,
+            wall_clock_cap,
+        };
+        let mut last_run = None;
+        group.bench_function(label, |bencher| {
+            bencher.iter(|| {
+                let run = OwnerLoopScanBenchmark::run(fixture.path(), options)
+                    .expect("owner-loop scan should run to completion or its cap");
+                let wall = run.wall;
+                last_run = Some(run);
+                black_box(wall)
+            });
+        });
+        if let Some(run) = last_run.as_ref() {
+            report_owner_loop(label, fixture_entries, run);
+        }
+    }
+    group.finish();
+}
+
 fn benchmark_canonical_store(c: &mut Criterion) {
     let mut publication = c.benchmark_group("scan-store/publication");
     for workload in CANONICAL_WORKLOADS {
@@ -267,6 +395,7 @@ criterion_group!(
     benchmark_treemap,
     benchmark_canonical_store,
     benchmark_million_tiny_files,
-    benchmark_scanner
+    benchmark_scanner,
+    benchmark_owner_loop
 );
 criterion_main!(benches);
