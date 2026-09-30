@@ -360,10 +360,13 @@ const DEMO_LOSSY: u32 = 50;
 /// Ceiling the published recording must stay under.
 ///
 /// A README hero is fetched by everyone who visits the page, so weight is a
-/// user-visible property. The optimised pipeline lands near 1.1 MiB. This
-/// catches a regression that silently restores dithering or full frame rate,
-/// which alone would triple the asset.
-const DEMO_MAX_BYTES: u64 = 1_572_864;
+/// user-visible property. The optimised pipeline lands between about 1.3 and
+/// 1.7 MiB. Live capture timing alone moves one tape's size by about a quarter
+/// between runs, and runner image updates shift the encoder's output. The
+/// ceiling leaves room for that variance and still catches a regression that
+/// silently restores dithering or full frame rate, which alone would triple the
+/// asset.
+const DEMO_MAX_BYTES: u64 = 2_097_152;
 /// Minimum duration retained by the tape's final asserted states.
 const DEMO_MIN_DURATION_SECONDS: f64 = 10.0;
 /// Minimum frames retained after VHS's frame deduplication.
