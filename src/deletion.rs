@@ -2491,27 +2491,37 @@ fn report_from_parts(
     }
 }
 
+/// How many unpredictable names a placeholder operation tries before giving up.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-fn create_placeholder(parent: &File) -> io::Result<(OsString, PlannedSnapshot)> {
+const PLACEHOLDER_NAME_ATTEMPTS: usize = 128;
+
+/// An unpredictable name for a deletion placeholder, unique to this process and call.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn placeholder_name() -> io::Result<OsString> {
     use std::sync::atomic::AtomicU64;
 
     static NEXT_PLACEHOLDER: AtomicU64 = AtomicU64::new(0);
-    for _ in 0..128 {
-        let sequence = NEXT_PLACEHOLDER.fetch_add(1, Ordering::Relaxed);
-        let mut random = [0_u8; 16];
-        getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
-        let token = random
-            .iter()
-            .fold(String::with_capacity(32), |mut token, byte| {
-                use std::fmt::Write as _;
+    let sequence = NEXT_PLACEHOLDER.fetch_add(1, Ordering::Relaxed);
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
+    let token = random
+        .iter()
+        .fold(String::with_capacity(32), |mut token, byte| {
+            use std::fmt::Write as _;
 
-                let _ = write!(token, "{byte:02x}");
-                token
-            });
-        let name = OsString::from(format!(
-            ".excise-delete-{token}-{:x}-{sequence:x}",
-            std::process::id()
-        ));
+            let _ = write!(token, "{byte:02x}");
+            token
+        });
+    Ok(OsString::from(format!(
+        ".excise-delete-{token}-{:x}-{sequence:x}",
+        std::process::id()
+    )))
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn create_placeholder(parent: &File) -> io::Result<(OsString, PlannedSnapshot)> {
+    for _ in 0..PLACEHOLDER_NAME_ATTEMPTS {
+        let name = placeholder_name()?;
         let mut options = cap_fs::OpenOptions::new();
         options.write(true).create_new(true);
         match cap_fs::open(parent, Path::new(&name), &options) {
@@ -2578,6 +2588,13 @@ fn restore_detached(
     remove_verified_placeholder(parent, detached, placeholder)
 }
 
+/// Removes the placeholder that holds a deleted entry's original name.
+///
+/// The placeholder first moves to a private name, so that the entry removed is the one checked.
+/// That is normally the detached name, which the deleted target has just vacated. APFS on macOS 14
+/// can still refuse it as taken for a moment after the removal, so a refused name is never reused
+/// or waited on: the placeholder moves to a fresh private name instead. The rename never replaces
+/// an entry, and the placeholder is checked again before it is removed.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn finalize_placeholder(
     parent: &File,
@@ -2593,15 +2610,24 @@ fn finalize_placeholder(
             "original name no longer contains the deletion placeholder",
         ));
     }
-    rustix::fs::renameat_with(
-        parent,
-        Path::new(original),
-        parent,
-        Path::new(detached),
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(io::Error::from)?;
-    remove_verified_placeholder(parent, detached, placeholder)
+    let mut private = detached.to_os_string();
+    for _ in 0..PLACEHOLDER_NAME_ATTEMPTS {
+        match rustix::fs::renameat_with(
+            parent,
+            Path::new(original),
+            parent,
+            Path::new(&private),
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => return remove_verified_placeholder(parent, &private, placeholder),
+            Err(rustix::io::Errno::EXIST) => private = placeholder_name()?,
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve a private name to remove the deletion placeholder",
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -3636,6 +3662,39 @@ mod tests {
         assert!(report.soft_cancelled);
         assert_eq!(report.unattempted_entries(), 1);
         assert!(path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn a_placeholder_is_removed_even_when_its_detached_name_is_taken() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let parent = std::fs::File::open(root.path()).expect("the root should open");
+        let (detached, placeholder) =
+            create_placeholder(&parent).expect("a placeholder should be reserved");
+        // After a deletion the placeholder holds the entry's original name and moves back to the
+        // detached name, which the target has just vacated. Here another entry holds that name.
+        std::fs::rename(root.path().join(&detached), root.path().join("target"))
+            .expect("the placeholder should take the original name");
+        std::fs::write(root.path().join(&detached), b"not ours")
+            .expect("another entry should take the detached name");
+
+        finalize_placeholder(
+            &parent,
+            std::ffi::OsStr::new("target"),
+            &detached,
+            &placeholder,
+        )
+        .expect("the placeholder should be removed under a fresh private name");
+
+        let names: Vec<OsString> = std::fs::read_dir(root.path())
+            .expect("the root should list")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(names, std::slice::from_ref(&detached));
+        assert_eq!(
+            std::fs::read(root.path().join(&detached)).expect("the other entry should remain"),
+            b"not ours"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
