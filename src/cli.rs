@@ -118,7 +118,7 @@ pub(crate) fn run_main() -> i32 {
     let backend = CrosstermBackend::new(SplitColorWriter::new(io::stdout()));
     let run_result = run(
         backend,
-        Box::new(TerminalEvents),
+        Box::new(TerminalEvents::default()),
         settings,
         Box::new(SystemClock::new()),
     );
