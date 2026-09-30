@@ -295,6 +295,16 @@ cargo "+$fuzz_toolchain" fuzz run native_path -- -max_total_time=60 -max_len=409
 
 Crash artifacts and evolving corpora are ignored. Curated seeds under `fuzz/seeds` are reviewed source fixtures.
 
+## Validation Harness
+
+The `excise-harness` workspace crate under `crates/` holds the shared vocabulary of the black-box validation harness: the strict TOML scenario format and the versioned JSON Schemas for its machine output (run summaries, failure bundles, and A/B evidence). The harness observes `excise` only from the outside and never depends on the `excise` crate. It is internal test tooling rather than a supported product interface, and it is not published. Its schemas stay beside the crate instead of in `docs/schemas`, which ships in release archives.
+
+```console
+cargo test -p excise-harness --locked
+```
+
+`cargo verify` and hosted CI run these tests with the rest of the workspace. See the [harness README](https://github.com/findyourexit/excise/blob/main/crates/excise-harness/README.md) for the scenario reference, runner semantics, safety rules, and output documents.
+
 ## Benchmarks
 
 The hosted `benchmark.yml` retains the `criterion-benchmark-evidence` artifact for 90 days. It contains Criterion raw samples and reports from `target/criterion`, one-million and bounded-fan-in probe logs, plus `benchmark-context.txt`, which records the checked-out SHA, workflow run, runner image and CPU, commands, Rust toolchain, and `Cargo.lock` digest.

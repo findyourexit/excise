@@ -1,0 +1,647 @@
+//! The step vocabulary of a scenario.
+//!
+//! Steps are written as an array of tables. The `step` key names the step and selects the fields
+//! that follow; every step rejects keys it does not define.
+//!
+//! ```toml
+//! [[steps]]
+//! step = "wait_header"
+//! state = "complete"
+//! timeout_ms = 30000
+//! ```
+//!
+//! Steps that wait for the program (or for the file system) take an optional `timeout_ms`.
+//! Omitting it applies [`DEFAULT_TIMEOUT_MS`]. `expect_*` steps other than `expect_exit`
+//! evaluate once against the current state and never wait.
+
+use std::{collections::BTreeMap, fmt, str::FromStr};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use super::{Budget, DEFAULT_TIMEOUT_MS};
+use crate::string_enum::string_enum;
+
+const fn default_timeout_ms() -> u64 {
+    DEFAULT_TIMEOUT_MS
+}
+
+/// One step of a scenario.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum Step {
+    /// Wait until text or a regular expression appears on the screen.
+    WaitText(WaitText),
+    /// Wait until the header row reports a scan state.
+    WaitHeader(WaitHeader),
+    /// Wait until the event channel reports an event.
+    WaitEvent(WaitEvent),
+    /// Press one key.
+    Key(PressKey),
+    /// Type literal text.
+    Type(TypeText),
+    /// Select an entry by name using the filter.
+    Select(Select),
+    /// Delete the selected entry through the confirmation dialog.
+    Delete(Delete),
+    /// Wait until a fixture-relative path no longer exists.
+    WaitFsAbsent(WaitFs),
+    /// Wait until a fixture-relative path exists.
+    WaitFsPresent(WaitFs),
+    /// Change the fixture while the program runs.
+    FsMutate(FsMutate),
+    /// Resize the terminal.
+    Resize(Resize),
+    /// Deliver a signal or console event to the program.
+    Signal(SendSignal),
+    /// Assert what is on the screen now.
+    ExpectScreen(ExpectScreen),
+    /// Assert which fixture-relative paths exist now.
+    ExpectFs(ExpectFs),
+    /// Wait for the program to exit and assert how it ended.
+    ExpectExit(ExpectExit),
+    /// Assert that a recorded metric is within a budget.
+    ExpectBudget(ExpectBudget),
+    /// Mark the start or the stop of a named measurement.
+    Measure(Measure),
+    /// Wait until the program has processed everything sent so far.
+    Settle(Settle),
+    /// Perform the ordinary confirmed quit.
+    Quit(Quit),
+}
+
+impl Step {
+    /// Every name accepted in the `step` field, in documentation order.
+    pub const KINDS: [&'static str; 19] = [
+        "wait_text",
+        "wait_header",
+        "wait_event",
+        "key",
+        "type",
+        "select",
+        "delete",
+        "wait_fs_absent",
+        "wait_fs_present",
+        "fs_mutate",
+        "resize",
+        "signal",
+        "expect_screen",
+        "expect_fs",
+        "expect_exit",
+        "expect_budget",
+        "measure",
+        "settle",
+        "quit",
+    ];
+
+    /// The name of this step as written in the `step` field.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::WaitText(_) => "wait_text",
+            Self::WaitHeader(_) => "wait_header",
+            Self::WaitEvent(_) => "wait_event",
+            Self::Key(_) => "key",
+            Self::Type(_) => "type",
+            Self::Select(_) => "select",
+            Self::Delete(_) => "delete",
+            Self::WaitFsAbsent(_) => "wait_fs_absent",
+            Self::WaitFsPresent(_) => "wait_fs_present",
+            Self::FsMutate(_) => "fs_mutate",
+            Self::Resize(_) => "resize",
+            Self::Signal(_) => "signal",
+            Self::ExpectScreen(_) => "expect_screen",
+            Self::ExpectFs(_) => "expect_fs",
+            Self::ExpectExit(_) => "expect_exit",
+            Self::ExpectBudget(_) => "expect_budget",
+            Self::Measure(_) => "measure",
+            Self::Settle(_) => "settle",
+            Self::Quit(_) => "quit",
+        }
+    }
+
+    /// The step's bound in milliseconds, or `None` for a step that never waits.
+    #[must_use]
+    pub const fn timeout_ms(&self) -> Option<u64> {
+        match self {
+            Self::WaitText(step) => Some(step.timeout_ms),
+            Self::WaitHeader(step) => Some(step.timeout_ms),
+            Self::WaitEvent(step) => Some(step.timeout_ms),
+            Self::Select(step) => Some(step.timeout_ms),
+            Self::Delete(step) => Some(step.timeout_ms),
+            Self::WaitFsAbsent(step) | Self::WaitFsPresent(step) => Some(step.timeout_ms),
+            Self::ExpectExit(step) => Some(step.timeout_ms),
+            Self::Settle(step) => Some(step.timeout_ms),
+            Self::Quit(step) => Some(step.timeout_ms),
+            Self::Key(_)
+            | Self::Type(_)
+            | Self::FsMutate(_)
+            | Self::Resize(_)
+            | Self::Signal(_)
+            | Self::ExpectScreen(_)
+            | Self::ExpectFs(_)
+            | Self::ExpectBudget(_)
+            | Self::Measure(_) => None,
+        }
+    }
+}
+
+/// A part of the screen that a text match is limited to.
+///
+/// Written as `"header"`, `"dialog"`, or `{ rows = [first, last] }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Region {
+    /// The header row, which is the only valid source of scan state.
+    Header,
+    /// The modal dialog, when one is open.
+    Dialog,
+    /// An inclusive span of zero-based screen rows, `[first, last]`.
+    Rows([u16; 2]),
+}
+
+string_enum! {
+    /// The scan state shown in the header row.
+    pub enum ScanState {
+        /// The header reports an active scan.
+        Scanning => "scanning",
+        /// The header reports a finished scan.
+        Complete => "complete",
+    }
+}
+
+string_enum! {
+    /// A kind of event reported by the program's event channel.
+    ///
+    /// These are the kinds the channel carries, without its `hello` handshake line, which the
+    /// runner consumes itself.
+    pub enum EventKind {
+        /// A frame was presented.
+        Frame => "frame",
+        /// The scan finished.
+        ScanComplete => "scan_complete",
+        /// A deletion ended.
+        DeletionFinished => "deletion_finished",
+        /// The quit prompt was shown.
+        QuitPrompt => "quit_prompt",
+        /// The program is exiting.
+        Exit => "exit",
+    }
+}
+
+string_enum! {
+    /// A numeric field of an event that a `wait_event` predicate can test.
+    pub enum EventField {
+        /// The frame sequence number.
+        Seq => "seq",
+        /// Terminal input events the program had consumed when the frame was presented.
+        Inputs => "inputs",
+        /// Microseconds since the channel opened. Every event carries it.
+        TimeMicros => "t_us",
+        /// Entries indexed by the finished scan.
+        Entries => "entries",
+        /// Entries a deletion removed.
+        Removed => "removed",
+        /// Entries a deletion failed to remove.
+        Failed => "failed",
+        /// The exit code.
+        Code => "code",
+    }
+}
+
+impl EventKind {
+    /// The numeric fields this kind of event carries.
+    #[must_use]
+    pub const fn fields(self) -> &'static [EventField] {
+        match self {
+            Self::Frame => &[EventField::Seq, EventField::Inputs, EventField::TimeMicros],
+            Self::ScanComplete => &[EventField::Entries, EventField::TimeMicros],
+            Self::DeletionFinished => &[
+                EventField::Removed,
+                EventField::Failed,
+                EventField::TimeMicros,
+            ],
+            Self::QuitPrompt => &[EventField::TimeMicros],
+            Self::Exit => &[EventField::Code, EventField::TimeMicros],
+        }
+    }
+}
+
+/// A test applied to one numeric event field.
+///
+/// Written as a table with exactly one key: `{ eq = 5 }`, `{ min = 5 }`, or `{ max = 5 }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Comparison {
+    /// The field equals the value.
+    Eq(u64),
+    /// The field is at least the value.
+    Min(u64),
+    /// The field is at most the value.
+    Max(u64),
+}
+
+/// Waits until `text` or `regex` (exactly one) appears on the screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitText {
+    /// Literal text to find.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// A regular expression to find, in Rust `regex` syntax.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    /// Limits the search to part of the screen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<Region>,
+    /// The bound on the wait.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// Waits until the header row reports `state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitHeader {
+    /// The scan state to wait for.
+    pub state: ScanState,
+    /// The bound on the wait.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// Waits until the event channel reports `event` with every listed field test satisfied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitEvent {
+    /// The event to wait for.
+    pub event: EventKind,
+    /// Tests on the event's numeric fields. Every field must belong to `event`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<EventField, Comparison>,
+    /// The bound on the wait.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// Presses one key, optionally with modifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PressKey {
+    /// The key: a single character or a named key.
+    pub key: KeyName,
+    /// Hold Ctrl.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ctrl: bool,
+    /// Hold Alt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alt: bool,
+}
+
+/// Types literal text, one character at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypeText {
+    /// The text to type.
+    pub text: String,
+}
+
+/// Selects the entry called `name`: opens the filter, types the name, presses Enter, then asserts
+/// that the selected item is that entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Select {
+    /// The entry name.
+    pub name: String,
+    /// The bound on the waits inside the step.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+string_enum! {
+    /// The kind of entry a deletion targets.
+    pub enum EntryKind {
+        /// A regular file (or other non-directory entry).
+        File => "file",
+        /// A directory.
+        Folder => "folder",
+    }
+}
+
+/// Deletes the currently selected entry: presses Backspace, asserts that the dialog names exactly
+/// this entry and kind, asserts the sentinels, and only then confirms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Delete {
+    /// The entry name the dialog must show.
+    pub name: String,
+    /// The kind of entry the dialog must show.
+    pub kind: EntryKind,
+    /// The bound on the waits inside the step.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// Waits for a fixture-relative path to appear or disappear.
+///
+/// Used by both `wait_fs_absent` and `wait_fs_present`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitFs {
+    /// The fixture-relative path.
+    pub path: String,
+    /// The bound on the wait.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+string_enum! {
+    /// A live change the runner makes to the fixture.
+    pub enum MutateOp {
+        /// Create a new entry.
+        Appear => "appear",
+        /// Change an existing entry in place.
+        Change => "change",
+        /// Remove an existing entry.
+        Vanish => "vanish",
+        /// Replace an existing entry with a different one of the same name.
+        Replace => "replace",
+    }
+}
+
+/// Changes the fixture while the program runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FsMutate {
+    /// What to do.
+    pub op: MutateOp,
+    /// The fixture-relative path to act on.
+    pub path: String,
+}
+
+/// Resizes the terminal. Unlike the initial terminal, a resize may go below the supported minimum
+/// to exercise the resize message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resize {
+    /// The new width in columns.
+    pub cols: u16,
+    /// The new height in rows.
+    pub rows: u16,
+}
+
+string_enum! {
+    /// A signal or console event a runner can deliver.
+    pub enum Signal {
+        /// Unix `SIGTERM`.
+        Term => "term",
+        /// Unix `SIGHUP`.
+        Hup => "hup",
+        /// Unix `SIGQUIT`.
+        Quit => "quit",
+        /// Unix `SIGINT`.
+        Int => "int",
+        /// Windows console close event.
+        Close => "close",
+        /// Windows console break event.
+        Break => "break",
+    }
+}
+
+/// Delivers a signal or console event to the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendSignal {
+    /// The signal to deliver.
+    pub signal: Signal,
+}
+
+/// Asserts the current screen. At least one of `contains`, `not_contains`, and `regex` must list
+/// something.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectScreen {
+    /// Text that must appear.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contains: Vec<String>,
+    /// Text that must not appear.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_contains: Vec<String>,
+    /// Regular expressions that must match, in Rust `regex` syntax.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regex: Vec<String>,
+    /// Limits every check to part of the screen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<Region>,
+}
+
+/// Asserts which fixture-relative paths exist now. At least one list must be non-empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectFs {
+    /// Paths that must exist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub present: Vec<String>,
+    /// Paths that must not exist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absent: Vec<String>,
+}
+
+string_enum! {
+    /// What must remain in the scenario scratch directory after the program exits.
+    pub enum Residue {
+        /// Nothing at all.
+        None => "none",
+    }
+}
+
+/// Waits for the program to exit and asserts how it ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectExit {
+    /// The exit code.
+    pub code: i32,
+    /// `true` asserts that the terminal is restored (alternate screen left, cursor visible, echo
+    /// and canonical mode on); `false` asserts that it is not.
+    pub terminal_restored: bool,
+    /// What may be left behind.
+    pub residue: Residue,
+    /// The bound on the wait for the exit.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// Asserts that the metric called `metric` is within `budget`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectBudget {
+    /// The budget, including any scenario override.
+    pub budget: Budget,
+    /// The recorded metric to compare, either built in or produced by `measure`.
+    pub metric: String,
+}
+
+string_enum! {
+    /// Which end of a measurement a `measure` step marks.
+    pub enum Marker {
+        /// The measurement starts.
+        Start => "start",
+        /// The measurement stops and its elapsed time is recorded.
+        Stop => "stop",
+    }
+}
+
+/// Marks the start or stop of a named measurement. The elapsed milliseconds between the two are
+/// recorded as the metric `name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Measure {
+    /// The metric name.
+    pub name: String,
+    /// Which end this step marks.
+    pub marker: Marker,
+}
+
+/// Waits until the program has processed everything sent so far.
+///
+/// The in-process runner drains its owner loop with the runtime's existing barrier. The
+/// pseudo-terminal runner waits on semantic signals only (events, header state, frame counts),
+/// never on the screen being idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settle {
+    /// The bound on the wait.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// Performs the ordinary confirmed quit: presses `q`, waits for the quit prompt, and confirms.
+/// It does not assert the exit; follow it with `expect_exit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Quit {
+    /// The bound on the wait for the prompt.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// A key to press.
+///
+/// Written as a single character (`"y"`, `"/"`, `" "`) or one of the [`KeyName::NAMES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum KeyName {
+    /// A printable character.
+    Char(char),
+    /// Enter.
+    Enter,
+    /// Escape.
+    Esc,
+    /// Backspace.
+    Backspace,
+    /// Tab.
+    Tab,
+    /// Arrow up.
+    Up,
+    /// Arrow down.
+    Down,
+    /// Arrow left.
+    Left,
+    /// Arrow right.
+    Right,
+    /// Page Up.
+    PageUp,
+    /// Page Down.
+    PageDown,
+}
+
+/// A string that is neither a single printable character nor a named key.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "unknown key {0:?}: use one printable character or one of {names}",
+    names = KeyName::NAMES.join(", ")
+)]
+pub struct KeyNameError(String);
+
+impl KeyName {
+    /// The names of the non-character keys.
+    pub const NAMES: [&'static str; 10] = [
+        "enter",
+        "esc",
+        "backspace",
+        "tab",
+        "up",
+        "down",
+        "left",
+        "right",
+        "page_up",
+        "page_down",
+    ];
+
+    /// The name of a non-character key, or `None` for [`KeyName::Char`].
+    #[must_use]
+    pub const fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Char(_) => None,
+            Self::Enter => Some("enter"),
+            Self::Esc => Some("esc"),
+            Self::Backspace => Some("backspace"),
+            Self::Tab => Some("tab"),
+            Self::Up => Some("up"),
+            Self::Down => Some("down"),
+            Self::Left => Some("left"),
+            Self::Right => Some("right"),
+            Self::PageUp => Some("page_up"),
+            Self::PageDown => Some("page_down"),
+        }
+    }
+}
+
+impl FromStr for KeyName {
+    type Err = KeyNameError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut characters = text.chars();
+        if let (Some(character), None) = (characters.next(), characters.next())
+            && !character.is_control()
+        {
+            return Ok(Self::Char(character));
+        }
+        match text {
+            "enter" => Ok(Self::Enter),
+            "esc" => Ok(Self::Esc),
+            "backspace" => Ok(Self::Backspace),
+            "tab" => Ok(Self::Tab),
+            "up" => Ok(Self::Up),
+            "down" => Ok(Self::Down),
+            "left" => Ok(Self::Left),
+            "right" => Ok(Self::Right),
+            "page_up" => Ok(Self::PageUp),
+            "page_down" => Ok(Self::PageDown),
+            _ => Err(KeyNameError(text.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for KeyName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Char(character) => write!(formatter, "{character}"),
+            named => formatter.write_str(named.name().unwrap_or_default()),
+        }
+    }
+}
+
+impl TryFrom<String> for KeyName {
+    type Error = KeyNameError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        text.parse()
+    }
+}
+
+impl From<KeyName> for String {
+    fn from(key: KeyName) -> Self {
+        key.to_string()
+    }
+}
