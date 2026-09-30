@@ -1,0 +1,19 @@
+schema_version = 1
+id = "mount-boundary"
+description = "A mount boundary inside a fixture: `outside/` is ordinary, `mnt/` is an empty mount point in the master. A privileged run copy attaches a 16 MiB volume there and writes 20 files of 2 KiB onto it."
+seed = 17
+
+[[parts]]
+kind = "tree"
+root = "outside"
+depth = 1
+fanout = 2
+files_per_dir = 3
+file_size = { min = 100, max = 2000 }
+
+[[parts]]
+kind = "volume"
+root = "mnt"
+size_mib = 16
+files = 20
+file_bytes = 2048

@@ -1,0 +1,70 @@
+schema_version = 1
+id = "all-classes-small"
+description = "One small instance of every class in a single fixture: a wide and a nested tree, a deep chain, the identity class, the hostile class, and a mount point. Used to prove determinism and the oracle across all classes at once."
+seed = 20260930
+
+[[parts]]
+kind = "tree"
+root = "nested"
+depth = 2
+fanout = 3
+files_per_dir = 4
+file_placement = "leaves"
+dir_names = { style = "hex", prefix = "n", length = 4 }
+file_names = { style = "hex", prefix = "f", suffix = ".txt", length = 6 }
+file_size = { min = 1, max = 2048 }
+
+[[parts]]
+kind = "tree"
+root = "wide"
+depth = 0
+files_per_dir = 50
+file_names = { style = "sequential", prefix = "w", suffix = ".dat", width = 3 }
+file_size = { min = 1, max = 512 }
+
+[[parts]]
+kind = "deep"
+root = "deep"
+depth = 20
+name_len = 240
+files_per_level = 1
+file_size = 8
+
+[[parts]]
+kind = "identity"
+root = "identity"
+hard_link_groups = 2
+links_per_group = 3
+link_spread = 3
+dangling_symlinks = 1
+valid_symlinks = true
+symlink_loops = ["self", "pair", "directory"]
+sparse_files = [{ apparent_mib = 32, data_kib = 8 }]
+clones = 1
+clone_kib = 32
+
+[[parts]]
+kind = "hostile"
+root = "hostile"
+features = [
+  "control_names",
+  "bidi_names",
+  "escape_names",
+  "newline_names",
+  "invalid_utf8_names",
+  "long_names",
+  "unreadable_dirs",
+  "unreadable_files",
+]
+
+[[parts]]
+kind = "volume"
+root = "mnt"
+size_mib = 16
+files = 5
+file_bytes = 1024
+
+[[parts]]
+kind = "file"
+root = "sentinel.bin"
+size = 1000

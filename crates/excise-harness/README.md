@@ -16,8 +16,8 @@ This crate defines the vocabulary the harness shares:
 - [`report`](src/report): the versioned machine-output documents, with JSON Schemas in
   [`schemas/`](schemas).
 
-Runners (in-process, pseudo-terminal, headless), the fixture generator, and the `xtask` commands
-build on this vocabulary.
+Runners (in-process, pseudo-terminal, headless) and the `xtask` commands build on this vocabulary
+and on the [fixture generator](#fixtures), which creates and checks the trees they run against.
 
 ## Scenario files
 
@@ -345,6 +345,245 @@ This crate enforces rules 1 and 2 and the sentinel requirement of rule 4: a scen
 name a root, and `Scenario::validate` rejects unsafe paths and unguarded deletions. Rule 3, the
 run-time dialog and sentinel checks of rule 4, and rules 5 and 6 are obligations of the runner and
 the fixture generator.
+
+## Fixtures
+
+The fixture generator builds the trees that scenarios run against. A fixture is a small TOML spec.
+A seeded generator expands the spec into a manifest of every entry it will create, creates the
+tree, and seals it with the ownership marker. An oracle then reads the tree back with `lstat`,
+knowing nothing about the generator, so a generator that does not do what it says is caught. A
+scenario names its fixture by id, and the id names the spec: `fixture = "node-modules-2k"` is
+[`fixtures/node-modules-2k.toml`](fixtures/node-modules-2k.toml).
+
+A runner takes an already materialized fixture root plus the scenario. It gets the root from
+`Fixtures`:
+
+```rust
+let fixtures = Fixtures::bundled();
+let copy = fixtures.run_copy("delete-folder", run_dir)?; // fresh, marked, removed on drop
+let root = copy.root(); // what `excise` is pointed at
+```
+
+### Spec files
+
+One file per fixture, `fixtures/<id>.toml`. Parsing rejects unknown fields at every level, and
+loading validates the spec (sizes, counts, colliding roots, and at most 2,000,000 planned
+entries), so an absurd spec never reaches the generator. `FixtureSpec::load(dir, id)`,
+`load_bundled(id)`, `from_toml_str`, and `from_path` return typed errors.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `schema_version` | yes | `1`. |
+| `id` | yes | 1 to 64 lowercase ASCII letters, digits, `-`, or `_`: the file name and the scenario's `fixture`. |
+| `description` | yes | What the fixture is for. Not part of the spec hash. |
+| `seed` | yes | The default seed. Names and sizes are a pure function of the spec and the seed. |
+| `parts` | yes | At least one class generator. Each fills one top-level entry of the fixture, named by its `root`; roots are distinct. |
+
+```toml fixture-spec
+schema_version = 1
+id = "node-modules-2k"
+description = "The node_modules-shaped tree behind the scan-starvation finding."
+seed = 1
+
+[[parts]]
+kind = "tree"
+root = "node_modules"
+depth = 4
+fanout = 4
+files_per_dir = 8
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "pkg" }
+file_names = { style = "sequential", prefix = "m", suffix = ".js" }
+file_size = 1
+```
+
+Every part has a `kind` and a `root`, and rejects fields that are not its own. A *size* is a byte
+count (`file_size = 1`) or an inclusive range drawn from the seed (`file_size = { min = 1, max = 64 }`);
+a dense file is at most 1 GiB. A *name style* is one of:
+
+- `{ style = "sequential", prefix = "", suffix = "", width = 0 }`: `prefix`, the index padded to
+  `width` digits, `suffix`. Independent of the seed.
+- `{ style = "hex", prefix = "", suffix = "", length = 8 }`: `length` hexadecimal digits that are a
+  keyed permutation of the index, so names look random, never collide, and change with the seed.
+- `{ style = "literal", name = "keep.txt" }`: one entry with exactly that name.
+
+| `kind` | Class | Fields (defaults in parentheses) |
+|---|---|---|
+| `tree` | Scale | A directory tree of fixed fan-out: a wide directory (`depth = 0`), the `node_modules` shape, or many tiny files. `depth` (required, at most 32), `fanout` (1), `files_per_dir` (0), `file_placement` (`all`, or `leaves` for the deepest directories only), `dir_names` (sequential `d`), `file_names` (sequential `f` `.dat`), `file_size` (1). |
+| `deep` | Scale | A chain of nested directories, created relative to open directory handles so that it can pass `PATH_MAX`. `depth` (required, at most 512), `name_len` (required, 5 to 255 bytes), `files_per_level` (0), `file_size` (1). The deepest path has `len(root) + depth × (name_len + 1)` bytes: choose it above 1,024 (macOS) or 4,096 (Linux). |
+| `file` | Any | One top-level file, for sentinels. `size` (1). |
+| `identity` | Identity | Features are off until asked for. Entries live in `links/`, `dangling/`, `symlinks/`, `loops/`, `sparse/`, and `clones/` below the root, and every link target is relative. `hard_link_groups` (0) of `links_per_group` (2, at most 64) names, spread over `link_spread` (2) directories `links/d0`, `links/d1`, and so on, of `link_file_size` (4096); `dangling_symlinks` (0); `valid_symlinks` (false: one link to a file and one to a directory); `symlink_loops` (a list of `self`, `pair`, and `directory`); `sparse_files` (a list of `{ apparent_mib, data_kib = 4 }`, above 16 MiB to stay sparse on APFS); `clones` (0) of one original of `clone_kib` (64) KiB. |
+| `hostile` | Hostile | `features`, at least one and without repeats, of `control_names`, `bidi_names` (U+202E and friends), `escape_names` (ESC sequences), `newline_names`, `invalid_utf8_names`, `long_names` (255 bytes), `unreadable_dirs` (modes 000 and 100, with contents), and `unreadable_files` (modes 000 and 200). Each name feature creates one directory per name, holding a file of the same name. |
+| `volume` | Volumes | A mount point: an empty directory in the master. `size_mib` (required, 8 to 1024), `files` (0) of `file_bytes` (1024) written once a volume is attached (see [Volumes](#volumes)). |
+
+The specs the crate ships. Entries are planned entries; every generated fixture also holds the
+marker.
+
+| id | Entries | Purpose |
+|---|---|---|
+| `wide-1k` | 1,001 | Scale: one directory of 1,000 files. |
+| `node-modules-2k` | 2,389 | The F1/F2 repro shape: `node_modules/pkg{0..3}` nested 4 levels, 8 one-byte `m{0..7}.js` files per leaf (2,390 entries with the marker). |
+| `deep-past-path-max` | 122 | Scale: a 20-level chain of 240-byte names, past `PATH_MAX` on every platform. |
+| `identity-small` | 34 | Hard links across directories, dangling and looping symlinks, a sparse file, and a clone. |
+| `hostile-small` | 80 | Hostile names and unreadable entries. |
+| `all-classes-small` | 253 | Every class once, in one fixture. |
+| `delete-folder` | 5,014 | A 5,000-entry victim for deletion scenarios. |
+| `mount-boundary` | 13 | An ordinary `outside/` tree and an empty mount point; a privileged run copy attaches a 16 MiB volume with 20 files. |
+| `tiny-files-50k` | 49,050 | 49 directories of 1,000 tiny files. |
+| `tiny-files-1m` | 1,010,101 | One million tiny files. For nightly and manual tiers only: tests never generate it. |
+
+### Determinism and the manifest
+
+The plan is a pure function of the spec and the seed. Names and sizes come from the crate's own
+SplitMix64 generator, seeded per part and per file, so adding a part never shifts the others. There
+is no clock and no hash-map iteration anywhere in the output. The manifest lists every planned
+entry in canonical order (component-wise byte order, so a directory precedes its contents): path,
+kind, size, symlink target, hard-link group, permission override, sparse data length, clone source,
+and the capability the entry needs. Its SHA-256, the *manifest hash*, is defined by the byte
+encoding documented in `src/fixture/plan/mod.rs` and pinned by a test. The same spec and seed
+therefore give the same manifest hash on every machine, and a different seed gives a different one
+(except for a spec whose names and sizes use no seeded style, like `node-modules-2k`).
+
+Some entries need a capability that not every file system has: `symlinks`, `hard_links`,
+`sparse_files`, `clones`, `invalid_utf8_names`, `control_character_names`, and `restricted_modes`.
+They are in the plan everywhere. The generator probes the file system once, skips the entries whose
+capability is missing, and records each capability, the probe's evidence, and the number of skipped
+entries in the marker. The marker also holds a *realized hash* over the entries that were created;
+it equals the manifest hash exactly when nothing was skipped.
+
+| Capability | macOS (APFS), observed | Linux, from the code | Windows, from the code |
+|---|---|---|---|
+| `symlinks` | yes | yes | not created: the Windows file layer has no symbolic links |
+| `hard_links` | yes | yes | yes |
+| `sparse_files` | yes (32 MiB occupies 16 KiB) | yes | decided by the probe |
+| `clones` | yes: `fclonefileat`, no subprocess | only where the file system shares extents (`FICLONE`: btrfs, XFS with reflinks); skipped on ext4 and tmpfs | not created |
+| `invalid_utf8_names` | no: APFS answers `EILSEQ` | yes on ext4 | no |
+| `control_character_names` | yes | yes | no |
+| `restricted_modes` | yes | yes; a root process still reads mode 000 entries, which the marker records as `running_as_root` | not created |
+
+Only the macOS column has been observed. The Windows layer is compiled and type-checked for
+`x86_64-pc-windows-msvc` but has never run; there the oracle also lacks `allocated`, `dev`, `ino`,
+`nlink`, and `mode`, which stable `std` does not expose.
+
+### Cache and integrity
+
+`FixtureCache` keeps generated masters in `<target dir>/excise-fixtures.noindex/<spec hash>-<generator
+version>/`, where the target dir is `CARGO_TARGET_DIR` or the workspace `target` and the spec hash
+is 16 hexadecimal digits. The name changes with the spec, the seed, and the generator version, so a
+stale entry is never mistaken for a current one. Generation happens in a `.partial-…` sibling that
+is renamed into place once the marker, written last, has sealed it. Tests pass a temporary
+directory as the cache root and never touch the shared cache.
+
+The marker `.excise-harness-owned` is a regular file (never a link) at every fixture root. Its JSON
+records the generator version, spec id, spec hash, seed, role (`master` or `run-copy`), manifest
+and realized hashes, entry counts, skipped counts, capabilities, generation time, and threads.
+Before a cached master is reused it is verified, cheapest first:
+
+1. the marker exists, parses, and names this generator version, spec id, spec hash, seed, and manifest hash;
+2. the marker's realized hash agrees with the plan;
+3. the top-level names equal the planned ones plus the marker;
+4. the contents: every planned entry when the plan has at most 20,000 entries, otherwise a sample of
+   64 chosen from the manifest hash. `Verify::Full` forces the full walk.
+
+An entry that fails is removed and regenerated, a partial directory left by a killed generation is
+never used, and a hit skips generation. Two processes that race to build the same entry agree on
+one.
+
+### Per-run copies
+
+A cached master is read-only for runners. `Fixtures::run_copy(id, parent)` generates the same plan
+fresh into a uniquely named directory below `parent`, with its own marker (`role = "run-copy"`).
+Generating rather than copying makes the copy exact by construction, hostile modes and links
+included. Dropping the copy removes it: `remove_tree` restores owner access to each directory before
+it descends and works through directory handles, so it removes trees that contain mode 000
+directories and trees deeper than `PATH_MAX`. `RunCopy::keep` opts out. `RunCopy::regenerate(part)`
+removes one top-level entry and generates it again, so a deletion scenario can run again without a
+new copy, and `RunCopy::oracle()` walks the copy as it is now.
+
+### Oracle
+
+`Oracle::collect(root)` walks the tree with `lstat`, never following a link, and reports raw facts
+and none of Excise's accounting rules (`docs/safety/accounting.md`); the differential runner maps
+those rules onto them. The document has `document_kind = "harness-fixture-oracle"` and
+`schema_version = 1`:
+
+| Field | Meaning |
+|---|---|
+| `platform` | `os`, and whether `identity` (`dev`, `ino`, `nlink`) and `allocation` (`allocated`) are filled in. |
+| `entries` | The root (empty path) first, then every entry in canonical order. |
+| `entries[].path` | Relative to the root, in the native-path encoding of Excise's JSON reports (`docs/schemas/native-path.schema.json`): `unix-bytes` with base64 data on Unix, so a name that is not valid UTF-8 round-trips. |
+| `entries[].kind` | `directory`, `file`, `symlink`, or `other`. |
+| `entries[].size` | `st_size`. For a symbolic link, the length of its target; for a directory, a property of the file system. |
+| `entries[].allocated` | `st_blocks × 512`, or `null` where the platform cannot say. |
+| `entries[].dev`, `ino`, `nlink`, `mode` | `st_dev`, `st_ino`, `st_nlink`, and `st_mode & 0o7777`, or `null`. |
+| `entries[].readable` | Whether the walking process can open the entry, and list it if it is a directory. A fact about the process: root reads a mode 000 file. |
+| `entries[].device_boundary` | The directory is on another device than its parent: a mount point. |
+| `entries[].symlink_target` | The text of a symbolic link, in the same encoding as `path`. |
+| `entries[].subtree` | For a directory, the totals below it: `entries`, `files`, `directories`, `symlinks`, `others`, `unreadable_directories`, `apparent_bytes`, `apparent_unique_bytes`, `allocated_bytes` (each `(dev, ino)` once), `directory_apparent_bytes`, and `directory_allocated_bytes`. |
+| `hard_links` | Files with more than one name: `dev`, `ino`, `nlink`, and the `paths` the walk found. |
+
+Read like `du`: `du -sk root` is `root.allocated + subtree.directory_allocated_bytes +
+subtree.allocated_bytes`, rounded up to KiB, in every `du`. The apparent-size total depends on the
+implementation, and the tests pin each rule exactly, with the expected value computed from the
+per-entry facts:
+
+| `du` | Command | Adds up `size` of | Unit |
+|---|---|---|---|
+| GNU coreutils 9.2 and later | `du --apparent-size -sb` | regular files and symbolic links only | bytes |
+| GNU coreutils before 9.2 | `du --apparent-size -sb` | every entry, directories included | bytes |
+| BSD (macOS) | `du -A -sk` | every entry, directories included, each rounded up to 512 bytes first | KiB, rounded up |
+
+GNU 9.2 stopped counting directories and every other entry that is not a regular file or a symbolic
+link (its NEWS: "`du --apparent` now counts apparent sizes only of regular files and symbolic
+links"), so on such a system a tree is short by the `size` of its directories, 4,096 bytes each on
+ext4. The tests do not read the version: they run `du` on a directory whose contents they know and
+see which rule applies. Every `du` counts a hard-linked file once per `(dev, ino)`. For a directory
+it cannot list, GNU adds the directory's own size and blocks after its `cannot read directory`
+message (its source: "even if this directory is unreadable ... do let its size contribute to the
+total") and BSD leaves it out; the oracle keeps it, flagged `readable = false`, so the caller
+chooses. BSD `du` stops where a path passes `PATH_MAX`, so it sees only the top of a `deep`
+fixture, while GNU `du` descends by descriptor; the oracle always walks all of it. The tests check
+every class that `du` can walk.
+
+### Live mutators
+
+`mutate::apply(root, op, path)` performs a scenario's `fs_mutate` step at a step boundary. It refuses
+a root without the marker, a path that breaks `check_fixture_relative_path` (`..`, an absolute path,
+a backslash, a Windows drive or device name), any path that names the marker, and any path that has
+a symbolic link in it: each component is opened relative to an open directory without following
+links, and the last one is not followed either, so `vanish` removes a link and never its target.
+Content is a function of the path, so a repeated run makes the same bytes.
+
+| `op` | Effect |
+|---|---|
+| `appear` | Creates a regular file of 4,096 bytes, and any missing directories above it. Fails if the path exists. |
+| `change` | Appends 4,096 bytes to an existing regular file: same inode, larger size. |
+| `vanish` | Removes an existing entry. A directory goes with everything below it. |
+| `replace` | Gives an existing entry a new identity under the same name. A file is replaced atomically, through a rename, by a new file of 1,024 bytes. A directory is swapped for a new empty one, so the name is briefly absent. |
+
+### Volumes
+
+A `volume` part puts only an empty mount-point directory in the master. `RunCopy::attach_volumes`
+attaches a size-limited volume there and writes the part's files onto it, so a run has a real mount
+boundary. The copy detaches its volumes before it removes its tree, and removal never crosses a
+mount boundary: a directory on another device is an error, so an attached volume is never emptied by
+accident.
+
+Creating a volume needs privileges on Linux and Windows and touches host mount state everywhere, so
+it needs an explicit opt-in: a `PrivilegedOptIn`, from `PrivilegedOptIn::from_env()` (the variable
+`EXCISE_HARNESS_PRIVILEGED` set to exactly `1`) or `PrivilegedOptIn::granted()` for an operator's
+explicit flag. Nothing attaches a volume by default, and the tests skip their volume steps without
+the opt-in.
+
+| OS | Mechanism | Privilege |
+|---|---|---|
+| macOS | `hdiutil create -type SPARSE -fs APFS`, then `hdiutil attach -mountpoint` | None. |
+| Linux | A sparse image formatted with `mkfs.ext4` and mounted with `mount -o loop,nodev,nosuid` | Root, or `sudo -n`. Written from the tools' documentation and never run. |
+| Windows | A `diskpart` script that creates and formats a VHD and assigns it to the folder | Elevated. Written from documentation and never run. |
+
+```console
+EXCISE_HARNESS_PRIVILEGED=1 cargo test -p excise-harness --locked --lib volume
+```
 
 ## Output documents
 

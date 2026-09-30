@@ -1,0 +1,15 @@
+schema_version = 1
+id = "tiny-files-1m"
+description = "One million tiny files: 100 x 100 leaf directories of 100 files of 1 to 32 bytes. 1,010,101 entries counting the root directory. Nightly and manual tiers only; tests must never generate it."
+seed = 1000000
+
+[[parts]]
+kind = "tree"
+root = "tiny"
+depth = 2
+fanout = 100
+files_per_dir = 100
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "g", width = 3 }
+file_names = { style = "sequential", prefix = "t", suffix = ".dat", width = 3 }
+file_size = { min = 1, max = 32 }

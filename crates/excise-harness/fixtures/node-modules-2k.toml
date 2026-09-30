@@ -1,0 +1,15 @@
+schema_version = 1
+id = "node-modules-2k"
+description = "The scan-starvation repro tree: node_modules/pkg{0..3} nested four levels, eight one-byte m{0..7}.js files in each of the 256 leaf packages. 2,389 entries below the root (341 directories, 2,048 files); 2,390 counting the root."
+seed = 1
+
+[[parts]]
+kind = "tree"
+root = "node_modules"
+depth = 4
+fanout = 4
+files_per_dir = 8
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "pkg" }
+file_names = { style = "sequential", prefix = "m", suffix = ".js" }
+file_size = 1

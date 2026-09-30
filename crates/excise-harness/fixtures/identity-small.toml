@@ -1,0 +1,18 @@
+schema_version = 1
+id = "identity-small"
+description = "The identity class: hard-link groups with names in different directories, dangling and working symbolic links, self, pair, and directory loops, two sparse files (64 MiB and 32 MiB of apparent size), and two clones (skipped where the file system cannot clone)."
+seed = 11
+
+[[parts]]
+kind = "identity"
+root = "identity"
+hard_link_groups = 3
+links_per_group = 3
+link_spread = 2
+link_file_size = { min = 4096, max = 16384 }
+dangling_symlinks = 2
+valid_symlinks = true
+symlink_loops = ["self", "pair", "directory"]
+sparse_files = [{ apparent_mib = 64, data_kib = 4 }, { apparent_mib = 32 }]
+clones = 2
+clone_kib = 64

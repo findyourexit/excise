@@ -1,0 +1,28 @@
+schema_version = 1
+id = "delete-folder"
+description = "A folder to delete and the siblings that must survive. `victim/` holds 5,011 entries (111 directories, 4,900 files of 100 to 8,192 bytes); `keep-a.bin` and `keep-b/keep.txt` are the sentinels."
+seed = 20260930
+
+[[parts]]
+kind = "file"
+root = "keep-a.bin"
+size = 4096
+
+[[parts]]
+kind = "tree"
+root = "keep-b"
+depth = 0
+files_per_dir = 1
+file_names = { style = "literal", name = "keep.txt" }
+file_size = 64
+
+[[parts]]
+kind = "tree"
+root = "victim"
+depth = 2
+fanout = 10
+files_per_dir = 49
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "part", width = 2 }
+file_names = { style = "hex", prefix = "blob-", suffix = ".bin", length = 6 }
+file_size = { min = 100, max = 8192 }
