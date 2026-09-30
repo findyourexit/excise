@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/harness/schemas/harness-summary-v1.json",
+  "title": "Excise harness summary v1",
+  "description": "The result of one validation harness run. Internal test tooling, not a supported product interface.",
+  "type": "object",
+  "required": [
+    "document_kind",
+    "schema_version",
+    "run_id",
+    "tier",
+    "started_at",
+    "finished_at",
+    "host",
+    "os",
+    "arch",
+    "excise_binary",
+    "git_sha",
+    "scenarios"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "harness-summary" },
+    "schema_version": { "const": 1 },
+    "run_id": {
+      "description": "Also the name of the run's output directory.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "tier": { "enum": ["quick", "full", "nightly", "weekly"] },
+    "started_at": { "$ref": "#/$defs/timestamp" },
+    "finished_at": { "$ref": "#/$defs/timestamp" },
+    "host": { "$ref": "#/$defs/text" },
+    "os": { "$ref": "#/$defs/text" },
+    "arch": { "$ref": "#/$defs/text" },
+    "excise_binary": { "$ref": "#/$defs/binary_identity" },
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "scenarios": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/scenario_result" }
+    }
+  },
+  "$defs": {
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "timestamp": {
+      "description": "An RFC 3339 date-time.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "profile": {
+      "enum": ["default", "deterministic", "monochrome-ascii", "narrow", "mouse-keymaps"]
+    },
+    "verdict": {
+      "description": "xpass means an expected failure passed; it fails the run.",
+      "enum": ["pass", "fail", "xfail", "xpass", "error"]
+    },
+    "binary_identity": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "$ref": "#/$defs/text" },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "scenario_result": {
+      "type": "object",
+      "required": ["name", "profile", "verdict", "duration_ms", "metrics"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "profile": { "$ref": "#/$defs/profile" },
+        "verdict": { "$ref": "#/$defs/verdict" },
+        "duration_ms": { "$ref": "#/$defs/unsigned" },
+        "metrics": {
+          "description": "Named measurements. Every value is a finite number.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "type": "number" }
+        },
+        "failure_bundle": { "$ref": "#/$defs/text" }
+      }
+    }
+  }
+}

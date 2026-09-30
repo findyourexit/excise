@@ -791,6 +791,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "excise-harness"
+version = "0.0.0"
+dependencies = [
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

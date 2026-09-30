@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/harness/schemas/harness-ab-v1.json",
+  "title": "Excise harness A/B evidence v1",
+  "description": "Paired, interleaved comparison evidence for two builds. Internal test tooling, not a supported product interface.",
+  "type": "object",
+  "required": [
+    "document_kind",
+    "schema_version",
+    "baseline",
+    "candidate",
+    "fixture_hash",
+    "trials",
+    "interleaving",
+    "metrics",
+    "context"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "harness-ab" },
+    "schema_version": { "const": 1 },
+    "baseline": { "$ref": "#/$defs/build" },
+    "candidate": { "$ref": "#/$defs/build" },
+    "fixture_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16,128}$"
+    },
+    "trials": {
+      "description": "The number of paired trials.",
+      "$ref": "#/$defs/count"
+    },
+    "interleaving": {
+      "description": "The order in which the individual runs executed.",
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/side" }
+    },
+    "metrics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/metric" }
+    },
+    "context": { "$ref": "#/$defs/context" }
+  },
+  "$defs": {
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "side": { "enum": ["baseline", "candidate"] },
+    "build": {
+      "type": "object",
+      "required": ["git_ref", "binary_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "git_ref": { "$ref": "#/$defs/text" },
+        "binary_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "samples": {
+      "description": "One measurement per trial, index-aligned across the two sides.",
+      "type": "object",
+      "required": ["baseline", "candidate"],
+      "additionalProperties": false,
+      "properties": {
+        "baseline": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "number" }
+        },
+        "candidate": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "number" }
+        }
+      }
+    },
+    "bootstrap_ci": {
+      "description": "A bootstrap confidence interval for the median per-trial candidate/baseline ratio.",
+      "type": "object",
+      "required": ["lower", "upper", "confidence"],
+      "additionalProperties": false,
+      "properties": {
+        "lower": { "type": "number" },
+        "upper": { "type": "number" },
+        "confidence": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "required": ["name", "samples", "median_ratio", "bootstrap_ci", "verdict"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "samples": { "$ref": "#/$defs/samples" },
+        "median_ratio": {
+          "type": "number",
+          "minimum": 0
+        },
+        "bootstrap_ci": { "$ref": "#/$defs/bootstrap_ci" },
+        "verdict": { "enum": ["block", "warn", "pass"] }
+      }
+    },
+    "context": {
+      "type": "object",
+      "required": [
+        "host",
+        "cpu",
+        "os",
+        "toolchain",
+        "power",
+        "concurrent_excise_processes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "host": { "$ref": "#/$defs/text" },
+        "cpu": { "$ref": "#/$defs/text" },
+        "os": { "$ref": "#/$defs/text" },
+        "toolchain": { "$ref": "#/$defs/text" },
+        "power": {
+          "description": "For example ac, battery, or unknown.",
+          "$ref": "#/$defs/text"
+        },
+        "concurrent_excise_processes": { "$ref": "#/$defs/count" }
+      }
+    }
+  }
+}

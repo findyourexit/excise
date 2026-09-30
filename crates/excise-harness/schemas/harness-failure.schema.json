@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/harness/schemas/harness-failure-v1.json",
+  "title": "Excise harness failure bundle v1",
+  "description": "The evidence for one failed scenario. Internal test tooling, not a supported product interface.",
+  "type": "object",
+  "required": [
+    "document_kind",
+    "schema_version",
+    "scenario",
+    "profile",
+    "failed_step",
+    "screen",
+    "terminal_modes",
+    "cast_path",
+    "rusage",
+    "fixture",
+    "repro_command"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "harness-failure" },
+    "schema_version": { "const": 1 },
+    "scenario": { "$ref": "#/$defs/identifier" },
+    "profile": { "$ref": "#/$defs/profile" },
+    "failed_step": { "$ref": "#/$defs/failed_step" },
+    "screen": { "$ref": "#/$defs/screen" },
+    "terminal_modes": { "$ref": "#/$defs/terminal_modes" },
+    "cast_path": {
+      "description": "The asciicast recording of the session.",
+      "$ref": "#/$defs/text"
+    },
+    "rusage": { "$ref": "#/$defs/rusage" },
+    "fixture": { "$ref": "#/$defs/fixture" },
+    "repro_command": {
+      "description": "A command that reruns exactly this scenario, profile, and fixture.",
+      "$ref": "#/$defs/text"
+    }
+  },
+  "$defs": {
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "profile": {
+      "enum": ["default", "deterministic", "monochrome-ascii", "narrow", "mouse-keymaps"]
+    },
+    "failed_step": {
+      "type": "object",
+      "required": ["index", "description"],
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "description": "The zero-based index into the scenario's steps.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "description": { "$ref": "#/$defs/text" }
+      }
+    },
+    "screen": {
+      "type": "object",
+      "required": ["expected", "actual"],
+      "additionalProperties": false,
+      "properties": {
+        "expected": {
+          "description": "The expectation that failed, rendered as text.",
+          "type": "string"
+        },
+        "actual": {
+          "description": "The screen text from the screen model, not raw output bytes.",
+          "type": "string"
+        }
+      }
+    },
+    "terminal_modes": {
+      "type": "object",
+      "required": ["alternate_screen", "cursor_visible", "echo", "icanon"],
+      "additionalProperties": false,
+      "properties": {
+        "alternate_screen": { "type": "boolean" },
+        "cursor_visible": { "type": "boolean" },
+        "echo": { "type": "boolean" },
+        "icanon": { "type": "boolean" }
+      }
+    },
+    "rusage": {
+      "type": "object",
+      "required": ["max_rss_bytes", "user_ms", "sys_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "max_rss_bytes": { "$ref": "#/$defs/unsigned" },
+        "user_ms": { "$ref": "#/$defs/unsigned" },
+        "sys_ms": { "$ref": "#/$defs/unsigned" }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "required": ["hash", "seed"],
+      "additionalProperties": false,
+      "properties": {
+        "hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16,128}$"
+        },
+        "seed": { "$ref": "#/$defs/unsigned" }
+      }
+    }
+  }
+}
