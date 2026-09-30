@@ -1,0 +1,22 @@
+schema_version = 1
+id = "delete-file"
+description = "A file to delete and the entries that must survive it. `victim.bin` is the victim; `keep-a.bin` beside it and `docs/keep-0.txt` one folder down are the sentinels, and `docs/keep-1.txt` is a sibling that must survive too."
+seed = 20261001
+
+[[parts]]
+kind = "file"
+root = "victim.bin"
+size = 49152
+
+[[parts]]
+kind = "file"
+root = "keep-a.bin"
+size = 16384
+
+[[parts]]
+kind = "tree"
+root = "docs"
+depth = 0
+files_per_dir = 2
+file_names = { style = "sequential", prefix = "keep-", suffix = ".txt" }
+file_size = 12288

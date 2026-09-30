@@ -1,0 +1,52 @@
+schema_version = 1
+name = "navigate-and-quit"
+description = "Drilling into a folder and back out returns to where the map started, and quitting exits cleanly."
+fixture = "navigate-folders"
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "photos"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "wait_text"
+text = "photos"
+region = "header"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+
+[[steps]]
+step = "key"
+key = "esc"
+
+[[steps]]
+step = "settle"
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["photos"]
+region = "header"
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"

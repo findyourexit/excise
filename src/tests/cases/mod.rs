@@ -3,6 +3,7 @@ mod config;
 mod native_path;
 mod outcome;
 mod runtime;
+mod scenario_runner;
 mod tachyonfx;
 pub mod test_utils;
 pub mod ui;
