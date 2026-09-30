@@ -20,6 +20,9 @@ allow = [
 confidence-threshold = 0.8
 exceptions = [
   { allow = ["MPL-2.0"], crate = "option-ext@0.2.0" },
+  # libproc reads the peak physical footprint on macOS. Its build script needs bindgen, which needs libloading.
+  { allow = ["BSD-3-Clause"], crate = "bindgen@0.72.1" },
+  { allow = ["ISC"], crate = "libloading@0.8.9" },
 ]
 
 [licenses.private]

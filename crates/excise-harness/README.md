@@ -300,6 +300,92 @@ Details that a table cannot carry:
 - **Verdicts.** A run succeeds only if no result has a blocking verdict; see
   [Expected failures](#expected-failures).
 
+## PTY runner
+
+`excise_harness::runner` executes a validated scenario against a real `excise` process in a
+pseudo-terminal. `run_scenario` runs one scenario under one profile; `run_e2e` runs the scenario ×
+profile matrix behind `cargo xtask e2e`. Both take an already-materialized fixture root and refuse
+a root without the ownership marker `.excise-harness-owned` before any process exists.
+
+| Module | What it does |
+|---|---|
+| `pty` | The session: `portable-pty` with a `vt100` screen model, key encoding for every scenario key with Ctrl and Alt, `ESC[6n` cursor-position requests answered from the screen model, resize, an asciicast v2 recording with output (`"o"`) and input (`"i"`) events, and the terminal modes that failure bundles report. |
+| `events` | A strict reader for the event channel (`EXCISE_TEST_EVENTS`, protocol v1). It reads complete lines only, rejects an unknown `v`, and requires the first event to be the `hello` of the process the runner started. |
+| `metrics` | Latency, stalls, output volume, and resource use (below). |
+| `safety` | Ownership markers, environment isolation, scratch areas, process-group kill, fixture snapshots, and residue checks. |
+| `runner` | Step execution, the verdict map, failure bundles, and the matrix. |
+
+**Isolation.** The child starts with an empty environment plus `TERM=xterm-256color`, `COLORTERM`,
+`LANG`, and the profile's variables (see [Profiles](#profiles)). `HOME`, `EXCISE_CONFIG`, the
+working directory, `EXCISE_SCAN_STORE_DIR`, and the temporary directory point into a fresh scratch
+area, and `EXCISE_TEST_EVENTS` names a new file inside it. The scratch area is deleted after the
+run unless `--keep-fixture` is given.
+
+**Process group.** On Unix the child leads its own session, so its process group id is its pid.
+A timeout, a failed step, or dropping the session kills the whole group with `SIGKILL`, and the
+session waits until nothing is left. On Windows there is no group to signal: the child is ended
+with the library's process termination, which does not reach descendants (`excise` starts none). A
+job object would, but creating one needs `unsafe`, which this workspace allows only in
+`src/os/windows.rs`.
+
+**Steps.**
+
+- **`settle`** waits for a `frame` event whose `inputs` counter is at least the number of input
+  events the runner has sent and that was observed after the last one was written. It then reads
+  the terminal output still in flight (at most 20 ms, ending after 3 ms of quiet) so that the
+  screen model has caught up with the frame. A key that changes nothing draws no frame and never
+  settles.
+- **`select`** opens the filter with `/`, erases any text it opened with, types the name, checks
+  the prompt, presses Enter, and waits until the inspector pane shows exactly that name.
+- **`delete`** presses Backspace and reads the dialog. It presses `y` only when the dialog names
+  exactly the requested entry, kind, and path and every sentinel exists. Any mismatch fails the
+  step and no `y` is ever sent. The step ends when the `deletion_finished` event and the first
+  frame after it have been read, so the screen shows the result. The program rebuilds its map after
+  a deletion and treats a quit during the rebuild as a cancellation (exit code 130): a scenario
+  that goes on to quit waits for the header to read `COMPLETE` first.
+- **`quit`** presses `q`, waits for the quit dialog, and confirms with `y`.
+- **`resize`** resizes the terminal and waits for the frame that answers it.
+- **`wait_event`** matches any event read so far, including events before the step began.
+- **`expect_exit`** also compares the fixture with its state before the run: only confirmed
+  deletions may differ. Residue is anything the run leaves in its scratch store and temporary
+  directories, or elsewhere in the scratch area apart from the event file and the configuration.
+- **`signal`** is delivered to the child on Unix (`term`, `hup`, `quit`, `int`). Windows console
+  events (`close`, `break`) need `unsafe` console calls, so the runner reports them as unsupported.
+- **`fs_mutate`** applies the fixture generator's mutator (`fixture::mutate::apply`) when the step
+  runs. A refused mutation fails the step and changes nothing. An applied one is an intended
+  change: `expect_exit` accepts differences at that path, below it, and in the directories the
+  mutation created above it, and nothing else.
+- A step's `timeout_ms` bounds the whole step, not each wait inside it.
+
+**Measurements.** Each run reports finite, named metrics. The scenario `expect_budget` step and the
+run summary use the same names.
+
+| Metric | Meaning |
+|---|---|
+| `first_frame_ms`, `scan_complete_ms` | Spawn to the first `frame` event, and to `scan_complete`. `run_e2e` launches the binary once with `--version` before its first run, in an isolated environment with a 10 s limit, so the first measured session does not include the one-time code-signature assessment that macOS applies to a new binary (over 300 ms on its first launch against 5 to 8 ms afterwards). A warm-up that fails or times out stops the matrix with an error. |
+| `input_to_frame_p50_ms`, `input_to_frame_p99_ms`, `input_to_frame_max_ms`, `input_samples` | For each key written while the previous one had been answered: the write to the first frame that reflects it. |
+| `max_stall_ms` | The longest gap between two frames inside a window in which the program was active (scanning, or working on a deletion or an input). |
+| `quit_ms`, `delete_ms` | The confirmation key to the exit of the process, and to `deletion_finished`. |
+| `output_bytes`, `output_bytes_per_s`, `frames`, `inputs_sent` | Terminal output and its rate, frames drawn, and input events sent. |
+| `peak_rss_bytes`, `user_ms`, `sys_ms` | Peak memory (the peak physical footprint on macOS, the peak resident set size on Linux) and the child's CPU time. |
+| `threads`, `fds` | The most threads and descriptors seen in a sample taken every 50 ms (`libproc` on macOS, `/proc` on Linux; not sampled on Windows). |
+
+Timing values are only evidence when compared in paired, interleaved runs; see
+[Output documents](#output-documents).
+
+**Failure bundles.** A failed run leaves a directory with `failure.json` (the `harness-failure`
+document), `session.cast`, `screen.txt`, `events.jsonl`, and `repro.txt`, which gives the exact
+`excise` invocation and environment.
+
+**Fixtures.** Each run gets a disposable copy of its scenario's fixture from the fixture generator
+(`Fixtures::bundled().run_copy(id, dir)`), in a work directory under `/tmp` on Unix, where paths stay
+short enough for the deletion dialog to show them whole, or under `EXCISE_E2E_TMPDIR`. The dialog is
+at most 78 columns wide, and the Windows temporary directory is too long for it, so on Windows set
+`EXCISE_E2E_TMPDIR` to a short directory; CI uses the runner's temporary directory. The copy is
+removed when the run ends, and `--keep-fixture` keeps it. The runner checks ownership with the
+generator's `verify_owned`, which refuses a root that is a symbolic link and a marker that is not a
+regular file; `FixtureRoot` adds only the canonical spelling of the path.
+
 ## Safety rules
 
 The harness only ever runs `excise` against fixtures it generated itself, and never against a real

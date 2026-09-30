@@ -1,0 +1,69 @@
+schema_version = 1
+name = "delete-folder-lifecycle"
+description = "Deleting a folder removes it, leaves its neighbours alone, keeps the map navigable, and restores the terminal on quit."
+fixture = "delete-folder"
+sentinels = ["keep-a.bin", "keep-b/keep.txt"]
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 120
+rows = 40
+
+# The scan is finished only when the header badge says so.
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# Select the folder through the filter and check the inspector: the selection is what the pane
+# shows, not what the keys meant.
+[[steps]]
+step = "select"
+name = "victim"
+timeout_ms = 10000
+
+# Backspace opens the dialog. The step reads it and confirms only when it names exactly this folder
+# and every sentinel is intact; then it waits for the deletion to finish.
+[[steps]]
+step = "delete"
+name = "victim"
+kind = "folder"
+timeout_ms = 60000
+
+[[steps]]
+step = "wait_fs_absent"
+path = "victim"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "keep-b/keep.txt"]
+absent = ["victim"]
+
+# A deletion invalidates the map, and the program rebuilds it; quitting during the rebuild would
+# cancel it and exit 130. The `delete` step returns on a frame drawn after the deletion, so this
+# wait cannot be satisfied by the screen as it was before.
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# The map stays navigable: a key is answered by a frame that reflects it.
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+[[steps]]
+step = "quit"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000
