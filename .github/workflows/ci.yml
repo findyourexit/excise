@@ -53,6 +53,9 @@ jobs:
       - name: Run strict Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run unit, snapshot, and native PTY tests
+        env:
+          # The deletion dialog is at most 78 columns wide; the Windows temporary directory is too long for scenario fixtures.
+          EXCISE_E2E_TMPDIR: ${{ runner.os == 'Windows' && runner.temp || '' }}
         run: cargo test --workspace --locked
       - name: Run release-profile PTY checks
         shell: bash

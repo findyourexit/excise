@@ -16,5 +16,6 @@ jsonschema = { version = "0.58.2", default-features = false }
 sha2 = "0.11.0"
 tar = "0.4.46"
 excise = { path = ".." }
+excise-harness = { path = "../crates/excise-harness" }
 [lints]
 workspace = true

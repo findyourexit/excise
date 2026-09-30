@@ -166,6 +166,8 @@ After `homebrew-tap` environment approval, `publish-homebrew` renders and pushes
 
 The crates.io package follows the release commit’s Cargo exclusions: `.cargo`, `.github`, `.gitmessage`, `assets`, `tapes`, `handoff`, and `packaging`. `cargo package --locked --list` is the source of truth. The GitHub archive and tap do not become crate contents, and the `1.0.0` API boundary is command-line only; publishing is not a promise of a supported Rust library.
 
+The package's tests cannot be built from the crates.io tarball. They depend on the unpublished `excise-harness` workspace crate, a path-only dev-dependency that Cargo removes from the packaged manifest. `cargo publish` verifies only the library and binaries, so publishing is unaffected; run the tests from the repository.
+
 ## Channel Verification
 
 === "Nix and cargo-binstall"

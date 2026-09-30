@@ -1,3 +1,5 @@
+mod e2e;
+
 use clap_complete::Shell;
 use excise::cli_command;
 use flate2::Compression;
@@ -108,10 +110,11 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
         Some("render-homebrew") => render_homebrew_formula(),
         Some("dist-local") => build_local_dist(),
         Some("demo") => render_demo(),
+        Some("e2e") => e2e::e2e(args),
         Some("demo-features") => render_feature_demos(args),
         Some("create-release-tag") => create_release_tag(args),
         _ => Err(io::Error::other(
-            "usage: cargo xtask <verify|fuzz-toolchain|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|demo-features [NAME...]|create-release-tag>",
+            "usage: cargo xtask <verify|fuzz-toolchain|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|demo-features [NAME...]|e2e [--quick|--full] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--keep-fixture]|create-release-tag>",
         )
         .into()),
     }
