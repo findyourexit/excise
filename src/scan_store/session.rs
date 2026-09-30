@@ -102,10 +102,13 @@ pub(crate) enum ScanStoreError {
     DuplicateInputRun,
 }
 
-/// Logical sealed-run I/O used by the internal benchmark harness.
+/// Sealed-run I/O used by the internal benchmark harness.
 ///
-/// The counters measure serialized run bytes rather than operating-system
-/// syscalls, so they stay deterministic across page-cache behavior.
+/// The byte counters measure serialized run bytes rather than operating-system
+/// syscalls, so they stay deterministic across page-cache behavior. The two
+/// operation counters are exact totals for the session's quota: they count every
+/// completed durable `sync_data` on a run or manifest file, wherever it ran, and
+/// every completed manifest commit (temporary write, sync, and rename).
 #[cfg(feature = "internal")]
 #[allow(
     clippy::struct_field_names,
@@ -120,6 +123,8 @@ pub(crate) struct ScanStoreIoMetrics {
     pub(crate) reduction_written_bytes: u64,
     pub(crate) publication_read_bytes: u64,
     pub(crate) publication_written_bytes: u64,
+    pub(crate) durable_syncs: u64,
+    pub(crate) manifest_persists: u64,
 }
 
 /// A coherent, immutable scan generation retained after successful reduction.
@@ -495,10 +500,16 @@ impl ScanStore {
         })
     }
 
+    /// Returns the byte metrics tallied by this store plus the session's exact
+    /// sync and manifest-commit totals, which scanner workers also contribute to.
     #[cfg(feature = "internal")]
     #[must_use]
-    pub(crate) const fn io_metrics(&self) -> ScanStoreIoMetrics {
-        self.io_metrics
+    pub(crate) fn io_metrics(&self) -> ScanStoreIoMetrics {
+        ScanStoreIoMetrics {
+            durable_syncs: self.temporary_storage.durable_syncs(),
+            manifest_persists: self.temporary_storage.manifest_persists(),
+            ..self.io_metrics
+        }
     }
 
     #[cfg(feature = "internal")]
@@ -2657,5 +2668,177 @@ mod tests {
             .page(PageRequest::first(path("alpha"), 8))
             .expect("second nested page should load");
         assert_eq!(first_alpha, second_alpha);
+    }
+
+    #[cfg(feature = "internal")]
+    fn session_backed_store(parent: &tempfile::TempDir) -> ScanStore {
+        let quota =
+            TemporaryStorage::scan_store_with_limit_bytes(INDEXED_PUBLICATION_STORAGE_BYTES);
+        let storage = ScanStoreStorage::new(quota, Some(parent.path()))
+            .expect("private scan session should initialize");
+        ScanStore::new_with_storage(ScanGeneration::initial(), storage)
+            .expect("scan store should initialize")
+    }
+
+    #[cfg(feature = "internal")]
+    fn seal_entry(factory: &ScanInputRunFactory, name: &str) -> SealedRun {
+        factory
+            .seal_observation_batch(
+                vec![path_observation(name, PathEntryKind::File, 1)],
+                Vec::new(),
+            )
+            .expect("a one-entry batch should seal")
+            .pop()
+            .expect("a path batch seals one run")
+    }
+
+    #[cfg(feature = "internal")]
+    #[test]
+    fn admitting_runs_counts_one_seal_sync_and_one_manifest_commit_each() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = session_backed_store(&parent);
+        let created = store.io_metrics();
+        assert_eq!(
+            (created.durable_syncs, created.manifest_persists),
+            (1, 1),
+            "creating a session commits its first manifest once"
+        );
+
+        let factory = store
+            .input_run_factory()
+            .expect("the active generation should accept input");
+        // One run short of the fan-in: the level never fills, so nothing merges.
+        let batch = MAX_ACTIVE_INPUT_RUNS - 1;
+        let expected = u64::try_from(batch).expect("run count fits in u64");
+        let runs = (0..batch)
+            .map(|index| seal_entry(&factory, &format!("entry-{index}")))
+            .collect::<Vec<_>>();
+        let sealed = store.io_metrics();
+        assert_eq!(
+            sealed.durable_syncs - created.durable_syncs,
+            expected,
+            "each sealed run is synced once"
+        );
+        assert_eq!(
+            sealed.manifest_persists, created.manifest_persists,
+            "sealing commits no manifest"
+        );
+
+        for run in runs {
+            store
+                .accept_input_run(run)
+                .expect("a sealed run should be admitted");
+        }
+        let admitted = store.io_metrics();
+        assert_eq!(
+            admitted.manifest_persists - sealed.manifest_persists,
+            expected,
+            "each admission commits the manifest once"
+        );
+        assert_eq!(
+            admitted.durable_syncs - sealed.durable_syncs,
+            expected,
+            "each manifest commit syncs once, and a level below the fan-in seals no merged run"
+        );
+    }
+
+    #[cfg(feature = "internal")]
+    #[test]
+    fn a_compaction_merge_adds_one_seal_sync_and_one_manifest_commit() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = session_backed_store(&parent);
+        let factory = store
+            .input_run_factory()
+            .expect("the active generation should accept input");
+        let runs = (0..MAX_ACTIVE_INPUT_RUNS)
+            .map(|index| seal_entry(&factory, &format!("entry-{index}")))
+            .collect::<Vec<_>>();
+        let sealed = store.io_metrics();
+        for run in runs {
+            store
+                .accept_input_run(run)
+                .expect("a sealed run should be admitted");
+        }
+        let admitted = store.io_metrics();
+        let admissions = u64::try_from(MAX_ACTIVE_INPUT_RUNS).expect("fan-in fits in u64");
+        assert_eq!(
+            admitted.manifest_persists - sealed.manifest_persists,
+            admissions + 1,
+            "every admission commits once and the full level's merge commits once more"
+        );
+        assert_eq!(
+            admitted.durable_syncs - sealed.durable_syncs,
+            admissions + 2,
+            "one sync per manifest commit plus the merged run's own seal"
+        );
+    }
+
+    #[cfg(feature = "internal")]
+    #[test]
+    fn a_manifest_commit_the_quota_rejects_counts_nothing() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let quota = TemporaryStorage::scan_store_with_limit_bytes(1);
+        let storage = ScanStoreStorage::new(quota.clone(), Some(parent.path()))
+            .expect("private scan session should initialize");
+        assert!(
+            ScanStore::new_with_storage(ScanGeneration::initial(), storage).is_err(),
+            "the first manifest cannot be charged to a one-byte quota"
+        );
+        assert_eq!(quota.durable_syncs(), 0);
+        assert_eq!(quota.manifest_persists(), 0);
+    }
+
+    #[cfg(feature = "internal")]
+    #[test]
+    fn worker_thread_seals_count_toward_their_own_session_only() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let first = session_backed_store(&parent);
+        let second = session_backed_store(&parent);
+        let (first_before, second_before) = (first.io_metrics(), second.io_metrics());
+        let first_factory = first
+            .input_run_factory()
+            .expect("first store should accept input");
+        let second_factory = second
+            .input_run_factory()
+            .expect("second store should accept input");
+
+        // Both sessions seal concurrently from several threads, as scanner workers do.
+        let (first_workers, first_per_worker) = (4_usize, 3_usize);
+        let (second_workers, second_per_worker) = (3_usize, 5_usize);
+        let sealed = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker in 0..first_workers {
+                let factory = first_factory.clone();
+                workers.push(scope.spawn(move || {
+                    (0..first_per_worker)
+                        .map(|batch| seal_entry(&factory, &format!("a-{worker}-{batch}")))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            for worker in 0..second_workers {
+                let factory = second_factory.clone();
+                workers.push(scope.spawn(move || {
+                    (0..second_per_worker)
+                        .map(|batch| seal_entry(&factory, &format!("b-{worker}-{batch}")))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("sealing worker should finish"))
+                .collect::<Vec<_>>()
+        });
+
+        let first_seals = first_workers * first_per_worker;
+        let second_seals = second_workers * second_per_worker;
+        assert_eq!(sealed.len(), first_seals + second_seals);
+        assert_eq!(
+            first.io_metrics().durable_syncs - first_before.durable_syncs,
+            u64::try_from(first_seals).expect("count fits in u64"),
+        );
+        assert_eq!(
+            second.io_metrics().durable_syncs - second_before.durable_syncs,
+            u64::try_from(second_seals).expect("count fits in u64"),
+        );
     }
 }

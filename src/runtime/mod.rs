@@ -1,4 +1,6 @@
 mod clock;
+#[cfg(feature = "internal")]
+mod probe;
 mod scanner;
 mod worker;
 
@@ -16,6 +18,10 @@ use ratatui::backend::Backend;
 #[cfg(any(test, feature = "fuzzing", feature = "internal"))]
 pub use clock::VirtualClock;
 pub(crate) use clock::{Clock, SystemClock};
+#[cfg(feature = "internal")]
+pub use probe::{
+    HISTOGRAM_BUCKETS, OwnerLoopProbe, OwnerLoopReport, OwnerPhase, PhaseHistogram, WorkerEventKind,
+};
 use worker::{DeletionWorkSubmissionError, ScannedEntry, WorkerEvent, WorkerPool};
 
 use crate::App;
@@ -265,6 +271,8 @@ where
             .ok_or_else(|| AppError::Invariant("worker pool already stopped".to_string()))?;
         let shutdown_result = workers.shutdown();
         let finish_result = self.app.finish();
+        #[cfg(feature = "internal")]
+        self.finish_probe();
 
         let outcome = loop_result?;
         shutdown_result?;
@@ -355,6 +363,8 @@ where
     }
 
     fn process_one_input(&mut self) -> Result<bool, AppError> {
+        #[cfg(feature = "internal")]
+        let _input = self.probe_phase(OwnerPhase::Input);
         let result = match self.input.read()? {
             InputEvent::Barrier => {
                 self.animation.set_activity_suspended(true);
@@ -730,6 +740,8 @@ where
     }
 
     fn handle_scan_entry(&mut self, entry: ScannedEntry) {
+        #[cfg(feature = "internal")]
+        self.probe_scan_entry();
         self.scan_view_dirty |= entry.path.starts_with(&self.scan_view_root);
         if self.primary_scan_active {
             self.summary.scanned_entries = self.summary.scanned_entries.saturating_add(1);
@@ -749,6 +761,8 @@ where
         let lease = lease.ok_or_else(|| {
             AppError::Invariant("scanner emitted an unleased sealed coverage result".to_string())
         })?;
+        #[cfg(feature = "internal")]
+        let _admission = self.probe_admission(input_runs.len());
         self.app.admit_scan_input_runs(lease, input_runs);
         Ok(())
     }
@@ -820,7 +834,11 @@ where
             self.app.cancel_primary_scan()?;
         } else {
             let reduction = self.workers()?.acquire_reducer()?;
+            #[cfg(feature = "internal")]
+            let publication = self.probe_phase(OwnerPhase::Publication);
             self.app.finalize_scan();
+            #[cfg(feature = "internal")]
+            drop(publication);
             self.workers()?
                 .finish_coordinated_work(reduction, WorkCompletion::Succeeded)?;
             self.app.start_ui();
@@ -859,6 +877,8 @@ where
 
     #[allow(clippy::too_many_lines)]
     fn handle_worker_event(&mut self, event: WorkerEvent) -> Result<(), AppError> {
+        #[cfg(feature = "internal")]
+        let _worker_event = self.probe_worker_event(&event);
         let exit_work_may_change = matches!(
             &event,
             WorkerEvent::ScanBatch { .. }
@@ -878,6 +898,8 @@ where
                     let lease = lease.as_ref().ok_or_else(|| {
                         AppError::Invariant("scanner emitted an unleased sealed batch".to_string())
                     })?;
+                    #[cfg(feature = "internal")]
+                    let _admission = self.probe_admission(input_runs.len());
                     self.app.admit_scan_input_runs(lease, input_runs);
                 }
                 debug_assert!(self.pending_scan_entries.is_empty());
@@ -1121,6 +1143,8 @@ where
     }
 
     fn render(&mut self) -> Result<bool, AppError> {
+        #[cfg(feature = "internal")]
+        let mut frame = self.probe_phase(OwnerPhase::Render);
         let result = self.app.render_if_dirty(
             &mut self.animation,
             self.clock.now(),
@@ -1132,6 +1156,12 @@ where
         );
         if matches!(&result, Ok(true)) {
             crate::app::emit_pty_test_marker("TERMINAL_READY");
+        }
+        #[cfg(feature = "internal")]
+        if !matches!(&result, Ok(true))
+            && let Some(frame) = frame.as_mut()
+        {
+            frame.cancel();
         }
 
         self.flush_deletion_plan_cancellation()?;

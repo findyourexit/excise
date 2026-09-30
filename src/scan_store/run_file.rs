@@ -259,6 +259,10 @@ impl RunWriter {
         self.write_reserved(&footer)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
+        #[cfg(feature = "internal")]
+        if let Some(reservation) = self.reservation.as_ref() {
+            reservation.record_durable_sync();
+        }
         let file = self.writer.get_ref().try_clone()?;
         let path = self.path.take();
         Ok(SealedRun {

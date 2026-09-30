@@ -193,9 +193,13 @@ impl ScanStoreStorage {
         temporary.write_all(encoded)?;
         temporary.flush()?;
         temporary.as_file().sync_data()?;
+        #[cfg(feature = "internal")]
+        self.quota.record_durable_sync();
         temporary
             .persist(self.root().join(MANIFEST_FILE))
             .map_err(|error| error.error)?;
+        #[cfg(feature = "internal")]
+        self.quota.record_manifest_persist();
         Ok(())
     }
 
