@@ -9,7 +9,10 @@
 //!   validation.
 //! * [`report`] holds the versioned machine-output documents (`harness-summary`,
 //!   `harness-failure`, `harness-ab`); their JSON Schemas live in `schemas/`.
+//! * [`fixture`] generates the fixtures scenarios run against, and computes the independent
+//!   oracle of what a generated tree contains.
 
+pub mod fixture;
 pub mod report;
 pub mod scenario;
 mod string_enum;

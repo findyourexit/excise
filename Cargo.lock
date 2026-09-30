@@ -794,9 +794,13 @@ dependencies = [
 name = "excise-harness"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "jsonschema",
+ "rustix",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.21",
  "toml",
 ]

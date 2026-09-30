@@ -1,0 +1,12 @@
+schema_version = 1
+id = "deep-past-path-max"
+description = "A chain of 60 directories with 90-byte names, one file per level. The deepest path is 5,464 bytes, past PATH_MAX on macOS (1,024) and Linux (4,096): only directory-relative calls can create or walk it."
+seed = 3
+
+[[parts]]
+kind = "deep"
+root = "deep"
+depth = 60
+name_len = 90
+files_per_level = 1
+file_size = { min = 1, max = 64 }

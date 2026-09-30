@@ -1,0 +1,18 @@
+schema_version = 1
+id = "hostile-small"
+description = "The hostile class: names with control characters, bidirectional overrides, escape sequences, and line breaks; names that are not valid UTF-8 (skipped where the file system refuses them); 255-byte names; and directories and files that cannot be read (mode 000, 100, and 200)."
+seed = 13
+
+[[parts]]
+kind = "hostile"
+root = "hostile"
+features = [
+  "control_names",
+  "bidi_names",
+  "escape_names",
+  "newline_names",
+  "invalid_utf8_names",
+  "long_names",
+  "unreadable_dirs",
+  "unreadable_files",
+]

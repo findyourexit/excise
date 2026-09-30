@@ -1,0 +1,13 @@
+schema_version = 1
+id = "wide-1k"
+description = "One directory holding 1,000 files with seed-driven names and sizes: the small wide shape of the scale class."
+seed = 7
+
+[[parts]]
+kind = "tree"
+root = "wide"
+depth = 0
+files_per_dir = 1000
+dir_names = { style = "sequential", prefix = "d" }
+file_names = { style = "hex", prefix = "w-", suffix = ".dat", length = 8 }
+file_size = { min = 1, max = 256 }
