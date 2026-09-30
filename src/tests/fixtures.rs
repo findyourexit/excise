@@ -14,11 +14,7 @@ impl TestDirectory {
         let directory = Builder::new()
             .prefix(&format!("excise-{name}-"))
             .tempdir()?;
-        SNAPSHOT_PATHS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .expect("failed to lock snapshot path registry")
-            .push((directory.path().to_path_buf(), name.to_owned()));
+        register_snapshot_root(directory.path(), name);
         Ok(Self { directory })
     }
 
@@ -26,6 +22,16 @@ impl TestDirectory {
     pub fn path(&self) -> &Path {
         self.directory.path()
     }
+}
+
+/// Makes displayed paths under `root` read `/tmp/excise_tests/<name>/...`, so frames do not
+/// depend on where the directory lives.
+pub fn register_snapshot_root(root: &Path, name: &str) {
+    SNAPSHOT_PATHS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("failed to lock snapshot path registry")
+        .push((root.to_path_buf(), name.to_owned()));
 }
 
 pub fn snapshot_path(path: &Path) -> String {

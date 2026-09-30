@@ -1,0 +1,25 @@
+schema_version = 1
+id = "navigate-folders"
+description = "Two folders to move between and a file beside them: `photos/` holds two 25 KiB files, `music/` holds one 40 KiB file, and `readme.txt` is 2 KiB."
+seed = 20261001
+
+[[parts]]
+kind = "tree"
+root = "photos"
+depth = 0
+files_per_dir = 2
+file_names = { style = "sequential", prefix = "photo-", suffix = ".jpg" }
+file_size = 25600
+
+[[parts]]
+kind = "tree"
+root = "music"
+depth = 0
+files_per_dir = 1
+file_names = { style = "literal", name = "track.mp3" }
+file_size = 40960
+
+[[parts]]
+kind = "file"
+root = "readme.txt"
+size = 2048

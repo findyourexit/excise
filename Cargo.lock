@@ -821,6 +821,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "redb",
+ "regex",
  "rustix",
  "serde",
  "serde_json",

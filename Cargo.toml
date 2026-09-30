@@ -95,6 +95,7 @@ portable-pty = "0.9.0"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 jsonschema = { version = "0.58.2", default-features = false }
 excise-harness = { path = "crates/excise-harness" }
+regex = "1.13.1"
 
 [lints]
 workspace = true

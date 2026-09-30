@@ -541,6 +541,8 @@ marker.
 | `hostile-small` | 80 | Hostile names and unreadable entries. |
 | `all-classes-small` | 253 | Every class once, in one fixture. |
 | `delete-folder` | 5,014 | A 5,000-entry victim for deletion scenarios. |
+| `delete-file` | 5 | A 48 KiB victim file, a sentinel beside it, and a folder below it with two more files that must survive. The in-process lifecycle scenario deletes the victim. |
+| `navigate-folders` | 6 | Two folders and a file beside them, to drill into and back out of. |
 | `mount-boundary` | 13 | An ordinary `outside/` tree and an empty mount point; a privileged run copy attaches a 16 MiB volume with 20 files. |
 | `tiny-files-50k` | 49,050 | 49 directories of 1,000 tiny files. |
 | `tiny-files-1m` | 1,010,101 | One million tiny files. For nightly and manual tiers only: tests never generate it. |
@@ -727,6 +729,103 @@ By convention a run writes its summary to `target/excise-e2e/<run-id>/summary.js
 is only meaningful from paired, interleaved A/B runs on one host in one session; the `harness-ab`
 document records the host, CPU, toolchain, power state, and concurrent `excise` processes so a
 comparison can be judged.
+
+## In-process runner
+
+The in-process runner runs a scenario against the real owner loop inside the `excise` crate's own
+test binary, with a ratatui `TestBackend` as the terminal. It is test-only code in
+`src/tests/scenario_runner.rs`, so this crate still never depends on `excise`. The `excise` tests
+run every scenario in [`scenarios/`](scenarios) that the runner can perform, under every profile
+the scenario declares:
+
+```console
+cargo test -p excise --lib scenario_runner
+```
+
+The runner takes an already-materialized fixture root and refuses one that the harness does not
+own (`verify_owned`: a real directory, not a link, holding `.excise-harness-owned` as a regular
+file). The suite gets each root from [`Fixtures`](#fixtures):
+`Fixtures::bundled().run_copy(id, parent)` generates a fresh, marked copy of the fixture the
+scenario names, in a scratch directory of its own, and removes it when it drops. A run that deletes
+or mutates therefore never touches the cached master.
+
+### Profiles
+
+The profiles are the in-process column of the contract, built from the same options through the
+same configuration layers, without reading the environment or a configuration file:
+
+| Profile | In-process configuration |
+|---|---|
+| `default` | The configuration defaults. |
+| `deterministic` | Reduced motion, loading animation off, one scan thread. |
+| `monochrome-ascii` | The monochrome theme, ASCII symbols and borders. |
+| `narrow` | A backend 60 columns wide, with the scenario's rows. |
+| `mouse-keymaps` | Mouse input, the Emacs key preset. |
+
+### Steps
+
+| Step | In-process behavior |
+|---|---|
+| `key`, `type` | Deliver key events. An uppercase letter carries Shift. An unmodified `e` or `E` outside a text prompt is refused: it would export a report into the process working directory, which the runner cannot isolate. |
+| `settle` | Delivers one barrier. See [`settle`](#settle-and-waits). |
+| `wait_text`, `expect_screen` | Match the screen text, or one region of it: `header` (the top three rows), `dialog`, or `rows`. |
+| `wait_header` | Reads the state badge that ends the title row. `scanning` can only be seen before the first settle. |
+| `select` | Opens the filter, replaces what it holds, types the name, applies it, and waits for the selected-item panel to name exactly that entry. The panel needs a terminal of at least 19 rows. |
+| `delete` | Presses Backspace, parses the dialog, asserts its title and path name exactly this entry and kind under the fixture root (a path the dialog cut short cannot be checked), asserts every sentinel exists, and only then sends `y`. A mismatch fails the step and `y` is never sent. |
+| `wait_fs_absent`, `wait_fs_present`, `expect_fs` | Resolve paths one component at a time, never through a symbolic link. |
+| `fs_mutate` | Applies `appear`, `change`, `vanish`, or `replace` with the [live mutators](#live-mutators), once the program is at rest: unless the last thing delivered was a barrier, one comes first, so even a mutation that opens the scenario lands after the first scan has settled. Nothing tells the program, so what it does about the change is what the steps after this one observe. A refused mutation fails the step with the mutator's reason. |
+| `resize` | Resizes the backend and delivers the resize event. |
+| `quit` | Presses `q`, waits for the plain `Quit Excise?` prompt, and presses `y`. A prompt about pending deletion work fails the step. |
+| `expect_exit` | Asserts the exit code the binary would return, and with `residue = "none"` that the run's scratch directory for its scan-store session is empty. `terminal_restored = true` is accepted and not evaluated: there is no terminal to inspect. |
+
+Every sentinel is asserted again when the run is over.
+
+A scenario with any other step is rejected before it runs, with `RunError::Unsupported { steps }`:
+
+- `signal` needs a separate process to receive it.
+- `wait_event` needs the event channel, which belongs to a separate process.
+- `expect_budget` and `measure` judge timing and resources, which are never judged in-process.
+- `expect_exit` with `terminal_restored = false`, and any step after `expect_exit`.
+- `type` text with control characters.
+
+The test suite selects only the scenarios the runner can perform, and skips the rest with the
+reason: a step only another runner can perform, a fixture that needs a scratch volume (only a
+privileged process runner attaches one), or a fixture that plans more than 10,000 entries (the
+large fixtures are for the runners built for them). A scenario file that does not parse, does not
+validate, is not named after its scenario, or names a fixture with no loadable spec fails the suite
+instead of being skipped.
+
+### `settle` and waits
+
+`settle` is the runtime's barrier: it renders, then drains worker events, background deletion
+work, timers, and animation until the owner loop is quiescent. In-process time is virtual, and the
+barrier drains work outside the production scheduling path, so **this runner never judges
+scheduling, throughput, latency, memory, or any other budget**. The pseudo-terminal and headless
+runners judge those.
+
+Every wait is a bounded loop: check, and while the condition does not hold, deliver a barrier and
+check again, until the step's `timeout_ms` (wall time) or the round limit is reached. Reaching a
+bound fails the step with what was seen. A check runs on a fresh screen: when input was delivered
+since the last barrier, a barrier comes first, so a scenario needs no `settle` before an
+assertion and no barrier counts found by trial. A barrier itself waits for real scan and deletion
+work and is not cut short by `timeout_ms`.
+
+### Failures and verdicts
+
+A failure names the step index and description, the reason, the expectation, and the screen text.
+A run resolves to a `Verdict` with strict xfail: an `expect = "fail"` scenario that passes is an
+`xpass` and fails the run.
+
+### Adding a scenario
+
+1. Write `scenarios/<name>.toml`, named after the scenario. Lifecycle scenarios declare the
+   `default` and `deterministic` profiles.
+2. Name a fixture from [`fixtures/`](fixtures), or add a spec there (see
+   [Spec files](#spec-files)).
+3. Use only the steps above. Put a `quit` and an `expect_exit` at the end, so the run ends the way
+   a user would end it; a scenario that stops earlier is stopped by the runner.
+4. Run `cargo test -p excise --lib scenario_runner`. A scenario with a step only another runner
+   can perform is skipped, so it is never silently dropped from the suite: check the skip reasons.
 
 ## Working on the crate
 

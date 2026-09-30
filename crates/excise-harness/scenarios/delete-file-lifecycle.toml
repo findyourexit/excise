@@ -1,0 +1,53 @@
+schema_version = 1
+name = "delete-file-lifecycle"
+description = "Deleting a file removes only that file, leaves its siblings alone, and keeps the map navigable."
+fixture = "delete-file"
+sentinels = ["keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "victim.bin"
+
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+timeout_ms = 30000
+
+[[steps]]
+step = "wait_fs_absent"
+path = "victim.bin"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
+absent = ["victim.bin"]
+
+# The map stays navigable: it still completes, and another entry can be selected.
+[[steps]]
+step = "wait_header"
+state = "complete"
+
+[[steps]]
+step = "select"
+name = "keep-a.bin"
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
