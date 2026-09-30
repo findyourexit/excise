@@ -32,6 +32,8 @@ registries = []
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"
+# The harness is a path-only dev-dependency of excise. Cargo strips it from the packaged manifest.
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"

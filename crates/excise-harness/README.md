@@ -386,6 +386,33 @@ removed when the run ends, and `--keep-fixture` keeps it. The runner checks owne
 generator's `verify_owned`, which refuses a root that is a symbolic link and a marker that is not a
 regular file; `FixtureRoot` adds only the canonical spelling of the path.
 
+## Running scenarios
+
+```console
+cargo xtask e2e [--quick|--full] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--keep-fixture]
+```
+
+The command builds the `excise` release binary, or uses the one named by `EXCISE_E2E_BINARY`, loads
+the scenarios in [`scenarios/`](scenarios), runs each under its profiles, and prints a verdict
+table. It exits non-zero on any `fail`, `xpass`, or `error`.
+
+- `--quick` runs the `default` and `deterministic` profiles only and must stay within two minutes.
+  `--full`, the default, runs every profile a scenario declares.
+- `--scenario` and `--profile` narrow the matrix and may repeat. `--repeat N` runs each pair `N`
+  times, which is how identical verdicts are shown.
+- `--keep-fixture` keeps each run's fixture and scratch area and prints where they are.
+- The summary is `target/excise-e2e/<run-id>/summary.json`, a `harness-summary` document, and
+  `target/excise-e2e/latest` points at the newest run (a symbolic link, or on Windows a text file).
+  Failure bundles sit beside it, one directory per failed run.
+
+The negative control for the `delete` step is not a scenario. It is
+[`tests/controls/delete-wrong-target.toml`](tests/controls/delete-wrong-target.toml): it selects a
+folder and then asks `delete` for a different entry. `cargo xtask e2e` never runs it, because it is
+not in `scenarios/`. `tests/harness_scenarios.rs` in the `excise` crate runs each scenario once per
+profile against the crate's own binary as part of `cargo test`, and runs the control to assert that
+the `delete` step failed, that the last input was Backspace, that no `y` appears among the
+recording's input events, and that every byte of the fixture is unchanged.
+
 ## Safety rules
 
 The harness only ever runs `excise` against fixtures it generated itself, and never against a real
