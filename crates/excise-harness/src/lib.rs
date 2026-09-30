@@ -12,7 +12,12 @@
 //! * [`fixture`] generates the fixtures scenarios run against, and computes the independent
 //!   oracle of what a generated tree contains.
 
+pub mod events;
 pub mod fixture;
+pub mod metrics;
+pub mod pty;
 pub mod report;
+pub mod runner;
+pub mod safety;
 pub mod scenario;
 mod string_enum;

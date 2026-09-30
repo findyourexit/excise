@@ -1,0 +1,28 @@
+schema_version = 1
+name = "delete-wrong-target"
+description = "Negative control for the deletion safety rules. It is not a product scenario: cargo xtask e2e never runs it, and tests/harness_scenarios.rs runs it and asserts that the delete step fails. The folder `victim` is selected but the delete step names a different entry, so the step must fail before any confirmation key is sent."
+fixture = "delete-folder"
+sentinels = ["keep-a.bin", "keep-b/keep.txt"]
+profiles = ["default"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# The folder `victim` is selected...
+[[steps]]
+step = "select"
+name = "victim"
+timeout_ms = 10000
+
+# ...but the step names a different entry. The dialog names `victim`, so the step must refuse.
+[[steps]]
+step = "delete"
+name = "keep-a.bin"
+kind = "file"
+timeout_ms = 10000
