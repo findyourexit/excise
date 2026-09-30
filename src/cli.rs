@@ -17,9 +17,9 @@ use crate::native_path::{ResolvedRoot, safe_display_text};
 use crate::report::{ReportError, ScanReport};
 use crate::runtime::{RuntimeSettings, SystemClock, run, scan_headless};
 use crate::terminal::{SplitColorWriter, TerminalSession, validate_terminal};
+use crate::test_events;
 use crate::theme::ThemeId;
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn run_main() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -78,6 +78,9 @@ pub(crate) fn run_main() -> i32 {
         config_path: preference_path,
         monochrome_locked,
     };
+    if let Err(error) = test_events::init_from_env() {
+        return report_error(&error);
+    }
     if output_format != OutputFormat::Tui {
         let outcome = match scan_headless(settings) {
             Ok(outcome) => outcome,
@@ -92,6 +95,12 @@ pub(crate) fn run_main() -> i32 {
         }
         return outcome.exit_class().code();
     }
+    let code = run_tui(settings);
+    test_events::exit(code);
+    code
+}
+
+fn run_tui(settings: RuntimeSettings) -> i32 {
     if let Err(error) = validate_terminal() {
         return report_error(&error);
     }

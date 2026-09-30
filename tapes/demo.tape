@@ -36,7 +36,7 @@ Set Framerate 24
 Hide
 Type `set -euo pipefail; umask 077; fixture="/tmp/excise-vhs-fixture"; if [[ -e "$fixture" || -L "$fixture" ]]; then printf 'refusing existing fixture path: %s\n' "$fixture" >&2; exit 1; fi; mkdir -m 700 "$fixture"; config="${fixture}/config.toml"; readonly fixture config; touch "$fixture/.excise-vhs-owned"; trap 'test -f "$fixture/.excise-vhs-owned" && rm -rf -- "$fixture"' EXIT; mkdir -p "$fixture/media" "$fixture/backups" "$fixture/cache" "$fixture/downloads" "$fixture/projects/src"; head -c 6291456 /dev/zero > "$fixture/media/capture.mov"; head -c 3355443 /dev/zero > "$fixture/backups/snapshot.tar"; head -c 2097152 /dev/zero > "$fixture/cache/index.bin"; head -c 1258291 /dev/zero > "$fixture/downloads/toolchain.pkg"; head -c 786432 /dev/zero > "$fixture/projects/target.bin"; head -c 262144 /dev/zero > "$fixture/projects/src/main.rs"; head -c 98304 /dev/zero > "$fixture/projects/src/lib.rs"; head -c 340992 /dev/zero > "$fixture/notes.md"; printf 'version = 1\n[runtime]\nformat = "tui"\n' > "$config"`
 Enter
-Type `unset EXCISE_CONFIG EXCISE_ROOT EXCISE_SCAN_THREADS EXCISE_EVENT_BUFFER EXCISE_APPARENT_SIZE EXCISE_CROSS_FILESYSTEMS EXCISE_EXCLUDE EXCISE_MEMORY_MIB EXCISE_REDUCED_MOTION EXCISE_THEME EXCISE_ASCII EXCISE_MOUSE EXCISE_KEYMAP EXCISE_FORMAT EXCISE_OUTPUT EXCISE_PTY_TEST_MARKERS NO_COLOR; export COLORTERM=truecolor; export TERM=xterm-256color`
+Type `unset EXCISE_CONFIG EXCISE_ROOT EXCISE_SCAN_THREADS EXCISE_EVENT_BUFFER EXCISE_APPARENT_SIZE EXCISE_CROSS_FILESYSTEMS EXCISE_EXCLUDE EXCISE_MEMORY_MIB EXCISE_REDUCED_MOTION EXCISE_THEME EXCISE_ASCII EXCISE_MOUSE EXCISE_KEYMAP EXCISE_FORMAT EXCISE_OUTPUT EXCISE_TEST_EVENTS NO_COLOR; export COLORTERM=truecolor; export TERM=xterm-256color`
 Enter
 Type `clear`
 Enter

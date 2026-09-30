@@ -85,6 +85,35 @@ Interactive support requires stdin and stdout TTYs, ANSI rendering, alternate-sc
 
     Build the site and inspect the changed page, navigation, rendered diagrams, tabs, admonitions, and links.
 
+## Test Event Channel
+
+!!! warning "Internal testing interface"
+
+    The test event channel exists for Excise's own tests and validation tooling. It is not part of the v1 command-line, configuration, or report contract, and it can change in any release. It is not a user setting, so the configuration reference deliberately omits it.
+
+Set `EXCISE_TEST_EVENTS` to the path of a file that does not exist yet, outside the tree Excise scans, because a file inside that tree is scanned like any other. Excise creates that file exclusively, with mode `0600` on Unix, and appends one JSON object per line. It never opens or truncates an existing path, and on Unix a symbolic link at the path is rejected rather than followed. An empty value, an existing path, a missing directory, or any other creation failure is a configuration error: Excise reports it and exits with class 78 before it touches the terminal. Without the variable, Excise creates no file and starts no thread, and each emission site costs one branch.
+
+Each event is written as one complete line and flushed, never synced to disk. If a write fails, the channel disables itself for the rest of the run, so a reader that went away cannot crash or stall the interface.
+
+Events carry counts and timings only. They never contain names, paths, or other scan data.
+
+Protocol version 1 objects start with `v` (always `1`) and `kind`, and end with `t_us`, the monotonic microseconds since the channel opened:
+
+| `kind` | Fields | Emitted |
+|---|---|---|
+| `hello` | `version`, `pid` | First line. `version` is the Excise package version. |
+| `frame` | `seq`, `inputs` | After every render that drew. `seq` counts drawn frames from 1. `inputs` counts the terminal input events the main loop has consumed so far. |
+| `scan_complete` | `entries` | The initial scan finished and the map switched to its completed state. `entries` is the scanned-entry count. |
+| `quit_prompt` | none | The quit dialog was built. It can be built again while background work finishes. |
+| `deletion_finished` | `removed`, `failed` | A deletion worker reported. The counts come from its report. |
+| `exit` | `code` | An interactive run is about to return its exit code. The terminal, if it was entered, has already been restored. A process that panics or is killed emits none. |
+
+An event marks a state change, not the screen that shows it. Wait for the next `frame` before reading the terminal.
+
+A headless run (`--format json` or `--format table`) opens the channel and writes only its `hello` line.
+
+`tests/pty_smoke.rs` consumes the channel on every platform today, and the validation harness will consume it later.
+
 ## Release Candidate Checks
 
 !!! warning "Candidate input must be exact"

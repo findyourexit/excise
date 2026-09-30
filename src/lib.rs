@@ -88,6 +88,7 @@ pub mod terminal;
 #[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod terminal;
+mod test_events;
 #[cfg(feature = "internal")]
 pub mod theme;
 #[cfg(not(feature = "internal"))]

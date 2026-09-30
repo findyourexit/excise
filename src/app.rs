@@ -1,6 +1,6 @@
 #[cfg(test)]
 use std::fs::Metadata;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,15 +57,6 @@ const MINIMUM_PLAN_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_DELETION_REPORTS: usize = 32;
 const SNAPSHOT_PAGE_ENTRIES: usize = 512;
 const MAX_SNAPSHOT_PAGE_HISTORY: usize = 32;
-
-pub(crate) fn emit_pty_test_marker(label: &str) {
-    if std::env::var_os("EXCISE_PTY_TEST_MARKERS").is_none() {
-        return;
-    }
-    let mut stdout = io::stdout();
-    let _ = writeln!(stdout, "\n__EXCISE_PTY_{label}__");
-    let _ = stdout.flush();
-}
 
 pub enum UiMode {
     Loading,
@@ -1221,7 +1212,6 @@ where
                 _ => {}
             }
         }
-        emit_pty_test_marker("SCAN_COMPLETE");
     }
 
     pub(crate) fn record_loading_entry(&mut self, entry_path: PathBuf) {
@@ -1451,7 +1441,7 @@ where
         }
         self.ui_mode = UiMode::Exiting { work, return_to };
         self.sync_deletion_work_summary();
-        emit_pty_test_marker("QUIT_PROMPT");
+        crate::test_events::quit_prompt();
         self.mark_dirty();
     }
 
