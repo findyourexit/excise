@@ -271,7 +271,7 @@ fn check_support_matrix() -> Result<(), Box<dyn Error>> {
             "Supported in stable v1",
             "docs/development.md",
         )?;
-        require_row(&support, target, "| Supported |", "SUPPORT.md")?;
+        require_row(&support, target, "✅ Supported", "SUPPORT.md")?;
     }
     for target in BUILD_ONLY_TARGETS {
         if ci.contains(target) {
@@ -287,11 +287,11 @@ fn check_support_matrix() -> Result<(), Box<dyn Error>> {
             "Build-only and best effort",
             "docs/development.md",
         )?;
-        require_row(&support, target, "Build-only and best effort", "SUPPORT.md")?;
+        require_row(&support, target, "🟡 Best effort", "SUPPORT.md")?;
     }
     require_text(
         &development,
-        "Behavior can vary with file system types",
+        "Behavior can vary with filesystem types",
         "filesystem caveat in docs/development.md",
     )?;
     require_text(
