@@ -365,7 +365,11 @@ where
     fn process_one_input(&mut self) -> Result<bool, AppError> {
         #[cfg(feature = "internal")]
         let _input = self.probe_phase(OwnerPhase::Input);
-        let result = match self.input.read()? {
+        let input = self.input.read()?;
+        if matches!(input, InputEvent::Terminal(_)) {
+            crate::test_events::input_consumed();
+        }
+        let result = match input {
             InputEvent::Barrier => {
                 self.animation.set_activity_suspended(true);
                 let result = (|| {
@@ -842,6 +846,7 @@ where
             self.workers()?
                 .finish_coordinated_work(reduction, WorkCompletion::Succeeded)?;
             self.app.start_ui();
+            crate::test_events::scan_complete(self.summary.scanned_entries);
             self.animation.schedule_completion();
         }
         let (used, limit) = self.app.scan_store_stats();
@@ -989,6 +994,10 @@ where
                 }
             }
             WorkerEvent::DeletionFinished { work_id, report } => {
+                crate::test_events::deletion_finished(
+                    report.deleted_entries(),
+                    report.failed_entries(),
+                );
                 let completion = if report.soft_cancelled {
                     WorkCompletion::Cancelled
                 } else {
@@ -1155,7 +1164,7 @@ where
             self.settings.reduced_motion,
         );
         if matches!(&result, Ok(true)) {
-            crate::app::emit_pty_test_marker("TERMINAL_READY");
+            crate::test_events::frame();
         }
         #[cfg(feature = "internal")]
         if !matches!(&result, Ok(true))
