@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tempfile::{Builder as TempBuilder, NamedTempFile, TempDir};
+use tempfile::{Builder as TempBuilder, NamedTempFile, TempDir, TempPath};
 
 use crate::temporary_storage::{TemporaryStorage, TemporaryStorageReservation};
 
@@ -195,9 +195,10 @@ impl ScanStoreStorage {
         temporary.as_file().sync_data()?;
         #[cfg(any(test, feature = "internal"))]
         self.quota.record_durable_sync();
-        temporary
-            .persist(self.root().join(MANIFEST_FILE))
-            .map_err(|error| error.error)?;
+        persist_replacing_transient_lock(
+            temporary.into_temp_path(),
+            &self.root().join(MANIFEST_FILE),
+        )?;
         #[cfg(feature = "internal")]
         self.quota.record_manifest_persist();
         Ok(())
@@ -222,5 +223,133 @@ impl ScanStoreStorage {
     #[cfg(test)]
     pub(crate) fn manifest_path(&self) -> PathBuf {
         self.root().join(MANIFEST_FILE)
+    }
+}
+
+/// The most times [`persist_replacing_transient_lock`] attempts the rename. Attempts are
+/// immediate (no sleep), so the bound only limits how long a lock that never clears is
+/// retried. Ten immediate attempts were enough on Windows CI runners.
+const TRANSIENT_LOCK_RETRY_ATTEMPTS: u32 = 10;
+
+/// Renames `temporary` onto `target`, retrying immediately when the destination is
+/// transiently locked.
+///
+/// `target` is a single, stable path that every manifest persist overwrites in place.
+/// On Windows, a file a moment after it is written is briefly open to another process,
+/// such as the filter driver behind antivirus or search indexing, which answers the next
+/// rename over that same path with `ERROR_ACCESS_DENIED` (`PermissionDenied`) rather than
+/// blocking for it to clear. POSIX rename has no such transient failure; there, a
+/// persistent `PermissionDenied` costs nine more immediate attempts before it surfaces.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error unchanged, including after the retry bound is spent on
+/// a persistent `PermissionDenied`, and for any other error on the first attempt that sees
+/// it.
+fn persist_replacing_transient_lock(temporary: TempPath, target: &Path) -> io::Result<()> {
+    let mut temporary = Some(temporary);
+    retry_transient_permission_denied(TRANSIENT_LOCK_RETRY_ATTEMPTS, || {
+        let this_attempt = temporary
+            .take()
+            .expect("called again after a prior attempt returned success or gave up");
+        this_attempt.persist(target).map_err(|error| {
+            temporary = Some(error.path);
+            error.error
+        })
+    })
+}
+
+/// Calls `attempt` up to `attempts` times, retrying immediately (no sleep) only while it
+/// fails with [`io::ErrorKind::PermissionDenied`]. Any other error, or exhausting the
+/// attempts, returns that call's error unchanged.
+fn retry_transient_permission_denied<T>(
+    attempts: u32,
+    mut attempt: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    assert!(
+        attempts > 0,
+        "retry_transient_permission_denied needs at least one attempt"
+    );
+    for try_number in 1..=attempts {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if try_number < attempts && error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the loop above returns on its final attempt")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{io, retry_transient_permission_denied};
+
+    fn permission_denied() -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, "access is denied")
+    }
+
+    #[test]
+    fn retry_transient_permission_denied_succeeds_on_the_first_try_without_retrying() {
+        let mut calls = 0;
+        let result = retry_transient_permission_denied(10, || {
+            calls += 1;
+            Ok::<_, io::Error>(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retry_transient_permission_denied_retries_past_a_transient_lock_and_then_succeeds() {
+        let mut calls = 0;
+        let result = retry_transient_permission_denied(10, || {
+            calls += 1;
+            if calls < 3 {
+                Err(permission_denied())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            calls, 3,
+            "should stop retrying as soon as an attempt succeeds"
+        );
+    }
+
+    #[test]
+    fn retry_transient_permission_denied_gives_up_after_its_bound_on_a_persistent_lock() {
+        let mut calls = 0;
+        let result = retry_transient_permission_denied(3, || {
+            calls += 1;
+            Err::<(), _>(permission_denied())
+        });
+        assert_eq!(
+            result
+                .expect_err("a permission-denied error that never clears must surface")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(calls, 3, "must not retry past its bound");
+    }
+
+    #[test]
+    fn retry_transient_permission_denied_does_not_retry_a_different_error_kind() {
+        let mut calls = 0;
+        let result = retry_transient_permission_denied(10, || {
+            calls += 1;
+            Err::<(), _>(io::Error::new(io::ErrorKind::NotFound, "no such file"))
+        });
+        assert_eq!(
+            result
+                .expect_err("a non-transient error must surface")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            calls, 1,
+            "only a transient PermissionDenied is worth retrying"
+        );
     }
 }
