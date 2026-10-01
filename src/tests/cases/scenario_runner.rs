@@ -61,6 +61,11 @@ fn failure_of(run: &ScenarioRun) -> &StepFailure {
 #[test]
 fn bundled_in_process_scenarios_pass_under_every_declared_profile() {
     let selection = select_scenarios(&scenarios_directory()).expect("scenario files should load");
+    // A scenario this runner cannot perform is skipped, never silently dropped: say which and why.
+    // `cargo test -p excise --lib scenario_runner -- --nocapture` shows the lines.
+    for (name, reason) in &selection.skipped {
+        println!("SKIP {name}: {reason}");
+    }
     // Lifecycle scenarios must run in-process, under the user defaults and under reduced motion.
     for lifecycle in ["delete-file-lifecycle", "navigate-and-quit"] {
         let scenario = selection

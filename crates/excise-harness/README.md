@@ -446,10 +446,11 @@ verdict table. It exits non-zero on any `fail`, `xpass`, or `error`.
 The negative control for the `delete` step is not a scenario. It is
 [`tests/controls/delete-wrong-target.toml`](tests/controls/delete-wrong-target.toml): it selects a
 folder and then asks `delete` for a different entry. `cargo xtask e2e` never runs it, because it is
-not in `scenarios/`. `tests/harness_scenarios.rs` in the `excise` crate runs each scenario once per
-profile against the crate's own binary as part of `cargo test`, and runs the control to assert that
-the `delete` step failed, that the last input was Backspace, that no `y` appears among the
-recording's input events, and that every byte of the fixture is unchanged.
+not in `scenarios/`. `tests/harness_scenarios.rs` in the `excise` crate runs
+`delete-folder-lifecycle` under every profile it names against the crate's own binary as part of
+`cargo test`, along with a few one-off scenarios that exercise the runner itself, and runs the
+control to assert that the `delete` step failed, that the last input was Backspace, that no `y`
+appears among the recording's input events, and that every byte of the fixture is unchanged.
 
 ## Headless runner
 
@@ -1021,8 +1022,9 @@ A run resolves to a `Verdict` with strict xfail: an `expect = "fail"` scenario t
    [Spec files](#spec-files)).
 3. Use only the steps above. Put a `quit` and an `expect_exit` at the end, so the run ends the way
    a user would end it; a scenario that stops earlier is stopped by the runner.
-4. Run `cargo test -p excise --lib scenario_runner`. A scenario with a step only another runner
-   can perform is skipped, so it is never silently dropped from the suite: check the skip reasons.
+4. Run `cargo test -p excise --lib scenario_runner -- --nocapture`. A scenario that this runner
+   cannot perform is skipped, never silently dropped: the suite prints `SKIP <name>: <reason>` for
+   each one.
 
 ## Working on the crate
 

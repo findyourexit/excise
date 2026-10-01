@@ -100,9 +100,15 @@ pub struct E2eOptions {
 /// The matrix could not be run.
 #[derive(Debug, Error)]
 pub enum E2eError {
-    /// Nothing matched the scenario and profile selection.
-    #[error("no scenario runs under the selected profiles ({0})")]
-    NothingToRun(String),
+    /// Nothing matched the scenario and profile selection. The message lists every scenario that
+    /// was skipped, with the reason, so a named scenario that cannot run here says why.
+    #[error("no scenario runs under the selected profiles ({selected}){}", skipped_lines(.skipped))]
+    NothingToRun {
+        /// The tier, or the profiles named on the command line.
+        selected: String,
+        /// The scenarios that were skipped, with the reason.
+        skipped: Vec<SkippedScenario>,
+    },
     /// A scenario file could not be loaded.
     #[error(transparent)]
     Load(#[from] LoadError),
@@ -141,6 +147,16 @@ pub enum E2eError {
         /// What went wrong.
         reason: String,
     },
+}
+
+/// The skipped scenarios as `SKIP <name>: <reason>` lines, each after a line break, as the verdict
+/// table prints them.
+fn skipped_lines(skipped: &[SkippedScenario]) -> String {
+    let mut lines = String::new();
+    for skipped in skipped {
+        let _ = write!(lines, "\nSKIP {}: {}", skipped.name, skipped.reason);
+    }
+    lines
 }
 
 fn io_error(context: impl Into<String>) -> impl FnOnce(io::Error) -> E2eError {
@@ -359,7 +375,7 @@ pub fn run_e2e(
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        return Err(E2eError::NothingToRun(selected));
+        return Err(E2eError::NothingToRun { selected, skipped });
     }
 
     let work_dir = options.work_dir.clone().unwrap_or_else(work_base);
@@ -772,6 +788,25 @@ mod tests {
         let (plan, skipped) = select(&opts, "linux");
         assert!(skipped.is_empty(), "{skipped:?}");
         assert_eq!(plan.len(), 1);
+    }
+
+    #[test]
+    fn a_named_scenario_that_cannot_run_here_says_why() {
+        let elsewhere = crate::platform::PLATFORMS
+            .iter()
+            .copied()
+            .find(|os| *os != std::env::consts::OS)
+            .expect("another platform");
+        let mut scenario = scenario(r#"["default"]"#);
+        scenario.platforms = Some(vec![elsewhere.to_owned()]);
+        let mut opts = options(Tier::Full, Vec::new());
+        opts.scenarios = vec![scenario];
+        opts.named = true;
+
+        let error = run_e2e(&opts, |_| {}).expect_err("nothing can run on this platform");
+        let message = error.to_string();
+        assert!(message.contains("SKIP s: "), "{message}");
+        assert!(message.contains(elsewhere), "{message}");
     }
 
     #[test]
