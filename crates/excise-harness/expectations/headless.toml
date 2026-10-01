@@ -25,3 +25,22 @@ platforms = ["macos", "linux"]
 findings = ["F11"]
 kinds = ["missing", "state", "summary"]
 reason = "The scanner stats every entry by its full path (process_entry calls fs::symlink_metadata), so nothing past PATH_MAX is scanned: the report lists a fraction of the tree, calls it uncertain, and counts one unreadable folder, where the tree can be read to the bottom."
+
+# Fixtures whose `headless_scan_ratio` is expected to miss the budget today, strictly (see the
+# harness README, "Expected failures"). Gated only where the fixture's oracle entry count (fixed
+# by its spec and seed, never a measured time) is large enough; elsewhere the ratio is reported
+# but never gated. A gated fixture over budget with no entry for this platform fails the run,
+# exactly like an undocumented oracle-diff discrepancy. Measured on macOS and Linux (CI); Windows
+# has no `du` reference, so no ratio is ever measured there and neither entry needs it.
+
+[[expect_ratio_fail]]
+fixture = "delete-folder"
+platforms = ["macos", "linux"]
+findings = ["F1"]
+reason = "Every admitted scan-store run, and the manifest commit that follows it, calls `sync_data` (`fcntl(F_FULLFSYNC)` on Apple, plain `fsync`-family on Linux) before the next run can be accepted. On this 5,011-entry fixture the per-run durable write dominates the scan, far over the ratio budget on both platforms."
+
+[[expect_ratio_fail]]
+fixture = "node-modules-2k"
+platforms = ["macos", "linux"]
+findings = ["F1"]
+reason = "The same per-run durable writes (every admitted run's seal and its manifest commit call `sync_data`) dominate this deeply nested, many-small-files tree too, far over the ratio budget on both platforms."

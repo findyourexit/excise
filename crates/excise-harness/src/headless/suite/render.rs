@@ -13,7 +13,9 @@ use crate::{
     run_support::{format_ms, median, render_rows, worst},
 };
 
-use super::{FixtureReport, RATIO_BUDGET, Round, ScanRun, SuiteReport, Volumes, millis};
+use super::{
+    FixtureReport, MIN_GATED_ENTRIES, RATIO_BUDGET, Round, ScanRun, SuiteReport, Volumes, millis,
+};
 
 /// How many discrepancies of a failing fixture the table lists.
 const TABLE_LISTED: usize = 8;
@@ -68,6 +70,11 @@ pub(super) fn result_of(report: &FixtureReport) -> ScenarioResult {
         put(&mut metrics, "headless_scan_ratio_q1", Some(spread.q1));
         put(&mut metrics, "headless_scan_ratio_q3", Some(spread.q3));
         put(&mut metrics, "headless_scan_ratio_max", Some(spread.max));
+        put(
+            &mut metrics,
+            "headless_scan_ratio_gated",
+            Some(f64::from(u8::from(report.ratio_gated))),
+        );
     }
     let last_du = report
         .rounds
@@ -218,6 +225,7 @@ impl SuiteReport {
         let mut table = render_rows(&self.rows());
         for fixture in &self.fixtures {
             write_fixture_block(&mut table, fixture);
+            write_ratio_block(&mut table, fixture);
         }
         self.write_notes(&mut table);
         let blocking = self
@@ -284,16 +292,6 @@ impl SuiteReport {
             let _ = writeln!(table, "\nno `du` on this machine: no ratio was measured");
             return;
         };
-        let over: Vec<&str> = self
-            .fixtures
-            .iter()
-            .filter(|fixture| {
-                fixture
-                    .ratio_spread()
-                    .is_some_and(|spread| spread.median > RATIO_BUDGET)
-            })
-            .map(|fixture| fixture.fixture.as_str())
-            .collect();
         let measured = self
             .fixtures
             .iter()
@@ -301,13 +299,37 @@ impl SuiteReport {
             .count();
         let _ = writeln!(
             table,
-            "\nratio: scan time over {} time, median of the interleaved pairs; the budget is {RATIO_BUDGET}x (reported, not gated here)",
+            "\nratio: scan time over {} time, median of the interleaved pairs; the budget is {RATIO_BUDGET}x",
             flavor.as_str()
         );
+        let too_small: Vec<&str> = self
+            .fixtures
+            .iter()
+            .filter(|fixture| fixture.ratio_spread().is_some() && !fixture.ratio_gated)
+            .map(|fixture| fixture.fixture.as_str())
+            .collect();
+        if !too_small.is_empty() {
+            let _ = writeln!(
+                table,
+                "not gated, reported only: fewer than {MIN_GATED_ENTRIES} entries, on: {}",
+                too_small.join(", ")
+            );
+        }
+        let gated = self
+            .fixtures
+            .iter()
+            .filter(|fixture| fixture.ratio_gated)
+            .count();
+        let over: Vec<&str> = self
+            .fixtures
+            .iter()
+            .filter(|fixture| fixture.ratio_gated && fixture.ratio_over_budget() == Some(true))
+            .map(|fixture| fixture.fixture.as_str())
+            .collect();
         if !over.is_empty() {
             let _ = writeln!(
                 table,
-                "above the {RATIO_BUDGET}x budget on {} of {measured}: {}",
+                "gated and above the {RATIO_BUDGET}x budget on {} of {gated} ({measured} measured): {}",
                 over.len(),
                 over.join(", ")
             );
@@ -389,7 +411,7 @@ fn write_fixture_block(table: &mut String, fixture: &FixtureReport) {
         return;
     }
     let Some((round, diff)) = fixture.first_failure() else {
-        if fixture.verdict == Verdict::Xpass {
+        if fixture.expectation.is_some() && fixture.kinds().is_empty() {
             let _ = writeln!(
                 table,
                 "\nXPASS {}: expected to fail ({}) but its diff is clean; remove its entry from expectations/headless.toml",
@@ -430,5 +452,47 @@ fn write_fixture_block(table: &mut String, fixture: &FixtureReport) {
     }
     if let Some(kept) = &fixture.kept {
         let _ = writeln!(table, "  kept fixture scratch: {}", kept.display());
+    }
+}
+
+/// The block for a fixture whose ratio was gated: printed only when the outcome is notable (an
+/// expected failure, an unexpected one, or a now-clean budget whose entry must be removed). A
+/// gated fixture that is within budget and not listed prints nothing here.
+fn write_ratio_block(table: &mut String, fixture: &FixtureReport) {
+    if fixture.error.is_some() || !fixture.ratio_gated {
+        return;
+    }
+    let Some(spread) = fixture.ratio_spread() else {
+        return;
+    };
+    let over_budget = spread.median > RATIO_BUDGET;
+    match (&fixture.ratio_expectation, over_budget) {
+        (Some(expected), true) => {
+            let _ = writeln!(
+                table,
+                "\nXFAIL {} ratio: {:.1}x over the {RATIO_BUDGET}x budget",
+                fixture.fixture, spread.median
+            );
+            let _ = writeln!(table, "  expected failure {expected}");
+        }
+        (Some(expected), false) => {
+            let _ = writeln!(
+                table,
+                "\nXPASS {} ratio: {:.1}x is within the {RATIO_BUDGET}x budget; expected to fail {expected}; remove its entry from expectations/headless.toml",
+                fixture.fixture, spread.median
+            );
+        }
+        (None, true) => {
+            let _ = writeln!(
+                table,
+                "\nFAIL {} ratio: {:.1}x over the {RATIO_BUDGET}x budget, and no expectation is \
+                 recorded for `{}`; add an [[expect_ratio_fail]] entry in \
+                 expectations/headless.toml if this is F1 (X1 will remove it once that lands)",
+                fixture.fixture,
+                spread.median,
+                std::env::consts::OS
+            );
+        }
+        (None, false) => {}
     }
 }

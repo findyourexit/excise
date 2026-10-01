@@ -259,7 +259,7 @@ impl RunWriter {
         self.write_reserved(&footer)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
-        #[cfg(feature = "internal")]
+        #[cfg(any(test, feature = "internal"))]
         if let Some(reservation) = self.reservation.as_ref() {
             reservation.record_durable_sync();
         }
