@@ -1,0 +1,37 @@
+schema_version = 1
+name = "resource-budget-large-fds"
+description = "Open descriptors must not grow with the size of the scanned tree (F13). On this 49k-entry tree, in 49 folders, they are far above the baseline measured on a flat 1k-entry tree, and under a 256-descriptor limit the scan fails with \"Too many open files\". Strict expected failure until descriptor use is bounded."
+fixture = "tiny-files-50k"
+profiles = ["deterministic"]
+tier = "full"
+expect = "fail"
+slice = "X9"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[budgets]
+fds = 48
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 60000
+
+[[steps]]
+step = "expect_budget"
+budget = "fds"
+metric = "fds"
+
+[[steps]]
+step = "quit"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000

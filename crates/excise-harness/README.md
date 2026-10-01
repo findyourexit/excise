@@ -430,6 +430,8 @@ run summary use the same names.
 | `output_bytes`, `output_bytes_per_s`, `frames`, `inputs_sent` | Terminal output and its rate, frames drawn, and input events sent. |
 | `peak_rss_bytes`, `user_ms`, `sys_ms` | Peak memory (the peak physical footprint on macOS, the peak resident set size on Linux) and the child's CPU time. |
 | `threads`, `fds` | The most threads and descriptors seen in a sample taken every 50 ms (`libproc` on macOS, `/proc` on Linux; not sampled on Windows). |
+| `scan_store_peak_bytes` | The peak total apparent size of the run's scan-store directory (`EXCISE_SCAN_STORE_DIR`), seen in a sample taken every 50 ms. |
+| `scan_store_bytes_per_entry` | `scan_store_peak_bytes` divided by the `entries` of the `scan_complete` event; absent without one or the other, or when `scan_complete` reports zero entries. |
 
 Timing values are only evidence when compared in paired, interleaved runs; see
 [Output documents](#output-documents).

@@ -18,6 +18,8 @@
 //! | `frames`, `inputs_sent` | Frames drawn and input events sent. |
 //! | `peak_rss_bytes` | Peak memory: the peak physical footprint on macOS, the peak resident set size on Linux. |
 //! | `threads`, `fds` | The most threads and descriptors seen in a sample. |
+//! | `scan_store_peak_bytes` | Peak total apparent size of the run's scan-store directory, seen in a sample. |
+//! | `scan_store_bytes_per_entry` | `scan_store_peak_bytes` divided by `scan_complete`'s `entries`. |
 //! | `user_ms`, `sys_ms` | CPU time of the child, from the change in `RUSAGE_CHILDREN`. |
 //! | `residue_files` | Entries left in the scratch area after the exit. |
 //! | any `measure` name | Elapsed milliseconds between its `start` and `stop`. |
@@ -42,10 +44,12 @@
 //!   that reaps other children concurrently would fold their time in.
 
 mod sample;
+mod store;
 
 use std::{collections::BTreeMap, time::Duration, time::Instant};
 
 pub use sample::ProcessSampler;
+pub use store::StoreSampler;
 
 use crate::events::{Event, Payload};
 
@@ -201,14 +205,16 @@ impl Recorder {
 
     /// The metrics of the run so far.
     ///
-    /// `output_bytes` counts terminal output, `sampler` holds the resource peaks, and `cpu` is the
-    /// child's CPU time when known. `now` closes the run for the output rate.
+    /// `output_bytes` counts terminal output, `sampler` holds the resource peaks, `store_peak_bytes`
+    /// is the peak size [`crate::metrics::StoreSampler`] saw of the run's scan-store directory, and
+    /// `cpu` is the child's CPU time when known. `now` closes the run for the output rate.
     #[must_use]
     pub fn finish(
         &self,
         events: &[Event],
         output_bytes: u64,
         sampler: &ProcessSampler,
+        store_peak_bytes: Option<u64>,
         cpu: Option<CpuTimes>,
         now: Instant,
     ) -> BTreeMap<String, f64> {
@@ -231,6 +237,10 @@ impl Recorder {
         if let Some(at) = scan_complete {
             metrics.insert("scan_complete_ms".to_owned(), since_spawn(at));
         }
+        let scan_complete_entries = events.iter().find_map(|event| match event.payload {
+            Payload::ScanComplete { entries } => Some(entries),
+            _ => None,
+        });
 
         metrics.insert(
             "inputs_sent".to_owned(),
@@ -295,6 +305,15 @@ impl Recorder {
         }
         if let Some(fds) = sampler.max_fds() {
             metrics.insert("fds".to_owned(), f64::from(fds));
+        }
+        if let Some(bytes) = store_peak_bytes {
+            metrics.insert("scan_store_peak_bytes".to_owned(), count(bytes));
+            if let Some(entries) = scan_complete_entries.filter(|&entries| entries > 0) {
+                metrics.insert(
+                    "scan_store_bytes_per_entry".to_owned(),
+                    count(bytes) / count(entries),
+                );
+            }
         }
         if let Some(cpu) = cpu {
             metrics.insert("user_ms".to_owned(), milliseconds(cpu.user));
@@ -401,6 +420,7 @@ mod tests {
             events,
             0,
             &ProcessSampler::default(),
+            None,
             None,
             start + Duration::from_millis(end_ms),
         )
@@ -586,6 +606,7 @@ mod tests {
             2_000,
             &ProcessSampler::default(),
             None,
+            None,
             start + Duration::from_secs(2),
         );
 
@@ -622,6 +643,7 @@ mod tests {
             &[],
             0,
             &ProcessSampler::default(),
+            None,
             Some(after.since(before)),
             start,
         );
@@ -663,6 +685,76 @@ mod tests {
 
         assert!(
             metrics.values().all(|value| value.is_finite()),
+            "{metrics:?}"
+        );
+    }
+
+    #[test]
+    fn scan_store_bytes_per_entry_divides_the_peak_by_the_scanned_entries() {
+        let start = Instant::now();
+        let events = [other(start, 10, Payload::ScanComplete { entries: 4 })];
+
+        let metrics = Recorder::new(start).finish(
+            &events,
+            0,
+            &ProcessSampler::default(),
+            Some(2_000),
+            None,
+            start,
+        );
+
+        assert!((metrics["scan_store_peak_bytes"] - 2000.0).abs() < f64::EPSILON);
+        assert!((metrics["scan_store_bytes_per_entry"] - 500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scan_store_peak_bytes_with_no_scan_complete_event_has_no_ratio() {
+        let start = Instant::now();
+
+        let metrics =
+            Recorder::new(start).finish(&[], 0, &ProcessSampler::default(), Some(900), None, start);
+
+        assert!((metrics["scan_store_peak_bytes"] - 900.0).abs() < f64::EPSILON);
+        assert!(
+            !metrics.contains_key("scan_store_bytes_per_entry"),
+            "{metrics:?}"
+        );
+    }
+
+    #[test]
+    fn a_scan_of_zero_entries_never_divides_by_zero() {
+        let start = Instant::now();
+        let events = [other(start, 10, Payload::ScanComplete { entries: 0 })];
+
+        let metrics = Recorder::new(start).finish(
+            &events,
+            0,
+            &ProcessSampler::default(),
+            Some(900),
+            None,
+            start,
+        );
+
+        assert!(
+            !metrics.contains_key("scan_store_bytes_per_entry"),
+            "{metrics:?}"
+        );
+    }
+
+    #[test]
+    fn no_sample_means_neither_scan_store_metric_is_reported() {
+        let start = Instant::now();
+        let events = [other(start, 10, Payload::ScanComplete { entries: 4 })];
+
+        let metrics =
+            Recorder::new(start).finish(&events, 0, &ProcessSampler::default(), None, None, start);
+
+        assert!(
+            !metrics.contains_key("scan_store_peak_bytes"),
+            "{metrics:?}"
+        );
+        assert!(
+            !metrics.contains_key("scan_store_bytes_per_entry"),
             "{metrics:?}"
         );
     }
