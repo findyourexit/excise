@@ -8,10 +8,12 @@
 //!
 //! # Tiers
 //!
-//! Scenarios carry no tier of their own yet, so the tier limits the *profiles*: the quick tier runs
-//! the two profiles that every lifecycle scenario must pass under (`default` and `deterministic`),
-//! and the full tier runs every profile a scenario declares. A scenario is selected for a profile
-//! only if it declares that profile.
+//! `--quick` runs scenarios tagged `quick` (the default), `--full` adds `full`, and `--nightly`
+//! adds `nightly` too; a scenario named with `--scenario` runs whatever its tier, but a scenario
+//! outside its `platforms` is always skipped, with the reason, even when it is named. The quick
+//! tier also limits the *profiles* that run: the two profiles every lifecycle scenario must pass
+//! under (`default` and `deterministic`); `--full` and `--nightly` run every profile a scenario
+//! declares. A scenario is selected for a profile only if it declares that profile.
 
 use std::{
     collections::BTreeMap,
@@ -36,7 +38,7 @@ use crate::{
         sha256_file, worst,
     },
     safety::{Scratch, isolated_env},
-    scenario::{LoadError, Profile, Scenario, ValidationErrors},
+    scenario::{LoadError, Profile, Scenario, Tier as ScenarioTier, ValidationErrors},
 };
 
 use super::{
@@ -50,15 +52,37 @@ const WARM_UP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The profiles of the quick tier.
 const QUICK_PROFILES: [Profile; 2] = [Profile::Default, Profile::Deterministic];
 
+/// Whether a scenario tagged `scenario_tier` runs when the matrix is asked for `tier`.
+const fn tier_includes(tier: Tier, scenario_tier: ScenarioTier) -> bool {
+    match scenario_tier {
+        ScenarioTier::Quick => true,
+        ScenarioTier::Full => !matches!(tier, Tier::Quick),
+        ScenarioTier::Nightly => matches!(tier, Tier::Nightly | Tier::Weekly),
+    }
+}
+
+/// A scenario this matrix did not attempt, and why.
+#[derive(Debug, Clone)]
+pub struct SkippedScenario {
+    /// The scenario's name.
+    pub name: String,
+    /// Why it was not run.
+    pub reason: String,
+}
+
 /// What to run and where to put the results.
 #[derive(Debug, Clone)]
 pub struct E2eOptions {
     /// The `excise` binary under test.
     pub binary: PathBuf,
-    /// The tier, which limits the profiles that run.
+    /// The tier, which selects scenarios whose own `tier` is no higher and, for `quick`, limits
+    /// the profiles that run too.
     pub tier: Tier,
     /// The scenarios to consider, already loaded.
     pub scenarios: Vec<Scenario>,
+    /// Whether `scenarios` was narrowed to scenarios named with `--scenario`: when true, each one
+    /// runs whatever its tier. Platform selection always applies.
+    pub named: bool,
     /// Limits the run to these profiles. Empty means every profile the tier allows.
     pub profiles: Vec<Profile>,
     /// How many times each scenario runs under each profile.
@@ -146,6 +170,8 @@ pub struct E2eReport {
     pub run_dir: PathBuf,
     /// Every run, in the order they ran.
     pub records: Vec<RunRecord>,
+    /// Scenarios this matrix did not attempt, with the reason.
+    pub skipped: Vec<SkippedScenario>,
 }
 
 impl E2eReport {
@@ -210,6 +236,46 @@ fn selected_profiles(options: &E2eOptions, scenario: &Scenario) -> Vec<Profile> 
         .filter(|profile| options.tier != Tier::Quick || QUICK_PROFILES.contains(profile))
         .filter(|profile| options.profiles.is_empty() || options.profiles.contains(profile))
         .collect()
+}
+
+/// Plans which of `options.scenarios` run on `os`, and under which profiles, and which are
+/// skipped, with the reason.
+///
+/// A scenario outside its `platforms` is always skipped, even when `options.named`. One outside
+/// `options.tier` is skipped too, unless `options.named`: a scenario named with `--scenario` runs
+/// whatever its tier.
+fn select<'a>(
+    options: &'a E2eOptions,
+    os: &str,
+) -> (Vec<(&'a Scenario, Profile)>, Vec<SkippedScenario>) {
+    let mut plan = Vec::new();
+    let mut skipped = Vec::new();
+    for scenario in &options.scenarios {
+        if !scenario.runs_on(os) {
+            skipped.push(SkippedScenario {
+                name: scenario.name.clone(),
+                reason: format!(
+                    "`platforms` is {:?}, which does not include `{os}`",
+                    scenario.effective_platforms()
+                ),
+            });
+            continue;
+        }
+        if !options.named && !tier_includes(options.tier, scenario.tier) {
+            skipped.push(SkippedScenario {
+                name: scenario.name.clone(),
+                reason: format!(
+                    "its tier is `{}`, outside the `{}` tier",
+                    scenario.tier, options.tier
+                ),
+            });
+            continue;
+        }
+        for profile in selected_profiles(options, scenario) {
+            plan.push((scenario, profile));
+        }
+    }
+    (plan, skipped)
 }
 
 /// Launches `binary --version` once, in an isolated environment, and waits for it to end.
@@ -281,12 +347,7 @@ pub fn run_e2e(
     options: &E2eOptions,
     mut progress: impl FnMut(&RunRecord),
 ) -> Result<E2eReport, E2eError> {
-    let mut plan: Vec<(&Scenario, Profile)> = Vec::new();
-    for scenario in &options.scenarios {
-        for profile in selected_profiles(options, scenario) {
-            plan.push((scenario, profile));
-        }
-    }
+    let (plan, skipped) = select(options, std::env::consts::OS);
     if plan.is_empty() {
         let selected = if options.profiles.is_empty() {
             format!("the {} tier", options.tier)
@@ -355,6 +416,7 @@ pub fn run_e2e(
         summary_path,
         run_dir,
         records,
+        skipped,
     })
 }
 
@@ -461,6 +523,7 @@ impl E2eReport {
     #[must_use]
     pub fn table(&self) -> String {
         let mut table = render_rows(&self.summary_rows());
+        self.write_skipped(&mut table);
         self.write_blocking_runs(&mut table);
         let blocking = self
             .records
@@ -475,6 +538,13 @@ impl E2eReport {
             self.summary_path.display()
         );
         table
+    }
+
+    /// One line per scenario this matrix did not attempt, with the reason.
+    fn write_skipped(&self, table: &mut String) {
+        for skipped in &self.skipped {
+            let _ = writeln!(table, "\nSKIP {}: {}", skipped.name, skipped.reason);
+        }
     }
 
     /// The header row and one row per scenario and profile.
@@ -595,6 +665,7 @@ mod tests {
             binary: PathBuf::from("/bin/true"),
             tier,
             scenarios: Vec::new(),
+            named: false,
             profiles,
             repeat: 1,
             keep_fixture: false,
@@ -639,6 +710,68 @@ mod tests {
             selected_profiles(&options(Tier::Quick, vec![Profile::Narrow]), &scenario).is_empty(),
             "the quick tier does not run the narrow profile even when asked"
         );
+    }
+
+    #[test]
+    fn tier_includes_every_scenario_tier_up_to_the_requested_one() {
+        let table = [
+            (Tier::Quick, ScenarioTier::Quick, true),
+            (Tier::Quick, ScenarioTier::Full, false),
+            (Tier::Quick, ScenarioTier::Nightly, false),
+            (Tier::Full, ScenarioTier::Quick, true),
+            (Tier::Full, ScenarioTier::Full, true),
+            (Tier::Full, ScenarioTier::Nightly, false),
+            (Tier::Nightly, ScenarioTier::Quick, true),
+            (Tier::Nightly, ScenarioTier::Full, true),
+            (Tier::Nightly, ScenarioTier::Nightly, true),
+        ];
+        for (tier, scenario_tier, included) in table {
+            assert_eq!(
+                tier_includes(tier, scenario_tier),
+                included,
+                "{tier} includes {scenario_tier}?"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scenario_above_the_requested_tier_is_skipped_with_the_reason_unless_named() {
+        let mut full_tier = scenario(r#"["default"]"#);
+        full_tier.tier = ScenarioTier::Full;
+        let mut opts = options(Tier::Quick, Vec::new());
+        opts.scenarios = vec![full_tier];
+
+        let (plan, skipped) = select(&opts, "linux");
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].name, "s");
+        assert!(skipped[0].reason.contains("full"), "{}", skipped[0].reason);
+        assert!(skipped[0].reason.contains("quick"), "{}", skipped[0].reason);
+
+        // Named with `--scenario`, the same scenario runs whatever its tier.
+        opts.named = true;
+        let (plan, skipped) = select(&opts, "linux");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(plan.len(), 1);
+    }
+
+    #[test]
+    fn a_scenario_outside_its_platforms_is_skipped_with_the_reason_even_when_named() {
+        let mut only_linux = scenario(r#"["default"]"#);
+        only_linux.platforms = Some(vec!["linux".to_owned()]);
+        let mut opts = options(Tier::Quick, Vec::new());
+        opts.scenarios = vec![only_linux];
+        opts.named = true;
+
+        let (plan, skipped) = select(&opts, "macos");
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].name, "s");
+        assert!(skipped[0].reason.contains("macos"), "{}", skipped[0].reason);
+
+        let (plan, skipped) = select(&opts, "linux");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(plan.len(), 1);
     }
 
     #[test]
@@ -705,6 +838,7 @@ mod tests {
             binary,
             tier: Tier::Quick,
             scenarios: vec![scenario],
+            named: false,
             profiles: vec![Profile::Deterministic],
             repeat: 1,
             keep_fixture: false,

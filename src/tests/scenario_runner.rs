@@ -34,7 +34,7 @@ use std::time::Instant;
 
 use excise_harness::fixture::{Fixtures, verify_owned};
 use excise_harness::report::{FailedStep, ScreenComparison};
-use excise_harness::scenario::{ExpectExit, Profile, Residue, Scenario, Step};
+use excise_harness::scenario::{ExpectExit, Profile, Residue, Scenario, Step, Tier};
 
 pub use fixture::{Fixture, materialize};
 pub use input::Limits;
@@ -111,7 +111,7 @@ pub fn run_scenario_with(
     Ok(ScenarioRun {
         name: scenario.name.clone(),
         profile,
-        expect: scenario.expect,
+        expect: scenario.expect_on(std::env::consts::OS),
         duration,
         failure,
         sent_keys: progress.sent_keys.clone(),
@@ -284,9 +284,9 @@ const MAX_FIXTURE_ENTRIES: u64 = 10_000;
 ///
 /// A file that does not parse, does not validate, is not named after its scenario, or names a
 /// fixture the harness cannot load is an error: it would break every runner. A scenario is skipped,
-/// with the reason, when it has a step only another runner can perform, when its fixture needs a
-/// scratch volume that only a privileged runner attaches, or when its fixture plans more than
-/// [`MAX_FIXTURE_ENTRIES`] entries.
+/// with the reason, when it is outside its `platforms`, when its `tier` is not `quick`, when it has
+/// a step only another runner can perform, when its fixture needs a scratch volume that only a
+/// privileged runner attaches, or when its fixture plans more than [`MAX_FIXTURE_ENTRIES`] entries.
 ///
 /// # Errors
 ///
@@ -329,8 +329,21 @@ pub fn select_scenarios(directory: &Path) -> Result<Selection, String> {
                 scenario.fixture
             )
         })?;
+        let os = std::env::consts::OS;
         let unsupported = unsupported_steps(&scenario);
-        if !unsupported.is_empty() {
+        if !scenario.runs_on(os) {
+            let reason = format!(
+                "`platforms` is {:?}, which does not include `{os}`",
+                scenario.effective_platforms()
+            );
+            selection.skipped.push((scenario.name, reason));
+        } else if scenario.tier != Tier::Quick {
+            let reason = format!(
+                "its tier is `{}`; this runner runs only `quick`",
+                scenario.tier
+            );
+            selection.skipped.push((scenario.name, reason));
+        } else if !unsupported.is_empty() {
             let kinds = unsupported
                 .iter()
                 .map(|step| step.kind)

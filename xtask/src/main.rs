@@ -116,7 +116,7 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
         Some("demo-features") => render_feature_demos(args),
         Some("create-release-tag") => create_release_tag(args),
         _ => Err(io::Error::other(
-            "usage: cargo xtask <verify|fuzz-toolchain|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|demo-features [NAME...]|e2e [--quick|--full] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--keep-fixture]|headless [--quick|--full] [--fixture ID]... [--class CLASS]... [--profile PROFILE] [--repeat N] [--timeout SECONDS] [--keep-scratch]|create-release-tag>",
+            "usage: cargo xtask <verify|fuzz-toolchain|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|demo-features [NAME...]|e2e [--quick|--full|--nightly] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--keep-fixture]|headless [--quick|--full] [--fixture ID]... [--class CLASS]... [--profile PROFILE] [--repeat N] [--timeout SECONDS] [--keep-scratch]|create-release-tag>",
         )
         .into()),
     }

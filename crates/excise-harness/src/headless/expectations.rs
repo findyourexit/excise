@@ -25,15 +25,13 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::diff::DiscrepancyKind;
+use crate::platform::PLATFORMS;
 
 /// The only version of the expectations file this module reads.
 pub const EXPECTATIONS_VERSION: u32 = 1;
 
 /// The expectations this crate ships.
 const BUNDLED: &str = include_str!("../../expectations/headless.toml");
-
-/// The operating systems an entry can name, as `std::env::consts::OS` spells them.
-const PLATFORMS: [&str; 3] = ["linux", "macos", "windows"];
 
 /// A fixture that is expected to fail the oracle diff.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

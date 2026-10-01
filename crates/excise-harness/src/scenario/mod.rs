@@ -17,7 +17,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::string_enum::string_enum;
+use crate::{platform::PLATFORMS, string_enum::string_enum};
 
 mod path;
 mod step;
@@ -66,6 +66,23 @@ string_enum! {
         Narrow => "narrow",
         /// Mouse input and the alternative movement keymaps.
         MouseKeymaps => "mouse-keymaps",
+    }
+}
+
+string_enum! {
+    /// How often a scenario runs: the cadence `cargo xtask e2e` and the in-process runner select
+    /// by. Distinct from [`crate::report::Tier`], which is how much of a *run* covered, not how
+    /// often one scenario runs.
+    #[derive(Default)]
+    pub enum Tier {
+        /// Runs under `cargo xtask e2e --quick`, `--full`, and `--nightly`, and under the
+        /// in-process runner. The default.
+        #[default]
+        Quick => "quick",
+        /// Runs under `cargo xtask e2e --full` and `--nightly`; never in-process.
+        Full => "full",
+        /// Runs under `cargo xtask e2e --nightly` only; never in-process.
+        Nightly => "nightly",
     }
 }
 
@@ -159,12 +176,26 @@ pub struct Scenario {
     pub sentinels: Vec<String>,
     /// The profiles the scenario runs under.
     pub profiles: Vec<Profile>,
+    /// How often the scenario runs. `quick` (the default) runs under every tier and in-process;
+    /// `full` needs `--full` or `--nightly`; `nightly` needs `--nightly`.
+    #[serde(default)]
+    pub tier: Tier,
+    /// The platforms the scenario runs on, as `std::env::consts::OS` spells them. Absent means
+    /// every platform the harness knows. Elsewhere every runner skips the scenario, with the
+    /// reason, even when it is named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<String>>,
     /// The initial terminal size.
     #[serde(default)]
     pub terminal: Terminal,
     /// Whether the scenario must pass or must fail.
     #[serde(default)]
     pub expect: Expect,
+    /// The platforms `expect = "fail"` applies to, as `std::env::consts::OS` spells them. Absent
+    /// means every platform in `platforms`. Elsewhere, on a platform the scenario runs on, it is
+    /// an ordinary `expect = "pass"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fails_on: Option<Vec<String>>,
     /// The id of the work slice that will fix the defect; required when `expect` is `fail`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slice: Option<String>,
@@ -225,5 +256,51 @@ impl Scenario {
             path: path.to_path_buf(),
             source,
         })
+    }
+}
+
+impl Scenario {
+    /// The platforms this scenario runs on, as `std::env::consts::OS` spells them: `platforms`
+    /// verbatim, or every platform the harness knows when it is absent.
+    #[must_use]
+    pub fn effective_platforms(&self) -> Vec<&str> {
+        self.platforms.as_deref().map_or_else(
+            || PLATFORMS.to_vec(),
+            |platforms| platforms.iter().map(String::as_str).collect(),
+        )
+    }
+
+    /// Whether the scenario runs on `os`, as `std::env::consts::OS` spells it.
+    #[must_use]
+    pub fn runs_on(&self, os: &str) -> bool {
+        match &self.platforms {
+            Some(platforms) => platforms.iter().any(|platform| platform == os),
+            None => PLATFORMS.contains(&os),
+        }
+    }
+
+    /// Whether `expect = "fail"` applies on `os`, as `std::env::consts::OS` spells it:
+    /// `fails_on` verbatim, or every platform in `platforms` when it is absent.
+    fn fails_on_platform(&self, os: &str) -> bool {
+        match &self.fails_on {
+            Some(fails_on) => fails_on.iter().any(|platform| platform == os),
+            None => self.runs_on(os),
+        }
+    }
+
+    /// The effective expectation on `os`, as `std::env::consts::OS` spells it.
+    ///
+    /// `expect = "fail"` applies only on the platforms [`Self::fails_on_platform`] names;
+    /// elsewhere the scenario is an ordinary `expect = "pass"`. Both runners' verdicts call this
+    /// instead of reading the raw `expect` field, so a scenario the harness runs at all is held
+    /// to the expectation that applies on the platform it ran on. Takes `os` as a parameter, not
+    /// `std::env::consts::OS` directly, so a test can check every platform from one host.
+    #[must_use]
+    pub fn expect_on(&self, os: &str) -> Expect {
+        if self.expect == Expect::Fail && self.fails_on_platform(os) {
+            Expect::Fail
+        } else {
+            Expect::Pass
+        }
     }
 }

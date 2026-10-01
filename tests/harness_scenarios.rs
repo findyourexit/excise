@@ -78,6 +78,22 @@ fn inline(name: &str, steps: &str) -> Scenario {
     scenario
 }
 
+/// A one-off scenario over the `delete-folder` fixture that documents an `expect = "fail"`
+/// restricted to `fails_on`, and fails deterministically: it waits for the scan, then asserts
+/// text that never appears on the screen.
+fn inline_expected_failure(name: &str, fails_on: &str) -> Scenario {
+    let scenario = Scenario::from_toml_str(&format!(
+        "schema_version = 1\nname = \"{name}\"\ndescription = \"a control for tests/harness_scenarios.rs\"\n\
+         fixture = \"delete-folder\"\nsentinels = [\"keep-a.bin\", \"keep-b/keep.txt\"]\n\
+         profiles = [\"default\"]\nexpect = \"fail\"\nslice = \"H5\"\nfails_on = [\"{fails_on}\"]\n\
+         [[steps]]\nstep = \"wait_header\"\nstate = \"complete\"\ntimeout_ms = 30000\n\
+         [[steps]]\nstep = \"expect_screen\"\ncontains = [\"XYZZY-TEXT-NEVER-ON-SCREEN\"]\n"
+    ))
+    .expect("a scenario");
+    scenario.validate().expect("a valid scenario");
+    scenario
+}
+
 /// Runs `scenario` once against the fixture at `root`. Returns the report and the directory a
 /// failure bundle is written to.
 fn run(
@@ -290,4 +306,30 @@ fn a_refused_mutation_fails_its_step_and_changes_nothing() {
     assert_eq!(failure.index, 1, "{failure}");
     assert!(failure.detail.contains("does not exist"), "{failure}");
     assert!(tree(fixture.root()) == before, "the fixture changed");
+}
+
+#[test]
+fn an_expected_failure_applies_only_on_its_platform() {
+    let _session = session_guard();
+    let host = std::env::consts::OS;
+    let other = if host == "linux" { "macos" } else { "linux" };
+
+    // `fails_on` names the host: the deterministic failure is documented here, so it is `xfail`.
+    let scenario = inline_expected_failure("xfail-here", host);
+    let work = Workspace::new();
+    let fixture = Fixtures::bundled()
+        .run_copy(&scenario.fixture, &work.0)
+        .expect("the fixture is built");
+    let (report, _) = run(&scenario, Profile::Default, fixture.root(), &work);
+    assert_eq!(report.verdict, Verdict::Xfail, "{report:?}");
+
+    // `fails_on` names only another platform: the same deterministic failure is an ordinary,
+    // undocumented `fail` here.
+    let scenario = inline_expected_failure("fail-elsewhere", other);
+    let work = Workspace::new();
+    let fixture = Fixtures::bundled()
+        .run_copy(&scenario.fixture, &work.0)
+        .expect("the fixture is built");
+    let (report, _) = run(&scenario, Profile::Default, fixture.root(), &work);
+    assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
 }

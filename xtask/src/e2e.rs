@@ -20,7 +20,7 @@ use excise_harness::{
     scenario::{Profile, Scenario},
 };
 
-const USAGE: &str = "usage: cargo xtask e2e [--quick|--full] [--scenario NAME]... \
+const USAGE: &str = "usage: cargo xtask e2e [--quick|--full|--nightly] [--scenario NAME]... \
                      [--profile PROFILE]... [--repeat N] [--keep-fixture]";
 /// Names a binary to test instead of building one. `cargo xtask headless` reads it too.
 pub(crate) const BINARY_ENV: &str = "EXCISE_E2E_BINARY";
@@ -57,6 +57,7 @@ pub fn e2e(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
         binary,
         tier: selection.tier,
         scenarios,
+        named: !selection.scenarios.is_empty(),
         profiles: selection.profiles,
         repeat: selection.repeat,
         keep_fixture: selection.keep_fixture,
@@ -96,17 +97,19 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
     let mut tier: Option<Tier> = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--quick" | "--full" => {
-                let requested = if argument == "--quick" {
-                    Tier::Quick
-                } else {
-                    Tier::Full
+            "--quick" | "--full" | "--nightly" => {
+                let requested = match argument.as_str() {
+                    "--quick" => Tier::Quick,
+                    "--full" => Tier::Full,
+                    _ => Tier::Nightly,
                 };
                 if tier
                     .replace(requested)
                     .is_some_and(|earlier| earlier != requested)
                 {
-                    return Err("`--quick` and `--full` exclude each other".to_owned());
+                    return Err(
+                        "`--quick`, `--full`, and `--nightly` exclude each other".to_owned()
+                    );
                 }
             }
             "--scenario" => selection.scenarios.push(value(&mut args, "--scenario")?),
@@ -223,9 +226,17 @@ mod tests {
     }
 
     #[test]
+    fn the_nightly_flag_selects_the_nightly_tier() {
+        let selection = parsed(&["--nightly"]).expect("valid");
+        assert_eq!(selection.tier, Tier::Nightly);
+    }
+
+    #[test]
     fn contradictory_or_malformed_arguments_are_refused() {
         for args in [
             &["--quick", "--full"][..],
+            &["--quick", "--nightly"],
+            &["--full", "--nightly"],
             &["--repeat", "0"],
             &["--repeat", "many"],
             &["--repeat"],
