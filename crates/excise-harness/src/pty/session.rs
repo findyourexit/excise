@@ -25,6 +25,7 @@
 
 use std::{
     ffi::OsString,
+    fmt,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
@@ -35,7 +36,10 @@ use std::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use thiserror::Error;
 
-use crate::metrics::{CpuTimes, ProcessSampler, reaped_children_cpu};
+use crate::{
+    fixture::path::write_escaped,
+    metrics::{CpuTimes, ProcessSampler, reaped_children_cpu},
+};
 
 use super::{
     cast::{CastHeader, CastWriter},
@@ -50,6 +54,9 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The size of one read from the terminal.
 const READ_CHUNK: usize = 64 * 1024;
+/// How many bytes of raw output a timeout's diagnostics keep from the start and from the end of
+/// the stream.
+const DIAGNOSTIC_BYTES: usize = 200;
 
 /// A session could not be started or driven.
 #[derive(Debug, Error)]
@@ -168,6 +175,55 @@ struct Chunk {
     bytes: Vec<u8>,
 }
 
+/// Everything a session can say about its output and its child, for a step that timed out: how
+/// much output arrived and when, whether the child is still alive, how many cursor position
+/// report requests the screen model has answered, and the bounded ends of the raw stream (see
+/// [`DIAGNOSTIC_BYTES`]). A step waits on the screen model, never on raw bytes (see
+/// [`crate::pty::Screen`]), so this is evidence for a human reading a failure, not something a
+/// scenario can assert on.
+#[derive(Debug, Clone)]
+pub struct Diagnostics {
+    /// Every byte of output read so far.
+    pub output_bytes: u64,
+    /// From the spawn to the first byte of output, once any has arrived.
+    pub first_byte_after: Option<Duration>,
+    /// How the child last reported, once the session has seen it end.
+    pub exit: Option<ExitInfo>,
+    /// How many `ESC [ 6 n` cursor position report requests the screen model has answered.
+    pub cursor_reports_answered: u32,
+    /// The first bytes of output.
+    pub head: Vec<u8>,
+    /// The last bytes of output.
+    pub tail: Vec<u8>,
+}
+
+impl fmt::Display for Diagnostics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} output bytes received", self.output_bytes)?;
+        if let Some(after) = self.first_byte_after {
+            write!(formatter, " (the first after {} ms)", after.as_millis())?;
+        }
+        write!(
+            formatter,
+            "; the program is {}",
+            self.exit.map_or_else(
+                || "still running".to_owned(),
+                |exit| format!("not running ({})", exit.describe())
+            )
+        )?;
+        write!(
+            formatter,
+            "; {} cursor-position requests answered",
+            self.cursor_reports_answered
+        )?;
+        write!(formatter, "; first bytes \"")?;
+        write_escaped(formatter, &self.head)?;
+        write!(formatter, "\", last bytes \"")?;
+        write_escaped(formatter, &self.tail)?;
+        write!(formatter, "\"")
+    }
+}
+
 /// A running (or finished) program in a pseudo-terminal.
 pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
@@ -185,6 +241,12 @@ pub struct PtySession {
     exit: Option<ExitInfo>,
     reaped: bool,
     output_bytes: u64,
+    /// When the first byte of output arrived, for a timeout's diagnostics.
+    first_byte_at: Option<Instant>,
+    /// The first bytes of output, for a timeout's diagnostics. See [`DIAGNOSTIC_BYTES`].
+    head: Vec<u8>,
+    /// The last bytes of output, for a timeout's diagnostics. See [`DIAGNOSTIC_BYTES`].
+    tail: Vec<u8>,
     sampler: ProcessSampler,
     last_sample: Instant,
     cpu_before: Option<CpuTimes>,
@@ -279,6 +341,9 @@ impl PtySession {
             exit: None,
             reaped: false,
             output_bytes: 0,
+            first_byte_at: None,
+            head: Vec::new(),
+            tail: Vec::new(),
             sampler: ProcessSampler::default(),
             last_sample: started.checked_sub(SAMPLE_INTERVAL).unwrap_or(started),
             cpu_before,
@@ -308,6 +373,22 @@ impl PtySession {
     #[must_use]
     pub const fn output_bytes(&self) -> u64 {
         self.output_bytes
+    }
+
+    /// Everything the session can say about its output and the child, for a step that timed out.
+    /// See [`Diagnostics`].
+    #[must_use]
+    pub fn diagnostics(&self) -> Diagnostics {
+        Diagnostics {
+            output_bytes: self.output_bytes,
+            first_byte_after: self
+                .first_byte_at
+                .map(|at| at.saturating_duration_since(self.started)),
+            exit: self.exit,
+            cursor_reports_answered: self.screen.cursor_reports_answered(),
+            head: self.head.clone(),
+            tail: self.tail.clone(),
+        }
     }
 
     /// The resource samples of the child.
@@ -569,6 +650,11 @@ impl PtySession {
 
     fn absorb(&mut self, chunk: &Chunk) -> Result<(), PtyError> {
         self.output_bytes += chunk.bytes.len() as u64;
+        if !chunk.bytes.is_empty() {
+            self.first_byte_at.get_or_insert(chunk.at);
+            capture_head(&mut self.head, &chunk.bytes);
+            capture_tail(&mut self.tail, &chunk.bytes);
+        }
         if let Some((path, cast)) = &mut self.recording {
             cast.output(chunk.at, &chunk.bytes)
                 .map_err(|source| PtyError::Recording {
@@ -579,9 +665,13 @@ impl PtySession {
         let replies = self.screen.process(&chunk.bytes);
         if !replies.is_empty() {
             // A terminal answers a cursor position request; ConPTY, for one, waits for it before it
-            // shows anything.
-            self.write_input(&replies)?;
-            self.record_input(Instant::now(), &replies)?;
+            // shows anything. A program that has already closed its side of the terminal cannot
+            // read the answer, and a terminal does not fail because an answer went unread.
+            match self.write_input(&replies) {
+                Ok(()) => self.record_input(Instant::now(), &replies)?,
+                Err(PtyError::Input(error)) if program_side_closed(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -695,6 +785,34 @@ fn spawn_reader(
             }
         })
         .map_err(|error| PtyError::Open(format!("cannot start the reader thread: {error}")))
+}
+
+/// Whether a write to the terminal failed because the program's side of it is closed, so nothing
+/// is left to read what was written: `EIO` on Unix, a broken pipe on Windows.
+fn program_side_closed(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) {
+        return true;
+    }
+    error.kind() == io::ErrorKind::BrokenPipe
+}
+
+/// Keeps the first [`DIAGNOSTIC_BYTES`] of output seen, across any number of calls.
+fn capture_head(head: &mut Vec<u8>, bytes: &[u8]) {
+    let room = DIAGNOSTIC_BYTES.saturating_sub(head.len());
+    head.extend_from_slice(&bytes[..bytes.len().min(room)]);
+}
+
+/// Keeps the last [`DIAGNOSTIC_BYTES`] of output seen, across any number of calls.
+fn capture_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() >= DIAGNOSTIC_BYTES {
+        tail.clear();
+        tail.extend_from_slice(&bytes[bytes.len() - DIAGNOSTIC_BYTES..]);
+        return;
+    }
+    tail.extend_from_slice(bytes);
+    let excess = tail.len().saturating_sub(DIAGNOSTIC_BYTES);
+    tail.drain(..excess);
 }
 
 fn open_recording(
@@ -850,6 +968,71 @@ mod tests {
             text.contains("033[5;7R"),
             "the program should have read the answer: {text:?}"
         );
+    }
+
+    #[test]
+    fn diagnostics_report_output_timing_cursor_reports_and_bounded_ends() {
+        let mut session = PtySession::spawn(&shell(
+            "stty -echo; printf '%300s' '' | tr ' ' 'A'; printf '\\033[6n'; \
+             printf 'tail-marker'; exit 7",
+        ))
+        .expect("spawn");
+
+        let before = session.diagnostics();
+        assert_eq!(before.output_bytes, 0);
+        assert!(before.first_byte_after.is_none());
+        assert_eq!(before.cursor_reports_answered, 0);
+        assert!(before.exit.is_none());
+        assert_eq!(
+            before.to_string(),
+            "0 output bytes received; the program is still running; 0 cursor-position requests \
+             answered; first bytes \"\", last bytes \"\""
+        );
+
+        run_until(&mut session, PtySession::finished);
+
+        let after = session.diagnostics();
+        assert!(after.output_bytes >= 315, "{after:?}");
+        assert!(after.first_byte_after.is_some());
+        assert_eq!(after.cursor_reports_answered, 1);
+        assert_eq!(after.head.len(), DIAGNOSTIC_BYTES);
+        assert!(
+            after.head.iter().all(|&byte| byte == b'A'),
+            "{:?}",
+            after.head
+        );
+        assert!(
+            after.tail.ends_with(b"tail-marker"),
+            "{:?}",
+            String::from_utf8_lossy(&after.tail)
+        );
+        let exit = after.exit.expect("the child exited");
+        assert_eq!(exit.code, Some(7));
+        assert!(
+            after.to_string().contains("not running (exit code 7)"),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn a_cursor_request_from_a_program_that_has_already_exited_is_not_an_error() {
+        let mut session = PtySession::spawn(&shell("printf '\\033[6n'; exit 0")).expect("spawn");
+        // Read nothing until the program has closed its side of the terminal and every byte has
+        // been read, so the answer to its request can only be written after it is gone.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !session.reader.as_ref().is_some_and(JoinHandle::is_finished) {
+            assert!(
+                Instant::now() < deadline,
+                "the program never closed its terminal"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        run_until(&mut session, PtySession::finished);
+
+        let diagnostics = session.diagnostics();
+        assert_eq!(diagnostics.cursor_reports_answered, 1);
+        assert_eq!(diagnostics.exit.expect("the child exited").code, Some(0));
     }
 
     #[test]

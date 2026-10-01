@@ -311,7 +311,11 @@ impl<'a> Executor<'a> {
                 index,
                 FailureCause::Timeout,
                 expected,
-                format!("not within {timeout_ms} ms; {}", observed()),
+                format!(
+                    "not within {timeout_ms} ms; {}\nsession: {}",
+                    observed(),
+                    self.session.diagnostics()
+                ),
             ),
             Waited::Exited => self.fail(
                 index,
