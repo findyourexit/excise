@@ -358,7 +358,7 @@ present = ["victim"]
 [[steps]]
 step = "wait_fs_absent"
 path = "victim"
-timeout_ms = 30000
+timeout_ms = 60000
 
 [[steps]]
 step = "wait_event"
@@ -382,7 +382,9 @@ absent = ["victim"]
     // between, asserts exactly that. The deletion still finishes normally afterward, on its own:
     // the filesystem loses `victim`, the program reports it through `deletion_finished`, and the
     // sentinels survive. What quitting afterward does is a different, already-covered behavior
-    // (`delete-folder-lifecycle`), not this option's.
+    // (`delete-folder-lifecycle`), not this option's. `wait_fs_absent` waits for the whole deletion
+    // here, so it gets the 60 s the lifecycle's `delete` step gives the same deletion: this test
+    // runs the debug binary, and under load 30 s was not enough.
     let (report, _) = run(&scenario, Profile::Deterministic, fixture.root(), &work);
 
     assert_eq!(
