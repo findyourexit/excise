@@ -170,6 +170,7 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
         cwd: scratch.cwd(),
         cols: settings.cols.unwrap_or(scenario.terminal.cols),
         rows: scenario.terminal.rows,
+        drain_bytes_per_sec: scenario.terminal.drain_bytes_per_sec,
         recording: Some(recording.to_path_buf()),
         title: Some(format!("{} ({})", scenario.name, request.profile)),
     };

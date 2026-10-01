@@ -28,7 +28,11 @@ use std::{
     fmt,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -57,6 +61,9 @@ const READ_CHUNK: usize = 64 * 1024;
 /// How many bytes of raw output a timeout's diagnostics keep from the start and from the end of
 /// the stream.
 const DIAGNOSTIC_BYTES: usize = 200;
+/// How often a capped reader thread rechecks its token bucket while no bytes are banked yet, so
+/// it notices a lifted cap (`PtySession::kill`) promptly instead of sleeping through it.
+const DRAIN_CAP_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// A session could not be started or driven.
 #[derive(Debug, Error)]
@@ -113,6 +120,12 @@ pub struct SpawnSpec {
     pub cols: u16,
     /// The terminal height in rows.
     pub rows: u16,
+    /// Caps how fast the reader thread drains the terminal's output, in bytes per second, so a
+    /// scenario can simulate a slow terminal and the backpressure it puts on the child's writes.
+    /// `None` (unchanged behavior) drains as fast as the operating system delivers bytes. The cap
+    /// stops applying, and the reader drains freely to the end of the output, the instant
+    /// [`PtySession::kill`] is called: see its documentation for why.
+    pub drain_bytes_per_sec: Option<u64>,
     /// Where to write the asciicast recording, if anywhere.
     pub recording: Option<PathBuf>,
     /// A title for the recording.
@@ -242,6 +255,8 @@ pub struct PtySession {
     chunks: Receiver<Chunk>,
     reader: Option<JoinHandle<()>>,
     reader_done: bool,
+    /// Lifted by [`PtySession::kill`] so a capped reader drains freely once the run ends.
+    uncapped: Arc<AtomicBool>,
     screen: Screen,
     recording: Option<(PathBuf, CastWriter<io::BufWriter<std::fs::File>>)>,
     started: Instant,
@@ -301,7 +316,13 @@ impl PtySession {
         // Every fallible step that does not need the child comes first, so a failure leaves
         // nothing running.
         let (sender, chunks) = mpsc::channel();
-        let reader = spawn_reader(reader, sender)?;
+        let uncapped = Arc::new(AtomicBool::new(false));
+        let reader = spawn_reader(
+            reader,
+            sender,
+            spec.drain_bytes_per_sec,
+            Arc::clone(&uncapped),
+        )?;
         let started = Instant::now();
         let recording = spec
             .recording
@@ -344,6 +365,7 @@ impl PtySession {
             chunks,
             reader: Some(reader),
             reader_done: false,
+            uncapped,
             screen: Screen::new(spec.rows, spec.cols),
             recording,
             started,
@@ -636,8 +658,14 @@ impl PtySession {
     /// Ends the child and everything it started, and reaps it. Does nothing once the child has
     /// been reaped.
     ///
-    /// Gives up waiting for the child to die after five seconds.
+    /// Gives up waiting for the child to die after five seconds. Also lifts any drain cap
+    /// (`SpawnSpec::drain_bytes_per_sec`) immediately, so output already queued in the
+    /// pseudo-terminal drains at full speed before the kill signal arrives.
     pub fn kill(&mut self) {
+        // Lifted first: a process that still has output queued when its terminal closes keeps
+        // writing until it is read, so the reader must drain freely before the signal arrives, or
+        // the reap could stall behind a write the reader is pacing.
+        self.uncapped.store(true, Ordering::Relaxed);
         if self.reaped {
             return;
         }
@@ -786,18 +814,86 @@ impl Drop for PtySession {
     }
 }
 
+/// A token-bucket limit on how fast [`spawn_reader`] drains the terminal's output, so a scenario
+/// can simulate a slow terminal and the backpressure it puts on the child's writes, without
+/// distorting timing with a sleep per chunk: tokens accrue continuously at `rate_per_sec` and one
+/// read takes only the tokens already banked.
+struct DrainCap {
+    rate_per_sec: u64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl DrainCap {
+    const fn new(rate_per_sec: u64, now: Instant) -> Self {
+        Self {
+            rate_per_sec,
+            // Starts empty, not pre-filled: a fresh cap paces its very first read exactly like
+            // every later one, with no one-time startup burst to account for.
+            tokens: 0.0,
+            last: now,
+        }
+    }
+
+    /// Bytes available to read right now, at most `want`, after banking tokens for the time
+    /// elapsed since the last call. Banked tokens never exceed one second's worth, so a long
+    /// pause (the reader asleep, or the program not writing) is never spent later as one large
+    /// burst. Invariant: `tokens` never goes negative, so `want`'s lower bound needs no clamp.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "drain rates and chunk sizes stay far below 2^52; `tokens` stays in \
+                  [0.0, rate_per_sec] by construction, so the truncating cast back to a byte \
+                  count is never negative"
+    )]
+    fn take(&mut self, want: usize, now: Instant) -> usize {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens =
+            (self.tokens + elapsed * self.rate_per_sec as f64).min(self.rate_per_sec as f64);
+        let allowed = self.tokens.min(want as f64);
+        self.tokens -= allowed;
+        allowed as usize
+    }
+}
+
 /// Starts the thread that forwards terminal output. It ends when the terminal reports the end of
 /// the output, which happens once the child and everything it started has closed the terminal.
+///
+/// `drain_bytes_per_sec` paces the reads with a [`DrainCap`], so a scenario can simulate a slow
+/// terminal (see [`SpawnSpec::drain_bytes_per_sec`]). `uncapped` lifts the pace the moment
+/// [`PtySession::kill`] is called, rechecked at least every [`DRAIN_CAP_POLL_INTERVAL`] even while
+/// no tokens are banked, so a sleeping reader notices the kill promptly and drains the rest of the
+/// output at full speed.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     sender: mpsc::Sender<Chunk>,
+    drain_bytes_per_sec: Option<u64>,
+    uncapped: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, PtyError> {
     thread::Builder::new()
         .name("harness-pty-reader".to_owned())
         .spawn(move || {
             let mut buffer = vec![0_u8; READ_CHUNK];
+            let mut cap = drain_bytes_per_sec.map(|rate| DrainCap::new(rate, Instant::now()));
             loop {
-                match reader.read(&mut buffer) {
+                let want = match &mut cap {
+                    Some(cap) if !uncapped.load(Ordering::Relaxed) => {
+                        let mut allowed = cap.take(READ_CHUNK, Instant::now());
+                        while allowed == 0 && !uncapped.load(Ordering::Relaxed) {
+                            thread::sleep(DRAIN_CAP_POLL_INTERVAL);
+                            allowed = cap.take(READ_CHUNK, Instant::now());
+                        }
+                        if uncapped.load(Ordering::Relaxed) {
+                            READ_CHUNK
+                        } else {
+                            allowed
+                        }
+                    }
+                    _ => READ_CHUNK,
+                };
+                match reader.read(&mut buffer[..want]) {
                     Ok(0) => break,
                     Ok(read) => {
                         let chunk = Chunk {
@@ -893,6 +989,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             cols: 80,
             rows: 24,
+            drain_bytes_per_sec: None,
             recording: None,
             title: None,
         }
@@ -1329,5 +1426,55 @@ mod tests {
             session.exit().is_some(),
             "the child is still reaped normally"
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_cap_tests {
+    use std::time::{Duration, Instant};
+
+    use super::DrainCap;
+
+    /// The cap's throughput over a simulated burst stays near its configured rate, with a
+    /// generous tolerance. Time is synthetic (`start + Duration::from_millis(..)`), never
+    /// `thread::sleep` or a real elapsed `Instant::now` delta, so the comparison is exact and
+    /// cannot flake under machine load.
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the byte counts here stay far below 2^52"
+    )]
+    fn a_capped_readers_throughput_stays_near_its_rate_over_a_simulated_burst() {
+        const RATE_BYTES_PER_SEC: u64 = 1000;
+        const STEPS: u32 = 100;
+        const STEP_MS: u64 = 100;
+        let start = Instant::now();
+        let mut cap = DrainCap::new(RATE_BYTES_PER_SEC, start);
+        let mut taken = 0_usize;
+        for step in 1..=STEPS {
+            let now = start + Duration::from_millis(u64::from(step) * STEP_MS);
+            taken += cap.take(10_000, now);
+        }
+        let elapsed_secs = f64::from(STEPS) * (STEP_MS as f64 / 1000.0);
+        let observed_rate = taken as f64 / elapsed_secs;
+        let rate = RATE_BYTES_PER_SEC as f64;
+        let tolerance = 0.05;
+        assert!(
+            (observed_rate - rate).abs() <= rate * tolerance,
+            "observed {observed_rate:.1} bytes/s over simulated time, wanted within \
+             {:.0}% of {rate}",
+            tolerance * 100.0,
+        );
+    }
+
+    /// A request for no more than the tokens banked by elapsed time is granted in full, never
+    /// throttled below what it asked for.
+    #[test]
+    fn a_request_within_the_banked_tokens_is_granted_in_full() {
+        let start = Instant::now();
+        let mut cap = DrainCap::new(1_000_000, start);
+        // A whole second elapses, banking exactly the rate; a smaller request is granted in full.
+        let later = start + Duration::from_secs(1);
+        assert_eq!(cap.take(4_096, later), 4_096);
     }
 }

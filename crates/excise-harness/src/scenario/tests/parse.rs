@@ -44,7 +44,8 @@ fn a_minimal_scenario_gets_the_documented_defaults() {
         scenario.terminal,
         Terminal {
             cols: 120,
-            rows: 40
+            rows: 40,
+            drain_bytes_per_sec: None,
         }
     );
     assert_eq!(scenario.expect, Expect::Pass);
@@ -76,7 +77,8 @@ fn a_full_scenario_parses_every_top_level_field() {
         scenario.terminal,
         Terminal {
             cols: 100,
-            rows: 30
+            rows: 30,
+            drain_bytes_per_sec: None,
         }
     );
     assert_eq!(scenario.tier, Tier::Nightly);

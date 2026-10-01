@@ -51,7 +51,7 @@
       "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
     },
     "profile": {
-      "enum": ["default", "deterministic", "monochrome-ascii", "narrow", "mouse-keymaps"]
+      "enum": ["default", "deterministic", "reduced-motion", "monochrome-ascii", "narrow", "mouse-keymaps"]
     },
     "failed_step": {
       "type": "object",

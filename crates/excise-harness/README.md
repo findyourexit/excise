@@ -95,7 +95,7 @@ the semantic rules below and reports every broken rule, not only the first. **A 
 | `profiles` | yes | A non-empty, duplicate-free list of profiles the scenario runs under. |
 | `tier` | no | `"quick"` (default), `"full"`, or `"nightly"`: which `cargo xtask e2e` tier runs it. See [Tiers and platforms](#tiers-and-platforms). |
 | `platforms` | no | The operating systems the scenario runs on, as `std::env::consts::OS` spells them. Defaults to all three. See [Tiers and platforms](#tiers-and-platforms). |
-| `terminal` | no | The initial terminal size. Defaults to 120 columns by 40 rows; at least 32 by 8. |
+| `terminal` | no | The initial terminal size, and an optional cap (`drain_bytes_per_sec`) on how fast the pseudo-terminal runner drains this scenario's output (see [Terminal throughput](#pty-runner)). Size defaults to 120 columns by 40 rows, at least 32 by 8; the drain cap defaults to unthrottled. |
 | `expect` | no | `"pass"` (default) or `"fail"`. See [Expected failures](#expected-failures). |
 | `fails_on` | no | The platforms `expect = "fail"` applies to; defaults to every platform in `platforms`. See [Expected failures](#expected-failures). |
 | `slice` | if `expect = "fail"` | The id of the work slice that fixes the defect, for example `X2`: an uppercase letter followed by up to seven uppercase letters or digits. |
@@ -111,6 +111,7 @@ environment, arguments, and terminal size.
 |---|---|
 | `default` | The user defaults. |
 | `deterministic` | Reduced motion and a single scan thread. |
+| `reduced-motion` | Reduced motion only; thread count is unchanged. The motion baseline for the ratio comparisons (see [Comparison files](#comparison-files)), so a real motion slowdown cannot hide behind `deterministic`'s extra threads. |
 | `monochrome-ascii` | Monochrome output with ASCII symbols and borders. |
 | `narrow` | A narrow terminal. |
 | `mouse-keymaps` | Mouse input and the alternative movement keymaps. |
@@ -180,7 +181,7 @@ idle_output_bytes = 0
 |---|---|---|
 | `headless_scan_ratio` | ratio | Headless scan time divided by `du -sk` time on the same fixture. |
 | `tui_complete_ratio` | ratio | Interactive time-to-COMPLETE divided by headless scan time. |
-| `motion_complete_ratio` | ratio | Default-motion time-to-COMPLETE divided by deterministic time-to-COMPLETE. |
+| `motion_complete_ratio` | ratio | Default-motion time-to-COMPLETE divided by reduced-motion time-to-COMPLETE. |
 | `input_to_frame_p99_ms` | ms | The 99th percentile of input-to-frame latency. |
 | `max_stall_ms` | ms | The longest gap without a frame while work is active. |
 | `first_frame_ms` | ms | Time to the first frame. |
@@ -195,6 +196,11 @@ idle_output_bytes = 0
 | `idle_cpu_ms` | ms | CPU time used while the program is idle. |
 | `residue_files` | count | Files left in the scenario scratch directory. |
 | `timing_ab_regression` | fraction | The tolerated timing regression between builds, for example `0.20`. |
+
+`tui_complete_ratio` and `motion_complete_ratio` are ratios between two runs, so no single run's
+`expect_budget` can compute them: see [Comparison files](#comparison-files) for how a comparison
+file checks one. Every other budget here is a single run's own metric, checked directly by
+`expect_budget`.
 
 Timing budgets are only meaningful from paired, interleaved A/B runs (see
 [Output documents](#output-documents)); a single run's wall time is never compared across sessions.
@@ -362,7 +368,7 @@ a root without the ownership marker `.excise-harness-owned` before any process e
 
 | Module | What it does |
 |---|---|
-| `pty` | The session: `portable-pty` with a `vt100` screen model, key encoding for every scenario key with Ctrl and Alt, `ESC[6n` cursor-position requests answered from the screen model, resize, an asciicast v2 recording with output (`"o"`) and input (`"i"`) events, the terminal modes that failure bundles report, and the diagnostics (output timing, the count of answered cursor-position requests, and the bounded head and tail of the raw stream) a timed-out step's failure reports. |
+| `pty` | The session: `portable-pty` with a `vt100` screen model, key encoding for every scenario key with Ctrl and Alt, `ESC[6n` cursor-position requests answered from the screen model, resize, an asciicast v2 recording with output (`"o"`) and input (`"i"`) events, a token-bucket cap on how fast it drains the child's output (see [Terminal throughput](#pty-runner)), the terminal modes that failure bundles report, and the diagnostics (output timing, the count of answered cursor-position requests, and the bounded head and tail of the raw stream) a timed-out step's failure reports. |
 | `events` | A strict reader for the event channel (`EXCISE_TEST_EVENTS`, protocol v1). It reads complete lines only, rejects an unknown `v`, and requires the first event to be the `hello` of the process the runner started. |
 | `metrics` | Latency, stalls, output volume, and resource use (below). |
 | `safety` | Ownership markers, environment isolation, scratch areas, process-group kill, fixture snapshots, and residue checks. |
@@ -382,6 +388,20 @@ session waits until nothing is left. On Windows there is no group to signal: the
 with the library's process termination, which does not reach descendants (`excise` starts none). A
 job object would, but creating one needs `unsafe`, which this workspace allows only in
 `src/os/windows.rs`.
+
+**Terminal throughput.** A scenario's `[terminal]` table, or a comparison's own field, can set
+`drain_bytes_per_sec`: it caps how fast the reader thread takes bytes from the pseudo-terminal,
+with a token bucket rather than a sleep per chunk, so it paces throughput without distorting
+timing. A PTY's kernel buffer blocks a write once it fills, so capping the drain rate below what
+the program writes puts the same backpressure on it that a real slow terminal does — this is how a
+comparison reproduces a regression that only a real terminal's pace exposes, which an unthrottled
+pseudo-terminal cannot. The cap stops applying, and the reader drains the rest of the output as
+fast as the operating system allows, the instant `PtySession::kill` is called (a timeout, a failed
+step, an ordinary run ending, and dropping the session all go through it): a process that still has
+output queued when its terminal closes keeps writing until it is read, so a cap that outlived the
+kill could delay or deadlock the reap. A step under a cap should wait on the event channel
+(`wait_event`), not the screen (`wait_text`, `wait_header`): the screen lags the capped reader, so
+a screen-based wait can time out long after the event it is really waiting for already fired.
 
 ### Linux cgroup memory cap
 
@@ -546,6 +566,100 @@ not in `scenarios/`. `tests/harness_scenarios.rs` in the `excise` crate runs
 `cargo test`, along with a few one-off scenarios that exercise the runner itself, and runs the
 control to assert that the `delete` step failed, that the last input was Backspace, that no `y`
 appears among the recording's input events, and that every byte of the fixture is unchanged.
+
+## Comparison files
+
+```console
+cargo xtask compare [--quick|--full|--nightly] [--comparison NAME]... [--pairs N] [--seed S]
+```
+
+`motion_complete_ratio` and `tui_complete_ratio` are ratios between two runs, so one scenario's
+`expect_budget` cannot check them: a single run has nothing to divide. A comparison file names the
+two sides, and `excise_harness::comparison` drives them paired and interleaved, reusing the same
+primitives `cargo xtask bench-e2e` uses to run one side
+([`crate::bench::cases::run_scenario_once`]/[`run_fixture_once`]) and to summarize a ratio
+([`crate::bench::pairing`], [`crate::bench::bootstrap`]). One file, `comparisons/<name>.toml`, is
+one comparison.
+
+```toml
+schema_version = 1
+name = "motion-complete-node-modules-2k"
+description = "Default-motion time-to-COMPLETE against reduced-motion time-to-COMPLETE."
+fixture = "node-modules-2k"
+budget = "motion_complete_ratio"
+pairs = 5
+timeout_ms = 60000
+tier = "full"
+platforms = ["macos"]
+```
+
+### Fields
+
+| Field | Required | Meaning |
+|---|---|---|
+| `schema_version` | yes | The format version. Only `1` is accepted. |
+| `name` | yes | The comparison identifier, identifier-shaped like a scenario's `name`. It must match the file's name. |
+| `description` | yes | What the comparison demonstrates. |
+| `fixture` | yes | The identifier of the fixture specification both sides run against. |
+| `budget` | yes | `motion_complete_ratio` or `tui_complete_ratio`: the ratio this comparison checks. No other budget is a ratio between two runs. |
+| `profile` | only for `tui_complete_ratio` | Which interactive profile is the candidate, compared against a headless scan of the same fixture. Omitted for `motion_complete_ratio`, whose two sides are fixed by the budget's own definition: `default` (candidate) against `reduced-motion` (baseline). |
+| `pairs` | no | How many interleaved baseline/candidate pairs to run. Defaults to 5. |
+| `timeout_ms` | yes | The bound each side's run gets to reach `COMPLETE` (or finish its scan), between 1 and the scenario format's `MAX_TIMEOUT_MS`. Choose it with headroom over the slower side's healthy time, not just the faster side's: the budgets need headroom beyond measurement noise, not a bound that only a perfectly quiet machine clears. |
+| `tier` | no | `"quick"` (default), `"full"`, or `"nightly"`: which `cargo xtask compare` tier runs it, exactly as a scenario's `tier` selects `cargo xtask e2e`. |
+| `platforms` | no | The operating systems the comparison runs on. Defaults to every platform the harness knows. |
+| `expect` | no | `"pass"` (default) or `"fail"`, with the same strict-xfail semantics as a scenario (see [Expected failures](#expected-failures)). |
+| `fails_on` | no | The platforms `expect = "fail"` applies to; defaults to every platform in `platforms`. |
+| `slice` | if `expect = "fail"` | The id of the work slice that fixes the defect. |
+| `limit` | no | Overrides the budget's default limit (1.25 for both ratio budgets). |
+| `drain_bytes_per_sec` | no | Caps how fast each side's interactive run drains its output, in bytes per second, so the comparison can simulate a slow terminal (see [Terminal throughput](#pty-runner)). Defaults to unthrottled. A headless baseline has no pseudo-terminal and ignores it. |
+
+### The two sides
+
+The **candidate** is always an interactive run: the comparison builds a minimal scenario against
+`fixture` whose only step is `wait_event { event = "scan_complete" }` bounded by `timeout_ms` (the
+event channel, not the screen, so a drain cap cannot make the wait lag the measurement; see
+[Terminal throughput](#pty-runner)), and runs it through the PTY runner under the candidate profile
+(`Comparison::candidate_profile`). The **baseline** is either another profile of the same minimal
+scenario (`motion_complete_ratio`: `reduced-motion`) or a headless scan of the same fixture
+(`tui_complete_ratio`: no profile runs the interface at all) (`Comparison::baseline_profile`). The
+candidate's metric is `scan_complete_ms` (spawn to the `scan_complete` event); the baseline's is
+`scan_complete_ms` for another profile, or a headless scan's `wall_time_ms` for
+`tui_complete_ratio`.
+
+### The timeout-as-failure rule
+
+A run that never reaches `COMPLETE` (or never finishes its scan) within `timeout_ms` is F2's own
+symptom under default motion: scan ingestion starving so badly that the interface never signals
+completion. Counting it as a harness error would be wrong twice over — it would abort the whole
+comparison instead of judging it, and a scenario author could never write down "this must not
+happen" as a budget. Instead, a run that does not complete counts as a **failed ratio**: its
+milliseconds are capped at the bound for the median and the confidence interval the report shows,
+and the comparison's outcome is `Failed` regardless of what that capped number comes out to,
+because non-completion is the defect on its own, not merely evidence of a large ratio.
+
+### Pairs and statistics
+
+`pairs` (5 by default) interleaved trials run baseline, candidate, baseline, candidate, and so on
+([`crate::bench::pairing::interleaving`]), exactly as `cargo xtask bench-e2e` interleaves its two
+builds. For every pair the report holds the candidate/baseline ratio, their median
+([`crate::bench::bootstrap::median_ratio`]), and a deterministic bootstrap 95% confidence interval
+of the median ([`crate::bench::bootstrap::bootstrap_ci`], seeded from `--seed`, `0` by default).
+
+### Verdicts
+
+The outcome is `Passed` when every run completed and the median ratio is at most the limit (its own
+`limit` override, or the budget's default of 1.25); otherwise `Failed`, whether because a run never
+completed or because the ratio itself is too high. Strict xfail then applies exactly as it does for
+a scenario (see [Expected failures](#expected-failures)): `expect = "fail"` with a failing outcome
+is `xfail`; a passing outcome there is `xpass`, which fails the run.
+
+### Running comparisons
+
+`cargo xtask compare` loads every file in `comparisons/`, selects by tier and platform exactly as
+`cargo xtask e2e` selects scenarios (a comparison named with `--comparison` runs whatever its tier;
+one outside its `platforms` is always skipped, with the reason), runs each selected comparison, and
+prints a table of its verdict, pairs, how many runs completed on each side, the median ratio, its
+confidence interval, and the limit. It exits non-zero on any `fail` or `xpass`.
 
 ## Headless runner
 
@@ -1102,6 +1216,7 @@ same configuration layers, without reading the environment or a configuration fi
 |---|---|
 | `default` | The configuration defaults. |
 | `deterministic` | Reduced motion, loading animation off, one scan thread. |
+| `reduced-motion` | Reduced motion and loading animation off; thread count unchanged. |
 | `monochrome-ascii` | The monochrome theme, ASCII symbols and borders. |
 | `narrow` | A backend 60 columns wide, with the scenario's rows. |
 | `mouse-keymaps` | Mouse input, the Emacs key preset. |

@@ -98,6 +98,7 @@ impl TuiSession {
             cwd: scratch.cwd(),
             cols: DEFAULT_TERMINAL_COLS,
             rows: DEFAULT_TERMINAL_ROWS,
+            drain_bytes_per_sec: None,
             recording: None,
             title: Some(title.to_owned()),
         };
