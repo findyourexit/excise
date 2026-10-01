@@ -341,7 +341,12 @@ Details that a table cannot carry:
   barrier drains work outside the production scheduling path, scheduling and throughput are judged
   only by the pseudo-terminal and headless runners.
 - **Bounds.** Every wait is bounded. When a bound elapses the runner kills the process group,
-  writes a failure bundle, and leaves nothing behind.
+  writes a failure bundle, and leaves nothing behind. A step that times out also reports the
+  session's diagnostics in its failure detail and in the bundle's `screen.txt`: how many output
+  bytes arrived and when the first one did, whether the child is still alive, how many `ESC[6n`
+  cursor-position requests were answered, and the bounded head and tail of the raw output stream
+  (`PtySession::diagnostics`). An empty screen at the deadline reads as zero bytes and zero
+  answered requests: the program's output never reached the screen model at all.
 - **Sentinels.** The runner asserts every sentinel before it sends `y` for a `delete` step, and
   again after the last step.
 - **Verdicts.** A run succeeds only if no result has a blocking verdict; see
@@ -356,7 +361,7 @@ a root without the ownership marker `.excise-harness-owned` before any process e
 
 | Module | What it does |
 |---|---|
-| `pty` | The session: `portable-pty` with a `vt100` screen model, key encoding for every scenario key with Ctrl and Alt, `ESC[6n` cursor-position requests answered from the screen model, resize, an asciicast v2 recording with output (`"o"`) and input (`"i"`) events, and the terminal modes that failure bundles report. |
+| `pty` | The session: `portable-pty` with a `vt100` screen model, key encoding for every scenario key with Ctrl and Alt, `ESC[6n` cursor-position requests answered from the screen model, resize, an asciicast v2 recording with output (`"o"`) and input (`"i"`) events, the terminal modes that failure bundles report, and the diagnostics (output timing, the count of answered cursor-position requests, and the bounded head and tail of the raw stream) a timed-out step's failure reports. |
 | `events` | A strict reader for the event channel (`EXCISE_TEST_EVENTS`, protocol v1). It reads complete lines only, rejects an unknown `v`, and requires the first event to be the `hello` of the process the runner started. |
 | `metrics` | Latency, stalls, output volume, and resource use (below). |
 | `safety` | Ownership markers, environment isolation, scratch areas, process-group kill, fixture snapshots, and residue checks. |

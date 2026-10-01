@@ -13,4 +13,4 @@ mod session;
 pub mod ui;
 
 pub use screen::{BoxRect, BoxView, HEADER_ROWS, Screen, ScreenModes};
-pub use session::{ExitInfo, PtyError, PtySession, SpawnSpec, TerminalModes};
+pub use session::{Diagnostics, ExitInfo, PtyError, PtySession, SpawnSpec, TerminalModes};

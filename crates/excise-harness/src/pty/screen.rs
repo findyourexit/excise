@@ -23,6 +23,8 @@ const MAX_BOX_ROWS: u16 = 30;
 #[derive(Debug, Default)]
 struct Responder {
     replies: Vec<u8>,
+    /// How many cursor position report requests have been answered, in all.
+    answered: u32,
 }
 
 impl vt100::Callbacks for Responder {
@@ -47,6 +49,7 @@ impl vt100::Callbacks for Responder {
             let column = column.min(columns.saturating_sub(1));
             self.replies
                 .extend_from_slice(format!("\u{1b}[{};{}R", row + 1, column + 1).as_bytes());
+            self.answered += 1;
         }
     }
 }
@@ -143,6 +146,15 @@ impl Screen {
     pub fn process(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.parser.process(bytes);
         std::mem::take(&mut self.parser.callbacks_mut().replies)
+    }
+
+    /// How many cursor position report requests (`ESC [ 6 n`) this screen has answered, in all.
+    /// A step that times out on an empty screen reports this: zero means the program's output
+    /// never reached the screen model at all, not even the handshake `ConPTY` waits for on
+    /// Windows (see the module documentation of [`crate::pty::session`]).
+    #[must_use]
+    pub fn cursor_reports_answered(&self) -> u32 {
+        self.parser.callbacks().answered
     }
 
     /// Resizes the emulator.
@@ -416,6 +428,20 @@ pub(crate) mod tests {
         let reply = screen.process(b"\x1b[6nx\x1b[10;20H\x1b[6n");
 
         assert_eq!(reply, b"\x1b[1;1R\x1b[10;20R");
+    }
+
+    #[test]
+    fn cursor_reports_answered_counts_every_request_seen_including_split_ones() {
+        let mut screen = Screen::new(24, 80);
+        assert_eq!(screen.cursor_reports_answered(), 0);
+
+        screen.process(b"\x1b[6nx\x1b[10;20H\x1b[6n");
+        assert_eq!(screen.cursor_reports_answered(), 2);
+
+        screen.process(b"\x1b[");
+        screen.process(b"6");
+        screen.process(b"n");
+        assert_eq!(screen.cursor_reports_answered(), 3);
     }
 
     #[test]
