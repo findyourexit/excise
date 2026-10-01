@@ -935,11 +935,13 @@ mod tests {
     #[test]
     fn a_binary_that_cannot_warm_up_stops_the_matrix_before_any_run() {
         let work = tempfile::tempdir().expect("a temporary directory");
+        // Only the hang needs a short bound, to fire the timeout. A stub that must finish gets the
+        // real one: on a loaded machine, starting `/bin/sh` alone can take longer than 300 ms.
         let quick = Duration::from_millis(300);
 
         // A healthy binary is launched once and leaves nothing behind.
         let healthy = stub(work.path(), "healthy", "#!/bin/sh\nexit 0\n");
-        warm_up(&healthy, work.path(), quick).expect("a healthy warm-up");
+        warm_up(&healthy, work.path(), WARM_UP_TIMEOUT).expect("a healthy warm-up");
         let entries: Vec<_> = fs::read_dir(work.path())
             .expect("the work directory")
             .filter_map(Result::ok)
@@ -953,17 +955,17 @@ mod tests {
         // An unsuccessful exit, a hang, and a missing binary are errors, never skipped.
         let failing = stub(work.path(), "failing", "#!/bin/sh\nexit 3\n");
         let hanging = stub(work.path(), "hanging", "#!/bin/sh\nexec sleep 30\n");
-        for (binary, reason) in [
-            (&failing, "exit status: 3"),
-            (&hanging, "did not end within 300 ms"),
+        for (binary, timeout, reason) in [
+            (&failing, WARM_UP_TIMEOUT, "exit status: 3"),
+            (&hanging, quick, "did not end within 300 ms"),
         ] {
-            let error = warm_up(binary, work.path(), quick).expect_err("a failed warm-up");
+            let error = warm_up(binary, work.path(), timeout).expect_err("a failed warm-up");
             assert!(matches!(error, E2eError::WarmUp { .. }), "{error}");
             assert!(error.to_string().contains(reason), "{error}");
         }
         let missing = work.path().join("absent");
         assert!(matches!(
-            warm_up(&missing, work.path(), quick),
+            warm_up(&missing, work.path(), WARM_UP_TIMEOUT),
             Err(E2eError::WarmUp { .. })
         ));
 
