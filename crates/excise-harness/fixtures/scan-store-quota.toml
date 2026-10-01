@@ -1,0 +1,15 @@
+schema_version = 1
+id = "scan-store-quota"
+description = "A flat directory of many tiny files beside an empty mount point. A privileged run copy attaches a small volume at the mount point and points the scan store there; the scan store the tree produces, at its measured bytes per entry, crosses 75% of the volume's real free space."
+seed = 23
+
+[[parts]]
+kind = "tree"
+root = "many"
+depth = 0
+files_per_dir = 35000
+
+[[parts]]
+kind = "volume"
+root = "mnt"
+size_mib = 8

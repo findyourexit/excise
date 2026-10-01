@@ -28,7 +28,7 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    fixture::Fixtures,
+    fixture::{Fixtures, PRIVILEGED_ENV, PrivilegedOptIn, RunCopy},
     report::{
         BinaryIdentity, Document, HarnessSummary, ScenarioResult, SchemaVersion, SummaryKind, Tier,
         Verdict,
@@ -259,11 +259,14 @@ fn selected_profiles(options: &E2eOptions, scenario: &Scenario) -> Vec<Profile> 
 ///
 /// A scenario outside its `platforms` is always skipped, even when `options.named`. One outside
 /// `options.tier` is skipped too, unless `options.named`: a scenario named with `--scenario` runs
-/// whatever its tier.
+/// whatever its tier. One whose fixture needs a scratch volume (`fixture::spec::FixtureSpec::has_volumes`)
+/// is skipped too, even when named, unless `EXCISE_HARNESS_PRIVILEGED=1` opts in: a volume is
+/// privileged-adjacent on every OS (see `fixture::volume`).
 fn select<'a>(
     options: &'a E2eOptions,
     os: &str,
 ) -> (Vec<(&'a Scenario, Profile)>, Vec<SkippedScenario>) {
+    let fixtures = Fixtures::bundled();
     let mut plan = Vec::new();
     let mut skipped = Vec::new();
     for scenario in &options.scenarios {
@@ -283,6 +286,20 @@ fn select<'a>(
                 reason: format!(
                     "its tier is `{}`, outside the `{}` tier",
                     scenario.tier, options.tier
+                ),
+            });
+            continue;
+        }
+        if fixtures
+            .spec(&scenario.fixture)
+            .is_ok_and(|spec| spec.has_volumes())
+            && PrivilegedOptIn::from_env().is_none()
+        {
+            skipped.push(SkippedScenario {
+                name: scenario.name.clone(),
+                reason: format!(
+                    "its fixture `{}` needs a scratch volume, which needs `{PRIVILEGED_ENV}=1`",
+                    scenario.fixture
                 ),
             });
             continue;
@@ -317,7 +334,7 @@ fn warm_up(binary: &Path, work_dir: &Path, timeout: Duration) -> Result<(), E2eE
     let mut child = Command::new(&program)
         .arg("--version")
         .env_clear()
-        .envs(isolated_env(&scratch, Profile::Default, false))
+        .envs(isolated_env(&scratch, Profile::Default, false, None))
         .current_dir(scratch.cwd())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -455,11 +472,15 @@ fn run_one(
             );
         }
     };
-    let fixture = match Fixtures::bundled().run_copy(&scenario.fixture, workspace.path()) {
+    let mut fixture = match Fixtures::bundled().run_copy(&scenario.fixture, workspace.path()) {
         Ok(fixture) => fixture,
         Err(error) => {
             return failed_to_start(scenario, profile, repetition, error.to_string());
         }
+    };
+    let scan_store_dir = match attach_volumes_if_needed(&mut fixture, scenario) {
+        Ok(scan_store_dir) => scan_store_dir,
+        Err(reason) => return failed_to_start(scenario, profile, repetition, reason),
     };
     let bundle_dir = run_dir.join(format!("{}-{profile}-{repetition}", scenario.name));
     let repro = format!(
@@ -471,6 +492,7 @@ fn run_one(
         profile,
         binary: &options.binary,
         fixture_root: fixture.root(),
+        scan_store_dir: scan_store_dir.as_deref(),
         work_dir: workspace.path(),
         bundle_dir: Some(&bundle_dir),
         repro_command: &repro,
@@ -487,6 +509,55 @@ fn run_one(
         repetition,
         report,
         kept_workspace,
+    }
+}
+
+/// Attaches every volume part of `fixture`'s plan, and returns the directory
+/// `scenario.scan_store_on_volume` asks `EXCISE_SCAN_STORE_DIR` to use instead of the scratch
+/// area's own `store` directory.
+///
+/// # Errors
+///
+/// Returns the reason the run cannot start: the fixture has no volume part but
+/// `scan_store_on_volume` is set; the opt-in is missing (`select` already filters this out, but
+/// this function is defensive on its own: a fixture can plan volumes without `select` loading
+/// its spec successfully, for example a spec that fails to parse); attaching failed; or
+/// `scan_store_on_volume` is set and the fixture declares other than exactly one volume part.
+fn attach_volumes_if_needed(
+    fixture: &mut RunCopy,
+    scenario: &Scenario,
+) -> Result<Option<PathBuf>, String> {
+    if fixture.plan().volumes().is_empty() {
+        return if scenario.scan_store_on_volume {
+            Err(format!(
+                "`{}` sets `scan_store_on_volume`, but its fixture `{}` has no volume part",
+                scenario.name, scenario.fixture
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    let opt_in = PrivilegedOptIn::from_env().ok_or_else(|| {
+        format!(
+            "its fixture `{}` needs a scratch volume, which needs `{PRIVILEGED_ENV}=1`",
+            scenario.fixture
+        )
+    })?;
+    fixture
+        .attach_volumes(opt_in)
+        .map_err(|error| error.to_string())?;
+    if !scenario.scan_store_on_volume {
+        return Ok(None);
+    }
+    match fixture.attached_mount_points().as_slice() {
+        [mount] => Ok(Some(mount.join("store"))),
+        mounts => Err(format!(
+            "`{}` sets `scan_store_on_volume`, which needs exactly one volume part; its \
+             fixture `{}` declares {}",
+            scenario.name,
+            scenario.fixture,
+            mounts.len()
+        )),
     }
 }
 
@@ -748,6 +819,53 @@ mod tests {
                 "{tier} includes {scenario_tier}?"
             );
         }
+    }
+
+    #[test]
+    fn a_scenario_whose_fixture_needs_a_volume_is_skipped_without_the_privileged_opt_in() {
+        // `mount-boundary` is a real bundled fixture with a `volume` part. The test process never
+        // sets `EXCISE_HARNESS_PRIVILEGED` (setting it would be unsafe and race every other test
+        // in this process), so `select` must skip it here exactly as it would in an ordinary,
+        // unprivileged run.
+        assert!(
+            PrivilegedOptIn::from_env().is_none(),
+            "this test assumes the opt-in is not set in the test process"
+        );
+        let mut needs_a_volume = scenario(r#"["default"]"#);
+        needs_a_volume.fixture = "mount-boundary".to_owned();
+        let mut opts = options(Tier::Quick, Vec::new());
+        opts.scenarios = vec![needs_a_volume];
+
+        let (plan, skipped) = select(&opts, "linux");
+
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].name, "s");
+        assert!(
+            skipped[0].reason.contains("scratch volume")
+                && skipped[0].reason.contains(PRIVILEGED_ENV),
+            "{}",
+            skipped[0].reason
+        );
+
+        // Named with `--scenario`, the same scenario is still skipped: platform and tier
+        // selection are bypassed by `named`, but the volume opt-in never is.
+        opts.named = true;
+        let (plan, skipped) = select(&opts, "linux");
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+    }
+
+    #[test]
+    fn a_scenario_whose_fixture_has_no_volume_part_is_never_skipped_for_one() {
+        let ordinary = scenario(r#"["default"]"#);
+        let mut opts = options(Tier::Quick, Vec::new());
+        opts.scenarios = vec![ordinary];
+
+        let (plan, skipped) = select(&opts, "linux");
+
+        assert_eq!(plan.len(), 1);
+        assert!(skipped.is_empty(), "{skipped:?}");
     }
 
     #[test]

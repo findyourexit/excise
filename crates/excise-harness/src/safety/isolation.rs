@@ -1,6 +1,7 @@
 //! Profiles and the isolated environment of a spawned `excise`.
 
 use std::ffi::OsString;
+use std::path::Path;
 
 use crate::scenario::Profile;
 
@@ -60,6 +61,11 @@ impl ProfileSettings {
 /// fixed to `/bin/sh` on Unix because the pseudo-terminal library always adds a `SHELL`, and an
 /// inherited one would leak the user's login shell into the run.
 ///
+/// `scan_store_dir` overrides `EXCISE_SCAN_STORE_DIR` to a path outside `scratch`, for a
+/// scenario that points the scan store at an attached volume (see
+/// [`Scenario::scan_store_on_volume`](crate::scenario::Scenario::scan_store_on_volume)). `None`
+/// uses the scratch area's own `store` directory, as before.
+///
 /// On Windows a process needs a few system variables to start at all, so `SystemRoot`,
 /// `SystemDrive`, and `windir` are copied from the parent. That variant is not exercised by this
 /// crate's own tests.
@@ -68,6 +74,7 @@ pub fn isolated_env(
     scratch: &Scratch,
     profile: Profile,
     with_events: bool,
+    scan_store_dir: Option<&Path>,
 ) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = Vec::new();
     let mut set = |name: &str, value: OsString| env.push((OsString::from(name), value));
@@ -92,7 +99,10 @@ pub fn isolated_env(
         set("SHELL", "/bin/sh".into());
     }
     set("EXCISE_CONFIG", scratch.config_file().into());
-    set("EXCISE_SCAN_STORE_DIR", scratch.store().into());
+    set(
+        "EXCISE_SCAN_STORE_DIR",
+        scan_store_dir.map_or_else(|| scratch.store().into(), OsString::from),
+    );
     if with_events {
         set("EXCISE_TEST_EVENTS", scratch.events().into());
     }
@@ -108,7 +118,7 @@ mod tests {
 
     fn env_of(profile: Profile) -> Vec<(String, String)> {
         let scratch = Scratch::create(&std::env::temp_dir()).expect("a scratch directory");
-        isolated_env(&scratch, profile, true)
+        isolated_env(&scratch, profile, true, None)
             .into_iter()
             .map(|(name, value)| {
                 (
@@ -159,7 +169,7 @@ mod tests {
     #[test]
     fn every_scratch_variable_points_inside_the_scratch_area() {
         let scratch = Scratch::create(&std::env::temp_dir()).expect("a scratch directory");
-        let env = isolated_env(&scratch, Profile::Default, true);
+        let env = isolated_env(&scratch, Profile::Default, true, None);
 
         for (name, value) in &env {
             let name = name.to_string_lossy();
@@ -184,9 +194,29 @@ mod tests {
     fn the_event_file_is_only_requested_when_asked_for() {
         let scratch = Scratch::create(&std::env::temp_dir()).expect("a scratch directory");
 
-        let without = isolated_env(&scratch, Profile::Default, false);
+        let without = isolated_env(&scratch, Profile::Default, false, None);
 
         assert!(without.iter().all(|(name, _)| name != "EXCISE_TEST_EVENTS"));
+    }
+
+    #[test]
+    fn a_scan_store_dir_override_replaces_the_scratch_store_path() {
+        let scratch = Scratch::create(&std::env::temp_dir()).expect("a scratch directory");
+        let volume_store = scratch.root().join("not-the-scratch-store");
+        let env = isolated_env(&scratch, Profile::Default, true, Some(&volume_store));
+
+        assert_eq!(
+            value(
+                &env.into_iter()
+                    .map(|(name, value)| (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned()
+                    ))
+                    .collect::<Vec<_>>(),
+                "EXCISE_SCAN_STORE_DIR"
+            ),
+            Some(volume_store.to_string_lossy().into_owned().as_str())
+        );
     }
 
     #[test]

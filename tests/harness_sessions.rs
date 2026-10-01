@@ -111,16 +111,10 @@ impl TuiSession {
 
 /// `isolated_env`'s environment for `scratch` under the `deterministic` profile (reduced motion,
 /// one scan thread: irrelevant to F4, but it keeps COMPLETE and idle redraws fast and predictable
-/// instead of depending on F2/F3, which are different, unfixed findings), except
-/// `EXCISE_SCAN_STORE_DIR` is overridden to the shared scan-store parent `store`.
+/// instead of depending on F2/F3, which are different, unfixed findings), with
+/// `EXCISE_SCAN_STORE_DIR` pointing at the shared scan-store parent `store`.
 fn session_env(scratch: &Scratch, store: &Path) -> Vec<(OsString, OsString)> {
-    let mut env = isolated_env(scratch, Profile::Deterministic, false);
-    for (name, value) in &mut env {
-        if name.to_str() == Some("EXCISE_SCAN_STORE_DIR") {
-            store.as_os_str().clone_into(value);
-        }
-    }
-    env
+    isolated_env(scratch, Profile::Deterministic, false, Some(store))
 }
 
 /// Every entry directly under `parent`, by name.

@@ -174,6 +174,12 @@ pub struct Scenario {
     /// Fixture-relative paths that must survive the scenario.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sentinels: Vec<String>,
+    /// Points `EXCISE_SCAN_STORE_DIR` at a subdirectory of the fixture's attached volume instead
+    /// of the scenario's own scratch area. The fixture must declare exactly one `volume` part.
+    /// Any fixture with a volume part already needs the `EXCISE_HARNESS_PRIVILEGED` opt-in to
+    /// attach it; this just chooses where the scan store goes once it is attached.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scan_store_on_volume: bool,
     /// The profiles the scenario runs under.
     pub profiles: Vec<Profile>,
     /// How often the scenario runs. `quick` (the default) runs under every tier and in-process;

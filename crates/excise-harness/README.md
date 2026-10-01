@@ -90,6 +90,7 @@ the semantic rules below and reports every broken rule, not only the first. **A 
 | `description` | yes | What the scenario demonstrates. |
 | `fixture` | yes | The identifier of the fixture specification to generate, in the same shape as `name`. The scenario never names a directory. |
 | `sentinels` | if any step is `delete` | Fixture-relative paths that must survive the scenario. |
+| `scan_store_on_volume` | no | Points `EXCISE_SCAN_STORE_DIR` at a subdirectory of the fixture's attached volume instead of the scenario's own scratch area. Defaults to `false`. The fixture must declare exactly one `volume` part. See [Volumes](#volumes). |
 | `profiles` | yes | A non-empty, duplicate-free list of profiles the scenario runs under. |
 | `tier` | no | `"quick"` (default), `"full"`, or `"nightly"`: which `cargo xtask e2e` tier runs it. See [Tiers and platforms](#tiers-and-platforms). |
 | `platforms` | no | The operating systems the scenario runs on, as `std::env::consts::OS` spells them. Defaults to all three. See [Tiers and platforms](#tiers-and-platforms). |
@@ -359,7 +360,9 @@ a root without the ownership marker `.excise-harness-owned` before any process e
 **Isolation.** The child starts with an empty environment plus `TERM=xterm-256color`, `COLORTERM`,
 `LANG`, and the profile's variables (see [Profiles](#profiles)). `HOME`, `EXCISE_CONFIG`, the
 working directory, `EXCISE_SCAN_STORE_DIR`, and the temporary directory point into a fresh scratch
-area, and `EXCISE_TEST_EVENTS` names a new file inside it. The scratch area is deleted after the
+area, and `EXCISE_TEST_EVENTS` names a new file inside it. A scenario's `scan_store_on_volume`
+overrides `EXCISE_SCAN_STORE_DIR` to a directory on an attached volume instead (see
+[Volumes](#volumes)); nothing else about isolation changes. The scratch area is deleted after the
 run unless `--keep-fixture` is given.
 
 **Process group.** On Unix the child leads its own session, so its process group id is its pid.
@@ -759,6 +762,7 @@ marker.
 | `delete-file` | 5 | A 48 KiB victim file, a sentinel beside it, and a folder below it with two more files that must survive. The in-process lifecycle scenario deletes the victim. |
 | `navigate-folders` | 6 | Two folders and a file beside them, to drill into and back out of. |
 | `mount-boundary` | 13 | An ordinary `outside/` tree and an empty mount point; a privileged run copy attaches a 16 MiB volume with 20 files. |
+| `scan-store-quota` | 35,002 | A flat directory of 35,000 tiny files beside an empty mount point; a privileged run copy attaches an 8 MiB volume there for `scan_store_on_volume` (see [Volumes](#volumes)). |
 | `tiny-files-50k` | 49,050 | 49 directories of 1,000 tiny files. |
 | `tiny-files-1m` | 1,010,101 | One million tiny files. For nightly and manual tiers only: tests never generate it. |
 
@@ -919,6 +923,26 @@ the opt-in.
 
 ```console
 EXCISE_HARNESS_PRIVILEGED=1 cargo test -p excise-harness --locked --lib volume
+```
+
+**`cargo xtask e2e` and `scan_store_on_volume`.** The PTY runner (`run_e2e`/`run_scenario`)
+always starts `excise` with `EXCISE_SCAN_STORE_DIR` inside its own per-run scratch area (see
+[Isolation](#isolation)), on the same file system as everything else the scenario touches. A
+scenario sets `scan_store_on_volume = true` to point it at `<mount>/store` on the fixture's
+attached volume instead, so the scan store's own free-space math runs against a real, tiny,
+disposable file system rather than the host disk. `select` skips any scenario whose fixture
+`has_volumes()` without the `EXCISE_HARNESS_PRIVILEGED` opt-in, named or not (the same rule the
+in-process runner already applies unconditionally, since it never attaches a volume at all); with
+the opt-in, `run_one` attaches every volume part before the process starts, and
+`scan_store_on_volume` additionally requires the fixture to declare exactly one of them. The runner
+creates `<mount>/store` before it takes the fixture's baseline snapshot: the store then lives inside
+the fixture tree, so `expect_exit`'s fixture diff reports anything excise leaves in it, while
+`residue = "none"` still covers the scratch area. A scenario's steps cannot see free space, so
+`tests/harness_scan_store_quota.rs` runs `scan-store-quota` against a real volume and checks that a
+scan stopped at the quota left the volume's reserve free:
+
+```console
+EXCISE_HARNESS_PRIVILEGED=1 cargo test --locked --test harness_scan_store_quota
 ```
 
 ## Output documents

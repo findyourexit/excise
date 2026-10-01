@@ -108,6 +108,7 @@ fn run(
         profile,
         binary: Path::new(env!("CARGO_BIN_EXE_excise")),
         fixture_root: root,
+        scan_store_dir: None,
         work_dir: &work.0,
         bundle_dir: Some(&bundle),
         repro_command: "cargo test --test harness_scenarios",

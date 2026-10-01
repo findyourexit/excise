@@ -42,6 +42,11 @@ pub struct RunRequest<'a> {
     pub fixture_root: &'a Path,
     /// The existing directory the scratch area and the recording are created in.
     pub work_dir: &'a Path,
+    /// Overrides `EXCISE_SCAN_STORE_DIR` to a path outside the scratch area, for a scenario
+    /// that points the scan store at an attached volume. The runner creates the directory before
+    /// it takes the fixture's baseline snapshot. `None` uses the scratch area's own `store`
+    /// directory.
+    pub scan_store_dir: Option<&'a Path>,
     /// Where to write a failure bundle if the scenario fails. `None` writes none.
     pub bundle_dir: Option<&'a Path>,
     /// The command that reruns this scenario, for the failure document.
@@ -132,6 +137,15 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
     let prepared = prepare(scenario)?;
     let fixture = FixtureRoot::open(request.fixture_root)?;
     let binary = resolve_binary(request.binary)?;
+    // A scan store moved onto the fixture's volume lives inside the fixture tree. Creating its
+    // directory before the baseline keeps the directory itself out of the fixture diff, which then
+    // reports anything the program leaves in it: the residue check for that store.
+    if let Some(store) = request.scan_store_dir {
+        fs::create_dir_all(store).map_err(|source| RunError::Io {
+            context: "cannot create the scan-store directory",
+            source,
+        })?;
+    }
     let baseline = FixtureSnapshot::take(fixture.path())?;
     report.fixture_digest = baseline.digest();
 
@@ -150,7 +164,7 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
     let spec = SpawnSpec {
         program: binary,
         args: vec![fixture.path().as_os_str().to_owned()],
-        env: isolated_env(&scratch, request.profile, true),
+        env: isolated_env(&scratch, request.profile, true, request.scan_store_dir),
         cwd: scratch.cwd(),
         cols: settings.cols.unwrap_or(scenario.terminal.cols),
         rows: scenario.terminal.rows,

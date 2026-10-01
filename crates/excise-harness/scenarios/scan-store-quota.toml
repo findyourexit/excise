@@ -1,0 +1,32 @@
+schema_version = 1
+name = "scan-store-quota"
+description = "On a small attached volume, the scan store crosses 75% of the volume's real free space. The intended behaviour is a graceful summary-only publication with no ENOSPC; tests/harness_scan_store_quota.rs checks that the quarter reserve stays free."
+fixture = "scan-store-quota"
+profiles = ["default"]
+tier = "full"
+platforms = ["linux", "macos"]
+expect = "fail"
+fails_on = ["macos"]
+slice = "X5"
+scan_store_on_volume = true
+
+# The scan stops at the scan-store quota and says so. On macOS the quota is computed from the wrong
+# block size today (F7), so the volume fills first and the generic message appears instead.
+[[steps]]
+step = "wait_text"
+text = "Not enough scratch space"
+timeout_ms = 180000
+
+# This screen quits at once on `q` while no deletion work is pending: there is no quit prompt for
+# the `quit` step to confirm.
+[[steps]]
+step = "key"
+key = "q"
+
+# A capacity-limited scan is never exact, so the run ends with exit code 2 (a usable result with
+# uncertainty), not 0.
+[[steps]]
+step = "expect_exit"
+code = 2
+terminal_restored = true
+residue = "none"
