@@ -232,6 +232,11 @@ where
     dirty: bool,
     /// The runtime decides whether to animate loading. Direct app fixtures stay static.
     loading_animation_enabled: bool,
+    /// Last input or state change (scan progress, completion, deletion
+    /// progress) that should keep the selected tile's travelling sheen awake.
+    /// The sheen plays one more full cycle after this instant and then
+    /// settles instead of animating indefinitely (F3): see `rearm_sheen`.
+    sheen_armed_at: Duration,
 }
 
 impl<B> App<B>
@@ -392,6 +397,7 @@ where
             mouse_enabled,
             dirty: true,
             loading_animation_enabled: false,
+            sheen_armed_at: Duration::ZERO,
             deletion_history_bytes: 0,
             deletion_history_limit: process_memory_mib.saturating_mul(MIB) / 8,
             deletion_history: Vec::with_capacity(MAX_RETAINED_DELETION_REPORTS),
@@ -430,6 +436,10 @@ where
             && !monochrome
             && !reduced_motion
             && ColorCycle::can_animate(theme.focus);
+        // The sheen plays one more full cycle after the last input or state
+        // change and then settles instead of animating indefinitely (F3).
+        let sheen_settled =
+            now.saturating_sub(self.sheen_armed_at) >= crate::animation::ONE_SHEEN_CYCLE;
         let scheduler_snapshot = self.scheduler_snapshot;
         let (display, board, page_cache, ui_mode, ui_effects, deletion_work) = (
             &mut self.display,
@@ -462,6 +472,7 @@ where
             self.delete_confirmation_disabled,
             reduced_motion,
             animate_loading_visual,
+            sheen_settled,
         )?;
         let has_selection = self.board.currently_selected().is_some();
         // Rendering lays out the board and can establish or clear its selection.
@@ -472,7 +483,8 @@ where
             && !ascii
             && !monochrome
             && !reduced_motion
-            && ColorCycle::can_animate(theme.focus);
+            && ColorCycle::can_animate(theme.focus)
+            && !sheen_settled;
 
         let animate_modal = self.ui_mode.has_modal_attention()
             && !ascii
@@ -520,6 +532,13 @@ where
 
     pub const fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Input or a state change (scan progress, completion, deletion progress)
+    /// wakes the selected tile's sheen for one more full cycle before it
+    /// settles (F3). Called by the owner loop, which observes those events.
+    pub(crate) const fn rearm_sheen(&mut self, now: Duration) {
+        self.sheen_armed_at = now;
     }
 
     pub(crate) const fn set_loading_animation_enabled(&mut self, enabled: bool) {

@@ -368,6 +368,8 @@ where
         let input = self.input.read()?;
         if matches!(input, InputEvent::Terminal(_)) {
             crate::test_events::input_consumed();
+            // Input re-arms the selected tile's sheen for one more cycle (F3).
+            self.app.rearm_sheen(self.clock.now());
         }
         let result = match input {
             InputEvent::Barrier => {
@@ -884,6 +886,9 @@ where
     fn handle_worker_event(&mut self, event: WorkerEvent) -> Result<(), AppError> {
         #[cfg(feature = "internal")]
         let _worker_event = self.probe_worker_event(&event);
+        // Scan progress, completion, and deletion events are state changes that
+        // re-arm the selected tile's sheen for one more cycle (F3).
+        self.app.rearm_sheen(self.clock.now());
         let exit_work_may_change = matches!(
             &event,
             WorkerEvent::ScanBatch { .. }
@@ -1125,6 +1130,9 @@ where
                 ) {
                     self.app.mark_dirty();
                     processed = true;
+                    // Deletion progress is a state change that re-arms the
+                    // selected tile's sheen for one more cycle (F3).
+                    self.app.rearm_sheen(now);
                 }
                 self.next_deletion_progress_frame = now.saturating_add(DELETION_PROGRESS_INTERVAL);
             }
@@ -1817,6 +1825,29 @@ mod tests {
 
         fn read(&mut self) -> Result<InputEvent, AppError> {
             panic!("input must only be observed while processing worker events");
+        }
+    }
+
+    /// Delivers exactly one real terminal key, then goes idle. Used to prove
+    /// that input re-arms the selected tile's sheen (F3).
+    struct OnceKeyInput {
+        delivered: bool,
+    }
+
+    impl InputSource for OnceKeyInput {
+        fn poll(&mut self, _timeout: Duration) -> Result<bool, AppError> {
+            Ok(!self.delivered)
+        }
+
+        fn read(&mut self) -> Result<InputEvent, AppError> {
+            assert!(!self.delivered, "this fake delivers exactly one keypress");
+            self.delivered = true;
+            Ok(InputEvent::Terminal(Event::Key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Down,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+            )))
         }
     }
 
@@ -2642,5 +2673,152 @@ mod tests {
         assert!(rendered.contains("\\u{202e}"));
         assert!(!rendered.chars().any(char::is_control));
         assert!(!rendered.contains('\u{202e}'));
+    }
+
+    /// F3: once one full sheen cycle has elapsed since the last input or state
+    /// change, the selected tile's sheen stops requesting frames; input rearms
+    /// it. This fails on the pre-fix behaviour, where `animate_selected_map`
+    /// requests frames forever as long as a selection exists.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression builds a fully populated board before exercising the idle-arm window"
+    )]
+    fn the_sheen_settles_one_cycle_after_the_last_state_change_and_input_rearms_it() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let entry = root.path().join("entry");
+        std::fs::write(&entry, b"x").expect("test entry should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let entry_metadata =
+            std::fs::symlink_metadata(&entry).expect("test entry metadata should exist");
+        let entry_identity = crate::native_path::identity_for(&entry, &entry_metadata)
+            .expect("test entry identity should be readable")
+            .expect("test entry should not be a link");
+        let mut app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        // Populate the board directly (bypassing the scanner threads) with one
+        // real, selectable entry, exactly as other owner-loop tests do.
+        app.append_scan_store_entry_for_test(&entry_metadata, &entry, &entry_identity);
+        app.finalize_scan();
+        app.start_ui();
+        let scan_view_root = app.current_folder_path();
+        let mut owner = OwnerLoop {
+            app,
+            input: Box::new(IdleInput),
+            workers: None,
+            clock: Box::new(VirtualClock::new()),
+            // Default motion (neither reduced nor monochrome): the selected
+            // tile's sheen can animate, which this test is about.
+            animation: AnimationScheduler::new(false, false, Duration::ZERO),
+            settings: RuntimeSettings {
+                root: root.path().to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                scan_store_mib: Some(4_096),
+                scan_store_reserve_mib: None,
+                scan_store_dir: None,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: false,
+                monochrome: false,
+                animate_loading: false,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: false,
+            },
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(4_096)
+                .expect("default scan-store capacity should fit"),
+            summary: RunSummary::default(),
+            scan_active: false,
+            scheduler_snapshot: None,
+            primary_scan_active: false,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            generation_rebuild_active: false,
+            generation_rebuild_target: None,
+            cancelled_while_scanning: false,
+            exit_after_work: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: Duration::ZERO,
+            next_deletion_progress_frame: Duration::ZERO,
+            last_deletion_progress: None,
+        };
+
+        owner.app.mark_dirty();
+        owner.render().expect("the post-scan render should succeed");
+        let armed_at = owner.clock.now();
+        assert!(
+            owner.animation.next_frame_at().is_some(),
+            "the selected tile's sheen should animate once a selection exists under default motion"
+        );
+
+        // One full cycle after the last state change (scan completion here)
+        // with no further input, the sheen must settle: no more frames
+        // requested.
+        assert!(
+            owner
+                .clock
+                .advance_to(armed_at.saturating_add(crate::animation::ONE_SHEEN_CYCLE))
+        );
+        assert!(
+            owner
+                .render_due_frame()
+                .expect("the settling frame should render"),
+            "the due animation frame should still render once, in its settled form"
+        );
+        assert!(
+            owner.animation.next_frame_at().is_none(),
+            "no more frames should be requested one cycle after the last state change"
+        );
+        assert!(!owner.animation.is_running());
+
+        // Idle well past the settle point produces no further frames either.
+        assert!(owner.clock.advance_to(
+            armed_at.saturating_add(crate::animation::ONE_SHEEN_CYCLE.saturating_mul(2))
+        ));
+        assert!(
+            !owner
+                .render_due_frame()
+                .expect("an idle frame should not fail"),
+            "a settled sheen must not render again on its own"
+        );
+        assert!(owner.animation.next_frame_at().is_none());
+
+        // Input re-arms the sheen for one more cycle.
+        owner.input = Box::new(OnceKeyInput { delivered: false });
+        owner
+            .process_one_input()
+            .expect("the keypress should be processed");
+        owner.app.mark_dirty();
+        owner.render().expect("the re-armed render should succeed");
+        assert!(
+            owner.animation.next_frame_at().is_some(),
+            "input must re-arm the sheen for another cycle"
+        );
     }
 }

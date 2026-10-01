@@ -23,6 +23,12 @@ pub const ROUTINE_MOTION: Duration = Duration::from_millis(160);
 pub const NAVIGATION_MOTION: Duration = Duration::from_millis(260);
 /// How long the measured map surface takes to emerge from the scan field.
 pub const SCAN_REVEAL_MOTION: Duration = Duration::from_millis(280);
+/// The selected tile's travelling sheen plays exactly one full cycle after the
+/// last input or state change (scan progress, completion, deletion progress)
+/// before it settles instead of animating indefinitely (F3). Shared with
+/// `ui::grid::dense_grid`'s wave period, so the final frame always lands on a
+/// quiet point in the cycle rather than mid-sweep.
+pub(crate) const ONE_SHEEN_CYCLE: Duration = Duration::from_millis(3_200);
 /// Stable seed keeps the randomized departure coherent between redraws.
 const DELETION_DISSOLVE_SEED: u32 = 0x0D3E_1E7E;
 
