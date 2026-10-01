@@ -55,7 +55,10 @@ const FOCUSED_FILL_TOWARD_TILE: f32 = 0.42;
 /// Receding faces keep the travelling phase but settle close to the tile surface.
 const FOCUSED_DIM_TOWARD_TILE: f32 = 0.84;
 /// One full diagonal fill sweep takes long enough to read as a travelling sheen.
-const FOCUSED_FILL_WAVE_PERIOD_MILLIS: u64 = 3_200;
+/// Kept equal to `crate::animation::ONE_SHEEN_CYCLE`: the owner loop lets the
+/// sheen run for exactly one of these after the last input or state change,
+/// then goes quiet (F3), so the two must never drift apart.
+const FOCUSED_FILL_WAVE_PERIOD_MILLIS: u64 = crate::animation::ONE_SHEEN_CYCLE.as_millis() as u64;
 /// A fifth of the diagonal span keeps the moving band broad without flattening the tile.
 const FOCUSED_FILL_WAVE_WIDTH_DIVISOR: u64 = 5;
 const FOCUSED_FILL_WAVE_STEPS: u16 = 256;
@@ -113,6 +116,11 @@ pub struct MapLayout<'a> {
     pub now: Duration,
     /// Whether this surface can show non-essential deletion motion.
     pub animate_deletion_checker: bool,
+    /// Whether the selected tile's travelling sheen has already played one full
+    /// cycle since the last input or state change, and should render settled
+    /// (bright/dim outline only, no travelling band) rather than keep sweeping
+    /// or freeze mid-sweep (F3).
+    pub sheen_settled: bool,
 }
 
 /// A densely tessellated treemap.
@@ -141,6 +149,7 @@ pub struct DenseRectangleGrid<'a> {
     deletion_departure: Option<&'a DeletionDeparture>,
     now: Duration,
     animate_deletion_checker: bool,
+    sheen_settled: bool,
 }
 
 impl<'a> DenseRectangleGrid<'a> {
@@ -176,6 +185,7 @@ impl<'a> DenseRectangleGrid<'a> {
             deletion_departure: layout.deletion_departure,
             now: layout.now,
             animate_deletion_checker: layout.animate_deletion_checker,
+            sheen_settled: layout.sheen_settled,
         }
     }
 
@@ -297,6 +307,7 @@ impl<'a> DenseRectangleGrid<'a> {
             || self.monochrome
             || !ColorCycle::can_animate(self.theme.focus)
             || self.transitioning
+            || self.sheen_settled
         {
             return None;
         }
@@ -2714,6 +2725,7 @@ mod tests {
                 deletion_departure: None,
                 now,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             },
             Theme::for_id(theme),
             ascii,
@@ -2744,6 +2756,7 @@ mod tests {
                 deletion_departure: None,
                 now,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -2779,6 +2792,7 @@ mod tests {
                 deletion_departure: None,
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             },
             Theme::for_id(theme),
             ascii,
@@ -2858,6 +2872,7 @@ mod tests {
                 deletion_departure: None,
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -3319,6 +3334,65 @@ mod tests {
                 "selected {presentation} presentation must not request motion"
             );
         }
+    }
+
+    #[test]
+    fn a_settled_sheen_renders_statically_instead_of_freezing_mid_sweep() {
+        let selected = tile(0, 0, 20, 12, 1);
+        let area = Rect::new(0, 0, 20, 6);
+        let theme = Theme::for_id(ThemeId::CatppuccinMocha);
+        let render_settled = |now: Duration| {
+            let mut buffer = Buffer::empty(area);
+            DenseRectangleGrid::new(
+                MapLayout {
+                    rectangles: std::slice::from_ref(&selected),
+                    departing: &[],
+                    overflow: None,
+                    selected_rect_index: Some(0),
+                    transitioning: false,
+                    show_empty_label: true,
+                    file_tree: None,
+                    deletion_work: None,
+                    scan: None,
+                    deletion_departure: None,
+                    now,
+                    animate_deletion_checker: false,
+                    sheen_settled: true,
+                },
+                theme,
+                false,
+                false,
+            )
+            .render(area, &mut buffer);
+            buffer
+        };
+        // One sheen cycle (F3) is 3,200 ms; two settled renders a cycle apart
+        // would show the travelling band at different, arbitrary points if the
+        // settled form merely froze the last wave phase instead of rendering
+        // the plain static bevel.
+        let settled_early = render_settled(Duration::from_millis(800));
+        let settled_late = render_settled(Duration::from_millis(2_400));
+        assert_eq!(
+            settled_early.content, settled_late.content,
+            "a settled sheen must render the same static bevel regardless of when it settled, not freeze mid-sweep"
+        );
+
+        // The animated (unsettled) wave visibly differs from one of these
+        // instants to the other (see `selected_tile_walks_a_full_contour_with_a_slower_diagonal_fill_wave`),
+        // so settling must actually change what is drawn, not merely ignore the flag.
+        let active_early = render_presentation_at(
+            std::slice::from_ref(&selected),
+            area,
+            Some(0),
+            ThemeId::CatppuccinMocha,
+            false,
+            false,
+            Duration::from_millis(800),
+        );
+        assert_ne!(
+            settled_early.content, active_early.content,
+            "settling must stop the travelling band, not render identically to the active wave"
+        );
     }
 
     #[test]
@@ -4093,6 +4167,7 @@ mod tests {
                 deletion_departure: None,
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -4126,6 +4201,7 @@ mod tests {
                 deletion_departure: None,
                 now: Duration::ZERO,
                 animate_deletion_checker: true,
+                sheen_settled: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -4159,6 +4235,7 @@ mod tests {
                 deletion_departure: Some(&departure),
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -4192,6 +4269,7 @@ mod tests {
                     deletion_departure: None,
                     now,
                     animate_deletion_checker: true,
+                    sheen_settled: false,
                 },
                 Theme::for_id(ThemeId::CatppuccinMocha),
                 false,
@@ -4235,6 +4313,7 @@ mod tests {
             deletion_departure: None,
             now,
             animate_deletion_checker: true,
+            sheen_settled: false,
         };
 
         let verification_work = work
@@ -4383,6 +4462,7 @@ mod tests {
                 deletion_departure: Some(&departure),
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -4420,6 +4500,7 @@ mod tests {
                 deletion_departure: Some(&departure),
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,
@@ -4620,6 +4701,7 @@ mod tests {
                 deletion_departure: None,
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             },
             Theme::for_id(ThemeId::CatppuccinMocha),
             false,

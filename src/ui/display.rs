@@ -118,6 +118,7 @@ where
             reduced_guardrails,
             reduced_motion,
             animate_loading,
+            false,
         )
     }
 
@@ -151,6 +152,9 @@ where
         reduced_guardrails: bool,
         reduced_motion: bool,
         animate_loading: bool,
+        // Whether the selected tile's sheen has already played one full cycle
+        // since the last input or state change, and should render settled (F3).
+        sheen_settled: bool,
     ) -> Result<(), AppError> {
         let deletion_phase = deletion_work.presentation_snapshot();
         let requires_legacy_theme_normalization = theme_requires_legacy_normalization(theme);
@@ -243,6 +247,7 @@ where
                                     deletion_departure,
                                     now,
                                     animate_deletion_checker,
+                                    sheen_settled,
                                 },
                                 theme,
                                 ascii,
@@ -2408,6 +2413,7 @@ mod tests {
                 deletion_departure: None,
                 now: Duration::ZERO,
                 animate_deletion_checker: false,
+                sheen_settled: false,
             }
             .overflow,
             board.overflow()

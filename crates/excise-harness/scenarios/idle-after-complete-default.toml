@@ -1,11 +1,9 @@
 schema_version = 1
 name = "idle-after-complete-default"
-description = "Under default motion, once the scan completes and settles, a quiet terminal with no input should show 0 bytes of output and at most 50 ms of CPU over a 5 s window that starts 3.2 s after the last state change (one sheen cycle). Instead the sheen keeps animating and writing continuously, an idle loop (F3)."
+description = "Under default motion, once the scan completes and settles, a quiet terminal with no input shows 0 bytes of output and at most 50 ms of CPU over a 5 s window that starts 3.2 s after the last state change (one sheen cycle). The sheen plays one more cycle after the last input or state change and then settles instead of animating indefinitely (F3)."
 fixture = "delete-folder"
 profiles = ["default"]
 tier = "full"
-expect = "fail"
-slice = "X6"
 platforms = ["linux", "macos"]
 
 [[steps]]
