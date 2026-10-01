@@ -351,6 +351,21 @@ cargo xtask e2e --scenario delete-folder-lifecycle --repeat 20
 
 `cargo test` also runs each scenario once per profile against the `excise` crate's own binary (`tests/harness_scenarios.rs`). It also runs a negative control from `crates/excise-harness/tests/controls`, which asks `delete` for the wrong entry and asserts that the step fails without a `y` being sent. Fixtures and scratch areas are created under `/tmp` on Unix, or under `EXCISE_E2E_TMPDIR`, and removed afterwards. On Windows, set `EXCISE_E2E_TMPDIR` to a short directory such as `C:\xh`. The deletion dialog is at most 78 columns wide, and the `delete` step refuses a path that the dialog cuts short.
 
+### Headless scans
+
+`cargo xtask headless` scans the fixtures without a terminal (`excise --format json --output <report> <fixture>`), under the same isolation as the scenarios, holds every scan report to the oracle of its fixture under the accounting contract (directory metadata excluded, allocation once per identity, links not followed, unreadable entries uncertain, exit code against the report state), and times the scan against `du -sk` on the same warm fixture.
+
+```console
+cargo xtask headless --quick
+cargo xtask headless --class hostile --class identity
+cargo xtask headless --fixture node-modules-2k --repeat 5
+EXCISE_HARNESS_PRIVILEGED=1 cargo xtask headless --class volumes
+```
+
+`--quick` runs the fixtures of at most 10,000 planned entries and `--full` (the default) those of at most 250,000. `--fixture` names fixtures and runs them whatever their size, and `--class` (`scale`, `identity`, `hostile`, `volumes`) selects by class. `--repeat N` is the number of timed pairs (five by default, interleaved as scan, `du`, scan, `du`, after one untimed warm-up pair), `--profile` is `default` or `deterministic`, `--timeout` bounds one scan or one `du` in seconds, and `--keep-scratch` keeps the scratch areas and reports. The command builds the release binary unless `EXCISE_E2E_BINARY` names one, prints one row per fixture with the headless and `du -sk` medians, the median and range of their ratio, and the oracle diff, and exits non-zero on any `fail`, `xpass`, or `error`. The ratio is reported against the 3x budget of the validation plan and is not gated. Volume fixtures run without privileges too, but then their mount points are empty directories and no boundary is crossed; the table says so. The summary is `target/excise-headless/<run-id>/summary.json`, and a failing fixture gets a directory beside it with its discrepancies, the command that reruns it, and the report. Fixtures that fail the diff for a known defect that is not yet fixed are listed, with the finding, in `crates/excise-harness/expectations/headless.toml` and show as `xfail`; the entry is removed by the change that fixes the defect.
+
+`cargo test` also scans the cheap fixtures that need no privileges against the `excise` crate's own binary (`tests/harness_headless.rs`) and runs a negative control: a binary that writes a report that breaks the published schema must fail the run.
+
 ## Benchmarks
 
 The hosted `benchmark.yml` retains the `criterion-benchmark-evidence` artifact for 90 days. It contains Criterion raw samples and reports from `target/criterion`, one-million and bounded-fan-in probe logs, plus `benchmark-context.txt`, which records the checked-out SHA, workflow run, runner image and CPU, commands, Rust toolchain, and `Cargo.lock` digest.

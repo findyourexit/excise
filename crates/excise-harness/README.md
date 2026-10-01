@@ -413,6 +413,90 @@ profile against the crate's own binary as part of `cargo test`, and runs the con
 the `delete` step failed, that the last input was Backspace, that no `y` appears among the
 recording's input events, and that every byte of the fixture is unchanged.
 
+## Headless runner
+
+```console
+cargo xtask headless [--quick|--full] [--fixture ID]... [--class scale|identity|hostile|volumes]... [--profile default|deterministic] [--repeat N] [--timeout SECONDS] [--keep-scratch]
+```
+
+`excise_harness::headless` scans a fixture without a terminal, holds the report to the fixture's
+oracle, and times the scan against `du -sk`. The exactness and throughput claims of the validation
+program rest on it.
+
+**A scan.** One run is `excise --format json --output <scratch>/scan-report.json <fixture-root>`,
+under the isolation of the PTY runner: the environment is cleared and rebuilt from `TERM`,
+`COLORTERM`, and `LANG`; `HOME`, `EXCISE_CONFIG`, the working directory, `TMPDIR`, and
+`EXCISE_SCAN_STORE_DIR` are in a scratch area; and the root must carry the ownership marker. The
+wait is bounded (`--timeout`, 900 s by default) and the process group is killed when the bound
+passes. Afterwards the fixture is compared with the snapshot taken before the scan, and a scratch
+area that holds anything but the report is residue. The run records the exit code, the wall time,
+the CPU time, and, where the platform says, the peak memory.
+
+**The report** is read only after it validates against the published
+`docs/schemas/scan-report.schema.json` and the `native-path` schema it references. The file is
+checked one entry at a time, so a large report never has to fit in memory twice. A report that
+breaks the schema is `invalid-report`, a scan that ends without one is `no-report`, a scan that
+does not end in time is `timeout`, and a scan that prints to standard output, although its report
+goes to a file, is `unexpected-output`.
+
+**The diff** joins every report entry to the oracle by its native path and holds the report to the
+accounting contract (`docs/safety/accounting.md`, `docs/reports.md`). What an entry must say is
+computed over the entries the report lists, so one missing entry is one discrepancy and not a wrong
+number on every folder above it. The rules are the ones the oracle deliberately does not apply:
+
+| Rule | What the report must say |
+|---|---|
+| Directory metadata is excluded | A directory's own size and blocks are in no total. |
+| Allocation counts once per identity | Every name of a file shares one `(device, inode)` and one allocation. It counts once, at the lowest entry that holds every name the scan met; every name, and every directory below that one, shows 0. File length counts for every name. |
+| Links are not followed | A link is an entry of its own: its length is its target text, and it has no descendants. |
+| Reclaimable space | An identity is reclaimable where its allocation counts when every link the file system declares was met; otherwise the lower bound is 0 and the upper bound is the allocation. |
+| Unknown is first class | An entry that is, or has below it, a directory that cannot be listed or a filesystem boundary is `uncertain` with a reason. Its lower bounds are exact and its upper bound is unknown or at least the lower bound. Every other entry is `complete` with exact bounds. |
+| Scope | A mount point is a boundary: it is an `uncertain` record, and nothing below it is expected or accepted. |
+| State and exit code | The document is `exact` when no entry is uncertain and `uncertain` otherwise, and the exit code is the one that goes with the state the report claims (0, 2, 3, 130). The summary counts links, unreadable folders, and boundaries as the tree has them, and no deletions. |
+| Coverage | Every in-scope oracle entry is in the report exactly once, and the report lists nothing else. |
+
+A discrepancy is typed (`root`, `state`, `exit-code`, `summary`, `missing`, `unexpected`,
+`duplicate`, `out-of-scope`, `kind`, `identity`, `apparent-bytes`, `allocated-bytes`,
+`reclaimable-bytes`, `descendants`, `entry-state`, `unscanned-reason`, plus the run's own
+`timeout`, `no-report`, `invalid-report`, `residue`, `unexpected-output`, and `fixture-changed`).
+The first 20 of each kind are listed and all are counted. Where the oracle has `null` facts
+(Windows has neither identity nor allocation), the rules that need them are skipped and the rest
+are applied.
+
+**Fixtures.** `--quick` selects the fixtures of at most 10,000 planned entries and `--full`, the
+default, those of at most 250,000. `--fixture` names fixtures and runs them whatever their size (the
+1,000,000-entry fixture only ever runs by name), and `--class` selects every fixture that generates
+a class. A fixture with a volume part also runs without privileges, but then the mount point is an
+empty directory, no boundary is crossed, and the table says so. With `EXCISE_HARNESS_PRIVILEGED=1`
+the volumes are attached and the boundary rule is exercised.
+
+**The `du` reference.** The same warm tree is timed with `du -sk`, through the same supervised
+process runner and in an empty environment, interleaved with the scans: a warm-up pair, which is
+diffed and not timed, and then `--repeat N` pairs (five by default) as H, D, H, D, and so on. The
+ratio of a pair is the scan's wall time over the wall time of the `du` that followed it, and the
+table gives the median of the ratios and their minimum and maximum. The `du` flavor is found by a
+probe, not by a version string, and the total it prints is checked against what the oracle predicts
+from the raw facts, so that a ratio is never taken against a `du` that walked a different tree
+(BSD `du` stops where a path passes `PATH_MAX`). The ratio is reported against the 3× budget of
+the validation plan and not gated: gating belongs to the budget scenarios.
+
+**Expected failures.** `expectations/headless.toml` lists the fixtures that fail the diff for a
+known defect that is not yet fixed, with the semantics of `expect = "fail"`: a fixture that fails
+with exactly the listed kinds is `xfail`, one that fails with other kinds is `fail`, and one that
+no longer fails is `xpass` and fails the run, so that the entry is removed by the change that fixes
+the defect. An entry names the platforms it applies to and the findings it documents.
+
+**Output.** `target/excise-headless/<run-id>/summary.json` is a `harness-summary` with one
+`headless-<fixture>` result per fixture, and `target/excise-headless/latest` points at the newest
+run. The open `metrics` object of a result has `entries`, `runs`, `oracle_ms`, `generation_ms`,
+`headless_ms` (the median, with `_min` and `_max`), `du_ms`, `headless_scan_ratio` (the median,
+with `_min`, `_q1`, `_q3`, and `_max`), `du_kib`, `du_expected_kib`, `user_ms`, `sys_ms`,
+`exit_code`, and `discrepancies` with one `discrepancies_<kind>` count per kind. A failing fixture
+gets `headless-<fixture>/` beside the summary, with `discrepancies.txt`, `repro.txt`, and the
+report. `tests/harness_headless.rs` in the `excise` crate runs the cheap fixtures that need no
+privileges against the crate's own binary as part of `cargo test`, and runs a binary that writes a
+report breaking the schema to assert that the run fails.
+
 ## Safety rules
 
 The harness only ever runs `excise` against fixtures it generated itself, and never against a real

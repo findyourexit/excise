@@ -22,8 +22,8 @@ use excise_harness::{
 
 const USAGE: &str = "usage: cargo xtask e2e [--quick|--full] [--scenario NAME]... \
                      [--profile PROFILE]... [--repeat N] [--keep-fixture]";
-/// Names a binary to test instead of building one.
-const BINARY_ENV: &str = "EXCISE_E2E_BINARY";
+/// Names a binary to test instead of building one. `cargo xtask headless` reads it too.
+pub(crate) const BINARY_ENV: &str = "EXCISE_E2E_BINARY";
 
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -167,7 +167,7 @@ fn select_scenarios(all: Vec<Scenario>, names: &[String]) -> Result<Vec<Scenario
 }
 
 /// Builds the release binary and returns its path.
-fn build_release_binary(root: &Path, target: &Path) -> Result<PathBuf, Box<dyn Error>> {
+pub(crate) fn build_release_binary(root: &Path, target: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let status = Command::new(&cargo)
         .current_dir(root)
