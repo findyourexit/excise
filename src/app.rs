@@ -2121,8 +2121,9 @@ where
                 .saturating_add(report.estimated_bytes);
             self.deletion_history.push(report);
         }
-        // The streamed report may remove the current node. Board replacement keeps
-        // a surviving actionable selection or deliberately clears an empty view.
+        // The streamed report may remove the current node. Board replacement keeps a
+        // surviving selection; a vanished one re-arms to the largest entry only before
+        // the reader's first move and otherwise clears, as an empty view does.
         self.render_and_update_board();
         deleted
     }

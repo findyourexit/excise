@@ -21,6 +21,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 * After a scan completes, the interactive map no longer animates the selected entry indefinitely. Its highlight plays one cycle after the last input or change and then settles; previously an idle session kept redrawing the terminal, writing almost 1 MB of output per second.
 * On macOS, the scan-store scratch-space budget used the wrong block size and could compute an effective quota far larger than the volume's real free space, so the documented 25 percent reserve was not enforced. It now uses the correct, POSIX-defined unit.
 * An out-of-space error while writing scan data now reaches the user the same way the session's own scratch-space limit does, in both the interactive map and `--format json`, instead of a generic "could not build a complete folder map" message.
+* The selection cursor could land on a different entry than the one chosen: a background refresh could reassign tile identities once a folder still being measured grew past another entry's size, including right as a scan completed. Once the cursor has been moved, it now stays on that exact entry through every later map refresh, or clears if the entry is genuinely gone, instead of silently landing on whichever entry is currently largest.
 
 ## [1.3.0] - 2026-09-24
 

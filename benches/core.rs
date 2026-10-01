@@ -384,7 +384,7 @@ fn benchmark_treemap(c: &mut Criterion) {
     c.bench_function("treemap/layout/100k/190x48", |bencher| {
         bencher.iter(|| {
             let mut treemap = TreeMap::new(Rect::new(0, 0, 190, 48));
-            treemap.populate_tiles(black_box(&input));
+            treemap.populate_tiles(black_box(&input), None);
             black_box((treemap.tiles.len(), treemap.unrenderable_tile_coordinates));
         });
     });

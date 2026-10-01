@@ -113,6 +113,8 @@ The interactive interface requires standard input and output connected to a term
 
     Opening or leaving a directory never starts another scanner or creates a second mutable model. Before a scan publishes its result, navigation reads the available partial stored pages and only reprioritizes existing work. A partial deletion can start one root rescan, which appears in the scan field until it publishes or is cancelled. Press ++esc++ to cancel that rescan and return to normal navigation.
 
+    Once you move the cursor, it stays on that exact entry through every later map refresh, including a scan publishing a result that resizes or reorders its siblings, instead of jumping to whichever entry is currently largest. If that entry is genuinely gone, the cursor clears rather than landing on something else.
+
     Press ++t++ in the normal view, while scanning, or during a root rescan to preview the theme list. Arrow keys or ++j++ and ++k++ move the preview. Press ++enter++ to save the selected theme for later TUI sessions, or ++esc++ to restore the prior theme.
 
     In a color-capable map, ordinary entry color carries the current space measure on one fixed absolute scale: 4 KiB and below is blue, 16 MiB is midpoint green, 1 GiB is yellow, and 64 GiB and above is red. The default measure is allocated space; `--apparent-size` uses logical file length instead. Unreadable entries retain distinct state colors. The virtual shared-allocation summary stays subdued and does not affect the size scale.

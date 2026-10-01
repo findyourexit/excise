@@ -1,12 +1,11 @@
 schema_version = 1
 name = "selection-drift"
-description = "Once the user has moved the selection, it must stay where they put it through COMPLETE and the settling map, even though the folder that was not yet fully measured becomes the largest entry. macOS-only: the precondition (the file, not the folder, is the provisional largest) needs the scan slow enough, relative to the first rendered frame, that the folder's running total has not yet caught up with the file; on this platform's durable per-run writes that holds, but a faster scan can admit enough of the folder before the first frame that the file is never the provisional largest at all. For F5, fixed by X7."
+description = "Once the user has moved the selection, it must stay where they put it through COMPLETE and the settling map, even though the folder that was not yet fully measured becomes the largest entry. macOS-only: the precondition (the file, not the folder, is the provisional largest) needs the scan slow enough, relative to the first rendered frame, that the folder's running total has not yet caught up with the file; on this platform's durable per-run writes that holds, but a faster scan can admit enough of the folder before the first frame that the file is never the provisional largest at all."
 fixture = "selection-drift"
+sentinels = ["victim"]
 profiles = ["default", "deterministic"]
 tier = "full"
 platforms = ["macos"]
-expect = "fail"
-slice = "X7"
 
 [terminal]
 cols = 120
@@ -40,6 +39,15 @@ step = "wait_event"
 event = "scan_complete"
 timeout_ms = 60000
 
+# The event channel and the terminal are independent: the event can be observed before the
+# matching screen bytes have drained through the PTY, especially under load. The header is
+# the only valid completion signal on screen (v1.3.0 prints a misleading mid-scan badge), so
+# wait for it before reading the inspector.
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 60000
+
 # Checkpoint 2: the first frame after COMPLETE.
 [[steps]]
 step = "expect_screen"
@@ -54,6 +62,25 @@ step = "settle"
 step = "expect_screen"
 contains = ["big-file.bin"]
 region = { rows = [31, 31] }
+
+# Checkpoint 4: the deletion dialog names the same entry the inspector shows, so a deletion
+# can never act on anything other than what the user chose.
+[[steps]]
+step = "delete"
+name = "big-file.bin"
+kind = "file"
+timeout_ms = 30000
+
+[[steps]]
+step = "wait_fs_absent"
+path = "big-file.bin"
+timeout_ms = 15000
+
+# Deleting the root's file can start a root rescan; let it settle before quitting.
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
 
 [[steps]]
 step = "quit"

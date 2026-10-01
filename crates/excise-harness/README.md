@@ -986,7 +986,7 @@ marker.
 | `navigate-folders` | 6 | Two folders and a file beside them, to drill into and back out of. |
 | `mount-boundary` | 13 | An ordinary `outside/` tree and an empty mount point; a privileged run copy attaches a 16 MiB volume with 20 files. |
 | `scan-store-quota` | 35,002 | A flat directory of 35,000 tiny files beside an empty mount point; a privileged run copy attaches an 8 MiB volume there for `scan_store_on_volume` (see [Volumes](#volumes)). |
-| `selection-drift` | 20,052 | A 5,000,000-byte file beside a folder of 20,000 tiny files that totals 21,000,000 bytes of content, 81,920,000 bytes of disk allocation (Excise's default view): the file is the largest entry when first measured, the folder once it is fully scanned. For F5/X7. |
+| `selection-drift` | 20,052 | A 5,000,000-byte file beside a folder of 20,000 tiny files that totals 21,000,000 bytes of content, 81,920,000 bytes of disk allocation (Excise's default view): the file is the largest entry when first measured, the folder once it is fully scanned. |
 | `tiny-files-50k` | 49,050 | 49 directories of 1,000 tiny files. |
 | `tiny-files-250k` | 249,250 | 249 directories of 1,000 tiny files: the full tier's memory-contract fixture, scanned within the 512 MiB peak-memory budget. |
 | `tiny-files-1m` | 1,010,101 | One million tiny files. For nightly and manual tiers only: tests never generate it. |

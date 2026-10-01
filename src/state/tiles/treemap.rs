@@ -1,5 +1,6 @@
 use ratatui::layout::Rect;
 
+use crate::model::NodeId;
 use crate::state::tiles::{FileMetadata, HALF_ROWS_PER_CELL, MapOverflow, RectFloat, Tile};
 
 /// Columns that visually match one half-row of vertical extent.
@@ -134,9 +135,12 @@ impl TreeMap {
         }
     }
 
-    pub fn populate_tiles(&mut self, children: &[FileMetadata]) {
+    /// `protected`, when present, must always get a tile: the caller is carrying a selection
+    /// across this layout, and an entry folded into the overflow summary cannot be selected
+    /// (`Board::select_node` only searches rendered tiles), which would silently drop it.
+    pub fn populate_tiles(&mut self, children: &[FileMetadata], protected: Option<NodeId>) {
         let mut omitted = OverflowAccounting::default();
-        self.squarify(children, &mut omitted);
+        self.squarify(children, protected, &mut omitted);
         if omitted.entries == 0 {
             self.overflow = None;
             return;
@@ -151,7 +155,8 @@ impl TreeMap {
             self.unrenderable_tile_coordinates = Some((raw_x, raw_y));
         }
 
-        let (x, y) = if let Some((x, y)) = self.reserve_overflow_region(raw_x, raw_y, &mut omitted)
+        let (x, y) = if let Some((x, y)) =
+            self.reserve_overflow_region(raw_x, raw_y, protected, &mut omitted)
         {
             self.unrenderable_tile_coordinates = Some((x, y));
             (x, y)
@@ -187,6 +192,7 @@ impl TreeMap {
         &mut self,
         raw_x: u16,
         raw_y: u32,
+        protected: Option<NodeId>,
         omitted: &mut OverflowAccounting,
     ) -> Option<(u16, u32)> {
         let last_column = self.area.right().checked_sub(1)?;
@@ -201,6 +207,15 @@ impl TreeMap {
             .clamp(u32::from(self.area.y), last_row);
         let y = row * HALF_ROWS_PER_CELL_U32;
         let area = self.area;
+
+        // A tile carrying the caller's selection must never be folded into the
+        // overflow summary, regardless of when it was laid out: leave the
+        // summary logically present but non-drawable instead.
+        if self.tiles.iter().any(|tile| {
+            Some(tile.node_id) == protected && Self::crosses_overflow_region(tile, area, x, y)
+        }) {
+            return None;
+        }
 
         // The renderer expands this anchor into a lower-right terminal-cell
         // rectangle. If that would cover a tile laid out after the first omitted
@@ -253,7 +268,12 @@ impl TreeMap {
             && y < tile.y.saturating_add(tile.height)
     }
 
-    fn layout_row(&mut self, row: &[FileMetadata], omitted: &mut OverflowAccounting) {
+    fn layout_row(
+        &mut self,
+        row: &[FileMetadata],
+        protected: Option<NodeId>,
+        omitted: &mut OverflowAccounting,
+    ) {
         if row.is_empty() {
             return;
         }
@@ -261,7 +281,7 @@ impl TreeMap {
             .iter()
             .fold(0.0, |total, file| total + file.percentage * self.total_size);
         if !row_total.is_finite() || row_total <= 0.0 {
-            self.add_unrenderable_row(row, omitted);
+            self.add_unrenderable_row(row, protected, omitted);
             return;
         }
 
@@ -272,12 +292,12 @@ impl TreeMap {
             self.empty_space.height
         };
         if !first_extent.is_finite() || first_extent <= 0.0 {
-            self.add_unrenderable_row(row, omitted);
+            self.add_unrenderable_row(row, protected, omitted);
             return;
         }
         let second_extent = row_total / first_extent;
         if !second_extent.is_finite() || second_extent <= 0.0 {
-            self.add_unrenderable_row(row, omitted);
+            self.add_unrenderable_row(row, protected, omitted);
             return;
         }
 
@@ -322,7 +342,8 @@ impl TreeMap {
             let bottom = half_row_coordinate(rect.y + rect.height.max(0.0)).max(y);
             let width = right.saturating_sub(x);
             let height = bottom.saturating_sub(y);
-            if height < MINIMUM_HEIGHT || width < MINIMUM_WIDTH {
+            if Some(file.node_id) != protected && (height < MINIMUM_HEIGHT || width < MINIMUM_WIDTH)
+            {
                 self.add_unrenderable_tile(x, y, file, omitted);
             } else {
                 self.tiles.push(Tile::new(&rect, file));
@@ -340,11 +361,51 @@ impl TreeMap {
         }
     }
 
-    fn add_unrenderable_row(&mut self, row: &[FileMetadata], omitted: &mut OverflowAccounting) {
+    /// `protected`, when present, must get a tile even here, as long as its own measured size
+    /// is non-zero: this row ran out of space, or its total underflowed to zero despite a
+    /// non-zero individual share, neither of which is that entry's own size being zero. An
+    /// entry whose own percentage is exactly zero never protects, whether or not it matches
+    /// `protected`: there is nothing to give it a sensible rectangle for.
+    fn add_unrenderable_row(
+        &mut self,
+        row: &[FileMetadata],
+        protected: Option<NodeId>,
+        omitted: &mut OverflowAccounting,
+    ) {
         self.mark_remaining_unrenderable();
         let rendered_before = self.tiles.len();
+        let mut placed = false;
         for file in row {
-            omitted.add_file(file, rendered_before);
+            if Some(file.node_id) == protected
+                && file.percentage > 0.0
+                && self.area.width > 0
+                && self.area.height > 0
+            {
+                let rect = RectFloat {
+                    x: self.empty_space.x,
+                    y: self.empty_space.y,
+                    width: f64::from(MINIMUM_WIDTH).min(self.empty_space.width),
+                    height: f64::from(MINIMUM_HEIGHT).min(self.empty_space.height),
+                };
+                self.tiles.push(Tile::new(&rect, file));
+                placed = true;
+            } else {
+                omitted.add_file(file, rendered_before);
+            }
+        }
+        if placed {
+            // Carve the placed tile's footprint out of the remaining space, exactly as a
+            // normally laid-out row would, so a later row can never be placed on top of it.
+            let horizontal = self.empty_space.width <= self.empty_space.height * HEIGHT_WIDTH_RATIO;
+            if horizontal {
+                let consumed = f64::from(MINIMUM_HEIGHT).min(self.empty_space.height);
+                self.empty_space.height = (self.empty_space.height - consumed).max(0.0);
+                self.empty_space.y += consumed;
+            } else {
+                let consumed = f64::from(MINIMUM_WIDTH).min(self.empty_space.width);
+                self.empty_space.width = (self.empty_space.width - consumed).max(0.0);
+                self.empty_space.x += consumed;
+            }
         }
     }
 
@@ -410,7 +471,12 @@ impl TreeMap {
         Some(smallest_ratio.min(largest_ratio))
     }
 
-    fn squarify(&mut self, children: &[FileMetadata], omitted: &mut OverflowAccounting) {
+    fn squarify(
+        &mut self,
+        children: &[FileMetadata],
+        protected: Option<NodeId>,
+        omitted: &mut OverflowAccounting,
+    ) {
         let mut row_start = 0;
         let mut row_end = 0;
         let mut metrics = RowMetrics::default();
@@ -432,12 +498,12 @@ impl TreeMap {
                 metrics = candidate;
                 row_end += 1;
             } else {
-                self.layout_row(&children[row_start..row_end], omitted);
+                self.layout_row(&children[row_start..row_end], protected, omitted);
                 row_start = row_end;
                 metrics = RowMetrics::default();
             }
         }
-        self.layout_row(&children[row_start..row_end], omitted);
+        self.layout_row(&children[row_start..row_end], protected, omitted);
     }
 }
 
@@ -488,7 +554,7 @@ mod tests {
         let area = Rect::new(3, 5, 190, 48);
         let files = files(10_000);
         let mut treemap = TreeMap::new(area);
-        treemap.populate_tiles(&files);
+        treemap.populate_tiles(&files, None);
 
         for (index, tile) in treemap.tiles.iter().enumerate() {
             assert!(tile.width >= MINIMUM_WIDTH);
@@ -529,7 +595,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut treemap = TreeMap::new(Rect::new(0, 0, 195, 128));
-        treemap.populate_tiles(&files);
+        treemap.populate_tiles(&files, None);
 
         for (index, tile) in treemap.tiles.iter().enumerate() {
             for other in &treemap.tiles[index + 1..] {
@@ -550,7 +616,7 @@ mod tests {
             file.percentage = 0.0;
         }
         let mut treemap = TreeMap::new(Rect::new(0, 0, 80, 24));
-        treemap.populate_tiles(&files);
+        treemap.populate_tiles(&files, None);
         assert!(treemap.tiles.is_empty());
         assert_eq!(treemap.unrenderable_tile_coordinates, Some((0, 0)));
         assert_eq!(
@@ -576,7 +642,7 @@ mod tests {
         );
         let children = [file(0, 1, 1.0), file(1, 0, 0.0)];
         let mut treemap = TreeMap::new(area);
-        treemap.populate_tiles(&children);
+        treemap.populate_tiles(&children, None);
 
         let Some(overflow) = treemap.overflow() else {
             panic!("zero-size entry should overflow");
@@ -606,7 +672,7 @@ mod tests {
     fn overflow_bytes_sum_only_omitted_entries_after_rendered_total_saturates() {
         let children = [file(0, u128::MAX, 0.5), file(1, 1, 0.0)];
         let mut treemap = TreeMap::new(Rect::new(0, 0, 16, 4));
-        treemap.populate_tiles(&children);
+        treemap.populate_tiles(&children, None);
 
         assert_eq!(treemap.tiles.len(), 1);
         assert_eq!(
@@ -630,7 +696,7 @@ mod tests {
             height: 50_000,
         };
         let mut treemap = TreeMap::new(area);
-        treemap.populate_tiles(&[file(0, 1, 1.0)]);
+        treemap.populate_tiles(&[file(0, 1, 1.0)], None);
 
         let [tile] = treemap.tiles.as_slice() else {
             panic!("full-height entry should remain renderable");
@@ -649,7 +715,7 @@ mod tests {
             uncertain.uncertain = true;
             let children = [file(0, 3, 0.5), uncertain];
             let mut treemap = TreeMap::new(area);
-            treemap.populate_tiles(&children);
+            treemap.populate_tiles(&children, None);
 
             assert!(treemap.tiles.is_empty());
             assert_eq!(
@@ -674,7 +740,7 @@ mod tests {
         let children = [file(0, 1, 0.0001), file(1, 1_000_000, 0.9999)];
         let area = Rect::new(0, 0, 80, 24);
         let mut treemap = TreeMap::new(area);
-        treemap.populate_tiles(&children);
+        treemap.populate_tiles(&children, None);
 
         assert_eq!(
             treemap
@@ -705,7 +771,7 @@ mod tests {
         let children = [file(0, 999_900, 0.9999), file(1, 100, 0.0001)];
         let area = Rect::new(0, 0, 80, 24);
         let mut treemap = TreeMap::new(area);
-        treemap.populate_tiles(&children);
+        treemap.populate_tiles(&children, None);
 
         assert_eq!(
             treemap
@@ -741,7 +807,7 @@ mod tests {
         ));
         let area = Rect::new(0, 0, 80, 24);
         let mut treemap = TreeMap::new(area);
-        treemap.populate_tiles(&children);
+        treemap.populate_tiles(&children, None);
 
         assert_eq!(
             treemap
@@ -771,7 +837,7 @@ mod tests {
         uncertain.uncertain = true;
         let children = [file(0, 9, 0.5), uncertain];
         let mut treemap = TreeMap::new(Rect::new(0, 0, 16, 4));
-        treemap.populate_tiles(&children);
+        treemap.populate_tiles(&children, None);
 
         let Some(overflow) = treemap.overflow() else {
             panic!("zero-sized entry should produce an overflow summary");

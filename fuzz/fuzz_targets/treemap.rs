@@ -31,7 +31,10 @@ fuzz_target!(|data: &[u8]| {
         width: u16_at(data, 4),
         height: u16_at(data, 6),
     };
-    let records = data.get(8..).unwrap_or(&[]);
+    // Byte 8 picks whether (and which) entry is the caller's protected selection: bit 0
+    // selects none/some, the rest is an index modulo the entry count.
+    let protect_selector = data.get(8).copied().unwrap_or(0);
+    let records = data.get(9..).unwrap_or(&[]);
     let count = (records.len() / 2).min(128);
     let records = &records[..count * 2];
     let total = records
@@ -61,8 +64,10 @@ fuzz_target!(|data: &[u8]| {
             }
         })
         .collect::<Vec<_>>();
+    let protected = (count > 0 && protect_selector & 1 != 0)
+        .then(|| NodeId(u32::try_from(usize::from(protect_selector >> 1) % count).expect("index fits")));
     let mut treemap = TreeMap::new(area);
-    treemap.populate_tiles(&files);
+    treemap.populate_tiles(&files, protected);
 
     let half_rows_per_cell = u32::from(HALF_ROWS_PER_CELL);
     let top_half_row = u32::from(area.y) * half_rows_per_cell;
@@ -96,6 +101,17 @@ fuzz_target!(|data: &[u8]| {
         assert!(index < files.len(), "tile has no matching fuzz input: {tile:?}");
         assert!(!rendered[index], "input rendered twice: {tile:?}");
         rendered[index] = true;
+    }
+    if let Some(protected) = protected {
+        let index = protected.index();
+        if files[index].percentage > 0.0 && area.width > 0 && area.height > 0 {
+            assert!(
+                rendered[index],
+                "a protected entry with non-zero measured size must always get a tile \
+                 in a non-zero-sized area: {:?}",
+                files[index]
+            );
+        }
     }
     let expected_entries = files
         .iter()
