@@ -267,7 +267,7 @@ fn whole_milliseconds(duration: Duration) -> u64 {
 
 /// The absolute path of the binary, which must be an executable file. A cleared environment has no
 /// `PATH`, so the pseudo-terminal library needs the absolute path.
-pub(super) fn resolve_binary(path: &Path) -> Result<PathBuf, RunError> {
+pub(crate) fn resolve_binary(path: &Path) -> Result<PathBuf, RunError> {
     let binary_error = |reason: String| RunError::Binary {
         path: path.to_path_buf(),
         reason,

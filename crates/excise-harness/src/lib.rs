@@ -11,12 +11,16 @@
 //!   `harness-failure`, `harness-ab`); their JSON Schemas live in `schemas/`.
 //! * [`fixture`] generates the fixtures scenarios run against, and computes the independent
 //!   oracle of what a generated tree contains.
+//! * [`headless`] runs `excise --format json` against a fixture, checks the scan report against
+//!   the oracle under the accounting contract, and times the scan against `du -sk`.
 
 pub mod events;
 pub mod fixture;
+pub mod headless;
 pub mod metrics;
 pub mod pty;
 pub mod report;
+mod run_support;
 pub mod runner;
 pub mod safety;
 pub mod scenario;

@@ -311,6 +311,15 @@ impl Fixtures {
         &self.cache
     }
 
+    /// The ids of the specs this facade can load, sorted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of reading the specs directory.
+    pub fn ids(&self) -> io::Result<Vec<String>> {
+        FixtureSpec::ids_in(&self.specs_dir)
+    }
+
     /// Loads and validates the spec `id`.
     ///
     /// # Errors

@@ -40,6 +40,7 @@ impl ScratchError {
 ///   store/              EXCISE_SCAN_STORE_DIR: nothing may be left here after an exit
 ///   tmp/                TMPDIR: nothing may be left here
 ///   events.jsonl        EXCISE_TEST_EVENTS: created by `excise`, never by the harness
+///   scan-report.json    `--output` of a headless run: created by `excise`, never by the harness
 /// ```
 ///
 /// Because `excise` is given no other writable location, [`Scratch::residue`] is an exact check:
@@ -131,6 +132,12 @@ impl Scratch {
         self.root.join("events.jsonl")
     }
 
+    /// The `--output` file of a headless run. It does not exist until `excise` creates it.
+    #[must_use]
+    pub fn report(&self) -> PathBuf {
+        self.root.join("scan-report.json")
+    }
+
     /// Keeps the scratch area on disk when the value is dropped, and returns its root.
     pub fn keep(&mut self) -> PathBuf {
         self.kept = true;
@@ -150,9 +157,9 @@ impl Scratch {
     /// to the root.
     ///
     /// The allowed remainder is the layout in the type documentation: the configuration file, the
-    /// event file, and the five directories, with `home/`, `cwd/`, `store/`, and `tmp/` empty. A
-    /// directory that holds unexpected entries is reported through those entries. Call this after
-    /// the process has exited.
+    /// event file and the report file, and the five directories, with `home/`, `cwd/`, `store/`,
+    /// and `tmp/` empty. A directory that holds unexpected entries is reported through those
+    /// entries. Call this after the process has exited.
     ///
     /// # Errors
     ///
@@ -184,7 +191,7 @@ impl Scratch {
                         }
                     }
                 }
-                "events.jsonl" if kind.is_file() => {}
+                "events.jsonl" | "scan-report.json" if kind.is_file() => {}
                 _ => collect_entry(&path, &name, &mut found)?,
             }
         }
@@ -251,12 +258,25 @@ mod tests {
     }
 
     #[test]
-    fn the_event_file_and_a_rewritten_configuration_are_not_residue() {
+    fn the_event_file_the_report_and_a_rewritten_configuration_are_not_residue() {
         let scratch = scratch();
         fs::write(scratch.events(), b"{}\n").expect("events");
+        fs::write(scratch.report(), b"{}\n").expect("report");
         fs::write(scratch.config_file(), "version = 1\n[runtime]\n").expect("config");
 
         assert_eq!(scratch.residue().expect("residue"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_directory_in_the_place_of_the_report_is_reported_with_its_contents() {
+        let scratch = scratch();
+        fs::create_dir(scratch.report()).expect("a directory");
+        fs::write(scratch.report().join("inner"), b"x").expect("inner file");
+
+        assert_eq!(
+            scratch.residue().expect("residue"),
+            ["scan-report.json", "scan-report.json/inner"]
+        );
     }
 
     #[test]
