@@ -13,7 +13,10 @@
 //!   oracle of what a generated tree contains.
 //! * [`headless`] runs `excise --format json` against a fixture, checks the scan report against
 //!   the oracle under the accounting contract, and times the scan against `du -sk`.
+//! * [`bench`] builds or accepts two `excise` binaries and compares them with paired, interleaved
+//!   A/B runs (`cargo xtask bench-e2e`), recording the result as a `harness-ab` document.
 
+pub mod bench;
 pub mod events;
 pub mod fixture;
 pub mod headless;

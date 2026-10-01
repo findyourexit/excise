@@ -24,8 +24,8 @@ mod summary;
 mod tests;
 
 pub use ab::{
-    AbContext, AbKind, AbVerdict, BuildIdentity, ConfidenceInterval, HarnessAb, MetricComparison,
-    Samples, Side,
+    AbContext, AbFixture, AbKind, AbVerdict, BuildIdentity, ConfidenceInterval, HarnessAb,
+    MetricComparison, Samples, Side,
 };
 pub use failure::{
     FailedStep, FailureKind, FixtureIdentity, HarnessFailure, Rusage, ScreenComparison,

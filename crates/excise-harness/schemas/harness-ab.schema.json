@@ -9,7 +9,6 @@
     "schema_version",
     "baseline",
     "candidate",
-    "fixture_hash",
     "trials",
     "interleaving",
     "metrics",
@@ -21,10 +20,6 @@
     "schema_version": { "const": 1 },
     "baseline": { "$ref": "#/$defs/build" },
     "candidate": { "$ref": "#/$defs/build" },
-    "fixture_hash": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{16,128}$"
-    },
     "trials": {
       "description": "The number of paired trials.",
       "$ref": "#/$defs/count"
@@ -46,6 +41,10 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 4294967295
+    },
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
     },
     "text": {
       "type": "string",
@@ -116,27 +115,63 @@
         "verdict": { "enum": ["block", "warn", "pass"] }
       }
     },
+    "fixture_context": {
+      "type": "object",
+      "required": ["id", "hash", "seed"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16,128}$"
+        },
+        "seed": { "$ref": "#/$defs/unsigned" }
+      }
+    },
     "context": {
       "type": "object",
       "required": [
         "host",
         "cpu",
         "os",
+        "arch",
+        "logical_cpus",
         "toolchain",
         "power",
-        "concurrent_excise_processes"
+        "load_average_start",
+        "load_average_end",
+        "concurrent_excise_processes",
+        "fixtures"
       ],
       "additionalProperties": false,
       "properties": {
         "host": { "$ref": "#/$defs/text" },
         "cpu": { "$ref": "#/$defs/text" },
         "os": { "$ref": "#/$defs/text" },
+        "arch": { "$ref": "#/$defs/text" },
+        "logical_cpus": {
+          "type": "integer",
+          "minimum": 1
+        },
         "toolchain": { "$ref": "#/$defs/text" },
         "power": {
           "description": "For example ac, battery, or unknown.",
           "$ref": "#/$defs/text"
         },
-        "concurrent_excise_processes": { "$ref": "#/$defs/count" }
+        "load_average_start": {
+          "type": "number",
+          "minimum": 0
+        },
+        "load_average_end": {
+          "type": "number",
+          "minimum": 0
+        },
+        "concurrent_excise_processes": { "$ref": "#/$defs/count" },
+        "fixtures": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/fixture_context" }
+        }
       }
     }
   }

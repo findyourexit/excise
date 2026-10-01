@@ -73,7 +73,10 @@ pub struct ConfidenceInterval {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricComparison {
-    /// The metric name.
+    /// The metric name: the case it came from (a fixture id, or `<scenario>-<profile>`), then
+    /// `__`, then the metric, for example `wide-1k__wall_time_ms` or
+    /// `delete-folder-lifecycle-default__scan_complete_ms`. Qualifying every name this way means
+    /// one comparison can hold several fixtures and scenarios without their metrics colliding.
     pub name: String,
     /// The raw measurements.
     pub samples: Samples,
@@ -85,22 +88,46 @@ pub struct MetricComparison {
     pub verdict: AbVerdict,
 }
 
-/// The conditions the comparison ran under, recorded because timings do not transfer.
+/// One underlying fixture a comparison ran against: a `--fixture` value, or the fixture a
+/// `--scenario` names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbFixture {
+    /// The fixture's id.
+    pub id: String,
+    /// The lowercase hexadecimal hash of the fixture manifest.
+    pub hash: String,
+    /// The seed the fixture was generated from.
+    pub seed: u64,
+}
+
+/// The conditions the comparison ran under, recorded because timings do not transfer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbContext {
     /// The host name.
     pub host: String,
     /// The CPU model.
     pub cpu: String,
-    /// The operating system and version.
+    /// The operating system and version, for example `macOS 14.8.9`.
     pub os: String,
-    /// The Rust toolchain that built both binaries.
+    /// The CPU architecture, for example `aarch64`.
+    pub arch: String,
+    /// The number of logical CPUs.
+    pub logical_cpus: u32,
+    /// The Rust toolchain that built both binaries (`rustc -Vv`).
     pub toolchain: String,
     /// The power state, for example `ac`, `battery`, or `unknown`.
     pub power: String,
+    /// The 1-minute load average when the comparison started.
+    pub load_average_start: f64,
+    /// The 1-minute load average when the comparison finished.
+    pub load_average_end: f64,
     /// How many other `excise` processes were running during the comparison.
     pub concurrent_excise_processes: u32,
+    /// The fixtures the comparison ran against, one entry per distinct fixture (a run that
+    /// compares several fixtures or scenarios lists one each).
+    pub fixtures: Vec<AbFixture>,
 }
 
 /// Paired, interleaved comparison evidence for two builds.
@@ -115,8 +142,6 @@ pub struct HarnessAb {
     pub baseline: BuildIdentity,
     /// The build under evaluation.
     pub candidate: BuildIdentity,
-    /// The lowercase hexadecimal hash of the fixture manifest both builds ran against.
-    pub fixture_hash: String,
     /// The number of paired trials.
     pub trials: u32,
     /// The order in which the individual runs executed, so the interleaving pattern is auditable.

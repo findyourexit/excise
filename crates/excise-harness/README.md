@@ -539,6 +539,70 @@ report. `tests/harness_headless.rs` in the `excise` crate runs the cheap fixture
 privileges against the crate's own binary as part of `cargo test`, and runs a binary that writes a
 report breaking the schema to assert that the run fails.
 
+## Paired A/B benchmark
+
+```console
+cargo xtask bench-e2e --baseline <ref> [--baseline-binary PATH] [--candidate-binary PATH] [--fixture ID]... [--scenario NAME --profile PROFILE]... [--pairs N] [--seed S] [--timing-threshold FRACTION] [--memory-tolerance FRACTION] [--strict] [--timeout SECONDS]
+```
+
+`excise_harness::bench` builds (or accepts) two `excise` binaries and compares them with paired,
+interleaved A/B runs on the same warm fixture. A single, unpaired timing never transfers across
+sessions (the same binary and tree shape have measured 9.46 s one day and 3.8–3.9 s the next); only
+a paired, interleaved comparison on one machine in one session counts as evidence.
+
+**The two builds.** `--baseline <ref>` builds any git ref (a branch, a tag, or a SHA) in a
+temporary detached worktree with its own `CARGO_TARGET_DIR`, release, `--locked`, then removes the
+worktree. The built binary is cached by its resolved commit SHA under the target directory, so a
+later run against the same commit does not rebuild. The candidate is always the current checkout's
+release build. `--baseline-binary` and `--candidate-binary` each skip building that side and use
+the given path instead (for tests, and for comparing prebuilt binaries); the document's
+`baseline`/`candidate` `git_ref` records which was used.
+
+**What is compared.** Every `--fixture ID` (repeatable) is a headless scan
+(`excise --format json`, through the same supervised process runner the headless runner uses),
+compared on wall time, user and system CPU, and peak memory. Every `--scenario NAME --profile
+PROFILE` pair (repeatable) is a PTY scenario run, compared on `scan_complete_ms`, `first_frame_ms`,
+`input_to_frame_p99_ms`, `max_stall_ms`, `peak_rss_bytes`, and any of its own `measure` names. A
+fixture scan reuses one shared, warm root for every pair (the cached master, or one run copy when
+the fixture cannot be cached, exactly as the [headless runner](#headless-runner) does); a scenario
+gets a fresh copy of its fixture for every run, baseline and candidate alike, because a scenario may
+delete or mutate it — what stays the same across its pairs is the fixture's spec and seed, not one
+mutable tree. Metric names are qualified by their case (a fixture id, or `<scenario>-<profile>`),
+for example `wide-1k__wall_time_ms` or `delete-folder-lifecycle-default__scan_complete_ms`, so one
+run can compare several fixtures and scenarios without their metrics colliding.
+
+**Pairs and statistics.** After one untimed warm-up pair (baseline, then candidate), `--pairs N`
+(10 by default) measured pairs run the same way, interleaved baseline, candidate, baseline,
+candidate, and so on. For every metric the document holds the per-pair candidate/baseline ratio,
+their median, and a deterministic bootstrap 95% confidence interval of the median (2,000 resamples
+seeded from `--seed`, so the same seed always gives the same interval; `0` when `--seed` is not
+given).
+
+**Verdicts.** A timing metric (every metric except `peak_memory_bytes`
+and `peak_rss_bytes`) blocks when its median is more than `--timing-threshold` worse (`0.20` by
+default, the `timing_ab_regression` budget) and its interval excludes 1.0 (no change); any other
+worse median warns. A memory metric blocks when its median moves, either direction, more than
+`--memory-tolerance` from 1.0 (`0.05` by default, the `memory_ab_tolerance` budget) and its
+interval excludes 1.0; beyond tolerance without that confidence warns. The command exits non-zero
+on any block.
+
+**Context.** The document's `context` records both builds' resolved git SHAs and binary digests,
+the toolchain (`rustc -Vv`), the host (hostname, OS and version, architecture, CPU model, logical
+CPUs), every fixture compared (id, manifest hash, seed), the power state (`ac`, `battery`, or
+`unknown`: macOS reads `pmset -g batt`, Linux reads `/sys/class/power_supply`, elsewhere is always
+`unknown`), and the 1-minute load average at the start and the end. Other `excise` processes found
+running are counted in `concurrent_excise_processes` and only warned about by default (the
+maintainer usually has one session open); `--strict` aborts instead.
+
+**Output.** `target/excise-bench-e2e/<run-id>/ab.json` is a `harness-ab` document (see
+[Output documents](#output-documents)), and `target/excise-bench-e2e/latest` points at the newest
+run. The command also prints a table: one row per metric, its median ratio, its confidence
+interval, and its verdict.
+
+```console
+cargo xtask bench-e2e --baseline main --fixture wide-1k --pairs 5
+```
+
 ## Safety rules
 
 The harness only ever runs `excise` against fixtures it generated itself, and never against a real
@@ -842,7 +906,7 @@ Machine output is versioned JSON. Every document carries a `document_kind` and a
 |---|---|---|---|
 | Summary | `harness-summary` | [`harness-summary.schema.json`](schemas/harness-summary.schema.json) | The result of one run: run id, tier, times, host, the binary's path and SHA-256, the git SHA, and a verdict, duration, and metrics for each scenario and profile. |
 | Failure bundle | `harness-failure` | [`harness-failure.schema.json`](schemas/harness-failure.schema.json) | The evidence for one failed scenario: the failed step, expected and actual screen text, terminal modes, the recording path, resource use, the fixture hash and seed, and a command that reruns it. |
-| A/B evidence | `harness-ab` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, fixture hash, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under. |
+| A/B evidence | `harness-ab` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under (the fixtures compared, the host, the toolchain, the power state, the load average, and concurrent `excise` processes). |
 
 Each schema's `$id` is
 `https://github.com/findyourexit/excise/harness/schemas/<document_kind>-v1.json`. The Rust types
@@ -859,8 +923,8 @@ declares is serialized by the types.
 
 By convention a run writes its summary to `target/excise-e2e/<run-id>/summary.json`. Timing evidence
 is only meaningful from paired, interleaved A/B runs on one host in one session; the `harness-ab`
-document records the host, CPU, toolchain, power state, and concurrent `excise` processes so a
-comparison can be judged.
+document records the host, CPU, architecture, logical CPUs, toolchain, power state, load average,
+the fixtures compared, and concurrent `excise` processes so a comparison can be judged.
 
 ## In-process runner
 
