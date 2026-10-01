@@ -4,8 +4,8 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use super::support::{Scratch, master, master_of, spec, tiny_spec, victim_spec};
 use crate::fixture::{
-    FixtureError, Fixtures, MARKER_FILE_NAME, MaterializeOptions, NodeKind, Oracle, OracleOptions,
-    RelPath, Role, SpecError, remove_tree, verify_owned,
+    FixtureError, FixtureSpec, Fixtures, MARKER_FILE_NAME, MaterializeOptions, NodeKind, Oracle,
+    OracleOptions, RelPath, Role, SpecError, remove_tree, verify_owned,
 };
 
 /// One entry of a listing.
@@ -294,6 +294,25 @@ fn the_facade_turns_a_fixture_id_into_a_marked_fresh_root() {
         fixtures.run_copy("../specs/tiny", &runs),
         Err(FixtureError::Spec(SpecError::Invalid { .. }))
     ));
+}
+
+#[test]
+fn the_facade_never_caches_a_fixture_that_cargo_clean_could_not_remove() {
+    // A directory that cannot be listed and a path longer than `PATH_MAX` both defeat a path-based
+    // removal, and the shared cache lives below the target directory, which `cargo clean` and
+    // `git worktree remove` must always be able to remove.
+    let scratch = Scratch::new();
+    let fixtures = Fixtures::new(FixtureSpec::bundled_dir(), scratch.cache());
+    for id in ["hostile-small", "deep-past-path-max"] {
+        assert!(
+            matches!(fixtures.master(id), Err(FixtureError::NotCacheable { .. })),
+            "{id} is refused"
+        );
+    }
+    assert!(
+        !scratch.join("cache").exists(),
+        "nothing was generated in the cache"
+    );
 }
 
 #[test]

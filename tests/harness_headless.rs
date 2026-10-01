@@ -16,7 +16,7 @@ use std::{
 };
 
 use excise_harness::{
-    fixture::Fixtures,
+    fixture::{FixtureCache, FixtureSpec, Fixtures},
     headless::{Expectations, SuiteOptions, SuiteReport, run_suite},
     report::{Tier, Verdict},
     runner::work_base,
@@ -52,12 +52,16 @@ impl Drop for Workspace {
     }
 }
 
-/// Scans each of `fixtures` once with `binary`: the oracle diff, and no timings.
+/// Scans each of `fixtures` once with `binary`: the oracle diff, and no timings. The fixture cache
+/// is `work`'s `cache` directory, so a test can tell whether the suite built anything in it.
 fn suite(binary: &Path, fixtures: &[&str], work: &Workspace) -> SuiteReport {
     run_suite(
         &SuiteOptions {
             binary: binary.to_path_buf(),
-            fixtures: Fixtures::bundled(),
+            fixtures: Fixtures::new(
+                FixtureSpec::bundled_dir(),
+                FixtureCache::at(work.0.join("cache")),
+            ),
             tier: Tier::Quick,
             fixture_ids: fixtures.iter().map(|id| (*id).to_owned()).collect(),
             classes: Vec::new(),
@@ -110,6 +114,43 @@ fn the_report_of_each_cheap_fixture_matches_its_oracle_under_the_accounting_cont
         );
     }
     assert!(report.is_success());
+}
+
+/// The suite reads the cached master of a fixture, generated once and then reused, except for a
+/// fixture that `cargo clean` could not remove, here one with directories that cannot be listed:
+/// that one is scanned in a disposable copy and never cached, because the cache lives below the
+/// target directory.
+#[test]
+fn the_suite_caches_only_the_fixtures_that_cargo_clean_can_remove() {
+    let _suite = serial();
+    let work = Workspace::new();
+    let binary = Path::new(env!("CARGO_BIN_EXE_excise"));
+
+    let hostile = suite(binary, &["hostile-small"], &work);
+    let [fixture] = hostile.fixtures.as_slice() else {
+        panic!("one fixture ran, not {}", hostile.fixtures.len());
+    };
+    assert!(
+        fixture.error.is_none(),
+        "hostile-small ran: {:?}",
+        fixture.error
+    );
+    assert!(!fixture.diffs.is_empty(), "hostile-small was scanned");
+    assert!(
+        !work.0.join("cache").exists(),
+        "hostile-small was cached below the target directory"
+    );
+
+    let first = suite(binary, &["identity-small"], &work);
+    let second = suite(binary, &["identity-small"], &work);
+    assert!(
+        first.fixtures[0].generation.is_some(),
+        "the first run generates the master"
+    );
+    assert!(
+        second.fixtures[0].generation.is_none(),
+        "the second run reuses it"
+    );
 }
 
 /// A binary that writes a report that is not a scan report, as the product's `--output` does.

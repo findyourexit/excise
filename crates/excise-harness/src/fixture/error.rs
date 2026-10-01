@@ -35,6 +35,18 @@ pub enum FixtureError {
         /// The names of the parts the plan has.
         known: Vec<String>,
     },
+    /// The fixture is never cached, because a path-based removal such as `cargo clean` could not
+    /// remove it: see
+    /// [`FixtureSpec::removable_by_path`](crate::fixture::FixtureSpec::removable_by_path). Take a
+    /// run copy of it instead.
+    #[error(
+        "the fixture `{id}` is never cached: it holds a directory that cannot be listed or a path \
+         longer than `PATH_MAX`, which `cargo clean` cannot remove; take a run copy of it instead"
+    )]
+    NotCacheable {
+        /// The id of the fixture.
+        id: String,
+    },
     /// A file system operation of the cache or a run copy failed.
     #[error("{context}: {source}")]
     Io {
