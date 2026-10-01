@@ -46,7 +46,12 @@ pub(crate) const MAX_OBSERVATIONS_PER_BATCH: usize = 128;
 
 #[derive(Debug, Error)]
 pub(crate) enum ScanStoreError {
-    #[error(transparent)]
+    /// Not `transparent`: a bare `io::Error` has no source of its own, so a transparent
+    /// wrapper's `source()` (which forwards to the wrapped value's source, not the wrapped
+    /// value itself) would make it unreachable to a caller walking the chain for its
+    /// `io::ErrorKind`. `"{0}"` keeps the same display text while keeping this variant
+    /// reachable as a real link in the chain.
+    #[error("{0}")]
     Io(#[from] io::Error),
     #[error(transparent)]
     Run(#[from] RunError),
@@ -1505,16 +1510,50 @@ impl ScanStore {
         )
     }
 }
-fn is_scan_store_capacity_error(error: &ScanStoreError) -> bool {
+/// Whether this error means the scan store ran out of room to admit or compact input,
+/// whatever the proximate cause: the session's own tracked quota (`TemporaryStorage::reserve`)
+/// or a raw out-of-space condition on the volume underneath it. Both report through an
+/// `io::Error`, so this walks the causal chain for an `io::ErrorKind` that means "no room
+/// left" instead of matching any message text. A filesystem-level quota (`QuotaExceeded`,
+/// distinct from this session's own tracked budget) gets the same answer: the remedy is the
+/// same for both, a scratch location outside whichever limit was hit.
+pub(crate) fn is_scan_store_capacity_error(error: &ScanStoreError) -> bool {
     let mut source: &(dyn StdError + 'static) = error;
     loop {
         if let Some(io_error) = source.downcast_ref::<io::Error>() {
-            return io_error.kind() == io::ErrorKind::StorageFull;
+            return matches!(
+                io_error.kind(),
+                io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+            );
         }
         let Some(next) = source.source() else {
             return false;
         };
         source = next;
+    }
+}
+
+/// Recognized by every consumer that only sees a string, not the typed error: the scanner's
+/// worker threads (crossing the event channel) and the owner's own admission call both use
+/// this exact text once [`is_scan_store_capacity_error`] recognizes their error, so a raw
+/// out-of-space error (OS-specific wording, no mention of `--scan-store-mib`) reaches the user
+/// exactly like the session's own tracked quota.
+pub(crate) const SCAN_STORE_CAPACITY_MESSAGE: &str =
+    "scan store capacity exhausted; increase --scan-store-mib";
+
+/// The message a scan-store admission or compaction error becomes once a caller can no longer
+/// keep the typed error (a worker thread sending it down the event channel, or an owner
+/// storing it as a terminal failure string). Classification happens once, here, while the
+/// error is still typed. The session's own tracked quota already explains itself (exact byte
+/// counts, which flag to raise), so that detail survives; a raw out-of-space error (no mention
+/// of "capacity exhausted") is replaced with the same explanation instead. Any other error
+/// keeps its own message unchanged.
+pub(crate) fn scan_store_capacity_message(error: &ScanStoreError) -> String {
+    let message = error.to_string();
+    if is_scan_store_capacity_error(error) && !message.contains("scan store capacity exhausted") {
+        SCAN_STORE_CAPACITY_MESSAGE.to_string()
+    } else {
+        message
     }
 }
 
@@ -2055,6 +2094,62 @@ mod tests {
             .state(),
             ScanGenerationState::Cancelled
         );
+    }
+
+    /// Proves classification is by `io::ErrorKind`, not message text: a raw out-of-space
+    /// error with OS-native wording (no mention of "capacity exhausted" or
+    /// `--scan-store-mib`) is still recognized, nested exactly as it would be inside a sealed
+    /// run's write failure, and both out-of-room kinds normalize to the same message a
+    /// filesystem-level quota does too, while an already self-describing quota message keeps
+    /// its own detail. An unrelated error kind, and a non-I/O `ScanStoreError` variant, are
+    /// both left alone.
+    #[test]
+    fn capacity_classification_ignores_message_text_and_keys_on_error_kind() {
+        let raw_enospc = ScanStoreError::Run(RunError::Io(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "No space left on device (os error 28)",
+        )));
+        assert!(is_scan_store_capacity_error(&raw_enospc));
+        assert_eq!(
+            scan_store_capacity_message(&raw_enospc),
+            SCAN_STORE_CAPACITY_MESSAGE
+        );
+
+        let raw_edquot = ScanStoreError::Io(io::Error::new(
+            io::ErrorKind::QuotaExceeded,
+            "Disc quota exceeded (os error 69)",
+        ));
+        assert!(is_scan_store_capacity_error(&raw_edquot));
+        assert_eq!(
+            scan_store_capacity_message(&raw_edquot),
+            SCAN_STORE_CAPACITY_MESSAGE
+        );
+
+        let self_describing = ScanStoreError::Run(RunError::Io(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "scan store capacity exhausted: 4096 bytes exceed the 2048 byte session limit; \
+             increase --scan-store-mib",
+        )));
+        assert!(is_scan_store_capacity_error(&self_describing));
+        assert_eq!(
+            scan_store_capacity_message(&self_describing),
+            self_describing.to_string(),
+            "a message that already names the limit and the flag should keep its detail"
+        );
+
+        let unrelated_io = ScanStoreError::Run(RunError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13)",
+        )));
+        assert!(!is_scan_store_capacity_error(&unrelated_io));
+        assert_eq!(
+            scan_store_capacity_message(&unrelated_io),
+            unrelated_io.to_string()
+        );
+
+        assert!(!is_scan_store_capacity_error(
+            &ScanStoreError::BatchTooLarge
+        ));
     }
     #[test]
     fn published_private_session_recovers_its_child_query_after_interruption() {

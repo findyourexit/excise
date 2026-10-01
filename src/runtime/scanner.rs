@@ -33,7 +33,7 @@ use crate::scan_session::ScanSessionId;
 use crate::scan_store::identity_observation::IdentityObservation;
 use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, SummaryMetrics};
 use crate::scan_store::run_file::SealedRun;
-use crate::scan_store::session::ScanInputRunFactory;
+use crate::scan_store::session::{ScanInputRunFactory, scan_store_capacity_message};
 use crate::temporary_storage::TemporaryStorage;
 /// The owner consumes each bounded batch before checking input again. Keep the
 /// batch small so scanning never makes keyboard feedback wait indefinitely.
@@ -1673,7 +1673,7 @@ fn seal_scanned_entries(
     }
     factory
         .seal_observation_batch(paths, identities)
-        .map_err(|error| error.to_string())
+        .map_err(|error| scan_store_capacity_message(&error))
 }
 
 fn send_scheduler_command(

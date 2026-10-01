@@ -132,13 +132,22 @@ fn scratch_volume_available_bytes(scratch: &Path) -> io::Result<u64> {
 }
 
 /// The pure arithmetic behind [`scratch_volume_available_bytes`] on Unix: POSIX defines
-/// `f_bavail` in `f_frsize` units. This still computes `f_bavail × f_frsize.max(f_bsize)`,
-/// which is wrong whenever the two block sizes differ (F7): kept byte-for-byte identical to
-/// the inline arithmetic this was extracted from, so the extraction is behaviour-preserving.
-/// X5 changes this to use `f_frsize` alone.
+/// `f_bavail` in `f_frsize` units (`statvfs(3)`), the volume's fundamental block size, not
+/// `f_bsize` (its preferred I/O size). The two can differ by orders of magnitude: one measured
+/// APFS volume reported `f_bsize = 1_048_576` (1 MiB) against `f_frsize = 4_096` (4 KiB), so
+/// multiplying by the larger of the two overstated real free space by about 256×.
+///
+/// `f_frsize == 0` would multiply the quota down to nothing rather than up, but still deserves
+/// a guard: Linux's `statvfs` wrapper already substitutes `f_bsize` for a zero raw `f_frsize`
+/// before this code ever sees it, for kernels whose `statfs(2)` predates the field (rustix
+/// 1.1.5 `src/backend/linux_raw/fs/syscalls.rs:938-960`). macOS's `statvfs(3)` sets `f_frsize`
+/// straight from `statfs(2)`'s block size with no fallback of its own
+/// (`apple-oss-distributions/Libc` `emulated/statvfs.c`: `to->f_frsize = from->f_bsize`), so a
+/// filesystem driver that reports a zero block size would reach us unless we substitute here
+/// too.
 #[cfg(unix)]
 fn available_bytes(f_bavail: u64, f_frsize: u64, f_bsize: u64) -> io::Result<u64> {
-    let block_size = f_frsize.max(f_bsize);
+    let block_size = if f_frsize == 0 { f_bsize } else { f_frsize };
     f_bavail.checked_mul(block_size).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -588,31 +597,39 @@ mod tests {
             .expect("scratch directory should resolve to a mounted volume");
     }
 
-    /// Strict xfail (F7): injects the macOS statvfs values from the finding
-    /// (`f_bsize = 1_048_576`, `f_frsize = 4_096`, `f_bavail = 14_979_245`) and asserts today's
-    /// wrong product, `f_bavail × f_bsize` (14.3 TiB), rather than the POSIX-correct
-    /// `f_bavail × f_frsize` (57.1 GiB). This passes on `main` because the defect is present;
-    /// X5's fix makes it fail with the message below, which is the signal to flip it.
+    /// Injects the macOS statvfs values from a measured 57.1 GiB-free APFS volume
+    /// (`f_bsize = 1_048_576`, `f_frsize = 4_096`, `f_bavail = 14_979_245`) and asserts the
+    /// POSIX-correct product, `f_bavail × f_frsize`, not `f_bavail × f_bsize` (which would
+    /// overstate free space by about 256×).
     #[cfg(unix)]
     #[test]
-    fn scratch_volume_available_bytes_is_still_wrong_on_macos_block_size_mismatch() {
+    fn scratch_volume_available_bytes_uses_frsize_when_block_sizes_differ() {
         let result = available_bytes(14_979_245, 4_096, 1_048_576)
             .expect("the injected statvfs values should multiply without overflow");
-        assert_eq!(
-            result,
-            14_979_245 * 1_048_576,
-            "F7 is fixed: flip R5 to assert 14979245 × 4096 (X5)"
-        );
+        assert_eq!(result, 14_979_245 * 4_096);
     }
 
-    /// When `f_bsize == f_frsize` (true of most non-APFS volumes), `max` is a no-op and the
-    /// result is correct both before and after X5.
+    /// When `f_bsize == f_frsize` (true of most non-APFS volumes), the choice between them
+    /// does not matter.
     #[cfg(unix)]
     #[test]
     fn scratch_volume_available_bytes_is_correct_when_block_sizes_already_agree() {
         assert_eq!(
             available_bytes(1_946, 4_096, 4_096).expect("matching block sizes should not overflow"),
             1_946 * 4_096
+        );
+    }
+
+    /// A filesystem driver that reports no fundamental block size at all falls back to the
+    /// preferred I/O size, the same substitution Linux's `statvfs` wrapper already makes for a
+    /// raw zero `f_frsize` (see `available_bytes`'s doc comment).
+    #[cfg(unix)]
+    #[test]
+    fn scratch_volume_available_bytes_falls_back_to_bsize_when_frsize_is_zero() {
+        assert_eq!(
+            available_bytes(14_979_245, 0, 1_048_576)
+                .expect("a zero frsize should fall back to bsize without overflow"),
+            14_979_245 * 1_048_576
         );
     }
 
