@@ -6,8 +6,8 @@ use jsonschema::Validator;
 use serde_json::Value;
 
 use super::{
-    AbContext, AbKind, AbVerdict, BinaryIdentity, BuildIdentity, ConfidenceInterval, Document,
-    FailedStep, FailureKind, FixtureIdentity, HarnessAb, HarnessFailure, HarnessSummary,
+    AbContext, AbFixture, AbKind, AbVerdict, BinaryIdentity, BuildIdentity, ConfidenceInterval,
+    Document, FailedStep, FailureKind, FixtureIdentity, HarnessAb, HarnessFailure, HarnessSummary,
     MetricComparison, Rusage, SCHEMA_VERSION, Samples, ScenarioResult, SchemaVersion,
     ScreenComparison, Side, SummaryKind, TerminalModes, Tier, Verdict,
 };
@@ -118,7 +118,6 @@ fn ab() -> HarnessAb {
             git_ref: "findyourexit/x1-drop-flushes".to_owned(),
             binary_sha256: SHA256.replace('9', "a"),
         },
-        fixture_hash: FIXTURE_HASH.to_owned(),
         trials: 2,
         interleaving: vec![
             Side::Baseline,
@@ -127,7 +126,7 @@ fn ab() -> HarnessAb {
             Side::Baseline,
         ],
         metrics: vec![MetricComparison {
-            name: "time_to_complete_ms".to_owned(),
+            name: "delete-folder-lifecycle-default__time_to_complete_ms".to_owned(),
             samples: Samples {
                 baseline: vec![3_900.0, 3_850.5],
                 candidate: vec![1_100.0, 1_050.25],
@@ -144,9 +143,18 @@ fn ab() -> HarnessAb {
             host: "macbook".to_owned(),
             cpu: "Apple M1 Pro".to_owned(),
             os: "macOS 26.0".to_owned(),
+            arch: "aarch64".to_owned(),
+            logical_cpus: 10,
             toolchain: "rustc 1.98.0".to_owned(),
             power: "ac".to_owned(),
+            load_average_start: 1.2,
+            load_average_end: 1.5,
             concurrent_excise_processes: 0,
+            fixtures: vec![AbFixture {
+                id: "delete-folder".to_owned(),
+                hash: FIXTURE_HASH.to_owned(),
+                seed: 7,
+            }],
         },
     }
 }
@@ -649,6 +657,21 @@ fn the_ab_schema_rejects_contract_drift() {
             }),
             ("a negative median ratio", &|d| {
                 set(d, "/metrics/0/median_ratio", (-0.5).into());
+            }),
+            ("zero logical cpus", &|d| {
+                set(d, "/context/logical_cpus", 0.into());
+            }),
+            ("a negative load average", &|d| {
+                set(d, "/context/load_average_start", (-0.1).into());
+            }),
+            ("an empty fixtures list", &|d| {
+                set(d, "/context/fixtures", serde_json::json!([]));
+            }),
+            ("a fixture hash that is not hexadecimal", &|d| {
+                set(d, "/context/fixtures/0/hash", "not-hex".into());
+            }),
+            ("a missing fixtures field", &|d| {
+                remove(d, "/context/fixtures");
             }),
             ("a missing context field", &|d| remove(d, "/context/power")),
         ],

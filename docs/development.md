@@ -367,6 +367,19 @@ EXCISE_HARNESS_PRIVILEGED=1 cargo xtask headless --class volumes
 
 `cargo test` also scans the cheap fixtures that need no privileges against the `excise` crate's own binary (`tests/harness_headless.rs`) and runs a negative control: a binary that writes a report that breaks the published schema must fail the run.
 
+### Paired A/B benchmark
+
+`cargo xtask bench-e2e --baseline <ref>` builds (or accepts, via `--baseline-binary`/`--candidate-binary`) a baseline and a candidate `excise` binary and compares them with paired, interleaved A/B runs on the same warm fixture: headless fixture scans (wall time, user and system CPU, peak memory) and PTY scenario runs (`scan_complete_ms`, `first_frame_ms`, `input_to_frame_p99_ms`, `max_stall_ms`, `peak_rss_bytes`, and any `measure` names), after one untimed warm-up pair.
+
+```console
+cargo xtask bench-e2e --baseline main --fixture wide-1k --pairs 5
+cargo xtask bench-e2e --baseline v1.3.0 --scenario delete-folder-lifecycle --profile deterministic
+```
+
+For every metric it reports the median candidate/baseline ratio and a deterministic bootstrap 95% confidence interval (`--seed`), and applies a verdict: a timing metric blocks past a 20% regression (`--timing-threshold`) with a confident interval, a memory metric blocks past a 5% move either direction (`--memory-tolerance`) with a confident interval, and the command exits non-zero on any block. The document is `target/excise-bench-e2e/<run-id>/ab.json`, a `harness-ab` document that records both builds' identities and the session's context (host, toolchain, power state, load average, and concurrent `excise` processes) because timings never transfer across sessions. `cargo test` runs the same comparison logic with the crate's own binary as both sides, on a small fixture, as a schema and verdict regression check (`tests/harness_bench.rs`).
+
+See the [harness README](https://github.com/findyourexit/excise/blob/main/crates/excise-harness/README.md) for the full reference.
+
 ## Benchmarks
 
 The hosted `benchmark.yml` retains the `criterion-benchmark-evidence` artifact for 90 days. It contains Criterion raw samples and reports from `target/criterion`, one-million and bounded-fan-in probe logs, plus `benchmark-context.txt`, which records the checked-out SHA, workflow run, runner image and CPU, commands, Rust toolchain, and `Cargo.lock` digest.
