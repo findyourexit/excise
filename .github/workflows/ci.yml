@@ -114,4 +114,4 @@ jobs:
       - name: Validate documentation links
         run: |
           cargo +stable install lychee --version 0.24.2 --locked
-          lychee --offline --no-progress README.md CONTRIBUTING.md GOVERNANCE.md MAINTAINERS.md SECURITY.md SUPPORT.md docs
+          lychee --offline --no-progress README.md AGENTS.md CONTRIBUTING.md GOVERNANCE.md MAINTAINERS.md SECURITY.md SUPPORT.md docs

@@ -828,6 +828,7 @@ fn run_static_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
             "--offline",
             "--no-progress",
             "README.md",
+            "AGENTS.md",
             "CONTRIBUTING.md",
             "GOVERNANCE.md",
             "MAINTAINERS.md",
