@@ -102,7 +102,7 @@ pub fn run_scan(request: &ScanRequest<'_>) -> Result<ScanRun, ScanError> {
         .arg(scratch.report())
         .arg(request.fixture.path())
         .env_clear()
-        .envs(isolated_env(&scratch, request.profile, false))
+        .envs(isolated_env(&scratch, request.profile, false, None))
         .current_dir(scratch.cwd());
     let finished = process::run(&mut command, request.timeout, true)?;
     let residue = scratch.residue()?;

@@ -128,8 +128,18 @@ const fn scan_store_limit_bytes(
 #[cfg(unix)]
 fn scratch_volume_available_bytes(scratch: &Path) -> io::Result<u64> {
     let statistics = rustix::fs::statvfs(scratch).map_err(io::Error::from)?;
-    let block_size = statistics.f_frsize.max(statistics.f_bsize);
-    statistics.f_bavail.checked_mul(block_size).ok_or_else(|| {
+    available_bytes(statistics.f_bavail, statistics.f_frsize, statistics.f_bsize)
+}
+
+/// The pure arithmetic behind [`scratch_volume_available_bytes`] on Unix: POSIX defines
+/// `f_bavail` in `f_frsize` units. This still computes `f_bavail × f_frsize.max(f_bsize)`,
+/// which is wrong whenever the two block sizes differ (F7): kept byte-for-byte identical to
+/// the inline arithmetic this was extracted from, so the extraction is behaviour-preserving.
+/// X5 changes this to use `f_frsize` alone.
+#[cfg(unix)]
+fn available_bytes(f_bavail: u64, f_frsize: u64, f_bsize: u64) -> io::Result<u64> {
+    let block_size = f_frsize.max(f_bsize);
+    f_bavail.checked_mul(block_size).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "scratch volume available-space calculation overflowed",
@@ -576,6 +586,34 @@ mod tests {
         let scratch = tempfile::tempdir().expect("scratch directory should exist");
         scratch_volume_available_bytes(scratch.path())
             .expect("scratch directory should resolve to a mounted volume");
+    }
+
+    /// Strict xfail (F7): injects the macOS statvfs values from the finding
+    /// (`f_bsize = 1_048_576`, `f_frsize = 4_096`, `f_bavail = 14_979_245`) and asserts today's
+    /// wrong product, `f_bavail × f_bsize` (14.3 TiB), rather than the POSIX-correct
+    /// `f_bavail × f_frsize` (57.1 GiB). This passes on `main` because the defect is present;
+    /// X5's fix makes it fail with the message below, which is the signal to flip it.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_volume_available_bytes_is_still_wrong_on_macos_block_size_mismatch() {
+        let result = available_bytes(14_979_245, 4_096, 1_048_576)
+            .expect("the injected statvfs values should multiply without overflow");
+        assert_eq!(
+            result,
+            14_979_245 * 1_048_576,
+            "F7 is fixed: flip R5 to assert 14979245 × 4096 (X5)"
+        );
+    }
+
+    /// When `f_bsize == f_frsize` (true of most non-APFS volumes), `max` is a no-op and the
+    /// result is correct both before and after X5.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_volume_available_bytes_is_correct_when_block_sizes_already_agree() {
+        assert_eq!(
+            available_bytes(1_946, 4_096, 4_096).expect("matching block sizes should not overflow"),
+            1_946 * 4_096
+        );
     }
 
     #[test]

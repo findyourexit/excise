@@ -310,6 +310,7 @@ pub fn run_scenario_once(
         binary,
         fixture_root: fixture.root(),
         work_dir: workspace.path(),
+        scan_store_dir: None,
         bundle_dir: None,
         repro_command: &repro,
         fixture_seed: fixture.plan().seed(),
