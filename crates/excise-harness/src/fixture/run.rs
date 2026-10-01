@@ -332,11 +332,20 @@ impl Fixtures {
     /// The cached master of the spec `id`, generated if it is not there or does not verify. Treat
     /// it as read-only.
     ///
+    /// A fixture that a path-based removal cannot remove is never cached, so that `cargo clean` and
+    /// `git worktree remove` can always remove the target directory that holds the cache (see
+    /// [`FixtureSpec::removable_by_path`]). Take a [`run_copy`](Self::run_copy) of it instead.
+    ///
     /// # Errors
     ///
-    /// Returns why the spec cannot be loaded or the fixture cannot be generated.
+    /// Returns why the spec cannot be loaded, that the fixture is never cached, or why it cannot
+    /// be generated.
     pub fn master(&self, id: &str) -> Result<Materialized, FixtureError> {
-        self.cache.materialize(&self.spec(id)?, &self.options)
+        let spec = self.spec(id)?;
+        if !spec.removable_by_path() {
+            return Err(FixtureError::NotCacheable { id: spec.id });
+        }
+        self.cache.materialize(&spec, &self.options)
     }
 
     /// A disposable copy of the fixture `id` in a new directory below `run_parent`, which must

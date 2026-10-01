@@ -466,9 +466,13 @@ are applied.
 **Fixtures.** `--quick` selects the fixtures of at most 10,000 planned entries and `--full`, the
 default, those of at most 250,000. `--fixture` names fixtures and runs them whatever their size (the
 1,000,000-entry fixture only ever runs by name), and `--class` selects every fixture that generates
-a class. A fixture with a volume part also runs without privileges, but then the mount point is an
-empty directory, no boundary is crossed, and the table says so. With `EXCISE_HARNESS_PRIVILEGED=1`
-the volumes are attached and the boundary rule is exercised.
+a class. A fixture is scanned in its cached master, which the runner only reads, so a large fixture
+is generated once. A fixture that `cargo clean` could not remove is never cached (see
+[Cache and integrity](#cache-and-integrity)) and is scanned in a run copy instead, generated fresh
+in the fixture's scratch area and removed when the fixture is done. A fixture with a volume part
+also runs without privileges, but then the mount point is an empty directory, no boundary is
+crossed, and the table says so. With `EXCISE_HARNESS_PRIVILEGED=1` the volumes are attached and the
+boundary rule is exercised.
 
 **The `du` reference.** The same warm tree is timed with `du -sk`, through the same supervised
 process runner and in an empty environment, interleaved with the scans: a warm-up pair, which is
@@ -672,6 +676,12 @@ is 16 hexadecimal digits. The name changes with the spec, the seed, and the gene
 stale entry is never mistaken for a current one. Generation happens in a `.partial-…` sibling that
 is renamed into place once the marker, written last, has sealed it. Tests pass a temporary
 directory as the cache root and never touch the shared cache.
+
+The shared cache holds only trees that a path-based removal can remove, so that `cargo clean` and
+`git worktree remove` can always remove the target directory. Such a removal fails on a directory
+that cannot be listed (the hostile `unreadable_dirs` feature) and on a path longer than `PATH_MAX`
+(a `deep` part), so `Fixtures::master` refuses a fixture with either
+(`FixtureSpec::removable_by_path`), and a runner takes a run copy of it instead.
 
 The marker `.excise-harness-owned` is a regular file (never a link) at every fixture root. Its JSON
 records the generator version, spec id, spec hash, seed, role (`master` or `run-copy`), manifest

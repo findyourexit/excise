@@ -677,6 +677,20 @@ impl FixtureSpec {
             .any(|part| matches!(part, Part::Volume(_)))
     }
 
+    /// Whether a path-based recursive removal can remove a generated tree of this spec, the way
+    /// `cargo clean` and `git worktree remove` remove a target directory. Such a removal fails on a
+    /// directory that its owner cannot list (`unreadable_dirs`) and on a path longer than
+    /// `PATH_MAX` (a `deep` part), so a fixture with either is never cached: see
+    /// [`Fixtures::master`](super::Fixtures::master).
+    #[must_use]
+    pub fn removable_by_path(&self) -> bool {
+        self.parts.iter().all(|part| match part {
+            Part::Deep(_) => false,
+            Part::Hostile(hostile) => !hostile.features.contains(&HostileFeature::UnreadableDirs),
+            Part::Tree(_) | Part::File(_) | Part::Identity(_) | Part::Volume(_) => true,
+        })
+    }
+
     /// The canonical text the spec hash covers: the schema version, id, seed, and parts as
     /// compact JSON in field order. Formatting, comments, and the description are not part of
     /// it, so editing them does not invalidate a cached fixture.

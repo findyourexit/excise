@@ -3,8 +3,11 @@
 //!
 //! For each fixture the suite
 //!
-//! 1. gets the fixture: the cached master, which headless runs only read, or, for a fixture with a
-//!    volume part, a fresh run copy with the volume attached (privileged, behind
+//! 1. gets the fixture: the cached master, which headless runs only read, or a fresh run copy,
+//!    removed when the fixture is done, for a fixture that is never cached because `cargo clean`
+//!    could not remove it (see
+//!    [`FixtureSpec::removable_by_path`](crate::fixture::FixtureSpec::removable_by_path)) and
+//!    for a fixture with a volume part whose volume is attached (privileged, behind
 //!    `EXCISE_HARNESS_PRIVILEGED=1`);
 //! 2. walks it for the oracle;
 //! 3. runs the scan once, and `du -sk` once, to warm the binary and the page cache, and drops both
@@ -392,6 +395,7 @@ struct Planned {
     classes: BTreeSet<Class>,
     entries: u64,
     needs_volumes: bool,
+    cacheable: bool,
 }
 
 /// What the suite tells a caller as it goes.
@@ -543,11 +547,13 @@ fn select(options: &SuiteOptions) -> Result<Vec<Planned>, SuiteError> {
             continue;
         }
         let needs_volumes = spec.has_volumes();
+        let cacheable = spec.removable_by_path();
         planned.push(Planned {
             id,
             classes,
             entries,
             needs_volumes,
+            cacheable,
         });
     }
     if planned.is_empty() {
@@ -634,23 +640,27 @@ fn measure(
         .tempdir_in(context.work_dir)
         .map_err(StepError::Workspace)?;
 
-    // A master is read-only and shared; a volume fixture that is to have its volumes attached
-    // needs a copy of its own to attach them to.
-    let (root, _copy) = match (planned.needs_volumes, options.privileged) {
-        (true, Some(opt_in)) => {
-            let mut copy = options.fixtures.run_copy(&planned.id, workspace.path())?;
+    // A master is read-only and shared, and it stays cached between runs, so a large fixture is
+    // generated once. A fixture whose volumes are to be attached needs a copy of its own to attach
+    // them to, and a fixture that `cargo clean` could not remove is never cached: each of those is
+    // scanned in a copy, generated fresh and removed, permissions restored first, when it drops.
+    let attach = options.privileged.filter(|_| planned.needs_volumes);
+    let (root, _copy) = if planned.cacheable && attach.is_none() {
+        let master = options.fixtures.master(&planned.id)?;
+        report.generation = master.generation_time();
+        (master.root, None)
+    } else {
+        let generating = Instant::now();
+        let mut copy = options.fixtures.run_copy(&planned.id, workspace.path())?;
+        report.generation = Some(generating.elapsed());
+        if let Some(opt_in) = attach {
             report.volumes = Volumes::Attached(copy.attach_volumes(opt_in)?);
-            (copy.root().to_path_buf(), Some(copy))
         }
-        (needs_volumes, _) => {
-            let master = options.fixtures.master(&planned.id)?;
-            report.generation = master.generation_time();
-            if needs_volumes {
-                report.volumes = Volumes::Detached;
-            }
-            (master.root, None)
-        }
+        (copy.root().to_path_buf(), Some(copy))
     };
+    if planned.needs_volumes && attach.is_none() {
+        report.volumes = Volumes::Detached;
+    }
     let fixture = FixtureRoot::open(&root)?;
 
     let walked = Instant::now();
