@@ -357,7 +357,14 @@ Details that a table cannot carry:
   bytes arrived and when the first one did, whether the child is still alive, how many `ESC[6n`
   cursor-position requests were answered, and the bounded head and tail of the raw output stream
   (`PtySession::diagnostics`). An empty screen at the deadline reads as zero bytes and zero
-  answered requests: the program's output never reached the screen model at all.
+  answered requests: the program's output never reached the screen model at all. When
+  `EXCISE_HARNESS_DIAGNOSTIC_COMMAND` names a command (every `{pid}` in it replaced with the
+  child's process id, for example `cdb -pv -p {pid} -c "~*k 40; qd"` on Windows or
+  `sample {pid} 2` on macOS), a timed-out step also runs it non-invasively against the child and
+  appends its output to the same failure detail and `screen.txt`, bounded to 15 s and 64 KiB
+  (`PtySession::sample_process`). The command is split into words as a POSIX shell would split
+  it, but never run through one, so quote a Windows path: an unquoted backslash is dropped.
+  Unset, the variable costs one environment lookup and nothing else.
 - **Sentinels.** The runner asserts every sentinel before it sends `y` for a `delete` step, and
   again after the last step.
 - **Verdicts.** A run succeeds only if no result has a blocking verdict; see

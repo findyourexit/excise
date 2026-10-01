@@ -7,6 +7,7 @@
 //! * [`keys`] encodes key presses and [`cast`] records the session in the asciicast format.
 
 pub mod cast;
+mod diagnostic_command;
 pub mod keys;
 mod screen;
 mod session;
