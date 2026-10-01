@@ -4,8 +4,8 @@ use std::{collections::BTreeMap, collections::BTreeSet, fs};
 
 use super::{ALL_STEPS, BASE, TempDir, parse, valid};
 use crate::scenario::{
-    Budget, Comparison, DEFAULT_TIMEOUT_MS, Delete, EntryKind, EventField, EventKind, Expect,
-    ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, FsMutate, KeyName, LoadError, Marker,
+    Budget, Comparison, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, EntryKind, EventField, EventKind,
+    Expect, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, FsMutate, KeyName, LoadError, Marker,
     Measure, MutateOp, PressKey, Profile, Quit, Region, Residue, Resize, ScanState, Scenario,
     Select, SendSignal, Settle, Signal, Step, Terminal, Tier, TypeText, WaitEvent, WaitFs,
     WaitHeader, WaitText,
@@ -301,6 +301,7 @@ fn delete_parses_a_name_and_both_kinds() {
         Step::Delete(Delete {
             name: "victim".to_owned(),
             kind: EntryKind::Folder,
+            wait_for: DeleteWait::Finished,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         })
     );
@@ -309,6 +310,7 @@ fn delete_parses_a_name_and_both_kinds() {
         Step::Delete(Delete {
             name: "keep.bin".to_owned(),
             kind: EntryKind::File,
+            wait_for: DeleteWait::Finished,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         })
     );

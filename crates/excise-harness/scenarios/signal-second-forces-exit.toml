@@ -1,0 +1,44 @@
+schema_version = 1
+name = "signal-second-forces-exit"
+description = "A second signal while the first is still being handled forces an immediate restore and exit 130, instead of waiting for whatever graceful shutdown the first signal alone starts; both signals land while a 5,011-entry deletion is running, the point where a graceful stop takes the longest."
+fixture = "delete-folder"
+sentinels = ["keep-a.bin", "keep-b/keep.txt"]
+profiles = ["deterministic"]
+tier = "full"
+expect = "fail"
+slice = "X3"
+platforms = ["linux", "macos"]
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "victim"
+timeout_ms = 10000
+
+[[steps]]
+step = "delete"
+name = "victim"
+kind = "folder"
+wait_for = "started"
+timeout_ms = 60000
+
+# Two signals in a row, while the first is still being handled: the second must not need to wait
+# for whatever the first started.
+[[steps]]
+step = "signal"
+signal = "term"
+
+[[steps]]
+step = "signal"
+signal = "term"
+
+[[steps]]
+step = "expect_exit"
+code = 130
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000

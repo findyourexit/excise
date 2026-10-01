@@ -11,9 +11,9 @@ use crate::{
     },
     safety::{FixtureSnapshot, send_signal},
     scenario::{
-        DEFAULT_TIMEOUT_MS, Delete, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, FsMutate,
-        Measure, Quit, Residue, Resize, Select, SendSignal, Settle, Step, WaitEvent, WaitFs,
-        WaitHeader, WaitText,
+        DEFAULT_TIMEOUT_MS, Delete, DeleteWait, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen,
+        FsMutate, Measure, Quit, Residue, Resize, Select, SendSignal, Settle, Signal, Step,
+        WaitEvent, WaitFs, WaitHeader, WaitText,
     },
 };
 
@@ -302,8 +302,10 @@ impl Executor<'_> {
     }
 
     /// Presses Backspace, reads the confirmation dialog, and presses `y` only when the dialog
-    /// names exactly the requested entry. See [`super::delete`] for what is checked. The step ends
-    /// on the first frame after `deletion_finished`, which shows the result.
+    /// names exactly the requested entry. See [`super::delete`] for what is checked. `wait_for`
+    /// (default `"finished"`) controls when the step returns: on the first frame after
+    /// `deletion_finished`, which shows the result, or (`"started"`) as soon as the dialog has
+    /// closed, while the deletion keeps running in the background.
     fn delete(&mut self, index: usize, step: &Delete) -> Result<(), Stop> {
         let deadline = Self::deadline(step.timeout_ms);
         let expected = format!(
@@ -366,6 +368,49 @@ impl Executor<'_> {
         let at = self.send_input(b"y")?;
         self.recorder.record_deletion_confirmed(at);
         self.intended_deletions.push(verified.relative);
+
+        match step.wait_for {
+            DeleteWait::Started => self.delete_wait_started(index, step, deadline),
+            DeleteWait::Finished => self.delete_wait_finished(index, step, deadline, events_before),
+        }
+    }
+
+    /// `wait_for = "started"`: returns once a frame shows the dialog has closed. The confirmation
+    /// was sent and processed: the dialog closing is the program leaving `DeleteConfirm` for the
+    /// planning/execution path it enters in the same turn (`queue_confirmed_deletion`), so the
+    /// deletion has started. Nothing here waits for it to finish; the deletion keeps running
+    /// after this returns.
+    fn delete_wait_started(
+        &mut self,
+        index: usize,
+        step: &Delete,
+        deadline: Instant,
+    ) -> Result<(), Stop> {
+        let closed = self.wait_until(deadline, |exec| {
+            exec.frame_reflecting_inputs()?;
+            matches!(dialog_view(exec.session.screen()), DialogView::None).then_some(())
+        })?;
+        match closed {
+            Waited::Ready(()) => Ok(()),
+            other => Err(self.unmet(
+                index,
+                &other,
+                "the deletion dialog to close after the confirmation",
+                step.timeout_ms,
+                || format!("the screen shows:\n{}", self.session.screen().text()),
+            )),
+        }
+    }
+
+    /// `wait_for = "finished"` (the default): waits for `deletion_finished` and for the frame
+    /// drawn after it, so the screen already shows the result.
+    fn delete_wait_finished(
+        &mut self,
+        index: usize,
+        step: &Delete,
+        deadline: Instant,
+        events_before: usize,
+    ) -> Result<(), Stop> {
         let finished = self.wait_until(deadline, |exec| {
             exec.events.events()[events_before..]
                 .iter()
@@ -481,6 +526,9 @@ impl Executor<'_> {
         }
     }
 
+    /// Delivers `step.signal`. `close` has no process id to signal: it is delivered by closing
+    /// the pseudo-terminal's controlling side (`PtySession::close_console`), not by
+    /// `safety::send_signal`.
     fn signal(&mut self, index: usize, step: SendSignal) -> Result<(), Stop> {
         self.pump()?;
         if let Some(exit) = self.session.exit() {
@@ -491,7 +539,10 @@ impl Executor<'_> {
                 format!("the program had already ended ({})", exit.describe()),
             ));
         }
-        send_signal(self.session.pid(), step.signal)?;
+        match step.signal {
+            Signal::Close => self.session.close_console(),
+            other => send_signal(self.session.pid(), other)?,
+        }
         Ok(())
     }
 
@@ -588,8 +639,12 @@ impl Executor<'_> {
                 step.code
             ));
         }
+        // After a `close` event the console is gone, and nothing the program writes reaches the
+        // screen model: the terminal cannot be inspected, so it is not checked (`plan::prepare`
+        // refuses `terminal_restored = false` there, which would otherwise pass unexamined).
+        let terminal_checked = !self.session.console_closed();
         let modes = self.session.modes();
-        if modes.restored() != step.terminal_restored {
+        if terminal_checked && modes.restored() != step.terminal_restored {
             problems.push(format!(
                 "the terminal is {} (alternate screen {}, cursor {}, echo {}, canonical mode {}), \
                  but the step expects it to be {}",
@@ -631,18 +686,15 @@ impl Executor<'_> {
         if problems.is_empty() {
             return Ok(());
         }
+        let terminal = match (terminal_checked, step.terminal_restored) {
+            (false, _) => "not checked (the console was closed)",
+            (true, true) => "restored",
+            (true, false) => "not restored",
+        };
         Err(self.fail(
             index,
             FailureCause::Mismatch,
-            format!(
-                "exit code {}, terminal {}, no residue",
-                step.code,
-                if step.terminal_restored {
-                    "restored"
-                } else {
-                    "not restored"
-                }
-            ),
+            format!("exit code {}, terminal {terminal}, no residue", step.code),
             problems.join("; "),
         ))
     }

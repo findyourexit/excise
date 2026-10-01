@@ -11,8 +11,10 @@
 //! There is no process group to signal. The pseudo-terminal runner ends a child with the library's
 //! `TerminateProcess` call, which does not reach descendants; `excise` starts none. A job object
 //! would, but creating one needs `unsafe`, which this workspace does not allow outside
-//! `src/os/windows.rs`. Delivering a console close or break event to a `ConPTY` child needs unsafe
-//! console calls as well, so [`send_signal`] reports every signal as unsupported there.
+//! `src/os/windows.rs`. The `signal` step's `close` event does not go through [`send_signal`]: it
+//! is delivered by closing the pseudo console (`pty::session::PtySession::close_console`), which
+//! needs no unsafe call. `break` would need `GenerateConsoleCtrlEvent`, which does, so
+//! [`send_signal`] reports it, and every Unix signal, as unsupported here.
 
 use std::io;
 

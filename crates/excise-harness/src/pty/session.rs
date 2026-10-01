@@ -172,7 +172,8 @@ struct Chunk {
 pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
     pid: u32,
-    master: Box<dyn MasterPty + Send>,
+    /// `None` once [`PtySession::close_console`] has closed it.
+    master: Option<Box<dyn MasterPty + Send>>,
     /// Dropped only after the child is dead; see the module documentation.
     writer: Option<Box<dyn Write + Send>>,
     chunks: Receiver<Chunk>,
@@ -267,7 +268,7 @@ impl PtySession {
         Ok(Self {
             child,
             pid,
-            master: pair.master,
+            master: Some(pair.master),
             writer: Some(writer),
             chunks,
             reader: Some(reader),
@@ -433,7 +434,11 @@ impl PtySession {
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<Instant, PtyError> {
         self.pump()?;
         let at = Instant::now();
-        self.master
+        let master = self
+            .master
+            .as_deref()
+            .ok_or_else(|| PtyError::Resize("the pseudo-terminal was closed".to_owned()))?;
+        master
             .resize(PtySize {
                 rows,
                 cols,
@@ -476,12 +481,15 @@ impl PtySession {
     fn line_discipline(&self) -> (Option<bool>, Option<bool>) {
         use nix::sys::termios::LocalFlags;
 
-        self.master.get_termios().map_or((None, None), |termios| {
-            (
-                Some(termios.local_flags.contains(LocalFlags::ECHO)),
-                Some(termios.local_flags.contains(LocalFlags::ICANON)),
-            )
-        })
+        self.master
+            .as_deref()
+            .and_then(MasterPty::get_termios)
+            .map_or((None, None), |termios| {
+                (
+                    Some(termios.local_flags.contains(LocalFlags::ECHO)),
+                    Some(termios.local_flags.contains(LocalFlags::ICANON)),
+                )
+            })
     }
 
     #[cfg(not(unix))]
@@ -491,6 +499,31 @@ impl PtySession {
     )]
     fn line_discipline(&self) -> (Option<bool>, Option<bool>) {
         (None, None)
+    }
+
+    /// Closes the pseudo-terminal's controlling side. Idempotent: a second call does nothing.
+    ///
+    /// On Windows this closes the pseudo console (`portable-pty`'s `ConPtyMasterPty` calls
+    /// `ClosePseudoConsole` when its last reference is dropped, which is this one: the slave is
+    /// dropped right after the child is spawned), which Windows itself delivers to every process
+    /// attached to the console as `CTRL_CLOSE_EVENT`. No Windows console call is made here or
+    /// needed: dropping the handle is enough. This is the `signal` step's `close` event
+    /// (`runner::plan::supported_signal`); `break` needs `GenerateConsoleCtrlEvent`, which does
+    /// need an unsafe call this workspace does not allow, so `signal` does not support it.
+    ///
+    /// On Unix `signal` never selects `close` (`supported_signal` refuses it there), so a
+    /// scenario can never reach this; closing the master side here only closes the pseudo-terminal
+    /// (resizing and reading the line discipline stop working, same as after any close), which is
+    /// not what a Windows console-close event would mean in the first place.
+    pub fn close_console(&mut self) {
+        drop(self.master.take());
+    }
+
+    /// Whether [`PtySession::close_console`] has closed the console. Nothing the program writes
+    /// afterwards reaches the screen model, so its terminal modes can no longer be observed.
+    #[must_use]
+    pub const fn console_closed(&self) -> bool {
+        self.master.is_none()
     }
 
     /// Ends the child and everything it started, and reaps it. Does nothing once the child has
@@ -989,5 +1022,37 @@ mod tests {
 
         assert!(session.sampler().samples() >= 1, "{:?}", session.sampler());
         assert!(session.cpu_time().is_some());
+    }
+
+    /// `close_console` is shared, platform-independent code: on Unix it closes the pty master
+    /// just like this test exercises; on Windows the same `Option::take` is what drops the last
+    /// `ConPtyMasterPty` reference and triggers `ClosePseudoConsole`. This proves the Unix-reachable
+    /// half is panic-free, idempotent, and that the methods which need the master degrade instead
+    /// of panicking once it is gone.
+    #[test]
+    fn closing_the_console_is_idempotent_and_leaves_resize_and_modes_reporting_it_is_gone() {
+        let mut session = PtySession::spawn(&shell("sleep 30")).expect("spawn");
+        assert!(!session.console_closed());
+
+        session.close_console();
+        session.close_console();
+        assert!(session.console_closed());
+
+        assert!(
+            matches!(session.resize(100, 40), Err(PtyError::Resize(_))),
+            "a resize after close should report the pseudo-terminal is closed, not panic"
+        );
+        let modes = session.modes();
+        assert_eq!(
+            (modes.echo, modes.icanon),
+            (None, None),
+            "the line discipline cannot be read once the master is gone"
+        );
+
+        session.kill();
+        assert!(
+            session.exit().is_some(),
+            "the child is still reaped normally"
+        );
     }
 }

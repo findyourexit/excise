@@ -28,9 +28,9 @@ mod tests;
 
 pub use path::{PathViolation, check_fixture_relative_path};
 pub use step::{
-    Comparison, Delete, EntryKind, EventField, EventKind, ExpectBudget, ExpectExit, ExpectFs,
-    ExpectScreen, FsMutate, KeyName, KeyNameError, Marker, Measure, MutateOp, PressKey, Quit,
-    Region, Residue, Resize, ScanState, Select, SendSignal, Settle, Signal, Step, TypeText,
+    Comparison, Delete, DeleteWait, EntryKind, EventField, EventKind, ExpectBudget, ExpectExit,
+    ExpectFs, ExpectScreen, FsMutate, KeyName, KeyNameError, Marker, Measure, MutateOp, PressKey,
+    Quit, Region, Residue, Resize, ScanState, Select, SendSignal, Settle, Signal, Step, TypeText,
     WaitEvent, WaitFs, WaitHeader, WaitText,
 };
 pub use validate::{Field, StepError, ValidationError, ValidationErrors};
