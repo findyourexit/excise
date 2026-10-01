@@ -12,6 +12,7 @@ use super::{
         EventField, EventKind, ExpectFs, ExpectScreen, Marker, Region, Step, WaitEvent, WaitText,
     },
 };
+use crate::platform::PLATFORMS;
 
 /// The longest slice id.
 const MAX_SLICE_LEN: usize = 8;
@@ -97,6 +98,39 @@ pub enum ValidationError {
          letters or digits, at most {MAX_SLICE_LEN} in all"
     )]
     InvalidSlice {
+        /// The offending value.
+        value: String,
+    },
+    /// `fails_on` is set without `expect = "fail"`.
+    #[error("`fails_on` requires `expect = \"fail\"`")]
+    FailsOnWithoutExpectedFailure,
+    /// `platforms` or `fails_on` is present but lists nothing.
+    #[error("`{field}` is present but empty; omit it to use every platform")]
+    EmptyPlatformList {
+        /// `platforms` or `fails_on`.
+        field: &'static str,
+    },
+    /// A platform name is not one this harness knows.
+    #[error("`{field}` names the platform {value:?}, which is not `linux`, `macos`, or `windows`")]
+    UnknownPlatform {
+        /// The field and index of the offending entry.
+        field: Field,
+        /// The offending value.
+        value: String,
+    },
+    /// `fails_on` names a platform outside `platforms`.
+    #[error("`{field}` names the platform {value:?}, which `platforms` does not include")]
+    FailsOnOutsidePlatforms {
+        /// The field and index of the offending entry.
+        field: Field,
+        /// The offending value.
+        value: String,
+    },
+    /// A platform name is listed more than once in `platforms` or in `fails_on`.
+    #[error("`{field}` lists the platform {value:?} more than once")]
+    DuplicatePlatform {
+        /// The field and index of the second occurrence.
+        field: Field,
         /// The offending value.
         value: String,
     },
@@ -319,6 +353,23 @@ impl Scenario {
                 value: slice.clone(),
             });
         }
+        if let Some(platforms) = &self.platforms {
+            check_platforms("platforms", platforms, errors);
+        }
+        if let Some(fails_on) = &self.fails_on {
+            if self.expect != Expect::Fail {
+                errors.push(ValidationError::FailsOnWithoutExpectedFailure);
+            }
+            check_platforms("fails_on", fails_on, errors);
+            for (index, platform) in fails_on.iter().enumerate() {
+                if PLATFORMS.contains(&platform.as_str()) && !self.runs_on(platform) {
+                    errors.push(ValidationError::FailsOnOutsidePlatforms {
+                        field: Field::at("fails_on", index),
+                        value: platform.clone(),
+                    });
+                }
+            }
+        }
         for (&budget, &limit) in &self.budgets {
             if !limit.is_finite() || limit < 0.0 {
                 errors.push(ValidationError::InvalidBudgetLimit { budget });
@@ -380,6 +431,27 @@ fn is_slice_id(value: &str) -> bool {
     matches!(bytes.next(), Some(b'A'..=b'Z'))
         && value.len() <= MAX_SLICE_LEN
         && bytes.all(|byte| matches!(byte, b'A'..=b'Z' | b'0'..=b'9'))
+}
+
+/// Checks a `platforms`-shaped list: rejects a present-and-empty list, a name this harness does
+/// not know, and a name repeated later in the same list.
+fn check_platforms(field: &'static str, platforms: &[String], errors: &mut Vec<ValidationError>) {
+    if platforms.is_empty() {
+        errors.push(ValidationError::EmptyPlatformList { field });
+    }
+    for (index, platform) in platforms.iter().enumerate() {
+        if !PLATFORMS.contains(&platform.as_str()) {
+            errors.push(ValidationError::UnknownPlatform {
+                field: Field::at(field, index),
+                value: platform.clone(),
+            });
+        } else if platforms[..index].contains(platform) {
+            errors.push(ValidationError::DuplicatePlatform {
+                field: Field::at(field, index),
+                value: platform.clone(),
+            });
+        }
+    }
 }
 
 fn check_step(step: &Step) -> Vec<StepError> {

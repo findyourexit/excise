@@ -91,8 +91,11 @@ the semantic rules below and reports every broken rule, not only the first. **A 
 | `fixture` | yes | The identifier of the fixture specification to generate, in the same shape as `name`. The scenario never names a directory. |
 | `sentinels` | if any step is `delete` | Fixture-relative paths that must survive the scenario. |
 | `profiles` | yes | A non-empty, duplicate-free list of profiles the scenario runs under. |
+| `tier` | no | `"quick"` (default), `"full"`, or `"nightly"`: which `cargo xtask e2e` tier runs it. See [Tiers and platforms](#tiers-and-platforms). |
+| `platforms` | no | The operating systems the scenario runs on, as `std::env::consts::OS` spells them. Defaults to all three. See [Tiers and platforms](#tiers-and-platforms). |
 | `terminal` | no | The initial terminal size. Defaults to 120 columns by 40 rows; at least 32 by 8. |
 | `expect` | no | `"pass"` (default) or `"fail"`. See [Expected failures](#expected-failures). |
+| `fails_on` | no | The platforms `expect = "fail"` applies to; defaults to every platform in `platforms`. See [Expected failures](#expected-failures). |
 | `slice` | if `expect = "fail"` | The id of the work slice that fixes the defect, for example `X2`: an uppercase letter followed by up to seven uppercase letters or digits. |
 | `budgets` | no | Overrides for named budget limits. See [Budgets](#budgets). |
 | `steps` | yes | The ordered steps; at least one. |
@@ -113,6 +116,26 @@ environment, arguments, and terminal size.
 Every lifecycle scenario is expected to pass under `default` and `deterministic`. The other
 profiles run on a representative subset.
 
+### Tiers and platforms
+
+`tier` is how often a scenario runs. `cargo xtask e2e --quick` runs only scenarios tagged `quick`
+(the default); `--full` adds `full`; `--nightly` adds `nightly` too. `--scenario NAME` runs a named
+scenario whatever its tier. The in-process runner (`cargo test`) runs only `quick` scenarios and
+skips the others, with the reason. The quick tier still limits *profiles* to `default` and
+`deterministic` (see [Profiles](#profiles) above); `--full` and `--nightly` run every profile a
+scenario declares.
+
+`platforms` is where the scenario runs at all, spelled as `std::env::consts::OS` spells them
+(`linux`, `macos`, `windows`), the same as
+[`expectations/headless.toml`](expectations/headless.toml). It defaults to every platform. Outside
+its `platforms`, every runner skips the scenario, with the reason, even when it is named with
+`--scenario`. For example, `tier = "nightly"` with `platforms = ["linux", "macos"]` runs only in
+the nightly tier, and only on Linux and macOS.
+
+Validation rejects `fails_on` without `expect = "fail"`, a name in either list this harness does
+not know, a name in `fails_on` outside `platforms`, a repeated name, and a present-but-empty list
+(omit the field instead, for the default).
+
 ### Expected failures
 
 `expect = "fail"` marks a scenario that documents a known defect. It requires `slice`, the id of
@@ -130,6 +153,14 @@ An `xpass` fails the run so that the change that fixes the defect is forced to f
 `expect = "pass"` and drop `slice`. A scenario the harness could not run at all (fixture, spawn, or
 isolation failure) has the verdict `error`, which also fails the run. `Verdict::resolve` and
 `Verdict::blocks_run` encode this table.
+
+`fails_on` restricts where `expect = "fail"` applies: a list of platforms, defaulting to every
+platform in `platforms`. On a platform the scenario runs on but `fails_on` omits, it is an ordinary
+`expect = "pass"` there: strict like any other platform, so an unexpected pass is fine but an
+unexpected failure still fails the run. `Scenario::expect_on(os)` gives the effective expectation
+on a platform, and both runners' verdicts call it instead of reading the raw `expect` field. For
+example, `expect = "fail"` with `fails_on = ["macos"]` and `slice = "H5"` must fail on macOS and
+must pass everywhere else the scenario runs.
 
 ### Budgets
 
@@ -268,6 +299,9 @@ Details that a table cannot carry:
 | `steps` is non-empty | `NoSteps` |
 | `expect = "fail"` has a `slice`, and any `slice` is a slice id | `ExpectedFailureWithoutSlice`, `InvalidSlice` |
 | budget overrides are finite and non-negative | `InvalidBudgetLimit` |
+| `fails_on` requires `expect = "fail"` | `FailsOnWithoutExpectedFailure` |
+| `platforms` and `fails_on` name only known platforms, without repeats, and are not present but empty | `UnknownPlatform`, `DuplicatePlatform`, `EmptyPlatformList` |
+| `fails_on` names only platforms `platforms` includes | `FailsOnOutsidePlatforms` |
 | a scenario with a `delete` step declares a sentinel | `DeleteWithoutSentinel` |
 | every fixture-relative path is safe (see [Safety rules](#safety-rules)) | `InvalidPath` |
 | every `timeout_ms` is between 1 and 1 800 000 | `TimeoutOutOfRange` |
@@ -389,17 +423,21 @@ regular file; `FixtureRoot` adds only the canonical spelling of the path.
 ## Running scenarios
 
 ```console
-cargo xtask e2e [--quick|--full] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--keep-fixture]
+cargo xtask e2e [--quick|--full|--nightly] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--keep-fixture]
 ```
 
 The command builds the `excise` release binary, or uses the one named by `EXCISE_E2E_BINARY`, loads
-the scenarios in [`scenarios/`](scenarios), runs each under its profiles, and prints a verdict
-table. It exits non-zero on any `fail`, `xpass`, or `error`.
+the scenarios in [`scenarios/`](scenarios), runs each selected one under its profiles, and prints a
+verdict table. It exits non-zero on any `fail`, `xpass`, or `error`.
 
-- `--quick` runs the `default` and `deterministic` profiles only and must stay within two minutes.
-  `--full`, the default, runs every profile a scenario declares.
-- `--scenario` and `--profile` narrow the matrix and may repeat. `--repeat N` runs each pair `N`
-  times, which is how identical verdicts are shown.
+- `--quick` runs scenarios tagged `tier = "quick"` (the default) under the `default` and
+  `deterministic` profiles only, and must stay within two minutes. `--full`, the default tier, adds
+  `full` and every profile a scenario declares. `--nightly` adds `nightly` too.
+- `--scenario` names a scenario and runs it whatever its tier, though a scenario outside its
+  `platforms` is still skipped, with the reason, even when it is named. A scenario outside the
+  selected tier or its `platforms` is otherwise skipped, with the reason, and printed.
+- `--profile` narrows the matrix and may repeat, alongside `--scenario`. `--repeat N` runs each
+  pair `N` times, which is how identical verdicts are shown.
 - `--keep-fixture` keeps each run's fixture and scratch area and prints where they are.
 - The summary is `target/excise-e2e/<run-id>/summary.json`, a `harness-summary` document, and
   `target/excise-e2e/latest` points at the newest run (a symbolic link, or on Windows a text file).
@@ -883,11 +921,12 @@ A scenario with any other step is rejected before it runs, with `RunError::Unsup
 - `type` text with control characters.
 
 The test suite selects only the scenarios the runner can perform, and skips the rest with the
-reason: a step only another runner can perform, a fixture that needs a scratch volume (only a
-privileged process runner attaches one), or a fixture that plans more than 10,000 entries (the
-large fixtures are for the runners built for them). A scenario file that does not parse, does not
-validate, is not named after its scenario, or names a fixture with no loadable spec fails the suite
-instead of being skipped.
+reason: a scenario outside its `platforms`, a scenario whose `tier` is not `quick`, a step only
+another runner can perform, a fixture that needs a scratch volume (only a privileged process
+runner attaches one), or a fixture that plans more than 10,000 entries (the large fixtures are for
+the runners built for them). A scenario file that does not parse, does not validate, is not named
+after its scenario, or names a fixture with no loadable spec fails the suite instead of being
+skipped.
 
 ### `settle` and waits
 

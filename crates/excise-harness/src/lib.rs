@@ -18,6 +18,7 @@ pub mod events;
 pub mod fixture;
 pub mod headless;
 pub mod metrics;
+mod platform;
 pub mod pty;
 pub mod report;
 mod run_support;

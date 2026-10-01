@@ -1,6 +1,7 @@
 //! Tests for the scenario model.
 
 mod parse;
+mod platform;
 mod readme;
 mod validate;
 
@@ -34,7 +35,10 @@ description = "Every step type at least once."
 fixture = "all-steps"
 sentinels = ["keep-a.bin", "nested/keep-b.txt"]
 profiles = ["default", "deterministic", "monochrome-ascii", "narrow", "mouse-keymaps"]
+tier = "nightly"
+platforms = ["linux", "macos", "windows"]
 expect = "fail"
+fails_on = ["linux", "macos"]
 slice = "X2"
 
 [terminal]

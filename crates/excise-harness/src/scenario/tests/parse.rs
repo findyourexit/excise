@@ -7,8 +7,8 @@ use crate::scenario::{
     Budget, Comparison, DEFAULT_TIMEOUT_MS, Delete, EntryKind, EventField, EventKind, Expect,
     ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, FsMutate, KeyName, LoadError, Marker,
     Measure, MutateOp, PressKey, Profile, Quit, Region, Residue, Resize, ScanState, Scenario,
-    Select, SendSignal, Settle, Signal, Step, Terminal, TypeText, WaitEvent, WaitFs, WaitHeader,
-    WaitText,
+    Select, SendSignal, Settle, Signal, Step, Terminal, Tier, TypeText, WaitEvent, WaitFs,
+    WaitHeader, WaitText,
 };
 
 const HEAD: &str = r#"schema_version = 1
@@ -48,6 +48,9 @@ fn a_minimal_scenario_gets_the_documented_defaults() {
         }
     );
     assert_eq!(scenario.expect, Expect::Pass);
+    assert_eq!(scenario.tier, Tier::Quick);
+    assert_eq!(scenario.platforms, None);
+    assert_eq!(scenario.fails_on, None);
     assert_eq!(scenario.slice, None);
     assert!(scenario.budgets.is_empty());
     assert_eq!(
@@ -76,7 +79,20 @@ fn a_full_scenario_parses_every_top_level_field() {
             rows: 30
         }
     );
+    assert_eq!(scenario.tier, Tier::Nightly);
+    assert_eq!(
+        scenario.platforms,
+        Some(vec![
+            "linux".to_owned(),
+            "macos".to_owned(),
+            "windows".to_owned()
+        ])
+    );
     assert_eq!(scenario.expect, Expect::Fail);
+    assert_eq!(
+        scenario.fails_on,
+        Some(vec!["linux".to_owned(), "macos".to_owned()])
+    );
     assert_eq!(scenario.slice.as_deref(), Some("X2"));
     assert_eq!(
         scenario.budgets,
@@ -92,6 +108,30 @@ fn the_full_scenario_contains_every_step_kind() {
     let kinds: BTreeSet<&str> = parse(ALL_STEPS).steps.iter().map(Step::kind).collect();
 
     assert_eq!(kinds, BTreeSet::from(Step::KINDS));
+}
+
+#[test]
+fn every_tier_parses() {
+    for &tier in Tier::ALL {
+        let scenario = parse(&BASE.replace(
+            "profiles = [\"default\", \"deterministic\"]\n",
+            &format!("profiles = [\"default\", \"deterministic\"]\ntier = \"{tier}\"\n"),
+        ));
+        assert_eq!(scenario.tier, tier);
+    }
+}
+
+#[test]
+fn platforms_and_fails_on_parse_as_lists() {
+    let scenario = parse(&format!(
+        "{HEAD}platforms = [\"linux\", \"macos\"]\nexpect = \"fail\"\nfails_on = [\"linux\"]\n\
+         slice = \"X1\"\n\n[[steps]]\nstep = \"settle\"\n"
+    ));
+    assert_eq!(
+        scenario.platforms,
+        Some(vec!["linux".to_owned(), "macos".to_owned()])
+    );
+    assert_eq!(scenario.fails_on, Some(vec!["linux".to_owned()]));
 }
 
 #[test]

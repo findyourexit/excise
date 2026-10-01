@@ -118,7 +118,10 @@ pub fn run_scenario(request: &RunRequest<'_>) -> RunReport {
     if let Err(error) = execute(request, &mut report) {
         report.error = Some(error.to_string());
     }
-    report.verdict = verdict(request.scenario.expect, report.outcome());
+    report.verdict = verdict(
+        request.scenario.expect_on(std::env::consts::OS),
+        report.outcome(),
+    );
     report.duration = started.elapsed();
     report
 }

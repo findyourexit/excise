@@ -586,6 +586,30 @@ fn never_holds_under(header: &str, timeout_ms: u64) -> Scenario {
 }
 
 #[test]
+fn an_expected_failure_applies_only_on_its_platform() {
+    let host = std::env::consts::OS;
+    let other = if host == "linux" { "macos" } else { "linux" };
+
+    let header =
+        format!("{DELETE_FILE}expect = \"fail\"\nslice = \"H5\"\nfails_on = [\"{host}\"]\n");
+    let (_fixture, run) = execute(&never_holds_under(&header, 50), Profile::Deterministic);
+    assert_eq!(
+        run.verdict(),
+        Verdict::Xfail,
+        "fails_on names the host: {run}"
+    );
+
+    let header =
+        format!("{DELETE_FILE}expect = \"fail\"\nslice = \"H5\"\nfails_on = [\"{other}\"]\n");
+    let (_fixture, run) = execute(&never_holds_under(&header, 50), Profile::Deterministic);
+    assert_eq!(
+        run.verdict(),
+        Verdict::Fail,
+        "fails_on names only another platform: {run}"
+    );
+}
+
+#[test]
 fn expect_exit_judges_the_exit_code() {
     let (_fixture, run) = execute(
         &scenario(
@@ -912,6 +936,54 @@ fn scenarios_this_runner_cannot_run_are_skipped_with_the_reason() {
         "{too_big}"
     );
     assert!(reason("needs-a-volume").contains("scratch volume"));
+}
+
+#[test]
+fn a_scenario_outside_its_platforms_is_skipped_with_the_reason() {
+    let directory = tempfile::tempdir().expect("the scenario directory should exist");
+    let host = std::env::consts::OS;
+    let other = if host == "linux" { "macos" } else { "linux" };
+    fs::write(
+        directory.path().join("elsewhere.toml"),
+        format!(
+            "schema_version = 1\nname = \"elsewhere\"\ndescription = \"d\"\n\
+             fixture = \"delete-file\"\nprofiles = [\"default\"]\nplatforms = [\"{other}\"]\n\n\
+             [[steps]]\nstep = \"settle\"\n"
+        ),
+    )
+    .expect("the scenario file should be written");
+
+    let selection = select_scenarios(directory.path()).expect("the file should load");
+    assert!(selection.runnable.is_empty(), "{:?}", selection.runnable);
+    assert_eq!(selection.skipped.len(), 1, "{:?}", selection.skipped);
+    assert_eq!(selection.skipped[0].0, "elsewhere");
+    assert!(
+        selection.skipped[0].1.contains(host),
+        "{}",
+        selection.skipped[0].1
+    );
+}
+
+#[test]
+fn a_scenario_above_the_quick_tier_is_skipped_with_the_reason() {
+    let directory = tempfile::tempdir().expect("the scenario directory should exist");
+    fs::write(
+        directory.path().join("nightly-only.toml"),
+        "schema_version = 1\nname = \"nightly-only\"\ndescription = \"d\"\n\
+         fixture = \"delete-file\"\nprofiles = [\"default\"]\ntier = \"nightly\"\n\n\
+         [[steps]]\nstep = \"settle\"\n",
+    )
+    .expect("the scenario file should be written");
+
+    let selection = select_scenarios(directory.path()).expect("the file should load");
+    assert!(selection.runnable.is_empty(), "{:?}", selection.runnable);
+    assert_eq!(selection.skipped.len(), 1, "{:?}", selection.skipped);
+    assert_eq!(selection.skipped[0].0, "nightly-only");
+    assert!(
+        selection.skipped[0].1.contains("nightly"),
+        "{}",
+        selection.skipped[0].1
+    );
 }
 
 #[test]

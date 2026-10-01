@@ -267,6 +267,114 @@ fn a_slice_must_be_shaped_like_a_slice_id() {
 }
 
 #[test]
+fn fails_on_requires_an_expected_failure() {
+    let mut scenario = valid();
+    scenario.fails_on = Some(vec!["linux".to_owned()]);
+
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::FailsOnWithoutExpectedFailure]
+    );
+
+    scenario.expect = Expect::Fail;
+    scenario.slice = Some("X2".to_owned());
+    assert_eq!(errors_of(&scenario), []);
+}
+
+#[test]
+fn platforms_and_fails_on_must_not_be_explicitly_empty() {
+    let mut scenario = valid();
+    scenario.platforms = Some(Vec::new());
+
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::EmptyPlatformList { field: "platforms" }]
+    );
+
+    scenario.platforms = None;
+    scenario.expect = Expect::Fail;
+    scenario.slice = Some("X2".to_owned());
+    scenario.fails_on = Some(Vec::new());
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::EmptyPlatformList { field: "fails_on" }]
+    );
+}
+
+#[test]
+fn platform_names_must_be_known() {
+    let mut scenario = valid();
+    scenario.platforms = Some(vec!["linux".to_owned(), "plan9".to_owned()]);
+
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::UnknownPlatform {
+            field: Field::at("platforms", 1),
+            value: "plan9".to_owned()
+        }]
+    );
+
+    scenario.platforms = None;
+    scenario.expect = Expect::Fail;
+    scenario.slice = Some("X2".to_owned());
+    scenario.fails_on = Some(vec!["plan9".to_owned()]);
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::UnknownPlatform {
+            field: Field::at("fails_on", 0),
+            value: "plan9".to_owned()
+        }],
+        "an unknown name in `fails_on` is not also reported as outside `platforms`"
+    );
+}
+
+#[test]
+fn platform_names_must_not_repeat() {
+    let mut scenario = valid();
+    scenario.platforms = Some(vec!["linux".to_owned(), "linux".to_owned()]);
+
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::DuplicatePlatform {
+            field: Field::at("platforms", 1),
+            value: "linux".to_owned()
+        }]
+    );
+
+    scenario.platforms = None;
+    scenario.expect = Expect::Fail;
+    scenario.slice = Some("X2".to_owned());
+    scenario.fails_on = Some(vec!["linux".to_owned(), "linux".to_owned()]);
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::DuplicatePlatform {
+            field: Field::at("fails_on", 1),
+            value: "linux".to_owned()
+        }]
+    );
+}
+
+#[test]
+fn fails_on_names_must_be_within_platforms() {
+    let mut scenario = valid();
+    scenario.platforms = Some(vec!["linux".to_owned()]);
+    scenario.expect = Expect::Fail;
+    scenario.slice = Some("X2".to_owned());
+    scenario.fails_on = Some(vec!["macos".to_owned()]);
+
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::FailsOnOutsidePlatforms {
+            field: Field::at("fails_on", 0),
+            value: "macos".to_owned()
+        }]
+    );
+
+    scenario.fails_on = Some(vec!["linux".to_owned()]);
+    assert_eq!(errors_of(&scenario), []);
+}
+
+#[test]
 fn budget_overrides_must_be_finite_and_non_negative() {
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.001] {
         let mut scenario = valid();
