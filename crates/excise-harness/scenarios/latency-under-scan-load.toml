@@ -1,0 +1,107 @@
+schema_version = 1
+name = "latency-under-scan-load"
+description = "Navigation keys sent while a 50k-entry scan is in progress must still get a frame within the strict latency budgets. Today the owner thread stalls for about 380 ms while it publishes the completed scan (the longest gap between frames ends at scan_complete), and on macOS the scan store's per-batch durable syncs on the same thread add 100-200 ms more. Both are write-side scan-store work on the owner thread, which X8 moves to a store thread; removing the syncs alone (X1) leaves the publication stall."
+fixture = "tiny-files-50k"
+profiles = ["default", "deterministic", "reduced-motion"]
+tier = "full"
+platforms = ["linux", "macos"]
+expect = "fail"
+slice = "X8"
+
+[terminal]
+cols = 120
+rows = 40
+
+# The scan is still running: the header badge must read SCANNING, never COMPLETE, so this never
+# passes by outrunning the scan.
+[[steps]]
+step = "wait_header"
+state = "scanning"
+timeout_ms = 10000
+
+# Six keys, spread by their own settles, so at least one lands in whatever part of the scan is
+# slow: `down` and `up` cancel out, so the final selection is unaffected.
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+[[steps]]
+step = "key"
+key = "up"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+[[steps]]
+step = "key"
+key = "up"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 120000
+
+[[steps]]
+step = "expect_budget"
+budget = "first_frame_ms"
+metric = "first_frame_ms"
+
+[[steps]]
+step = "expect_budget"
+budget = "input_to_frame_p99_ms"
+metric = "input_to_frame_p99_ms"
+
+[[steps]]
+step = "expect_budget"
+budget = "max_stall_ms"
+metric = "max_stall_ms"
+
+[[steps]]
+step = "quit"
+timeout_ms = 15000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000
+
+# `quit_ms` is only known once `expect_exit` has observed the process actually exit.
+[[steps]]
+step = "expect_budget"
+budget = "quit_ms"
+metric = "quit_ms"

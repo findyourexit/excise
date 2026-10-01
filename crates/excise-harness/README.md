@@ -168,8 +168,12 @@ must pass everywhere else the scenario runs.
 ### Budgets
 
 `expect_budget` compares a recorded metric with a named budget. The scenario can override a
-budget's limit in `[budgets]`; without an override the runner applies its default for the tier it
-is running. Limits are finite, non-negative numbers in the unit shown.
+budget's limit in `[budgets]`; without an override the runner applies the fixed default below,
+which is the strict limit the validation program holds locally and in the nightly tier. The
+runner has no notion of tier: a scenario meant for the quick, pull-request-gated tier that needs a
+looser limit (for example the latency budgets at 2x, matching this project's pull-request CI gate)
+overrides it explicitly, as `latency-under-deletion-load-default.toml` does; a `full` or `nightly`
+scenario checking the same budget ordinarily takes the strict default instead of repeating it.
 
 ```toml
 [budgets]
@@ -965,6 +969,7 @@ marker.
 |---|---|---|
 | `wide-1k` | 1,001 | Scale: one directory of 1,000 files. |
 | `node-modules-2k` | 2,389 | The F1/F2 repro shape: `node_modules/pkg{0..3}` nested 4 levels, 8 one-byte `m{0..7}.js` files per leaf (2,390 entries with the marker). |
+| `node-modules-50k` | 49,738 | The F1/F2 repro shape at larger scale: `node_modules/pkg{0..7}` nested 4 levels, 11 one-byte `m{0..10}.js` files per leaf (4,681 directories, 45,056 files, counting the root and the marker). |
 | `deep-past-path-max` | 122 | Scale: a 20-level chain of 240-byte names, past `PATH_MAX` on every platform. |
 | `identity-small` | 34 | Hard links across directories, dangling and looping symlinks, a sparse file, and a clone. |
 | `hostile-small` | 80 | Hostile names and unreadable entries. |
