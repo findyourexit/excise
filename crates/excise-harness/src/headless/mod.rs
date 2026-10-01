@@ -17,7 +17,8 @@
 //!   accounting contract, and returns typed discrepancies.
 //! * [`du`] runs `du -sk` on the same tree, and says what it must print for it.
 //! * [`pairs`] has the statistics of paired, interleaved timings.
-//! * [`expectations`] lists the fixtures that are expected to fail the diff, strictly.
+//! * [`expectations`] lists the fixtures that are expected to fail the diff, or whose ratio is
+//!   expected to miss the budget, strictly.
 //! * [`suite`] runs all of it over the selected fixtures, writes a `harness-summary`, and renders
 //!   the verdict table behind `cargo xtask headless`.
 
@@ -32,7 +33,7 @@ pub mod suite;
 
 pub use diff::{Diff, Discrepancy, DiscrepancyKind};
 pub use document::{DocumentError, ScanDocument};
-pub use expectations::{ExpectationError, Expectations, ExpectedFailure};
+pub use expectations::{ExpectationError, Expectations, ExpectedFailure, RatioExpectedFailure};
 pub use scan::{ScanError, ScanRequest, ScanRun, run_scan};
 pub use suite::{
     Class, DEFAULT_REPEAT, FixtureReport, Progress, SuiteError, SuiteOptions, SuiteReport,

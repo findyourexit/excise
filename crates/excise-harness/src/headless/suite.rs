@@ -51,7 +51,7 @@ use super::{
     diff::{Diff, Discrepancy, DiscrepancyKind, Scan, diff},
     document::{DocumentError, ScanDocument, path_bytes},
     du::{Du, DuError, DuFlavor},
-    expectations::{Expectations, ExpectedFailure},
+    expectations::{Expectations, ExpectedFailure, RatioExpectedFailure},
     pairs::{Spread, millis, ratios},
     process::Ended,
     scan::{ScanError, ScanRequest, ScanRun, run_scan},
@@ -68,9 +68,20 @@ pub const QUICK_MAX_ENTRIES: u64 = 10_000;
 /// tier's limit.
 pub const FULL_MAX_ENTRIES: u64 = 250_000;
 
-/// The scan-time multiple of `du -sk` that the validation program starts from (section 4, decision
-/// D2.1). A ratio above it is reported; gating on it belongs to a later slice.
+/// The scan-time multiple of `du -sk` a headless scan is budgeted to. Gated per platform and
+/// fixture through `expectations/headless.toml` (see [`Expectations::expected_ratio_failure`])
+/// on a fixture whose ratio is gated; see [`MIN_GATED_ENTRIES`]. Both this budget and that
+/// threshold are expected to be revisited once the durable-write fix lands and ratios approach
+/// the budget.
 pub const RATIO_BUDGET: f64 = 3.0;
+
+/// The smallest oracle entry count, fixed by a fixture's spec and seed, gated against
+/// [`RATIO_BUDGET`]. Below it the ratio is reported but never gated. This is a count, not a
+/// measured time, so which fixtures are gated never depends on how loaded the machine was: an
+/// earlier, measured-`du`-time threshold let one fixture's ratio verdict flip between runs,
+/// because its median `du` time landed right at the boundary under load. The harness README,
+/// "Expected failures", names the fixtures this currently excludes.
+pub const MIN_GATED_ENTRIES: u64 = 2_000;
 
 /// How large a report may be, in bytes, for every run of a fixture to keep its report until the
 /// diffs are made. Above it, only the first run's report is kept, to bound the disk a large
@@ -253,6 +264,11 @@ pub struct FixtureReport {
     pub verdict: Verdict,
     /// The expected failure that applies to it, if any.
     pub expectation: Option<ExpectedFailure>,
+    /// Whether this fixture's ratio is gated against [`RATIO_BUDGET`]: see
+    /// [`FixtureReport::ratio_is_gated`].
+    pub ratio_gated: bool,
+    /// The ratio-budget expectation that applies to this fixture on this platform, if any.
+    pub ratio_expectation: Option<RatioExpectedFailure>,
     /// The warm-up round, then the measured rounds, in the order they ran.
     pub rounds: Vec<Round>,
     /// The diff of every report that was held to the oracle, with the index of its round.
@@ -285,6 +301,8 @@ impl FixtureReport {
             volumes: Volumes::None,
             verdict: Verdict::Error,
             expectation: None,
+            ratio_gated: false,
+            ratio_expectation: None,
             rounds: Vec::new(),
             diffs: Vec::new(),
             du_flavor: None,
@@ -337,6 +355,21 @@ impl FixtureReport {
             .filter_map(|round| Some((round.scan.wall, round.du.as_ref()?.wall)))
             .unzip();
         Spread::of(&ratios(&scans, &references))
+    }
+
+    /// Whether this fixture's ratio is gated against [`RATIO_BUDGET`]: its oracle entry count
+    /// (fixed by its spec and seed) is at least [`MIN_GATED_ENTRIES`]. Below it the ratio is
+    /// reported but never gated.
+    #[must_use]
+    pub const fn ratio_is_gated(&self) -> bool {
+        self.entries >= MIN_GATED_ENTRIES
+    }
+
+    /// Whether the measured ratio exceeds [`RATIO_BUDGET`], when it was measured at all.
+    #[must_use]
+    pub fn ratio_over_budget(&self) -> Option<bool> {
+        self.ratio_spread()
+            .map(|spread| spread.median > RATIO_BUDGET)
     }
 
     /// Whether every `du` printed what the oracle says it must, which is to say that it walked the
@@ -627,6 +660,41 @@ fn resolve(expected: Option<&ExpectedFailure>, observed: &BTreeSet<DiscrepancyKi
     }
 }
 
+/// The verdict of a fixture's ratio against [`RATIO_BUDGET`], when it is precise enough to judge
+/// (`report.ratio_gated`): the same strict-xfail shape as [`resolve`], with a single over-budget
+/// bit standing in for discrepancy kinds. A fixture with no expectation for this platform must be
+/// within budget, exactly like an undocumented oracle-diff discrepancy.
+fn resolve_ratio(expected: Option<&RatioExpectedFailure>, over_budget: bool) -> Verdict {
+    match (expected, over_budget) {
+        (None, false) => Verdict::Pass,
+        (Some(_), false) => Verdict::Xpass,
+        (Some(_), true) => Verdict::Xfail,
+        (None, true) => Verdict::Fail,
+    }
+}
+
+/// How much a verdict counts against a run, highest first: an expected outcome (`Pass`, `Xfail`)
+/// is least notable, a blocking one (`Xpass`, `Fail`, `Error`) more so.
+const fn verdict_severity(verdict: Verdict) -> u8 {
+    match verdict {
+        Verdict::Pass => 0,
+        Verdict::Xfail => 1,
+        Verdict::Xpass => 2,
+        Verdict::Fail => 3,
+        Verdict::Error => 4,
+    }
+}
+
+/// Combines two independent verdicts of the same fixture (the oracle diff and the ratio budget)
+/// into the one the run reports: the more severe of the two.
+fn combine_verdicts(first: Verdict, second: Verdict) -> Verdict {
+    if verdict_severity(second) > verdict_severity(first) {
+        second
+    } else {
+        first
+    }
+}
+
 /// Gets the fixture, runs the rounds, and holds every kept report to the oracle. Leaves the
 /// verdict in `report`, and the evidence of a failure on disk, before the scratch areas go.
 fn measure(
@@ -685,6 +753,16 @@ fn measure(
         report.diffs.push((*index, diff));
     }
     report.verdict = resolve(report.expectation.as_ref(), &report.kinds());
+    report.ratio_expectation = options
+        .expectations
+        .expected_ratio_failure(&planned.id)
+        .cloned();
+    if report.ratio_is_gated() {
+        report.ratio_gated = true;
+        let over_budget = report.ratio_over_budget().unwrap_or(false);
+        let ratio_verdict = resolve_ratio(report.ratio_expectation.as_ref(), over_budget);
+        report.verdict = combine_verdicts(report.verdict, ratio_verdict);
+    }
     if report.first_failure().is_some() {
         report.failure_dir = render::write_failure_dir(context.run_dir, report, &kept_runs);
     }
@@ -824,3 +902,6 @@ fn describe_changes(before: &Oracle, after: &Oracle) -> Vec<String> {
     }
     changes
 }
+
+#[cfg(test)]
+mod tests;

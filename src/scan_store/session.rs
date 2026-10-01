@@ -2680,7 +2680,6 @@ mod tests {
             .expect("scan store should initialize")
     }
 
-    #[cfg(feature = "internal")]
     fn seal_entry(factory: &ScanInputRunFactory, name: &str) -> SealedRun {
         factory
             .seal_observation_batch(
@@ -2690,6 +2689,36 @@ mod tests {
             .expect("a one-entry batch should seal")
             .pop()
             .expect("a path batch seals one run")
+    }
+
+    /// F1: admitting a sealed run performs a durable `sync_data` today — one for the run's own
+    /// seal, one more for the manifest commit that admission writes. This is a strict expected
+    /// failure: it holds while the defect is present, and its failure message names the finding
+    /// and the slice that fixes it. Unlike the `internal`-only tests below (which read the same
+    /// counter through `io_metrics`), this one runs in plain `cargo test`: the counter is
+    /// `cfg(any(test, feature = "internal"))`.
+    #[test]
+    fn admitting_a_run_performs_a_durable_sync_today() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let quota =
+            TemporaryStorage::scan_store_with_limit_bytes(INDEXED_PUBLICATION_STORAGE_BYTES);
+        let storage = ScanStoreStorage::new(quota.clone(), Some(parent.path()))
+            .expect("private scan session should initialize");
+        let mut store = ScanStore::new_with_storage(ScanGeneration::initial(), storage)
+            .expect("scan store should initialize");
+        let before = quota.durable_syncs();
+
+        let factory = store
+            .input_run_factory()
+            .expect("the active generation should accept input");
+        store
+            .accept_input_run(seal_entry(&factory, "entry-0"))
+            .expect("a sealed run should be admitted");
+
+        assert!(
+            quota.durable_syncs() > before,
+            "F1 is fixed: flip R2 to assert that admitting a run performs zero durable syncs (X1)"
+        );
     }
 
     #[cfg(feature = "internal")]

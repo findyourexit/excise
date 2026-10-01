@@ -549,20 +549,35 @@ ratio of a pair is the scan's wall time over the wall time of the `du` that foll
 table gives the median of the ratios and their minimum and maximum. The `du` flavor is found by a
 probe, not by a version string, and the total it prints is checked against what the oracle predicts
 from the raw facts, so that a ratio is never taken against a `du` that walked a different tree
-(BSD `du` stops where a path passes `PATH_MAX`). The ratio is reported against the 3× budget of
-the validation plan and not gated: gating belongs to the budget scenarios.
+(BSD `du` stops where a path passes `PATH_MAX`). The ratio is checked against the 3× budget
+(`RATIO_BUDGET`), gated only on a fixture whose oracle entry count (fixed by its spec and seed) is
+at least `MIN_GATED_ENTRIES` (2,000): below it the ratio is reported but never gated. The gate
+reads a count, not a measured time, so which fixtures are gated never depends on how loaded the
+machine was; an earlier, `du`-time-based threshold let one fixture's ratio verdict flip between
+runs under load. Both this budget and the entry threshold are expected to be revisited once the
+durable-write fix lands and ratios approach the budget.
 
-**Expected failures.** `expectations/headless.toml` lists the fixtures that fail the diff for a
-known defect that is not yet fixed, with the semantics of `expect = "fail"`: a fixture that fails
-with exactly the listed kinds is `xfail`, one that fails with other kinds is `fail`, and one that
-no longer fails is `xpass` and fails the run, so that the entry is removed by the change that fixes
-the defect. An entry names the platforms it applies to and the findings it documents.
+**Expected failures.** `expectations/headless.toml` has two independent tables.
+`[[expect_fail]]` lists the fixtures that fail the oracle diff for a known defect that is not yet
+fixed, with the semantics of `expect = "fail"`: a fixture that fails with exactly the listed kinds
+is `xfail`, one that fails with other kinds is `fail`, and one that no longer fails is `xpass` and
+fails the run, so that the entry is removed by the change that fixes the defect.
+`[[expect_ratio_fail]]` is the same semantics for the scan-time ratio, applied only where the
+fixture is gated (above): over budget and listed is `xfail`; over budget and not listed is `fail`,
+exactly like an undocumented diff discrepancy, so a platform the entry does not name must stay
+within budget; within budget while listed is `xpass`. Both tables name the platforms an entry
+applies to and the findings it documents; `[[expect_fail]]` also names the exact discrepancy
+kinds. The current `[[expect_ratio_fail]]` entries were measured on macOS locally and on Linux in
+CI; Windows has no `du` reference (above), so no ratio is ever measured there and neither entry
+names it. A fixture gated on a platform with a `du` reference that nobody has measured yet needs
+its own entry once someone does, or the run fails there until then.
 
 **Output.** `target/excise-headless/<run-id>/summary.json` is a `harness-summary` with one
 `headless-<fixture>` result per fixture, and `target/excise-headless/latest` points at the newest
 run. The open `metrics` object of a result has `entries`, `runs`, `oracle_ms`, `generation_ms`,
 `headless_ms` (the median, with `_min` and `_max`), `du_ms`, `headless_scan_ratio` (the median,
-with `_min`, `_q1`, `_q3`, and `_max`), `du_kib`, `du_expected_kib`, `user_ms`, `sys_ms`,
+with `_min`, `_q1`, `_q3`, and `_max`), `headless_scan_ratio_gated` (1 when the ratio was gated
+against the budget, 0 when it was only reported), `du_kib`, `du_expected_kib`, `user_ms`, `sys_ms`,
 `exit_code`, and `discrepancies` with one `discrepancies_<kind>` count per kind. A failing fixture
 gets `headless-<fixture>/` beside the summary, with `discrepancies.txt`, `repro.txt`, and the
 report. `tests/harness_headless.rs` in the `excise` crate runs the cheap fixtures that need no
