@@ -17,6 +17,7 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 * Cancelling a retained-map refresh now labels the map as stale and blocks deletion and exact scan export until a verified replacement publishes.
 * On Windows, the interactive map no longer stalls after a key release. It previously waited for the next input before redrawing, applying scan results, or showing the quit dialog.
 * On macOS, deleting a folder no longer occasionally leaves it behind. When the file system briefly refused the temporary name a deleted file had just vacated, Excise kept an empty file under the deleted file's name, so the folder could not be removed and the deletion reported skipped entries. The temporary entry now moves to a fresh private name and is removed there.
+* On Windows, a scan no longer occasionally ends with "Excise could not build a complete folder map" instead of completing. When another program briefly held a scan-store file Excise had just written, the rename that replaces it failed and the scan was abandoned; the rename is now retried.
 
 ## [1.3.0] - 2026-09-24
 
