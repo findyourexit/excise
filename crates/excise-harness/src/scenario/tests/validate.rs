@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 use super::{ALL_STEPS, errors_of, parse, step_errors, valid};
 use crate::scenario::{
     Budget, Comparison, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, EntryKind, EventField, EventKind,
-    Expect, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, Field, FsMutate, MAX_TIMEOUT_MS,
-    Marker, Measure, MutateOp, PathViolation, Profile, Quit, Region, Residue, Resize, ScanState,
-    Scenario, Select, Settle, Step, StepError, TypeText, ValidationError, WaitEvent, WaitFs,
-    WaitHeader, WaitText, check_fixture_relative_path,
+    Expect, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, Field, FsMutate, Idle,
+    MAX_TIMEOUT_MS, Marker, Measure, MutateOp, PathViolation, Profile, Quit, Region, Residue,
+    Resize, ScanState, Scenario, Select, Settle, Step, StepError, TypeText, ValidationError,
+    WaitEvent, WaitFs, WaitHeader, WaitText, check_fixture_relative_path,
 };
 
 fn wait_text(text: Option<&str>, regex: Option<&str>, region: Option<Region>) -> Step {
@@ -898,6 +898,39 @@ fn a_resize_needs_non_zero_dimensions_but_may_go_below_the_minimum_terminal() {
             "{cols}x{rows} exercises the resize message"
         );
     }
+}
+
+#[test]
+fn an_idle_duration_must_be_between_one_and_the_cap() {
+    for bad in [0, MAX_TIMEOUT_MS + 1, u64::MAX] {
+        assert_eq!(
+            step_errors(Step::Idle(Idle {
+                after_ms: bad,
+                window_ms: 5000
+            })),
+            [StepError::DurationOutOfRange {
+                field: "after_ms",
+                value: bad
+            }]
+        );
+        assert_eq!(
+            step_errors(Step::Idle(Idle {
+                after_ms: 3200,
+                window_ms: bad
+            })),
+            [StepError::DurationOutOfRange {
+                field: "window_ms",
+                value: bad
+            }]
+        );
+    }
+    assert_eq!(
+        step_errors(Step::Idle(Idle {
+            after_ms: 3200,
+            window_ms: 5000
+        })),
+        []
+    );
 }
 
 fn wait_event(event: EventKind, field: EventField) -> Step {

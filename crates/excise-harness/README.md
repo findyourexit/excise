@@ -237,6 +237,7 @@ state and never wait; put a `wait_*` or `settle` step before them.
 | `expect_exit` | `code`, `terminal_restored`, `residue`, `timeout_ms` | Waits for the program to exit and asserts how it ended. |
 | `expect_budget` | `budget`, `metric` | Asserts that a recorded metric is within a budget. |
 | `measure` | `name`, `marker` (`start` or `stop`) | Marks one end of a named measurement. |
+| `idle` | `after_ms`, `window_ms` | Sends nothing, waits `after_ms`, then measures over `window_ms` the terminal output bytes and the child's live CPU time, recording them as `idle_output_bytes` and `idle_cpu_ms`. Not one of the waiting steps above: both durations are unconditional, so there is no `timeout_ms`. |
 | `settle` | `timeout_ms` | Waits until the program has processed everything sent so far. |
 | `quit` | `timeout_ms` | Performs the ordinary confirmed quit. |
 
@@ -291,6 +292,10 @@ Details that a table cannot carry:
   and every `start` needs a `stop`. `expect_budget` names a metric, built in or recorded by
   `measure`, and the budget it is checked against. Metric and measurement names use the identifier
   shape of `name`.
+- **`idle`.** Pseudo-terminal only: the in-process runner has no separate process to sample and
+  skips any scenario that uses it. The child's live CPU time is not sampled on Windows (see
+  [Measurements](#pty-runner)); `idle_cpu_ms` is simply not recorded there, so an `expect_budget`
+  step checking it reports the metric as not recorded rather than a value.
 - **`quit`.** The runner presses `q`, waits for the quit prompt, and confirms. It does not assert
   the exit; follow it with `expect_exit`.
 
@@ -416,6 +421,12 @@ job object would, but creating one needs `unsafe`, which this workspace allows o
   runs. A refused mutation fails the step and changes nothing. An applied one is an intended
   change: `expect_exit` accepts differences at that path, below it, and in the directories the
   mutation created above it, and nothing else.
+- **`idle`** sends nothing, waits `after_ms`, then samples the terminal output byte count and the
+  child's live CPU time, waits `window_ms`, and samples both again. The difference is recorded as
+  `idle_output_bytes` and `idle_cpu_ms`. The live CPU sample (`metrics::live_cpu_ms`) is a point-in-
+  time read of the still-running child, not `RUSAGE_CHILDREN`, which only answers after a child is
+  reaped and so cannot isolate a window; it works on macOS and Linux and is not sampled on Windows,
+  so `idle_cpu_ms` is simply absent there.
 - A step's `timeout_ms` bounds the whole step, not each wait inside it.
 
 **Measurements.** Each run reports finite, named metrics. The scenario `expect_budget` step and the
@@ -429,6 +440,7 @@ run summary use the same names.
 | `quit_ms`, `delete_ms` | The confirmation key to the exit of the process, and to `deletion_finished`. |
 | `output_bytes`, `output_bytes_per_s`, `frames`, `inputs_sent` | Terminal output and its rate, frames drawn, and input events sent. |
 | `peak_rss_bytes`, `user_ms`, `sys_ms` | Peak memory (the peak physical footprint on macOS, the peak resident set size on Linux) and the child's CPU time. |
+| `idle_output_bytes`, `idle_cpu_ms` | Terminal output bytes and the child's live CPU time over an `idle` step's window; `idle_cpu_ms` is absent on Windows. |
 | `threads`, `fds` | The most threads and descriptors seen in a sample taken every 50 ms (`libproc` on macOS, `/proc` on Linux; not sampled on Windows). |
 | `scan_store_peak_bytes` | The peak total apparent size of the run's scan-store directory (`EXCISE_SCAN_STORE_DIR`), seen in a sample taken every 50 ms. |
 | `scan_store_bytes_per_entry` | `scan_store_peak_bytes` divided by the `entries` of the `scan_complete` event; absent without one or the other, or when `scan_complete` reports zero entries. |
@@ -1048,6 +1060,7 @@ A scenario with any other step is rejected before it runs, with `RunError::Unsup
 - `signal` needs a separate process to receive it.
 - `wait_event` needs the event channel, which belongs to a separate process.
 - `expect_budget` and `measure` judge timing and resources, which are never judged in-process.
+- `idle` needs a separate process to measure output and CPU on.
 - `expect_exit` with `terminal_restored = false`, and any step after `expect_exit`.
 - `type` text with control characters.
 

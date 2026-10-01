@@ -5,10 +5,10 @@ use std::{collections::BTreeMap, collections::BTreeSet, fs};
 use super::{ALL_STEPS, BASE, TempDir, parse, valid};
 use crate::scenario::{
     Budget, Comparison, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, EntryKind, EventField, EventKind,
-    Expect, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, FsMutate, KeyName, LoadError, Marker,
-    Measure, MutateOp, PressKey, Profile, Quit, Region, Residue, Resize, ScanState, Scenario,
-    Select, SendSignal, Settle, Signal, Step, Terminal, Tier, TypeText, WaitEvent, WaitFs,
-    WaitHeader, WaitText,
+    Expect, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, FsMutate, Idle, KeyName, LoadError,
+    Marker, Measure, MutateOp, PressKey, Profile, Quit, Region, Residue, Resize, ScanState,
+    Scenario, Select, SendSignal, Settle, Signal, Step, Terminal, Tier, TypeText, WaitEvent,
+    WaitFs, WaitHeader, WaitText,
 };
 
 const HEAD: &str = r#"schema_version = 1
@@ -354,6 +354,17 @@ fn resize_parses_dimensions() {
     assert_eq!(
         step("step = \"resize\"\ncols = 60\nrows = 20"),
         Step::Resize(Resize { cols: 60, rows: 20 })
+    );
+}
+
+#[test]
+fn idle_parses_both_durations() {
+    assert_eq!(
+        step("step = \"idle\"\nafter_ms = 3200\nwindow_ms = 5000"),
+        Step::Idle(Idle {
+            after_ms: 3200,
+            window_ms: 5000
+        })
     );
 }
 

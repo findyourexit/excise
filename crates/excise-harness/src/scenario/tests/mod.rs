@@ -144,6 +144,11 @@ budget = "input_to_frame_p99_ms"
 metric = "delete-time"
 
 [[steps]]
+step = "idle"
+after_ms = 1
+window_ms = 1
+
+[[steps]]
 step = "settle"
 
 [[steps]]

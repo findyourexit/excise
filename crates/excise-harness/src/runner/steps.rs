@@ -1,10 +1,11 @@
 //! The steps of the scenario vocabulary, implemented on the executor.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     events::Payload,
     fixture::mutate,
+    metrics::live_cpu_ms,
     pty::ui::{
         DialogView, FilterPrompt, Inspector, dialog_view, filter_prompt, header_state, inspector,
         offers_plain_quit,
@@ -12,7 +13,7 @@ use crate::{
     safety::{FixtureSnapshot, send_signal},
     scenario::{
         DEFAULT_TIMEOUT_MS, Delete, DeleteWait, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen,
-        FsMutate, Measure, Quit, Residue, Resize, Select, SendSignal, Settle, Signal, Step,
+        FsMutate, Idle, Measure, Quit, Residue, Resize, Select, SendSignal, Settle, Signal, Step,
         WaitEvent, WaitFs, WaitHeader, WaitText,
     },
 };
@@ -70,6 +71,7 @@ impl Executor<'_> {
                 self.measure(step);
                 Ok(())
             }
+            Step::Idle(step) => self.idle(index, step),
             Step::Settle(step) => self.settle(index, *step),
             Step::Quit(step) => self.quit(index, *step),
         }
@@ -735,6 +737,57 @@ impl Executor<'_> {
                 self.recorder.stop_measure(&step.name, now);
             }
         }
+    }
+
+    /// Sends nothing, waits `step.after_ms`, then measures over `step.window_ms` the terminal
+    /// output bytes and the child's live CPU time, recording them as the metrics
+    /// `idle_output_bytes` and `idle_cpu_ms`. `idle_cpu_ms` is recorded only when both samples
+    /// were readable (Windows has no live CPU sampler yet, see `metrics::live_cpu_ms`);
+    /// `idle_output_bytes` always is, because the runner counts output itself.
+    fn idle(&mut self, index: usize, step: &Idle) -> Result<(), Stop> {
+        if self.wait_quietly(Duration::from_millis(step.after_ms))? {
+            return Err(self.idle_exited(index, step.after_ms));
+        }
+
+        let start_bytes = self.session.output_bytes();
+        let start_cpu = live_cpu_ms(self.session.pid());
+
+        if self.wait_quietly(Duration::from_millis(step.window_ms))? {
+            return Err(self.idle_exited(index, step.after_ms + step.window_ms));
+        }
+
+        let output_bytes = self.session.output_bytes().saturating_sub(start_bytes);
+        #[allow(clippy::cast_precision_loss)]
+        self.recorder
+            .record_metric("idle_output_bytes", output_bytes as f64);
+
+        if let (Some(start), Some(end)) = (start_cpu, live_cpu_ms(self.session.pid())) {
+            self.recorder
+                .record_metric("idle_cpu_ms", (end - start).max(0.0));
+        }
+        Ok(())
+    }
+
+    /// Waits for `duration` to pass while pumping the session. Returns `true` if the program
+    /// ended first. Unlike every other wait, this one has no condition to satisfy: letting time
+    /// pass quietly, with nothing sent, is the point, so reaching the deadline is the step
+    /// succeeding, not timing out.
+    fn wait_quietly(&mut self, duration: Duration) -> Result<bool, Stop> {
+        match self.wait_until(Instant::now() + duration, |_| None::<()>)? {
+            Waited::Exited => Ok(true),
+            Waited::TimedOut => Ok(false),
+            Waited::Ready(()) => unreachable!("the idle wait has no condition to resolve"),
+        }
+    }
+
+    /// The failure for the program ending before an idle window of `waited_ms` finished.
+    fn idle_exited(&self, index: usize, waited_ms: u64) -> Stop {
+        self.fail(
+            index,
+            FailureCause::ProcessExited,
+            format!("the program to still be running {waited_ms} ms into the idle step"),
+            format!("it ended first ({})", self.exit_summary()),
+        )
     }
 
     /// Waits until the program has drawn a frame that reflects every input sent so far, then reads
