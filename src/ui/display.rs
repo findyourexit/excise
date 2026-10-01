@@ -2397,6 +2397,9 @@ mod tests {
         board.advance_geometry(Duration::ZERO, true);
 
         board.change_area(Rect::new(0, 0, 72, 1));
+        // The selected entry keeps a real tile across the resize (a forced sliver instead of
+        // its spacious old rectangle), so this legitimately transitions; settle it first.
+        board.advance_geometry(Duration::ZERO, true);
         assert!(!board.is_transitioning());
         let work = DeletionWork::new();
         assert_eq!(

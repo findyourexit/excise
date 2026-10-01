@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::time::Duration;
 
 use ratatui::layout::Rect;
@@ -51,10 +52,20 @@ impl TileGeometry {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "list_layout, the two scan-reveal flags, and the selection lock are independent, unrelated concerns; a state machine would need as many variants as the bools it replaces."
+)]
 pub struct Board {
     pub tiles: Vec<Tile>,
     overflow: Option<MapOverflow>,
     pub selected_index: Option<usize>, // None means nothing is selected
+    /// Set once the user moves or places the cursor deliberately (an arrow key
+    /// or a pointer click). Auto-arming (`select_largest`) may retarget the
+    /// selection only before this becomes true; afterward the selection follows
+    /// the same entry by name across every regeneration, or clears if that
+    /// entry is genuinely gone.
+    selection_locked: bool,
     /// Zoom level held in each folder on the way down, restored on the way back
     /// up. The cursor is not stacked with it: coming out of a folder selects that
     /// folder by identity, which survives a layout the index would not.
@@ -108,6 +119,7 @@ impl Board {
             overflow: None,
             files: Vec::new(),
             selected_index: None,
+            selection_locked: false,
             previous_zoom_levels: Vec::new(),
             zoom_level: 0,
             area: Rect {
@@ -179,13 +191,13 @@ impl Board {
 
     fn replace_files(&mut self, files: Vec<FileMetadata>, reset_list_scroll: bool) {
         let selected = (!reset_list_scroll)
-            .then(|| self.currently_selected().map(|tile| tile.node_id))
+            .then(|| self.currently_selected().map(|tile| tile.name.clone()))
             .flatten();
         if reset_list_scroll {
             self.list_offset = 0;
         }
         self.files = files;
-        self.fill_from_selected(selected);
+        self.fill_from_selected(selected.as_deref());
     }
     /// Drops a resolved drill pivot once no movement remains. A stationary pivot
     /// is retained only for same-view scan arrivals. Resize and zoom are new
@@ -197,7 +209,8 @@ impl Board {
     }
 
     fn fill(&mut self) {
-        self.fill_from_selected(self.currently_selected().map(|tile| tile.node_id));
+        let selected = self.currently_selected().map(|tile| tile.name.clone());
+        self.fill_from_selected(selected.as_deref());
     }
 
     /// Lays the current dataset out for the area, as a list when the terminal is
@@ -205,7 +218,7 @@ impl Board {
     fn lay_out_tiles(&mut self, selected: Option<NodeId>) -> Vec<Tile> {
         if !self.list_layout {
             let mut tree_map = TreeMap::new(self.area);
-            tree_map.populate_tiles(&self.files);
+            tree_map.populate_tiles(&self.files, selected);
             self.overflow = tree_map.overflow();
             return tree_map.tiles;
         }
@@ -389,25 +402,34 @@ impl Board {
         self.transition_from.sort_unstable_by_key(|(node, _)| *node);
     }
 
-    fn fill_from_selected(&mut self, selected: Option<NodeId>) {
+    fn fill_from_selected(&mut self, selected: Option<&OsStr>) {
         self.list_layout = self.area.width < 72;
+        let had_candidate = selected.is_some();
         let selected = selected
-            .filter(|id| {
+            .and_then(|name| {
                 self.files
                     .iter()
-                    .any(|file| file.node_id == *id && file.is_interactive())
+                    .find(|file| file.name.as_os_str() == name && file.is_interactive())
+                    .map(|file| file.node_id)
             })
             .or_else(|| {
-                self.files
-                    .iter()
-                    .find(|file| file.is_interactive())
-                    .map(|file| file.node_id)
+                if had_candidate && self.selection_locked {
+                    None
+                } else {
+                    self.files
+                        .iter()
+                        .find(|file| file.is_interactive())
+                        .map(|file| file.node_id)
+                }
             });
         self.tiles = self.lay_out_tiles(selected);
         self.selected_index =
             selected.and_then(|id| self.tiles.iter().position(|tile| tile.node_id == id));
-        // The map holds a cursor only while an actionable entry is available.
-        if self.selected_index.is_none() {
+        // The map holds a cursor only while an actionable entry is available, unless the
+        // user has already chosen one: once locked, a candidate that no longer resolves
+        // clears the selection instead of auto-arming elsewhere, so a deletion can never
+        // silently retarget after the user has picked something.
+        if self.selected_index.is_none() && !self.selection_locked {
             self.select_largest();
         }
         let pivot_resolution = self.resolve_pivot();
@@ -735,6 +757,7 @@ impl Board {
         if x < self.area.x || x >= self.area.right() || y < self.area.y || y >= self.area.bottom() {
             return false;
         }
+        self.selection_locked = true;
 
         // DenseGrid lifts a valid selected entry over its siblings in every
         // frame, then paints the remaining source order front-to-back in reverse.
@@ -789,6 +812,7 @@ impl Board {
         }
     }
     pub fn move_selected_right(&mut self) {
+        self.selection_locked = true;
         match self.currently_selected() {
             Some(currently_selected) => {
                 let next_index = self
@@ -814,6 +838,7 @@ impl Board {
         }
     }
     pub fn move_selected_left(&mut self) {
+        self.selection_locked = true;
         match self.currently_selected() {
             Some(currently_selected) => {
                 let next_index = self
@@ -839,6 +864,7 @@ impl Board {
         }
     }
     pub fn move_selected_down(&mut self) {
+        self.selection_locked = true;
         if self.list_layout {
             self.move_list_selection(1);
             return;
@@ -867,6 +893,7 @@ impl Board {
     }
 
     pub fn move_selected_up(&mut self) {
+        self.selection_locked = true;
         if self.list_layout {
             self.move_list_selection(-1);
             return;
@@ -936,6 +963,8 @@ impl Board {
     ///
     /// The treemap is laid out largest first, so the first interactive entry is
     /// both the largest actionable entry and the one most worth looking at.
+    /// Callers must not use this to retarget a selection the user already made;
+    /// see `fill_from_selected`'s `selection_locked` handling.
     pub fn select_largest(&mut self) {
         self.selected_index = self.tiles.iter().position(Tile::is_interactive);
     }
@@ -950,16 +979,18 @@ impl Board {
             self.selected_index = Some(index);
             return true;
         }
-        if self.list_layout
-            && self
-                .files
-                .iter()
-                .any(|file| file.node_id == node && file.is_interactive())
+        if let Some(name) = self
+            .files
+            .iter()
+            .find(|file| file.node_id == node && file.is_interactive())
+            .map(|file| file.name.clone())
         {
-            // `lay_out_tiles` resolves list identities against the full dataset,
-            // moves the page window, and lets `fill_from_selected` resolve a
-            // pending return pivot only after this identity is selected.
-            self.fill_from_selected(Some(node));
+            // `lay_out_tiles` resolves list identities against the full dataset, moves the
+            // page window, and protects this identity from the treemap's overflow fold, so
+            // it always gets a tile even if it would otherwise be too small to render on its
+            // own; `fill_from_selected` also lets a pending return pivot resolve only after
+            // this identity is selected.
+            self.fill_from_selected(Some(name.as_os_str()));
             return self
                 .currently_selected()
                 .is_some_and(|tile| tile.node_id == node);
@@ -1128,6 +1159,20 @@ mod tests {
             name: OsString::from(format!("file-{id}")),
             size,
             apparent_size: size,
+            descendants: None,
+            percentage,
+            file_type: FileType::File,
+            synthetic_kind: None,
+            uncertain: false,
+        }
+    }
+
+    fn file_named(id: u32, name: &str, percentage: f64) -> FileMetadata {
+        FileMetadata {
+            node_id: NodeId(id),
+            name: OsString::from(name),
+            size: 100,
+            apparent_size: 100,
             descendants: None,
             percentage,
             file_type: FileType::File,
@@ -1850,14 +1895,18 @@ mod tests {
             file_with_size(4, 44, 0.1),
         ]);
 
-        assert!(board.tiles.is_empty(), "the pane cannot draw any entries");
+        // The pane is too cramped for a real treemap, but the auto-armed
+        // selection (the first interactive entry, before any user input) must
+        // still get a tile; every other entry folds into the overflow summary.
+        assert_eq!(board.tiles.len(), 1);
+        assert_eq!(board.tiles[0].node_id, NodeId(1));
         assert_eq!(
             board.overflow(),
             Some(MapOverflow {
                 x: 0,
-                y: 0,
-                entries: 4,
-                bytes: 110,
+                y: 2,
+                entries: 3,
+                bytes: 99,
                 uncertain: false,
             })
         );
@@ -1886,6 +1935,79 @@ mod tests {
         assert_eq!(
             board.currently_selected().map(|tile| tile.node_id),
             Some(NodeId(5))
+        );
+    }
+
+    #[test]
+    fn selection_follows_the_entry_when_a_regeneration_reassigns_node_ids_by_rank() {
+        // `NodeId`s are assigned by each dataset's current rank, largest first, exactly as
+        // the real scanner's provisional and published pages both do (`SnapshotTree::push_node`):
+        // the same filesystem entry can get a different id whenever a regeneration resorts its
+        // siblings.
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files(vec![
+            file_named(0, "big-file.bin", 0.6),
+            file_named(1, "victim", 0.4),
+        ]);
+        assert_eq!(
+            board.currently_selected().map(|tile| tile.name.clone()),
+            Some(OsString::from("big-file.bin"))
+        );
+
+        // The folder has grown past the file: a regeneration (e.g. the scan completing) now
+        // ranks `victim` first and hands its old id, 0, to it instead, while `big-file.bin`
+        // becomes id 1.
+        board.change_files(vec![
+            file_named(0, "victim", 0.7),
+            file_named(1, "big-file.bin", 0.3),
+        ]);
+
+        assert_eq!(
+            board.currently_selected().map(|tile| tile.name.clone()),
+            Some(OsString::from("big-file.bin")),
+            "the selection must follow the same filesystem entry, not whichever entry now holds its old NodeId"
+        );
+    }
+
+    #[test]
+    fn auto_arm_stops_retargeting_once_the_user_has_chosen() {
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+
+        // Before any input, losing the selected (largest) entry still auto-arms: there is
+        // nothing yet to preserve.
+        board.change_files(vec![file(1, 0.6), file(2, 0.4)]);
+        assert_eq!(
+            board.currently_selected().map(|tile| tile.node_id),
+            Some(NodeId(1))
+        );
+        board.change_files(vec![file(2, 1.0)]);
+        assert_eq!(
+            board.currently_selected().map(|tile| tile.node_id),
+            Some(NodeId(2)),
+            "before any input, auto-arm may still retarget onto whatever remains"
+        );
+
+        // A single entry, then a deliberate move: running off the edge holds the cursor where
+        // it is, but still counts as the user's first input.
+        board.change_files(vec![file(3, 1.0)]);
+        assert_eq!(
+            board.currently_selected().map(|tile| tile.node_id),
+            Some(NodeId(3))
+        );
+        board.move_selected_right();
+        assert_eq!(
+            board.currently_selected().map(|tile| tile.node_id),
+            Some(NodeId(3))
+        );
+
+        // Entry 3 is now genuinely gone (e.g. deleted). Auto-arming may no longer retarget
+        // onto whatever remains: the selection clears instead of jumping to entry 4.
+        board.change_files(vec![file(4, 1.0)]);
+        assert!(
+            board.currently_selected().is_none(),
+            "after the first input, a vanished selection must clear, not silently jump elsewhere"
         );
     }
 
@@ -2062,15 +2184,19 @@ mod tests {
         board.advance_geometry(Duration::ZERO, true);
 
         board.change_area(Rect::new(0, 0, 72, 1));
+        // The selected entry keeps a real tile across the resize (just a
+        // forced sliver now instead of its spacious old rectangle), so this
+        // legitimately transitions; settle it before reading the final state.
+        board.advance_geometry(Duration::ZERO, true);
         assert!(!board.is_transitioning());
         assert_eq!(board.rendered_overflow(), board.overflow());
         assert_eq!(
             board.rendered_overflow(),
             Some(MapOverflow {
                 x: 0,
-                y: 0,
-                entries: 4,
-                bytes: 110,
+                y: 2,
+                entries: 3,
+                bytes: 99,
                 uncertain: false,
             })
         );
@@ -2163,7 +2289,7 @@ mod tests {
     }
 
     #[test]
-    fn list_fallback_reveals_largest_entry_after_selection_disappears() {
+    fn list_selection_clears_when_the_chosen_entry_disappears_after_input() {
         let mut board = Board::new();
         board.change_area(Rect::new(0, 0, 40, 3));
         board.change_files((1..=5).map(|id| file(id, 0.2)).collect());
@@ -2176,14 +2302,12 @@ mod tests {
         );
         assert_eq!(board.list_offset, 2);
 
+        // Entry 5 is now genuinely gone. The user already moved the cursor (the four
+        // moves above), so the list no longer falls back to the new largest entry the
+        // way it would before any input: the selection clears instead.
         board.change_files((1..=4).map(|id| file(id, 0.25)).collect());
 
-        assert_eq!(
-            board.currently_selected().map(|tile| tile.node_id),
-            Some(NodeId(1))
-        );
-        assert_eq!(board.list_offset, 0);
-        assert_eq!(board.tiles[0].node_id, NodeId(1));
+        assert!(board.currently_selected().is_none());
     }
 
     #[test]

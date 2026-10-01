@@ -62,7 +62,7 @@ The shared-allocation summary is the only virtual entry and cannot be selected.
 
     The exit dialog distinguishes no work, cancellable pending work, and active deletion. Pending work can be cancelled before quitting or left running while the reader returns to the map. Active deletion can stop only at an entry boundary or be awaited. No key silently detaches a mutation worker.
 
-A completed report either invalidates or republishes the current ScanStore result. A complete target removal creates an immutable overlay without that path. A partial or uncertain result discards the active view and schedules a newer root scan. The board then selects a surviving actionable entry, clears an empty view, or restores the nearest valid folder.
+A completed report either invalidates or republishes the current ScanStore result. A complete target removal creates an immutable overlay without that path. A partial or uncertain result discards the active view and schedules a newer root scan. The board then keeps the selected entry if it survived. If it did not, the board selects the largest surviving actionable entry only while the reader has not yet moved the cursor; after the first move it clears the selection until the next one, so a deletion never moves the cursor onto an entry the reader did not choose. An empty view is cleared, and a removed folder view restores the nearest valid folder.
 
 ## Consequences
 
