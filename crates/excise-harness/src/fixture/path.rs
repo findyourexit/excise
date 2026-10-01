@@ -351,6 +351,28 @@ fn decode_native(encoded: &Encoded) -> Result<Vec<u8>, PathError> {
     }
 }
 
+/// A native path as a JSON report writes it, absolute or relative.
+///
+/// A [`RelPath`] names an entry below a fixture root and rejects anything else. A scan report
+/// names every entry by its absolute path, so a reader decodes it with this type and relates it
+/// to the report's own root.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct EncodedPath(Encoded);
+
+impl EncodedPath {
+    /// The bytes of the path, with `/` as the separator on every platform: the decoding of a
+    /// [`RelPath`] without its rule that the path be relative and canonical.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PathError`] when the payload is not valid base64, belongs to another platform,
+    /// or is not valid text where the encoding needs it to be.
+    pub fn decode(&self) -> Result<Vec<u8>, PathError> {
+        decode_native(&self.0)
+    }
+}
+
 impl Serialize for RelPath {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         encode_native(&self.0).serialize(serializer)

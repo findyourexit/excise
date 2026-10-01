@@ -1,0 +1,27 @@
+schema_version = 1
+
+# Fixtures that are expected to FAIL the headless oracle diff, strictly (see the harness README,
+# "Expected failures"). Each entry must fail with exactly the listed discrepancy kinds on the
+# listed platforms: a different failure is a new defect, and no failure means the defect is fixed
+# and the entry has to go.
+
+[[expect_fail]]
+fixture = "hostile-small"
+platforms = ["macos", "linux"]
+findings = ["F10"]
+kinds = ["entry-state"]
+reason = "A directory that cannot be listed, and every folder above it, is reported `complete` with exact bounds. Only the document state, the exit code, and the summary carry the uncertainty, against docs/safety/accounting.md: \"Parent folders retain a lower bound and show the uncertainty.\""
+
+[[expect_fail]]
+fixture = "all-classes-small"
+platforms = ["macos", "linux"]
+findings = ["F10", "F11"]
+kinds = ["entry-state", "missing", "summary"]
+reason = "F10 for its hostile part, and F11 for its deep part: the scanner stats every entry by its full path, so nothing past PATH_MAX is scanned."
+
+[[expect_fail]]
+fixture = "deep-past-path-max"
+platforms = ["macos", "linux"]
+findings = ["F11"]
+kinds = ["missing", "state", "summary"]
+reason = "The scanner stats every entry by its full path (process_entry calls fs::symlink_metadata), so nothing past PATH_MAX is scanned: the report lists a fraction of the tree, calls it uncertain, and counts one unreadable folder, where the tree can be read to the bottom."

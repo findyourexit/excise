@@ -23,6 +23,8 @@ exceptions = [
   # libproc reads the peak physical footprint on macOS. Its build script needs bindgen, which needs libloading.
   { allow = ["BSD-3-Clause"], crate = "bindgen@0.72.1" },
   { allow = ["ISC"], crate = "libloading@0.8.9" },
+  # The headless runner validates scan reports with jsonschema. Its URI resolver depends on borrow-or-share.
+  { allow = ["MIT-0"], crate = "borrow-or-share@0.2.4" },
 ]
 
 [licenses.private]

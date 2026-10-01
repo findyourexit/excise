@@ -68,6 +68,7 @@ mod work;
 pub use budget::{default_limit, limit_for};
 pub use e2e::{E2eError, E2eOptions, E2eReport, RunRecord, load_scenarios, run_e2e};
 pub use outcome::{FailureCause, RunError, StepFailure};
+pub(crate) use run::resolve_binary;
 pub use run::{RunReport, RunRequest, run_scenario};
 pub use verdict::{Outcome, verdict};
 pub use work::work_base;
