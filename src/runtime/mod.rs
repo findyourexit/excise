@@ -41,7 +41,9 @@ use crate::scan_coordinator::{
     WorkLease, WorkPriority,
 };
 use crate::scan_store::run_file::SealedRun;
-use crate::scan_store::session::ScanStore;
+use crate::scan_store::session::{
+    ScanStore, is_scan_store_capacity_error, scan_store_capacity_message,
+};
 use crate::scan_store::storage::ScanStoreStorage;
 use crate::temporary_storage::TemporaryStorage;
 use crate::theme::ThemeId;
@@ -924,7 +926,26 @@ where
                 self.handle_primary_unscanned(lease.as_ref(), input_runs, &path, &reason)?;
             }
             WorkerEvent::ScanFailed { path, message } => {
-                self.handle_scan_failure(path.as_deref(), &message, self.generation_rebuild_active);
+                if is_scan_store_capacity_failure(&message) {
+                    let message = safe_display_text(&message);
+                    if self
+                        .app
+                        .note_scan_store_capacity_failure_from_worker(message.clone())
+                    {
+                        self.summary.unscanned_entries =
+                            self.summary.unscanned_entries.saturating_add(1);
+                        self.summary.last_unscanned_path =
+                            path.as_deref().map(safe_display_path_text);
+                        self.summary.last_unscanned_reason = Some(message.clone());
+                        self.summary.last_worker_error = Some(message);
+                    }
+                } else {
+                    self.handle_scan_failure(
+                        path.as_deref(),
+                        &message,
+                        self.generation_rebuild_active,
+                    );
+                }
             }
             WorkerEvent::ScanFinished { cancelled } => {
                 if self.generation_rebuild_active {
@@ -1467,6 +1488,13 @@ fn display_reason(reason: &crate::model::UnscannedReason) -> String {
     }
 }
 
+/// The one place left that can only compare strings: a worker thread's sealing failure
+/// crosses the event channel as a plain `message`, already classified by
+/// [`scan_store_capacity_message`](crate::scan_store::session::scan_store_capacity_message) at
+/// its origin, while the error was still typed. The session's own tracked quota keeps its
+/// detailed wording (exact byte counts); a raw out-of-space error is replaced with the
+/// canonical phrase there. Both satisfy this check, so it recognizes either, not guessed
+/// OS-specific wording.
 fn is_scan_store_capacity_failure(message: &str) -> bool {
     message.contains("scan store capacity exhausted") && message.contains("--scan-store-mib")
 }
@@ -1563,10 +1591,10 @@ fn scan_headless_with_scan_store_session(
                         })?;
                         for run in input_runs {
                             if let Err(error) = scan_store.accept_leased_input_run(lease, run) {
-                                let message = error.to_string();
-                                if !is_scan_store_capacity_failure(&message) {
-                                    return Err(AppError::Model(message));
+                                if !is_scan_store_capacity_error(&error) {
+                                    return Err(AppError::Model(error.to_string()));
                                 }
+                                let message = scan_store_capacity_message(&error);
                                 scan_store_capacity_exhausted = true;
                                 scan_store
                                     .discard_active()
@@ -1597,10 +1625,10 @@ fn scan_headless_with_scan_store_session(
                         })?;
                         for run in input_runs {
                             if let Err(error) = scan_store.accept_leased_input_run(lease, run) {
-                                let message = error.to_string();
-                                if !is_scan_store_capacity_failure(&message) {
-                                    return Err(AppError::Model(message));
+                                if !is_scan_store_capacity_error(&error) {
+                                    return Err(AppError::Model(error.to_string()));
                                 }
+                                let message = scan_store_capacity_message(&error);
                                 scan_store_capacity_exhausted = true;
                                 scan_store
                                     .discard_active()
@@ -2542,6 +2570,234 @@ mod tests {
         assert!(!is_scan_store_capacity_failure(
             "temporary storage capacity exhausted; increase --temporary-storage-mib"
         ));
+    }
+
+    /// Proves the headless side of the contract between the scanner's worker-thread
+    /// classification and the owner's string-only recognition: whatever
+    /// `scan_store_capacity_message` produces for an out-of-room error, raw OS wording and
+    /// all, `is_scan_store_capacity_failure` always recognizes, exactly as it does the
+    /// session's own tracked quota (a strict no-op here) and never for an unrelated failure.
+    #[test]
+    fn capacity_message_and_failure_check_agree_on_a_raw_enospc() {
+        let out_of_space = crate::scan_store::session::ScanStoreError::Run(
+            crate::scan_store::run_file::RunError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "No space left on device (os error 28)",
+            )),
+        );
+        let message = crate::scan_store::session::scan_store_capacity_message(&out_of_space);
+        assert!(is_scan_store_capacity_failure(&message));
+
+        let unrelated = crate::scan_store::session::ScanStoreError::Run(
+            crate::scan_store::run_file::RunError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            )),
+        );
+        let message = crate::scan_store::session::scan_store_capacity_message(&unrelated);
+        assert!(!is_scan_store_capacity_failure(&message));
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression constructs a complete owner loop before asserting the capacity remedy"
+    )]
+    #[test]
+    fn worker_capacity_failure_gets_the_scratch_space_remedy_not_an_unreadable_count() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let scan_view_root = app.current_folder_path();
+        let mut owner = OwnerLoop {
+            app,
+            input: Box::new(PendingInput),
+            workers: None,
+            clock: Box::new(VirtualClock::new()),
+            animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            settings: RuntimeSettings {
+                root: root.path().to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                scan_store_mib: Some(4_096),
+                scan_store_reserve_mib: None,
+                scan_store_dir: None,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: true,
+                monochrome: true,
+                animate_loading: false,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: true,
+            },
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(4_096)
+                .expect("default scan-store capacity should fit"),
+            summary: RunSummary::default(),
+            scan_active: true,
+            scheduler_snapshot: None,
+            primary_scan_active: true,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            generation_rebuild_active: false,
+            generation_rebuild_target: None,
+            cancelled_while_scanning: false,
+            exit_after_work: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: Duration::ZERO,
+            next_deletion_progress_frame: Duration::ZERO,
+            last_deletion_progress: None,
+        };
+
+        let out_of_space = crate::scan_store::session::ScanStoreError::Run(
+            crate::scan_store::run_file::RunError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "No space left on device (os error 28)",
+            )),
+        );
+        let capacity_message =
+            crate::scan_store::session::scan_store_capacity_message(&out_of_space);
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanFailed {
+                path: Some(root.path().join("entry-0")),
+                message: capacity_message.clone(),
+            })
+            .expect("a capacity-classified scan failure should be handled");
+        assert_eq!(owner.summary.unscanned_entries, 1);
+        assert_eq!(
+            owner.summary.unreadable_entries, 0,
+            "a scan-store capacity failure is a store-wide problem, not one unreadable entry"
+        );
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanFailed {
+                path: Some(root.path().join("entry-1")),
+                message: capacity_message,
+            })
+            .expect("a repeated capacity failure should still be handled");
+        assert_eq!(
+            owner.summary.unscanned_entries, 1,
+            "a second capacity failure must be a no-op, like headless's own \"first one wins\""
+        );
+        assert_eq!(owner.summary.unreadable_entries, 0);
+
+        owner.app.finalize_scan();
+        owner.app.start_ui();
+        assert!(matches!(
+            &owner.app.ui_mode,
+            crate::UiMode::ScanResultsUnavailable(message)
+                if message.contains("Not enough scratch space")
+                    && message.contains("--scan-store-dir")
+                    && message.contains("--scan-store-reserve-mib")
+        ));
+    }
+
+    #[test]
+    fn unrelated_worker_scan_failure_still_counts_as_unreadable() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let scan_view_root = app.current_folder_path();
+        let mut owner = OwnerLoop {
+            app,
+            input: Box::new(PendingInput),
+            workers: None,
+            clock: Box::new(VirtualClock::new()),
+            animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            settings: RuntimeSettings {
+                root: root.path().to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                scan_store_mib: Some(4_096),
+                scan_store_reserve_mib: None,
+                scan_store_dir: None,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: true,
+                monochrome: true,
+                animate_loading: false,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: true,
+            },
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(4_096)
+                .expect("default scan-store capacity should fit"),
+            summary: RunSummary::default(),
+            scan_active: true,
+            scheduler_snapshot: None,
+            primary_scan_active: true,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            generation_rebuild_active: false,
+            generation_rebuild_target: None,
+            cancelled_while_scanning: false,
+            exit_after_work: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: Duration::ZERO,
+            next_deletion_progress_frame: Duration::ZERO,
+            last_deletion_progress: None,
+        };
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanFailed {
+                path: Some(root.path().join("locked")),
+                message: "Permission denied (os error 13)".to_string(),
+            })
+            .expect("an unrelated scan failure should be handled");
+        assert_eq!(owner.summary.unreadable_entries, 1);
+        assert_eq!(owner.summary.unscanned_entries, 1);
     }
 
     #[test]

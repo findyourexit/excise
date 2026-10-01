@@ -66,21 +66,18 @@ fn a_scan_stopped_at_the_quota_leaves_a_quarter_of_the_free_space()
     });
     let free_after = free_bytes(&mount)?;
 
-    // A pass, or a strict expected failure where the scenario declares one (`fails_on`).
     assert!(
-        matches!(report.verdict, Verdict::Pass | Verdict::Xfail),
+        report.verdict == Verdict::Pass,
         "verdict {:?}, failure {:?}, error {:?}",
         report.verdict,
         report.failure,
         report.error
     );
-    if report.verdict == Verdict::Pass {
-        // A fifth, not a quarter: the file system's own metadata takes some of the reserve.
-        assert!(
-            free_after.saturating_mul(5) >= free_before,
-            "the reserve is gone: {free_after} bytes free after the scan, {free_before} before"
-        );
-    }
+    // A fifth, not a quarter: the file system's own metadata takes some of the reserve.
+    assert!(
+        free_after.saturating_mul(5) >= free_before,
+        "the reserve is gone: {free_after} bytes free after the scan, {free_before} before"
+    );
     fixture.remove()?;
     Ok(())
 }

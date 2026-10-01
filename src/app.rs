@@ -37,7 +37,9 @@ use crate::scan_store::page::{PageCursor, PageRequest};
 #[cfg(test)]
 use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, SummaryMetrics};
 use crate::scan_store::run_file::SealedRun;
-use crate::scan_store::session::{ScanInputRunFactory, ScanStore, ScanStoreError};
+use crate::scan_store::session::{
+    ScanInputRunFactory, ScanStore, ScanStoreError, scan_store_capacity_message,
+};
 use crate::scan_store::storage::ScanStoreStorage;
 use crate::state::deletion_work::{
     DeletionExecutionProgress, DeletionWork, DeletionWorkCommand, DeletionWorkId,
@@ -1299,10 +1301,27 @@ where
         }
         for run in runs {
             if let Err(error) = self.scan_store.accept_leased_input_run(lease, run) {
-                self.abandon_scan_store_generation_with_failure(error.to_string());
+                self.abandon_scan_store_generation_with_failure(scan_store_capacity_message(
+                    &error,
+                ));
                 return;
             }
         }
+    }
+
+    /// Treats a worker's scan-store capacity failure exactly like a failed admission call
+    /// (`admit_scan_input_runs`): marks the scan store unavailable with the scratch-space
+    /// remedy and returns `true` the first time. Once it is already unavailable, later calls
+    /// are a no-op and return `false`, matching headless's "first one wins" handling of the
+    /// same condition: a worker thread's own sealing failure is the common real-world trigger
+    /// (the first bytes to fail writing to a full volume), and the disk tends to stay full, so
+    /// more than one worker can report this in the same scan.
+    pub(crate) fn note_scan_store_capacity_failure_from_worker(&mut self, message: String) -> bool {
+        if !self.scan_store_available {
+            return false;
+        }
+        self.abandon_scan_store_generation_with_failure(message);
+        true
     }
 
     pub fn reset_ui_mode(&mut self) {
@@ -2994,6 +3013,45 @@ mod tests {
             UiMode::ScanResultsUnavailable(message)
                 if message.contains("Not enough scratch space")
                     && message.contains("deletion controls")
+                    && message.contains("--scan-store-dir")
+                    && message.contains("--scan-store-reserve-mib")
+        ));
+    }
+
+    #[test]
+    fn out_of_space_io_error_gets_the_scratch_space_remedy() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+
+        // A raw out-of-space error from the volume itself, not the session's own tracked
+        // quota: OS-native wording, no mention of "capacity exhausted" or `--scan-store-mib`.
+        // This is exactly the typed error `admit_scan_input_runs` sees from a failed
+        // admission; its production call site classifies it through
+        // `scan_store_capacity_message` before the typed error becomes a string.
+        let out_of_space = ScanStoreError::Run(crate::scan_store::run_file::RunError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "No space left on device (os error 28)",
+            ),
+        ));
+        app.abandon_scan_store_generation_with_failure(scan_store_capacity_message(&out_of_space));
+        app.finalize_scan();
+        app.start_ui();
+
+        assert!(matches!(
+            &app.ui_mode,
+            UiMode::ScanResultsUnavailable(message)
+                if message.contains("Not enough scratch space")
                     && message.contains("--scan-store-dir")
                     && message.contains("--scan-store-reserve-mib")
         ));

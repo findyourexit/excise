@@ -19,6 +19,8 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 * On macOS, deleting a folder no longer occasionally leaves it behind. When the file system briefly refused the temporary name a deleted file had just vacated, Excise kept an empty file under the deleted file's name, so the folder could not be removed and the deletion reported skipped entries. The temporary entry now moves to a fresh private name and is removed there.
 * On Windows, a scan no longer occasionally ends with "Excise could not build a complete folder map" instead of completing. When another program briefly held a scan-store file Excise had just written, the rename that replaces it failed and the scan was abandoned; the rename is now retried.
 * After a scan completes, the interactive map no longer animates the selected entry indefinitely. Its highlight plays one cycle after the last input or change and then settles; previously an idle session kept redrawing the terminal, writing almost 1 MB of output per second.
+* On macOS, the scan-store scratch-space budget used the wrong block size and could compute an effective quota far larger than the volume's real free space, so the documented 25 percent reserve was not enforced. It now uses the correct, POSIX-defined unit.
+* An out-of-space error while writing scan data now reaches the user the same way the session's own scratch-space limit does, in both the interactive map and `--format json`, instead of a generic "could not build a complete folder map" message.
 
 ## [1.3.0] - 2026-09-24
 

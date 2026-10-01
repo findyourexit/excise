@@ -5,13 +5,10 @@ fixture = "scan-store-quota"
 profiles = ["default"]
 tier = "full"
 platforms = ["linux", "macos"]
-expect = "fail"
-fails_on = ["macos"]
-slice = "X5"
 scan_store_on_volume = true
 
-# The scan stops at the scan-store quota and says so. On macOS the quota is computed from the wrong
-# block size today (F7), so the volume fills first and the generic message appears instead.
+# The scan stops at the scan-store quota and says so, well before the volume's real free space
+# runs out.
 [[steps]]
 step = "wait_text"
 text = "Not enough scratch space"
