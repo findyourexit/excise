@@ -21,6 +21,8 @@ exclude = [
     ".cargo",
     ".github",
     ".gitmessage",
+    "AGENTS.md",
+    "CLAUDE.md",
     "assets",
     "tapes",
     "handoff",
