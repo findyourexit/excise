@@ -329,7 +329,8 @@ string_enum! {
 }
 
 /// Deletes the currently selected entry: presses Backspace, asserts that the dialog names exactly
-/// this entry and kind, asserts the sentinels, and only then confirms.
+/// this entry and kind, asserts the sentinels, and only then confirms. `wait_for` controls when
+/// the step returns relative to the deletion it starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Delete {
@@ -337,9 +338,27 @@ pub struct Delete {
     pub name: String,
     /// The kind of entry the dialog must show.
     pub kind: EntryKind,
+    /// When the step returns relative to the deletion. Defaults to `"finished"`.
+    #[serde(default)]
+    pub wait_for: DeleteWait,
     /// The bound on the waits inside the step.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+string_enum! {
+    /// When a `delete` step returns relative to the deletion it starts.
+    #[derive(Default)]
+    pub enum DeleteWait {
+        /// Wait for the deletion to finish (a `deletion_finished` event) and for the frame drawn
+        /// after it, so the screen already shows the result. The default.
+        #[default]
+        Finished => "finished",
+        /// Return once the confirmation has been processed and the deletion has started: the
+        /// dialog has closed. The deletion keeps running after the step returns; a step that
+        /// needs its result waits for that separately (`wait_fs_absent`, `wait_event`).
+        Started => "started",
+    }
 }
 
 /// Waits for a fixture-relative path to appear or disappear.
@@ -462,7 +481,9 @@ pub struct ExpectExit {
     /// The exit code.
     pub code: i32,
     /// `true` asserts that the terminal is restored (alternate screen left, cursor visible, echo
-    /// and canonical mode on); `false` asserts that it is not.
+    /// and canonical mode on); `false` asserts that it is not. After a `close` event there is no
+    /// console left to inspect: the pseudo-terminal runner accepts `true` there without
+    /// evaluating it and refuses `false`.
     pub terminal_restored: bool,
     /// What may be left behind.
     pub residue: Residue,

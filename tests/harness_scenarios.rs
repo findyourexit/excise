@@ -333,3 +333,63 @@ fn an_expected_failure_applies_only_on_its_platform() {
     let (report, _) = run(&scenario, Profile::Default, fixture.root(), &work);
     assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
 }
+
+#[test]
+fn a_deferred_delete_returns_once_the_dialog_closes_and_the_deletion_still_finishes() {
+    let _session = session_guard();
+    let scenario = inline(
+        "deferred-delete",
+        r#"
+[[steps]]
+step = "select"
+name = "victim"
+
+[[steps]]
+step = "delete"
+name = "victim"
+kind = "folder"
+wait_for = "started"
+timeout_ms = 60000
+
+[[steps]]
+step = "expect_fs"
+present = ["victim"]
+
+[[steps]]
+step = "wait_fs_absent"
+path = "victim"
+timeout_ms = 30000
+
+[[steps]]
+step = "wait_event"
+event = "deletion_finished"
+fields = { removed = { eq = 5011 }, failed = { eq = 0 } }
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "keep-b/keep.txt"]
+absent = ["victim"]
+"#,
+    );
+    let work = Workspace::new();
+    let fixture = Fixtures::bundled()
+        .run_copy(&scenario.fixture, &work.0)
+        .expect("the fixture is built");
+
+    // `wait_for = "started"` must return before the 5,011-entry deletion can possibly have
+    // finished: `expect_fs { present = ["victim"] }` right after the step, with no wait in
+    // between, asserts exactly that. The deletion still finishes normally afterward, on its own:
+    // the filesystem loses `victim`, the program reports it through `deletion_finished`, and the
+    // sentinels survive. What quitting afterward does is a different, already-covered behavior
+    // (`delete-folder-lifecycle`), not this option's.
+    let (report, _) = run(&scenario, Profile::Deterministic, fixture.root(), &work);
+
+    assert_eq!(
+        report.verdict,
+        Verdict::Pass,
+        "failure {:?}, error {:?}",
+        report.failure,
+        report.error
+    );
+}

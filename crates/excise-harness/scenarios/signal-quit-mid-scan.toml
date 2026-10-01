@@ -1,0 +1,27 @@
+schema_version = 1
+name = "signal-quit-mid-scan"
+description = "SIGQUIT delivered while the scan is still running is a confirmed quit: it should cancel the scan, restore the terminal, remove session storage, and exit 130, instead of killing the process mid-scan with none of that done (F6)."
+fixture = "node-modules-2k"
+profiles = ["deterministic"]
+tier = "full"
+expect = "fail"
+slice = "X3"
+platforms = ["linux", "macos"]
+
+# A fixture large enough that the scan is still running when the signal lands: the header badge
+# must read SCANNING, never COMPLETE, so a step that outruns the scan never passes by accident.
+[[steps]]
+step = "wait_header"
+state = "scanning"
+timeout_ms = 10000
+
+[[steps]]
+step = "signal"
+signal = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 130
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000

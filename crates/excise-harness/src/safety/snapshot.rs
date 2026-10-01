@@ -354,6 +354,35 @@ mod tests {
         );
     }
 
+    /// The invariant an interrupted deletion (a signal mid-flight, before `X3`) relies on: a
+    /// confirmed target excuses a removal anywhere below it, but never an addition or a change,
+    /// even below that same target. This is what proves a deletion stopped at an entry boundary:
+    /// every entry of the target is either untouched or gone, never a changed or a freshly
+    /// created one, such as a private placeholder name a half-finished cleanup might leave.
+    #[test]
+    fn a_new_or_changed_entry_below_a_confirmed_deletion_target_is_still_unexpected() {
+        let root = fixture();
+        let before = FixtureSnapshot::take(root.path()).expect("a snapshot");
+        // The deletion stopped partway through `victim`: one entry is gone (excused), but it also
+        // left one entry changed in place and one brand new entry, both still below the target.
+        fs::remove_file(root.path().join("victim/nested/b.bin")).expect("one entry is gone");
+        fs::write(root.path().join("victim/a.bin"), vec![0; 999])
+            .expect("one entry changed in place");
+        fs::write(root.path().join("victim/nested/placeholder"), b"x")
+            .expect("one new entry appeared");
+        let after = FixtureSnapshot::take(root.path()).expect("a snapshot");
+
+        let unexpected = before.diff(&after).unexpected(&["victim".to_owned()], &[]);
+
+        assert_eq!(
+            unexpected,
+            [
+                "appeared: victim/nested/placeholder",
+                "changed: victim/a.bin (file, 10 bytes became file, 999 bytes)",
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn symbolic_links_are_fingerprinted_by_target_and_never_followed() {

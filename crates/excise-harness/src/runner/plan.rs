@@ -148,6 +148,20 @@ fn prepare_step(scenario: &Scenario, index: usize, step: &Step) -> Result<Prepar
             }
             Ok(Prepared::Nothing)
         }
+        Step::ExpectExit(exit) => {
+            let console_closed = scenario.steps.iter().take(index).any(
+                |earlier| matches!(earlier, Step::Signal(send) if send.signal == Signal::Close),
+            );
+            if console_closed && !exit.terminal_restored {
+                return Err(invalid(
+                    "a `close` event before it leaves no console to inspect, so \
+                     `terminal_restored = false` could never be checked; after a `close` the \
+                     runner accepts `terminal_restored = true` without evaluating it"
+                        .to_owned(),
+                ));
+            }
+            Ok(Prepared::Nothing)
+        }
         Step::WaitHeader(_)
         | Step::WaitEvent(_)
         | Step::Delete(_)
@@ -155,7 +169,6 @@ fn prepare_step(scenario: &Scenario, index: usize, step: &Step) -> Result<Prepar
         | Step::WaitFsPresent(_)
         | Step::Resize(_)
         | Step::ExpectFs(_)
-        | Step::ExpectExit(_)
         | Step::Measure(_)
         | Step::Settle(_)
         | Step::Quit(_)
@@ -179,7 +192,13 @@ fn supported_signal(signal: Signal) -> Result<(), String> {
             "the `{signal}` signal is a Unix signal and this platform has no safe way to deliver it \
              to a pseudo-terminal child"
         )),
-        Signal::Close | Signal::Break => Err(format!(
+        // `close` needs no unsafe call: it closes the pseudo console, which Windows itself
+        // delivers as `CTRL_CLOSE_EVENT` to every attached process (`PtySession::close_console`).
+        Signal::Close if cfg!(windows) => Ok(()),
+        Signal::Close => Err(format!(
+            "the `{signal}` console event is a Windows event; this platform has no equivalent"
+        )),
+        Signal::Break => Err(format!(
             "the `{signal}` console event needs unsafe Windows console calls, which this \
              workspace does not allow"
         )),
@@ -362,18 +381,48 @@ regex = "(unclosed"
     }
 
     #[test]
-    fn console_events_are_unsupported_and_unix_signals_follow_the_platform() {
-        for signal in ["close", "break"] {
-            let scenario = scenario(&format!(
-                "[[steps]]\nstep = \"signal\"\nsignal = \"{signal}\"\n"
-            ));
-            assert!(
-                matches!(prepare(&scenario), Err(RunError::Unsupported { .. })),
-                "{signal}"
-            );
-        }
+    fn break_is_always_unsupported_and_close_and_unix_signals_follow_the_platform() {
+        let brk = scenario("[[steps]]\nstep = \"signal\"\nsignal = \"break\"\n");
+        assert!(matches!(prepare(&brk), Err(RunError::Unsupported { .. })));
+
+        let close = scenario("[[steps]]\nstep = \"signal\"\nsignal = \"close\"\n");
+        assert_eq!(prepare(&close).is_ok(), cfg!(windows));
+
         let term = scenario("[[steps]]\nstep = \"signal\"\nsignal = \"term\"\n");
         assert_eq!(prepare(&term).is_ok(), cfg!(unix));
+    }
+
+    #[test]
+    fn after_a_close_only_a_terminal_check_that_is_skipped_anyway_is_accepted() {
+        let close_then_exit = |restored: bool| {
+            scenario(&format!(
+                "[[steps]]\nstep = \"signal\"\nsignal = \"close\"\n[[steps]]\nstep = \
+                 \"expect_exit\"\ncode = 130\nterminal_restored = {restored}\nresidue = \"none\"\n"
+            ))
+        };
+
+        if cfg!(windows) {
+            assert!(prepare(&close_then_exit(true)).is_ok());
+            assert!(matches!(
+                prepare(&close_then_exit(false)),
+                Err(RunError::InvalidStep {
+                    index: 1,
+                    step: "expect_exit",
+                    ..
+                })
+            ));
+        } else {
+            // `close` is refused first wherever it cannot be delivered.
+            assert!(matches!(
+                prepare(&close_then_exit(false)),
+                Err(RunError::Unsupported { index: 0, .. })
+            ));
+        }
+
+        let exit_only = scenario(
+            "[[steps]]\nstep = \"expect_exit\"\ncode = 0\nterminal_restored = false\nresidue = \"none\"\n",
+        );
+        assert!(prepare(&exit_only).is_ok(), "without a close it is checked");
     }
 
     #[test]

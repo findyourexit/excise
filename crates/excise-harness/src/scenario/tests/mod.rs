@@ -96,6 +96,7 @@ marker = "start"
 step = "delete"
 name = "victim"
 kind = "folder"
+wait_for = "started"
 
 [[steps]]
 step = "wait_fs_absent"

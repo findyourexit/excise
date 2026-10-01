@@ -225,12 +225,12 @@ state and never wait; put a `wait_*` or `settle` step before them.
 | `key` | `key`, `ctrl`, `alt` | Presses one key. |
 | `type` | `text` | Types literal text, one character at a time. |
 | `select` | `name`, `timeout_ms` | Selects the entry by name through the filter. |
-| `delete` | `name`, `kind` (`file` or `folder`), `timeout_ms` | Deletes the selected entry through the confirmation dialog. |
+| `delete` | `name`, `kind` (`file` or `folder`), `wait_for` (`finished` or `started`), `timeout_ms` | Deletes the selected entry through the confirmation dialog. |
 | `wait_fs_absent` | `path`, `timeout_ms` | Waits until the fixture-relative path no longer exists. |
 | `wait_fs_present` | `path`, `timeout_ms` | Waits until the fixture-relative path exists. |
 | `fs_mutate` | `op` (`appear`, `change`, `vanish`, `replace`), `path` | Changes the fixture while the program runs. |
 | `resize` | `cols`, `rows` | Resizes the terminal. |
-| `signal` | `signal` (`term`, `hup`, `quit`, `int`, `close`, `break`) | Delivers a signal or console event. |
+| `signal` | `signal` (`term`, `hup`, `quit`, `int`, `close`, `break`) | Delivers a signal or console event. `close` needs Windows; `break` is never deliverable (see below). |
 | `expect_screen` | `contains`, `not_contains`, `regex`, `region` | Asserts what the screen shows now. |
 | `expect_fs` | `present`, `absent` | Asserts which fixture-relative paths exist now. |
 | `expect_exit` | `code`, `terminal_restored`, `residue`, `timeout_ms` | Waits for the program to exit and asserts how it ended. |
@@ -261,7 +261,10 @@ Details that a table cannot carry:
 - **`delete`.** The runner acts on the selected entry. It presses Backspace, parses the
   confirmation dialog, asserts that its title and path name that entry, `name` and `kind`, under the
   fixture root, asserts that every sentinel still exists, and only then presses `y`. Any mismatch
-  fails the step and `y` is never sent.
+  fails the step and `y` is never sent. `wait_for` (default `"finished"`) controls when the step
+  returns: `"finished"` waits for the deletion to finish; `"started"` returns as soon as the
+  confirmation has closed the dialog, while the deletion keeps running, so a later step can act
+  while it is still in progress (for example, delivering a `signal`).
 - **`wait_event`.** `event` is one of `frame`, `scan_complete`, `deletion_finished`, `quit_prompt`,
   or `exit`: the kinds reported by the program's internal test event channel (which also opens with
   a `hello` line that the runner consumes itself). `fields` maps a numeric event field to a test:
@@ -270,14 +273,18 @@ Details that a table cannot carry:
   `failed`; and `exit`: `code`. Every event also carries `t_us`, the microseconds since the channel
   opened. Testing a field the event does not carry is a validation error.
 - **`signal`.** `term`, `hup`, `quit`, and `int` are Unix signals; `close` and `break` are Windows
-  console events. Whether the host can deliver one is a runner concern, and an undeliverable signal
-  must never be reported as a pass.
+  console events. `close` closes the pseudo console, which Windows delivers to every attached
+  process as `CTRL_CLOSE_EVENT`; this needs no unsafe call, so the runner can deliver it. `break`
+  would need `GenerateConsoleCtrlEvent`, which does, so the runner reports it as unsupported on
+  every platform. Whether the host can deliver a given signal at all is a runner concern, and an
+  undeliverable signal must never be reported as a pass.
 - **`resize`.** Unlike the initial terminal, a resize may go below 32 by 8 to exercise the resize
   message. Both dimensions must be non-zero.
 - **`expect_exit`.** `terminal_restored = true` asserts that the alternate screen was left, the
   cursor is visible, and echo and canonical mode are on; `false` asserts that they are not.
   `residue = "none"` asserts that nothing is left in the scenario scratch directory. `code` is the
-  process exit code.
+  process exit code. After a `close` event there is no console left to inspect: the runner accepts
+  `terminal_restored = true` there without evaluating it, and refuses `false` before the run.
 - **`measure` and `expect_budget`.** A `start` and a `stop` with the same `name` record the elapsed
   milliseconds as the metric `name`. Each name is used once; every `stop` needs an earlier `start`
   and every `start` needs a `stop`. `expect_budget` names a metric, built in or recorded by
@@ -373,18 +380,35 @@ job object would, but creating one needs `unsafe`, which this workspace allows o
   the prompt, presses Enter, and waits until the inspector pane shows exactly that name.
 - **`delete`** presses Backspace and reads the dialog. It presses `y` only when the dialog names
   exactly the requested entry, kind, and path and every sentinel exists. Any mismatch fails the
-  step and no `y` is ever sent. The step ends when the `deletion_finished` event and the first
-  frame after it have been read, so the screen shows the result. The program rebuilds its map after
-  a deletion and treats a quit during the rebuild as a cancellation (exit code 130): a scenario
-  that goes on to quit waits for the header to read `COMPLETE` first.
+  step and no `y` is ever sent. `wait_for = "finished"` (the default) ends the step when the
+  `deletion_finished` event and the first frame after it have been read, so the screen shows the
+  result. `wait_for = "started"` ends it as soon as a frame shows the dialog has closed, without
+  waiting for the deletion itself: the deletion keeps running after the step returns, so a step
+  that needs its outcome waits for that separately (`wait_fs_absent`, `wait_event`). The program
+  rebuilds its map after a deletion and treats a quit during the rebuild as a cancellation (exit
+  code 130): a scenario that goes on to quit after a `"finished"` delete waits for the header to
+  read `COMPLETE` first; one that quits after a `"started"` delete needs to reach the same point
+  itself (`wait_fs_absent`, then `wait_event { event = "deletion_finished" }`, then a frame after
+  it), since the step returned before any of that happened.
 - **`quit`** presses `q`, waits for the quit dialog, and confirms with `y`.
 - **`resize`** resizes the terminal and waits for the frame that answers it.
 - **`wait_event`** matches any event read so far, including events before the step began.
 - **`expect_exit`** also compares the fixture with its state before the run: only confirmed
-  deletions may differ. Residue is anything the run leaves in its scratch store and temporary
-  directories, or elsewhere in the scratch area apart from the event file and the configuration.
-- **`signal`** is delivered to the child on Unix (`term`, `hup`, `quit`, `int`). Windows console
-  events (`close`, `break`) need `unsafe` console calls, so the runner reports them as unsupported.
+  deletions may differ, and only by removal. A confirmed deletion excuses a removal anywhere at or
+  below its target; it never excuses an addition or a change there or anywhere else, so an
+  interrupted deletion (a signal mid-flight) that stopped at an entry boundary is exactly what
+  passes: every entry of the target is either untouched or gone, never a changed one and never a
+  newly created one, such as a private placeholder name a half-finished cleanup might leave.
+  Residue is anything the run leaves in its scratch store and temporary directories, or elsewhere
+  in the scratch area apart from the event file and the configuration.
+- **`signal`** delivers `term`, `hup`, `quit`, and `int` to the child on Unix. `close` closes the
+  pseudo-terminal's controlling side (`PtySession::close_console`): on Windows this closes the
+  pseudo console, which Windows itself delivers to every attached process as `CTRL_CLOSE_EVENT`,
+  and needs no `unsafe` call, so the runner delivers it there; Unix has nothing to close in the
+  same sense, so the runner reports `close` as unsupported there. Nothing the program writes after
+  a `close` reaches the screen model, so a later `expect_exit` checks the exit code and the
+  residue but not the terminal. `break` would need `GenerateConsoleCtrlEvent`, which does need an
+  `unsafe` call this workspace does not allow, so the runner reports it as unsupported everywhere.
 - **`fs_mutate`** applies the fixture generator's mutator (`fixture::mutate::apply`) when the step
   runs. A refused mutation fails the step and changes nothing. An applied one is an intended
   change: `expect_exit` accepts differences at that path, below it, and in the directories the

@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use super::{ALL_STEPS, errors_of, parse, step_errors, valid};
 use crate::scenario::{
-    Budget, Comparison, DEFAULT_TIMEOUT_MS, Delete, EntryKind, EventField, EventKind, Expect,
-    ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, Field, FsMutate, MAX_TIMEOUT_MS, Marker,
-    Measure, MutateOp, PathViolation, Profile, Quit, Region, Residue, Resize, ScanState, Scenario,
-    Select, Settle, Step, StepError, TypeText, ValidationError, WaitEvent, WaitFs, WaitHeader,
-    WaitText, check_fixture_relative_path,
+    Budget, Comparison, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, EntryKind, EventField, EventKind,
+    Expect, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, Field, FsMutate, MAX_TIMEOUT_MS,
+    Marker, Measure, MutateOp, PathViolation, Profile, Quit, Region, Residue, Resize, ScanState,
+    Scenario, Select, Settle, Step, StepError, TypeText, ValidationError, WaitEvent, WaitFs,
+    WaitHeader, WaitText, check_fixture_relative_path,
 };
 
 fn wait_text(text: Option<&str>, regex: Option<&str>, region: Option<Region>) -> Step {
@@ -64,6 +64,7 @@ fn waiting_steps(timeout_ms: u64) -> Vec<Step> {
         Step::Delete(Delete {
             name: "victim".to_owned(),
             kind: EntryKind::Folder,
+            wait_for: DeleteWait::Finished,
             timeout_ms,
         }),
         Step::WaitFsAbsent(WaitFs {
@@ -402,6 +403,7 @@ fn a_delete_step_requires_at_least_one_sentinel() {
     let delete = Step::Delete(Delete {
         name: "victim".to_owned(),
         kind: EntryKind::Folder,
+        wait_for: DeleteWait::Finished,
         timeout_ms: DEFAULT_TIMEOUT_MS,
     });
     let mut scenario = with_steps(vec![delete]);
@@ -789,6 +791,7 @@ fn typed_text_and_entry_names_must_not_be_empty() {
     let delete = Step::Delete(Delete {
         name: String::new(),
         kind: EntryKind::File,
+        wait_for: DeleteWait::Finished,
         timeout_ms: DEFAULT_TIMEOUT_MS,
     });
     let typed = Step::Type(TypeText {
@@ -1108,6 +1111,7 @@ fn every_broken_rule_is_reported_in_scenario_order() {
         Step::Delete(Delete {
             name: "victim".to_owned(),
             kind: EntryKind::File,
+            wait_for: DeleteWait::Finished,
             timeout_ms: 0,
         }),
         measure("t", Marker::Stop),

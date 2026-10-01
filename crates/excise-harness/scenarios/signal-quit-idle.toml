@@ -1,0 +1,25 @@
+schema_version = 1
+name = "signal-quit-idle"
+description = "SIGQUIT delivered once the scan is idle (after COMPLETE) is a confirmed quit: it should restore the terminal, remove session storage, and exit 130, instead of killing the process with none of that done (F6)."
+fixture = "navigate-folders"
+profiles = ["deterministic"]
+tier = "full"
+expect = "fail"
+slice = "X3"
+platforms = ["linux", "macos"]
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "signal"
+signal = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 130
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000

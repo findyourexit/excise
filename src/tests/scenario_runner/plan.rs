@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 
 use excise_harness::fixture::OwnershipError;
-use excise_harness::scenario::{Region, Scenario, Step, ValidationErrors};
+use excise_harness::scenario::{DeleteWait, Region, Scenario, Step, ValidationErrors};
 use regex::Regex;
 use thiserror::Error;
 
@@ -81,6 +81,9 @@ pub struct Plan {
 ///
 /// * `signal` needs a process to receive it.
 /// * `wait_event` needs the event channel, which belongs to a process.
+/// * `delete` with `wait_for = "started"` needs the deletion to keep running after the step
+///   returns, observed by a step that runs meanwhile; the in-process barrier instead drains the
+///   owner loop to quiescence, which would just finish the deletion.
 /// * `expect_budget` and `measure` judge timing and resources; the barrier drains the owner loop
 ///   outside the production scheduling path, so in-process timing means nothing.
 /// * `expect_exit` with `terminal_restored = false` asserts a terminal that was left unrestored,
@@ -95,6 +98,11 @@ pub fn unsupported_steps(scenario: &Scenario) -> Vec<UnsupportedStep> {
     for (index, step) in scenario.steps.iter().enumerate() {
         let reason = match step {
             Step::Signal(_) => Some("signals need a separate process to receive them"),
+            Step::Delete(delete) if delete.wait_for == DeleteWait::Started => Some(
+                "`wait_for = \"started\"` needs the deletion to keep running after the step \
+                 returns, which this runner cannot observe: it drains the owner loop until it is \
+                 quiescent, so the deletion would already be finished",
+            ),
             Step::WaitEvent(_) => {
                 Some("the event channel belongs to a separate process; an in-process run has none")
             }

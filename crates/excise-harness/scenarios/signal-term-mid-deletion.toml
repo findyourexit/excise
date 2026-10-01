@@ -1,0 +1,46 @@
+schema_version = 1
+name = "signal-term-mid-deletion"
+description = "SIGTERM delivered after the deletion is confirmed but before it finishes is a confirmed quit: it should stop the deletion at the next entry boundary, restore the terminal, remove session storage, and exit 130, instead of killing the process mid-deletion with none of that done (F6)."
+fixture = "delete-folder"
+sentinels = ["keep-a.bin", "keep-b/keep.txt"]
+profiles = ["deterministic"]
+tier = "full"
+expect = "fail"
+slice = "X3"
+platforms = ["linux", "macos"]
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "victim"
+timeout_ms = 10000
+
+# `wait_for = "started"` returns once the confirmation has closed the dialog, instead of waiting
+# for the deletion to finish: the 5,011-entry victim keeps the deletion running in the background
+# for several seconds after this step returns, which is exactly where the signal must land.
+[[steps]]
+step = "delete"
+name = "victim"
+kind = "folder"
+wait_for = "started"
+timeout_ms = 60000
+
+[[steps]]
+step = "signal"
+signal = "term"
+
+# The entry-boundary stop is checked by `expect_exit`'s own fixture comparison below: a confirmed
+# deletion excuses a removal anywhere below `victim`, but never an addition or a change there, so
+# whatever the deletion got through before the signal, every entry of `victim` is either intact or
+# gone, never a changed one and never a newly created one (such as a private placeholder name),
+# and nothing outside `victim` is touched.
+[[steps]]
+step = "expect_exit"
+code = 130
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000
