@@ -59,7 +59,11 @@ fn the_same_binary_on_both_sides_validates_and_blocks_nothing() {
         }],
         pairs: 5,
         seed: 1,
-        timing_threshold: 0.20,
+        // Five pairs of a scan that costs a few tens of milliseconds of CPU cannot resolve a 20%
+        // difference on a shared machine: in a CI build sandbox, this same binary once measured
+        // 1.25x on user CPU with a confident interval. Only a gross difference may block here; the
+        // 20% rule itself is covered by the verdict unit tests.
+        timing_threshold: 1.0,
         memory_tolerance: 0.05,
         strict: false,
         timeout: Duration::from_secs(120),
