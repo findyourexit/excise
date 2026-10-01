@@ -1,0 +1,9 @@
+schema_version = 1
+name = "motion-complete-node-modules-2k"
+description = "Default-motion time-to-COMPLETE against reduced-motion time-to-COMPLETE (F2's repro shape), on the 2.4k-entry node_modules-shaped fixture."
+fixture = "node-modules-2k"
+budget = "motion_complete_ratio"
+pairs = 5
+timeout_ms = 60000
+tier = "full"
+platforms = ["macos"]

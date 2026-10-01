@@ -90,6 +90,9 @@ pub enum ValidationError {
         /// The configured height.
         rows: u16,
     },
+    /// `terminal.drain_bytes_per_sec` is present but zero, which would never drain.
+    #[error("`terminal.drain_bytes_per_sec` must be positive; zero would never drain")]
+    ZeroDrainRate,
     /// `expect` is `fail` but no `slice` says which slice will fix it.
     #[error("`expect = \"fail\"` requires `slice`")]
     ExpectedFailureWithoutSlice,
@@ -351,6 +354,9 @@ impl Scenario {
                 cols: self.terminal.cols,
                 rows: self.terminal.rows,
             });
+        }
+        if self.terminal.drain_bytes_per_sec == Some(0) {
+            errors.push(ValidationError::ZeroDrainRate);
         }
         if self.expect == Expect::Fail && self.slice.is_none() {
             errors.push(ValidationError::ExpectedFailureWithoutSlice);

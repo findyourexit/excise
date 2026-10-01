@@ -8,6 +8,7 @@
 //! |---|---|
 //! | `default` | the configuration defaults |
 //! | `deterministic` | reduced motion, loading animation off, one scan thread |
+//! | `reduced-motion` | reduced motion and loading animation off, thread count unchanged |
 //! | `monochrome-ascii` | the monochrome theme, ASCII symbols and borders |
 //! | `narrow` | a backend 60 columns wide, with the scenario's rows |
 //! | `mouse-keymaps` | mouse input, the Emacs key preset |
@@ -48,6 +49,7 @@ pub fn configure(
     let (options, animate_loading): (&[&str], bool) = match profile {
         Profile::Default | Profile::Narrow => (&[], true),
         Profile::Deterministic => (&["--reduced-motion", "--scan-threads", "1"], false),
+        Profile::ReducedMotion => (&["--reduced-motion"], false),
         Profile::MonochromeAscii => (&["--theme", "monochrome", "--ascii"], true),
         Profile::MouseKeymaps => (&["--mouse", "--keymap", "emacs"], true),
     };

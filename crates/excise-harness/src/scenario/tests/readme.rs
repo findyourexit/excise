@@ -34,6 +34,12 @@ fn toml_blocks(markdown: &str) -> Vec<&str> {
 fn every_toml_example_in_the_readme_parses_and_validates() {
     let mut complete_scenarios = 0;
     for block in toml_blocks(README) {
+        // A `budget = "..."` scalar belongs to a comparison file (`crate::comparison::Comparison`),
+        // not a scenario: a scenario's budget overrides are a `[budgets]` table of named limits.
+        // `crate::comparison::tests::readme` validates those blocks against that type instead.
+        if block.contains("\nbudget = \"") {
+            continue;
+        }
         let source = if block.starts_with("schema_version") {
             complete_scenarios += 1;
             block.to_owned()

@@ -1,0 +1,10 @@
+schema_version = 1
+name = "tui-complete-node-modules-2k-default"
+description = "Interactive time-to-COMPLETE under default motion against a headless scan of the same fixture, on the 2.4k-entry node_modules-shaped fixture."
+fixture = "node-modules-2k"
+budget = "tui_complete_ratio"
+profile = "default"
+pairs = 5
+timeout_ms = 60000
+tier = "full"
+platforms = ["macos"]

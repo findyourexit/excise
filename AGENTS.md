@@ -7,8 +7,8 @@ This file is canonical: `CLAUDE.md` and `.github/copilot-instructions.md` only p
 ## Layout
 
 - `src/`, `tests/`, `benches/`: the `excise` binary, its tests, and its benchmarks. `docs/` is the published documentation, with the `docs/safety/` contracts. `generated/` holds the man page and completions: `cargo generate` rewrites them and `cargo check-generated` verifies them.
-- `crates/excise-harness/`: the internal, unpublished validation harness: `scenarios/`, `fixtures/`, the runners, and `schemas/` (never `docs/schemas/`, which release archives ship).
-- `xtask/`: the `cargo xtask` commands: the harness runners (`e2e`, `headless`), repository checks, and release tooling.
+- `crates/excise-harness/`: the internal, unpublished validation harness: `scenarios/`, `fixtures/`, `comparisons/`, the runners, and `schemas/` (never `docs/schemas/`, which release archives ship).
+- `xtask/`: the `cargo xtask` commands: the harness runners (`e2e`, `headless`, `compare`), repository checks, and release tooling.
 
 ## Safety rules
 
@@ -41,6 +41,7 @@ cargo xtask e2e --quick            # pseudo-terminal scenarios, quick tier
 cargo xtask e2e --scenario NAME    # one scenario, whatever its tier
 cargo xtask headless --quick       # headless scans, checked against the fixture oracle and timed against `du`
 cargo xtask bench-e2e --baseline main --fixture ID   # paired A/B evidence against another build
+cargo xtask compare --full         # ratio budgets (motion_complete_ratio, tui_complete_ratio) between two runs of one binary
 ```
 
 `e2e` builds the release binary first, or uses the one named by `EXCISE_E2E_BINARY`. `cargo verify` is the complete local suite and needs more tools than the gate; see [docs/development.md](docs/development.md).

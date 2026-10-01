@@ -63,7 +63,7 @@
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
     },
     "profile": {
-      "enum": ["default", "deterministic", "monochrome-ascii", "narrow", "mouse-keymaps"]
+      "enum": ["default", "deterministic", "reduced-motion", "monochrome-ascii", "narrow", "mouse-keymaps"]
     },
     "verdict": {
       "description": "xpass means an expected failure passed; it fails the run.",

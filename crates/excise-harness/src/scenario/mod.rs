@@ -60,6 +60,11 @@ string_enum! {
         Default => "default",
         /// Reduced motion and a single scan thread.
         Deterministic => "deterministic",
+        /// Reduced motion only, with every other setting (including scan threads) left at the
+        /// user defaults. The motion baseline for `motion_complete_ratio` and `tui_complete_ratio`
+        /// (see [`Budget`]): unlike `deterministic`, it isolates motion from thread count, so a
+        /// real motion-driven slowdown cannot hide behind extra threads.
+        ReducedMotion => "reduced-motion",
         /// Monochrome output with ASCII symbols and borders.
         MonochromeAscii => "monochrome-ascii",
         /// A narrow terminal.
@@ -107,7 +112,7 @@ string_enum! {
         HeadlessScanRatio => "headless_scan_ratio",
         /// Ratio of interactive time-to-COMPLETE to headless scan time.
         TuiCompleteRatio => "tui_complete_ratio",
-        /// Ratio of default-motion time-to-COMPLETE to deterministic time-to-COMPLETE.
+        /// Ratio of default-motion time-to-COMPLETE to reduced-motion time-to-COMPLETE.
         MotionCompleteRatio => "motion_complete_ratio",
         /// The 99th percentile of input-to-frame latency, in milliseconds.
         InputToFrameP99Ms => "input_to_frame_p99_ms",
@@ -148,6 +153,12 @@ pub struct Terminal {
     pub cols: u16,
     /// Height in rows.
     pub rows: u16,
+    /// Caps how fast the pseudo-terminal runner's reader drains this scenario's output, in bytes
+    /// per second, so it can simulate a slow terminal and the backpressure it puts on the child's
+    /// writes. `None` (the default) drains as fast as the operating system delivers bytes; the
+    /// in-process and headless runners, which have no pseudo-terminal, ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_bytes_per_sec: Option<u64>,
 }
 
 impl Default for Terminal {
@@ -155,6 +166,7 @@ impl Default for Terminal {
         Self {
             cols: DEFAULT_TERMINAL_COLS,
             rows: DEFAULT_TERMINAL_ROWS,
+            drain_bytes_per_sec: None,
         }
     }
 }

@@ -13,9 +13,9 @@ pub const NARROW_COLS: u16 = 60;
 /// What a profile changes for a process runner.
 ///
 /// The table is the one in the harness README: `default` changes nothing, `deterministic` asks
-/// for reduced motion and one scan thread, `monochrome-ascii` for the monochrome theme and ASCII
-/// symbols, `narrow` for a 60-column terminal, and `mouse-keymaps` for mouse input and the Emacs
-/// key preset.
+/// for reduced motion and one scan thread, `reduced-motion` asks for reduced motion alone,
+/// `monochrome-ascii` for the monochrome theme and ASCII symbols, `narrow` for a 60-column
+/// terminal, and `mouse-keymaps` for mouse input and the Emacs key preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileSettings {
     /// The environment variables the profile sets, on top of the isolation environment.
@@ -35,6 +35,10 @@ impl ProfileSettings {
             },
             Profile::Deterministic => Self {
                 env: &[("EXCISE_REDUCED_MOTION", "1"), ("EXCISE_SCAN_THREADS", "1")],
+                cols: None,
+            },
+            Profile::ReducedMotion => Self {
+                env: &[("EXCISE_REDUCED_MOTION", "1")],
                 cols: None,
             },
             Profile::MonochromeAscii => Self {
@@ -229,6 +233,10 @@ mod tests {
         let deterministic = env_of(Profile::Deterministic);
         assert_eq!(value(&deterministic, "EXCISE_REDUCED_MOTION"), Some("1"));
         assert_eq!(value(&deterministic, "EXCISE_SCAN_THREADS"), Some("1"));
+
+        let reduced_motion = env_of(Profile::ReducedMotion);
+        assert_eq!(value(&reduced_motion, "EXCISE_REDUCED_MOTION"), Some("1"));
+        assert_eq!(value(&reduced_motion, "EXCISE_SCAN_THREADS"), None);
 
         let monochrome = env_of(Profile::MonochromeAscii);
         assert_eq!(value(&monochrome, "EXCISE_THEME"), Some("monochrome"));

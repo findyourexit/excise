@@ -15,8 +15,12 @@
 //!   the oracle under the accounting contract, and times the scan against `du -sk`.
 //! * [`bench`] builds or accepts two `excise` binaries and compares them with paired, interleaved
 //!   A/B runs (`cargo xtask bench-e2e`), recording the result as a `harness-ab` document.
+//! * [`comparison`] checks a ratio budget (`motion_complete_ratio`, `tui_complete_ratio`) between
+//!   two runs of one binary: another profile of the same interactive scenario, or a headless
+//!   scan of the same fixture (`cargo xtask compare`).
 
 pub mod bench;
+pub mod comparison;
 pub mod events;
 pub mod fixture;
 pub mod headless;
