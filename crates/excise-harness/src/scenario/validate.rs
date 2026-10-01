@@ -9,7 +9,8 @@ use super::{
     Profile, SCHEMA_VERSION, Scenario,
     path::{PathViolation, check_fixture_relative_path},
     step::{
-        EventField, EventKind, ExpectFs, ExpectScreen, Marker, Region, Step, WaitEvent, WaitText,
+        EventField, EventKind, ExpectFs, ExpectScreen, Idle, Marker, Region, Step, WaitEvent,
+        WaitText,
     },
 };
 use crate::platform::PLATFORMS;
@@ -258,6 +259,14 @@ pub enum StepError {
         /// The measurement name.
         name: String,
     },
+    /// An `idle` duration field is zero or above the cap.
+    #[error("`{field}` is {value}, but must be between 1 and {MAX_TIMEOUT_MS}")]
+    DurationOutOfRange {
+        /// The field that holds the value.
+        field: &'static str,
+        /// The offending value.
+        value: u64,
+    },
 }
 
 /// Every rule a scenario breaks, in scenario order.
@@ -483,6 +492,7 @@ fn check_step(step: &Step) -> Vec<StepError> {
         Step::ExpectFs(step) => check_expect_fs(step, &mut errors),
         Step::ExpectBudget(step) => check_identifier("metric", &step.metric, &mut errors),
         Step::Measure(step) => check_identifier("name", &step.name, &mut errors),
+        Step::Idle(step) => check_idle(step, &mut errors),
         Step::WaitHeader(_)
         | Step::Key(_)
         | Step::Signal(_)
@@ -512,6 +522,14 @@ fn check_wait_event(step: &WaitEvent, errors: &mut Vec<StepError>) {
                 event: step.event,
                 field,
             });
+        }
+    }
+}
+
+fn check_idle(step: &Idle, errors: &mut Vec<StepError>) {
+    for (field, value) in [("after_ms", step.after_ms), ("window_ms", step.window_ms)] {
+        if !(1..=MAX_TIMEOUT_MS).contains(&value) {
+            errors.push(StepError::DurationOutOfRange { field, value });
         }
     }
 }

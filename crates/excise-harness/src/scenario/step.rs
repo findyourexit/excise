@@ -64,6 +64,8 @@ pub enum Step {
     ExpectBudget(ExpectBudget),
     /// Mark the start or the stop of a named measurement.
     Measure(Measure),
+    /// Measure the program's idle output and CPU over a quiet window.
+    Idle(Idle),
     /// Wait until the program has processed everything sent so far.
     Settle(Settle),
     /// Perform the ordinary confirmed quit.
@@ -72,7 +74,7 @@ pub enum Step {
 
 impl Step {
     /// Every name accepted in the `step` field, in documentation order.
-    pub const KINDS: [&'static str; 19] = [
+    pub const KINDS: [&'static str; 20] = [
         "wait_text",
         "wait_header",
         "wait_event",
@@ -90,6 +92,7 @@ impl Step {
         "expect_exit",
         "expect_budget",
         "measure",
+        "idle",
         "settle",
         "quit",
     ];
@@ -115,6 +118,7 @@ impl Step {
             Self::ExpectExit(_) => "expect_exit",
             Self::ExpectBudget(_) => "expect_budget",
             Self::Measure(_) => "measure",
+            Self::Idle(_) => "idle",
             Self::Settle(_) => "settle",
             Self::Quit(_) => "quit",
         }
@@ -141,7 +145,8 @@ impl Step {
             | Self::ExpectScreen(_)
             | Self::ExpectFs(_)
             | Self::ExpectBudget(_)
-            | Self::Measure(_) => None,
+            | Self::Measure(_)
+            | Self::Idle(_) => None,
         }
     }
 }
@@ -521,6 +526,22 @@ pub struct Measure {
     pub name: String,
     /// Which end this step marks.
     pub marker: Marker,
+}
+
+/// Measures the program's idle output and CPU over a quiet window.
+///
+/// Sends nothing. Waits `after_ms`, then measures over `window_ms` the terminal output bytes and
+/// the child's live CPU time, recording them as the metrics `idle_output_bytes` and
+/// `idle_cpu_ms`. Both durations are unconditional, unlike every waiting step above: there is no
+/// condition to satisfy and so no `timeout_ms`. Pseudo-terminal only: the in-process runner has no
+/// separate process to sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Idle {
+    /// How long to wait, sending nothing, before the measurement window starts.
+    pub after_ms: u64,
+    /// How long the measurement window lasts.
+    pub window_ms: u64,
 }
 
 /// Waits until the program has processed everything sent so far.

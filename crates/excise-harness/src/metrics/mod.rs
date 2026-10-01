@@ -21,6 +21,7 @@
 //! | `scan_store_peak_bytes` | Peak total apparent size of the run's scan-store directory, seen in a sample. |
 //! | `scan_store_bytes_per_entry` | `scan_store_peak_bytes` divided by `scan_complete`'s `entries`. |
 //! | `user_ms`, `sys_ms` | CPU time of the child, from the change in `RUSAGE_CHILDREN`. |
+//! | `idle_output_bytes`, `idle_cpu_ms` | Terminal output bytes and the child's live CPU time over an `idle` step's window. |
 //! | `residue_files` | Entries left in the scratch area after the exit. |
 //! | any `measure` name | Elapsed milliseconds between its `start` and `stop`. |
 //!
@@ -42,13 +43,16 @@
 //! * **CPU time** is the change in the CPU time of all reaped children around this child's life.
 //!   It is exact when the harness reaps one child at a time, as `cargo xtask e2e` does; a process
 //!   that reaps other children concurrently would fold their time in.
+//! * **Idle CPU** (`idle_cpu_ms`) is sampled live, twice, while the child still runs, not from
+//!   `RUSAGE_CHILDREN` after it is reaped: the reaped figure accumulates the child's whole life
+//!   and cannot isolate one window. See [`sample::live_cpu_ms`].
 
 mod sample;
 mod store;
 
 use std::{collections::BTreeMap, time::Duration, time::Instant};
 
-pub use sample::ProcessSampler;
+pub use sample::{ProcessSampler, live_cpu_ms};
 pub use store::StoreSampler;
 
 use crate::events::{Event, Payload};
@@ -180,6 +184,12 @@ impl Recorder {
         let elapsed = milliseconds(at.saturating_duration_since(started));
         self.measures.insert(name.to_owned(), elapsed);
         Some(elapsed)
+    }
+
+    /// Records the metric `name` as `value` directly, for a step that measures something itself
+    /// instead of timing a start and a stop, for example `idle`'s output bytes and CPU.
+    pub fn record_metric(&mut self, name: &str, value: f64) {
+        self.measures.insert(name.to_owned(), value);
     }
 
     /// The isolated input timings so far: each input's latency in milliseconds.
@@ -625,6 +635,19 @@ mod tests {
         assert!(elapsed.is_some_and(|ms| (ms - 50.0).abs() < 1e-6));
         assert!((finish(&recorder, &[], start, 100)["delete-window"] - 50.0).abs() < 1e-6);
         assert_eq!(recorder.stop_measure("never-started", start), None);
+    }
+
+    #[test]
+    fn a_recorded_metric_appears_in_the_finished_map_untouched() {
+        let start = Instant::now();
+        let mut recorder = Recorder::new(start);
+
+        recorder.record_metric("idle_output_bytes", 0.0);
+        recorder.record_metric("idle_cpu_ms", 12.5);
+
+        let metrics = finish(&recorder, &[], start, 100);
+        assert!((metrics["idle_output_bytes"] - 0.0).abs() < f64::EPSILON);
+        assert!((metrics["idle_cpu_ms"] - 12.5).abs() < 1e-6);
     }
 
     #[test]

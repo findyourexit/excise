@@ -732,6 +732,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::metrics::live_cpu_ms;
     use crate::safety::process_group_exists;
 
     fn shell(script: &str) -> SpawnSpec {
@@ -1022,6 +1023,68 @@ mod tests {
 
         assert!(session.sampler().samples() >= 1, "{:?}", session.sampler());
         assert!(session.cpu_time().is_some());
+    }
+
+    /// Drives the session for exactly `duration`, discarding what it sees: the control below
+    /// needs a fixed window, not a condition to wait for.
+    fn pump_for(session: &mut PtySession, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        loop {
+            session.pump().expect("pump");
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            session
+                .wait_activity((deadline - now).min(Duration::from_millis(5)))
+                .expect("wait");
+        }
+    }
+
+    /// The control the idle measurement needs: a stub that is known, independently of `excise`,
+    /// to write nothing and spend no CPU must read back as exactly that through the same session
+    /// primitives the `idle` step uses (`output_bytes`, `live_cpu_ms`).
+    #[test]
+    fn a_sleeping_stub_shows_no_output_and_almost_no_cpu() {
+        let mut session = PtySession::spawn(&shell("sleep 2")).expect("spawn");
+        pump_for(&mut session, Duration::from_millis(50)); // let it actually start running
+
+        let start_bytes = session.output_bytes();
+        let start_cpu = live_cpu_ms(session.pid()).expect("a live sample");
+
+        pump_for(&mut session, Duration::from_millis(800));
+
+        let output_bytes = session.output_bytes() - start_bytes;
+        let cpu_ms = live_cpu_ms(session.pid()).expect("a live sample") - start_cpu;
+        session.kill();
+
+        assert_eq!(output_bytes, 0, "a sleeping process should write nothing");
+        assert!(
+            cpu_ms < 50.0,
+            "a sleeping process should spend almost no CPU, read {cpu_ms} ms"
+        );
+    }
+
+    /// The other half of the same control: a stub that is known to spend the whole window
+    /// runnable, never blocked, must read back CPU time clearly above zero.
+    #[test]
+    fn a_busy_looping_stub_shows_cpu_clearly_above_zero() {
+        let mut session = PtySession::spawn(&shell("while :; do :; done")).expect("spawn");
+        pump_for(&mut session, Duration::from_millis(50));
+
+        let start_cpu = live_cpu_ms(session.pid()).expect("a live sample");
+        pump_for(&mut session, Duration::from_millis(800));
+        let cpu_ms = live_cpu_ms(session.pid()).expect("a live sample") - start_cpu;
+        session.kill();
+
+        // A sleeping stub reads back exactly 0 ms (its own test above), so any margin above 0
+        // already distinguishes it from a busy one; 15 ms needs only 2% of a core over the 800 ms
+        // window, generous headroom on a host whose other load can leave a runnable thread far
+        // short of a full core (observed 104 ms under load average 14 on 10 cores).
+        assert!(
+            cpu_ms > 15.0,
+            "an 800 ms busy loop should accumulate real CPU time, read {cpu_ms} ms"
+        );
     }
 
     /// `close_console` is shared, platform-independent code: on Unix it closes the pty master

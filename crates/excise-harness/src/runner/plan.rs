@@ -170,6 +170,7 @@ fn prepare_step(scenario: &Scenario, index: usize, step: &Step) -> Result<Prepar
         | Step::Resize(_)
         | Step::ExpectFs(_)
         | Step::Measure(_)
+        | Step::Idle(_)
         | Step::Settle(_)
         | Step::Quit(_)
         | Step::FsMutate(_) => Ok(Prepared::Nothing),
@@ -253,6 +254,7 @@ pub(crate) fn describe_step(step: &Step) -> String {
             format!("expect_budget {} of {}", expect.budget, expect.metric)
         }
         Step::Measure(measure) => format!("measure {} {}", measure.marker, measure.name),
+        Step::Idle(idle) => format!("idle after {} ms for {} ms", idle.after_ms, idle.window_ms),
         Step::Settle(_) => "settle".to_owned(),
         Step::Quit(_) => "quit".to_owned(),
     }

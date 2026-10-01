@@ -308,12 +308,14 @@ impl ScenarioInput {
             Step::Select(select) => self.select(select),
             Step::Delete(delete) => self.delete(delete),
             Step::Quit(quit) => self.quit(*quit),
-            Step::Signal(_) | Step::WaitEvent(_) | Step::ExpectBudget(_) | Step::Measure(_) => {
-                fail(
-                    "a step the in-process runner can perform",
-                    "the plan should have refused this step before the run",
-                )
-            }
+            Step::Signal(_)
+            | Step::WaitEvent(_)
+            | Step::ExpectBudget(_)
+            | Step::Measure(_)
+            | Step::Idle(_) => fail(
+                "a step the in-process runner can perform",
+                "the plan should have refused this step before the run",
+            ),
         }
     }
 

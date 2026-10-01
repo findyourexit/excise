@@ -110,6 +110,10 @@ pub fn unsupported_steps(scenario: &Scenario) -> Vec<UnsupportedStep> {
                 "timing and resources are never judged in-process: the barrier drains the owner \
                  loop outside the production scheduling path",
             ),
+            Step::Idle(_) => Some(
+                "the idle window measures a live process's output and CPU, which an in-process \
+                 run has neither: there is no separate process and no terminal byte count",
+            ),
             Step::ExpectExit(exit) if !exit.terminal_restored => {
                 Some("an in-process run cannot leave the terminal unrestored")
             }
@@ -208,6 +212,7 @@ pub fn describe(step: &Step) -> String {
         Step::ExpectExit(exit) => format!("expect_exit code {}", exit.code),
         Step::ExpectBudget(budget) => format!("expect_budget {}", budget.budget),
         Step::Measure(measure) => format!("measure {} {}", measure.name, measure.marker),
+        Step::Idle(idle) => format!("idle after {} ms for {} ms", idle.after_ms, idle.window_ms),
         Step::Settle(_) => "settle".to_owned(),
         Step::Quit(_) => "quit".to_owned(),
     }

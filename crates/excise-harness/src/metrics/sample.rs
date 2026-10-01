@@ -9,6 +9,14 @@
 //!   thread count) and counts the entries of `/proc/<pid>/fd`.
 //! * Other platforms report nothing. In particular Windows has no safe wrapper in this workspace,
 //!   so a Windows run has no memory, thread, or descriptor figures.
+//! * **A live CPU sample** (`live_cpu_ms`) answers for a process that is still running, so a step
+//!   can isolate one window instead of a whole process life. On macOS the task's accounted CPU
+//!   time comes back in the Mach timebase's raw ticks, not nanoseconds (about 42 ns each on
+//!   Apple Silicon; a plain cast would under-report by that factor). Linux's equivalent is clock
+//!   ticks (`/proc/<pid>/stat`, divided by `sysconf(_SC_CLK_TCK)`, commonly 100 Hz). Neither
+//!   conversion has a safe wrapper of its own in this workspace, so `live_cpu_ms` reuses
+//!   `sysinfo`'s existing, tested one (`Process::accumulated_cpu_time`) instead of a second,
+//!   hand-rolled copy.
 //!
 //! The sampler reads one process by pid, so it measures that child alone. `RUSAGE_CHILDREN` cannot:
 //! its `ru_maxrss` is a high-water mark over every child the harness ever reaped.
@@ -149,6 +157,39 @@ fn read(_pid: u32) -> Option<Reading> {
     None
 }
 
+/// The live CPU time `pid` has used since it started, in milliseconds (user and system
+/// combined), or `None` where the process cannot be found. Unlike [`ProcessSampler`], this
+/// answers once for a process that is still running: a caller samples it at the start and the
+/// end of a window and takes the difference, which `RUSAGE_CHILDREN` cannot do (it is a
+/// high-water mark over the child's whole life, read only after it is reaped).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[must_use]
+pub fn live_cpu_ms(pid: u32) -> Option<f64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let target = Pid::from_u32(pid);
+    let mut system = System::new();
+    if system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(std::slice::from_ref(&target)),
+        false,
+        ProcessRefreshKind::nothing().with_cpu(),
+    ) == 0
+    {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    system
+        .process(target)
+        .map(|process| process.accumulated_cpu_time() as f64)
+}
+
+/// The live CPU time of `pid`. Windows has no safe wrapper in this workspace.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[must_use]
+pub fn live_cpu_ms(_pid: u32) -> Option<f64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +266,32 @@ mod tests {
         );
         assert!(sampler.max_threads().is_some_and(|threads| threads >= 1));
         assert!(sampler.max_fds().is_some_and(|fds| fds >= 3));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn live_cpu_ms_reads_the_running_test_process_and_grows_with_real_work() {
+        let pid = std::process::id();
+        let before = live_cpu_ms(pid).expect("a live sample of the running test process");
+
+        // Burn CPU on this thread for a bit so the accumulated total visibly moves.
+        let start = std::time::Instant::now();
+        let mut acc: u64 = 0;
+        while start.elapsed() < std::time::Duration::from_millis(200) {
+            acc = acc.wrapping_add(1);
+        }
+        std::hint::black_box(acc);
+
+        let after = live_cpu_ms(pid).expect("a second live sample");
+        assert!(
+            after > before,
+            "200 ms of real CPU-bound work should move the accumulated total: {before} -> {after}"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn live_cpu_ms_is_none_for_a_pid_that_does_not_exist() {
+        assert_eq!(live_cpu_ms(999_999), None);
     }
 }

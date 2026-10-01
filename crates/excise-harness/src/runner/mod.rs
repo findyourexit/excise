@@ -44,6 +44,9 @@
 //! * **`fs_mutate`** applies the fixture generator's mutator (`fixture::mutate::apply`) when the
 //!   step runs. The mutated path is then an intended change: `expect_exit` accepts differences at
 //!   that path, below it, and in the directories the mutation created above it, and nothing else.
+//! * **`idle`** sends nothing, waits `after_ms`, then measures over `window_ms` the terminal
+//!   output bytes and the child's live CPU time (`metrics::live_cpu_ms`, not sampled on Windows),
+//!   recording them as `idle_output_bytes` and `idle_cpu_ms`.
 //! * A step's `timeout_ms` bounds the whole step, not each wait inside it.
 //!
 //! # Profiles
