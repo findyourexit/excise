@@ -440,6 +440,14 @@ impl PtySession {
         }
     }
 
+    /// Runs the command named by `EXCISE_HARNESS_DIAGNOSTIC_COMMAND` against this session's
+    /// child, for a timed-out step's failure detail and the bundle's `screen.txt`. `None` when
+    /// the variable is unset. See [`diagnostic_command`](super::diagnostic_command).
+    #[must_use]
+    pub fn sample_process(&self) -> Option<String> {
+        super::diagnostic_command::sample(self.pid)
+    }
+
     /// The resource samples of the child.
     #[must_use]
     pub const fn sampler(&self) -> &ProcessSampler {

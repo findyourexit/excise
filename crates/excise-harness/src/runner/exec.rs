@@ -320,12 +320,17 @@ impl<'a> Executor<'a> {
         match waited {
             Waited::TimedOut => {
                 let diagnostics = self.session.diagnostics();
+                let sampled = self
+                    .session
+                    .sample_process()
+                    .map(|text| format!("\n{text}"))
+                    .unwrap_or_default();
                 let stop = self.fail(
                     index,
                     FailureCause::Timeout,
                     expected,
                     format!(
-                        "not within {timeout_ms} ms; {}\nsession: {diagnostics}",
+                        "not within {timeout_ms} ms; {}\nsession: {diagnostics}{sampled}",
                         observed()
                     ),
                 );
