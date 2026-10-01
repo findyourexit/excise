@@ -1056,6 +1056,23 @@ mod tests {
         }
     }
 
+    /// Validates the document at `path` against `schema`.
+    #[cfg(unix)]
+    fn validate_against_schema(schema: &str, path: &Path) {
+        let schema = serde_json::from_str(schema).expect("a schema");
+        let validator = jsonschema::draft202012::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .expect("the schema compiles");
+        let text = fs::read_to_string(path).expect("a document");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+        let violations: Vec<String> = validator
+            .iter_errors(&document)
+            .map(|error| error.to_string())
+            .collect();
+        assert!(violations.is_empty(), "{}: {violations:?}", path.display());
+    }
+
     /// A stand-in for `excise` that prints its version and then exits at once: the run fails, and
     /// the matrix still reports it.
     #[cfg(unix)]
@@ -1081,27 +1098,105 @@ mod tests {
             "{:?}",
             record.report.error
         );
-        let validate = |schema: &str, path: &Path| {
-            let schema = serde_json::from_str(schema).expect("a schema");
-            let validator = jsonschema::draft202012::options()
-                .should_validate_formats(true)
-                .build(&schema)
-                .expect("the schema compiles");
-            let text = fs::read_to_string(path).expect("a document");
-            let document: serde_json::Value = serde_json::from_str(&text).expect("JSON");
-            let violations: Vec<String> = validator
-                .iter_errors(&document)
-                .map(|error| error.to_string())
-                .collect();
-            assert!(violations.is_empty(), "{}: {violations:?}", path.display());
-        };
-        validate(HarnessSummary::SCHEMA_JSON, &report.summary_path);
+        validate_against_schema(HarnessSummary::SCHEMA_JSON, &report.summary_path);
         let bundle = record
             .report
             .bundle
             .as_ref()
             .expect("a failed run leaves a bundle");
-        validate(HarnessFailure::SCHEMA_JSON, &bundle.join("failure.json"));
+        validate_against_schema(HarnessFailure::SCHEMA_JSON, &bundle.join("failure.json"));
+    }
+
+    /// A scenario whose one step waits for text `excise` never prints, bounded by a short
+    /// timeout: the shape needed to force a step to time out with the child still running,
+    /// rather than exiting first.
+    #[cfg(unix)]
+    fn timeout_probe_scenario() -> Scenario {
+        Scenario::from_toml_str(
+            "schema_version = 1\n\
+             name = \"timeout-probe\"\n\
+             description = \"A step that can never be satisfied, so it always times out.\"\n\
+             fixture = \"wide-1k\"\n\
+             profiles = [\"default\"]\n\
+             [[steps]]\n\
+             step = \"wait_text\"\n\
+             text = \"text that excise never prints\"\n\
+             timeout_ms = 300\n",
+        )
+        .expect("a valid scenario")
+    }
+
+    /// A stand-in for `excise` that writes a little output and then hangs well past the
+    /// scenario's 300 ms step timeout, so the step times out with the child still alive instead
+    /// of exiting first: the shape `PtySession::diagnostics` is captured for.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_step_leaves_a_bundle_whose_session_diagnostics_match_the_schema() {
+        use crate::report::HarnessFailure;
+
+        let work = tempfile::tempdir().expect("a temporary directory");
+        let program = stub(
+            work.path(),
+            "excise",
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && exit 0\nprintf 'booting up\\n'\nsleep 5\nexit 0\n",
+        );
+        let options = E2eOptions {
+            binary: program,
+            tier: Tier::Quick,
+            scenarios: vec![timeout_probe_scenario()],
+            named: false,
+            profiles: vec![Profile::Default],
+            repeat: 1,
+            keep_fixture: false,
+            out_root: work.path().join("out"),
+            work_dir: Some(work.path().to_path_buf()),
+            git_sha: "0".repeat(40),
+        };
+
+        let report = run_e2e(&options, |_| {}).expect("the matrix runs");
+
+        assert!(!report.is_success());
+        let record = &report.records[0];
+        assert_eq!(
+            record.report.verdict,
+            Verdict::Fail,
+            "{:?}",
+            record.report.error
+        );
+        let failure = record.report.failure.as_ref().expect("a failed step");
+        assert_eq!(
+            failure.cause,
+            crate::runner::FailureCause::Timeout,
+            "{failure}"
+        );
+        let diagnostics = failure
+            .session_diagnostics
+            .as_ref()
+            .expect("a timed-out step records session diagnostics");
+        assert!(diagnostics.output_bytes > 0, "{diagnostics:?}");
+        assert!(diagnostics.first_byte_after.is_some(), "{diagnostics:?}");
+        assert!(
+            diagnostics.exit.is_none(),
+            "the child was still running when the step timed out"
+        );
+
+        let bundle = record
+            .report
+            .bundle
+            .as_ref()
+            .expect("a failed run leaves a bundle");
+        let failure_path = bundle.join("failure.json");
+        validate_against_schema(HarnessFailure::SCHEMA_JSON, &failure_path);
+
+        let text = fs::read_to_string(&failure_path).expect("a document");
+        let document = HarnessFailure::from_json_str(&text).expect("a harness-failure document");
+        let recorded = document
+            .session_diagnostics
+            .expect("the document records session diagnostics");
+        assert!(recorded.output_bytes > 0, "{recorded:?}");
+        assert!(recorded.first_byte_after_ms.is_some(), "{recorded:?}");
+        assert!(recorded.child_running, "{recorded:?}");
+        assert!(recorded.head.contains("booting up"), "{recorded:?}");
     }
 
     #[cfg(unix)]

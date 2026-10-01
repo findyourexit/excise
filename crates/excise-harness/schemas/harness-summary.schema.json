@@ -91,7 +91,7 @@
         "verdict": { "$ref": "#/$defs/verdict" },
         "duration_ms": { "$ref": "#/$defs/unsigned" },
         "metrics": {
-          "description": "Named measurements. Every value is a finite number.",
+          "description": "Named measurements. Every value is a finite number. This is a deliberately open map: the harness does not constrain which metric names appear, since each scenario and fixture names its own (for example `peak_rss_bytes`, `idle_output_bytes`, `idle_cpu_ms`, `scan_store_peak_bytes`, `scan_store_bytes_per_entry`, `cgroup_memory_peak_bytes`, `threads`, `fds`, `residue_files`, a headless fixture's `memory_budget_bytes` and oracle-diff counts, or any scenario `measure` name). Consumers must not assume a fixed set of keys.",
           "type": "object",
           "propertyNames": { "$ref": "#/$defs/identifier" },
           "additionalProperties": { "type": "number" }

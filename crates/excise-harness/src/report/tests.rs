@@ -9,7 +9,7 @@ use super::{
     AbContext, AbFixture, AbKind, AbVerdict, BinaryIdentity, BuildIdentity, ConfidenceInterval,
     Document, FailedStep, FailureKind, FixtureIdentity, HarnessAb, HarnessFailure, HarnessSummary,
     MetricComparison, Rusage, SCHEMA_VERSION, Samples, ScenarioResult, SchemaVersion,
-    ScreenComparison, Side, SummaryKind, TerminalModes, Tier, Verdict,
+    ScreenComparison, SessionDiagnostics, Side, SummaryKind, TerminalModes, Tier, Verdict,
 };
 use crate::scenario::{Expect, Profile};
 
@@ -90,6 +90,7 @@ fn failure() -> HarnessFailure {
             echo: false,
             icanon: false,
         },
+        session_diagnostics: None,
         cast_path: "target/excise-e2e/run/delete-folder-lifecycle.cast".to_owned(),
         rusage: Rusage {
             max_rss_bytes: 20_971_520,
@@ -103,6 +104,28 @@ fn failure() -> HarnessFailure {
         repro_command:
             "cargo xtask e2e --scenario delete-folder-lifecycle --profile monochrome-ascii"
                 .to_owned(),
+    }
+}
+
+/// A failure whose cause was a step timing out, with the session's diagnostics recorded: the
+/// counterpart to [`failure`], whose cause leaves `session_diagnostics` absent.
+fn timeout_failure() -> HarnessFailure {
+    HarnessFailure {
+        failed_step: FailedStep {
+            index: 0,
+            description: "wait_header expects complete [Timeout]: not within 5000 ms; the \
+                           header shows nothing yet"
+                .to_owned(),
+        },
+        session_diagnostics: Some(SessionDiagnostics {
+            output_bytes: 412,
+            first_byte_after_ms: Some(18),
+            child_running: true,
+            cursor_reports_answered: 1,
+            head: "booting up".to_owned(),
+            tail: "still scanning".to_owned(),
+        }),
+        ..failure()
     }
 }
 
@@ -411,13 +434,14 @@ fn serialized_documents_validate_against_their_schemas() {
     assert_valid(&summary());
     assert_valid(&minimal_summary());
     assert_valid(&failure());
+    assert_valid(&timeout_failure());
     assert_valid(&ab());
 }
 
 #[test]
 fn schemas_and_types_declare_exactly_the_same_fields() {
     assert_schema_and_types_declare_the_same_fields(&summary());
-    assert_schema_and_types_declare_the_same_fields(&failure());
+    assert_schema_and_types_declare_the_same_fields(&timeout_failure());
     assert_schema_and_types_declare_the_same_fields(&ab());
 }
 
@@ -564,7 +588,7 @@ fn the_summary_schema_rejects_contract_drift() {
 #[test]
 fn the_failure_schema_rejects_contract_drift() {
     assert_rejected(
-        &failure(),
+        &timeout_failure(),
         &[
             ("an undeclared field", &|d| d["extra"] = true.into()),
             ("an undeclared nested field", &|d| {
@@ -604,6 +628,25 @@ fn the_failure_schema_rejects_contract_drift() {
             }),
             ("an unknown profile", &|d| {
                 set(d, "/profile", "fancy".into());
+            }),
+            ("an undeclared field inside session diagnostics", &|d| {
+                d["session_diagnostics"]["extra"] = true.into();
+            }),
+            ("a non-boolean child_running", &|d| {
+                set(d, "/session_diagnostics/child_running", "yes".into());
+            }),
+            ("a negative cursor_reports_answered", &|d| {
+                set(
+                    d,
+                    "/session_diagnostics/cursor_reports_answered",
+                    (-1).into(),
+                );
+            }),
+            ("a missing session diagnostics head", &|d| {
+                remove(d, "/session_diagnostics/head");
+            }),
+            ("a negative first_byte_after_ms", &|d| {
+                set(d, "/session_diagnostics/first_byte_after_ms", (-1).into());
             }),
         ],
     );
@@ -718,6 +761,7 @@ fn documents_render_a_canonical_form_that_round_trips() {
     assert_round_trips(&summary());
     assert_round_trips(&minimal_summary());
     assert_round_trips(&failure());
+    assert_round_trips(&timeout_failure());
     assert_round_trips(&ab());
 }
 

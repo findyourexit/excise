@@ -29,7 +29,7 @@ pub use ab::{
 };
 pub use failure::{
     FailedStep, FailureKind, FixtureIdentity, HarnessFailure, Rusage, ScreenComparison,
-    TerminalModes,
+    SessionDiagnostics, TerminalModes,
 };
 pub use summary::{BinaryIdentity, HarnessSummary, ScenarioResult, SummaryKind, Tier, Verdict};
 

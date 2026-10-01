@@ -1169,11 +1169,25 @@ Machine output is versioned JSON. Every document carries a `document_kind` and a
 (`1`), like the published Excise scan report, and has a draft 2020-12 schema with
 `additionalProperties: false`.
 
-| Document | `document_kind` | Schema | What it is |
-|---|---|---|---|
-| Summary | `harness-summary` | [`harness-summary.schema.json`](schemas/harness-summary.schema.json) | The result of one run: run id, tier, times, host, the binary's path and SHA-256, the git SHA, and a verdict, duration, and metrics for each scenario and profile. |
-| Failure bundle | `harness-failure` | [`harness-failure.schema.json`](schemas/harness-failure.schema.json) | The evidence for one failed scenario: the failed step, expected and actual screen text, terminal modes, the recording path, resource use, the fixture hash and seed, and a command that reruns it. |
-| A/B evidence | `harness-ab` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under (the fixtures compared, the host, the toolchain, the power state, the load average, and concurrent `excise` processes). |
+| Document | `document_kind` | `schema_version` | Written by | Schema | What it is |
+|---|---|---|---|---|---|
+| Summary | `harness-summary` | 1 | `cargo xtask e2e` and `cargo xtask headless` (one schema, both commands; see below) | [`harness-summary.schema.json`](schemas/harness-summary.schema.json) | The result of one run: run id, tier, times, host, the binary's path and SHA-256, the git SHA, and a verdict, duration, and an open map of named metrics for each scenario and profile (or, under `headless`, each fixture). |
+| Failure bundle | `harness-failure` | 1 | `cargo xtask e2e` | [`harness-failure.schema.json`](schemas/harness-failure.schema.json) | The evidence for one failed scenario: the failed step, expected and actual screen text, terminal modes, the session's diagnostics (present only when the step timed out; see [Runner semantics](#runner-semantics)), the recording path, resource use, the fixture hash and seed, and a command that reruns it. |
+| A/B evidence | `harness-ab` | 1 | `cargo xtask bench-e2e` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under (the fixtures compared, the host, the toolchain, the power state, the load average, and concurrent `excise` processes). |
+
+`cargo xtask headless` writes a `harness-summary`, not a separate document kind: a headless run is
+one more kind of scenario result, named `headless-<fixture>`, whose open `metrics` map carries the
+oracle-diff and `du -sk` figures instead of pseudo-terminal ones (see
+[headless's own **Output**](#headless-runner) for the names). `cargo xtask compare` writes no
+document at all: it only prints the verdict table, because a ratio-budget comparison's evidence
+(the paired samples and the ratio) is exactly a `harness-ab` row running against this crate's own
+binary, and a future slice may fold it into one if that evidence needs to be kept.
+
+A `metrics` map is deliberately open: the harness does not constrain which names appear, and the
+schemas say so rather than enumerating them (a scenario's own `measure` names, a fixture's class,
+or a future metric all pass through unchanged). Fixed-shape fields (identities, verdicts, the
+profile and tier enums, the session diagnostics object) are fully enumerated and reject an unknown
+member or an undeclared field.
 
 Each schema's `$id` is
 `https://github.com/findyourexit/excise/harness/schemas/<document_kind>-v1.json`. The Rust types
@@ -1185,8 +1199,20 @@ The schemas live here, not in `docs/schemas`, because that directory is copied i
 archives and packages and these formats are not part of the product. The types and the schemas
 reject unknown fields, so any change to a document's shape needs a new `schema_version`. The tests
 keep the Rust types and the schemas in step: every schema compiles, its `$id`, `document_kind`, and
-`schema_version` match the Rust constants, serialized samples validate, and every field a schema
-declares is serialized by the types.
+`schema_version` match the Rust constants, every writer's real output (not a hand-built sample)
+validates, and every field a schema declares is serialized by the types. A negative test per schema
+proves a plausibly wrong document (an unknown verdict, a missing required field) is rejected, so a
+loosened schema fails the suite.
+
+Three more documents carry the same `document_kind`/`schema_version` convention but are not part of
+this family: the fixture ownership marker (`harness-fixture-marker`, `fixture::marker::Marker`,
+written to every fixture root as `.excise-harness-owned`; see [Fixtures](#fixtures)), the fixture
+manifest (`harness-fixture-manifest`, `fixture::plan::Manifest`), and the independent oracle
+(`harness-fixture-oracle`, `fixture::oracle::Oracle`). All three are generator- and runner-internal
+bookkeeping, read back only by this crate itself to validate a cached fixture or diff a scan
+against the tree it actually found; the manifest is never written to disk at all, and the oracle is
+walked and compared in memory, never persisted. None is evidence a run hands to an agent or to CI,
+so none has a schema file here.
 
 By convention a run writes its summary to `target/excise-e2e/<run-id>/summary.json`. Timing evidence
 is only meaningful from paired, interleaved A/B runs on one host in one session; the `harness-ab`

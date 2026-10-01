@@ -31,6 +31,7 @@
       "items": { "$ref": "#/$defs/side" }
     },
     "metrics": {
+      "description": "One comparison per metric. This is a deliberately open list: the harness does not constrain which metric names appear, since a comparison can hold several fixtures and scenarios at once (see `metric.name`).",
       "type": "array",
       "items": { "$ref": "#/$defs/metric" }
     },
@@ -105,7 +106,10 @@
       "required": ["name", "samples", "median_ratio", "bootstrap_ci", "verdict"],
       "additionalProperties": false,
       "properties": {
-        "name": { "$ref": "#/$defs/identifier" },
+        "name": {
+          "description": "`<case>__<metric>`: the fixture id, or `<scenario>-<profile>`, then `__`, then the metric name, for example `wide-1k__wall_time_ms` or `delete-folder-lifecycle-default__scan_complete_ms`. Not enumerated: qualifying every name this way lets one comparison hold several fixtures and scenarios without their metrics colliding.",
+          "$ref": "#/$defs/identifier"
+        },
         "samples": { "$ref": "#/$defs/samples" },
         "median_ratio": {
           "type": "number",

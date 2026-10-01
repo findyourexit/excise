@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::{
     events::EventError,
-    pty::PtyError,
+    pty::{Diagnostics, PtyError},
     safety::{SafetyError, ScratchError, SnapshotError},
     scenario::ValidationErrors,
 };
@@ -37,6 +37,9 @@ pub struct StepFailure {
     pub expected: String,
     /// What was found instead.
     pub detail: String,
+    /// The session's diagnostics, when the cause is a timeout. `None` for any other cause. See
+    /// `crate::pty::PtySession::diagnostics`.
+    pub session_diagnostics: Option<Diagnostics>,
 }
 
 impl std::fmt::Display for StepFailure {
