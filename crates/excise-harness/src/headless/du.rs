@@ -164,7 +164,7 @@ fn run_with(
         command.arg(root);
     }
     command.env_clear().current_dir(cwd);
-    process::run(&mut command, timeout, false)
+    process::run(&mut command, timeout, false, false)
 }
 
 /// The first executable file called `name` in a directory of `PATH`.

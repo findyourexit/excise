@@ -13,13 +13,14 @@
 //!   [`process`] for what Windows can and cannot do.
 //! * [`FixtureSnapshot`] fingerprints a fixture so that a run can prove it changed nothing but its
 //!   intended deletions and mutations.
+//! * [`cgroup`] is the opt-in Linux cgroup v2 memory cap for both process runners.
 
+pub mod cgroup;
 mod fixture;
 mod isolation;
 pub mod process;
 mod scratch;
 mod snapshot;
-
 pub use fixture::{FixtureRoot, SafetyError};
 pub use isolation::{NARROW_COLS, ProfileSettings, isolated_env};
 pub use process::{KillOutcome, SignalError, send_signal};

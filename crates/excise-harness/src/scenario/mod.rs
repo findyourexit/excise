@@ -180,6 +180,13 @@ pub struct Scenario {
     /// attach it; this just chooses where the scan store goes once it is attached.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scan_store_on_volume: bool,
+    /// Spawns `excise` for this scenario under the Linux cgroup memory cap (`safety::cgroup`),
+    /// capped at the effective `peak_rss_bytes` budget, instead of only sampling it. Needs the
+    /// `EXCISE_HARNESS_CGROUP=1` opt-in and a host that can do it (Linux, `systemd-run`, cgroup
+    /// v2); every runner skips a scenario that sets this without both, with the reason, even when
+    /// it is named, the same way a fixture with a volume part needs `EXCISE_HARNESS_PRIVILEGED`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cgroup_memory_cap: bool,
     /// The profiles the scenario runs under.
     pub profiles: Vec<Profile>,
     /// How often the scenario runs. `quick` (the default) runs under every tier and in-process;
