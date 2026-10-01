@@ -1,0 +1,65 @@
+schema_version = 1
+name = "selection-drift"
+description = "Once the user has moved the selection, it must stay where they put it through COMPLETE and the settling map, even though the folder that was not yet fully measured becomes the largest entry. macOS-only: the precondition (the file, not the folder, is the provisional largest) needs the scan slow enough, relative to the first rendered frame, that the folder's running total has not yet caught up with the file; on this platform's durable per-run writes that holds, but a faster scan can admit enough of the folder before the first frame that the file is never the provisional largest at all. For F5, fixed by X7."
+fixture = "selection-drift"
+profiles = ["default", "deterministic"]
+tier = "full"
+platforms = ["macos"]
+expect = "fail"
+slice = "X7"
+
+[terminal]
+cols = 120
+rows = 40
+
+# The user confirms the provisional largest entry (the file) while the folder that will end up
+# larger is still being measured, with a movement key: `down` has no directly-below neighbour in
+# this two-tile map, so it never changes the selection on its own; sending it is what counts as a
+# deliberate user input before COMPLETE.
+[[steps]]
+step = "wait_text"
+text = "big-file.bin"
+region = { rows = [31, 31] }
+timeout_ms = 60000
+
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+
+# Checkpoint 1: the selection before COMPLETE.
+[[steps]]
+step = "expect_screen"
+contains = ["big-file.bin"]
+region = { rows = [31, 31] }
+
+[[steps]]
+step = "wait_event"
+event = "scan_complete"
+timeout_ms = 60000
+
+# Checkpoint 2: the first frame after COMPLETE.
+[[steps]]
+step = "expect_screen"
+contains = ["big-file.bin"]
+region = { rows = [31, 31] }
+
+[[steps]]
+step = "settle"
+
+# Checkpoint 3: after the map settles.
+[[steps]]
+step = "expect_screen"
+contains = ["big-file.bin"]
+region = { rows = [31, 31] }
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
