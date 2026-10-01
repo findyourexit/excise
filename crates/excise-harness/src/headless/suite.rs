@@ -51,7 +51,7 @@ use super::{
     diff::{Diff, Discrepancy, DiscrepancyKind, Scan, diff},
     document::{DocumentError, ScanDocument, path_bytes},
     du::{Du, DuError, DuFlavor},
-    expectations::{Expectations, ExpectedFailure, RatioExpectedFailure},
+    expectations::{Expectations, ExpectedFailure, ExpectedMemoryFailure, RatioExpectedFailure},
     pairs::{Spread, millis, ratios},
     process::Ended,
     scan::{ScanError, ScanRequest, ScanRun, run_scan},
@@ -82,6 +82,14 @@ pub const RATIO_BUDGET: f64 = 3.0;
 /// because its median `du` time landed right at the boundary under load. The harness README,
 /// "Expected failures", names the fixtures this currently excludes.
 pub const MIN_GATED_ENTRIES: u64 = 2_000;
+
+/// The process memory contract: the peak-memory budget both the headless gate (`measure`, below)
+/// and the Linux cgroup cap (`safety::cgroup`) check a scan against, 512 MiB. The same figure as
+/// `Budget::PeakRssBytes`'s default (`runner::budget`) and `excise`'s own `EXCISE_MEMORY_MIB`
+/// default (`src/config.rs`); kept here, not in `safety::cgroup`, because the cap is a mechanism
+/// for enforcing this budget on Linux, not a budget of its own, and the PTY runner's cgroup wrap
+/// (`runner::run`) imports it from here for the same reason.
+pub const MEMORY_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// How large a report may be, in bytes, for every run of a fixture to keep its report until the
 /// diffs are made. Above it, only the first run's report is kept, to bound the disk a large
@@ -215,6 +223,10 @@ pub struct ScanMeasure {
     pub cpu: Option<CpuTimes>,
     /// Peak memory, where the platform says.
     pub peak_memory_bytes: Option<u64>,
+    /// The Linux cgroup v2 `memory.peak` of the scope the scan ran in, when the
+    /// `EXCISE_HARNESS_CGROUP=1` opt-in wrapped it (see `safety::cgroup`). `None` off Linux,
+    /// without the opt-in, or when the counter could not be read.
+    pub cgroup_memory_peak_bytes: Option<u64>,
     /// How the process ended.
     pub ended: Ended,
     /// Whether the deadline killed it.
@@ -269,6 +281,17 @@ pub struct FixtureReport {
     pub ratio_gated: bool,
     /// The ratio-budget expectation that applies to this fixture on this platform, if any.
     pub ratio_expectation: Option<RatioExpectedFailure>,
+    /// The highest `peak_memory_bytes` seen across its rounds, where the platform could measure
+    /// it.
+    pub memory_peak_bytes: Option<u64>,
+    /// The budget `memory_peak_bytes` was checked against, when it was checked.
+    pub memory_budget_bytes: Option<u64>,
+    /// The memory-budget verdict: `pass` or `fail` against the plain budget, or `xfail`/`xpass`
+    /// against `memory_expectation`. Stays `pass` when nothing was measured (for example on
+    /// Windows, which this crate has no safe way to sample).
+    pub memory_verdict: Verdict,
+    /// The expected memory failure that applies to it, if any.
+    pub memory_expectation: Option<ExpectedMemoryFailure>,
     /// The warm-up round, then the measured rounds, in the order they ran.
     pub rounds: Vec<Round>,
     /// The diff of every report that was held to the oracle, with the index of its round.
@@ -303,6 +326,10 @@ impl FixtureReport {
             expectation: None,
             ratio_gated: false,
             ratio_expectation: None,
+            memory_peak_bytes: None,
+            memory_budget_bytes: None,
+            memory_verdict: Verdict::Pass,
+            memory_expectation: None,
             rounds: Vec::new(),
             diffs: Vec::new(),
             du_flavor: None,
@@ -412,7 +439,8 @@ pub struct SuiteReport {
 }
 
 impl SuiteReport {
-    /// Whether no fixture has a blocking verdict: a `fail`, `xpass`, or `error` fails the run.
+    /// Whether no fixture has a blocking verdict: a `fail`, `xpass`, or `error`, on the oracle
+    /// diff, the ratio budget, or the memory budget, fails the run.
     #[must_use]
     pub fn is_success(&self) -> bool {
         !self
@@ -642,6 +670,11 @@ fn run_fixture(context: &Context<'_>, planned: &Planned) -> FixtureReport {
         .expectations
         .expected_failure(&planned.id)
         .cloned();
+    report.memory_expectation = context
+        .options
+        .expectations
+        .expected_memory_failure(&planned.id)
+        .cloned();
     if let Err(error) = measure(context, planned, &mut report) {
         report.verdict = Verdict::Error;
         report.error = Some(error.to_string());
@@ -660,16 +693,20 @@ fn resolve(expected: Option<&ExpectedFailure>, observed: &BTreeSet<DiscrepancyKi
     }
 }
 
-/// The verdict of a fixture's ratio against [`RATIO_BUDGET`], when it is precise enough to judge
-/// (`report.ratio_gated`): the same strict-xfail shape as [`resolve`], with a single over-budget
-/// bit standing in for discrepancy kinds. A fixture with no expectation for this platform must be
-/// within budget, exactly like an undocumented oracle-diff discrepancy.
-fn resolve_ratio(expected: Option<&RatioExpectedFailure>, over_budget: bool) -> Verdict {
+/// The verdict of a fixture's single-bit budget check (the ratio budget or the memory budget),
+/// when it applies at all (`report.ratio_gated` for the ratio; the memory budget always
+/// applies): the same strict-xfail shape as [`resolve`], with one over/under-budget bit standing
+/// in for discrepancy kinds, and `expected` collapsed to whether any applicable expectation
+/// exists (a caller already resolved which one, if any, through
+/// [`crate::headless::expectations::Expectations`]). Shared by both budgets: a fixture with no
+/// expectation for this platform must be within budget, exactly like an undocumented oracle-diff
+/// discrepancy.
+fn resolve_budget_check(expected: bool, over_budget: bool) -> Verdict {
     match (expected, over_budget) {
-        (None, false) => Verdict::Pass,
-        (Some(_), false) => Verdict::Xpass,
-        (Some(_), true) => Verdict::Xfail,
-        (None, true) => Verdict::Fail,
+        (false, false) => Verdict::Pass,
+        (true, false) => Verdict::Xpass,
+        (true, true) => Verdict::Xfail,
+        (false, true) => Verdict::Fail,
     }
 }
 
@@ -760,8 +797,22 @@ fn measure(
     if report.ratio_is_gated() {
         report.ratio_gated = true;
         let over_budget = report.ratio_over_budget().unwrap_or(false);
-        let ratio_verdict = resolve_ratio(report.ratio_expectation.as_ref(), over_budget);
+        let ratio_verdict = resolve_budget_check(report.ratio_expectation.is_some(), over_budget);
         report.verdict = combine_verdicts(report.verdict, ratio_verdict);
+    }
+    let peak = report
+        .rounds
+        .iter()
+        .filter_map(|round| round.scan.peak_memory_bytes)
+        .max();
+    if let Some(peak) = peak {
+        let budget = MEMORY_BUDGET_BYTES;
+        report.memory_peak_bytes = Some(peak);
+        report.memory_budget_bytes = Some(budget);
+        let memory_verdict =
+            resolve_budget_check(report.memory_expectation.is_some(), peak > budget);
+        report.memory_verdict = memory_verdict;
+        report.verdict = combine_verdicts(report.verdict, memory_verdict);
     }
     if report.first_failure().is_some() {
         report.failure_dir = render::write_failure_dir(context.run_dir, report, &kept_runs);
@@ -802,6 +853,7 @@ fn run_rounds(
             wall: finished.wall,
             cpu: finished.cpu,
             peak_memory_bytes: finished.peak_memory_bytes,
+            cgroup_memory_peak_bytes: finished.cgroup_memory_peak_bytes,
             ended: finished.ended,
             timed_out: finished.timed_out,
             report_bytes,

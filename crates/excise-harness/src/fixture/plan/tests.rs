@@ -91,6 +91,12 @@ fn every_spec_plans_exactly_the_entries_its_parameters_predict() {
     // The large specs are validated and counted without being expanded.
     let million = spec("tiny-files-1m");
     assert_eq!(million.planned_entry_count(), 1_010_101);
+    let quarter_million = spec("tiny-files-250k");
+    assert_eq!(quarter_million.planned_entry_count(), 249_250);
+    assert!(
+        quarter_million.planned_entry_count() <= 250_000,
+        "the 250k spec must fit the full tier's 250,000-entry cap"
+    );
     let fifty = spec("tiny-files-50k");
     assert_eq!(fifty.planned_entry_count(), 49_050);
     assert!(

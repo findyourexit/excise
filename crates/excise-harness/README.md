@@ -91,6 +91,7 @@ the semantic rules below and reports every broken rule, not only the first. **A 
 | `fixture` | yes | The identifier of the fixture specification to generate, in the same shape as `name`. The scenario never names a directory. |
 | `sentinels` | if any step is `delete` | Fixture-relative paths that must survive the scenario. |
 | `scan_store_on_volume` | no | Points `EXCISE_SCAN_STORE_DIR` at a subdirectory of the fixture's attached volume instead of the scenario's own scratch area. Defaults to `false`. The fixture must declare exactly one `volume` part. See [Volumes](#volumes). |
+| `cgroup_memory_cap` | no | Spawns `excise` under the Linux cgroup memory cap instead of only sampling its memory. Defaults to `false`. Needs `EXCISE_HARNESS_CGROUP=1` and a host that can do it; every runner skips a scenario that sets this without both, with the reason, even when it is named. See [Linux cgroup memory cap](#linux-cgroup-memory-cap). |
 | `profiles` | yes | A non-empty, duplicate-free list of profiles the scenario runs under. |
 | `tier` | no | `"quick"` (default), `"full"`, or `"nightly"`: which `cargo xtask e2e` tier runs it. See [Tiers and platforms](#tiers-and-platforms). |
 | `platforms` | no | The operating systems the scenario runs on, as `std::env::consts::OS` spells them. Defaults to all three. See [Tiers and platforms](#tiers-and-platforms). |
@@ -382,6 +383,53 @@ with the library's process termination, which does not reach descendants (`excis
 job object would, but creating one needs `unsafe`, which this workspace allows only in
 `src/os/windows.rs`.
 
+### Linux cgroup memory cap
+
+A scenario with `cgroup_memory_cap = true` is spawned under
+`systemd-run --scope -p MemoryMax=<limit> -p MemorySwapMax=0 --collect --unit=<name> [--user]`
+instead of only being sampled for memory: cgroup v2's own OOM killer enforces `<limit>` (the
+scenario's effective `peak_rss_bytes` budget), rather than this crate finding out after the fact
+that a scan used too much. `--user` is added only when a reachable user service manager and bus
+are found (`$XDG_RUNTIME_DIR/bus`); otherwise the scope is created in the system manager instead,
+which needs whatever privilege the host already grants for that (root, or a polkit rule) — this
+crate never elevates privileges itself. `--collect` unloads the transient unit whether the wrapped
+program succeeds or fails, so nothing but the scope's own (automatic) cgroup removal is needed for
+no residue.
+
+This needs the `EXCISE_HARNESS_CGROUP=1` opt-in, and a host that can do it (Linux, `systemd-run` on
+`PATH`, cgroup v2 mounted): every runner skips a scenario that asks for it without both, with the
+reason, even when it is named, the same way a fixture with a volume part needs
+`EXCISE_HARNESS_PRIVILEGED`. Off (the default), nothing here changes how a scenario runs.
+
+Backgrounding `systemd-run --scope` directly and comparing its own pid against the wrapped
+program's self-reported pid shows they are the same: the wrapped program *becomes* the
+`systemd-run` process (an `execve`, not the fork `systemd-run(1)`'s own wording, "a scope command
+is executed by systemd-run itself as parent process," suggests), keeping its pid, its process
+group (so the existing process-group kill is unaffected), and its cgroup throughout.
+`peak_rss_bytes` and `idle_cpu_ms` therefore already read the right process with no extra step;
+`memory.peak` is read from that same pid, at the same "exited, not yet reaped" moment the existing
+peak-memory sampling already uses, and reported as the metric `cgroup_memory_peak_bytes`. `--user`
+needs `XDG_RUNTIME_DIR` in `systemd-run`'s own environment before it can reach the bus to register
+the scope; an isolated spawn environment does not carry it by default, so both runners add it back
+whenever `--user` is chosen. `safety::cgroup` has the whole mechanism, including the command
+construction and the `memory.peak` parsing, unit-tested on every platform even though the wrap
+itself only ever runs on Linux.
+
+The headless runner wraps every scan the same way while `EXCISE_HARNESS_CGROUP=1` is set: unlike a
+scenario, a fixture has no per-run opt-in field, so the environment variable alone decides it.
+
+`cgroup_memory_peak_bytes` is reported, not gated: cgroup v2 enforces `MemoryMax` by construction,
+so a scan's own `memory.peak` can never exceed the limit it was capped at, and a step that checked
+it against that same budget could never fail. What the cap actually proves, which `peak_rss_bytes`
+cannot from outside the process, is that the kernel kills a scan that needs more anonymous memory
+than the limit allows — a scan that completes and exits normally under the cap already
+demonstrates that it did not. The figure is still worth reading: on a large, many-file tree it can
+sit at the cap even while `peak_rss_bytes` stays far below it, because cgroup v2 accounting counts
+reclaimable page cache (file and directory contents the scan reads) toward the cgroup's usage, and
+the kernel is free to fill headroom with that cache before reclaiming it. A reading at the cap is
+therefore not by itself a sign that `excise` is close to its own limit; `peak_rss_bytes` already
+checks that directly.
+
 **Steps.**
 
 - **`settle`** waits for a `frame` event whose `inputs` counter is at least the number of input
@@ -445,6 +493,7 @@ run summary use the same names.
 | `quit_ms`, `delete_ms` | The confirmation key to the exit of the process, and to `deletion_finished`. |
 | `output_bytes`, `output_bytes_per_s`, `frames`, `inputs_sent` | Terminal output and its rate, frames drawn, and input events sent. |
 | `peak_rss_bytes`, `user_ms`, `sys_ms` | Peak memory (the peak physical footprint on macOS, the peak resident set size on Linux) and the child's CPU time. |
+| `cgroup_memory_peak_bytes` | The Linux cgroup v2 `memory.peak` of the scope a `cgroup_memory_cap` scenario ran in. See [Linux cgroup memory cap](#linux-cgroup-memory-cap). |
 | `idle_output_bytes`, `idle_cpu_ms` | Terminal output bytes and the child's live CPU time over an `idle` step's window; `idle_cpu_ms` is absent on Windows. |
 | `threads`, `fds` | The most threads and descriptors seen in a sample taken every 50 ms (`libproc` on macOS, `/proc` on Linux; not sampled on Windows). |
 | `scan_store_peak_bytes` | The peak total apparent size of the run's scan-store directory (`EXCISE_SCAN_STORE_DIR`), seen in a sample taken every 50 ms. |
@@ -515,7 +564,9 @@ under the isolation of the PTY runner: the environment is cleared and rebuilt fr
 wait is bounded (`--timeout`, 900 s by default) and the process group is killed when the bound
 passes. Afterwards the fixture is compared with the snapshot taken before the scan, and a scratch
 area that holds anything but the report is residue. The run records the exit code, the wall time,
-the CPU time, and, where the platform says, the peak memory.
+the CPU time, and, where the platform says, the peak memory. While `EXCISE_HARNESS_CGROUP=1` is
+set and this host can do it, every scan also runs under the Linux cgroup memory cap; see
+[Linux cgroup memory cap](#linux-cgroup-memory-cap).
 
 **The report** is read only after it validates against the published
 `docs/schemas/scan-report.schema.json` and the `native-path` schema it references. The file is
@@ -574,7 +625,7 @@ machine was; an earlier, `du`-time-based threshold let one fixture's ratio verdi
 runs under load. Both this budget and the entry threshold are expected to be revisited once the
 durable-write fix lands and ratios approach the budget.
 
-**Expected failures.** `expectations/headless.toml` has two independent tables.
+**Expected failures.** `expectations/headless.toml` has three independent tables.
 `[[expect_fail]]` lists the fixtures that fail the oracle diff for a known defect that is not yet
 fixed, with the semantics of `expect = "fail"`: a fixture that fails with exactly the listed kinds
 is `xfail`, one that fails with other kinds is `fail`, and one that no longer fails is `xpass` and
@@ -582,12 +633,22 @@ fails the run, so that the entry is removed by the change that fixes the defect.
 `[[expect_ratio_fail]]` is the same semantics for the scan-time ratio, applied only where the
 fixture is gated (above): over budget and listed is `xfail`; over budget and not listed is `fail`,
 exactly like an undocumented diff discrepancy, so a platform the entry does not name must stay
-within budget; within budget while listed is `xpass`. Both tables name the platforms an entry
+within budget; within budget while listed is `xpass`. All three tables name the platforms an entry
 applies to and the findings it documents; `[[expect_fail]]` also names the exact discrepancy
 kinds. The current `[[expect_ratio_fail]]` entries were measured on macOS locally and on Linux in
 CI; Windows has no `du` reference (above), so no ratio is ever measured there and neither entry
 names it. A fixture gated on a platform with a `du` reference that nobody has measured yet needs
 its own entry once someone does, or the run fails there until then.
+
+**Peak-memory gate.** Every fixture's run is also held to the memory contract (`peak_rss_bytes` of
+any round at most 512 MiB, `MEMORY_BUDGET_BYTES`), the same way and in the same file, under
+`[[expect_memory_fail]]`: `fixture`, `platforms`, `findings`, and `reason`, with the same strict
+semantics as `[[expect_ratio_fail]]` above, minus `kinds` (there is only the one check). The check's
+own verdict (kept as `memory_verdict`, for the verdict table's block below) is folded into the
+fixture's overall `verdict` with `combine_verdicts` the moment it is measured, exactly like the
+ratio budget: a fixture can fail it while its oracle diff is clean, and the other way around;
+either one fails the run. Nothing is checked on a platform this crate has no safe way to sample
+memory on (Windows).
 
 **Output.** `target/excise-headless/<run-id>/summary.json` is a `harness-summary` with one
 `headless-<fixture>` result per fixture, and `target/excise-headless/latest` points at the newest
@@ -595,7 +656,9 @@ run. The open `metrics` object of a result has `entries`, `runs`, `oracle_ms`, `
 `headless_ms` (the median, with `_min` and `_max`), `du_ms`, `headless_scan_ratio` (the median,
 with `_min`, `_q1`, `_q3`, and `_max`), `headless_scan_ratio_gated` (1 when the ratio was gated
 against the budget, 0 when it was only reported), `du_kib`, `du_expected_kib`, `user_ms`, `sys_ms`,
-`exit_code`, and `discrepancies` with one `discrepancies_<kind>` count per kind. A failing fixture
+`peak_rss_bytes`, `cgroup_memory_peak_bytes` (while the cgroup cap measured it),
+`memory_budget_bytes` (the limit `peak_rss_bytes` was checked against), `exit_code`, and
+`discrepancies` with one `discrepancies_<kind>` count per kind. A failing fixture
 gets `headless-<fixture>/` beside the summary, with `discrepancies.txt`, `repro.txt`, and the
 report. `tests/harness_headless.rs` in the `excise` crate runs the cheap fixtures that need no
 privileges against the crate's own binary as part of `cargo test`, and runs a binary that writes a
@@ -799,6 +862,7 @@ marker.
 | `scan-store-quota` | 35,002 | A flat directory of 35,000 tiny files beside an empty mount point; a privileged run copy attaches an 8 MiB volume there for `scan_store_on_volume` (see [Volumes](#volumes)). |
 | `selection-drift` | 20,052 | A 5,000,000-byte file beside a folder of 20,000 tiny files that totals 21,000,000 bytes of content, 81,920,000 bytes of disk allocation (Excise's default view): the file is the largest entry when first measured, the folder once it is fully scanned. For F5/X7. |
 | `tiny-files-50k` | 49,050 | 49 directories of 1,000 tiny files. |
+| `tiny-files-250k` | 249,250 | 249 directories of 1,000 tiny files: the full tier's memory-contract fixture, scanned within the 512 MiB peak-memory budget. |
 | `tiny-files-1m` | 1,010,101 | One million tiny files. For nightly and manual tiers only: tests never generate it. |
 
 ### Determinism and the manifest

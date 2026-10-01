@@ -111,8 +111,13 @@ pub struct Finished {
     pub cpu: Option<CpuTimes>,
     /// The peak memory in bytes: the peak physical footprint on macOS, the peak resident set size
     /// where `/proc` can say (sampled every few milliseconds, so a peak that falls between two
-    /// samples is missed), and nothing elsewhere.
+    /// samples is missed), and nothing elsewhere. Unaffected by `cgroup`: `systemd-run --scope`
+    /// execs into the wrapped program, so this crate only ever samples one pid either way.
     pub peak_memory_bytes: Option<u64>,
+    /// The Linux cgroup v2 `memory.peak` of the scope the process ran in, when `cgroup` asked for
+    /// the wrap and the counter could be read (`safety::cgroup::read_memory_peak`). `None` off
+    /// Linux, without the wrap, or when the counter could not be read.
+    pub cgroup_memory_peak_bytes: Option<u64>,
     /// What the process wrote to standard output.
     pub stdout: Captured,
     /// What the process wrote to standard error.
@@ -126,6 +131,10 @@ pub struct Finished {
 /// is killed when the deadline passes and once more after the process has exited, so nothing it
 /// started outlives the run.
 ///
+/// `cgroup` says whether `command` was already rewritten to run under the Linux cgroup memory cap
+/// (`safety::cgroup::wrap`): when true, this function also reads the cgroup's `memory.peak` once
+/// the process has exited, before it is reaped.
+///
 /// # Errors
 ///
 /// Returns [`ProcessError`] when the process cannot be started or waited for.
@@ -133,6 +142,7 @@ pub fn run(
     command: &mut Command,
     timeout: Duration,
     measure_memory: bool,
+    cgroup: bool,
 ) -> Result<Finished, ProcessError> {
     let program = command.get_program().to_string_lossy().into_owned();
     command
@@ -155,8 +165,8 @@ pub fn run(
     let stdout = capture_in_background(child.stdout.take());
     let stderr = capture_in_background(child.stderr.take());
 
-    let waited = supervise(&mut child, started + timeout, measure_memory);
-    let (ended, ended_at, timed_out, sampler) = match waited {
+    let waited = supervise(&mut child, started + timeout, measure_memory, cgroup);
+    let (ended, ended_at, timed_out, sampler, cgroup_memory_peak_bytes) = match waited {
         Ok(waited) => waited,
         Err(source) => {
             kill(&mut child);
@@ -178,6 +188,7 @@ pub fn run(
         wall: ended_at.saturating_duration_since(started),
         cpu,
         peak_memory_bytes: sampler.peak_memory_bytes(),
+        cgroup_memory_peak_bytes,
         stdout: stdout.join().unwrap_or_default(),
         stderr: stderr.join().unwrap_or_default(),
     })
@@ -234,7 +245,10 @@ mod unix {
         time::{Duration, Instant},
     };
 
-    use crate::{metrics::ProcessSampler, safety::kill_process_group};
+    use crate::{
+        metrics::ProcessSampler,
+        safety::{cgroup, kill_process_group},
+    };
 
     use super::Ended;
 
@@ -250,12 +264,14 @@ mod unix {
     }
 
     /// Waits for `child` to exit. Returns how it ended, when the exit was seen, whether the
-    /// deadline killed it, and the memory samples.
+    /// deadline killed it, the memory samples, and the cgroup's `memory.peak` when `cgroup` wrapped
+    /// the spawn and the counter could be read.
     pub(super) fn supervise(
         child: &mut Child,
         deadline: Instant,
         measure_memory: bool,
-    ) -> io::Result<(Ended, Instant, bool, ProcessSampler)> {
+        cgroup: bool,
+    ) -> io::Result<(Ended, Instant, bool, ProcessSampler, Option<u64>)> {
         let pid = child.id();
         let gate = Gate {
             done: Mutex::new(false),
@@ -275,7 +291,18 @@ mod unix {
                 // The final figures: exact on macOS, and a last chance elsewhere.
                 sampler.sample(pid);
             }
-            Ok((ended, ended_at, timed_out, sampler))
+            // `pid` is a member of the scope's cgroup throughout: `systemd-run --scope` execs
+            // into the wrapped program, which keeps the pid this crate spawned (see
+            // `safety::cgroup`). It is still a zombie here, not yet reaped by the caller, so the
+            // scope is not yet garbage collected.
+            let cgroup_memory_peak_bytes = cgroup.then(|| cgroup::read_memory_peak(pid)).flatten();
+            Ok((
+                ended,
+                ended_at,
+                timed_out,
+                sampler,
+                cgroup_memory_peak_bytes,
+            ))
         })
     }
 
@@ -310,7 +337,8 @@ mod unix {
         }
     }
 
-    /// Kills the process group once the deadline has passed, and samples memory while it waits.
+    /// Kills the process group once the deadline has passed, and samples `pid`'s memory while it
+    /// waits.
     fn watch(
         pid: u32,
         deadline: Instant,
@@ -354,8 +382,15 @@ fn supervise(
     child: &mut Child,
     deadline: Instant,
     measure_memory: bool,
-) -> io::Result<(Ended, Instant, bool, crate::metrics::ProcessSampler)> {
-    let _ = measure_memory;
+    cgroup: bool,
+) -> io::Result<(
+    Ended,
+    Instant,
+    bool,
+    crate::metrics::ProcessSampler,
+    Option<u64>,
+)> {
+    let _ = (measure_memory, cgroup);
     let mut timed_out = false;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -365,6 +400,7 @@ fn supervise(
                 ended_at,
                 timed_out,
                 crate::metrics::ProcessSampler::default(),
+                None,
             ));
         }
         if !timed_out && Instant::now() >= deadline {

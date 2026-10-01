@@ -1,12 +1,13 @@
-//! Tests of the ratio budget's verdict resolution: pure functions, exercised directly so that the
-//! gating threshold and the combination of the oracle diff with the ratio budget are each covered
-//! without a real scan or a real `du` (both are noisy and slow; see the harness README).
+//! Tests of the ratio and peak-memory budgets' verdict resolution: pure functions, exercised
+//! directly so that the gating threshold and the combination of the oracle diff with each budget
+//! are each covered without a real scan or a real `du` (both are noisy and slow; see the harness
+//! README).
 
 use std::collections::BTreeSet;
 
 use super::{
-    Class, DuMeasure, Ended, FixtureReport, MIN_GATED_ENTRIES, RATIO_BUDGET, RatioExpectedFailure,
-    Round, ScanMeasure, Verdict, combine_verdicts, resolve_ratio,
+    Class, DuMeasure, Ended, FixtureReport, MIN_GATED_ENTRIES, RATIO_BUDGET, Round, ScanMeasure,
+    Verdict, combine_verdicts, resolve_budget_check,
 };
 use crate::scenario::Profile;
 
@@ -22,6 +23,7 @@ fn round(scan_ms: f64, du_ms: f64) -> Round {
             wall: millis(scan_ms),
             cpu: None,
             peak_memory_bytes: None,
+            cgroup_memory_peak_bytes: None,
             ended: Ended::Exited(0),
             timed_out: false,
             report_bytes: None,
@@ -32,15 +34,6 @@ fn round(scan_ms: f64, du_ms: f64) -> Round {
             ended: Ended::Exited(0),
         }),
         diffed: false,
-    }
-}
-
-fn expectation(reason: &str) -> RatioExpectedFailure {
-    RatioExpectedFailure {
-        fixture: "fixture".to_owned(),
-        platforms: vec![std::env::consts::OS.to_owned()],
-        findings: vec!["F1".to_owned()],
-        reason: reason.to_owned(),
     }
 }
 
@@ -85,32 +78,31 @@ fn ratio_over_budget_reads_the_spread_median_against_the_budget() {
 }
 
 // -------------------------------------------------------------------------------------------
-// `resolve_ratio`: the four combinations of (expectation, over_budget).
+// `resolve_budget_check`: the four combinations of (expected, over_budget), shared by the ratio
+// budget and the memory budget (both reduce to one over/under-budget bit).
 
 #[test]
 fn an_expected_failure_over_budget_is_xfail() {
-    let expected = expectation("reason");
-    assert_eq!(resolve_ratio(Some(&expected), true), Verdict::Xfail);
+    assert_eq!(resolve_budget_check(true, true), Verdict::Xfail);
 }
 
 #[test]
 fn an_expected_failure_within_budget_is_xpass() {
-    let expected = expectation("reason");
-    assert_eq!(resolve_ratio(Some(&expected), false), Verdict::Xpass);
+    assert_eq!(resolve_budget_check(true, false), Verdict::Xpass);
 }
 
 #[test]
-fn an_unexpected_over_budget_ratio_is_fail_like_an_undocumented_diff() {
-    assert_eq!(resolve_ratio(None, true), Verdict::Fail);
+fn an_unexpected_over_budget_is_fail_like_an_undocumented_diff() {
+    assert_eq!(resolve_budget_check(false, true), Verdict::Fail);
 }
 
 #[test]
-fn an_unexpected_within_budget_ratio_is_pass() {
-    assert_eq!(resolve_ratio(None, false), Verdict::Pass);
+fn an_unexpected_within_budget_is_pass() {
+    assert_eq!(resolve_budget_check(false, false), Verdict::Pass);
 }
 
 // -------------------------------------------------------------------------------------------
-// `combine_verdicts`: the more severe of the oracle diff and the ratio budget.
+// `combine_verdicts`: the more severe of the oracle diff and a budget check.
 
 #[test]
 fn combining_keeps_the_more_severe_verdict_either_way_round() {

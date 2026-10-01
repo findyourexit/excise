@@ -130,7 +130,10 @@ impl<'a> Executor<'a> {
         self.final_checks()
     }
 
-    /// The metrics of the run so far.
+    /// The metrics of the run so far: `cgroup_memory_peak_bytes` joins them once the session has
+    /// seen the exit (see `PtySession::mark_cgroup_wrapped`), so an `expect_budget` step placed
+    /// after the program has exited (for example after `expect_exit`) can check it like any other
+    /// metric.
     pub(crate) fn metrics(&self) -> BTreeMap<String, f64> {
         let mut metrics = self.recorder.finish(
             self.events.events(),
@@ -143,6 +146,13 @@ impl<'a> Executor<'a> {
         if let Some(files) = self.residue_files {
             #[allow(clippy::cast_precision_loss)]
             metrics.insert("residue_files".to_owned(), files as f64);
+        }
+        if let Some(bytes) = self.session.cgroup_memory_peak_bytes() {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "byte counts far below 2^52, like every other byte metric in this crate"
+            )]
+            metrics.insert("cgroup_memory_peak_bytes".to_owned(), bytes as f64);
         }
         metrics
     }

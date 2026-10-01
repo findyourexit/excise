@@ -104,16 +104,7 @@ pub(super) fn result_of(report: &FixtureReport) -> ScenarioResult {
     };
     put(&mut metrics, "user_ms", median(&cpu(|cpu| cpu.user)));
     put(&mut metrics, "sys_ms", median(&cpu(|cpu| cpu.system)));
-    put(
-        &mut metrics,
-        "peak_rss_bytes",
-        report
-            .rounds
-            .iter()
-            .filter_map(|round| round.scan.peak_memory_bytes)
-            .max()
-            .map(number),
-    );
+    put_memory_metrics(&mut metrics, report);
     if let Some(round) = report.rounds.first()
         && let Some(code) = round.scan.ended.code()
     {
@@ -142,6 +133,36 @@ pub(super) fn result_of(report: &FixtureReport) -> ScenarioResult {
             .as_ref()
             .map(|directory| directory.display().to_string()),
     }
+}
+
+/// Writes `peak_rss_bytes`, `cgroup_memory_peak_bytes`, and `memory_budget_bytes`: split out of
+/// [`result_of`] to keep it under the line limit.
+fn put_memory_metrics(metrics: &mut BTreeMap<String, f64>, report: &FixtureReport) {
+    put(
+        metrics,
+        "peak_rss_bytes",
+        report
+            .rounds
+            .iter()
+            .filter_map(|round| round.scan.peak_memory_bytes)
+            .max()
+            .map(number),
+    );
+    put(
+        metrics,
+        "cgroup_memory_peak_bytes",
+        report
+            .rounds
+            .iter()
+            .filter_map(|round| round.scan.cgroup_memory_peak_bytes)
+            .max()
+            .map(number),
+    );
+    put(
+        metrics,
+        "memory_budget_bytes",
+        report.memory_budget_bytes.map(number),
+    );
 }
 
 /// Writes the evidence of a failing fixture to `<run_dir>/<name>/`: every discrepancy of the first
@@ -226,6 +247,7 @@ impl SuiteReport {
         for fixture in &self.fixtures {
             write_fixture_block(&mut table, fixture);
             write_ratio_block(&mut table, fixture);
+            write_memory_block(&mut table, fixture);
         }
         self.write_notes(&mut table);
         let blocking = self
@@ -495,4 +517,52 @@ fn write_ratio_block(table: &mut String, fixture: &FixtureReport) {
         }
         (None, false) => {}
     }
+}
+
+/// The block under the table for a fixture whose peak memory was checked and is not a plain,
+/// unexpected pass: reported whenever `memory_verdict` is not `pass`, independent of whether the
+/// oracle diff also has something to say (`write_fixture_block`, above, which this never touches).
+fn write_memory_block(table: &mut String, fixture: &FixtureReport) {
+    if fixture.memory_verdict == Verdict::Pass {
+        return;
+    }
+    let (Some(peak), Some(budget)) = (fixture.memory_peak_bytes, fixture.memory_budget_bytes)
+    else {
+        return;
+    };
+    let _ = writeln!(
+        table,
+        "\n{} {} [{}] peak memory: {} of a {} budget",
+        fixture.memory_verdict.as_str().to_uppercase(),
+        fixture.fixture,
+        fixture.profile,
+        format_bytes(peak),
+        format_bytes(budget)
+    );
+    if let Some(expected) = &fixture.memory_expectation {
+        let _ = writeln!(table, "  expected failure {expected}");
+    } else if fixture.memory_verdict == Verdict::Fail {
+        let _ = writeln!(
+            table,
+            "  add an `[[expect_memory_fail]]` entry to expectations/headless.toml if this is a \
+             known, not yet fixed, defect"
+        );
+    }
+    if fixture.memory_verdict == Verdict::Xpass {
+        let _ = writeln!(
+            table,
+            "  expected to exceed the budget but stayed within it; remove its entry from \
+             expectations/headless.toml"
+        );
+    }
+}
+
+/// A byte count as whole mebibytes, to the nearest tenth.
+fn format_bytes(bytes: u64) -> String {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "byte counts far below 2^52, like every other byte metric in this crate"
+    )]
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    format!("{mib:.1} MiB")
 }

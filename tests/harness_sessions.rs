@@ -254,8 +254,8 @@ fn run_headless_scan(binary: &Path, fixture: &Path, store: &Path, work_dir: &Pat
         .env_clear()
         .envs(session_env(&scratch, store))
         .current_dir(scratch.cwd());
-    let finished =
-        process::run(&mut command, HEADLESS_TIMEOUT, false).expect("the headless scan can run");
+    let finished = process::run(&mut command, HEADLESS_TIMEOUT, false, false)
+        .expect("the headless scan can run");
     assert!(
         !finished.timed_out,
         "the headless scan timed out: {finished:?}"

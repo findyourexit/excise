@@ -1,0 +1,34 @@
+schema_version = 1
+name = "memory-budget-interactive-1m-cgroup"
+description = "The same 1,000,000-entry interactive scan as memory-budget-interactive-1m, run under the Linux cgroup memory cap: excise is spawned under systemd-run --scope with MemoryMax set to the peak_rss_bytes budget, so the kernel kills the scan outright if it ever needs more anonymous memory than that allows, instead of this crate noticing only after the fact. The cap bounds the cgroup's own memory.peak by construction, so checking cgroup_memory_peak_bytes against the same budget would never fail; it is reported, not gated. What this scenario proves under the cap: the scan still completes, excise still exits 0, and its own peak_rss_bytes still stays within budget."
+fixture = "tiny-files-1m"
+profiles = ["default"]
+tier = "nightly"
+platforms = ["linux"]
+cgroup_memory_cap = true
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+# See memory-budget-interactive-1m.toml for why thirty minutes.
+timeout_ms = 1800000
+
+[[steps]]
+step = "expect_budget"
+budget = "peak_rss_bytes"
+metric = "peak_rss_bytes"
+
+[[steps]]
+step = "quit"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 30000

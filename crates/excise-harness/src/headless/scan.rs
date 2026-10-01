@@ -8,6 +8,7 @@
 //! report, and nothing else may be left.
 
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -17,11 +18,14 @@ use thiserror::Error;
 
 use crate::{
     runner::resolve_binary,
-    safety::{FixtureRoot, Scratch, ScratchError, isolated_env},
+    safety::{FixtureRoot, Scratch, ScratchError, cgroup, isolated_env},
     scenario::Profile,
 };
 
-use super::process::{self, Finished, ProcessError};
+use super::{
+    process::{self, Finished, ProcessError},
+    suite::MEMORY_BUDGET_BYTES,
+};
 
 /// What one scan needs.
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +88,12 @@ impl ScanRun {
 
 /// Runs one scan.
 ///
+/// When the `EXCISE_HARNESS_CGROUP=1` opt-in is set and this host can do it (Linux, `systemd-run`,
+/// cgroup v2; see `safety::cgroup`), the scan runs under the Linux cgroup memory cap, at the
+/// default `peak_rss_bytes` budget, and the scan's `Finished::cgroup_memory_peak_bytes` carries the
+/// scope's `memory.peak`. Unlike the pseudo-terminal runner, this needs no per-scenario opt-in
+/// field: every headless scan a caller makes while the environment variable is set is wrapped.
+///
 /// # Errors
 ///
 /// Returns [`ScanError`] when the binary or the profile cannot be used, the scratch area cannot be
@@ -96,15 +106,40 @@ pub fn run_scan(request: &ScanRequest<'_>) -> Result<ScanRun, ScanError> {
     let program =
         resolve_binary(request.binary).map_err(|error| ScanError::Binary(error.to_string()))?;
     let scratch = Scratch::create(request.work_dir)?;
+    let args: Vec<OsString> = vec![
+        "--format".into(),
+        "json".into(),
+        "--output".into(),
+        scratch.report().into_os_string(),
+        request.fixture.path().as_os_str().to_owned(),
+    ];
+    let want_cgroup = cgroup::CgroupOptIn::from_env().is_some() && cgroup::detect().is_ok();
+    let (program, args, extra_env, wrapped) = if want_cgroup {
+        let seed = request.fixture.path().file_name().map_or_else(
+            || "headless".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let unit = cgroup::unit_name(&format!("headless-{seed}"));
+        match cgroup::wrap(&unit, MEMORY_BUDGET_BYTES, &program, &args) {
+            Ok((program, args, extra_env)) => (program, args, extra_env, true),
+            // `detect` just confirmed this host can wrap; a failure here would be a race between
+            // that check and this spawn (for example `systemd-run` removed mid-run), vanishingly
+            // unlikely and not worth failing the whole scan over: fall back to running unwrapped,
+            // exactly as if the opt-in were unset, and tell `process::run` the truth so it does
+            // not wait for a wrapped child that was never spawned.
+            Err(_) => (program, args, Vec::new(), false),
+        }
+    } else {
+        (program, args, Vec::new(), false)
+    };
     let mut command = Command::new(&program);
     command
-        .args(["--format", "json", "--output"])
-        .arg(scratch.report())
-        .arg(request.fixture.path())
+        .args(&args)
         .env_clear()
         .envs(isolated_env(&scratch, request.profile, false, None))
+        .envs(extra_env)
         .current_dir(scratch.cwd());
-    let finished = process::run(&mut command, request.timeout, true)?;
+    let finished = process::run(&mut command, request.timeout, true, wrapped)?;
     let residue = scratch.residue()?;
     Ok(ScanRun {
         finished,

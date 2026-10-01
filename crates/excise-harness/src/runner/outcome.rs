@@ -116,6 +116,12 @@ pub enum RunError {
     /// The event channel does not belong to the process that was started.
     #[error("event channel error: {0}")]
     Protocol(String),
+    /// The scenario asks for the Linux cgroup memory cap (`scenario::Scenario::cgroup_memory_cap`)
+    /// but this host cannot provide it. `runner::e2e::select` already skips such a scenario before
+    /// any process is spawned, unless the opt-in and the host both allow it; reaching this is a
+    /// defensive re-check, exactly like `attach_volumes_if_needed`'s for `scan_store_on_volume`.
+    #[error("needs the Linux cgroup memory cap: {0}")]
+    CgroupUnavailable(String),
     /// A signal could not be delivered.
     #[error(transparent)]
     Signal(#[from] crate::safety::SignalError),

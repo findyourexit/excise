@@ -228,6 +228,13 @@ impl fmt::Display for Diagnostics {
 pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
     pid: u32,
+    /// Whether the spawn was wrapped under the Linux cgroup memory cap. `read_memory_peak` is
+    /// then tried through `pid` at the same "zombie, not yet reaped" moment the resource sampler
+    /// already uses; see `safety::cgroup`.
+    cgroup_wrapped: bool,
+    /// The cgroup's `memory.peak`, once read. `None` until the child has exited, and also when
+    /// `cgroup_wrapped` is false or the counter could not be read.
+    cgroup_peak_bytes: Option<u64>,
     /// `None` once [`PtySession::close_console`] has closed it.
     master: Option<Box<dyn MasterPty + Send>>,
     /// Dropped only after the child is dead; see the module documentation.
@@ -330,6 +337,8 @@ impl PtySession {
         Ok(Self {
             child,
             pid,
+            cgroup_wrapped: false,
+            cgroup_peak_bytes: None,
             master: Some(pair.master),
             writer: Some(writer),
             chunks,
@@ -355,6 +364,23 @@ impl PtySession {
     #[must_use]
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Tells the session that its direct child is `systemd-run`, wrapping the real program under
+    /// the Linux cgroup memory cap (`safety::cgroup`): `kill`, the process-group id, and reaping
+    /// are unaffected (they already operate on the whole process group), but `poll_exit` also
+    /// tries to read the cgroup's `memory.peak` once the child has exited. Called by `runner::run`
+    /// right after a wrapped spawn, before the first step runs.
+    pub(crate) fn mark_cgroup_wrapped(&mut self) {
+        self.cgroup_wrapped = true;
+    }
+
+    /// The cgroup's `memory.peak`, when the spawn was wrapped under the Linux cgroup memory cap
+    /// and the child has exited: see [`PtySession::mark_cgroup_wrapped`]. `None` before the child
+    /// exits, when the session was not wrapped, or when the counter could not be read.
+    #[must_use]
+    pub const fn cgroup_memory_peak_bytes(&self) -> Option<u64> {
+        self.cgroup_peak_bytes
     }
 
     /// When the child was spawned.
@@ -714,6 +740,9 @@ impl PtySession {
                 });
                 // The child is a zombie until it is reaped. Its final figures are still readable.
                 self.sampler.sample(self.pid);
+                if self.cgroup_wrapped {
+                    self.cgroup_peak_bytes = crate::safety::cgroup::read_memory_peak(self.pid);
+                }
             }
             let _ = self.child.wait();
             self.reaped = true;

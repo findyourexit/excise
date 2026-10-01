@@ -50,7 +50,8 @@ fn an_events_path_that_already_exists_is_a_configuration_error_with_no_residue()
         .env_clear()
         .envs(isolated_env(&scratch, Profile::Default, true, None))
         .current_dir(scratch.cwd());
-    let finished = process::run(&mut command, TIMEOUT, false).expect("the process can be run");
+    let finished =
+        process::run(&mut command, TIMEOUT, false, false).expect("the process can be run");
 
     assert!(
         !finished.timed_out,

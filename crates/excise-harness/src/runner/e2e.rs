@@ -37,7 +37,7 @@ use crate::{
         compact_utc, format_ms, host_name, median, point_latest_at, render_rows, rfc3339,
         sha256_file, worst,
     },
-    safety::{Scratch, isolated_env},
+    safety::{Scratch, cgroup, isolated_env},
     scenario::{LoadError, Profile, Scenario, Tier as ScenarioTier, ValidationErrors},
 };
 
@@ -303,6 +303,25 @@ fn select<'a>(
                 ),
             });
             continue;
+        }
+        if scenario.cgroup_memory_cap {
+            if cgroup::CgroupOptIn::from_env().is_none() {
+                skipped.push(SkippedScenario {
+                    name: scenario.name.clone(),
+                    reason: format!(
+                        "needs the Linux cgroup memory cap, which needs `{}=1`",
+                        cgroup::OPT_IN_ENV
+                    ),
+                });
+                continue;
+            }
+            if let Err(reason) = cgroup::detect() {
+                skipped.push(SkippedScenario {
+                    name: scenario.name.clone(),
+                    reason: format!("needs the Linux cgroup memory cap: {reason}"),
+                });
+                continue;
+            }
         }
         for profile in selected_profiles(options, scenario) {
             plan.push((scenario, profile));
@@ -850,6 +869,42 @@ mod tests {
 
         // Named with `--scenario`, the same scenario is still skipped: platform and tier
         // selection are bypassed by `named`, but the volume opt-in never is.
+        opts.named = true;
+        let (plan, skipped) = select(&opts, "linux");
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+    }
+
+    #[test]
+    fn a_scenario_that_asks_for_the_cgroup_memory_cap_is_skipped_without_the_opt_in() {
+        // The test process never sets `EXCISE_HARNESS_CGROUP` (setting it would be unsafe and race
+        // every other test in this process), so `select` must skip it here exactly as it would in
+        // an ordinary run without the opt-in.
+        assert!(
+            crate::safety::cgroup::CgroupOptIn::from_env().is_none(),
+            "this test assumes the opt-in is not set in the test process"
+        );
+        let mut wants_the_cap = scenario(r#"["deterministic"]"#);
+        wants_the_cap.cgroup_memory_cap = true;
+        let mut opts = options(Tier::Nightly, Vec::new());
+        opts.scenarios = vec![wants_the_cap];
+
+        let (plan, skipped) = select(&opts, "linux");
+
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].name, "s");
+        assert!(
+            skipped[0].reason.contains("cgroup")
+                && skipped[0]
+                    .reason
+                    .contains(crate::safety::cgroup::OPT_IN_ENV),
+            "{}",
+            skipped[0].reason
+        );
+
+        // Named with `--scenario`, the same scenario is still skipped: platform and tier
+        // selection are bypassed by `named`, but the cgroup opt-in never is.
         opts.named = true;
         let (plan, skipped) = select(&opts, "linux");
         assert!(plan.is_empty(), "{plan:?}");

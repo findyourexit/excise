@@ -1,0 +1,15 @@
+schema_version = 1
+id = "tiny-files-250k"
+description = "About 250k tiny files: 249 directories of 1,000 files of 1 to 32 bytes. 249,250 entries counting the root directory. The memory-contract fixture: within the full tier's 250,000-entry cap, so the PR tier scans it at the size the process memory contract checks peak memory against."
+seed = 250000
+
+[[parts]]
+kind = "tree"
+root = "tiny"
+depth = 1
+fanout = 249
+files_per_dir = 1000
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "bucket", width = 3 }
+file_names = { style = "sequential", prefix = "t", suffix = ".dat", width = 4 }
+file_size = { min = 1, max = 32 }

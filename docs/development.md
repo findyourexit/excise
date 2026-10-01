@@ -352,6 +352,20 @@ Each scenario declares a `tier` (`quick`, the default; `full`; or `nightly`) and
 
 `cargo test` also runs each scenario once per profile against the `excise` crate's own binary (`tests/harness_scenarios.rs`). It also runs a negative control from `crates/excise-harness/tests/controls`, which asks `delete` for the wrong entry and asserts that the step fails without a `y` being sent. Fixtures and scratch areas are created under `/tmp` on Unix, or under `EXCISE_E2E_TMPDIR`, and removed afterwards. On Windows, set `EXCISE_E2E_TMPDIR` to a short directory such as `C:\xh`. The deletion dialog is at most 78 columns wide, and the `delete` step refuses a path that the dialog cuts short.
 
+`memory-budget-interactive-250k` (`full` tier) and `memory-budget-interactive-1m` (`nightly`)
+check that an interactive scan's peak memory (`peak_rss_bytes`) stays within its budget (512 MiB
+by default) on a 250,000- and a 1,000,000-entry fixture. `memory-budget-interactive-1m-cgroup`
+(`nightly`, Linux only) runs the same 1,000,000-entry scan under the Linux cgroup memory cap,
+checking that it still completes, exits normally, and keeps `peak_rss_bytes` within budget:
+`EXCISE_HARNESS_CGROUP=1` and a scenario's own `cgroup_memory_cap = true` together spawn `excise`
+under `systemd-run --scope` with `MemoryMax` set to the budget, so the kernel kills the scan
+outright if it ever needs more than that, instead of this crate finding out after the fact. The
+cgroup's own `memory.peak` (`cgroup_memory_peak_bytes`) is reported alongside `peak_rss_bytes`, not
+gated: the cap bounds it by construction, so a check against the same budget could never fail.
+Without the opt-in, or on a host that cannot do it, every runner skips such a scenario, with the
+reason. The harness README documents the mechanism
+(`crates/excise-harness/README.md#linux-cgroup-memory-cap`).
+
 ### Headless scans
 
 `cargo xtask headless` scans the fixtures without a terminal (`excise --format json --output <report> <fixture>`), under the same isolation as the scenarios, holds every scan report to the oracle of its fixture under the accounting contract (directory metadata excluded, allocation once per identity, links not followed, unreadable entries uncertain, exit code against the report state), and times the scan against `du -sk` on the same warm fixture.
@@ -366,6 +380,14 @@ EXCISE_HARNESS_PRIVILEGED=1 cargo xtask headless --class volumes
 `--quick` runs the fixtures of at most 10,000 planned entries and `--full` (the default) those of at most 250,000. `--fixture` names fixtures and runs them whatever their size, and `--class` (`scale`, `identity`, `hostile`, `volumes`) selects by class. `--repeat N` is the number of timed pairs (five by default, interleaved as scan, `du`, scan, `du`, after one untimed warm-up pair), `--profile` is `default` or `deterministic`, `--timeout` bounds one scan or one `du` in seconds, and `--keep-scratch` keeps the scratch areas and reports. A fixture is scanned in its cached master below the target directory, generated once and then reused, except a fixture that `cargo clean` could not remove because it holds directories that cannot be listed or paths longer than `PATH_MAX`: that one is never cached and is scanned in a fresh copy, removed when the fixture is done. The command builds the release binary unless `EXCISE_E2E_BINARY` names one, prints one row per fixture with the headless and `du -sk` medians, the median and range of their ratio, and the oracle diff, and exits non-zero on any `fail`, `xpass`, or `error`. The ratio is checked against a 3x budget on a fixture whose oracle entry count (fixed by its spec and seed, never a measured time) is large enough to judge; below that it is reported but never gated. A count keeps the gate deterministic: which fixtures are judged never depends on how loaded the machine was. `expectations/headless.toml` names the fixtures and platforms expected to miss the budget today, with the same strict xfail semantics as the oracle diff, and the command exits non-zero on any other miss; both the budget and the entry threshold are expected to be revisited once the durable-write fix lands and ratios approach the budget. Volume fixtures run without privileges too, but then their mount points are empty directories and no boundary is crossed; the table says so. The summary is `target/excise-headless/<run-id>/summary.json`, and a failing fixture gets a directory beside it with its discrepancies, the command that reruns it, and the report. Fixtures that fail the diff for a known defect that is not yet fixed are listed, with the finding, in `crates/excise-harness/expectations/headless.toml` and show as `xfail`; the entry is removed by the change that fixes the defect.
 
 `cargo test` also scans the cheap fixtures that need no privileges against the `excise` crate's own binary (`tests/harness_headless.rs`) and runs a negative control: a binary that writes a report that breaks the published schema must fail the run.
+
+Every scan is also held to the memory contract: its peak memory (`peak_rss_bytes`, where the
+platform can measure it) must stay at most 512 MiB, with the same strict-xfail semantics as the
+oracle diff (`[[expect_memory_fail]]` in `expectations/headless.toml`). `EXCISE_HARNESS_CGROUP=1`
+wraps every scan under the Linux cgroup memory cap (`systemd-run --scope`) while this host can do
+it; `EXCISE_HARNESS_CGROUP=1 cargo xtask headless --fixture tiny-files-1m --repeat 0` is the
+nightly-tier check at the 1,000,000-entry size (`--repeat 0` scans it once; the default five pairs
+would cost that many scans of the slowest fixture this program has).
 
 ### Paired A/B benchmark
 

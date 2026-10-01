@@ -33,7 +33,9 @@ pub mod suite;
 
 pub use diff::{Diff, Discrepancy, DiscrepancyKind};
 pub use document::{DocumentError, ScanDocument};
-pub use expectations::{ExpectationError, Expectations, ExpectedFailure, RatioExpectedFailure};
+pub use expectations::{
+    ExpectationError, Expectations, ExpectedFailure, ExpectedMemoryFailure, RatioExpectedFailure,
+};
 pub use scan::{ScanError, ScanRequest, ScanRun, run_scan};
 pub use suite::{
     Class, DEFAULT_REPEAT, FixtureReport, Progress, SuiteError, SuiteOptions, SuiteReport,

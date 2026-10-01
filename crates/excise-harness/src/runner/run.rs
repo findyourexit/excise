@@ -9,14 +9,16 @@ use std::{
 };
 
 use crate::{
+    headless::suite::MEMORY_BUDGET_BYTES,
     metrics::milliseconds,
     pty::{PtySession, SpawnSpec},
     report::{FixtureIdentity, Rusage, Verdict},
-    safety::{FixtureRoot, FixtureSnapshot, ProfileSettings, Scratch, isolated_env},
-    scenario::{Profile, Scenario},
+    safety::{FixtureRoot, FixtureSnapshot, ProfileSettings, Scratch, cgroup, isolated_env},
+    scenario::{Budget, Profile, Scenario},
 };
 
 use super::{
+    budget::limit_for,
     bundle::{self, Bundle, Invocation},
     exec::Executor,
     outcome::{RunError, StepFailure, Stop},
@@ -161,7 +163,7 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
         .into_temp_path();
 
     let settings = ProfileSettings::for_profile(request.profile);
-    let spec = SpawnSpec {
+    let mut spec = SpawnSpec {
         program: binary,
         args: vec![fixture.path().as_os_str().to_owned()],
         env: isolated_env(&scratch, request.profile, true, request.scan_store_dir),
@@ -171,7 +173,11 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
         recording: Some(recording.to_path_buf()),
         title: Some(format!("{} ({})", scenario.name, request.profile)),
     };
-    let session = PtySession::spawn(&spec)?;
+    let cgroup_wrapped = apply_cgroup_wrap(scenario, request.profile, &mut spec)?;
+    let mut session = PtySession::spawn(&spec)?;
+    if cgroup_wrapped {
+        session.mark_cgroup_wrapped();
+    }
     let store_dir = request
         .scan_store_dir
         .map_or_else(|| scratch.store(), Path::to_path_buf);
@@ -217,6 +223,40 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
         let _ = recording.keep();
     }
     Ok(())
+}
+
+/// Rewrites `spec` to run under the Linux cgroup memory cap, if `scenario.cgroup_memory_cap` asks
+/// for it, and returns whether it did.
+///
+/// `select` (`runner::e2e`) already skips a scenario that asks for it without the opt-in, or on a
+/// host that cannot do it, even when the scenario is named; reaching this with the field set and
+/// no cgroup support is therefore a harness bug, not a scenario failure, and is reported as a
+/// harness error rather than run unwrapped. A memory-contract scenario that silently stopped
+/// enforcing its cap would be worse than one that refuses to run.
+fn apply_cgroup_wrap(
+    scenario: &Scenario,
+    profile: Profile,
+    spec: &mut SpawnSpec,
+) -> Result<bool, RunError> {
+    if !scenario.cgroup_memory_cap {
+        return Ok(false);
+    }
+    cgroup::CgroupOptIn::from_env()
+        .ok_or_else(|| RunError::CgroupUnavailable(format!("needs `{}=1`", cgroup::OPT_IN_ENV)))?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a peak_rss_bytes budget is a small positive number of bytes, far below u64::MAX"
+    )]
+    let limit_bytes = limit_for(scenario, Budget::PeakRssBytes)
+        .map_or(MEMORY_BUDGET_BYTES, |limit| limit.round() as u64);
+    let unit = cgroup::unit_name(&format!("{}-{profile}", scenario.name));
+    let (program, args, extra_env) = cgroup::wrap(&unit, limit_bytes, &spec.program, &spec.args)
+        .map_err(|reason| RunError::CgroupUnavailable(reason.to_string()))?;
+    spec.program = program;
+    spec.args = args;
+    spec.env.extend(extra_env);
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
