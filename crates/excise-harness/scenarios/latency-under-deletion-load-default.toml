@@ -1,0 +1,125 @@
+schema_version = 1
+name = "latency-under-deletion-load-default"
+description = "Navigation keys sent while the 5,011-entry delete-folder victim is still being removed get a frame within twice the strict latency budgets: the cheap, quick-tier representative of latency under load. The strict budgets are checked in full and nightly (latency-under-deletion-load-deterministic)."
+fixture = "delete-folder"
+sentinels = ["keep-a.bin", "keep-b/keep.txt"]
+profiles = ["default"]
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+# Pull-request-tier budgets: twice the strict local and nightly limits.
+[budgets]
+input_to_frame_p99_ms = 100
+max_stall_ms = 500
+first_frame_ms = 500
+quit_ms = 500
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "victim"
+timeout_ms = 10000
+
+# `wait_for = "started"` returns as soon as the dialog has closed, while the 5,011-entry deletion
+# keeps running in the background: that is exactly where the keys below must land.
+[[steps]]
+step = "delete"
+name = "victim"
+kind = "folder"
+wait_for = "started"
+timeout_ms = 60000
+
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+[[steps]]
+step = "key"
+key = "up"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+# The deletion step returned before the deletion itself finished: reach the same point the
+# "finished" wait would have, by hand (wait_fs_absent, then deletion_finished, then a frame after
+# it), before trusting the map or quitting.
+[[steps]]
+step = "wait_fs_absent"
+path = "victim"
+timeout_ms = 30000
+
+[[steps]]
+step = "wait_event"
+event = "deletion_finished"
+timeout_ms = 30000
+
+# `wait_event` only waits for the event line itself; force a fresh frame after it before trusting
+# the header, or a stale pre-rebuild COMPLETE frame could let the quit below race the rebuild. A
+# resize forces that frame without counting as a measured input; the width only changes by one
+# column, which cannot break anything this scenario checks afterward.
+[[steps]]
+step = "resize"
+cols = 121
+rows = 40
+
+# A deletion invalidates the map, and the program rebuilds it; this is the frame after the rebuild.
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "keep-b/keep.txt"]
+absent = ["victim"]
+
+[[steps]]
+step = "expect_budget"
+budget = "first_frame_ms"
+metric = "first_frame_ms"
+
+[[steps]]
+step = "expect_budget"
+budget = "input_to_frame_p99_ms"
+metric = "input_to_frame_p99_ms"
+
+[[steps]]
+step = "expect_budget"
+budget = "max_stall_ms"
+metric = "max_stall_ms"
+
+[[steps]]
+step = "quit"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000
+
+[[steps]]
+step = "expect_budget"
+budget = "quit_ms"
+metric = "quit_ms"

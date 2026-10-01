@@ -1,0 +1,88 @@
+schema_version = 1
+name = "latency-under-slow-terminal"
+description = "Input must stay responsive while scanning, however fast the terminal drains. Capping the pseudo-terminal's drain at 150000 bytes/sec reproduces F2: the owner thread blocks in the terminal write once a slow terminal backs it up, and scan ingestion and input handling share that thread, so both stall together. Fixed by X2."
+fixture = "node-modules-2k"
+profiles = ["default", "deterministic"]
+tier = "full"
+platforms = ["linux", "macos"]
+expect = "fail"
+slice = "X2"
+
+[terminal]
+cols = 120
+rows = 40
+drain_bytes_per_sec = 150000
+
+# The scan is still running: the header badge must read SCANNING, never COMPLETE, so this never
+# passes by outrunning the scan.
+[[steps]]
+step = "wait_header"
+state = "scanning"
+timeout_ms = 10000
+
+# `down` and `up` cancel out, so the final selection is unaffected. The settle timeout is generous
+# because a settle step is exactly where the owner thread blocking in a slow terminal write shows
+# up: a key answered only once the backed-up output drains is the defect this scenario checks for,
+# not a harness bug.
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 30000
+
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 30000
+
+[[steps]]
+step = "key"
+key = "up"
+
+[[steps]]
+step = "settle"
+timeout_ms = 30000
+
+# Checked before the scan is awaited to completion: under default motion a throttled terminal can
+# make the scan take a very long time to reach COMPLETE at all (F2's own symptom), and this check
+# must still run and report the real number even then.
+[[steps]]
+step = "expect_budget"
+budget = "input_to_frame_p99_ms"
+metric = "input_to_frame_p99_ms"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 90000
+
+[[steps]]
+step = "expect_budget"
+budget = "first_frame_ms"
+metric = "first_frame_ms"
+
+[[steps]]
+step = "expect_budget"
+budget = "max_stall_ms"
+metric = "max_stall_ms"
+
+[[steps]]
+step = "quit"
+timeout_ms = 15000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000
+
+[[steps]]
+step = "expect_budget"
+budget = "quit_ms"
+metric = "quit_ms"
