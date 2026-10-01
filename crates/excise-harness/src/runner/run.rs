@@ -172,7 +172,12 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
         title: Some(format!("{} ({})", scenario.name, request.profile)),
     };
     let session = PtySession::spawn(&spec)?;
-    let mut executor = Executor::new(scenario, &prepared, &fixture, &scratch, &baseline, session);
+    let store_dir = request
+        .scan_store_dir
+        .map_or_else(|| scratch.store(), Path::to_path_buf);
+    let mut executor = Executor::new(
+        scenario, &prepared, &fixture, &scratch, &baseline, store_dir, session,
+    );
 
     let result = executor.run();
     match result {

@@ -22,12 +22,13 @@
 
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
 use crate::{
     events::{Event, EventLog, Payload},
-    metrics::Recorder,
+    metrics::{Recorder, StoreSampler},
     pty::PtySession,
     safety::{FixtureRoot, FixtureSnapshot, Scratch},
     scenario::{Scenario, Step},
@@ -42,6 +43,8 @@ use super::{
 pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// How often a wait for a file system condition looks at the file system.
 pub(super) const FS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How often the run's scan-store directory is sampled for its peak size.
+pub(super) const STORE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How a bounded wait ended.
 #[derive(Debug)]
@@ -71,6 +74,11 @@ pub(crate) struct Executor<'a> {
     /// Fixture-relative paths that `fs_mutate` steps changed.
     pub(super) intended_mutations: Vec<String>,
     pub(super) residue_files: Option<usize>,
+    /// The scan-store directory the program was given: the scratch area's own, or the directory a
+    /// scenario moved it to (`scan_store_on_volume`).
+    store_dir: PathBuf,
+    store_sampler: StoreSampler,
+    last_store_sample: Instant,
     hello_checked: bool,
 }
 
@@ -81,10 +89,12 @@ impl<'a> Executor<'a> {
         fixture: &'a FixtureRoot,
         scratch: &'a Scratch,
         baseline: &'a FixtureSnapshot,
+        store_dir: PathBuf,
         session: PtySession,
     ) -> Self {
         let recorder = Recorder::new(session.started());
         let events = EventLog::new(scratch.events());
+        let started = session.started();
         Self {
             scenario,
             prepared,
@@ -99,6 +109,11 @@ impl<'a> Executor<'a> {
             intended_deletions: Vec::new(),
             intended_mutations: Vec::new(),
             residue_files: None,
+            store_dir,
+            store_sampler: StoreSampler::default(),
+            last_store_sample: started
+                .checked_sub(STORE_SAMPLE_INTERVAL)
+                .unwrap_or(started),
             hello_checked: false,
         }
     }
@@ -121,6 +136,7 @@ impl<'a> Executor<'a> {
             self.events.events(),
             self.session.output_bytes(),
             self.session.sampler(),
+            self.store_sampler.peak_bytes(),
             self.session.cpu_time(),
             Instant::now(),
         );
@@ -134,6 +150,10 @@ impl<'a> Executor<'a> {
     /// Reads all pending terminal output and events.
     pub(super) fn pump(&mut self) -> Result<(), Stop> {
         self.session.pump()?;
+        if self.last_store_sample.elapsed() >= STORE_SAMPLE_INTERVAL {
+            self.last_store_sample = Instant::now();
+            self.store_sampler.sample(&self.store_dir);
+        }
         if self.events.poll(Instant::now())? > 0 && !self.hello_checked {
             self.check_hello()?;
         }

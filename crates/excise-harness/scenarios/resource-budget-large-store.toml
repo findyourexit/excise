@@ -1,0 +1,35 @@
+schema_version = 1
+name = "resource-budget-large-store"
+description = "Scan-store bytes per scanned entry stays within the baseline proposed from a small, flat tree even on a 49k-entry tree, confirming the ratio does not grow with tree size."
+fixture = "tiny-files-50k"
+profiles = ["deterministic"]
+tier = "full"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[budgets]
+scan_store_bytes_per_entry = 1665
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 60000
+
+[[steps]]
+step = "expect_budget"
+budget = "scan_store_bytes_per_entry"
+metric = "scan_store_bytes_per_entry"
+
+[[steps]]
+step = "quit"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000

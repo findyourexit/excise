@@ -28,9 +28,16 @@ pub struct SnapshotError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Fingerprint {
-    File { len: u64 },
+    File {
+        len: u64,
+    },
     Directory,
-    Symlink { target: String },
+    /// A directory the hostile fixture class made unreadable on purpose. It contributes no
+    /// descendants, the same rule the fixture generator's oracle applies to one it cannot list.
+    UnreadableDirectory,
+    Symlink {
+        target: String,
+    },
     Other,
 }
 
@@ -39,6 +46,7 @@ impl Fingerprint {
         match self {
             Self::File { len } => format!("file, {len} bytes"),
             Self::Directory => "directory".to_owned(),
+            Self::UnreadableDirectory => "unreadable directory".to_owned(),
             Self::Symlink { target } => format!("symbolic link to {target}"),
             Self::Other => "special file".to_owned(),
         }
@@ -136,9 +144,14 @@ impl FixtureDiff {
 impl FixtureSnapshot {
     /// Walks `root` without following symbolic links.
     ///
+    /// A directory discovered below the root that cannot be listed (the hostile fixture class
+    /// makes some on purpose) is recorded as [`Fingerprint::UnreadableDirectory`] and contributes
+    /// no descendants, the same rule the fixture generator's oracle applies. Only the root itself
+    /// must be listable.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a directory cannot be read or an entry cannot be inspected.
+    /// Returns an error if the root cannot be read or an entry cannot be inspected.
     pub fn take(root: &Path) -> Result<Self, SnapshotError> {
         let error = |path: &Path, source: io::Error| SnapshotError {
             path: path.to_path_buf(),
@@ -147,7 +160,15 @@ impl FixtureSnapshot {
         let mut entries = BTreeMap::new();
         let mut pending = vec![(root.to_path_buf(), String::new())];
         while let Some((directory, prefix)) = pending.pop() {
-            for entry in fs::read_dir(&directory).map_err(|source| error(&directory, source))? {
+            let listing = match fs::read_dir(&directory) {
+                Ok(listing) => listing,
+                Err(_source) if !prefix.is_empty() => {
+                    entries.insert(prefix, Fingerprint::UnreadableDirectory);
+                    continue;
+                }
+                Err(source) => return Err(error(&directory, source)),
+            };
+            for entry in listing {
                 let entry = entry.map_err(|source| error(&directory, source))?;
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -395,5 +416,32 @@ mod tests {
 
         assert!(snapshot.contains("link"));
         assert!(!snapshot.contains("link/secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_nested_directory_contributes_no_descendants_and_does_not_fail_the_walk() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = fixture();
+        let locked = root.path().join("victim/locked");
+        fs::create_dir(&locked).expect("a directory to lock");
+        fs::write(locked.join("hidden.bin"), b"x").expect("a file that will become unreadable");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
+            .expect("a restrictive mode");
+
+        let first = FixtureSnapshot::take(root.path());
+        let second = FixtureSnapshot::take(root.path());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))
+            .expect("the probe directory must stay removable");
+        let first = first.expect("an unreadable nested directory does not fail the walk");
+        let second = second.expect("an unreadable nested directory does not fail the walk");
+        assert!(first.contains("victim/locked"));
+        assert!(!first.contains("victim/locked/hidden.bin"));
+
+        assert!(
+            first.diff(&second).is_empty(),
+            "two snapshots of the same unreadable directory produce the same fingerprint"
+        );
     }
 }

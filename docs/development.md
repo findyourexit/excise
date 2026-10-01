@@ -384,6 +384,17 @@ See the [harness README](https://github.com/findyourexit/excise/blob/main/crates
 
 `tests/harness_sessions.rs` builds one scan-store parent shared by three `excise` processes: a session killed with `SIGKILL` (process termination on Windows) right after its session directory appears under it, a session kept running in its own pseudo-terminal until the test quits it, and a directory with the same `.excise-scan-*` name shape that no `excise` process ever made. A third `excise`, started against the same parent, finishes a headless scan normally; the live session's directory and the unverified directory must survive it. The dead session's directory survives it too today, which is finding F4 (`src/scan_store/storage.rs`): nothing sweeps a killed session's leftovers. That assertion is a strict expected failure: it holds while the defect is present, its failure message names the finding and the fixing slice, and it must be flipped once a startup sweep of verified, unlocked, same-user sessions ships.
 
+### Error exits
+
+`tests/harness_error_exits.rs` runs `excise` against a fixture with `EXCISE_TEST_EVENTS` pointed at
+a path that already exists. The channel is created exclusively and never overwrites an existing
+file, so this is a configuration error, caught and reported before the terminal is entered. The
+process must exit 78 and leave nothing behind in its scratch area.
+
+The PTY scenario `error-exit-unreadable-root.toml` covers the other side: a root containing files
+and directories `excise` cannot read still reaches an exit code that reflects the uncertainty
+(2), restores the terminal, and leaves no residue, after an ordinary quit.
+
 ## Benchmarks
 
 The hosted `benchmark.yml` retains the `criterion-benchmark-evidence` artifact for 90 days. It contains Criterion raw samples and reports from `target/criterion`, one-million and bounded-fan-in probe logs, plus `benchmark-context.txt`, which records the checked-out SHA, workflow run, runner image and CPU, commands, Rust toolchain, and `Cargo.lock` digest.

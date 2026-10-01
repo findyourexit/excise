@@ -1,0 +1,47 @@
+schema_version = 1
+name = "resource-budget-small-default"
+description = "Threads, open descriptors, and scan-store bytes per scanned entry stay within their proposed baselines on a small, flat tree under the default profile."
+fixture = "wide-1k"
+profiles = ["default"]
+tier = "quick"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[budgets]
+threads = 17
+fds = 48
+scan_store_bytes_per_entry = 1665
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_budget"
+budget = "threads"
+metric = "threads"
+
+[[steps]]
+step = "expect_budget"
+budget = "fds"
+metric = "fds"
+
+[[steps]]
+step = "expect_budget"
+budget = "scan_store_bytes_per_entry"
+metric = "scan_store_bytes_per_entry"
+
+[[steps]]
+step = "quit"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000
