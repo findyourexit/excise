@@ -26,6 +26,10 @@
     "failed_step": { "$ref": "#/$defs/failed_step" },
     "screen": { "$ref": "#/$defs/screen" },
     "terminal_modes": { "$ref": "#/$defs/terminal_modes" },
+    "session_diagnostics": {
+      "description": "Present only when the failure's cause was a timeout.",
+      "$ref": "#/$defs/session_diagnostics"
+    },
     "cast_path": {
       "description": "The asciicast recording of the session.",
       "$ref": "#/$defs/text"
@@ -91,6 +95,30 @@
         "cursor_visible": { "type": "boolean" },
         "echo": { "type": "boolean" },
         "icanon": { "type": "boolean" }
+      }
+    },
+    "session_diagnostics": {
+      "type": "object",
+      "description": "Everything the session could say about its output and the child at the moment a step timed out.",
+      "required": [
+        "output_bytes",
+        "child_running",
+        "cursor_reports_answered",
+        "head",
+        "tail"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "output_bytes": { "$ref": "#/$defs/unsigned" },
+        "first_byte_after_ms": { "$ref": "#/$defs/unsigned" },
+        "child_running": { "type": "boolean" },
+        "cursor_reports_answered": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "head": { "type": "string" },
+        "tail": { "type": "string" }
       }
     },
     "rusage": {

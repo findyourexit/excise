@@ -109,7 +109,7 @@ The in-process run fails on a scenario file that does not parse or validate, but
 
 A failed scenario leaves a bundle at `target/excise-e2e/<run-id>/<scenario>-<profile>-<n>/`. `target/excise-e2e/latest` points at the newest run, whose `summary.json` holds every verdict. The bundle holds:
 
-- `failure.json`: the failed step, the expected and the actual screen text, the terminal modes, resource use, and the fixture hash and seed;
+- `failure.json`: the failed step, the expected and the actual screen text, the terminal modes, resource use, the fixture hash and seed, and, when the step timed out, the session's diagnostics (output bytes, whether the child was still alive, and the raw output's head and tail);
 - `session.cast`: an asciicast recording of the session;
 - `screen.txt`: the failure and the screen at that moment;
 - `events.jsonl`: the events the program emitted;

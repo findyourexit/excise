@@ -19,10 +19,11 @@ use std::{
 };
 
 use crate::{
-    pty::TerminalModes,
+    fixture::path::write_escaped,
+    pty::{Diagnostics, TerminalModes},
     report::{
         Document, FailedStep, FailureKind, FixtureIdentity, HarnessFailure, Rusage, SchemaVersion,
-        ScreenComparison, TerminalModes as ReportModes,
+        ScreenComparison, SessionDiagnostics, TerminalModes as ReportModes,
     },
     scenario::Profile,
 };
@@ -118,6 +119,11 @@ pub(crate) fn write(dir: &Path, bundle: &Bundle<'_>) -> io::Result<()> {
             echo: modes.echo.unwrap_or(true),
             icanon: modes.icanon.unwrap_or(true),
         },
+        session_diagnostics: bundle
+            .failure
+            .session_diagnostics
+            .as_ref()
+            .map(diagnostics_of),
         cast_path: cast.to_string_lossy().into_owned(),
         rusage: bundle.rusage,
         fixture: bundle.fixture.clone(),
@@ -127,6 +133,29 @@ pub(crate) fn write(dir: &Path, bundle: &Bundle<'_>) -> io::Result<()> {
         io::Error::other(format!("cannot render the failure document: {error}"))
     })?;
     fs::write(dir.join("failure.json"), json)
+}
+
+/// Converts the session's raw diagnostics into the document's shape: milliseconds instead of a
+/// `Duration`, a plain `bool` instead of an optional exit, and the raw byte ends escaped for
+/// display exactly as `screen.txt` shows them.
+fn diagnostics_of(diagnostics: &Diagnostics) -> SessionDiagnostics {
+    SessionDiagnostics {
+        output_bytes: diagnostics.output_bytes,
+        first_byte_after_ms: diagnostics
+            .first_byte_after
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        child_running: diagnostics.exit.is_none(),
+        cursor_reports_answered: diagnostics.cursor_reports_answered,
+        head: escape(&diagnostics.head),
+        tail: escape(&diagnostics.tail),
+    }
+}
+
+/// Escapes raw output bytes for display, exactly as `Diagnostics`'s `Display` impl does.
+fn escape(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    let _ = write_escaped(&mut text, bytes);
+    text
 }
 
 fn first_line(text: &str) -> &str {

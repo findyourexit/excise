@@ -192,9 +192,10 @@ struct Chunk {
 /// much output arrived and when, whether the child is still alive, how many cursor position
 /// report requests the screen model has answered, and the bounded ends of the raw stream (see
 /// [`DIAGNOSTIC_BYTES`]). A step waits on the screen model, never on raw bytes (see
-/// [`crate::pty::Screen`]), so this is evidence for a human reading a failure, not something a
-/// scenario can assert on.
-#[derive(Debug, Clone)]
+/// [`crate::pty::Screen`]), so this is evidence for a human (and, via
+/// `report::SessionDiagnostics`, a failure document) reading a failure, not something a scenario
+/// can assert on.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostics {
     /// Every byte of output read so far.
     pub output_bytes: u64,

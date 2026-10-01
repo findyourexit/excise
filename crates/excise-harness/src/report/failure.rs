@@ -75,6 +75,28 @@ pub struct FixtureIdentity {
     pub seed: u64,
 }
 
+/// The session's diagnostics when a step failed by timing out: everything
+/// `PtySession::diagnostics` could say about the output and the child at the moment the step gave
+/// up. `None` for any other failure cause (a mismatch, the process exiting first, or a `delete`
+/// step that was refused).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDiagnostics {
+    /// Every byte of terminal output the session had read when the step gave up.
+    pub output_bytes: u64,
+    /// Milliseconds from the spawn to the first byte of output, once any had arrived.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_byte_after_ms: Option<u64>,
+    /// Whether the child was still running.
+    pub child_running: bool,
+    /// How many `ESC[6n` cursor-position report requests the screen model had answered.
+    pub cursor_reports_answered: u32,
+    /// The first bytes of output, escaped for display.
+    pub head: String,
+    /// The last bytes of output, escaped for display.
+    pub tail: String,
+}
+
 /// The evidence bundle for one failed scenario.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +115,10 @@ pub struct HarnessFailure {
     pub screen: ScreenComparison,
     /// The terminal modes at that moment.
     pub terminal_modes: TerminalModes,
+    /// The session's diagnostics, recorded when the step failed by timing out. See
+    /// [`SessionDiagnostics`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_diagnostics: Option<SessionDiagnostics>,
     /// The recording of the session, in asciicast format.
     pub cast_path: String,
     /// Resource use of the process.

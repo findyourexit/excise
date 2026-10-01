@@ -29,7 +29,7 @@ use std::{
 use crate::{
     events::{Event, EventLog, Payload},
     metrics::{Recorder, StoreSampler},
-    pty::PtySession,
+    pty::{Diagnostics, PtySession},
     safety::{FixtureRoot, FixtureSnapshot, Scratch},
     scenario::{Scenario, Step},
 };
@@ -303,6 +303,7 @@ impl<'a> Executor<'a> {
             cause,
             expected: expected.into(),
             detail: detail.into(),
+            session_diagnostics: None,
         }))
     }
 
@@ -317,16 +318,19 @@ impl<'a> Executor<'a> {
     ) -> Stop {
         let expected = expected.into();
         match waited {
-            Waited::TimedOut => self.fail(
-                index,
-                FailureCause::Timeout,
-                expected,
-                format!(
-                    "not within {timeout_ms} ms; {}\nsession: {}",
-                    observed(),
-                    self.session.diagnostics()
-                ),
-            ),
+            Waited::TimedOut => {
+                let diagnostics = self.session.diagnostics();
+                let stop = self.fail(
+                    index,
+                    FailureCause::Timeout,
+                    expected,
+                    format!(
+                        "not within {timeout_ms} ms; {}\nsession: {diagnostics}",
+                        observed()
+                    ),
+                );
+                attach_session_diagnostics(stop, diagnostics)
+            }
             Waited::Exited => self.fail(
                 index,
                 FailureCause::ProcessExited,
@@ -344,4 +348,13 @@ impl<'a> Executor<'a> {
     fn execute(&mut self, index: usize, step: &Step) -> Result<(), Stop> {
         self.dispatch(index, step)
     }
+}
+
+/// Attaches `diagnostics` to a timed-out failure, so the failure document can carry them
+/// structurally alongside the text `unmet` already folds into the failure's `detail`.
+fn attach_session_diagnostics(mut stop: Stop, diagnostics: Diagnostics) -> Stop {
+    if let Stop::Fail(failure) = &mut stop {
+        failure.session_diagnostics = Some(diagnostics);
+    }
+    stop
 }
