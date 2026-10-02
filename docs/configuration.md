@@ -67,7 +67,7 @@ format = "tui"
 1. `version = 1` is required. Unsupported versions are rejected rather than silently reinterpreted.
 2. A configured worker count must be between one and 32. By default, Excise uses all but one detected processor, bounded to one through eight workers.
 3. `scan_store_mib` and `scan_store_reserve_mib` are optional limits. Omit them to retain the adaptive scan-store budget.
-4. `scan_store_dir` names the parent directory for private, automatically cleaned per-session scan data. It must be writable.
+4. `scan_store_dir` names the parent directory for private per-session scan data. It must be writable. A session removes its own directory when it ends, and the next start removes one that a killed run left behind (see "Scratch directory cleanup" below).
 
 ### Custom Movement Keys
 
@@ -115,6 +115,24 @@ right = "d"
     Temporary storage defaults to 4 GiB per session. The scan-store budget adapts to its scratch volume: it uses up to 75 percent of safe free space and reserves the remaining 25 percent for the user and other processes. `model.scan_store_mib`, `EXCISE_SCAN_STORE_MIB`, and `--scan-store-mib` set an optional upper limit. `model.scan_store_reserve_mib`, `EXCISE_SCAN_STORE_RESERVE_MIB`, and `--scan-store-reserve-mib` replace the default reserve.
 
     When the volume permits it, the effective budget still leaves the minimum usable scan-store capacity. The scan-store directory contains checksummed scan data and completed page indexes only for the private active session.
+
+???+ info "Scratch directory cleanup"
+
+    Each session keeps its scan data in its own `.excise-scan-*` directory inside the scan-store parent (`model.scan_store_dir`, or the system temporary directory when it is unset). Only the current user can open it. A session removes its directory when it ends, whether by a quit, an error, or a signal.
+
+    A killed process (`SIGKILL`), a crash, or a power loss cannot. So every start sweeps the parent before it creates its own session, and removes a leftover directory only when all of these hold:
+
+    - It is a real directory on the parent's file system, not a link, owned by the current user and closed to everyone else.
+    - Its `session.lock` file is a regular file under the same rules and holds the marker that records that Excise made the directory.
+    - The lock on that file can be taken. Every running session holds it, and the operating system drops it when a process ends however it ends, so a free lock means the session is gone.
+
+    Everything else is left alone: running sessions (including another Excise that starts at the same moment), other users' directories, directories that are not Excise's, any entry not named `.excise-scan-*`, and directories that earlier versions left behind, which have no marker. Remove those by hand when no Excise is running. Removal never follows a link and never leaves the verified directory.
+
+    The sweep reports nothing and cannot fail a scan. A start that finds dead sessions spends the time it takes to delete them before it begins, and one that cannot remove a directory completely leaves it for the next start. A start examines at most 256 directories, so a very large backlog clears over several starts.
+
+    On Windows, a headless run that a second signal ends removes its directory while the process still holds the session's lock, which can make that removal fail. The next start removes the directory.
+
+    A power loss can lose a session's marker before it reaches the disk. Such a directory has no marker, so it is left alone like any other directory Excise cannot verify.
 
 The interactive ++t++ picker previews existing `runtime.theme` values without changing configuration. Press ++enter++ to save the selected theme for later TUI sessions, or ++esc++ to restore the original value without writing a preference.
 

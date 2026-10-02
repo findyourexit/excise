@@ -103,7 +103,10 @@ fn forced_exit_action(headless_session_root: Option<&Path>) -> ForcedExitAction 
 /// directory already gone, or any other failure to remove it, does not stop the exit that
 /// follows - nothing could act on that error once the process is gone anyway, and a partially
 /// written `--output` file from whatever the main thread was doing is simply left behind for the
-/// caller to discard (see `docs/reports.md`).
+/// caller to discard (see `docs/reports.md`). The session still holds its lock when this runs.
+/// That does not stop the removal on Unix. On Windows it can make it fail, which is
+/// acceptable: the directory is then a dead session's, and the next start's sweep
+/// (`scan_store::sweep`) removes it. No wait is added here for that.
 ///
 /// Never returns when it removes a directory: ends the process directly, bypassing whatever the
 /// main thread is doing.

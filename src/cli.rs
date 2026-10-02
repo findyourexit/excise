@@ -18,6 +18,7 @@ use crate::report::{ReportError, ScanReport, write_buffered};
 use crate::runtime::{
     RuntimeSettings, SystemClock, run_with_frame_gate, scan_headless_with_stop_signals,
 };
+use crate::scan_store::sweep::sweep_dead_sessions;
 use crate::signals::{self, StopRequest};
 use crate::terminal::{SplitColorWriter, TerminalSession, spawn_frame_writer, validate_terminal};
 use crate::test_events;
@@ -86,6 +87,11 @@ pub(crate) fn run_main() -> i32 {
     if let Err(error) = test_events::init_from_env() {
         return report_error(&error);
     }
+    // Every start removes what dead sessions left in the scratch parent before it creates its own
+    // session. It runs ahead of the signal handling on purpose: a signal during a sweep that has a
+    // lot to remove ends the process at once, as it always did, and what it had not reached is
+    // still a verified session for the next start. It reports nothing and cannot fail the run.
+    sweep_dead_sessions(settings.scan_store_dir.as_deref());
     let stop_signals = match signals::install() {
         Ok(stop_signals) => stop_signals,
         Err(error) => {
