@@ -1,12 +1,10 @@
 schema_version = 1
 name = "signal-hup-mid-deletion"
-description = "SIGHUP delivered after the deletion is confirmed but before it finishes is a confirmed quit: it should stop the deletion at the next entry boundary, restore the terminal, remove session storage, and exit 130, instead of killing the process mid-deletion with none of that done (F6)."
+description = "SIGHUP delivered after the deletion is confirmed but before it finishes is a confirmed quit: it stops the deletion at the next entry boundary, restores the terminal, removes session storage, and exits 130."
 fixture = "delete-folder"
 sentinels = ["keep-a.bin", "keep-b/keep.txt"]
 profiles = ["deterministic"]
 tier = "full"
-expect = "fail"
-slice = "X3"
 platforms = ["linux", "macos"]
 
 [[steps]]

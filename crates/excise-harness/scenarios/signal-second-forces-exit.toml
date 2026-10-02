@@ -5,8 +5,6 @@ fixture = "delete-folder"
 sentinels = ["keep-a.bin", "keep-b/keep.txt"]
 profiles = ["deterministic"]
 tier = "full"
-expect = "fail"
-slice = "X3"
 platforms = ["linux", "macos"]
 
 [[steps]]

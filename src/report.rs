@@ -180,6 +180,16 @@ impl ScanReport {
         &self.summary
     }
 
+    #[must_use]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub(crate) fn root_identity(&self) -> Option<&NativeIdentity> {
+        self.root_identity.as_ref()
+    }
+
     /// Writes this scan report as pretty JSON without materializing its entries into a document.
     ///
     /// # Errors

@@ -1,11 +1,9 @@
 schema_version = 1
 name = "signal-hup-mid-scan"
-description = "SIGHUP delivered while the scan is still running is a confirmed quit: it should cancel the scan, restore the terminal, remove session storage, and exit 130, instead of killing the process mid-scan with none of that done (F6)."
+description = "SIGHUP delivered while the scan is still running is a confirmed quit: it cancels the scan, restores the terminal, removes session storage, and exits 130."
 fixture = "node-modules-2k"
 profiles = ["deterministic"]
 tier = "full"
-expect = "fail"
-slice = "X3"
 platforms = ["linux", "macos"]
 
 # A fixture large enough that the scan is still running when the signal lands: the header badge

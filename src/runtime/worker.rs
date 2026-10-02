@@ -394,6 +394,11 @@ impl WorkerPool {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn deletion_soft_cancelled_for_test(&self) -> bool {
+        self.deletion_soft_cancelled.load(Ordering::Acquire)
+    }
+
     pub fn cancel_deletion_plan(&self) {
         self.deletion_plan_cancelled.store(true, Ordering::Release);
     }

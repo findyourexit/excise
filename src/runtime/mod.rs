@@ -12,7 +12,7 @@ use std::time::Duration;
 #[cfg(feature = "internal")]
 use std::time::Instant;
 
-use crossbeam_channel::{RecvTimeoutError, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
 use crossterm::event::Event;
 use ratatui::backend::Backend;
 
@@ -48,6 +48,7 @@ use crate::scan_store::session::{
     ScanStore, is_scan_store_capacity_error, scan_store_capacity_message,
 };
 use crate::scan_store::storage::ScanStoreStorage;
+use crate::signals::{self, StopRequest};
 use crate::temporary_storage::TemporaryStorage;
 use crate::terminal::FrameSink;
 use crate::theme::ThemeId;
@@ -63,6 +64,12 @@ const MAX_INPUT_BATCH: usize = 32;
 /// A scanner event is capped at 32 entries. Keep one owner slice bounded so
 /// scanning can never monopolize the UI loop.
 const MAX_SCAN_ENTRIES_PER_SLICE: usize = 32;
+/// Upper bound on one blocked input poll while a signal/console-event watcher is attached
+/// (`OwnerLoop::stop_signals`), so a confirmed-quit request that arrives while otherwise idle
+/// (`IDLE_INPUT_WAIT`) is still noticed promptly instead of only at the next keypress. Comfortably
+/// under the 250 ms quit budget; a `poll` that returns on its own timeout spends no measurable
+/// CPU while blocked, so this does not reopen the idle budget this program also enforces.
+const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -185,6 +192,15 @@ where
     next_deletion_progress_frame: Duration,
     /// Last rendered deletion lifecycle state. Unchanged state does not redraw the map.
     last_deletion_progress: Option<(u64, u64, bool)>,
+    /// An external signal (Unix) or console control event (Windows) delivers a confirmed-quit
+    /// request here. `None` outside a real terminal or headless process run:
+    /// nothing can deliver a real signal to the in-process test or scenario runners.
+    stop_signals: Option<Receiver<StopRequest>>,
+    /// Set by [`OwnerLoop::begin_signal_quit`] or [`OwnerLoop::force_signal_exit`]. Forces the
+    /// run's outcome to [`OperationOutcome::Cancelled`] regardless of scan or deletion state,
+    /// because an external signal is always a confirmed quit (the existing `Interrupted` exit
+    /// class), even when nothing was scanning or being deleted.
+    signal_quit: bool,
 }
 
 /// # Errors
@@ -198,7 +214,7 @@ pub fn run<B>(
 where
     B: Backend,
 {
-    run_with_frame_gate(terminal_backend, input, settings, clock, None)
+    run_with_frame_gate(terminal_backend, input, settings, clock, None, None)
 }
 
 /// Like [`run`], but when `frame_sink` is set, `render` draws a new frame only once the terminal
@@ -206,6 +222,10 @@ where
 /// handling (coalescing: the next frame it does draw reflects however much changed meanwhile).
 /// `cli::run_tui` is the only caller that passes one; every in-process caller (tests, benchmarks,
 /// the in-process scenario runner) passes `None` and renders exactly as before.
+///
+/// `stop_signals` carries a confirmed-quit request from an external signal or console control
+/// event; `cli::run_tui` is again the only caller that passes one, from the same
+/// watcher `cli::run_main` installs for the headless path.
 ///
 /// # Errors
 /// Returns a terminal, input, worker, or invariant error after shutting down owned workers.
@@ -215,6 +235,7 @@ pub fn run_with_frame_gate<B>(
     settings: RuntimeSettings,
     clock: Box<dyn Clock>,
     frame_sink: Option<FrameSink>,
+    stop_signals: Option<Receiver<StopRequest>>,
 ) -> Result<OperationOutcome<RunSummary>, AppError>
 where
     B: Backend,
@@ -287,6 +308,8 @@ where
         next_loading_frame: now.saturating_add(LOADING_FRAME_INTERVAL),
         next_deletion_progress_frame: now.saturating_add(DELETION_PROGRESS_INTERVAL),
         last_deletion_progress: None,
+        stop_signals,
+        signal_quit: false,
     }
     .run()
 }
@@ -312,8 +335,9 @@ where
     fn run_loop(&mut self) -> Result<OperationOutcome<RunSummary>, AppError> {
         self.render()?;
         while self.app.is_running {
+            let mut did_work = self.process_stop_signals()?;
             let input_processed = self.process_input_batch()?;
-            let mut did_work = input_processed;
+            did_work |= input_processed;
             // A keystroke must be drawn before background work can spend another
             // scheduling slice. This keeps cursor feedback independent of scan load.
             if input_processed {
@@ -356,7 +380,7 @@ where
             .saturating_add(summary.deletion_missing_entries)
             .saturating_add(summary.deletion_failed_entries)
             .saturating_add(summary.deletion_unattempted_entries);
-        if self.scan_cancelled || self.cancelled_while_scanning {
+        if self.scan_cancelled || self.cancelled_while_scanning || self.signal_quit {
             Ok(OperationOutcome::Cancelled {
                 value: Some(summary),
                 precise: true,
@@ -616,6 +640,53 @@ where
             }
         };
         self.app.prompt_exit(work);
+        Ok(())
+    }
+
+    /// Drains every confirmed-quit request delivered since the last check: the
+    /// first begins a graceful quit, and any further one forces an immediate exit instead of
+    /// waiting out whatever the first started. `None` outside a real terminal or headless
+    /// process run, where nothing can send one. Returns whether any request was seen, so the
+    /// caller treats draining them as work done this iteration rather than idling.
+    fn process_stop_signals(&mut self) -> Result<bool, AppError> {
+        let Some(receiver) = self.stop_signals.clone() else {
+            return Ok(false);
+        };
+        let mut processed = false;
+        while let Ok(request) = receiver.try_recv() {
+            processed = true;
+            match request {
+                StopRequest::Graceful => self.begin_signal_quit()?,
+                StopRequest::Forced => self.force_signal_exit()?,
+            }
+        }
+        Ok(processed)
+    }
+
+    /// Begins a confirmed quit: cancels any pending deletion plan, requests that an
+    /// active deletion stop at its next entry boundary, and exits once that settles, exactly
+    /// like the interactive "stop and quit" key - but unconditionally, and always forcing the
+    /// `Interrupted` exit class (`signal_quit`), even when there is no work to cancel or stop.
+    fn begin_signal_quit(&mut self) -> Result<(), AppError> {
+        self.signal_quit = true;
+        self.cancel_pending_work_and_exit(true)?;
+        self.finish_exit_after_work();
+        Ok(())
+    }
+
+    /// Forces the exit a second confirmed-quit request demands: skips the ordinary wait for a
+    /// rescan the interrupted deletion may have scheduled (read-only and not worth waiting out,
+    /// unlike an in-flight deletion entry) and any other bookkeeping `finish_exit_after_work`
+    /// would otherwise gate on, and ends the run immediately. Filesystem safety for an in-flight
+    /// deletion entry still comes from the executor's own entry-boundary check against the stop
+    /// this (idempotently, in case both requests were drained together) and the first request
+    /// already set, and from `WorkerPool::shutdown` always joining that executor before this
+    /// run's process can exit - not from waiting here.
+    fn force_signal_exit(&mut self) -> Result<(), AppError> {
+        self.signal_quit = true;
+        self.workers()?.safely_stop_deletion();
+        self.exit_after_work = false;
+        self.app.exit();
         Ok(())
     }
 
@@ -1306,6 +1377,9 @@ where
         if self.app.is_dirty() {
             timeout = timeout.min(WORKER_POLL_INTERVAL);
         }
+        if self.stop_signals.is_some() {
+            timeout = timeout.min(SIGNAL_POLL_INTERVAL);
+        }
         timeout
     }
 
@@ -1586,13 +1660,33 @@ fn summary_only_scan_outcome(
 /// Returns a scanner, model, or worker error after all owned workers stop.
 #[allow(clippy::needless_pass_by_value)]
 pub fn scan_headless(settings: RuntimeSettings) -> Result<OperationOutcome<ScanReport>, AppError> {
+    scan_headless_with_stop_signals(settings, None)
+}
+
+/// Like [`scan_headless`], but ends the scan as a confirmed quit the moment a signal or
+/// console-event request arrives, exactly like the interactive owner loop minus the terminal
+/// and deletion UI neither has here: the run reports [`OperationOutcome::Cancelled`]. Records
+/// this run's scan-store session directory ([`signals::record_headless_session_root`]) so that
+/// a second request, which this scan loop and `cli::run_headless`'s own later check cannot
+/// always wait for (publication and building the report have no check of their own in between),
+/// still removes it and exits at once; otherwise session storage is removed the same way any
+/// other headless exit removes it, by every owned value (the `ScanStore`, its
+/// `ScanStoreStorage` session) dropping normally as this function returns. `cli::run_main` is
+/// the only caller that passes one.
+pub(crate) fn scan_headless_with_stop_signals(
+    settings: RuntimeSettings,
+    stop_signals: Option<Receiver<StopRequest>>,
+) -> Result<OperationOutcome<ScanReport>, AppError> {
     let scan_store_session = ScanStoreStorage::new_for_scan_store_mib(
         settings.scan_store_mib,
         settings.scan_store_reserve_mib,
         settings.scan_store_dir.as_deref(),
     )
     .map_err(|error| AppError::Config(error.to_string()))?;
-    scan_headless_with_scan_store_session(settings, scan_store_session)
+    if stop_signals.is_some() {
+        signals::record_headless_session_root(scan_store_session.root().to_path_buf());
+    }
+    scan_headless_with_scan_store_session(settings, scan_store_session, stop_signals)
 }
 
 #[cfg(test)]
@@ -1603,13 +1697,14 @@ fn scan_headless_with_scan_store_storage(
     let scan_store_session =
         ScanStoreStorage::new(scan_store_storage, settings.scan_store_dir.as_deref())
             .map_err(|error| AppError::Config(error.to_string()))?;
-    scan_headless_with_scan_store_session(settings, scan_store_session)
+    scan_headless_with_scan_store_session(settings, scan_store_session, None)
 }
 
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn scan_headless_with_scan_store_session(
     settings: RuntimeSettings,
     scan_store_session: ScanStoreStorage,
+    stop_signals: Option<Receiver<StopRequest>>,
 ) -> Result<OperationOutcome<ScanReport>, AppError> {
     let scan_store_storage = scan_store_session.quota();
     let temporary_storage = TemporaryStorage::from_mib(settings.temporary_storage_mib)
@@ -1642,10 +1737,25 @@ fn scan_headless_with_scan_store_session(
     let mut scan_store_capacity_exhausted = false;
     let scan_result = (|| -> Result<bool, AppError> {
         loop {
-            let event = workers
-                .events()
-                .recv()
-                .map_err(|_| AppError::Worker("scanner event channel disconnected".to_string()))?;
+            let event = match &stop_signals {
+                Some(stop_signals) => crossbeam_channel::select! {
+                    recv(workers.events()) -> event => event.map_err(|_| {
+                        AppError::Worker("scanner event channel disconnected".to_string())
+                    })?,
+                    recv(stop_signals) -> _ => {
+                        // A signal headless run has no terminal or deletion UI to settle
+                        // first: ending the scan here is the whole of the confirmed quit.
+                        // Session storage is removed the same way any other headless exit
+                        // removes it, by every owned value dropping normally as this function
+                        // returns below (`scan_store`, its `ScanStoreStorage` session); a
+                        // second request only confirms what the first already decided.
+                        return Ok(true);
+                    },
+                },
+                None => workers.events().recv().map_err(|_| {
+                    AppError::Worker("scanner event channel disconnected".to_string())
+                })?,
+            };
             match event {
                 WorkerEvent::ScanBatch {
                     lease,
@@ -1776,6 +1886,16 @@ fn scan_headless_with_scan_store_session(
     let shutdown_result = workers.shutdown();
     let cancelled = scan_result?;
     shutdown_result?;
+    // The scan loop's own select! notices a request that arrives while it is still running; a
+    // request that lands in the narrow gap between the loop ending and here (nothing polls for
+    // one in between) still ends the run as a cancelled, 130 exit, exactly like one the loop
+    // itself caught - checked once more, non-blocking, right before the two phases ahead
+    // (publication, then building the report) that have no check of their own. `cli::run_headless`
+    // checks once more again, after both, for the same reason.
+    let cancelled = cancelled
+        || stop_signals
+            .as_ref()
+            .is_some_and(|stop_signals| stop_signals.try_recv().is_ok());
     if cancelled {
         return Ok(OperationOutcome::Cancelled {
             value: Some(ScanReport::cancelled(
@@ -2055,6 +2175,8 @@ mod tests {
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
             last_deletion_progress: None,
+            stop_signals: None,
+            signal_quit: false,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while owner
@@ -2166,6 +2288,8 @@ mod tests {
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
             last_deletion_progress: None,
+            stop_signals: None,
+            signal_quit: false,
         };
 
         owner
@@ -2311,6 +2435,8 @@ mod tests {
             next_loading_frame: due_frame,
             next_deletion_progress_frame: due_frame,
             last_deletion_progress: None,
+            stop_signals: None,
+            signal_quit: false,
         };
 
         assert!(
@@ -2421,7 +2547,329 @@ mod tests {
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
             last_deletion_progress: None,
+            stop_signals: None,
+            signal_quit: false,
         }
+    }
+
+    /// Builds an `App` with one real, selectable entry and a `FileToDelete` for it, exactly as
+    /// other owner-loop deletion tests do (`append_scan_store_entry_for_test`, `finalize_scan`,
+    /// `start_ui`, `request_deletion`).
+    #[cfg(any(unix, windows))]
+    fn app_with_one_deletable_entry(
+        root: &std::path::Path,
+        root_identity: &NativeIdentity,
+    ) -> (App<TestBackend>, crate::state::FileToDelete) {
+        let entry = root.join("entry");
+        std::fs::write(&entry, b"x").expect("test entry should be created");
+        let entry_metadata =
+            std::fs::symlink_metadata(&entry).expect("test entry metadata should exist");
+        let entry_identity = crate::native_path::identity_for(&entry, &entry_metadata)
+            .expect("test entry identity should be readable")
+            .expect("test entry should not be a link");
+        let mut app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.append_scan_store_entry_for_test(&entry_metadata, &entry, &entry_identity);
+        app.finalize_scan();
+        app.start_ui();
+        let mut animation = AnimationScheduler::new(true, false, Duration::ZERO);
+        app.render_if_dirty(
+            &mut animation,
+            Duration::ZERO,
+            "test",
+            crate::theme::Theme::for_id(ThemeId::ExciseDark),
+            false,
+            false,
+            true,
+        )
+        .expect("entry should render into the map");
+        let target = app
+            .request_deletion()
+            .expect("rendered target should delete");
+        (app, target)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_graceful_stop_cancels_a_pending_deletion_plan() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let (mut app, target) = app_with_one_deletable_entry(root.path(), &root_identity);
+        assert!(app.queue_deletion_confirmation(target.clone(), false, 1024, Duration::ZERO));
+        assert!(app.show_next_deletion_confirmation());
+        let (work_id, confirmed) = app
+            .arm_and_confirm_deletion_target()
+            .expect("confirmation should arm deletion work");
+        assert!(app.queue_confirmed_deletion(work_id, confirmed, Duration::ZERO));
+        assert_eq!(
+            app.deletion_work.pending_count(),
+            1,
+            "the plan must be pending, not yet executing, before the stop"
+        );
+
+        let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
+
+        owner
+            .begin_signal_quit()
+            .expect("a graceful stop should always succeed");
+
+        assert!(owner.signal_quit);
+        assert_eq!(
+            owner.app.deletion_work.pending_count(),
+            0,
+            "the pending plan must be cancelled"
+        );
+        assert!(
+            !owner.app.deletion_work.has_work(),
+            "nothing is left to wait on, so the run can end at once"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_graceful_stop_refuses_the_active_deletions_next_entry() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_metadata =
+            std::fs::symlink_metadata(root.path()).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let (mut app, target) = app_with_one_deletable_entry(root.path(), &root_identity);
+        assert!(app.queue_deletion_confirmation(target.clone(), false, 1024, Duration::ZERO));
+        assert!(app.show_next_deletion_confirmation());
+        let (work_id, confirmed) = app
+            .arm_and_confirm_deletion_target()
+            .expect("confirmation should arm deletion work");
+        assert!(app.queue_confirmed_deletion(work_id, confirmed, Duration::ZERO));
+        // Jumps straight to the executing stage a real plan and worker round-trip would
+        // eventually reach. What this test checks is the owner loop's own request, not the
+        // executor's response to it: `deletion.rs`'s `soft_cancelled` tests already cover the
+        // executor honoring the same flag this asserts was set.
+        app.deletion_work.set_execution_for_test(work_id, 1);
+        assert!(app.deletion_work.active_progress().is_some());
+
+        let workers = WorkerPool::start(
+            scanner::ScannerOptions {
+                session: app.scan_session_id(),
+                generation: ScanGeneration::initial(),
+                coordinator: app.session_coordinator(),
+                root: root.path().to_path_buf(),
+                root_identity: Some(root_identity.clone()),
+                threads: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                internal_paths: app.internal_scan_paths(),
+                temporary_storage: TemporaryStorage::default(),
+                input_runs: None,
+            },
+            1,
+        )
+        .expect("workers should start");
+        assert!(!workers.deletion_soft_cancelled_for_test());
+        let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
+        owner.workers = Some(workers);
+
+        owner
+            .begin_signal_quit()
+            .expect("a graceful stop should always succeed");
+
+        assert!(owner.signal_quit);
+        assert!(
+            matches!(
+                owner.app.ui_mode,
+                crate::UiMode::Exiting {
+                    work: ExitWork::Stopping { .. },
+                    ..
+                }
+            ),
+            "an active deletion must be asked to stop, not silently cancelled"
+        );
+        assert!(
+            owner
+                .workers
+                .as_ref()
+                .expect("workers should still be owned")
+                .deletion_soft_cancelled_for_test(),
+            "the owner loop must set the same stop flag the executor's entry-boundary check \
+             reads, so it is refused its next entry rather than silently left running"
+        );
+
+        owner
+            .workers
+            .take()
+            .expect("workers should still be owned")
+            .shutdown()
+            .expect("workers should shut down cleanly");
+    }
+
+    fn owner_with_workers_for_signal_tests(
+        root: &std::path::Path,
+        stop_signals: Option<Receiver<StopRequest>>,
+    ) -> OwnerLoop<TestBackend> {
+        let root_metadata =
+            std::fs::symlink_metadata(root).expect("test root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root, &root_metadata)
+            .expect("test root identity should be readable")
+            .expect("test root should not be a link");
+        let app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::DEFAULT_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let scan_view_root = app.current_folder_path();
+        let workers = WorkerPool::start(
+            scanner::ScannerOptions {
+                session: app.scan_session_id(),
+                generation: ScanGeneration::initial(),
+                coordinator: app.session_coordinator(),
+                root: root.to_path_buf(),
+                root_identity: Some(root_identity.clone()),
+                threads: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                internal_paths: app.internal_scan_paths(),
+                temporary_storage: TemporaryStorage::default(),
+                input_runs: None,
+            },
+            1,
+        )
+        .expect("workers should start");
+        OwnerLoop {
+            app,
+            input: Box::new(IdleInput),
+            workers: Some(workers),
+            clock: Box::new(VirtualClock::new()),
+            animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            frame_sink: None,
+            settings: RuntimeSettings {
+                root: root.to_path_buf(),
+                root_identity,
+                scan_threads: 1,
+                event_capacity: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                memory_mib: crate::model::DEFAULT_PROCESS_MIB,
+                temporary_storage_mib: crate::temporary_storage::DEFAULT_TEMPORARY_STORAGE_MIB,
+                scan_store_mib: Some(4_096),
+                scan_store_reserve_mib: None,
+                scan_store_dir: None,
+                apparent_size: false,
+                disable_delete_confirmation: false,
+                reduced_motion: true,
+                monochrome: true,
+                animate_loading: false,
+                theme: ThemeId::ExciseDark,
+                ascii: false,
+                mouse: false,
+                keymap: KeyPreset::Vim,
+                custom_keys: None,
+                config_path: None,
+                monochrome_locked: true,
+            },
+            scan_store_storage: TemporaryStorage::scan_store_from_mib(4_096)
+                .expect("default scan-store capacity should fit"),
+            summary: RunSummary::default(),
+            scan_active: true,
+            scheduler_snapshot: None,
+            primary_scan_active: true,
+            scan_view_dirty: false,
+            scan_view_root,
+            pending_scan_entries: VecDeque::new(),
+            scan_cancelled: false,
+            generation_rebuild_active: false,
+            generation_rebuild_target: None,
+            cancelled_while_scanning: false,
+            exit_after_work: false,
+            timed_actions: Vec::new(),
+            next_loading_frame: Duration::ZERO,
+            next_deletion_progress_frame: Duration::ZERO,
+            last_deletion_progress: None,
+            stop_signals,
+            signal_quit: false,
+        }
+    }
+
+    #[test]
+    fn a_signal_quit_run_ends_with_the_interrupted_class() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        sender
+            .send(StopRequest::Graceful)
+            .expect("the channel should accept the queued request");
+        let mut owner = owner_with_workers_for_signal_tests(root.path(), Some(receiver));
+
+        let outcome = owner.run_loop().expect("the loop should end cleanly");
+        owner
+            .workers
+            .take()
+            .expect("workers should still be owned")
+            .shutdown()
+            .expect("workers should shut down cleanly");
+
+        assert!(
+            matches!(outcome, OperationOutcome::Cancelled { .. }),
+            "a signal-driven quit must report Cancelled regardless of scan state: {outcome:?}"
+        );
+        assert_eq!(outcome.exit_class(), ExitClass::Interrupted);
+    }
+
+    #[test]
+    fn a_second_stop_forces_the_exit_past_a_gate_the_first_alone_would_wait_on() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        sender
+            .send(StopRequest::Graceful)
+            .expect("the channel should accept the queued request");
+        sender
+            .send(StopRequest::Forced)
+            .expect("the channel should accept the queued request");
+        let mut owner = owner_with_workers_for_signal_tests(root.path(), Some(receiver));
+        // Simulates a rescan the first request's graceful handling would otherwise wait out
+        // (a partial deletion schedules one; nothing in this test ever resolves it), so only
+        // the second, forced request can end the run.
+        owner.generation_rebuild_active = true;
+        owner.generation_rebuild_target = Some(root.path().to_path_buf());
+
+        assert!(
+            owner
+                .process_stop_signals()
+                .expect("draining the queued requests should succeed")
+        );
+
+        assert!(owner.signal_quit);
+        assert!(
+            !owner.app.is_running,
+            "the forced request must end the run even though the rebuild gate never cleared \
+             on its own, unlike the first request alone"
+        );
+
+        owner
+            .workers
+            .take()
+            .expect("workers should still be owned")
+            .shutdown()
+            .expect("workers should shut down cleanly");
     }
 
     #[cfg(any(unix, windows))]
@@ -2595,6 +3043,8 @@ mod tests {
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
             last_deletion_progress: None,
+            stop_signals: None,
+            signal_quit: false,
         };
 
         owner
@@ -2760,6 +3210,8 @@ mod tests {
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
             last_deletion_progress: None,
+            stop_signals: None,
+            signal_quit: false,
         };
 
         let out_of_space = crate::scan_store::session::ScanStoreError::Run(
@@ -2877,6 +3329,8 @@ mod tests {
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
             last_deletion_progress: None,
+            stop_signals: None,
+            signal_quit: false,
         };
 
         owner
@@ -3134,6 +3588,8 @@ mod tests {
             next_loading_frame: Duration::ZERO,
             next_deletion_progress_frame: Duration::ZERO,
             last_deletion_progress: None,
+            stop_signals: None,
+            signal_quit: false,
         };
 
         owner.app.mark_dirty();

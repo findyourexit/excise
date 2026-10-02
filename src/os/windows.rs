@@ -8,6 +8,11 @@ use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use crossbeam_channel::{Receiver, Sender};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
@@ -33,10 +38,16 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle,
     WRITE_DAC, WRITE_OWNER,
 };
+use windows_sys::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    SetConsoleCtrlHandler,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
+
+use crate::signals::StopRequest;
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const PRIVATE_ACE_FLAGS: u8 = 0;
@@ -770,6 +781,94 @@ fn private_path_error(message: &str) -> io::Error {
 
 fn win32_error(code: u32) -> io::Error {
     io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(i32::MAX))
+}
+
+/// How long the console control handler (installed by [`install_console_ctrl_handler`]) blocks
+/// before returning, giving the owner loop or headless scan loop time to finish a confirmed
+/// quit (cancel pending plans, stop an active deletion at its next entry boundary,
+/// restore the terminal, remove session storage) before returning invites Windows to conclude
+/// nothing is still cleaning up. `CTRL_CLOSE_EVENT`'s own system timeout is 5 s
+/// (`SPI_GETHUNGAPPTIMEOUT`); logoff and shutdown use the same figure outside the rare "quick
+/// shutdown" registry setting. This stays comfortably under that with margin to spare;
+/// `CTRL_BREAK_EVENT` has no timeout at all, so the bound only matters for the other three.
+/// [INFERENCE from the Windows documentation (`HandlerRoutine`'s reference page); not measured
+/// on a Windows probe by this change].
+const CONSOLE_HANDLER_WAIT: Duration = Duration::from_secs(4);
+
+/// The state [`handle_console_event`] needs: a plain function pointer cannot capture anything,
+/// so both channel ends it uses, and whether an earlier event already used them, live here
+/// instead, set once by [`install_console_ctrl_handler`].
+struct ConsoleHandlerChannels {
+    stop: Sender<StopRequest>,
+    done: Receiver<()>,
+    seen_first: AtomicBool,
+}
+
+static CONSOLE_HANDLER: OnceLock<ConsoleHandlerChannels> = OnceLock::new();
+
+/// Installs the process-wide console control handler for close, break, logoff, and shutdown
+/// events; `CTRL_C_EVENT` is left to the terminal's default handling, matching the Unix
+/// side's exclusion of `SIGINT`. Returns the receiver the owner loop or headless scan loop
+/// watches for a confirmed quit, and the sender the caller signals, exactly once, after that
+/// quit has finished (terminal restored, session storage removed, any report written): see
+/// `CONSOLE_HANDLER_WAIT` for why the handler waits to hear that before returning.
+///
+/// # Errors
+/// Returns an I/O error when this process already installed a handler, or the system call
+/// itself fails.
+pub(crate) fn install_console_ctrl_handler() -> io::Result<(Receiver<StopRequest>, Sender<()>)> {
+    let (stop_tx, stop_rx) = crossbeam_channel::unbounded();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    CONSOLE_HANDLER
+        .set(ConsoleHandlerChannels {
+            stop: stop_tx,
+            done: done_rx,
+            seen_first: AtomicBool::new(false),
+        })
+        .map_err(|_| private_path_error("the console control handler is already installed"))?;
+    // SAFETY: `handle_console_event` matches `PHANDLER_ROUTINE`'s signature. It reads only the
+    // process-wide `CONSOLE_HANDLER` set just above, so it has nothing caller-owned whose
+    // lifetime to uphold.
+    let installed = unsafe { SetConsoleCtrlHandler(Some(handle_console_event), 1) };
+    if installed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((stop_rx, done_tx))
+}
+
+/// Whether a console control event is one of the four this handler recognizes (close, break,
+/// logoff, shutdown). `CTRL_C_EVENT` is deliberately absent: it is left to the terminal's
+/// default handling, as `SIGINT` is on Unix.
+const fn is_recognized_console_event(ctrl_type: u32) -> bool {
+    matches!(
+        ctrl_type,
+        CTRL_CLOSE_EVENT | CTRL_BREAK_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    )
+}
+
+/// The `HandlerRoutine` Windows calls, on a thread it creates for the purpose, when the console
+/// receives a close, break, logoff, or shutdown event (`windows-sys`'s `PHANDLER_ROUTINE`).
+///
+/// # Safety
+/// Called only by Windows, through the pointer [`install_console_ctrl_handler`] installs, per
+/// `SetConsoleCtrlHandler`'s documented contract.
+unsafe extern "system" fn handle_console_event(ctrl_type: u32) -> i32 {
+    if !is_recognized_console_event(ctrl_type) {
+        return 0;
+    }
+    if let Some(channels) = CONSOLE_HANDLER.get() {
+        let request = if channels.seen_first.swap(true, Ordering::AcqRel) {
+            StopRequest::Forced
+        } else {
+            StopRequest::Graceful
+        };
+        if matches!(request, StopRequest::Forced) {
+            crate::signals::act_on_second_request();
+        }
+        let _ = channels.stop.send(request);
+        let _ = channels.done.recv_timeout(CONSOLE_HANDLER_WAIT);
+    }
+    1
 }
 
 #[cfg(test)]
