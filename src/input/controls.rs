@@ -728,8 +728,11 @@ mod tests {
                 .expect("fixture should be concrete");
             app.append_scan_store_entry_for_test(&metadata, path, &identity);
         }
-        app.refresh_board_from_scan()
-            .expect("live canonical page should refresh");
+        assert!(
+            app.refresh_board_from_scan(),
+            "live canonical page should refresh"
+        );
+        app.process_scan_store_events();
         let mut animation = AnimationScheduler::new(true, true, Duration::ZERO);
         app.render_if_dirty(
             &mut animation,
@@ -746,6 +749,7 @@ mod tests {
             handle_keypress(&key(KeyCode::Enter, KeyModifiers::NONE), &mut app),
             InputCommand::Drill
         ));
+        app.process_scan_store_events();
         assert_eq!(app.current_folder_path(), folder);
         assert!(!app.loaded, "the initial scan must remain active");
     }

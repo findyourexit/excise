@@ -1,0 +1,76 @@
+schema_version = 1
+name = "latency-under-export-after-deletion"
+description = "Exporting the deletion history (Shift+E) right after a 65,111-entry deletion must still get a frame within the strict latency budgets: the history holds a result for every deleted entry, and writing it out is work the reader should never wait for. The plan of a deletion this large spills to temporary storage and the history keeps its report there, so the export streams a result for every deleted entry from a file. The input budget covers the key, and the stall budget covers the whole export, from the key to the frame that reflects it. The stall budget is not the run-wide max_stall_ms: the planning and rechecking that precede a deletion this large draw no frames for seconds, which that metric would count as a stall of the deletion, not of the export. The scenario has no exit check: the export is, by design, a file in the working directory, which the exit's residue check would report."
+fixture = "delete-folder-65k"
+sentinels = ["keep-a.bin", "keep-b/keep.txt"]
+profiles = ["default", "deterministic"]
+tier = "full"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 120000
+
+# The victim is the largest entry, so the map has it selected once the scan is done; the delete step
+# refuses any other target. No filter is typed first: applying one reads a whole page of 65,111
+# entries, and that read is not what this scenario measures.
+# Waits for the deletion to finish; the wait below is for the rebuilt map, so the export is
+# requested on an owner loop with nothing left to do and the only work it can wait for is the
+# export's.
+[[steps]]
+step = "delete"
+name = "victim"
+kind = "folder"
+timeout_ms = 600000
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 120000
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "keep-b/keep.txt"]
+absent = ["victim"]
+
+# Shift+E: the deletion history, one result per deleted entry. The settle step returns on the
+# frame that reflects the key.
+[[steps]]
+step = "measure"
+name = "export_ms"
+marker = "start"
+
+[[steps]]
+step = "key"
+key = "E"
+
+[[steps]]
+step = "settle"
+timeout_ms = 120000
+
+[[steps]]
+step = "measure"
+name = "export_ms"
+marker = "stop"
+
+[[steps]]
+step = "expect_budget"
+budget = "input_to_frame_p99_ms"
+metric = "input_to_frame_p99_ms"
+
+[[steps]]
+step = "expect_budget"
+budget = "max_stall_ms"
+metric = "export_ms"
+
+# The export is background work, so it must also end, and say where it wrote. The key's frame
+# above only shows that the export began.
+[[steps]]
+step = "wait_text"
+text = "Deletion history exported to"
+timeout_ms = 120000

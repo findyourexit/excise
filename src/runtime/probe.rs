@@ -9,8 +9,11 @@
 //! unchanged. Timings use real [`Instant`]s, never the loop's logical clock.
 //!
 //! Phases nest. Admission runs inside the `scan_batch` and `scan_unscanned`
-//! worker events, and publication runs inside `scan_finished`, so each phase
-//! reports its own inclusive duration.
+//! worker events, so each phase reports its own inclusive duration. Admission
+//! is the owner loop's handoff of a sealed batch to the store thread, which
+//! does the admitting; publication is the owner loop's part of a scan's
+//! publication, swapping in the generation the store thread built. The store
+//! thread's own work is not an owner-loop phase.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -161,9 +164,10 @@ pub enum OwnerPhase {
     Input,
     /// One frame drawn. A `render` call that found nothing dirty records nothing.
     Render,
-    /// One handoff of sealed scanner runs to the scan store's admission path.
+    /// One handoff of sealed scanner runs to the store thread, which admits them.
     Admission,
-    /// One publication of the primary scan generation, including its first page.
+    /// One application of the primary scan's published generation: swapping it in and reading
+    /// its first page.
     Publication,
 }
 
@@ -393,7 +397,6 @@ pub(super) struct PhaseTimer {
     probe: OwnerLoopProbe,
     target: TimerTarget,
     started: Instant,
-    completes_scan: bool,
     cancelled: bool,
 }
 
@@ -403,7 +406,6 @@ impl PhaseTimer {
             probe,
             target,
             started: Instant::now(),
-            completes_scan: false,
             cancelled: false,
         }
     }
@@ -420,9 +422,6 @@ impl Drop for PhaseTimer {
             return;
         }
         self.probe.record(self.target, self.started.elapsed());
-        if self.completes_scan {
-            self.probe.mark_scan_complete();
-        }
     }
 }
 
@@ -437,17 +436,22 @@ where
         Some(PhaseTimer::start(probe.clone(), TimerTarget::Phase(phase)))
     }
 
-    /// Starts timing one worker event under its kind. A successful scan
-    /// completion also stamps the probe once the event has been handled.
+    /// Starts timing one worker event under its kind.
     #[must_use]
     pub(super) fn probe_worker_event(&self, event: &WorkerEvent) -> Option<PhaseTimer> {
         let probe = self.input.owner_loop_probe()?;
-        let mut timer = PhaseTimer::start(
+        Some(PhaseTimer::start(
             probe.clone(),
             TimerTarget::WorkerEvent(WorkerEventKind::of(event)),
-        );
-        timer.completes_scan = matches!(event, WorkerEvent::ScanFinished { cancelled: false });
-        Some(timer)
+        ))
+    }
+
+    /// Stamps the probe: the loop finished the scan, its map published. This is the moment the
+    /// reader sees the scan complete.
+    pub(super) fn probe_scan_complete(&self) {
+        if let Some(probe) = self.input.owner_loop_probe() {
+            probe.mark_scan_complete();
+        }
     }
 
     /// Counts `runs` sealed runs and starts timing their admission.
@@ -691,42 +695,29 @@ mod tests {
     }
 
     #[test]
-    fn scan_completion_is_stamped_once_when_the_finish_event_ends() {
+    fn scan_completion_is_stamped_once_and_not_by_the_finish_event() {
         let probe = OwnerLoopProbe::new();
         assert!(!probe.scan_complete());
-        let mut finish = PhaseTimer::start(
+        // The scanner is done when its finish event is handled, but the map is not published yet,
+        // so the reader does not see the scan complete.
+        drop(PhaseTimer::start(
             probe.clone(),
             TimerTarget::WorkerEvent(WorkerEventKind::ScanFinished),
-        );
-        finish.completes_scan = true;
+        ));
         assert!(
             !probe.scan_complete(),
-            "completion is observable only after the event has been handled"
+            "handling the scanner's finish event is not the scan's completion"
         );
-        drop(finish);
+
+        probe.mark_scan_complete();
         assert!(probe.scan_complete());
         let first = probe.report().time_to_scan_complete();
 
-        let mut later = PhaseTimer::start(
-            probe.clone(),
-            TimerTarget::WorkerEvent(WorkerEventKind::ScanFinished),
-        );
-        later.completes_scan = true;
-        drop(later);
+        probe.mark_scan_complete();
         assert_eq!(
             probe.report().time_to_scan_complete(),
             first,
             "a later completion never moves the first"
-        );
-
-        let unfinished = OwnerLoopProbe::new();
-        drop(PhaseTimer::start(
-            unfinished.clone(),
-            TimerTarget::WorkerEvent(WorkerEventKind::ScanFinished),
-        ));
-        assert!(
-            !unfinished.scan_complete(),
-            "a scan-finished event that did not succeed is not a completion"
         );
     }
 

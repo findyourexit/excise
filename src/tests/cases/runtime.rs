@@ -642,6 +642,109 @@ fn missing_confirmed_target_reports_partial_summary() {
     assert!(!target.exists(), "missing target should remain absent");
 }
 
+/// Deleting what is inside a folder changes the folder on disk: its modification time, and on
+/// Unix its link count. The map a deletion leaves must record the folder as it is now, or the
+/// check that the reader is deleting what they saw refuses the folder as changed, and nothing
+/// can delete it until the program restarts.
+#[cfg(unix)]
+#[test]
+fn a_folder_can_be_deleted_after_the_folder_inside_it_was() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let outer = root.path().join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(&inner).expect("nested folders should be created");
+    std::fs::write(inner.join("leaf.txt"), b"payload").expect("leaf should be written");
+    // The scan records a time long ago. Removing `inner` moves it to now, however coarse the file
+    // system's timestamps are.
+    std::fs::File::open(&outer)
+        .expect("outer should open")
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_500_000_001))
+        .expect("outer's modification time should be set");
+    let (_, _, backend) = test_backend_factory(100, 32);
+    let input = TerminalEvents::new(vec![
+        None,
+        Some(key(KeyCode::Down, KeyModifiers::NONE)),
+        Some(key(KeyCode::Enter, KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Down, KeyModifiers::NONE)),
+        Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Esc, KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+    ]);
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("both deletions should end the run cleanly");
+    let summary = outcome.value().expect("the run should have a summary");
+
+    assert!(
+        !outer.exists(),
+        "the folder was refused as changed after the deletion of the folder inside it: {summary:?}"
+    );
+    assert_eq!(summary.deleted_entries, 3, "inner, its leaf, then outer");
+    assert_eq!(summary.deletion_changed_entries, 0);
+}
+
+/// Deleting one of two hard links leaves the other with one link, not two. A map that still
+/// recorded two would have the reader's next deletion of it refused as changed.
+#[cfg(unix)]
+#[test]
+fn the_survivor_of_two_hard_links_can_be_deleted_once_its_twin_was() {
+    let root = tempfile::tempdir().expect("runtime root should exist");
+    let holder = root.path().join("holder");
+    std::fs::create_dir(&holder).expect("holder should be created");
+    let first = holder.join("first.dat");
+    let second = holder.join("second.dat");
+    std::fs::write(&first, vec![7_u8; 8192]).expect("first link should be written");
+    std::fs::hard_link(&first, &second).expect("second link should be created");
+    let (_, _, backend) = test_backend_factory(100, 32);
+    let input = TerminalEvents::new(vec![
+        None,
+        Some(key(KeyCode::Down, KeyModifiers::NONE)),
+        Some(key(KeyCode::Enter, KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Down, KeyModifiers::NONE)),
+        Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Down, KeyModifiers::NONE)),
+        Some(key(KeyCode::Backspace, KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+        None,
+        Some(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Some(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+    ]);
+    let outcome = run(
+        backend,
+        Box::new(input),
+        settings(root.path()),
+        Box::new(VirtualClock::new()),
+    )
+    .expect("both deletions should end the run cleanly");
+    let summary = outcome.value().expect("the run should have a summary");
+
+    assert!(
+        !first.exists() && !second.exists(),
+        "the second link was refused as changed after its twin was deleted: {summary:?}"
+    );
+    assert_eq!(summary.deleted_entries, 2);
+    assert_eq!(summary.deletion_changed_entries, 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn skipped_link_is_an_explicit_scoped_boundary() {

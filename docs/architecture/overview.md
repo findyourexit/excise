@@ -2,14 +2,14 @@
 
 !!! abstract "Ownership rule"
 
-    One main loop owns application state, terminal state, layout, rendering, and visual effects. Persistent scanner, deletion-planner, and serial deletion-executor workers perform blocking filesystem work in the background through typed queues with fixed limits.
+    One main loop owns application state, terminal state, layout, rendering, and visual effects. Persistent scanner, deletion-planner, and serial deletion-executor workers perform blocking filesystem work in the background through typed queues with fixed limits. A terminal writer, a scan-store thread that writes the session's scan data, and a short-lived deletion-history exporter act only on the main loop's decisions and decide nothing themselves.
 
 ```mermaid
 flowchart LR
     Input[CLI, environment, and TOML] --> App[Main loop and terminal session]
     App --> Coordinator[Session coordinator]
     Coordinator --> Scanner[Persistent scanner]
-    Scanner --> Store[ScanStore]
+    Scanner --> Store[ScanStore on the store thread]
     Store --> Views[Map and reports]
     Coordinator --> Deletion[Planner and serial executor]
     Deletion --> Filesystem[Verified filesystem operations]
@@ -29,7 +29,7 @@ A terminal-session guard owns raw input mode, the separate screen, cursor visibi
 
 ### Main Loop
 
-The main loop polls terminal input with a short maximum wait. It renders each folder opening before returning to queued scanning and applies at most one stored scan batch before checking input again. When the map is moving, a fixed-size channel slows scanner updates. The interface redraws when state changes, apart from deletion progress and visual effects. Effects run at most 30 times per second; overdue frames are dropped, and a new transition replaces an earlier transition with the same purpose. A dedicated writer thread transmits each rendered frame's bytes to the terminal; the loop decides what to render and renders a new frame only once that thread confirms the previous one drained, so a terminal slower than excise's output paces frame production instead of blocking scan ingestion or input handling. On Unix, a dedicated `excise-signal-listener` thread turns an external SIGTERM, SIGHUP, or SIGQUIT into the same confirmed-quit request that a Windows console control handler, running on a system thread rather than one Excise starts, delivers for a close, break, logoff, or shutdown event; see [threat-model.md](threat-model.md)'s "Terminal restoration" control.
+The main loop polls terminal input with a short maximum wait. It renders each folder opening before returning to queued scanning and applies at most one stored scan batch before checking input again. Admitting a batch, merging runs, and publishing a finished scan are not the loop's work: it hands each batch to the scan-store thread and swaps in each published generation when that thread reports one, and it takes no further scanner event while the thread's queue is nearly full. When the map is moving, a fixed-size channel slows scanner updates. The interface redraws when state changes, apart from deletion progress and visual effects. Effects run at most 30 times per second; overdue frames are dropped, and a new transition replaces an earlier transition with the same purpose. A dedicated writer thread transmits each rendered frame's bytes to the terminal; the loop decides what to render and renders a new frame only once that thread confirms the previous one drained, so a terminal slower than excise's output paces frame production instead of blocking scan ingestion or input handling. On Unix, a dedicated `excise-signal-listener` thread turns an external SIGTERM, SIGHUP, or SIGQUIT into the same confirmed-quit request that a Windows console control handler, running on a system thread rather than one Excise starts, delivers for a close, break, logoff, or shutdown event; see [threat-model.md](threat-model.md)'s "Terminal restoration" control.
 
 ### Scanner and Session Coordinator
 
@@ -45,7 +45,9 @@ The scanner walks directories without recursion and uses a fixed worker count. O
 
 ### ScanStore
 
-`ScanStore` is private session storage for scan data. Workers turn each fixed-size batch into sorted path and identity runs. The coordinator accepts a run only while the directory task that produced it remains valid, combines a fixed number of inputs at a time, and creates a compact block-indexed `ChildQuery` for navigation. Raw runs are released as publication proceeds, so a completed scan retains only the compact query. Each run's blocks carry SHA-256 checksums that every read verifies. The store belongs to one session and is never reopened, so no write waits on a durable sync. A sealed run holds no file descriptor until it is read, so neither a full admission channel nor a wide tree grows the store's descriptor use, and a published scan keeps a fixed number of runs open whatever its size. On Unix, startup also raises the process's soft file-descriptor limit toward its hard limit, never lowering an inherited one.
+`ScanStore` is private session storage for scan data. Workers turn each fixed-size batch into sorted path and identity runs. The scan-store thread accepts a run only while the directory task that produced it remains valid, combines a fixed number of inputs at a time, and creates a compact block-indexed `ChildQuery` for navigation. Raw runs are released as publication proceeds, so a completed scan retains only the compact query. Each run's blocks carry SHA-256 checksums that every read verifies. The store belongs to one session and is never reopened, so no write waits on a durable sync. A sealed run holds no file descriptor until it is read, so neither a full admission channel nor a wide tree grows the store's descriptor use, and a published scan keeps a fixed number of runs open whatever its size. On Unix, startup also raises the process's soft file-descriptor limit toward its hard limit, never lowering an inherited one.
+
+The scan-store thread, `excise-scan-store`, owns the store's write side. The main loop hands it each sealed batch, and the thread admits the batch, merges runs, and builds the published generation, so none of that blocking I/O delays input or a frame. The main loop decides every step and the thread only applies it: commands and results travel through two bounded queues, and a finished generation changes hands, so the main loop swaps it in and reads its pages synchronously, as it always has. Each sealed batch holds one in-flight credit from the scanner's seal until the batch is dropped, which caps how far the scanner can run ahead. [background-tasks.md](background-tasks.md#scan-store-thread) defines the thread's ownership, bounds, and shutdown.
 
 A session's directory also holds a lock file that the session locks for as long as it lives, and the file records that Excise made the directory. The next start can therefore tell a directory that a killed session left behind from a running session's, and removes only the former, as the resource controls in [threat-model.md](threat-model.md) describe.
 
@@ -53,7 +55,7 @@ A session's directory also holds a lock file that the session locks for as long 
 
     If a path cannot be represented, available pages remain concrete, the report records the omitted-path count, and affected space totals become lower bounds. A directory the scanner could not open or list is tracked by path, up to a fixed cap, so every ancestor up to the root can be reported uncertain with an open upper bound; past that cap the session stops tracking individual paths and reports every folder uncertain instead, rather than growing the tracked set without bound.
 
-    The interactive map reads one 512-entry page of direct children and its ancestor chain. It keeps only a small cache of recent pages. ++page-down++ and ++page-up++ move between concrete pages. No child is replaced with an undeletable summary. When an unfiltered page is not cached, the map reads only the requested slice from the published `ChildQuery`. Completed-folder navigation has no loading view or live-model fallback; filters read only the relevant stored page.
+    The interactive map reads one 512-entry page of direct children and its ancestor chain. It keeps only a small cache of recent pages. ++page-down++ and ++page-up++ move between concrete pages. No child is replaced with an undeletable summary. When an unfiltered page is not cached, the map reads only the requested slice from the published `ChildQuery`. Completed-folder navigation has no loading view or live-model fallback; filters read only the relevant stored page. While a scan is still running, the map shows a live view of each folder that the scan-store thread builds from the scan so far; a folder opened then appears when that page arrives, and the map keeps drawing what it had until then.
 
 ### Working Model
 
@@ -75,11 +77,11 @@ A separate planner can prepare the next identity plan while one executor perform
 
 ### Reports
 
-Versioned `scan-report` and `deletion-history` documents use the same stable path encoding. Scan reports read immutable published ScanStore pages and state uncertainty from their recorded coverage.
+Versioned `scan-report` and `deletion-history` documents use the same stable path encoding. Scan reports read immutable published ScanStore pages and state uncertainty from their recorded coverage. The interactive deletion-history export serializes on a thread of its own, so a long history never delays a frame; background-tasks.md's "Deletion-History Export" defines it.
 
 ## Dependency Direction
 
-Platform code supplies file information to the scanner and deletion code. The scanner seals facts for ScanStore, which publishes immutable pages to application state and reports. Domain code does not depend on terminal widgets, and interface code does not change the filesystem.
+Platform code supplies file information to the scanner and deletion code. The scanner seals facts for ScanStore, whose thread builds immutable pages that application state and reports then read. Domain code does not depend on terminal widgets, and interface code does not change the filesystem.
 
 The storage map uses dense half-block cells in its pane. Each cell carries foreground and background shading without gaps between entries. Map movement belongs to application state: the board holds the current position, next position, and one transition clock. A new scan may redirect a transition from its current position without restarting it.
 
@@ -89,9 +91,9 @@ Opening an entry grows its contents from the selected rectangle. Moving back con
 
 | Constraint | Consequence |
 |---|---|
-| One writer | The owner loop is the only thread that decides application or terminal state and content; nothing else changes either. A dedicated writer thread (see background-tasks.md's "Terminal Output Writer") only transmits the bytes it is handed, in the order it is handed them, and never decides what they are. |
-| Fixed owners | No queue or model owner grows without a limit, including the scan store's open descriptors: a sealed run holds none until it is read, and a published generation retains a fixed count. |
+| One writer | The owner loop is the only thread that decides application or terminal state and content; nothing else changes either. The threads that are not workers act only on its decisions. A dedicated writer thread (see background-tasks.md's "Terminal Output Writer") only transmits the bytes it is handed, in the order it is handed them, and never decides what they are. The scan-store thread (see "Scan Store Thread") applies the commands it is sent, in the order sent, to the store it owns and reports each outcome; a generation it publishes changes hands, and the owner loop decides what that changes. A transient thread writes one deletion-history file from the snapshot it is given ("Deletion-History Export"). |
+| Fixed owners | No queue or model owner grows without a limit, including the scan store's open descriptors: a sealed run holds none until it is read, and a published generation retains a fixed count. The scan-store thread's two queues have capacities that follow the in-flight batch cap, not the tree, and every sealed batch returns its in-flight credit exactly once. |
 | No shell mutation | No shell command performs scanning or deletion. |
 | No network path | No network client or telemetry runs as part of the program. |
 | Reviewed unsafe boundary | Unsafe code is confined to the Windows system interface; domain, model, runtime, and interface code remain safe Rust. |
-| Public review | A new background-task system requires public design review. |
+| Public review | A new task type requires public design review, and so does a change to what another background thread owns, how its queues are bounded, the order it acts in, or how it stops (background-tasks.md, "Task Types"). |

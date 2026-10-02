@@ -47,6 +47,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
+use crate::private_files::{PrivateFileGuard, PrivateFiles};
 use crate::signals::StopRequest;
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -75,7 +76,15 @@ pub(crate) fn raise_soft_descriptor_limit() {}
 /// directory. The exclusive handle denies every sharing mode, so another process
 /// running as the same user cannot reopen or replace its record stream. Windows
 /// removes the file when this handle closes, including process termination.
-pub(crate) fn create_private_temporary_file(directory: &Path) -> io::Result<File> {
+///
+/// The file is a file of Excise's in the user's tree for as long as the handle lives, so its
+/// exact path is registered in `private_files` before it exists, and stays registered until the
+/// returned guard is dropped. The guard must outlive the handle: dropping the handle removes
+/// the file, and only then may the path stop being Excise's own.
+pub(crate) fn create_private_temporary_file(
+    directory: &Path,
+    private_files: &PrivateFiles,
+) -> io::Result<(File, PrivateFileGuard)> {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const ERROR_FILE_EXISTS: i32 = 80;
@@ -86,6 +95,7 @@ pub(crate) fn create_private_temporary_file(directory: &Path) -> io::Result<File
     for _ in 0..128 {
         let path = private_temporary_path(directory)?;
         let wide_path = wide_path(&path);
+        let registration = private_files.register(path);
         let attributes = SECURITY_ATTRIBUTES {
             nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
             lpSecurityDescriptor: (&raw const security.descriptor).cast_mut().cast(),
@@ -119,7 +129,10 @@ pub(crate) fn create_private_temporary_file(directory: &Path) -> io::Result<File
         verify_private_handle(handle.raw(), false, &user)?;
         // SAFETY: `OwnedHandle::into_raw` transfers this valid owned Windows file handle
         // exactly once to `File`, whose Drop closes it and triggers delete-on-close.
-        return Ok(unsafe { File::from_raw_handle(handle.into_raw()) });
+        return Ok((
+            unsafe { File::from_raw_handle(handle.into_raw()) },
+            registration,
+        ));
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,

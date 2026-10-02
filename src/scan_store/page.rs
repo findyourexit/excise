@@ -581,16 +581,27 @@ struct EntryEncodingScratch {
     observation_value: Vec<u8>,
 }
 
+/// How many steps [`materialize_child_queries`] reports: the four fact families indexed, the
+/// metric-ordered index built, and the child-query records written.
+pub(crate) const MATERIALIZE_STEPS: u8 = 6;
+
 /// Builds a query-ready child run while publication owns all derived facts.
 /// The temporary database is a bounded build accumulator. It consumes every
 /// raw source run and leaves the sealed, sparse-indexed `ChildQuery` run as
 /// the only retained generation representation.
+///
+/// Each completed step (`1` through [`MATERIALIZE_STEPS`]) is reported to `report`: a large scan
+/// spends most of its publication here, and the reader should see it advance.
 ///
 /// # Errors
 ///
 /// Returns an error for corrupt input facts, a bounded-storage failure, or an
 /// inconsistent hierarchy. Callers must not publish a partially materialized
 /// generation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every source run, the output, and the progress report stay explicit at the publication boundary"
+)]
 pub(crate) fn materialize_child_queries(
     temporary_storage: &TemporaryStorage,
     session_storage: Option<&ScanStoreStorage>,
@@ -599,6 +610,7 @@ pub(crate) fn materialize_child_queries(
     directory_summaries: &mut SealedRun,
     allocation_contributions: &mut SealedRun,
     output: &mut RunWriter,
+    report: &mut dyn FnMut(u8),
 ) -> Result<PageIndexMetadata, PageIndexError> {
     if output.descriptor().kind() != RunKind::ChildQuery {
         return Err(PageIndexError::WrongOutputKind);
@@ -606,15 +618,21 @@ pub(crate) fn materialize_child_queries(
     let database = create_page_index_database(temporary_storage, session_storage)?;
 
     path_observations.with_reader(|reader| index_path_observations(&database, reader))?;
+    report(1);
     identity_observations.with_reader(|reader| index_identity_observations(&database, reader))?;
+    report(2);
     directory_summaries.with_reader(|reader| index_directory_summaries(&database, reader))?;
+    report(3);
     allocation_contributions
         .with_reader(|reader| index_allocation_contributions(&database, reader))?;
-    build_metric_query_index(&database)?;
+    report(4);
+    build_metric_query_index(&database, temporary_storage)?;
+    report(5);
 
     let root = read_header_from_database(&database, &RelativePath::root())?
         .ok_or(PageIndexError::MissingHeader)?;
     write_page_records(&database, output)?;
+    report(6);
     Ok(PageIndexMetadata {
         root_metrics: root.metrics,
         root_coverage: root.coverage,
@@ -1176,7 +1194,14 @@ fn read_header_from_database(
         .map_err(Into::into)
 }
 
-fn build_metric_query_index(database: &Database) -> Result<(), PageIndexError> {
+/// Builds the metric-ordered query records from the page index records, one pass over every
+/// fact of the scan. Nothing here reads a run, so no block read would notice a session told to
+/// stop: the pass checks the quota itself, once per [`PAGE_INDEX_BATCH`] records and before it
+/// commits, so stopping waits for a batch of records and not for the whole pass.
+fn build_metric_query_index(
+    database: &Database,
+    temporary_storage: &TemporaryStorage,
+) -> Result<(), PageIndexError> {
     let transaction = begin_ephemeral_write(database)?;
     {
         let records = transaction
@@ -1187,7 +1212,10 @@ fn build_metric_query_index(database: &Database) -> Result<(), PageIndexError> {
             .map_err(database_error)?;
         let mut full_path_key = Vec::new();
         let mut query_key = Vec::new();
-        for record in records.iter().map_err(database_error)? {
+        for (visited, record) in records.iter().map_err(database_error)?.enumerate() {
+            if visited.is_multiple_of(PAGE_INDEX_BATCH) {
+                temporary_storage.ensure_running()?;
+            }
             let (key, value) = record.map_err(database_error)?;
             let key = key.value();
             let value = value.value();
@@ -1227,6 +1255,7 @@ fn build_metric_query_index(database: &Database) -> Result<(), PageIndexError> {
             }
         }
     }
+    temporary_storage.ensure_running()?;
     transaction.commit().map_err(database_error)
 }
 
@@ -1430,7 +1459,7 @@ fn take_record_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], PageR
     Ok(output)
 }
 
-/// Visits every fact retained in a published child-query run.
+/// Visits every fact retained in a published child-query run through a sequential reader.
 ///
 /// The query records preserve each original path observation and its optional
 /// identity fact. Overlay publication re-sorts these bounded batches instead
@@ -1440,40 +1469,37 @@ fn take_record_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], PageR
 ///
 /// Returns an error for a wrong run family, corrupt record, or visitor error.
 pub(crate) fn visit_child_query_entries<E>(
-    run: &mut SealedRun,
+    reader: &mut RunReader,
     mut visit: impl FnMut(PathObservation, Option<IdentityObservation>) -> Result<(), E>,
 ) -> Result<(), E>
 where
     E: From<RunError> + From<PageIndexError>,
 {
-    run.with_reader(|reader| {
-        if reader.descriptor().kind() != RunKind::ChildQuery {
-            return Err(E::from(PageIndexError::WrongInputKind));
+    if reader.descriptor().kind() != RunKind::ChildQuery {
+        return Err(E::from(PageIndexError::WrongInputKind));
+    }
+    let mut key = Vec::new();
+    let mut value = Vec::new();
+    let mut path_key = Vec::new();
+    while reader.next_record_into(&mut key, &mut value)? {
+        if value.first() == Some(&PAGE_HEADER_VERSION) {
+            continue;
         }
-        let mut key = Vec::new();
-        let mut value = Vec::new();
-        let mut path_key = Vec::new();
-        while reader.next_record_into(&mut key, &mut value)? {
-            if value.first() == Some(&PAGE_HEADER_VERSION) {
-                continue;
-            }
-            let parent_key_bytes = stored_entry_parent_key_bytes(&value)
-                .map_err(|error| E::from(PageIndexError::from(error)))?;
-            child_path_key_from_record(&key, parent_key_bytes, &mut path_key)
-                .map_err(|error| E::from(PageIndexError::from(error)))?;
-            let entry = decode_stored_entry(&path_key, &value)
-                .map_err(|error| E::from(PageIndexError::from(error)))?;
-            let StoredEntry {
-                observation,
-                identity,
-                ..
-            } = entry;
-            let identity =
-                identity.map(|identity| identity.into_observation(observation.path.clone()));
-            visit(observation, identity)?;
-        }
-        Ok(())
-    })
+        let parent_key_bytes = stored_entry_parent_key_bytes(&value)
+            .map_err(|error| E::from(PageIndexError::from(error)))?;
+        child_path_key_from_record(&key, parent_key_bytes, &mut path_key)
+            .map_err(|error| E::from(PageIndexError::from(error)))?;
+        let entry = decode_stored_entry(&path_key, &value)
+            .map_err(|error| E::from(PageIndexError::from(error)))?;
+        let StoredEntry {
+            observation,
+            identity,
+            ..
+        } = entry;
+        let identity = identity.map(|identity| identity.into_observation(observation.path.clone()));
+        visit(observation, identity)?;
+    }
+    Ok(())
 }
 
 /// Visits every concrete entry with its publication-time page metrics.
@@ -2584,6 +2610,43 @@ mod tests {
                 RunKind::IdentityObservation,
                 RunKind::DirectorySummary,
             ]
+        );
+    }
+
+    /// The metric-ordered index is one pass over every fact of the scan, and it reads no run, so
+    /// no block read ends it when the session stops: it has to check for itself.
+    #[test]
+    fn a_session_stopped_before_the_metric_pass_ends_it_instead_of_letting_it_finish() {
+        let mut store = ScanStore::new(
+            ScanGeneration::initial(),
+            TemporaryStorage::with_limit_bytes(2 * 1024 * 1024),
+        )
+        .expect("store should initialize");
+        add_path_run(
+            &mut store,
+            &[
+                path_observation("alpha", PathEntryKind::Directory, 0),
+                path_observation("alpha/first", PathEntryKind::File, 4),
+            ],
+        );
+        let quota = store.quota();
+        // The stage reported once the four fact families are indexed, with the metric pass next.
+        let reduce_stages = ScanStore::PUBLISH_STAGES - MATERIALIZE_STEPS - 1;
+        let before_metric_pass = reduce_stages + 4;
+        let mut reported = Vec::new();
+
+        let result = store.publish_reporting(&mut |stage| {
+            reported.push(stage);
+            if stage == before_metric_pass {
+                quota.stop();
+            }
+        });
+
+        assert!(result.is_err(), "a stopped session publishes nothing");
+        assert_eq!(
+            reported.last(),
+            Some(&before_metric_pass),
+            "the metric pass must end at once, not run to the end and report its own stage"
         );
     }
 }

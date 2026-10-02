@@ -4,6 +4,8 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -14,8 +16,12 @@ use cap_primitives::ambient_authority;
 use cap_primitives::fs::FollowSymlinks;
 use cap_primitives::fs::{self as cap_fs};
 use file_id::FileId;
+#[cfg(target_vendor = "apple")]
+use rustix::fs::FileType;
 #[cfg(unix)]
 use rustix::fs::{AtFlags, statat};
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use rustix::fs::{Mode, OFlags, fstat, openat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 #[cfg(not(unix))]
@@ -23,14 +29,14 @@ use sysinfo::{DiskRefreshKind, Disks};
 
 #[cfg(unix)]
 use crate::entry_metadata::EntryMetadata;
-use crate::model::NodeId;
-use crate::model::NodeKind;
+use crate::model::{EntrySnapshot, NodeId, NodeKind};
 use crate::native_path::{
     EncodedNativePath, NativeIdentity, NativePath, identity_for, safe_display_os_str,
     safe_display_path_text, safe_display_text,
 };
 #[cfg(windows)]
 use crate::os::windows::{physical_size_from_handle, remove_open_handle};
+use crate::private_files::PrivateFileGuard;
 use crate::state::FileToDelete;
 use crate::temporary_storage::{TemporaryStorage, TemporaryStorageReservation};
 
@@ -122,6 +128,10 @@ pub struct DeletionPlan {
     root_snapshot: PlannedSnapshot,
     pub challenge: ConfirmationChallenge,
     pub apparent_bytes: u128,
+    /// What the plan, and the report that follows it, hold in memory: the entries it keeps
+    /// resident, and nothing once it has spilled, because every entry is then in a file. It never
+    /// exceeds the budget the plan was built with, so the place the deletion history keeps for
+    /// the report always fits it.
     pub estimated_bytes: usize,
 }
 
@@ -145,6 +155,11 @@ struct RecordSpill {
     reservation: TemporaryStorageReservation,
     maximum_payload: u64,
     authentication: SpillAuthenticationKey,
+    /// Where the spill is a named file in the user's tree (on Windows), the registration that
+    /// tells every reader of that tree the file is Excise's own. Held only for its drop, which
+    /// comes after the file's, as fields drop in the order they are declared: the file is closed
+    /// and removed first, and the path stops being Excise's only when the file is gone.
+    _private_file: Option<PrivateFileGuard>,
 }
 
 struct SpillAuthenticationKey([u8; SPILL_MAC_BYTES]);
@@ -227,6 +242,10 @@ struct PendingDirectories {
 }
 
 impl PlanEntries {
+    const fn is_spilled(&self) -> bool {
+        matches!(self, Self::Spilled(_))
+    }
+
     #[must_use]
     fn len(&self) -> u64 {
         match self {
@@ -373,13 +392,18 @@ impl RecordSpill {
                 "deletion spill record limit does not fit in u64",
             )
         })?;
+        let reservation = temporary_storage.reservation(0)?;
+        let authentication = SpillAuthenticationKey::new()?;
+        // Last, so that nothing fallible follows the creation of a named file.
+        let (file, private_file) = new_plan_spill_file(spill_directory, temporary_storage)?;
         Ok(Self {
-            file: new_plan_spill_file(spill_directory)?,
+            file,
             length: 0,
             records: 0,
-            reservation: temporary_storage.reservation(0)?,
+            reservation,
             maximum_payload,
-            authentication: SpillAuthenticationKey::new()?,
+            authentication,
+            _private_file: private_file,
         })
     }
 
@@ -647,14 +671,27 @@ fn read_spill_record(
     Ok((payload, record_end))
 }
 
+/// A new spill file, and where it is a named file in the user's tree (on Windows, where an
+/// anonymous temporary file is not available) the registration that keeps every reader of that
+/// tree away from it. The storage's registry is the session's.
 #[cfg(windows)]
-fn new_plan_spill_file(spill_directory: &Path) -> io::Result<PlanSpillFile> {
-    crate::os::windows::create_private_temporary_file(spill_directory)
+fn new_plan_spill_file(
+    spill_directory: &Path,
+    temporary_storage: &TemporaryStorage,
+) -> io::Result<(PlanSpillFile, Option<PrivateFileGuard>)> {
+    let (file, registration) = crate::os::windows::create_private_temporary_file(
+        spill_directory,
+        temporary_storage.private_files(),
+    )?;
+    Ok((file, Some(registration)))
 }
 
 #[cfg(not(windows))]
-fn new_plan_spill_file(_spill_directory: &Path) -> io::Result<PlanSpillFile> {
-    tempfile::tempfile()
+fn new_plan_spill_file(
+    _spill_directory: &Path,
+    _temporary_storage: &TemporaryStorage,
+) -> io::Result<(PlanSpillFile, Option<PrivateFileGuard>)> {
+    Ok((tempfile::tempfile()?, None))
 }
 
 fn plan_spill_file_mut(file: &mut PlanSpillFile) -> &mut File {
@@ -833,6 +870,15 @@ impl ResultCollector {
         Ok(())
     }
 
+    /// Records that a file or link just removed may have had other links.
+    const fn note_other_links(&mut self) {
+        match self {
+            Self::InMemory { summary, .. } | Self::Spilled { summary, .. } => {
+                summary.deleted_with_other_links = true;
+            }
+        }
+    }
+
     fn finish(self, target: &Path, complete: bool, error: Option<String>) -> DeletionEntries {
         let error = error.map(|detail| bounded_outcome_detail(&detail));
         match self {
@@ -875,6 +921,15 @@ struct DeletionSummary {
     unattempted: u64,
     deleted_apparent_bytes: u128,
     deleted_allocated_bytes: u128,
+    /// A file or link that left the tree during the run may have had other links when it went. A
+    /// fixed-size answer for the whole run: the report keeps no list of them. The executor sets
+    /// it from what it saw of the object's links as the entry was removed (the links that
+    /// outlived the removal, counted through a reference or handle held across it, see
+    /// [`removed_with_other_links`]), and counts an entry that was already gone too. It is not
+    /// derived from the recorded entries, whose count is deliberately conservative where a
+    /// platform cannot keep it: a Windows regular file's is never recorded, and every removal of
+    /// one would then count.
+    deleted_with_other_links: bool,
 }
 
 impl DeletionSummary {
@@ -994,6 +1049,14 @@ impl DeletionEntries {
     #[must_use]
     pub(crate) const fn target_removed(&self) -> bool {
         self.target_removed
+    }
+
+    /// Whether a file or link that left the tree during the run may have had other links when it
+    /// went: the executor did not see the removal take its last link with it (see
+    /// [`removed_with_other_links`]), or the entry was already gone when it reached it.
+    #[must_use]
+    pub(crate) const fn deleted_with_other_links(&self) -> bool {
+        self.summary.deleted_with_other_links
     }
 
     #[must_use]
@@ -1247,6 +1310,8 @@ pub struct DeletionReport {
     pub entries: DeletionEntries,
     pub soft_cancelled: bool,
     pub precise: bool,
+    /// What the deletion history is charged for the report: what the plan held in memory, which
+    /// never exceeds the budget the plan was built with ([`DeletionPlan::estimated_bytes`]).
     pub estimated_bytes: usize,
 }
 
@@ -1293,6 +1358,26 @@ impl DeletionReport {
             && self.precise
             && self.reporting_complete()
             && self.entries.target_removed()
+    }
+
+    /// Whether a file or link that left the tree during the run may have had other links when it
+    /// went: the executor did not see the removal take its last link with it, or the entry was
+    /// already gone when it reached it. The map has its files by path and cannot say where the
+    /// others are, so it cannot be updated in place after such a removal.
+    #[must_use]
+    pub(crate) const fn deleted_files_may_have_other_links(&self) -> bool {
+        self.entries.deleted_with_other_links()
+    }
+
+    /// This report, as one in which no file or link was seen to leave a link behind. For the tests
+    /// of what the owner does with a report that says so, which are about the owner: what the
+    /// executor can prove of links through the handle that removed a file depends on the file
+    /// system, and is tested where the executor reads it (on Unix the report says so as it is).
+    #[cfg(all(test, windows))]
+    #[must_use]
+    pub(crate) fn assuming_no_link_survived(mut self) -> Self {
+        self.entries.summary.deleted_with_other_links = false;
+        self
     }
 
     #[must_use]
@@ -1922,6 +2007,7 @@ where
         let mut isolation = Isolation {
             deep: past_path_max(scan_root, &entry.relative_path),
             refused: false,
+            no_link_survived: false,
         };
         let outcome = execute_unix_entry(
             &root,
@@ -1947,8 +2033,16 @@ where
             // run is not marked cancelled: the user did not cancel it.
             stopped = true;
         }
-        if matches!(outcome, DeletionEntryOutcome::Deleted) {
-            note_deleted_link(&mut entry);
+        if matches!(
+            outcome,
+            DeletionEntryOutcome::Deleted | DeletionEntryOutcome::Missing
+        ) {
+            if removed_with_other_links(entry.snapshot.kind, isolation.no_link_survived) {
+                results.note_other_links();
+            }
+            if matches!(outcome, DeletionEntryOutcome::Deleted) {
+                note_deleted_link(&mut entry);
+            }
         }
         let result = DeletionEntryResult { entry, outcome };
         if let Err(error) = results.push(result) {
@@ -2125,18 +2219,15 @@ where
         };
     }
 
-    let link_hold = if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link) {
-        if actual.identity.link_count.is_some() {
-            if let Ok(name) = create_link_hold(&parent, &detached_name) {
-                Some(name)
-            } else {
-                entry.snapshot.identity.link_count = None;
-                None
-            }
-        } else {
-            entry.snapshot.identity.link_count = None;
-            None
-        }
+    // A reference to the object, held across its removal, so that the links that outlive the
+    // removal can be counted through it once every name the executor controls is gone. A count
+    // read through a name has to be read while the name is there, and a link made after that read
+    // is not in it. An object that already had other links needs none: it is known to have had
+    // them.
+    let reference = if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link)
+        && actual.identity.link_count == Some(1)
+    {
+        LinkReference::open(&parent, &detached_name, &actual.identity)
     } else {
         None
     };
@@ -2149,55 +2240,35 @@ where
     };
     match removal {
         Ok(()) => {
-            if let Some(link_hold) = link_hold.as_ref()
-                && !link_hold_matches_count(&parent, link_hold, actual.identity.link_count)
-                    .unwrap_or(false)
-            {
-                entry.snapshot.identity.link_count = None;
+            if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link) {
+                // The detached name was the last name the executor held for the object, and no
+                // other process can name a removed object, so a link the reference still counts
+                // is one that outlived the removal. Only an object that had one link when it was
+                // isolated and has none now is proven to have left none; anything the executor
+                // could not read, or could not reference, is a link that may remain.
+                isolation.no_link_survived =
+                    reference.as_ref().and_then(LinkReference::links) == Some(0);
+                if !isolation.no_link_survived {
+                    entry.snapshot.identity.link_count = None;
+                }
             }
-            let finalization =
-                finalize_placeholder(&parent, &original_name, &detached_name, &placeholder);
-            let hold_cleanup = link_hold
-                .as_ref()
-                .map(|name| remove_link_hold(&parent, name, &actual.identity));
-            match (finalization, hold_cleanup) {
-                (Ok(()), Some(Ok(())) | None) => DeletionEntryOutcome::Deleted,
-                (Ok(()), Some(Err(error))) => DeletionEntryOutcome::Failed(format!(
-                    "target deleted; hard-link check cleanup failed: {error}"
-                )),
-                (Err(error), Some(Ok(())) | None) => DeletionEntryOutcome::Failed(format!(
+            match finalize_placeholder(&parent, &original_name, &detached_name, &placeholder) {
+                Ok(()) => DeletionEntryOutcome::Deleted,
+                Err(error) => DeletionEntryOutcome::Failed(format!(
                     "target deleted; namespace cleanup failed: {error}"
-                )),
-                (Err(error), Some(Err(cleanup_error))) => DeletionEntryOutcome::Failed(format!(
-                    "target deleted; namespace cleanup failed: {error}; hard-link check cleanup failed: {cleanup_error}"
                 )),
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let finalization =
-                finalize_placeholder(&parent, &original_name, &detached_name, &placeholder);
-            let hold_cleanup = link_hold
-                .as_ref()
-                .map(|name| remove_link_hold(&parent, name, &actual.identity));
-            match (finalization, hold_cleanup) {
-                (Ok(()), Some(Ok(())) | None) => DeletionEntryOutcome::Missing,
-                (Ok(()), Some(Err(cleanup_error))) => DeletionEntryOutcome::Failed(format!(
-                    "target disappeared; hard-link check cleanup failed: {cleanup_error}"
-                )),
-                (Err(error), Some(Ok(())) | None) => DeletionEntryOutcome::Failed(format!(
+            match finalize_placeholder(&parent, &original_name, &detached_name, &placeholder) {
+                Ok(()) => DeletionEntryOutcome::Missing,
+                Err(error) => DeletionEntryOutcome::Failed(format!(
                     "target disappeared; namespace cleanup failed: {error}"
-                )),
-                (Err(error), Some(Err(cleanup_error))) => DeletionEntryOutcome::Failed(format!(
-                    "target disappeared; namespace cleanup failed: {error}; hard-link check cleanup failed: {cleanup_error}"
                 )),
             }
         }
         Err(error) => {
             let restore = restore_detached(&parent, &original_name, &detached_name, &placeholder);
-            let hold_cleanup = link_hold
-                .as_ref()
-                .map(|name| remove_link_hold(&parent, name, &actual.identity));
-            let cleanup_error = hold_cleanup.and_then(Result::err);
             if error.kind() == io::ErrorKind::DirectoryNotEmpty {
                 restore.map_or_else(
                     |restore_error| {
@@ -2206,28 +2277,15 @@ where
                         ))
                     },
                     |()| {
-                        if let Some(cleanup_error) = cleanup_error {
-                            DeletionEntryOutcome::Failed(format!(
-                                "directory changed; hard-link check cleanup failed: {cleanup_error}"
-                            ))
-                        } else {
-                            DeletionEntryOutcome::Changed(
-                                "directory contains a new or changed entry".to_string(),
-                            )
-                        }
+                        DeletionEntryOutcome::Changed(
+                            "directory contains a new or changed entry".to_string(),
+                        )
                     },
                 )
             } else {
                 DeletionEntryOutcome::Failed(restore.map_or_else(
                     |restore_error| format!("{error}; namespace recovery failed: {restore_error}"),
-                    |()| {
-                        cleanup_error.map_or_else(
-                            || error.to_string(),
-                            |cleanup_error| {
-                                format!("{error}; hard-link check cleanup failed: {cleanup_error}")
-                            },
-                        )
-                    },
+                    |()| error.to_string(),
                 ))
             }
         }
@@ -2291,18 +2349,28 @@ where
             }
             continue;
         }
+        let mut no_link_survived = false;
         let outcome = execute_windows_entry(
             &root,
             &mut entry,
             &mut try_claim_mutation,
             &mut try_begin_mutation,
+            &mut no_link_survived,
         );
         if matches!(outcome, DeletionEntryOutcome::Unattempted) {
             stopped = true;
             soft_cancelled.store(true, Ordering::Release);
         }
-        if matches!(outcome, DeletionEntryOutcome::Deleted) {
-            note_deleted_link(&mut entry);
+        if matches!(
+            outcome,
+            DeletionEntryOutcome::Deleted | DeletionEntryOutcome::Missing
+        ) {
+            if removed_with_other_links(entry.snapshot.kind, no_link_survived) {
+                results.note_other_links();
+            }
+            if matches!(outcome, DeletionEntryOutcome::Deleted) {
+                note_deleted_link(&mut entry);
+            }
         }
         if !matches!(outcome, DeletionEntryOutcome::Unattempted)
             && let Some(progress) = progress
@@ -2335,6 +2403,7 @@ fn execute_windows_entry<C, M>(
     entry: &mut PlannedEntry,
     try_claim_mutation: &mut C,
     try_begin_mutation: &mut M,
+    no_link_survived: &mut bool,
 ) -> DeletionEntryOutcome
 where
     C: FnMut() -> bool,
@@ -2388,6 +2457,10 @@ where
         Ok(snapshot) => snapshot,
         Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
     };
+    // The count as the executor found the file, before it removes it. It is not the answer: a link
+    // made after this read, and before the removal, survives it. The answer is the count the same
+    // handle reads after the removal.
+    let links_when_opened = actual.identity.link_count;
     if kind == PlannedKind::File {
         // A pathname-independent post-open hard-link count can still change
         // before handle deletion. Report regular-file allocation conservatively.
@@ -2404,7 +2477,17 @@ where
         return DeletionEntryOutcome::Unattempted;
     }
     match remove_open_handle(&handle) {
-        Ok(()) => DeletionEntryOutcome::Deleted,
+        Ok(()) => {
+            // The removal took one name off the object. A file system that does not say so
+            // through the handle that removed it (the name may leave the count only when the
+            // handle closes, or the count may not be kept at all) leaves a count other than zero,
+            // and then every removal of a file counts as possibly leaving a link, which is the
+            // safe answer: only an object that had one link, and reads none after its removal, is
+            // proven to have left none.
+            *no_link_survived =
+                links_when_opened == Some(1) && link_count_of_open_file(&handle) == Some(0);
+            DeletionEntryOutcome::Deleted
+        }
         Err(error) if error.raw_os_error() == Some(145) => {
             DeletionEntryOutcome::Changed("directory contains a new or changed entry".to_string())
         }
@@ -2551,7 +2634,7 @@ fn report_from_parts(
 }
 
 /// What the executor tells `execute_unix_entry` about an entry's depth, and learns back about its
-/// isolation.
+/// isolation and removal.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[derive(Clone, Copy, Debug)]
 struct Isolation {
@@ -2560,6 +2643,10 @@ struct Isolation {
     /// The system refused the rename that isolates the entry, for a reason other than the entry
     /// no longer being there.
     refused: bool,
+    /// The executor removed a file or link and saw every link to it go with the removal: the
+    /// object had one link when it was isolated, and has none now. False for anything else,
+    /// including an entry that was already gone and one it could not count.
+    no_link_survived: bool,
 }
 
 /// `PATH_MAX`: the longest path, terminator included, that a path-based system call accepts
@@ -2739,52 +2826,180 @@ fn finalize_placeholder(
     ))
 }
 
+/// A reference to the object an entry names, held across the removal of the names the executor
+/// controls, so that the links that outlive the removal can be counted through it afterwards.
+///
+/// A count read through a name has to be read while the name is there, and a link made after that
+/// read is not in it. A reference outlives every name, and its count is the object's own: zero
+/// once the last link is gone, whatever the number was and whenever the links were made.
+///
+/// It is opened without following a link and without any effect on the object. Linux's `O_PATH`
+/// has none for any kind of object, a FIFO, a device, and a socket included. Elsewhere there is no
+/// such flag, so only the kinds that a plain open leaves alone get one: a regular file whose
+/// content is on this machine, opened for reading without blocking, and a symbolic link itself. A
+/// device, a FIFO, or a socket, a file whose content is somewhere else (opening it to read can
+/// make the system fetch it, which deleting it must not), a file this process may not read, and an
+/// object that is not the one that was inspected get none, and the executor then counts the
+/// removal as one that may have left a link.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-fn create_link_hold(parent: &File, source: &OsStr) -> io::Result<OsString> {
-    use std::sync::atomic::AtomicU64;
+struct LinkReference(OwnedFd);
 
-    static NEXT_LINK_HOLD: AtomicU64 = AtomicU64::new(0);
-    for _ in 0..128 {
-        let sequence = NEXT_LINK_HOLD.fetch_add(1, Ordering::Relaxed);
-        let name = OsString::from(format!(
-            ".excise-link-check-{:x}-{sequence:x}",
-            std::process::id()
-        ));
-        match cap_fs::hard_link(parent, Path::new(source), parent, Path::new(&name)) {
-            Ok(()) => return Ok(name),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+impl LinkReference {
+    /// A reference to the object that `name` names in `parent`, when that is `expected` and can
+    /// be referenced without affecting it.
+    fn open(parent: &File, name: &OsStr, expected: &NativeIdentity) -> Option<Self> {
+        let descriptor = open_without_effect(parent, name).ok()?;
+        let (_, identity) = EntryMetadata::from_stat(&fstat(&descriptor).ok()?).ok()?;
+        same_object(expected, &identity).then_some(Self(descriptor))
+    }
+
+    /// How many links the object has now.
+    fn links(&self) -> Option<u64> {
+        let (_, identity) = EntryMetadata::from_stat(&fstat(&self.0).ok()?).ok()?;
+        identity.link_count
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_without_effect(parent: &File, name: &OsStr) -> io::Result<OwnedFd> {
+    openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(target_vendor = "apple")]
+fn open_without_effect(parent: &File, name: &OsStr) -> io::Result<OwnedFd> {
+    /// `SF_DATALESS` of `<sys/stat.h>`: the file's content is not on this machine.
+    const SF_DATALESS: u32 = 0x4000_0000;
+
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    let flags = match FileType::from_raw_mode(stat.st_mode) {
+        FileType::RegularFile if stat.st_flags & SF_DATALESS == 0 => {
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK
+        }
+        FileType::Symlink => OFlags::RDONLY | OFlags::SYMLINK,
+        _ => return Err(io::Error::from(io::ErrorKind::Unsupported)),
+    };
+    openat(parent, name, flags | OFlags::CLOEXEC, Mode::empty()).map_err(io::Error::from)
+}
+
+/// The folder at `relative` below `scan_root` as it is now: the snapshot a scan would record for
+/// it, and its direct entries, each handed to `visit` with its name, kind, and identity as the
+/// scan reads them. `visit` returns whether to go on.
+///
+/// The folder is read the way the planner reads a target, through the handles of the folders
+/// above it, so the length of the path does not matter and a link on the way is not followed.
+/// Each entry is read by its name from the folder's own handle, with one no-follow stat and
+/// never opened, so a folder this process cannot open is listed like any other, as the scan
+/// listed it. The snapshot is read before the listing and again after it: a folder that changed
+/// meanwhile is not described, because what was listed is then not one moment of it. Nothing is
+/// held of the listing: its size does not grow what this keeps.
+///
+/// `skip` is asked of each name first, and a name it accepts is neither read nor visited: it is
+/// one of Excise's own, which the scan leaves out of the map, and one that is held open with no
+/// sharing cannot be read at all.
+///
+/// # Errors
+/// Returns an error when the scan root is no longer the folder the scan read, when nothing is at
+/// `relative`, when what is there is not a folder, when the folder or one of its entries cannot
+/// be read, when the folder changed while it was listed, or when `visit` stopped the listing
+/// ([`DeletionPlanError::Cancelled`]).
+pub(crate) fn current_folder_listing(
+    scan_root: &Path,
+    scan_root_identity: &NativeIdentity,
+    relative: &Path,
+    skip: impl Fn(&OsStr) -> bool,
+    mut visit: impl FnMut(&OsStr, PlannedKind, &NativeIdentity) -> bool,
+) -> Result<EntrySnapshot, DeletionPlanError> {
+    let root = open_root(scan_root, scan_root_identity)?;
+    let (before, handle) = inspect_relative(&root, relative)?;
+    let Some(handle) = handle.filter(|_| before.kind == PlannedKind::Directory) else {
+        return Err(DeletionPlanError::Changed);
+    };
+    let entries = cap_fs::read_base_dir(&handle).map_err(|error| plan_io(relative, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| plan_io(relative, error))?;
+        let name = entry.file_name();
+        if skip(&name) {
+            continue;
+        }
+        validate_component(&name)?;
+        let (kind, identity) = list_entry(&handle, &name, relative)?;
+        if !visit(&name, kind, &identity) {
+            return Err(DeletionPlanError::Cancelled);
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not reserve a hard-link verification name",
-    ))
+    let after = snapshot_from_open_file(&handle, PlannedKind::Directory)
+        .map_err(|error| plan_io(relative, error))?;
+    if after != before {
+        return Err(DeletionPlanError::Changed);
+    }
+    Ok(EntrySnapshot {
+        identity: Some(before.identity),
+        kind: NodeKind::Directory,
+        apparent_bytes: before.apparent_bytes,
+        allocated_bytes: before.allocated_bytes,
+        modified_nanos: before.modified_nanos,
+    })
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
-fn link_hold_matches_count(parent: &File, hold: &OsStr, expected: Option<u64>) -> io::Result<bool> {
-    let snapshot = snapshot_of_entry(parent, hold, PlannedKind::File)?;
-    Ok(snapshot.identity.link_count == expected)
-}
-
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
-fn remove_link_hold(parent: &File, hold: &OsStr, expected: &NativeIdentity) -> io::Result<()> {
-    let actual = match snapshot_of_entry(parent, hold, PlannedKind::File) {
-        Ok(snapshot) => snapshot,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+/// The kind and identity of the entry `name` of `folder`, read from the folder's handle `parent`
+/// without following a link and without opening the entry, classified as the scanner classifies
+/// what it lists: a link, or a reparse point, is a link, whatever it points at. The entry's path
+/// is built only for an error.
+#[cfg(unix)]
+fn list_entry(
+    parent: &File,
+    name: &OsStr,
+    folder: &Path,
+) -> Result<(PlannedKind, NativeIdentity), DeletionPlanError> {
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| plan_io(&folder.join(name), io::Error::from(error)))?;
+    let (metadata, identity) =
+        EntryMetadata::from_stat(&stat).map_err(|message| DeletionPlanError::Unrepresentable {
+            path: safe_display_path_text(&folder.join(name)),
+            message: safe_display_text(&message),
+        })?;
+    let kind = if metadata.is_symlink() || identity.reparse_point {
+        PlannedKind::Link
+    } else if metadata.is_dir() {
+        PlannedKind::Directory
+    } else {
+        PlannedKind::File
     };
-    if !same_object(expected, &actual.identity) {
-        return Err(io::Error::other(
-            "hard-link verification name no longer contains the target",
-        ));
-    }
-    match cap_fs::remove_file(parent, Path::new(hold)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
+    Ok((kind, identity))
+}
+
+/// As the Unix reading, from the metadata of a no-follow stat and the identity of a handle that
+/// asks for no access to the entry's data: it works for a folder this process may not open.
+#[cfg(not(unix))]
+fn list_entry(
+    parent: &File,
+    name: &OsStr,
+    folder: &Path,
+) -> Result<(PlannedKind, NativeIdentity), DeletionPlanError> {
+    let metadata = cap_fs::stat(parent, Path::new(name), FollowSymlinks::No)
+        .map_err(|error| plan_io(&folder.join(name), error))?;
+    let kind = if metadata.is_symlink() {
+        PlannedKind::Link
+    } else if metadata.is_dir() {
+        PlannedKind::Directory
+    } else {
+        PlannedKind::File
+    };
+    let snapshot = snapshot_from_cap_metadata(parent, name, &metadata, kind)
+        .map_err(|error| plan_io(&folder.join(name), error))?;
+    let kind = if snapshot.identity.reparse_point {
+        PlannedKind::Link
+    } else {
+        kind
+    };
+    Ok((kind, snapshot.identity))
 }
 
 fn inspect_relative(
@@ -3314,6 +3529,28 @@ fn note_deleted_link(entry: &mut PlannedEntry) {
     }
 }
 
+/// Whether an entry the run took out of the tree may have had other links when it went: a file or
+/// link that the executor did not see take its last link with it (`no_link_survived`), and every
+/// one that was already gone when the executor reached it, since nothing says where its object
+/// is by then, or under what other names. Only proof that no link survived says otherwise, so an
+/// entry the executor could not count, or could not reference, counts too. A folder has no other
+/// links to speak of.
+const fn removed_with_other_links(kind: PlannedKind, no_link_survived: bool) -> bool {
+    matches!(kind, PlannedKind::File | PlannedKind::Link) && !no_link_survived
+}
+
+/// How many links the file behind `handle` has now: zero once the removal that the handle made
+/// has taken its last one. `None` when the file system does not say.
+#[cfg(windows)]
+fn link_count_of_open_file(handle: &File) -> Option<u64> {
+    use cap_primitives::fs::_WindowsByHandle as _;
+
+    cap_fs::Metadata::from_file(handle)
+        .ok()?
+        .number_of_links()
+        .map(u64::from)
+}
+
 #[cfg(unix)]
 fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
     metadata
@@ -3426,20 +3663,6 @@ fn snapshot_from_entry(
     })
 }
 
-/// The snapshot of the entry `name` of `parent`, read without following a link and converted by
-/// the same checked conversion as [`inspect_child`].
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
-fn snapshot_of_entry(
-    parent: &File,
-    name: &OsStr,
-    kind: PlannedKind,
-) -> io::Result<PlannedSnapshot> {
-    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
-    let (metadata, identity) = EntryMetadata::from_stat(&stat)
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
-    snapshot_from_entry(&metadata, identity, kind, Path::new(name))
-}
-
 #[cfg(windows)]
 fn snapshot_from_cap_metadata(
     parent: &File,
@@ -3517,7 +3740,12 @@ impl PlanningStorage<'_> {
         self.entries
             .push(entry, spill, self.temporary_storage, self.spill_directory)
             .map_err(|error| plan_io(context, error))?;
-        *estimated_bytes = next;
+        // A plan that spills moves every entry it holds into a file, and its report follows it
+        // there, so from then on it holds none in memory and is charged nothing. What the history
+        // is charged for is what a report holds in memory, which the budget bounds. Counting the
+        // entries on disk as well would charge a large folder's report more than the place the
+        // history kept for it, and the report of a deletion that ran would not fit.
+        *estimated_bytes = if self.entries.is_spilled() { 0 } else { next };
         Ok(())
     }
 }
@@ -4366,6 +4594,569 @@ mod tests {
         assert!(!directory.exists());
         drop(report);
         assert_eq!(temporary_storage.used(), 0);
+    }
+
+    /// The history keeps a place for the report of every deletion allowed to start, as large as
+    /// the budget the plan was given. A plan that spills keeps none of its entries in memory once
+    /// it has, so it and the report it ends in are charged for what it held in memory and never
+    /// for the entries on disk: charged for those, a large folder's report would outgrow the
+    /// place kept for it and be dropped after its files were gone.
+    #[test]
+    fn a_plan_that_spills_charges_its_report_no_more_than_the_budget_it_was_given() {
+        const FILES: usize = 64;
+
+        for budget in [1, 4 * 1024, 16 * 1024] {
+            let root = tempfile::tempdir().expect("deletion root should exist");
+            let directory = root.path().join("target");
+            std::fs::create_dir(&directory).expect("target directory should exist");
+            for index in 0..FILES {
+                std::fs::write(directory.join(format!("file-{index:03}")), b"payload")
+                    .expect("target file should exist");
+            }
+            let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+            target.reviewed_entries.clear();
+            let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+
+            let plan = build_plan_cancellable_with_temporary_storage(
+                root.path(),
+                target,
+                false,
+                &AtomicBool::new(false),
+                budget,
+                &temporary_storage,
+            )
+            .expect("a directory plan spills instead of exceeding its budget");
+            assert!(
+                matches!(&plan.entries, PlanEntries::Spilled(_)),
+                "the fixture should be too large for a budget of {budget} bytes"
+            );
+            assert!(
+                plan.estimated_bytes <= budget,
+                "a plan with a budget of {budget} bytes charged {}",
+                plan.estimated_bytes
+            );
+
+            let report = execute_plan(
+                root.path(),
+                plan,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+            );
+            assert_eq!(
+                report.deleted_entries(),
+                u64::try_from(FILES + 1).expect("count should fit")
+            );
+            assert!(
+                report.estimated_bytes <= budget,
+                "a report whose plan had a budget of {budget} bytes charged {}",
+                report.estimated_bytes
+            );
+        }
+    }
+
+    /// A deletion reports whether a file it removed may have had other links: the executor reads
+    /// each file's link count as it removes it, and the owner scans the map again, instead of
+    /// updating it in place, when the count was not one. A link gained after the plan was made
+    /// counts as much as one the plan saw, and so does one that is outside the folder deleted.
+    #[cfg(unix)]
+    #[test]
+    fn a_deletion_reports_whether_a_file_it_removed_may_have_had_other_links() {
+        fn deleted_with(
+            folder: bool,
+            budget: usize,
+            before_planning: impl FnOnce(&Path),
+            after_planning: impl FnOnce(&Path),
+        ) -> DeletionReport {
+            let root = tempfile::tempdir().expect("deletion root should exist");
+            let path = root.path().join("target");
+            if folder {
+                std::fs::create_dir(&path).expect("target folder should exist");
+                for index in 0..4 {
+                    std::fs::write(path.join(format!("file-{index}")), b"payload")
+                        .expect("target file should exist");
+                }
+            } else {
+                std::fs::write(&path, b"payload").expect("target file should exist");
+            }
+            before_planning(root.path());
+            let file_type = if folder {
+                FileType::Folder
+            } else {
+                FileType::File
+            };
+            let mut target = target(root.path(), OsString::from("target"), file_type);
+            if folder {
+                target.reviewed_entries.clear();
+            }
+            let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+            let plan = build_plan_cancellable_with_temporary_storage(
+                root.path(),
+                target,
+                false,
+                &AtomicBool::new(false),
+                budget,
+                &temporary_storage,
+            )
+            .expect("the plan should build");
+            after_planning(root.path());
+            execute_plan(
+                root.path(),
+                plan,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+            )
+        }
+        let link = |root: &Path, from: &str| {
+            std::fs::hard_link(root.join(from), root.join("another-name"))
+                .expect("a second link should be created");
+        };
+
+        let sole_link = deleted_with(false, DEFAULT_PLAN_LIMIT_BYTES, |_| {}, |_| {});
+        assert_eq!(sole_link.deleted_entries(), 1);
+        assert!(
+            !sole_link.deleted_files_may_have_other_links(),
+            "a file with one link"
+        );
+
+        let linked_when_planned = deleted_with(
+            false,
+            DEFAULT_PLAN_LIMIT_BYTES,
+            |root| link(root, "target"),
+            |_| {},
+        );
+        assert!(
+            linked_when_planned.deleted_files_may_have_other_links(),
+            "a file with a second link when it was planned"
+        );
+
+        let linked_after_planning = deleted_with(
+            false,
+            DEFAULT_PLAN_LIMIT_BYTES,
+            |_| {},
+            |root| link(root, "target"),
+        );
+        assert_eq!(linked_after_planning.deleted_entries(), 1);
+        assert!(
+            linked_after_planning.deleted_files_may_have_other_links(),
+            "a file that gained a second link after it was planned"
+        );
+
+        let folder_of_sole_links = deleted_with(true, 1, |_| {}, |_| {});
+        assert_eq!(folder_of_sole_links.deleted_entries(), 5);
+        assert!(folder_of_sole_links.entries.is_spilled());
+        assert!(
+            !folder_of_sole_links.deleted_files_may_have_other_links(),
+            "a folder of files with one link each, in a plan that spilled"
+        );
+
+        let folder_with_a_linked_file =
+            deleted_with(true, 1, |root| link(root, "target/file-0"), |_| {});
+        assert!(folder_with_a_linked_file.entries.is_spilled());
+        assert!(
+            folder_with_a_linked_file.deleted_files_may_have_other_links(),
+            "a file of the folder has another link outside it, and the report was spilled"
+        );
+    }
+
+    /// A link made after the executor last looked at a file, and before it removes the file, is a
+    /// link that outlives the removal. The executor counts what is left once the file is gone,
+    /// not what it read before.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_made_between_the_last_inspection_and_the_removal_is_counted() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        std::fs::write(root.path().join("target"), b"payload").expect("target file should exist");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("the plan should build");
+        let late_link = root.path().join("late-link");
+
+        let report = execute_plan_unix_with_hooks(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            || {},
+            |detached| {
+                std::fs::hard_link(root.path().join(detached), &late_link)
+                    .expect("the late link should be made");
+            },
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert!(
+            report.deleted_files_may_have_other_links(),
+            "a link made just before the removal outlived it"
+        );
+        assert!(
+            late_link.exists(),
+            "the link made before the removal is what survives it"
+        );
+    }
+
+    /// The same on Windows: a link made after the handle was opened, and before the file is
+    /// removed through it, outlives the removal. The count the handle read when it was opened
+    /// does not say so.
+    #[cfg(windows)]
+    #[test]
+    fn a_link_made_between_opening_a_file_and_removing_it_is_counted() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        std::fs::write(root.path().join("target"), b"payload").expect("target file should exist");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("the plan should build");
+        let late_link = root.path().join("late-link");
+        let mut made = false;
+
+        let report = execute_plan_windows(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+            || true,
+            || {
+                if !made {
+                    std::fs::hard_link(root.path().join("target"), &late_link)
+                        .expect("the late link should be made");
+                    made = true;
+                }
+                true
+            },
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert!(
+            report.deleted_files_may_have_other_links(),
+            "a link made just before the removal outlived it"
+        );
+        assert!(
+            late_link.exists(),
+            "the link made before the removal is what survives it"
+        );
+    }
+
+    /// A symbolic link is referenced itself, never what it points at, so the executor proves it
+    /// had no other link as it proves it of a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_is_removed_and_proven_to_have_no_other_link() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::os::unix::fs::symlink("points-nowhere", &path).expect("the link should be created");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("the plan should build");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert!(!report.deleted_files_may_have_other_links());
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the link is gone"
+        );
+    }
+
+    /// A FIFO is removed without being opened, which a plain open would block on, and a device
+    /// without the side effects an open can have. Where a reference to it can be made without
+    /// opening it (Linux's `O_PATH`), the executor proves it had no other link; elsewhere it
+    /// cannot reference it, and counts the removal as one that may have left a link.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_removed_without_being_opened() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        // macOS has no `mknodat`, so the system's own `mkfifo` makes the fixture.
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo should run");
+        assert!(made.success(), "the FIFO should be created");
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("the plan should build");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert_eq!(
+            report.deleted_files_may_have_other_links(),
+            cfg!(target_vendor = "apple"),
+            "only where the FIFO can be referenced without opening it is its removal proven"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the FIFO is gone"
+        );
+    }
+
+    /// An entry that was already gone when the executor reached it records `Missing`, though the
+    /// run removed the rest of its folder: nothing says where its object is by then, or under
+    /// what other names, so the map cannot be updated in place.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_entry_that_vanished_before_its_removal_counts_as_possibly_linked() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let folder = root.path().join("target");
+        std::fs::create_dir(&folder).expect("target folder should exist");
+        std::fs::write(folder.join("kept"), b"payload").expect("kept file should exist");
+        std::fs::write(folder.join("vanishes"), b"payload").expect("vanishing file should exist");
+        let mut target = target(root.path(), OsString::from("target"), FileType::Folder);
+        target.reviewed_entries.clear();
+        let plan = build_plan(root.path(), target, false).expect("the plan should build");
+        // Another process unlinks a file of the folder between the plan and the run.
+        std::fs::remove_file(folder.join("vanishes")).expect("the file should be unlinked");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert!(report.target_was_removed());
+        assert_eq!(
+            report.deleted_entries(),
+            2,
+            "the kept file, then the folder"
+        );
+        assert!(
+            report.deleted_files_may_have_other_links(),
+            "a file that was gone when the executor reached it may live on under another name"
+        );
+    }
+
+    /// On Windows a spill is a named file in the folder that holds the target, and it is Excise's
+    /// own for as long as it exists: registered, so that nothing reads it as the user's, from
+    /// before it is created until after it is gone.
+    #[cfg(windows)]
+    #[test]
+    fn a_spill_registers_its_file_for_as_long_as_the_file_exists() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let temporary_storage = TemporaryStorage::with_limit_bytes(2 * 1024 * 1024);
+        let spill = RecordSpill::new(&temporary_storage, MAX_PLAN_SPILL_RECORD_BYTES, root.path())
+            .expect("spill should open");
+        let files: Vec<PathBuf> = std::fs::read_dir(root.path())
+            .expect("the folder should list")
+            .map(|entry| entry.expect("the entry should read").path())
+            .collect();
+
+        assert_eq!(files.len(), 1, "the spill is the one file in its folder");
+        assert!(
+            temporary_storage.private_files().contains(&files[0]),
+            "the spill's file is registered while it exists"
+        );
+
+        drop(spill);
+
+        assert!(!files[0].exists(), "the file went with its handle");
+        assert!(
+            !temporary_storage.private_files().contains(&files[0]),
+            "the registration ended with the file"
+        );
+    }
+
+    /// A name the listing is told to skip is neither read nor visited.
+    #[test]
+    fn a_name_the_listing_skips_is_neither_read_nor_visited() {
+        let root = tempfile::tempdir().expect("root should exist");
+        let folder = root.path().join("folder");
+        std::fs::create_dir(&folder).expect("folder should exist");
+        std::fs::write(folder.join("kept"), b"payload").expect("kept file should exist");
+        std::fs::write(folder.join("skipped"), b"payload").expect("skipped file should exist");
+        let root_identity =
+            current_scan_root_identity(root.path()).expect("the root should have an identity");
+        let mut visited = Vec::new();
+
+        current_folder_listing(
+            root.path(),
+            &root_identity,
+            Path::new("folder"),
+            |name| name == OsStr::new("skipped"),
+            |name, _, _| {
+                visited.push(name.to_os_string());
+                true
+            },
+        )
+        .expect("the folder should be listed");
+
+        assert_eq!(visited, [OsString::from("kept")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_is_listed_as_the_scan_records_it_without_opening_its_entries() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = tempfile::tempdir().expect("root should exist");
+        let folder = root.path().join("folder");
+        std::fs::create_dir_all(folder.join("sub")).expect("subfolder should exist");
+        std::fs::write(folder.join("file"), b"payload").expect("file should exist");
+        std::os::unix::fs::symlink("sub", folder.join("link")).expect("link should exist");
+        let sealed = folder.join("sealed");
+        std::fs::create_dir(&sealed).expect("sealed folder should exist");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000))
+            .expect("sealed folder should be locked");
+        let root_identity =
+            current_scan_root_identity(root.path()).expect("the root should have an identity");
+
+        let mut listed = Vec::new();
+        let snapshot = current_folder_listing(
+            root.path(),
+            &root_identity,
+            Path::new("folder"),
+            |_| false,
+            |name, kind, identity| {
+                listed.push((name.to_os_string(), kind, identity.file_id));
+                true
+            },
+        );
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))
+            .expect("sealed folder should be unlocked for its removal");
+
+        let snapshot = snapshot.expect("the folder should be listed");
+        let metadata = std::fs::symlink_metadata(&folder).expect("folder should have metadata");
+        assert_eq!(
+            snapshot.identity.map(|identity| identity.file_id),
+            Some(FileId::new_inode(metadata.dev(), metadata.ino()))
+        );
+        listed.sort_by(|left, right| left.0.cmp(&right.0));
+        let expected: Vec<_> = [
+            ("file", PlannedKind::File),
+            ("link", PlannedKind::Link),
+            ("sealed", PlannedKind::Directory),
+            ("sub", PlannedKind::Directory),
+        ]
+        .into_iter()
+        .map(|(name, kind)| {
+            let metadata =
+                std::fs::symlink_metadata(folder.join(name)).expect("entry should have metadata");
+            (
+                OsString::from(name),
+                kind,
+                FileId::new_inode(metadata.dev(), metadata.ino()),
+            )
+        })
+        .collect();
+        assert_eq!(
+            listed, expected,
+            "a link is listed as a link and not followed, and a folder that cannot be opened is listed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_changes_while_it_is_listed_is_not_described() {
+        let root = tempfile::tempdir().expect("root should exist");
+        let folder = root.path().join("folder");
+        std::fs::create_dir(&folder).expect("folder should exist");
+        std::fs::write(folder.join("early"), b"payload").expect("file should exist");
+        // A time long ago: a change to the folder moves it to now, however coarse the file
+        // system's timestamps are.
+        std::fs::File::open(&folder)
+            .expect("folder should open")
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_001))
+            .expect("the folder's modification time should be set");
+        let root_identity =
+            current_scan_root_identity(root.path()).expect("the root should have an identity");
+
+        let result = current_folder_listing(
+            root.path(),
+            &root_identity,
+            Path::new("folder"),
+            |_| false,
+            |_, _, _| {
+                // Another process makes an entry in the folder while it is being read.
+                std::fs::write(folder.join("late"), b"payload").expect("file should be made");
+                true
+            },
+        );
+
+        assert!(
+            matches!(result, Err(DeletionPlanError::Changed)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_listing_that_is_stopped_describes_nothing() {
+        let root = tempfile::tempdir().expect("root should exist");
+        std::fs::create_dir(root.path().join("folder")).expect("folder should exist");
+        std::fs::write(root.path().join("folder/entry"), b"payload").expect("file should exist");
+        let root_identity =
+            current_scan_root_identity(root.path()).expect("the root should have an identity");
+
+        let result = current_folder_listing(
+            root.path(),
+            &root_identity,
+            Path::new("folder"),
+            |_| false,
+            |_, _, _| false,
+        );
+
+        assert!(
+            matches!(result, Err(DeletionPlanError::Cancelled)),
+            "{result:?}"
+        );
+    }
+
+    /// What is at the path must be a folder, not what a link there points at.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_folder_is_listed() {
+        let root = tempfile::tempdir().expect("root should exist");
+        std::fs::create_dir(root.path().join("folder")).expect("folder should exist");
+        std::fs::write(root.path().join("file"), b"payload").expect("file should exist");
+        std::os::unix::fs::symlink("folder", root.path().join("link")).expect("link should exist");
+        let root_identity =
+            current_scan_root_identity(root.path()).expect("the root should have an identity");
+
+        for name in ["file", "link"] {
+            let result = current_folder_listing(
+                root.path(),
+                &root_identity,
+                Path::new(name),
+                |_| false,
+                |_, _, _| panic!("nothing is listed of {name}"),
+            );
+            assert!(
+                matches!(result, Err(DeletionPlanError::Changed)),
+                "{name}: {result:?}"
+            );
+        }
+        assert!(matches!(
+            current_folder_listing(
+                root.path(),
+                &root_identity,
+                Path::new("missing"),
+                |_| false,
+                |_, _, _| true
+            ),
+            Err(DeletionPlanError::Missing(_))
+        ));
     }
 
     #[test]

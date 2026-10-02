@@ -19,12 +19,12 @@ use crate::model::{ByteBounds, NodeKind, NodeState, SyntheticKind, UnscannedReas
 use crate::native_path::SafeDisplayPath;
 use crate::os::is_user_admin;
 use crate::scan_coordinator::SchedulerSnapshot;
-use crate::state::UiEffects;
 use crate::state::deletion_work::{
     DeletionWork, DeletionWorkPhaseSnapshot, MAX_DELETION_WORK_ITEMS, WorkRailItem, WorkRailStatus,
 };
 use crate::state::files::tree_view::TreeView;
 use crate::state::tiles::{Board, FileType, Tile};
+use crate::state::{PublicationProgress, UiEffects};
 use crate::theme::Theme;
 use crate::ui::TermTooSmall;
 use crate::ui::format::{
@@ -1633,10 +1633,23 @@ fn header_status_line(
         | UiMode::Notice {
             return_to: ThemePickerReturn::Loading,
             ..
-        } => Some(ui_effects.last_read_path.as_ref().map_or_else(
-            || "~ SCANNING".to_string(),
-            |path| status_with_path("~ SCANNING ", path, "", context_width),
-        )),
+        } => Some(match ui_effects.publication_progress {
+            // The scanner is done; the map is being finished. What moves on screen is how far, and
+            // how long it has taken.
+            Some(PublicationProgress {
+                done,
+                total,
+                elapsed_tenths,
+            }) => format!(
+                "~ SCANNING {separator} finishing the map {done}/{total} {separator} {}.{} s",
+                elapsed_tenths / 10,
+                elapsed_tenths % 10
+            ),
+            None => ui_effects.last_read_path.as_ref().map_or_else(
+                || "~ SCANNING".to_string(),
+                |path| status_with_path("~ SCANNING ", path, "", context_width),
+            ),
+        }),
         _ => None,
     };
     let mode_status = match (mode_status, scheduler_status.as_deref()) {
@@ -3188,6 +3201,61 @@ mod tests {
         assert!(text.contains("ERROR"));
         assert!(text.contains("complete folder map"));
         assert!(!text.contains("SUMMARIZED"));
+    }
+
+    #[test]
+    fn the_header_shows_how_far_and_for_how_long_the_finishing_map_has_got() {
+        let root = tempfile::tempdir().expect("loading root should exist");
+        let file_tree = loading_tree(root.path());
+        let mut effects = UiEffects::new();
+        effects.publication_progress = Some(PublicationProgress {
+            done: 5,
+            total: 12,
+            elapsed_tenths: 27,
+        });
+        for (ascii, expected) in [
+            (false, "finishing the map 5/12 · 2.7 s"),
+            (true, "finishing the map 5/12 . 2.7 s"),
+        ] {
+            let mut display =
+                Display::new(TestBackend::new(100, 24)).expect("display should be created");
+            let mut board = Board::new();
+            let deletion_work = DeletionWork::new();
+            let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+
+            display
+                .render(
+                    &file_tree,
+                    &mut board,
+                    &UiMode::Loading,
+                    &effects,
+                    &deletion_work,
+                    &mut animation,
+                    Duration::ZERO,
+                    "test",
+                    Theme::for_id(ThemeId::ExciseDark),
+                    ascii,
+                    false,
+                    KeyPreset::Vim,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("the finishing frame should render");
+
+            let text = display
+                .terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(Cell::symbol)
+                .collect::<String>();
+            assert!(text.contains("~ SCANNING"), "ascii={ascii}: {text}");
+            assert!(text.contains(expected), "ascii={ascii}: {text}");
+        }
     }
 
     #[test]

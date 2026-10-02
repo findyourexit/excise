@@ -9,6 +9,8 @@ use sysinfo::Disks;
 
 use redb::StorageBackend;
 
+use crate::private_files::PrivateFiles;
+
 pub(crate) const DEFAULT_TEMPORARY_STORAGE_MIB: usize = 4_096;
 pub(crate) const MIN_SCAN_STORE_MIB: usize = 2;
 pub(crate) const MIN_TEMPORARY_STORAGE_MIB: usize = 2;
@@ -17,6 +19,11 @@ const MIB: u64 = 1024 * 1024;
 #[derive(Clone, Debug)]
 pub(crate) struct TemporaryStorage {
     state: Arc<TemporaryStorageState>,
+    /// The files this session keeps open in the user's tree, for every reader of that tree to
+    /// leave out. It belongs to the handle, not to the shared accounting, so that the storage the
+    /// deletion spills are charged to can share the registry of the storage the scanner and the
+    /// scan store use while each keeps its own quota ([`Self::sharing_private_files_with`]).
+    private_files: PrivateFiles,
 }
 
 #[derive(Debug)]
@@ -25,6 +32,10 @@ struct TemporaryStorageState {
     capacity_name: &'static str,
     increase_flag: &'static str,
     used: AtomicU64,
+    /// Set once by [`TemporaryStorage::stop`]: every later reservation and every run-block read
+    /// then fails, so work a session runs on another thread unwinds within one block of I/O
+    /// instead of running to completion.
+    stopped: AtomicBool,
     #[cfg(feature = "internal")]
     peak_used: AtomicU64,
 }
@@ -197,13 +208,47 @@ impl TemporaryStorage {
                 capacity_name,
                 increase_flag,
                 used: AtomicU64::new(0),
+                stopped: AtomicBool::new(false),
                 #[cfg(feature = "internal")]
                 peak_used: AtomicU64::new(0),
             }),
+            private_files: PrivateFiles::default(),
         }
     }
 
+    /// The files this session keeps open in the user's tree.
+    pub(crate) const fn private_files(&self) -> &PrivateFiles {
+        &self.private_files
+    }
+
+    /// This storage, with its quota and its stop signal as they are, but with the registry of
+    /// `other`: the two are one session's, and a file that one of them keeps in the user's tree is
+    /// a file the readers of the other must leave out.
+    #[must_use]
+    pub(crate) fn sharing_private_files_with(mut self, other: &Self) -> Self {
+        self.private_files = other.private_files.clone();
+        self
+    }
+
+    /// Makes every later reservation, and every later block read of a run charged here, fail.
+    ///
+    /// One-way and idempotent. A session calls it when it is shutting down while a thread it
+    /// started may still be merging or publishing runs: that thread then ends at its next block
+    /// of I/O, and whoever joins it does not wait out a merge sized by the whole scan.
+    pub(crate) fn stop(&self) {
+        self.state.stopped.store(true, Ordering::Release);
+    }
+
+    /// Fails once [`Self::stop`] was called.
+    pub(crate) fn ensure_running(&self) -> io::Result<()> {
+        if self.state.stopped.load(Ordering::Acquire) {
+            return Err(io::Error::other("the scan store session was stopped"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn reserve(&self, bytes: u64) -> io::Result<()> {
+        self.ensure_running()?;
         let mut used = self.state.used.load(Ordering::Acquire);
         loop {
             let required = used.checked_add(bytes).ok_or_else(|| {
@@ -293,6 +338,11 @@ impl TemporaryStorageReservation {
     #[must_use]
     pub(crate) const fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Fails once the storage this reservation is charged to was stopped.
+    pub(crate) fn ensure_running(&self) -> io::Result<()> {
+        self.storage.ensure_running()
     }
 
     pub(crate) fn grow_to(&mut self, bytes: u64) -> io::Result<()> {
