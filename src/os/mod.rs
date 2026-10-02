@@ -11,5 +11,11 @@ pub mod unix;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::is_user_admin;
 
+#[cfg(target_os = "windows")]
+pub(crate) use windows::raise_soft_descriptor_limit;
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) use unix::raise_soft_descriptor_limit;
+
 #[cfg(not(target_os = "windows"))]
 pub(crate) use unix::is_user_admin;

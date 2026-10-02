@@ -1765,6 +1765,12 @@ fn scan_headless_with_scan_store_session(
                     entries,
                     input_runs,
                 } => {
+                    if !input_runs.is_empty() {
+                        // Headless admits directly, with no `App::admit_scan_input_runs` in
+                        // between, so this is this batch's only release point for the credit
+                        // `ScanInputRunFactory::seal_observation_batch` acquired.
+                        scan_store.release_inflight_batch_credit();
+                    }
                     if !scan_store_capacity_exhausted && !input_runs.is_empty() {
                         let lease = lease.as_ref().ok_or_else(|| {
                             AppError::Invariant(
@@ -1799,6 +1805,9 @@ fn scan_headless_with_scan_store_session(
                     input_runs,
                 } => {
                     let represented = !input_runs.is_empty();
+                    if represented {
+                        scan_store.release_inflight_batch_credit();
+                    }
                     if !scan_store_capacity_exhausted && represented {
                         let lease = lease.as_ref().ok_or_else(|| {
                             AppError::Invariant(

@@ -3,7 +3,9 @@ use std::error::Error as StdError;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -56,6 +58,85 @@ pub(crate) const MAX_OBSERVATIONS_PER_BATCH: usize = 128;
 /// folder `Uncertain`, the same conservative direction `unrecorded_path_count`
 /// already takes for the root alone when a fact cannot be retained.
 const MAX_TRACKED_UNREADABLE_DIRECTORIES: usize = 4096;
+
+/// Runs retained for as long as a generation is published or summary-only: the concrete
+/// entries (`child_queries`), their compact parent/name lookup (`path_catalog`), physical-
+/// byte dedup facts (`identity_index`), and per-folder roll-ups (`directory_summary_index`).
+/// `publish` replaces all of a prior generation's runs together with the next one's, so this
+/// count is the scan store's descriptor floor once a scan completes, fixed regardless of how
+/// many entries or directories were scanned. Before that, the same bound this module already
+/// enforces on admitted input (`MAX_ACTIVE_INPUT_RUNS`/`MAX_RUN_LEVELS`) is what limits a
+/// generation in progress: a sealed run holds no descriptor merely by existing in the
+/// scanner-to-owner channel or an unmerged level (`SealedRun::ensure_resident`, `run_file.rs`
+/// derives why), so neither a deep admission backlog nor a wide tree adds descriptors by
+/// itself. A later directory-relative walk (holding one descriptor per directory level
+/// while it walks) adds its own budget beside this one rather than replacing it.
+const RESIDENT_PUBLISHED_RUNS: usize = 4;
+
+/// Scanner batches sealed but not yet admitted, capped independently of the event channel's
+/// own capacity (`event_buffer`, `config.rs`), which also bounds memory and latency for every
+/// kind of worker event, not just these two. Removing the per-run durable sync let the
+/// scanner outrun admission more, growing this backlog's `Vec<ScannedEntry>` and run-file
+/// memory past the pre-removal baseline on `tiny-files-250k` (20.1-23.4 MB peak footprint
+/// against 17.7-20.9 MB before); 16 keeps it within that baseline again (`cargo xtask
+/// bench-e2e --baseline bf63697 --fixture tiny-files-250k`), with ample headroom below the
+/// channel's own default 256-event capacity.
+const MAX_INFLIGHT_SCAN_BATCHES: usize = 16;
+
+/// Shared between the scanner (acquires one credit per batch it seals for admission, in
+/// [`ScanInputRunFactory::seal_observation_batch`]) and the owner (releases it once that batch
+/// reaches admission: [`ScanStore::release_inflight_batch_credit`]). Backpressure, not a hard
+/// guarantee: this counter's job is smoothing memory and descriptor use, not correctness, so a
+/// missed release (which a future change to an admission path could introduce) cannot stall
+/// the scanner forever -- `acquire` gives up after a bounded wait and proceeds anyway.
+#[derive(Clone, Debug)]
+struct InflightBatchBudget(Arc<AtomicUsize>);
+
+impl InflightBatchBudget {
+    fn new() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn acquire(&self) {
+        const POLL: Duration = Duration::from_millis(1);
+        const MAX_WAIT: Duration = Duration::from_millis(50);
+        let mut waited = Duration::ZERO;
+        loop {
+            let current = self.0.load(Ordering::Acquire);
+            if current < MAX_INFLIGHT_SCAN_BATCHES {
+                if self
+                    .0
+                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return;
+                }
+                continue;
+            }
+            if waited >= MAX_WAIT {
+                return;
+            }
+            thread::sleep(POLL);
+            waited += POLL;
+        }
+    }
+
+    fn release(&self) {
+        // Saturating: `acquire` can give up without ever incrementing (the bounded-wait
+        // fallback above), and this budget's own philosophy is backpressure, not a correctness
+        // guarantee, so a release that outnumbers its acquires must settle at zero rather than
+        // wrap a `usize` and poison every later `acquire` into reading a falsely full budget.
+        // `fetch_update` is `try_update` on a newer nightly than this crate's pinned stable
+        // toolchain ships; keep the name that compiles on both rather than one only nightly
+        // accepts.
+        #[allow(deprecated)]
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_sub(1))
+            });
+    }
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum ScanStoreError {
@@ -425,6 +506,7 @@ pub(crate) struct ScanInputRunFactory {
     temporary_storage: TemporaryStorage,
     session_storage: Option<ScanStoreStorage>,
     next_run_id: Arc<AtomicU64>,
+    budget: InflightBatchBudget,
 }
 
 impl ScanInputRunFactory {
@@ -441,13 +523,32 @@ impl ScanInputRunFactory {
     /// the shared run identifier sequence is exhausted.
     pub(crate) fn seal_observation_batch(
         &self,
-        mut paths: Vec<PathObservation>,
-        mut identities: Vec<IdentityObservation>,
+        paths: Vec<PathObservation>,
+        identities: Vec<IdentityObservation>,
     ) -> Result<Vec<SealedRun>, ScanStoreError> {
         if paths.len() > MAX_OBSERVATIONS_PER_BATCH || identities.len() > MAX_OBSERVATIONS_PER_BATCH
         {
             return Err(ScanStoreError::BatchTooLarge);
         }
+        if paths.is_empty() && identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Acquired here (the scanner, about to seal a batch destined for admission);
+        // released in `ScanStore::release_inflight_batch_credit` once the batch reaches
+        // admission, or right below if sealing itself fails and the batch never ships.
+        self.budget.acquire();
+        let sealed = self.seal_sorted_batch(paths, identities);
+        if sealed.is_err() {
+            self.budget.release();
+        }
+        sealed
+    }
+
+    fn seal_sorted_batch(
+        &self,
+        mut paths: Vec<PathObservation>,
+        mut identities: Vec<IdentityObservation>,
+    ) -> Result<Vec<SealedRun>, ScanStoreError> {
         paths.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         identities.sort_unstable_by(compare_identity_observations);
         let mut runs = Vec::with_capacity(2);
@@ -500,6 +601,7 @@ pub(crate) struct ScanStore {
     published: Option<PublishedGeneration>,
     summary_only: Option<SummaryOnlyGeneration>,
     retired_generation: Option<ScanGeneration>,
+    inflight_batches: InflightBatchBudget,
     #[cfg(feature = "internal")]
     io_metrics: ScanStoreIoMetrics,
 }
@@ -540,6 +642,7 @@ impl ScanStore {
             published: None,
             summary_only: None,
             retired_generation: None,
+            inflight_batches: InflightBatchBudget::new(),
             #[cfg(feature = "internal")]
             io_metrics: ScanStoreIoMetrics::default(),
         })
@@ -868,7 +971,15 @@ impl ScanStore {
             temporary_storage: self.temporary_storage.clone(),
             session_storage: self.session_storage.clone(),
             next_run_id: Arc::clone(&self.next_run_id),
+            budget: self.inflight_batches.clone(),
         })
+    }
+
+    /// Releases one credit [`ScanInputRunFactory::seal_observation_batch`] acquired, now that
+    /// its batch has reached admission -- whatever admission then does with the runs (accepts,
+    /// rejects as a duplicate, or abandons the generation) no longer matters to this budget.
+    pub(crate) fn release_inflight_batch_credit(&self) {
+        self.inflight_batches.release();
     }
 
     /// Adds one sealed raw scanner run to the active generation.
@@ -973,17 +1084,32 @@ impl ScanStore {
         paths: Vec<PathObservation>,
         identities: Vec<IdentityObservation>,
     ) -> Result<(), ScanStoreError> {
-        let result = (|| {
-            let factory = self.input_run_factory()?;
-            for run in factory.seal_observation_batch(paths, identities)? {
-                self.accept_input_run(run)?;
-            }
-            Ok(())
-        })();
+        let result = self.append_sealed_observation_batch(paths, identities);
         if result.is_err() {
             self.mark_active_incomplete();
         }
         result
+    }
+
+    fn append_sealed_observation_batch(
+        &mut self,
+        paths: Vec<PathObservation>,
+        identities: Vec<IdentityObservation>,
+    ) -> Result<(), ScanStoreError> {
+        let factory = self.input_run_factory()?;
+        let runs = factory.seal_observation_batch(paths, identities)?;
+        let sealed_a_batch = !runs.is_empty();
+        let mut outcome = Ok(());
+        for run in runs {
+            if let Err(error) = self.accept_input_run(run) {
+                outcome = Err(error);
+                break;
+            }
+        }
+        if sealed_a_batch {
+            self.release_inflight_batch_credit();
+        }
+        outcome
     }
 
     /// Returns a bounded, explicitly incomplete page from the active generation.
@@ -1043,7 +1169,7 @@ impl ScanStore {
             mut identity_observations,
             mut allocation_contributions,
             mut directory_summaries,
-            path_catalog,
+            mut path_catalog,
         ) = match self.reduce_active_generation(&mut active) {
             Ok(reduced) => reduced,
             Err(error) => return self.finish_incomplete_generation(active, error),
@@ -1062,7 +1188,7 @@ impl ScanStore {
             )?;
             Ok((child_writer.seal()?, page_metadata))
         })();
-        let (child_queries, page_metadata) = match child_result {
+        let (mut child_queries, page_metadata) = match child_result {
             Ok(result) => result,
             Err(error) if is_scan_store_capacity_error(&error) => {
                 return self.finish_summary_only_generation(
@@ -1078,6 +1204,21 @@ impl ScanStore {
             }
             Err(error) => return self.finish_incomplete_generation(active, error),
         };
+        // Warm the four runs this generation keeps for as long as it stays published: an
+        // interactive page read (`PublishedGeneration::page_entry`/`path_catalog_entry`) uses
+        // `SealedRun::range_reader`, which cannot cache a lazily reopened file behind a shared
+        // `&self` borrow, so opening it once here keeps every later read as cheap as before
+        // this run stopped holding its file from `seal` onward. Best-effort: a failed warm
+        // still serves correctly, just by reopening on that first read instead.
+        let resident: [&mut SealedRun; RESIDENT_PUBLISHED_RUNS] = [
+            &mut child_queries,
+            &mut path_catalog,
+            &mut identity_observations,
+            &mut directory_summaries,
+        ];
+        for run in resident {
+            let _ = run.ensure_resident();
+        }
         #[cfg(feature = "internal")]
         self.record_publication_io(
             &path_observations,
@@ -1143,6 +1284,9 @@ impl ScanStore {
         })?;
         manifest.transition(ScanGenerationState::SummaryOnly)?;
         drop(sources);
+        // Best-effort for the same reason as the published path above; summary-only serves
+        // `directory_summaries` the same way.
+        let _ = directory_summaries.ensure_resident();
         self.summary_only = Some(SummaryOnlyGeneration {
             manifest,
             directory_summaries,
