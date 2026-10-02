@@ -35,7 +35,7 @@
 //! | `scan_complete` | `entries` | The initial scan finished and the map switched to its completed state. `entries` counts the scanned entries. |
 //! | `quit_prompt` | | The quit dialog was built. |
 //! | `deletion_finished` | `removed`, `failed` | A deletion worker reported. The counts come from its report. |
-//! | `exit` | `code` | An interactive run is about to return its exit code. The terminal, if it was entered, has already been restored. A process that panics or is killed emits none. |
+//! | `exit` | `code` | An interactive run is about to return its exit code. The terminal, if it was entered, has already been restored, unless it never absorbed the restoration output within a bounded wait. A process that panics or is killed emits none. |
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};

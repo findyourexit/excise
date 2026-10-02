@@ -25,11 +25,11 @@ Excise validates command-line options, environment variables, and the TOML confi
 
 ### Terminal Session
 
-A terminal-session guard owns raw input mode, the separate screen, cursor visibility, colors, and optional mouse capture. It restores the terminal after normal return, a typed error, a panic, or a boundary-safe cancellation.
+A terminal-session guard owns raw input mode, the separate screen, cursor visibility, colors, and optional mouse capture. It restores the terminal after normal return, a typed error, a panic, or a boundary-safe cancellation. Restoration is ordered after every frame byte the terminal writer thread has been handed and waits for it, bounded, so a terminal that never reads anything cannot hang exit.
 
 ### Main Loop
 
-The main loop polls terminal input with a short maximum wait. It renders each folder opening before returning to queued scanning and applies at most one stored scan batch before checking input again. When the map is moving, a fixed-size channel slows scanner updates. The interface redraws when state changes, apart from deletion progress and visual effects. Effects run at most 30 times per second; overdue frames are dropped, and a new transition replaces an earlier transition with the same purpose.
+The main loop polls terminal input with a short maximum wait. It renders each folder opening before returning to queued scanning and applies at most one stored scan batch before checking input again. When the map is moving, a fixed-size channel slows scanner updates. The interface redraws when state changes, apart from deletion progress and visual effects. Effects run at most 30 times per second; overdue frames are dropped, and a new transition replaces an earlier transition with the same purpose. A dedicated writer thread transmits each rendered frame's bytes to the terminal; the loop decides what to render and renders a new frame only once that thread confirms the previous one drained, so a terminal slower than excise's output paces frame production instead of blocking scan ingestion or input handling.
 
 ### Scanner and Session Coordinator
 
@@ -87,7 +87,7 @@ Opening an entry grows its contents from the selected rectangle. Moving back con
 
 | Constraint | Consequence |
 |---|---|
-| One writer | Multiple threads never change application or terminal state. |
+| One writer | The owner loop is the only thread that decides application or terminal state and content; nothing else changes either. A dedicated writer thread (see background-tasks.md's "Terminal Output Writer") only transmits the bytes it is handed, in the order it is handed them, and never decides what they are. |
 | Fixed owners | No queue or model owner grows without a limit. |
 | No shell mutation | No shell command performs scanning or deletion. |
 | No network path | No network client or telemetry runs as part of the program. |

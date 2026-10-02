@@ -106,7 +106,7 @@ Protocol version 1 objects start with `v` (always `1`) and `kind`, and end with 
 | `scan_complete` | `entries` | The initial scan finished and the map switched to its completed state. `entries` is the scanned-entry count. |
 | `quit_prompt` | none | The quit dialog was built. It can be built again while background work finishes. |
 | `deletion_finished` | `removed`, `failed` | A deletion worker reported. The counts come from its report. |
-| `exit` | `code` | An interactive run is about to return its exit code. The terminal, if it was entered, has already been restored. A process that panics or is killed emits none. |
+| `exit` | `code` | An interactive run is about to return its exit code. The terminal, if it was entered, has already been restored, unless it never absorbed the restoration output within a bounded wait. A process that panics or is killed emits none. |
 
 An event marks a state change, not the screen that shows it. Wait for the next `frame` before reading the terminal.
 

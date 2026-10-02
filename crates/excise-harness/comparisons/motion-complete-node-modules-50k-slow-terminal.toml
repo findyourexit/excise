@@ -1,6 +1,6 @@
 schema_version = 1
 name = "motion-complete-node-modules-50k-slow-terminal"
-description = "Default-motion time-to-COMPLETE against reduced-motion time-to-COMPLETE under a throttled terminal (F2's repro trigger), on the 50k-entry node_modules-shaped fixture."
+description = "Default-motion time-to-COMPLETE against reduced-motion time-to-COMPLETE under a throttled terminal, on the 50k-entry node_modules-shaped fixture."
 fixture = "node-modules-50k"
 budget = "motion_complete_ratio"
 pairs = 1
@@ -8,5 +8,3 @@ timeout_ms = 1500000
 drain_bytes_per_sec = 150000
 tier = "nightly"
 platforms = ["macos"]
-expect = "fail"
-slice = "X2"

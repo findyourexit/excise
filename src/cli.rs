@@ -15,8 +15,8 @@ use crate::input::TerminalEvents;
 use crate::native_path::safe_display_os_str_text;
 use crate::native_path::{ResolvedRoot, safe_display_text};
 use crate::report::{ReportError, ScanReport};
-use crate::runtime::{RuntimeSettings, SystemClock, run, scan_headless};
-use crate::terminal::{SplitColorWriter, TerminalSession, validate_terminal};
+use crate::runtime::{RuntimeSettings, SystemClock, run_with_frame_gate, scan_headless};
+use crate::terminal::{SplitColorWriter, TerminalSession, spawn_frame_writer, validate_terminal};
 use crate::test_events;
 use crate::theme::ThemeId;
 
@@ -104,8 +104,17 @@ fn run_tui(settings: RuntimeSettings) -> i32 {
     if let Err(error) = validate_terminal() {
         return report_error(&error);
     }
+    let (frame_writer, frame_sink) = match spawn_frame_writer(io::stdout(), io::stdout()) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return report_error(&AppError::io(
+                "could not start the terminal writer thread",
+                error,
+            ));
+        }
+    };
 
-    let mut session = match TerminalSession::enter_with_mouse(settings.mouse) {
+    let mut session = match TerminalSession::enter_with_mouse(settings.mouse, frame_sink.clone()) {
         Ok(session) => session,
         Err(error) => return report_error(&error),
     };
@@ -124,12 +133,13 @@ fn run_tui(settings: RuntimeSettings) -> i32 {
         }
         return report_error(&error);
     }
-    let backend = CrosstermBackend::new(SplitColorWriter::new(io::stdout()));
-    let run_result = run(
+    let backend = CrosstermBackend::new(SplitColorWriter::new(frame_writer));
+    let run_result = run_with_frame_gate(
         backend,
         Box::new(TerminalEvents::default()),
         settings,
         Box::new(SystemClock::new()),
+        Some(frame_sink),
     );
     let restore_result = session.restore();
     drop(session);

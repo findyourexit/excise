@@ -1,6 +1,6 @@
 schema_version = 1
 name = "tui-complete-node-modules-50k-default-slow-terminal"
-description = "Interactive time-to-COMPLETE under default motion against a headless scan of the same fixture, under a throttled terminal (F2's repro trigger), on the 50k-entry node_modules-shaped fixture."
+description = "Interactive time-to-COMPLETE under default motion against a headless scan of the same fixture, under a throttled terminal, on the 50k-entry node_modules-shaped fixture."
 fixture = "node-modules-50k"
 budget = "tui_complete_ratio"
 profile = "default"
@@ -9,5 +9,3 @@ timeout_ms = 1500000
 drain_bytes_per_sec = 150000
 tier = "nightly"
 platforms = ["macos"]
-expect = "fail"
-slice = "X2"

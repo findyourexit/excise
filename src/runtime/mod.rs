@@ -46,6 +46,7 @@ use crate::scan_store::session::{
 };
 use crate::scan_store::storage::ScanStoreStorage;
 use crate::temporary_storage::TemporaryStorage;
+use crate::terminal::FrameSink;
 use crate::theme::ThemeId;
 use crate::ui::palette::ColorCycle;
 
@@ -151,6 +152,10 @@ where
     workers: Option<WorkerPool>,
     clock: Box<dyn Clock>,
     animation: AnimationScheduler,
+    /// Set only for a real terminal (`cli::run_tui`); gates `render` so a slow terminal cannot
+    /// block scan ingestion or input handling. `None` for in-process and test backends (a
+    /// `TestBackend` has no terminal to back up), which render exactly as before.
+    frame_sink: Option<FrameSink>,
     settings: RuntimeSettings,
     scan_store_storage: TemporaryStorage,
     summary: RunSummary,
@@ -186,6 +191,27 @@ pub fn run<B>(
     input: Box<dyn InputSource>,
     settings: RuntimeSettings,
     clock: Box<dyn Clock>,
+) -> Result<OperationOutcome<RunSummary>, AppError>
+where
+    B: Backend,
+{
+    run_with_frame_gate(terminal_backend, input, settings, clock, None)
+}
+
+/// Like [`run`], but when `frame_sink` is set, `render` draws a new frame only once the terminal
+/// has drained the previous one, so a slow real terminal cannot block scan ingestion or input
+/// handling (coalescing: the next frame it does draw reflects however much changed meanwhile).
+/// `cli::run_tui` is the only caller that passes one; every in-process caller (tests, benchmarks,
+/// the in-process scenario runner) passes `None` and renders exactly as before.
+///
+/// # Errors
+/// Returns a terminal, input, worker, or invariant error after shutting down owned workers.
+pub fn run_with_frame_gate<B>(
+    terminal_backend: B,
+    input: Box<dyn InputSource>,
+    settings: RuntimeSettings,
+    clock: Box<dyn Clock>,
+    frame_sink: Option<FrameSink>,
 ) -> Result<OperationOutcome<RunSummary>, AppError>
 where
     B: Backend,
@@ -239,6 +265,7 @@ where
         workers: Some(workers),
         clock,
         animation,
+        frame_sink,
         settings,
         scan_store_storage,
         summary: RunSummary::default(),
@@ -290,7 +317,7 @@ where
             // A keystroke must be drawn before background work can spend another
             // scheduling slice. This keeps cursor feedback independent of scan load.
             if input_processed {
-                did_work |= self.render()?;
+                did_work |= self.render_reflecting_input()?;
             }
             if !self.app.is_running && self.scan_active {
                 self.cancelled_while_scanning = true;
@@ -1180,18 +1207,54 @@ where
         self.render()
     }
 
+    /// Draws the next frame when dirty, unless a real terminal is still draining the previous
+    /// one (`frame_sink`): coalesces by skipping this attempt rather than blocking on the write,
+    /// so scan ingestion and input keep running on a slow terminal. `self.app.dirty` stays set,
+    /// so the next opportunity renders whatever changed meanwhile instead of this moment's state.
+    ///
+    /// Animation and scan-progress ticks are unbounded in count, so coalescing them to at most
+    /// one frame in flight is what keeps a slow terminal from falling further and further behind.
+    /// A keystroke is different: discrete, bounded by how fast a person (or the harness) can
+    /// produce them, and the input-latency budget applies even while a large scan-driven frame is
+    /// still draining. `render_reflecting_input` is for that case; it never coalesces this way.
     fn render(&mut self) -> Result<bool, AppError> {
+        self.render_with_backlog_gate(true)
+    }
+
+    /// Draws the next frame reflecting input just processed, without waiting for a still-draining
+    /// frame: see `render`'s doc for why input does not coalesce behind scan or animation output.
+    /// Its bytes still queue strictly after whatever is already draining or queued (`FrameSink`
+    /// never reorders or drops what it is handed), so this cannot show the input out of order.
+    fn render_reflecting_input(&mut self) -> Result<bool, AppError> {
+        self.render_with_backlog_gate(false)
+    }
+
+    fn render_with_backlog_gate(&mut self, respect_backlog_gate: bool) -> Result<bool, AppError> {
+        if let Some(sink) = &self.frame_sink
+            && let Some(error) = sink.take_failure()
+        {
+            return Err(AppError::terminal("draw", error));
+        }
         #[cfg(feature = "internal")]
         let mut frame = self.probe_phase(OwnerPhase::Render);
-        let result = self.app.render_if_dirty(
-            &mut self.animation,
-            self.clock.now(),
-            self.settings.theme.attribution().name,
-            crate::theme::Theme::for_id(self.settings.theme),
-            self.settings.ascii,
-            self.settings.monochrome,
-            self.settings.reduced_motion,
-        );
+        let gated = respect_backlog_gate
+            && self
+                .frame_sink
+                .as_ref()
+                .is_some_and(|sink| !sink.previous_frame_drained());
+        let result = if gated {
+            Ok(false)
+        } else {
+            self.app.render_if_dirty(
+                &mut self.animation,
+                self.clock.now(),
+                self.settings.theme.attribution().name,
+                crate::theme::Theme::for_id(self.settings.theme),
+                self.settings.ascii,
+                self.settings.monochrome,
+                self.settings.reduced_motion,
+            )
+        };
         if matches!(&result, Ok(true)) {
             crate::test_events::frame();
         }
@@ -1236,6 +1299,14 @@ where
         }
         if let Some(deadline) = self.timed_actions.iter().map(|action| action.at).min() {
             timeout = timeout.min(deadline.saturating_sub(now));
+        }
+        // A frame is waiting to draw but gated on the terminal writer draining the previous one
+        // (`render`): recheck soon rather than sleeping for up to `IDLE_INPUT_WAIT`, so output
+        // catching up after the scan completes still renders promptly instead of waiting for the
+        // next keypress. `dirty` cannot stay set here for any other reason: an unguarded `render`
+        // this same loop iteration would already have cleared it.
+        if self.app.is_dirty() {
+            timeout = timeout.min(WORKER_POLL_INTERVAL);
         }
         timeout
     }
@@ -1929,6 +2000,7 @@ mod tests {
             workers: Some(workers),
             clock: Box::new(VirtualClock::new()),
             animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            frame_sink: None,
             settings: RuntimeSettings {
                 root: root.path().to_path_buf(),
                 root_identity,
@@ -2039,6 +2111,7 @@ mod tests {
             workers: None,
             clock: Box::new(VirtualClock::new()),
             animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            frame_sink: None,
             settings: RuntimeSettings {
                 root: root.path().to_path_buf(),
                 root_identity,
@@ -2183,6 +2256,7 @@ mod tests {
             workers: None,
             clock: Box::new(clock),
             animation,
+            frame_sink: None,
             settings: RuntimeSettings {
                 root: root.path().to_path_buf(),
                 root_identity,
@@ -2292,6 +2366,7 @@ mod tests {
             workers: None,
             clock: Box::new(VirtualClock::new()),
             animation: AnimationScheduler::new(false, false, Duration::ZERO),
+            frame_sink: None,
             settings: RuntimeSettings {
                 root: root.to_path_buf(),
                 root_identity,
@@ -2465,6 +2540,7 @@ mod tests {
             workers: None,
             clock: Box::new(VirtualClock::new()),
             animation: AnimationScheduler::new(false, false, Duration::ZERO),
+            frame_sink: None,
             settings: RuntimeSettings {
                 root: root.path().to_path_buf(),
                 root_identity,
@@ -2629,6 +2705,7 @@ mod tests {
             workers: None,
             clock: Box::new(VirtualClock::new()),
             animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            frame_sink: None,
             settings: RuntimeSettings {
                 root: root.path().to_path_buf(),
                 root_identity,
@@ -2745,6 +2822,7 @@ mod tests {
             workers: None,
             clock: Box::new(VirtualClock::new()),
             animation: AnimationScheduler::new(true, true, Duration::ZERO),
+            frame_sink: None,
             settings: RuntimeSettings {
                 root: root.path().to_path_buf(),
                 root_identity,
@@ -2980,6 +3058,7 @@ mod tests {
             // Default motion (neither reduced nor monochrome): the selected
             // tile's sheen can animate, which this test is about.
             animation: AnimationScheduler::new(false, false, Duration::ZERO),
+            frame_sink: None,
             settings: RuntimeSettings {
                 root: root.path().to_path_buf(),
                 root_identity,

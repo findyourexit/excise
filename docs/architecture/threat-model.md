@@ -33,7 +33,7 @@
 
     **Terminal injection** — Store file paths without losing original bytes. Show a reversible escaped form. Never write untrusted control characters directly to the terminal. A narrow display keeps the marker that warns about deceptive text.
 
-    **Terminal restoration** — Validate the terminal before entering raw input mode. Restore it automatically on normal exit, typed errors, panics, and cancellation. Test failures and panics through a pseudo-terminal. An active deletion stops only at an entry boundary, and its worker always joins before the terminal session ends.
+    **Terminal restoration** — Validate the terminal before entering raw input mode. Restore it automatically on normal exit, typed errors, panics, and cancellation, ordered after every frame byte already produced. The wait for a terminal that is merely slow to absorb that output is bounded, not unbounded, so a terminal that never reads anything cannot hang exit; raw mode is still disabled either way. Test failures and panics through a pseudo-terminal. An active deletion stops only at an entry boundary, and its worker always joins before the terminal session ends.
 
 === "Deletion"
 

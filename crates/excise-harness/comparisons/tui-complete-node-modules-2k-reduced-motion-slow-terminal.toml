@@ -9,5 +9,3 @@ timeout_ms = 90000
 drain_bytes_per_sec = 150000
 tier = "full"
 platforms = ["macos"]
-expect = "fail"
-slice = "X2"
