@@ -1,16 +1,19 @@
-//! F4: killed or interrupted `excise` sessions leave `.excise-scan-*` directories in the scratch
-//! parent named by `EXCISE_SCAN_STORE_DIR`, and nothing sweeps them
-//! (`src/scan_store/storage.rs:11,59-94`).
+//! Dead scan-store sessions are swept at the next start (`src/scan_store/sweep.rs`).
 //!
-//! This test builds one scan-store parent shared by three `excise` processes: a session killed
-//! with `SIGKILL` (process termination on Windows) right after its session directory appears
-//! under it, a session kept running in its own pseudo-terminal until the test quits it, and a
-//! directory with the same `.excise-scan-*` name shape that no `excise` process ever made. A
-//! third `excise`, started against the same parent and left to finish a headless scan normally,
-//! must never touch the live session's directory or the unverified one. It also never touches the
-//! dead session's directory today, which is F4. That last assertion is a strict expected
-//! failure: it holds while the defect is present, and its failure message names the finding and
-//! the slice that fixes it.
+//! A session killed with `SIGKILL` (process termination on Windows) cannot remove its own
+//! `.excise-scan-*` directory from the scratch parent named by `EXCISE_SCAN_STORE_DIR`. Every
+//! start sweeps that parent before it creates its own session, and removes a directory only when
+//! it is a verified excise session whose lock no process holds.
+//!
+//! The first test builds one scan-store parent shared by `excise` processes: a directory with the
+//! `.excise-scan-*` name shape that no `excise` process ever made, a session kept running in its
+//! own pseudo-terminal until the test quits it, and a session killed with no cleanup once it has
+//! finished setting itself up. A further `excise`, started against the same parent and left to
+//! finish a headless scan normally, must remove the dead session's directory and nothing else.
+//!
+//! The second test starts several `excise` processes at once against a parent that also holds a
+//! dead session. Each sweeps while the others create and use their sessions, so a sweep that
+//! removed a session being set up or in use would fail that session's scan.
 
 use std::{
     collections::BTreeSet,
@@ -19,6 +22,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU32, Ordering},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -34,11 +38,15 @@ use excise_harness::{
     scenario::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS, Profile},
 };
 
-/// `excise`'s private scan-store session prefix (`src/scan_store/storage.rs:11`). The harness
-/// crate does not export it: this test hardcodes it exactly as
+/// `excise`'s private scan-store session prefix (`src/scan_store/storage.rs`). The harness crate
+/// does not export it: this test hardcodes it exactly as
 /// `crates/excise-harness/src/safety/scratch.rs`'s and `src/tests/scenario_runner.rs`'s own tests
 /// already do.
 const SESSION_PREFIX: &str = ".excise-scan-";
+/// The file inside a session directory that holds its lock and, once the session has taken the
+/// lock, the owner marker (`src/scan_store/session_lock.rs`). It is empty until then, and a
+/// session killed before that is a directory no sweep can tell from one `excise` never made.
+const LOCK_FILE: &str = "session.lock";
 /// A fast, privilege-free fixture: a single directory of 1,000 small files. What is scanned does
 /// not matter here, only that starting `excise` creates a session directory and a clean exit
 /// removes it.
@@ -172,6 +180,57 @@ fn wait_for_new_session_entry(
     }
 }
 
+/// Pumps `session` until the session directory `dir` has finished setting itself up: its lock
+/// file holds the owner marker, which the session writes only after it has taken the lock.
+fn wait_for_session_marker(session: &mut PtySession, dir: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        session.pump().expect("the session's output can be read");
+        if fs::metadata(dir.join(LOCK_FILE)).is_ok_and(|meta| meta.len() > 0) {
+            return;
+        }
+        if let Some(exit) = session.exit() {
+            panic!(
+                "excise exited before its session was set up: {}",
+                exit.describe()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} did not get its owner marker within {timeout:?}:\n{}",
+            dir.display(),
+            session.screen().text()
+        );
+        session
+            .wait_activity(FS_POLL_INTERVAL)
+            .expect("the session's output can be read");
+    }
+}
+
+/// Starts a pseudo-terminal session against the shared `store`, waits until its session
+/// directory exists and is set up, then kills it with no chance to clean up. Returns the
+/// directory it leaves behind.
+fn leave_dead_session(
+    binary: &Path,
+    fixture: &Path,
+    store: &Path,
+    work_dir: &Path,
+    known: &mut BTreeSet<String>,
+    title: &str,
+) -> PathBuf {
+    let mut dead = TuiSession::spawn(binary, fixture, store, work_dir, title);
+    let name = wait_for_new_session_entry(&mut dead.pty, store, known, SESSION_WAIT);
+    known.insert(name.clone());
+    let directory = store.join(name);
+    wait_for_session_marker(&mut dead.pty, &directory, SESSION_WAIT);
+    dead.pty.kill();
+    assert!(
+        directory.is_dir(),
+        "the dead session's directory should still be there right after the kill"
+    );
+    directory
+}
+
 /// Waits for the header badge to read `COMPLETE`.
 fn wait_for_complete(session: &mut PtySession, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -269,7 +328,7 @@ fn run_headless_scan(binary: &Path, fixture: &Path, store: &Path, work_dir: &Pat
 }
 
 #[test]
-fn nothing_sweeps_a_dead_scan_store_session_while_live_and_unverified_directories_survive() {
+fn a_dead_scan_store_session_is_swept_while_live_and_unverified_directories_survive() {
     let binary = Path::new(env!("CARGO_BIN_EXE_excise"));
     let master = Fixtures::bundled()
         .master(FIXTURE)
@@ -284,64 +343,126 @@ fn nothing_sweeps_a_dead_scan_store_session_while_live_and_unverified_directorie
     fs::create_dir_all(&store).expect("the shared scan-store parent can be created");
     let mut known = BTreeSet::new();
 
-    // A dead session: killed as soon as its session directory exists, before it ever reaches
-    // `COMPLETE`. Nothing it did is confirmed or cleaned up.
-    let mut dead = TuiSession::spawn(binary, &fixture, &store, &work.0, "dead session");
-    let dead_name = wait_for_new_session_entry(&mut dead.pty, &store, &known, SESSION_WAIT);
-    known.insert(dead_name.clone());
-    dead.pty.kill();
-    let dead_dir = store.join(&dead_name);
-    assert!(
-        dead_dir.is_dir(),
-        "the dead session's directory should still be there right after the kill"
-    );
+    // An unverified directory: no `excise` process ever made this one. It is there for every
+    // start below.
+    let unverified_name = format!("{SESSION_PREFIX}not-made-by-excise");
+    let unverified_dir = store.join(&unverified_name);
+    fs::create_dir(&unverified_dir).expect("the unverified directory can be created");
+    known.insert(unverified_name.clone());
 
     // A live session: stays up in its own pseudo-terminal until it is quit at the end.
     let mut live = TuiSession::spawn(binary, &fixture, &store, &work.0, "live session");
     let live_name = wait_for_new_session_entry(&mut live.pty, &store, &known, SESSION_WAIT);
     known.insert(live_name.clone());
+    let live_dir = store.join(&live_name);
     wait_for_complete(&mut live.pty, COMPLETE_WAIT);
 
-    // An unverified directory: no `excise` process ever made this one.
-    let unverified_name = format!("{SESSION_PREFIX}not-made-by-excise");
-    fs::create_dir(store.join(&unverified_name)).expect("the unverified directory can be created");
+    // A dead session: killed once it has set itself up, before it ever reaches `COMPLETE`.
+    // Nothing it did is confirmed or cleaned up. Its own start swept the parent too, and found
+    // the live session and the unverified directory, which it left alone.
+    let dead_dir = leave_dead_session(
+        binary,
+        &fixture,
+        &store,
+        &work.0,
+        &mut known,
+        "dead session",
+    );
+    assert!(
+        live_dir.is_dir() && unverified_dir.is_dir(),
+        "a start that swept the parent must leave a live session and an unverified directory"
+    );
 
-    // A third excise finishes a headless scan of the same fixture normally, against the same
-    // scan-store parent.
+    // A further excise finishes a headless scan of the same fixture normally, against the same
+    // scan-store parent. Starting it sweeps the parent.
     run_headless_scan(binary, &fixture, &store, &work.0);
 
-    // The live session's directory and the unverified directory survive today, and must keep
-    // surviving once X4 ships.
-    let live_dir = store.join(&live_name);
-    let unverified_dir = store.join(&unverified_name);
+    assert!(
+        !dead_dir.exists(),
+        "the dead session's directory should have been swept by the next start"
+    );
     assert!(
         live_dir.is_dir(),
-        "the live session's directory must survive a third excise's normal start and exit"
+        "the live session's directory must survive another excise's start and exit"
+    );
+    assert!(
+        fs::metadata(live_dir.join(LOCK_FILE)).is_ok_and(|meta| meta.len() > 0),
+        "the live session must keep its lock file and owner marker"
     );
     assert!(
         unverified_dir.is_dir(),
-        "the unverified directory must survive a third excise's normal start and exit"
-    );
-    // F4: nothing sweeps a dead session's directory today. This is a strict expected failure: X4,
-    // a startup sweep of verified, unlocked, same-user sessions, must make this assertion fail,
-    // and then it flips to assert that the directory is gone.
-    assert!(
-        dead_dir.is_dir(),
-        "F4 is fixed: flip R4 to assert that the dead session is swept (X4)"
+        "the unverified directory must survive another excise's start and exit"
     );
 
-    // Quit the live session normally. The scan-store parent must then hold exactly the dead
-    // session and the unverified directory: nothing else leaked, and nothing else was swept.
+    // Quit the live session normally. The scan-store parent must then hold exactly the
+    // unverified directory: nothing else leaked, and nothing but the dead session was swept.
     quit_normally(&mut live.pty, QUIT_WAIT);
     assert_eq!(
         entry_names(&store),
-        BTreeSet::from([dead_name, unverified_name]),
-        "the scan-store parent should hold only the dead session and the unverified directory"
+        BTreeSet::from([unverified_name]),
+        "the scan-store parent should hold only the unverified directory"
     );
-    remove_tree(&dead_dir).expect("the dead session's directory can be removed");
     remove_tree(&unverified_dir).expect("the unverified directory can be removed");
     assert!(
         entry_names(&store).is_empty(),
-        "the scan-store parent should be empty once both are removed"
+        "the scan-store parent should be empty once it is removed"
     );
+}
+
+#[test]
+fn excise_processes_starting_together_never_remove_each_others_live_sessions() {
+    /// Processes started at once in each round.
+    const STARTERS: usize = 4;
+    /// Rounds of simultaneous starts. Only the first has a dead session to sweep; every round
+    /// has each process sweeping while the others set up and use their own sessions.
+    const ROUNDS: usize = 3;
+
+    let binary = Path::new(env!("CARGO_BIN_EXE_excise"));
+    let master = Fixtures::bundled()
+        .master(FIXTURE)
+        .expect("the bundled fixture materializes");
+    let fixture = FixtureRoot::open(&master.root)
+        .expect("the fixture carries the ownership marker")
+        .path()
+        .to_path_buf();
+
+    let work = Workspace::new();
+    let store = work.0.join("store");
+    fs::create_dir_all(&store).expect("the shared scan-store parent can be created");
+    let mut known = BTreeSet::new();
+    let unverified_name = format!("{SESSION_PREFIX}not-made-by-excise");
+    let unverified_dir = store.join(&unverified_name);
+    fs::create_dir(&unverified_dir).expect("the unverified directory can be created");
+    known.insert(unverified_name.clone());
+    let dead_dir = leave_dead_session(
+        binary,
+        &fixture,
+        &store,
+        &work.0,
+        &mut known,
+        "dead session",
+    );
+
+    for round in 0..ROUNDS {
+        // A headless scan fails if its session directory is removed under it, so every process
+        // finishing with exit 0 shows that no sweep removed a session that was being set up or
+        // used. Each scan panics, and the scope re-panics, when one does not.
+        thread::scope(|scope| {
+            for _ in 0..STARTERS {
+                scope.spawn(|| run_headless_scan(binary, &fixture, &store, &work.0));
+            }
+        });
+        if round == 0 {
+            assert!(
+                !dead_dir.exists(),
+                "the starts of the first round should have swept the dead session's directory"
+            );
+        }
+        assert_eq!(
+            entry_names(&store),
+            BTreeSet::from([unverified_name.clone()]),
+            "after round {round} the scan-store parent should hold only the unverified directory"
+        );
+    }
+    remove_tree(&unverified_dir).expect("the unverified directory can be removed");
 }

@@ -14,5 +14,7 @@ pub(crate) mod path_reducer;
 pub(crate) mod run_file;
 pub(crate) mod run_merge;
 pub(crate) mod session;
+pub(crate) mod session_lock;
 pub(crate) mod storage;
 pub(crate) mod summary_metrics;
+pub(crate) mod sweep;

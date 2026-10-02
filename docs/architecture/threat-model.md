@@ -25,6 +25,7 @@
 - Terminal size and capability changes.
 - Invalid configuration, environment, and report paths.
 - Corrupted temporary session data.
+- Entries in the scratch parent that are named like a session directory but are links, belong to another user, or were never made by Excise.
 - Compromised dependencies or release systems.
 
 ## Required Controls
@@ -51,7 +52,8 @@
     - Enforce a hard memory limit for page views and a separate scan-store quota.
     - Keep exact totals in private stored scan data and immutable page queries.
     - Use loops for traversal, layout, and deletion.
-    - Store scan data in private files with fixed limits.
+    - Store scan data in private files with fixed limits, in a session directory that only the current user can open.
+    - Remove a dead session's directory only when it is verified, unlocked, and the current user's. Each session holds a lock on a file in its own directory for its whole life, and that file records that Excise made the directory. A start removes a `.excise-scan-*` directory only when it is a real directory on the scratch parent's file system, never a link, owned by the current user and closed to everyone else; its lock file is a regular file under the same rules and holds exactly that record; and the lock can be taken, so no process holds it. It removes inside that directory without following a link or leaving it, leaves a directory it cannot remove completely verifiable for the next start, and leaves everything else alone. It never reports and never fails the run that started it.
     - Replace repeated visual effects by purpose and avoid an idle animation loop.
 
 === "Reports and meaning"
@@ -72,6 +74,8 @@
 | A name contains an escape sequence | Display an escaped name and leave terminal state unchanged. |
 | A metadata query fails | Mark the value unknown and do not substitute file length. |
 | The scan store reaches capacity | Publish a deterministic `summary-only` result. Do not expose a detailed map or deletion controls. |
+| A previous session was killed and left its scratch directory behind | The next start removes the directory when it is verified, unlocked, and the current user's. A running session, including one that starts at the same moment, is never removed. |
+| A scratch directory is named like a session but is a link, belongs to another user, is open to others, or has no valid record that Excise made it | Leave it exactly as found. Never follow a link and never remove anything inside it. |
 | Focus changes repeat quickly | Replace the earlier visual effect and keep memory bounded. |
 | The user quits during deletion | Cancel pending plans, safely stop after the current entry, or return to the map and wait. Never detach an active filesystem change. |
 
