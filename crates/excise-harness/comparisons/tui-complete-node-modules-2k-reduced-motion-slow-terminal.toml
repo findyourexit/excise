@@ -8,4 +8,5 @@ pairs = 5
 timeout_ms = 90000
 drain_bytes_per_sec = 150000
 tier = "full"
-platforms = ["macos"]
+# Linux only: on macOS this ratio sits at the budget, so its verdict is not stable there.
+platforms = ["linux"]

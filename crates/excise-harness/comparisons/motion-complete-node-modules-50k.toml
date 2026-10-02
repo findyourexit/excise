@@ -6,4 +6,4 @@ budget = "motion_complete_ratio"
 pairs = 3
 timeout_ms = 240000
 tier = "nightly"
-platforms = ["macos"]
+platforms = ["macos", "linux"]

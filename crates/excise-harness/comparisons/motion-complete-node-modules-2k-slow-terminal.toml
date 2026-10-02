@@ -7,4 +7,4 @@ pairs = 5
 timeout_ms = 90000
 drain_bytes_per_sec = 150000
 tier = "full"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
