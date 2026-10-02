@@ -1,4 +1,3 @@
-use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -10,7 +9,7 @@ use crossbeam_channel::{
     Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
 };
 
-use super::scanner::{self, ScannerHandle, ScannerOptions, ScannerRequestError};
+use super::scanner::{self, EntryMetadata, ScannerHandle, ScannerOptions, ScannerRequestError};
 use crate::deletion::{
     DeletionPlan, DeletionPlanError, DeletionReport,
     build_plan_cancellable_with_root_identity_and_temporary_storage,
@@ -54,7 +53,7 @@ fn clear_active_deletion_progress(
 }
 
 pub struct ScannedEntry {
-    pub metadata: Metadata,
+    pub metadata: EntryMetadata,
     pub path: PathBuf,
     pub identity: NativeIdentity,
 }

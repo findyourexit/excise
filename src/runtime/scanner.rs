@@ -1,9 +1,11 @@
+mod entry_metadata;
 mod scheduler;
 mod task_queue;
 mod task_spill;
+use std::ffi::OsStr;
 #[cfg(windows)]
 use std::ffi::OsString;
-use std::fs::{self, File, Metadata};
+use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +19,8 @@ use crossbeam_channel::{
     Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
 };
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+#[cfg(unix)]
+use rustix::fs::{AtFlags, FileType, statat};
 
 use scheduler::SchedulerHandle;
 use scheduler::{LeasedDirectoryTask, SchedulerCommand};
@@ -25,7 +29,6 @@ use task_queue::{DirectoryTask, TASK_QUEUE_PER_WORKER, TaskQueue};
 use super::worker::{ScannedEntry, WorkerEvent, send_event};
 use crate::model::{ByteBounds, EntrySnapshot, NodeKind, UnscannedReason};
 use crate::native_path::{NativeIdentity, identity_for};
-use crate::os::physical_size;
 use crate::scan_coordinator::{
     RelativePath, ScanGeneration, SessionCoordinator, WorkCompletion, WorkLease,
 };
@@ -35,6 +38,7 @@ use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, 
 use crate::scan_store::run_file::SealedRun;
 use crate::scan_store::session::{ScanInputRunFactory, scan_store_capacity_message};
 use crate::temporary_storage::TemporaryStorage;
+pub(super) use entry_metadata::EntryMetadata;
 /// The owner consumes each bounded batch before checking input again. Keep the
 /// batch small so scanning never makes keyboard feedback wait indefinitely.
 const MAX_FOCUS_REQUESTS: usize = 32;
@@ -655,7 +659,7 @@ fn run_with_scheduler(
 
 struct ScanFrame {
     task: DirectoryTask,
-    _directory: File,
+    directory: File,
     entries: cap_fs::ReadDir,
     batch: Vec<ScannedEntry>,
     directories: Vec<DirectoryTask>,
@@ -1012,7 +1016,7 @@ fn validate_directory_task(
         return Ok(());
     };
     let directory = open_scan_directory(root_directory, root, &task.path)
-        .map_err(|error| classify_directory_open_error(&task.path, error))?;
+        .map_err(|error| classify_directory_open_error(root_directory, root, &task.path, error))?;
     let metadata = cap_fs::Metadata::from_file(&directory).map_err(DirectoryTaskError::Io)?;
     if !metadata.is_dir() || metadata.is_symlink() {
         return Err(DirectoryTaskError::Replaced(
@@ -1219,11 +1223,12 @@ fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink() || metadata.file_attributes() & 0x0000_0400 != 0
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
 fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
+#[cfg(not(unix))]
 fn path_has_reparse_component(path: &Path) -> bool {
     let mut current = PathBuf::new();
     path.components().any(|component| {
@@ -1232,7 +1237,68 @@ fn path_has_reparse_component(path: &Path) -> bool {
     })
 }
 
-fn classify_directory_open_error(path: &Path, error: io::Error) -> DirectoryTaskError {
+/// Whether the folder `path` names, or a folder above it below the scan root, is now a link, or
+/// the folder itself is now something other than a directory.
+///
+/// Every step is a no-follow `fstatat` against the handle of the folder above it, never a stat
+/// of a path: a full-path `lstat` fails with `ENAMETOOLONG` past `PATH_MAX`, which would report
+/// a replaced deep folder as a plain I/O failure. A step that cannot be read ends the walk with
+/// "not replaced", leaving the open's own error to explain the failure.
+#[cfg(unix)]
+fn path_was_replaced(root_directory: &File, root: &Path, path: &Path) -> bool {
+    let Ok(relative) = task_relative_path(root, path) else {
+        return false;
+    };
+    let Ok(mut directory) = root_directory.try_clone() else {
+        return false;
+    };
+    let mut names = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .peekable();
+    while let Some(name) = names.next() {
+        let Ok(stat) = statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            return false;
+        };
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Symlink => return true,
+            FileType::Directory => {}
+            _ => return names.peek().is_none(),
+        }
+        let Ok(next) = cap_fs::open_dir_nofollow(&directory, Path::new(name)) else {
+            return false;
+        };
+        directory = next;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn classify_directory_open_error(
+    root_directory: &File,
+    root: &Path,
+    path: &Path,
+    error: io::Error,
+) -> DirectoryTaskError {
+    if path_was_replaced(root_directory, root, path) {
+        DirectoryTaskError::Replaced(
+            "scanner directory task was replaced by a symbolic link or non-directory".to_string(),
+        )
+    } else {
+        DirectoryTaskError::Io(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn classify_directory_open_error(
+    _root_directory: &File,
+    _root: &Path,
+    path: &Path,
+    error: io::Error,
+) -> DirectoryTaskError {
     let is_non_directory = fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_dir());
     if is_non_directory || path_has_reparse_component(path) {
         DirectoryTaskError::Replaced(
@@ -1257,7 +1323,7 @@ fn open_frame(
         Err(error) => {
             return Err(Box::new((
                 task.clone(),
-                classify_directory_open_error(&task.path, error),
+                classify_directory_open_error(root_directory, root, &task.path, error),
             )));
         }
     };
@@ -1305,7 +1371,7 @@ fn open_frame(
     };
     Ok(ScanFrame {
         task,
-        _directory: directory,
+        directory,
         entries,
         batch: Vec::with_capacity(BATCH_SIZE),
         directories: Vec::with_capacity(BATCH_SIZE),
@@ -1353,7 +1419,7 @@ fn report_unscanned_entry(
     root: &Path,
     lease: Option<&WorkLease>,
     factory: Option<&ScanInputRunFactory>,
-    metadata: &Metadata,
+    metadata: &EntryMetadata,
     path: PathBuf,
     identity: NativeIdentity,
     reason: UnscannedReason,
@@ -1398,6 +1464,47 @@ fn report_unscanned_entry(
     );
 }
 
+/// Reads one listed entry's metadata and identity without following a link.
+///
+/// On Unix this is a single `fstatat` (`rustix::fs::statat`, `AT_SYMLINK_NOFOLLOW`) against the
+/// handle of the folder that lists the entry, so it depends on the entry's name and not on the
+/// length of its path: a full-path stat fails with `ENAMETOOLONG` past `PATH_MAX`, which would
+/// drop everything below that depth. The handle is the one `open_frame` verified, so an ancestor
+/// swapped for a link after the open cannot redirect the read either. Every field is converted
+/// with a checked conversion from that one `Stat`: a value that does not fit makes the entry an
+/// error reported like any unreadable one, where a library `Metadata` would panic. Windows has no
+/// equivalent call (cap-std's relative metadata carries no file index or volume serial number
+/// there), so it reads the entry by its path, as it always has.
+#[cfg(unix)]
+fn read_entry(
+    directory: &File,
+    name: &OsStr,
+    _path: &Path,
+) -> Result<(EntryMetadata, Option<NativeIdentity>), String> {
+    let stat = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io::Error::from(error).to_string())?;
+    let (metadata, identity) = EntryMetadata::from_stat(&stat)?;
+    Ok((metadata, Some(identity)))
+}
+
+#[cfg(not(unix))]
+fn read_entry(
+    _directory: &File,
+    _name: &OsStr,
+    path: &Path,
+) -> Result<(EntryMetadata, Option<NativeIdentity>), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let identity = identity_for(path, &metadata).map_err(|error| {
+        format!(
+            "{}: {error}",
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_string_lossy()
+        )
+    })?;
+    Ok((EntryMetadata::from_std(&metadata), identity))
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn process_entry(
     frame: &mut ScanFrame,
@@ -1417,23 +1524,9 @@ fn process_entry(
     if exclusions.is_internal(&path) {
         return;
     }
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            let _ = send_event(
-                sender,
-                WorkerEvent::ScanFailed {
-                    path: Some(path),
-                    message: error.to_string(),
-                },
-                cancelled,
-            );
-            return;
-        }
-    };
-    let identity = match identity_for(&path, &metadata) {
-        Ok(Some(identity)) => identity,
-        Ok(None) => {
+    let (metadata, identity) = match read_entry(&frame.directory, &name, &path) {
+        Ok((metadata, Some(identity))) => (metadata, identity),
+        Ok((_, None)) => {
             let _ = send_event(
                 sender,
                 WorkerEvent::ScanUnscanned {
@@ -1448,13 +1541,7 @@ fn process_entry(
             );
             return;
         }
-        Err(error) => {
-            let message = format!(
-                "{}: {error}",
-                path.parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_string_lossy()
-            );
+        Err(message) => {
             let _ = send_event(
                 sender,
                 WorkerEvent::ScanFailed {
@@ -1482,7 +1569,7 @@ fn process_entry(
         );
         return;
     }
-    if metadata.file_type().is_symlink() || identity.reparse_point {
+    if metadata.is_symlink() || identity.reparse_point {
         report_unscanned_entry(
             root,
             lease,
@@ -1607,7 +1694,7 @@ fn seal_scanned_entries(
             .map_err(|_| "scanner entry escaped its configured root".to_string())?;
         let relative = RelativePath::from_path(relative)
             .map_err(|_| "scanner entry has an invalid root-relative path".to_string())?;
-        let kind = if entry.metadata.file_type().is_symlink() || entry.identity.reparse_point {
+        let kind = if entry.metadata.is_symlink() || entry.identity.reparse_point {
             PathEntryKind::Link
         } else if entry.metadata.is_dir() {
             PathEntryKind::Directory
@@ -1621,7 +1708,9 @@ fn seal_scanned_entries(
         };
         let allocated_bytes = (kind != PathEntryKind::Directory)
             .then(|| {
-                physical_size(&entry.path, &entry.metadata)
+                entry
+                    .metadata
+                    .physical_size(&entry.path)
                     .ok()
                     .map(u128::from)
             })
@@ -1646,7 +1735,6 @@ fn seal_scanned_entries(
             modified_nanos: entry
                 .metadata
                 .modified()
-                .ok()
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_nanos()),
         };
@@ -2315,6 +2403,612 @@ mod tests {
             "outside target should remain untouched"
         );
     }
+
+    /// A tree nested past `PATH_MAX`, created, changed, and removed only through directory
+    /// handles (`mkdirat`, `openat`, `unlinkat`), the way the harness builds its deep fixture: no
+    /// path in it can be named whole, so a test cannot reach it any other way.
+    #[cfg(unix)]
+    mod deep_tree {
+        use std::ffi::OsString;
+        use std::fs::File;
+        use std::io::Write as _;
+        use std::os::fd::OwnedFd;
+        use std::path::{Path, PathBuf};
+
+        use rustix::fs::{
+            AtFlags, CWD, Dir, FileType, Mode, OFlags, mkdirat, openat, statat, symlinkat, unlinkat,
+        };
+
+        /// Folders in the chain. A folder name is `NAME_LEN` bytes plus a separator, so the deepest
+        /// path passes 4,096 bytes, `PATH_MAX` on Linux (1,024 on macOS), whatever the root's name.
+        pub(super) const LEVELS: usize = 44;
+        const NAME_LEN: usize = 100;
+        const FILE_NAME: &str = "leaf.dat";
+        const LINK_NAME: &str = "loop";
+        const LINK_TARGET: &str = "..";
+        const FOLDER_MODE: Mode = Mode::from_raw_mode(0o755);
+        const FILE_MODE: Mode = Mode::from_raw_mode(0o644);
+        const OPEN_FOLDER: OFlags = OFlags::RDONLY
+            .union(OFlags::DIRECTORY)
+            .union(OFlags::NOFOLLOW)
+            .union(OFlags::CLOEXEC);
+        const CREATE_FILE: OFlags = OFlags::WRONLY
+            .union(OFlags::CREATE)
+            .union(OFlags::EXCL)
+            .union(OFlags::NOFOLLOW)
+            .union(OFlags::CLOEXEC);
+
+        fn folder_name(level: usize) -> OsString {
+            let mut name = format!("{level:03}-");
+            while name.len() < NAME_LEN {
+                name.push('x');
+            }
+            OsString::from(name)
+        }
+
+        /// The size of the file written in the folder at `level`: distinct at every level.
+        fn file_size(level: usize) -> u64 {
+            u64::try_from(level * 7 + 1).expect("a small size fits a u64")
+        }
+
+        fn write_file(folder: &OwnedFd, name: impl rustix::path::Arg, size: u64) {
+            let handle =
+                openat(folder, name, CREATE_FILE, FILE_MODE).expect("the file should be created");
+            File::from(handle)
+                .write_all(&vec![
+                    b'x';
+                    usize::try_from(size).expect("a small size fits")
+                ])
+                .expect("the file should be written");
+        }
+
+        /// Removes everything below `folder` through its handle, so a tree of any depth goes.
+        fn remove_below(folder: &OwnedFd) {
+            let Ok(mut listing) = Dir::read_from(folder) else {
+                return;
+            };
+            let mut names = Vec::new();
+            while let Some(Ok(entry)) = listing.read() {
+                let name = entry.file_name().to_owned();
+                if name.as_bytes() != b"." && name.as_bytes() != b".." {
+                    names.push(name);
+                }
+            }
+            for name in names {
+                let is_folder = statat(folder, &name, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Directory);
+                if is_folder {
+                    if let Ok(child) = openat(folder, &name, OPEN_FOLDER, Mode::empty()) {
+                        remove_below(&child);
+                    }
+                    let _ = unlinkat(folder, &name, AtFlags::REMOVEDIR);
+                } else {
+                    let _ = unlinkat(folder, &name, AtFlags::empty());
+                }
+            }
+        }
+
+        pub(super) struct DeepTree {
+            /// The root as a scan sees it, resolved: no link above it can pass for a replaced
+            /// folder. (The temporary directory itself may sit behind one, as macOS's does.)
+            root: PathBuf,
+            names: Vec<OsString>,
+            _temporary: tempfile::TempDir,
+        }
+
+        impl DeepTree {
+            /// One chain of `LEVELS` folders, each holding a file of its own size, and a symbolic
+            /// link in the deepest, aimed back up the chain, that a scan must not follow.
+            pub(super) fn build() -> Self {
+                let temporary = tempfile::tempdir().expect("scan root should exist");
+                // Dropped on a panic part-way, the tree removes what was made so far.
+                let mut tree = Self {
+                    root: std::fs::canonicalize(temporary.path())
+                        .expect("the scan root should resolve"),
+                    names: Vec::new(),
+                    _temporary: temporary,
+                };
+                let mut folder = openat(CWD, &tree.root, OPEN_FOLDER, Mode::empty())
+                    .expect("the root should open");
+                for level in 1..=LEVELS {
+                    let name = folder_name(level);
+                    mkdirat(&folder, name.as_os_str(), FOLDER_MODE)
+                        .expect("the folder should be created");
+                    folder = openat(&folder, name.as_os_str(), OPEN_FOLDER, Mode::empty())
+                        .expect("the new folder should open");
+                    write_file(&folder, FILE_NAME, file_size(level));
+                    tree.names.push(name);
+                }
+                symlinkat(LINK_TARGET, &folder, LINK_NAME).expect("the link should be created");
+                tree
+            }
+
+            pub(super) fn root(&self) -> &Path {
+                &self.root
+            }
+
+            /// The folder at `level` of the chain (1 is its top), relative to the root.
+            fn relative_folder(&self, level: usize) -> PathBuf {
+                self.names.iter().take(level).collect()
+            }
+
+            /// Every folder of the chain, relative to the root.
+            pub(super) fn folders(&self) -> Vec<PathBuf> {
+                (1..=LEVELS)
+                    .map(|level| self.relative_folder(level))
+                    .collect()
+            }
+
+            /// Every file, relative to the root, with the size it was written with.
+            pub(super) fn files(&self) -> Vec<(PathBuf, u64)> {
+                (1..=LEVELS)
+                    .map(|level| {
+                        (
+                            self.relative_folder(level).join(FILE_NAME),
+                            file_size(level),
+                        )
+                    })
+                    .collect()
+            }
+
+            /// The symbolic link in the deepest folder, relative to the root.
+            pub(super) fn link(&self) -> PathBuf {
+                self.relative_folder(LEVELS).join(LINK_NAME)
+            }
+
+            /// The apparent size of everything in the tree: every file, and the link, whose size
+            /// is the length of its target.
+            pub(super) fn apparent_bytes(&self) -> u64 {
+                let link = u64::try_from(LINK_TARGET.len()).expect("a short target fits a u64");
+                self.files().iter().map(|(_, size)| size).sum::<u64>() + link
+            }
+
+            /// The full path of the deepest folder: longer than any system call accepts.
+            pub(super) fn deepest(&self) -> PathBuf {
+                self.root().join(self.relative_folder(LEVELS))
+            }
+
+            /// Opens the folder at `level` (0 is the root) through the handles of the folders
+            /// above it.
+            pub(super) fn open_folder(&self, level: usize) -> File {
+                let mut folder = openat(CWD, self.root(), OPEN_FOLDER, Mode::empty())
+                    .expect("the root should open");
+                for name in self.names.iter().take(level) {
+                    folder = openat(&folder, name.as_os_str(), OPEN_FOLDER, Mode::empty())
+                        .expect("a folder of the chain should open");
+                }
+                File::from(folder)
+            }
+
+            /// Removes the deepest folder, freeing its name for something else. Removed rather
+            /// than renamed aside: on GitHub's macOS runners, renaming a folder whose path is
+            /// longer than `PATH_MAX` fails with "No space left on device", while removing one
+            /// works. What takes the name is reported as a replacement for its kind (a link, or
+            /// not a folder), not for its identity, so the inode it gets does not matter.
+            fn displace_deepest(&self) -> OwnedFd {
+                self.remove_deepest();
+                OwnedFd::from(self.open_folder(LEVELS - 1))
+            }
+
+            /// Puts a symbolic link under the deepest folder's name, as a swap by an attacker would.
+            pub(super) fn replace_deepest_with_link(&self) {
+                let parent = self.displace_deepest();
+                symlinkat("..", &parent, self.names[LEVELS - 1].as_os_str())
+                    .expect("the replacement link should be created");
+            }
+
+            /// Puts a regular file under the deepest folder's name.
+            pub(super) fn replace_deepest_with_file(&self) {
+                let parent = self.displace_deepest();
+                write_file(&parent, self.names[LEVELS - 1].as_os_str(), 1);
+            }
+
+            /// Removes the deepest folder and everything in it.
+            pub(super) fn remove_deepest(&self) {
+                let parent = OwnedFd::from(self.open_folder(LEVELS - 1));
+                let name = self.names[LEVELS - 1].as_os_str();
+                if let Ok(folder) = openat(&parent, name, OPEN_FOLDER, Mode::empty()) {
+                    remove_below(&folder);
+                }
+                unlinkat(&parent, name, AtFlags::REMOVEDIR)
+                    .expect("the emptied deepest folder should go");
+            }
+        }
+
+        impl Drop for DeepTree {
+            fn drop(&mut self) {
+                if let Ok(root) = openat(CWD, &self.root, OPEN_FOLDER, Mode::empty()) {
+                    remove_below(&root);
+                }
+            }
+        }
+    }
+
+    /// One finished scan: what the workers reported, and the store their sealed runs published.
+    #[cfg(unix)]
+    struct ScannedTree {
+        store: crate::scan_store::session::ScanStore,
+        /// Every entry the batches listed, by full path: whether it is a folder, and its size.
+        listed: std::collections::BTreeMap<PathBuf, (bool, u64)>,
+        failed: Vec<(Option<PathBuf>, String)>,
+        unscanned: Vec<(PathBuf, UnscannedReason)>,
+    }
+
+    /// Admits the sealed runs of one worker event the way the owner does, then returns the batch's
+    /// credit: a scanner whose credits come back only after it finishes waits for each batch
+    /// past the sixteenth (`InflightBatchBudget`).
+    #[cfg(unix)]
+    fn admit(
+        store: &mut crate::scan_store::session::ScanStore,
+        lease: &WorkLease,
+        runs: Vec<SealedRun>,
+    ) {
+        if runs.is_empty() {
+            return;
+        }
+        for run in runs {
+            assert!(
+                store
+                    .accept_leased_input_run(lease, run)
+                    .expect("lease-validated run should be admitted")
+            );
+        }
+        store.release_inflight_batch_credit();
+    }
+
+    #[cfg(unix)]
+    fn scan_tree(root: &Path, threads: usize) -> ScannedTree {
+        use crossbeam_channel::unbounded;
+
+        let storage = TemporaryStorage::scan_store_with_limit_bytes(8 * 1024 * 1024);
+        let mut store =
+            crate::scan_store::session::ScanStore::new(ScanGeneration::initial(), storage.clone())
+                .expect("scan store should initialize");
+        let input_runs = store
+            .input_run_factory()
+            .expect("initial generation should accept input");
+        let (sender, events) = unbounded();
+        let cancelled = AtomicBool::new(false);
+        let options = ScannerOptions {
+            session: store.session(),
+            generation: input_runs.generation(),
+            coordinator: SessionCoordinator::start(store.session(), input_runs.generation())
+                .expect("scanner coordinator should start"),
+            root: root.to_path_buf(),
+            root_identity: None,
+            threads,
+            cross_filesystems: false,
+            exclusions: Vec::new(),
+            internal_paths: Vec::new(),
+            temporary_storage: storage,
+            input_runs: Some(input_runs),
+        };
+
+        let mut listed = std::collections::BTreeMap::new();
+        let mut failed = Vec::new();
+        let mut unscanned = Vec::new();
+        thread::scope(|scope| {
+            scope.spawn(|| run(options, &sender, &cancelled));
+            loop {
+                let event = events
+                    .recv_timeout(Duration::from_secs(120))
+                    .expect("the scanner should report until it finishes");
+                match event {
+                    WorkerEvent::ScanBatch {
+                        lease: Some(lease),
+                        entries,
+                        input_runs,
+                    } => {
+                        for entry in entries {
+                            listed.insert(
+                                entry.path,
+                                (entry.metadata.is_dir(), entry.metadata.len()),
+                            );
+                        }
+                        admit(&mut store, &lease, input_runs);
+                    }
+                    WorkerEvent::ScanUnscanned {
+                        lease: Some(lease),
+                        path,
+                        reason,
+                        input_runs,
+                    } => {
+                        admit(&mut store, &lease, input_runs);
+                        unscanned.push((path, reason));
+                    }
+                    WorkerEvent::ScanFailed { path, message } => failed.push((path, message)),
+                    WorkerEvent::ScanFinished { cancelled } => {
+                        assert!(!cancelled, "scanner should reach its normal terminal event");
+                        break;
+                    }
+                    WorkerEvent::ScanBatch { lease: None, .. }
+                    | WorkerEvent::ScanUnscanned { lease: None, .. } => {
+                        panic!("scanner emitted an unleased result")
+                    }
+                    WorkerEvent::DeletionPlanned { .. }
+                    | WorkerEvent::DeletionExecutionRejected { .. }
+                    | WorkerEvent::DeletionFinished { .. } => {}
+                }
+            }
+        });
+        store
+            .publish()
+            .expect("admitted scanner facts should publish");
+        ScannedTree {
+            store,
+            listed,
+            failed,
+            unscanned,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_measures_every_entry_of_a_tree_deeper_than_path_max() {
+        use crate::scan_store::page::{PageEntryKind, PageRequest};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let tree = deep_tree::DeepTree::build();
+        let root = tree.root().to_path_buf();
+        assert!(
+            tree.deepest().as_os_str().len() > 4096,
+            "the tree should pass PATH_MAX on every platform"
+        );
+        let scan = scan_tree(&root, 2);
+
+        assert!(
+            scan.failed.is_empty(),
+            "no folder of this readable tree may fail to read: {:?}",
+            scan.failed
+        );
+        assert_eq!(
+            scan.unscanned,
+            [(root.join(tree.link()), UnscannedReason::SymbolicLink)],
+            "only the link is left unscanned, and it is not followed"
+        );
+        let folders: BTreeSet<PathBuf> = tree
+            .folders()
+            .iter()
+            .map(|folder| root.join(folder))
+            .collect();
+        let files: BTreeMap<PathBuf, u64> = tree
+            .files()
+            .into_iter()
+            .map(|(file, size)| (root.join(file), size))
+            .collect();
+        let listed_folders: BTreeSet<PathBuf> = scan
+            .listed
+            .iter()
+            .filter(|(_, (is_folder, _))| *is_folder)
+            .map(|(path, _)| path.clone())
+            .collect();
+        let listed_files: BTreeMap<PathBuf, u64> = scan
+            .listed
+            .iter()
+            .filter(|(_, (is_folder, _))| !*is_folder)
+            .map(|(path, (_, size))| (path.clone(), *size))
+            .collect();
+        assert_eq!(
+            listed_folders, folders,
+            "every folder of the chain is listed"
+        );
+        assert_eq!(
+            listed_files, files,
+            "every file is listed with the size it was written with"
+        );
+
+        let published = scan.store.published().expect("the scan should publish");
+        let stored = |relative: &Path| {
+            published
+                .page_entry(&RelativePath::from_path(relative).expect("a relative path"))
+                .expect("the lookup should succeed")
+                .unwrap_or_else(|| panic!("{} is not in the store", relative.display()))
+        };
+        for (file, size) in tree.files() {
+            let entry = stored(&file);
+            assert_eq!(entry.kind, PageEntryKind::File);
+            assert_eq!(entry.metrics.apparent_bytes, u128::from(size));
+            assert_eq!(entry.coverage, Coverage::Complete);
+        }
+        for folder in tree.folders() {
+            let entry = stored(&folder);
+            assert_eq!(entry.kind, PageEntryKind::Directory);
+            assert_eq!(entry.coverage, Coverage::Complete);
+        }
+        let page = published
+            .page(PageRequest::first(RelativePath::root(), 8))
+            .expect("the root page should load");
+        assert_eq!(
+            page.root_metrics.apparent_bytes,
+            u128::from(tree.apparent_bytes()),
+            "the root's total is the sum of every entry's size"
+        );
+        assert_eq!(
+            page.root_coverage,
+            Coverage::Complete,
+            "nothing in the tree was unreadable"
+        );
+    }
+
+    /// The events one worker sends for one directory task run on its own.
+    #[cfg(unix)]
+    fn scan_one_directory(root: &Path, task: DirectoryTask) -> Vec<WorkerEvent> {
+        use crossbeam_channel::bounded;
+
+        let (queue, _) = TaskQueue::new(root.to_path_buf(), 1, &TemporaryStorage::default())
+            .expect("scanner task queue should be available");
+        let (sender, events) = bounded(64);
+        let cancelled = AtomicBool::new(false);
+        let root_invalid = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let root_directory = cap_fs::open_ambient_dir(root, ambient_authority())
+            .expect("scan root handle should open");
+        let exclusions = Exclusions::new(root, Vec::new(), Vec::new())
+            .expect("scanner exclusions should compile");
+        assert!(scan_directory_with_queue(
+            task,
+            &queue,
+            &sender,
+            &cancelled,
+            &failed,
+            &root_invalid,
+            &root_directory,
+            root,
+            None,
+            &exclusions,
+            None,
+            true,
+        ));
+        events.try_iter().collect()
+    }
+
+    #[cfg(unix)]
+    fn describe(event: &WorkerEvent) -> String {
+        match event {
+            WorkerEvent::ScanBatch { entries, .. } => {
+                format!("a batch of {} entries", entries.len())
+            }
+            WorkerEvent::ScanUnscanned { reason, .. } => format!("unscanned: {reason:?}"),
+            WorkerEvent::ScanFailed { message, .. } => format!("failed: {message}"),
+            WorkerEvent::ScanFinished { .. } => "finished".to_string(),
+            WorkerEvent::DeletionPlanned { .. }
+            | WorkerEvent::DeletionExecutionRejected { .. }
+            | WorkerEvent::DeletionFinished { .. } => "a deletion event".to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn deepest_identity(tree: &deep_tree::DeepTree) -> NativeIdentity {
+        let folder = tree.open_folder(deep_tree::LEVELS);
+        let metadata =
+            cap_fs::Metadata::from_file(&folder).expect("the deepest folder should be readable");
+        identity_from_entry_metadata(&metadata)
+            .expect("the identity should read")
+            .expect("the identity should be available")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_reports_a_folder_replaced_past_path_max_as_replaced() {
+        for replace in [
+            deep_tree::DeepTree::replace_deepest_with_link,
+            deep_tree::DeepTree::replace_deepest_with_file,
+        ] {
+            let tree = deep_tree::DeepTree::build();
+            let identity = deepest_identity(&tree);
+            replace(&tree);
+
+            let events = scan_one_directory(
+                tree.root(),
+                DirectoryTask {
+                    path: tree.deepest(),
+                    identity: Some(identity),
+                },
+            );
+
+            let [
+                WorkerEvent::ScanUnscanned {
+                    path,
+                    reason: UnscannedReason::Replacement(_),
+                    ..
+                },
+            ] = events.as_slice()
+            else {
+                panic!(
+                    "a folder replaced past PATH_MAX should be reported as replaced, got {:?}",
+                    events.iter().map(describe).collect::<Vec<_>>()
+                );
+            };
+            assert_eq!(*path, tree.deepest());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_reports_a_folder_that_cannot_be_opened_past_path_max() {
+        let tree = deep_tree::DeepTree::build();
+        let identity = deepest_identity(&tree);
+        tree.remove_deepest();
+
+        let events = scan_one_directory(
+            tree.root(),
+            DirectoryTask {
+                path: tree.deepest(),
+                identity: Some(identity),
+            },
+        );
+
+        let [WorkerEvent::ScanFailed { path, message }] = events.as_slice() else {
+            panic!(
+                "a folder that cannot be opened should be reported, got {:?}",
+                events.iter().map(describe).collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(path.as_deref(), Some(tree.deepest().as_path()));
+        assert!(
+            message.contains("No such file or directory"),
+            "the reason should name the failure: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_stat_reports_what_a_full_path_stat_does() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = tempfile::tempdir().expect("fixture root should exist");
+        let base = root.path();
+        fs::write(base.join("file"), vec![b'x'; 5000]).expect("file should be written");
+        fs::write(base.join("empty"), b"").expect("empty file should be written");
+        fs::create_dir(base.join("folder")).expect("folder should be created");
+        std::os::unix::fs::symlink("missing-target", base.join("link"))
+            .expect("dangling link should be created");
+        fs::hard_link(base.join("file"), base.join("hard")).expect("hard link should be created");
+
+        let directory = cap_fs::open_ambient_dir(base, ambient_authority())
+            .expect("fixture root handle should open");
+        let mut compared = 0;
+        for entry in cap_fs::read_base_dir(&directory).expect("fixture root should list") {
+            let entry = entry.expect("fixture entry should list");
+            let path = base.join(entry.file_name());
+            let full = fs::symlink_metadata(&path).expect("full-path stat should read");
+            let (relative, identity) = read_entry(&directory, &entry.file_name(), &path)
+                .expect("relative stat should read");
+
+            assert_eq!(
+                identity,
+                identity_for(&path, &full).expect("identity should read"),
+                "{path:?}: identity"
+            );
+            assert_eq!(relative.is_dir(), full.is_dir(), "{path:?}: is a folder");
+            assert_eq!(
+                relative.is_symlink(),
+                full.file_type().is_symlink(),
+                "{path:?}: is a link"
+            );
+            assert_eq!(relative.len(), full.len(), "{path:?}: size");
+            assert_eq!(relative.modified(), full.modified().ok(), "{path:?}: mtime");
+            assert_eq!(relative.device(), full.dev(), "{path:?}: device");
+            assert_eq!(
+                relative.physical_size(&path).ok(),
+                crate::os::physical_size(&path, &full).ok(),
+                "{path:?}: allocated bytes"
+            );
+            if relative.is_dir() {
+                let opened = open_scan_directory(&directory, base, &path)
+                    .expect("the listed folder should open");
+                let opened = cap_fs::Metadata::from_file(&opened)
+                    .expect("the opened folder should be readable");
+                assert_eq!(
+                    identity,
+                    identity_from_entry_metadata(&opened).expect("identity at open should read"),
+                    "{path:?}: the identity the listing records is the one the open reads"
+                );
+            }
+            compared += 1;
+        }
+        assert_eq!(compared, 5, "every fixture entry is compared");
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2376,12 +3070,11 @@ fn filesystem_key_with_metadata(_path: &Path, _metadata: &fs::Metadata) -> Files
 
 #[cfg(unix)]
 fn filesystem_boundary_reason(
-    path: &Path,
-    metadata: &fs::Metadata,
+    _path: &Path,
+    metadata: &EntryMetadata,
     root_filesystem: &FilesystemKey,
 ) -> Option<UnscannedReason> {
-    let current = filesystem_key_with_metadata(path, metadata);
-    if &current == root_filesystem {
+    if &FilesystemKey::Unix(metadata.device()) == root_filesystem {
         None
     } else {
         Some(UnscannedReason::FilesystemBoundary)
@@ -2391,10 +3084,10 @@ fn filesystem_boundary_reason(
 #[cfg(windows)]
 fn filesystem_boundary_reason(
     path: &Path,
-    metadata: &fs::Metadata,
+    metadata: &EntryMetadata,
     root_filesystem: &FilesystemKey,
 ) -> Option<UnscannedReason> {
-    match filesystem_key_with_metadata(path, metadata) {
+    match filesystem_key_with_metadata(path, metadata.as_std()) {
         Ok(current) if &current != root_filesystem => Some(UnscannedReason::FilesystemBoundary),
         Ok(_) => None,
         Err(error) => Some(UnscannedReason::Metadata(format!(
@@ -2406,10 +3099,10 @@ fn filesystem_boundary_reason(
 #[cfg(not(any(unix, windows)))]
 fn filesystem_boundary_reason(
     path: &Path,
-    metadata: &fs::Metadata,
+    metadata: &EntryMetadata,
     root_filesystem: &FilesystemKey,
 ) -> Option<UnscannedReason> {
-    let current = filesystem_key_with_metadata(path, metadata);
+    let current = filesystem_key_with_metadata(path, metadata.as_std());
     if &current == root_filesystem {
         None
     } else {

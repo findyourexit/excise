@@ -3,21 +3,7 @@ schema_version = 1
 # Fixtures that are expected to FAIL the headless oracle diff, strictly (see the harness README,
 # "Expected failures"). Each entry must fail with exactly the listed discrepancy kinds on the
 # listed platforms: a different failure is a new defect, and no failure means the defect is fixed
-# and the entry has to go.
-
-[[expect_fail]]
-fixture = "all-classes-small"
-platforms = ["macos", "linux"]
-findings = ["F11"]
-kinds = ["missing", "summary"]
-reason = "Its deep part: the scanner stats every entry by its full path, so nothing past PATH_MAX is scanned."
-
-[[expect_fail]]
-fixture = "deep-past-path-max"
-platforms = ["macos", "linux"]
-findings = ["F11"]
-kinds = ["missing", "state", "summary"]
-reason = "The scanner stats every entry by its full path (process_entry calls fs::symlink_metadata), so nothing past PATH_MAX is scanned: the report lists a fraction of the tree, calls it uncertain, and counts one unreadable folder, where the tree can be read to the bottom."
+# and the entry has to go. None is expected today.
 
 # Fixtures whose `headless_scan_ratio` is expected to miss the budget, strictly (see the harness
 # README, "Expected failures"). Gated only where the fixture's oracle entry count (fixed by its

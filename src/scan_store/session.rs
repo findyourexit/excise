@@ -69,8 +69,14 @@ const MAX_TRACKED_UNREADABLE_DIRECTORIES: usize = 4096;
 /// generation in progress: a sealed run holds no descriptor merely by existing in the
 /// scanner-to-owner channel or an unmerged level (`SealedRun::ensure_resident`, `run_file.rs`
 /// derives why), so neither a deep admission backlog nor a wide tree adds descriptors by
-/// itself. A later directory-relative walk (holding one descriptor per directory level
-/// while it walks) adds its own budget beside this one rather than replacing it.
+/// itself. The scanner's directory-relative walk (`runtime/scanner.rs`) adds descriptors of
+/// its own, beside this budget rather than inside it, and holds none per directory level: a
+/// worker reaches a folder by opening each name from the scan root's handle in turn and
+/// closing the handle above it as it goes, so a path at any depth takes at most two at once.
+/// The folder it then lists and measures takes two more, its own handle and the listing's,
+/// and an entry's metadata (`fstatat` against the listing's handle) opens none. Re-checking
+/// the folder's path during the listing repeats the first step on top of those two, so a
+/// worker's peak is four, whatever the depth, path length, or tree size.
 const RESIDENT_PUBLISHED_RUNS: usize = 4;
 
 /// Scanner batches sealed but not yet admitted, capped independently of the event channel's

@@ -977,7 +977,7 @@ marker.
 | `wide-1k` | 1,001 | Scale: one directory of 1,000 files. |
 | `node-modules-2k` | 2,389 | The F1/F2 repro shape: `node_modules/pkg{0..3}` nested 4 levels, 8 one-byte `m{0..7}.js` files per leaf (2,390 entries with the marker). |
 | `node-modules-50k` | 49,738 | The F1/F2 repro shape at larger scale: `node_modules/pkg{0..7}` nested 4 levels, 11 one-byte `m{0..10}.js` files per leaf (4,681 directories, 45,056 files, counting the root and the marker). |
-| `deep-past-path-max` | 122 | Scale: a 20-level chain of 240-byte names, past `PATH_MAX` on every platform. |
+| `deep-past-path-max` | 122 | Scale: a 60-level chain of 90-byte names with one file per level; the deepest path is 5,464 bytes, past `PATH_MAX` on every platform. |
 | `identity-small` | 34 | Hard links across directories, dangling and looping symlinks, a sparse file, and a clone. |
 | `hostile-small` | 80 | Hostile names and unreadable entries. |
 | `all-classes-small` | 253 | Every class once, in one fixture. |

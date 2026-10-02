@@ -2316,7 +2316,7 @@ mod tests {
                 lease: None,
                 entries: (0..=MAX_SCAN_ENTRIES_PER_SLICE)
                     .map(|index| ScannedEntry {
-                        metadata: first_metadata.clone(),
+                        metadata: scanner::EntryMetadata::from_std(&first_metadata),
                         path: root.path().join(format!("entry-{index}")),
                         identity: first_identity.clone(),
                     })
@@ -2400,7 +2400,7 @@ mod tests {
         clock.advance(due_frame);
         let scan_view_root = app.current_folder_path();
         let pending_scan_entries = VecDeque::from([ScannedEntry {
-            metadata: entry_metadata,
+            metadata: scanner::EntryMetadata::from_std(&entry_metadata),
             path: entry.clone(),
             identity: entry_identity,
         }]);

@@ -33,7 +33,7 @@ The main loop polls terminal input with a short maximum wait. It renders each fo
 
 ### Scanner and Session Coordinator
 
-The scanner walks directories without recursion and uses a fixed worker count. One session coordinator owns work keys, task ownership records, focus, scan versions, and final status for scanning, reduction, refresh, and deletion. Workers cannot change queue or task-ownership state.
+The scanner walks directories without recursion and uses a fixed worker count. On Unix a worker reaches each folder by opening it name by name from the scan root's handle, without following a link, and reads every entry's metadata through the handle of the folder that lists it. How deep a folder sits and how long its full path is therefore do not limit a scan, and a worker holds the same few descriptors at any depth. Depth still costs time, because every folder is reached from the scan root again: a very deep tree scans much more slowly than a flat tree of the same size. Windows still reads each entry by its path, so its own path length limit applies there. One session coordinator owns work keys, task ownership records, focus, scan versions, and final status for scanning, reduction, refresh, and deletion. Workers cannot change queue or task-ownership state.
 
 === "Initial scan and refresh"
 
