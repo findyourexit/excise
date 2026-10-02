@@ -71,9 +71,11 @@ pub const FULL_MAX_ENTRIES: u64 = 250_000;
 /// The scan-time multiple of `du -sk` a headless scan is budgeted to. Gated per platform and
 /// fixture through `expectations/headless.toml` (see [`Expectations::expected_ratio_failure`])
 /// on a fixture whose ratio is gated; see [`MIN_GATED_ENTRIES`]. Revisited only at a maintainer
-/// recalibration: the ratio stays well over this budget on every gated fixture even with the
-/// per-run durable writes gone, because the dominant cost is now building and serializing the
-/// report after the scan publishes, not the scan itself.
+/// recalibration: every gated fixture still runs well over this budget even with the per-run
+/// durable writes gone and the report writer buffered (one flushed `BufWriter`, not one `write`
+/// syscall per pretty-printed token), because the remaining cost is CPU, not I/O: publishing the
+/// scan-store's queryable page index, then building and serializing the report from it, both
+/// dominate `du`'s near-instant stat-only walk.
 pub const RATIO_BUDGET: f64 = 3.0;
 
 /// The smallest oracle entry count, fixed by a fixture's spec and seed, gated against
