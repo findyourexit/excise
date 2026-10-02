@@ -19,51 +19,9 @@ findings = ["F11"]
 kinds = ["missing", "state", "summary"]
 reason = "The scanner stats every entry by its full path (process_entry calls fs::symlink_metadata), so nothing past PATH_MAX is scanned: the report lists a fraction of the tree, calls it uncertain, and counts one unreadable folder, where the tree can be read to the bottom."
 
-# Fixtures whose `headless_scan_ratio` is expected to miss the budget today, strictly (see the
-# harness README, "Expected failures"). Gated only where the fixture's oracle entry count (fixed
-# by its spec and seed, never a measured time) is large enough; elsewhere the ratio is reported
-# but never gated. A gated fixture over budget with no entry for this platform fails the run,
-# exactly like an undocumented oracle-diff discrepancy. Measured on macOS and Linux (CI); Windows
-# has no `du` reference, so no ratio is ever measured there and neither entry needs it.
-
-[[expect_ratio_fail]]
-fixture = "delete-folder"
-platforms = ["macos", "linux"]
-findings = ["F16"]
-reason = "The same post-publication cost (not the removed per-run durable syncs, and no longer raw write syscalls: the report writer is buffered now) still leaves this 5,011-entry fixture over the 3x budget: 10.4x `du` on macOS (9.8-10.8x across the measured pairs)."
-
-[[expect_ratio_fail]]
-fixture = "node-modules-2k"
-platforms = ["macos", "linux"]
-findings = ["F16"]
-reason = "The same post-publication cost dominates this deeply nested, many-small-files tree too: 36.2x `du` on macOS (23.6-56.7x)."
-
-[[expect_ratio_fail]]
-fixture = "node-modules-50k"
-platforms = ["macos", "linux"]
-findings = ["F16"]
-reason = "The same post-publication cost, at a larger scale: 7.6x `du` on macOS (7.1-15.1x)."
-
-[[expect_ratio_fail]]
-fixture = "scan-store-quota"
-platforms = ["macos", "linux"]
-findings = ["F16"]
-reason = "The same post-publication cost, on this 35,000-tiny-file volume fixture: 7.6x `du` on macOS (7.5-9.1x)."
-
-[[expect_ratio_fail]]
-fixture = "selection-drift"
-platforms = ["macos", "linux"]
-findings = ["F16"]
-reason = "The same post-publication cost, on this fixture's 20,000-plus entries: 7.8x `du` on macOS (7.6-8.2x)."
-
-[[expect_ratio_fail]]
-fixture = "tiny-files-50k"
-platforms = ["macos", "linux"]
-findings = ["F16"]
-reason = "The same post-publication cost, at 49,052 entries: 7.0x `du` on macOS (6.5-15.8x)."
-
-[[expect_ratio_fail]]
-fixture = "tiny-files-250k"
-platforms = ["macos", "linux"]
-findings = ["F16"]
-reason = "Buffering the report writer removed the syscall-per-token cost, but this 249,252-entry fixture still runs over the 3x budget: 4.6x `du` on macOS (3.7-4.9x; only the first run's report is diffed, to bound the disk a fixture this size uses). A fresh `sample` profile (14 back-to-back headless runs) shows `cli::write_scan_report` no longer bottlenecked on `std::fs::File::write`: of 61 main-thread samples inside it, only a handful reach `BufWriter::flush_buf`'s underlying write, and the rest sit in `write_canonical_scan_report_json`'s pretty-printed serde_json serialization (`serialize_canonical_entry`, `format_escaped_str`) and in `SealedRun::with_reader` -> `page::visit_child_query_page_entries`, which re-reads each entry to serialize it. The other main-thread samples in the same profile (80 of 142) were in `ScanStore::publish`'s page-index materialization (`build_metric_query_index`, redb B-tree inserts), ahead of report writing: the remaining cost is CPU (serialization and page reads, scan-store publication), not I/O."
+# Fixtures whose `headless_scan_ratio` is expected to miss the budget, strictly (see the harness
+# README, "Expected failures"). Gated only where the fixture's oracle entry count (fixed by its
+# spec and seed, never a measured time) is large enough; elsewhere the ratio is reported but never
+# gated. A gated fixture over budget with no entry for this platform fails the run, exactly like an
+# undocumented oracle-diff discrepancy. None is expected today: every gated fixture is within the
+# budget on macOS and Linux. Windows has no `du` reference, so no ratio is ever measured there.

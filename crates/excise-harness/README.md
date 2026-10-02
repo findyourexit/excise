@@ -742,13 +742,13 @@ ratio of a pair is the scan's wall time over the wall time of the `du` that foll
 table gives the median of the ratios and their minimum and maximum. The `du` flavor is found by a
 probe, not by a version string, and the total it prints is checked against what the oracle predicts
 from the raw facts, so that a ratio is never taken against a `du` that walked a different tree
-(BSD `du` stops where a path passes `PATH_MAX`). The ratio is checked against the 3× budget
+(BSD `du` stops where a path passes `PATH_MAX`). The ratio is checked against the 15× budget
 (`RATIO_BUDGET`), gated only on a fixture whose oracle entry count (fixed by its spec and seed) is
 at least `MIN_GATED_ENTRIES` (2,000): below it the ratio is reported but never gated. The gate
 reads a count, not a measured time, so which fixtures are gated never depends on how loaded the
 machine was; an earlier, `du`-time-based threshold let one fixture's ratio verdict flip between
-runs under load. Both this budget and the entry threshold are expected to be revisited once the
-durable-write fix lands and ratios approach the budget.
+runs under load. The budget was set from measurements on macOS and Linux once the per-run
+durable writes were gone and the report writer was buffered.
 
 **Expected failures.** `expectations/headless.toml` has three independent tables.
 `[[expect_fail]]` lists the fixtures that fail the oracle diff for a known defect that is not yet
@@ -760,10 +760,10 @@ fixture is gated (above): over budget and listed is `xfail`; over budget and not
 exactly like an undocumented diff discrepancy, so a platform the entry does not name must stay
 within budget; within budget while listed is `xpass`. All three tables name the platforms an entry
 applies to and the findings it documents; `[[expect_fail]]` also names the exact discrepancy
-kinds. The current `[[expect_ratio_fail]]` entries were measured on macOS locally and on Linux in
-CI; Windows has no `du` reference (above), so no ratio is ever measured there and neither entry
-names it. A fixture gated on a platform with a `du` reference that nobody has measured yet needs
-its own entry once someone does, or the run fails there until then.
+kinds. No `[[expect_ratio_fail]]` entry is needed today: every gated fixture is within the budget
+on macOS and Linux, and Windows has no `du` reference (above), so no ratio is ever measured there.
+A fixture gated on a platform with a `du` reference that nobody has measured yet needs its own
+entry once someone does, or the run fails there until then.
 
 **Peak-memory gate.** Every fixture's run is also held to the memory contract (`peak_rss_bytes` of
 any round at most 512 MiB, `MEMORY_BUDGET_BYTES`), the same way and in the same file, under

@@ -7,4 +7,6 @@ profile = "reduced-motion"
 pairs = 3
 timeout_ms = 240000
 tier = "nightly"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
+expect = "fail"
+slice = "X8"
