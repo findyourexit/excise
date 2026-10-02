@@ -65,6 +65,12 @@ pub(crate) fn is_user_admin() -> bool {
     is_elevated::is_elevated()
 }
 
+/// Windows has no `RLIMIT_NOFILE` (no POSIX-style per-process open-file soft/hard limit to
+/// raise); the process's open-file ceiling instead comes from the system handle table, which
+/// Windows manages itself. Nothing to raise here: the scan store's own descriptor bound
+/// (`scan_store/session.rs`) is what keeps a large scan within reach on every OS.
+pub(crate) fn raise_soft_descriptor_limit() {}
+
 /// Creates a randomly named, current-user-only temporary file in a caller-verified
 /// directory. The exclusive handle denies every sharing mode, so another process
 /// running as the same user cannot reopen or replace its record stream. Windows

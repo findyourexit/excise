@@ -45,7 +45,7 @@ The scanner walks directories without recursion and uses a fixed worker count. O
 
 ### ScanStore
 
-`ScanStore` is private session storage for scan data. Workers turn each fixed-size batch into sorted path and identity runs. The coordinator accepts a run only while the directory task that produced it remains valid, combines a fixed number of inputs at a time, and creates a compact block-indexed `ChildQuery` for navigation. Raw runs are released as publication proceeds, so a completed scan retains only the compact query. Each run's blocks carry SHA-256 checksums that every read verifies. The store belongs to one session and is never reopened, so no write waits on a durable sync.
+`ScanStore` is private session storage for scan data. Workers turn each fixed-size batch into sorted path and identity runs. The coordinator accepts a run only while the directory task that produced it remains valid, combines a fixed number of inputs at a time, and creates a compact block-indexed `ChildQuery` for navigation. Raw runs are released as publication proceeds, so a completed scan retains only the compact query. Each run's blocks carry SHA-256 checksums that every read verifies. The store belongs to one session and is never reopened, so no write waits on a durable sync. A sealed run holds no file descriptor until it is read, so neither a full admission channel nor a wide tree grows the store's descriptor use, and a published scan keeps a fixed number of runs open whatever its size. On Unix, startup also raises the process's soft file-descriptor limit toward its hard limit, never lowering an inherited one.
 
 ???+ info "Concrete pages, bounded retention"
 
@@ -88,7 +88,7 @@ Opening an entry grows its contents from the selected rectangle. Moving back con
 | Constraint | Consequence |
 |---|---|
 | One writer | The owner loop is the only thread that decides application or terminal state and content; nothing else changes either. A dedicated writer thread (see background-tasks.md's "Terminal Output Writer") only transmits the bytes it is handed, in the order it is handed them, and never decides what they are. |
-| Fixed owners | No queue or model owner grows without a limit. |
+| Fixed owners | No queue or model owner grows without a limit, including the scan store's open descriptors: a sealed run holds none until it is read, and a published generation retains a fixed count. |
 | No shell mutation | No shell command performs scanning or deletion. |
 | No network path | No network client or telemetry runs as part of the program. |
 | Reviewed unsafe boundary | Unsafe code is confined to the Windows system interface; domain, model, runtime, and interface code remain safe Rust. |

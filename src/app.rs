@@ -1317,9 +1317,12 @@ where
     /// Admits worker-sealed runs only after the scanner coordinator validated
     /// the corresponding work lease.
     pub(crate) fn admit_scan_input_runs(&mut self, lease: &WorkLease, runs: Vec<SealedRun>) {
-        if runs.is_empty() || !self.scan_store_available {
+        if runs.is_empty() {
             return;
         }
+        // Releases this batch's credit (`ScanInputRunFactory::seal_observation_batch`) now
+        // that it has reached admission, regardless of what admission does with it below.
+        self.scan_store.release_inflight_batch_credit();
         if !self.scan_store_available {
             return;
         }

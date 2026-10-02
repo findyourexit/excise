@@ -1,11 +1,9 @@
 schema_version = 1
 name = "resource-budget-large-fds"
-description = "Open descriptors must not grow with the size of the scanned tree (F13). On this 49k-entry tree, in 49 folders, they are far above the baseline measured on a flat 1k-entry tree, and under a 256-descriptor limit the scan fails with \"Too many open files\". Strict expected failure until descriptor use is bounded."
+description = "Open descriptors do not grow with the size of the scanned tree. On this 49k-entry tree, in 49 folders, they stay within the baseline measured on a flat 1k-entry tree."
 fixture = "tiny-files-50k"
 profiles = ["deterministic"]
 tier = "full"
-expect = "fail"
-slice = "X9"
 platforms = ["linux", "macos"]
 
 [terminal]

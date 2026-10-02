@@ -25,6 +25,7 @@ use crate::theme::ThemeId;
 use crossbeam_channel::Receiver;
 
 pub(crate) fn run_main() -> i32 {
+    crate::os::raise_soft_descriptor_limit();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)

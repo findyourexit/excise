@@ -253,15 +253,26 @@ impl RunWriter {
     }
 
     /// Seals and flushes the run. Only a sealed run can be read.
+    ///
+    /// A run with a private-session path does not keep this write handle open: a sealed run
+    /// holding a file only because it was just written would hold one descriptor for as long
+    /// as it waits to be read (admitted, merged, or published), and that wait scales with how
+    /// far a scanner races ahead of admission, not with anything bounded.
+    /// `SealedRun::with_reader`/`into_reader`/`range_reader` reopen such a run from its path
+    /// on demand instead. An anonymous run (no path: tests, fuzzing) has nothing to reopen
+    /// from, so it keeps the handle this call already holds.
     pub(crate) fn seal(mut self) -> Result<SealedRun, RunError> {
         self.flush_block()?;
         let footer = encode_footer(self.total_records, self.total_blocks);
         self.write_reserved(&footer)?;
         self.writer.flush()?;
-        let file = self.writer.get_ref().try_clone()?;
         let path = self.path.take();
+        let file = match path {
+            Some(_) => None,
+            None => Some(self.writer.get_ref().try_clone()?),
+        };
         Ok(SealedRun {
-            file: Some(file),
+            file,
             path,
             reservation: self.reservation.take(),
             descriptor: self.descriptor,
@@ -322,7 +333,13 @@ impl RunWriter {
     }
 }
 
-/// A sealed run owns both its file and storage charge until it is dropped.
+/// A sealed run owns its storage charge until it is dropped, and its file for as long as
+/// something has read it. `RunWriter::seal` leaves a path-backed run's file closed until
+/// then (`with_reader`/`into_reader`/`range_reader` reopen it from the path on demand, and
+/// `ensure_resident` warms it eagerly), so a run that is merely sealed and waiting -- in the
+/// scanner-to-owner channel, or in the store's bounded merge pyramid -- holds no descriptor.
+/// An anonymous run (no path: tests, fuzzing) keeps the handle it was sealed with,
+/// since it has nothing to reopen from.
 #[derive(Debug)]
 pub(crate) struct SealedRun {
     file: Option<File>,
@@ -353,15 +370,42 @@ impl SealedRun {
         self.bytes
     }
 
+    /// Reopens a closed, path-backed run once so that later point and range reads (a
+    /// published generation's hot path for interactive page requests) reuse this handle
+    /// instead of paying one `open` per read. Leaves an already-open or anonymous run
+    /// unchanged.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the sealed file cannot be rewound and validated.
+    /// Returns an error when a path-backed run's file cannot be reopened.
+    pub(crate) fn ensure_resident(&mut self) -> Result<(), RunError> {
+        if self.file.is_some() {
+            return Ok(());
+        }
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        self.file = Some(File::open(path)?);
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when a closed run cannot be reopened from its path, or the sealed
+    /// file cannot be rewound and validated.
     pub(crate) fn into_reader(mut self) -> Result<RunReader, RunError> {
-        let mut file = self.file.take().expect("sealed run must own a file");
         let reservation = self
             .reservation
             .take()
             .expect("sealed run must own its reservation");
+        let mut file = match self.file.take() {
+            Some(file) => file,
+            None => File::open(
+                self.path
+                    .as_ref()
+                    .expect("a sealed run must retain its file or its path"),
+            )?,
+        };
         file.seek(SeekFrom::Start(0))?;
         let path = self.path.take();
         RunReader::open(
@@ -380,7 +424,9 @@ impl SealedRun {
     }
 
     /// Borrows this sealed run for one sequential pass, restoring ownership
-    /// before returning even when `visit` fails.
+    /// before returning even when `visit` fails. A run with a closed file (one that has not
+    /// been read since it was sealed with a path to reopen from) is reopened here and then
+    /// stays open, the same way a freshly read run always has.
     ///
     /// # Errors
     ///
@@ -392,8 +438,21 @@ impl SealedRun {
     where
         E: From<RunError>,
     {
-        let mut file = self.file.take().expect("sealed run must own a file");
         let path = self.path.take();
+        let mut file = if let Some(file) = self.file.take() {
+            file
+        } else {
+            let reopen = path
+                .as_ref()
+                .expect("a sealed run must retain its file or its path");
+            match File::open(reopen) {
+                Ok(file) => file,
+                Err(error) => {
+                    self.path = path;
+                    return Err(E::from(RunError::Io(error)));
+                }
+            }
+        };
         let reservation = self
             .reservation
             .take()
@@ -437,8 +496,8 @@ impl SealedRun {
     ///
     /// # Errors
     ///
-    /// Returns an error when this is not an indexed child-query run or its
-    /// backing file cannot be cloned and positioned.
+    /// Returns an error when this is not an indexed child-query run or its backing file
+    /// cannot be reopened, cloned, or positioned.
     pub(crate) fn range_reader(&self, lower_bound: &[u8]) -> Result<RunRangeReader, RunError> {
         if !matches!(
             self.descriptor.kind(),
@@ -458,11 +517,14 @@ impl SealedRun {
             .checked_sub(1)
             .and_then(|position| index.blocks.get(position));
         let offset = block.map_or(fallback, |block| block.offset);
-        let mut file = self
-            .file
-            .as_ref()
-            .expect("sealed run must retain its file")
-            .try_clone()?;
+        let mut file = match self.file.as_ref() {
+            Some(file) => file.try_clone()?,
+            None => File::open(
+                self.path
+                    .as_ref()
+                    .expect("a sealed run must retain its file or its path"),
+            )?,
+        };
         file.seek(SeekFrom::Start(offset))?;
         Ok(RunRangeReader::new(file, index.block_capacity))
     }
@@ -926,6 +988,73 @@ mod tests {
             RunDescriptor::new(ScanGeneration::from_value(7), 42, RunKind::PathObservation),
             block_capacity,
         )
+    }
+
+    fn writer_with_path(
+        storage: &TemporaryStorage,
+        path: PathBuf,
+        block_capacity: usize,
+    ) -> RunWriter {
+        let file = File::create(&path).expect("named run file should open");
+        RunWriter::new_with_path(
+            file,
+            Some(path),
+            storage
+                .reservation(0)
+                .expect("empty reservation should fit"),
+            RunDescriptor::new(ScanGeneration::from_value(9), 1, RunKind::PathObservation),
+            block_capacity,
+        )
+        .expect("named run writer should initialize")
+    }
+
+    #[test]
+    fn sealing_a_path_backed_run_closes_its_file_until_something_reads_it() {
+        let storage = TemporaryStorage::with_limit_bytes(16 * 1024);
+        let dir = tempfile::tempdir().expect("scratch directory should create");
+        let mut writer = writer_with_path(&storage, dir.path().join("probe.run"), 128);
+        writer
+            .append(b"alpha", b"one")
+            .expect("record should append");
+        let mut sealed = writer.seal().expect("run should seal");
+        assert!(
+            sealed.file.is_none(),
+            "a path-backed run must not hold an open file once sealed"
+        );
+
+        let mut records = Vec::new();
+        sealed
+            .with_reader(|reader| {
+                reader.visit_records(|key, value| {
+                    records.push((key.to_vec(), value.to_vec()));
+                    Ok::<(), RunError>(())
+                })
+            })
+            .expect("a closed run should reopen from its path and read back");
+        assert_eq!(records, vec![(b"alpha".to_vec(), b"one".to_vec())]);
+        assert!(
+            sealed.file.is_some(),
+            "a run read once should stay open for the next read"
+        );
+    }
+
+    #[test]
+    fn ensure_resident_warms_a_path_backed_run_without_reading_it() {
+        let storage = TemporaryStorage::with_limit_bytes(16 * 1024);
+        let dir = tempfile::tempdir().expect("scratch directory should create");
+        let mut writer = writer_with_path(&storage, dir.path().join("probe.run"), 128);
+        writer
+            .append(b"alpha", b"one")
+            .expect("record should append");
+        let mut sealed = writer.seal().expect("run should seal");
+        assert!(sealed.file.is_none());
+        sealed
+            .ensure_resident()
+            .expect("a path-backed run should reopen");
+        assert!(sealed.file.is_some());
+        sealed
+            .ensure_resident()
+            .expect("warming an already-open run should stay a no-op");
     }
 
     #[test]
