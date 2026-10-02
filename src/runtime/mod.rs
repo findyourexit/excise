@@ -6,6 +6,7 @@ mod worker;
 
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 #[cfg(feature = "internal")]
@@ -35,7 +36,9 @@ use crate::native_path::{
     DECEPTIVE_DISPLAY_MARKER, NativeIdentity, safe_display_path_text, safe_display_text,
 };
 use crate::outcome::{OperationOutcome, RunSummary};
-use crate::report::{ScanReport, ScanReportState, canonical_scan_report_state};
+use crate::report::{
+    ReportError, ScanReport, ScanReportState, canonical_scan_report_state, write_buffered,
+};
 use crate::scan_coordinator::{
     RelativePath, ScanGeneration, SchedulerSnapshot, SessionCoordinator, WorkCompletion, WorkKind,
     WorkLease, WorkPriority,
@@ -481,14 +484,14 @@ where
             }
             InputCommand::ExportScan => {
                 let result = next_export_path("scan-report").and_then(|path| {
-                    let mut file = OpenOptions::new()
+                    let file = OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .open(&path)
                         .map_err(|error| error.to_string())?;
-                    self.app
-                        .write_scan_report(&self.summary, &mut file)
-                        .map_err(|error| error.to_string())?;
+                    export_report(file, |writer| {
+                        self.app.write_scan_report(&self.summary, writer)
+                    })?;
                     Ok(path)
                 });
                 match result {
@@ -500,14 +503,12 @@ where
             }
             InputCommand::ExportDeletionHistory => {
                 let result = next_export_path("deletion-history").and_then(|path| {
-                    let mut file = OpenOptions::new()
+                    let file = OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .open(&path)
                         .map_err(|error| error.to_string())?;
-                    self.app
-                        .write_deletion_history(&mut file)
-                        .map_err(|error| error.to_string())?;
+                    export_report(file, |writer| self.app.write_deletion_history(writer))?;
                     Ok(path)
                 });
                 match result {
@@ -1874,6 +1875,18 @@ fn next_export_path(kind: &str) -> Result<PathBuf, String> {
     Err(format!("no free export filename for {kind}"))
 }
 
+/// Buffers `writer`, writes an export through `write`, and flushes explicitly, turning any
+/// failure (including a flush failure on the writer's final buffered bytes) into the plain
+/// message both export notices report. Shared by both TUI exports: a `BufWriter` dropped
+/// without an explicit flush discards that failure, so a full disk would silently truncate an
+/// export with no failure notice at all.
+fn export_report<W: Write>(
+    writer: W,
+    write: impl FnOnce(&mut BufWriter<W>) -> Result<(), ReportError>,
+) -> Result<(), String> {
+    write_buffered(writer, write).map_err(|error| error.to_string())
+}
+
 #[must_use]
 pub const fn outcome_exit_class(outcome: &OperationOutcome<RunSummary>) -> ExitClass {
     outcome.exit_class()
@@ -1883,6 +1896,7 @@ pub const fn outcome_exit_class(outcome: &OperationOutcome<RunSummary>) -> ExitC
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use std::io;
 
     struct PendingInput;
 
@@ -2992,6 +3006,27 @@ mod tests {
         let rendered = export_notice("Deletion history exported to", &path);
         assert!(rendered.contains("[deceptive]"));
         assert!(rendered.contains("report-\\xff.json"));
+    }
+
+    struct FlushFailsWriter;
+
+    impl Write for FlushFailsWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("disk full"))
+        }
+    }
+
+    #[test]
+    fn export_report_surfaces_a_flush_failure_instead_of_truncating_silently() {
+        let error = export_report(FlushFailsWriter, |writer| {
+            writer.write_all(b"{}").map_err(ReportError::from)
+        })
+        .expect_err("a flush failure must surface as an export failure, not vanish");
+        assert!(error.contains("disk full"));
     }
 
     #[test]

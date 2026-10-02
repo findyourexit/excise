@@ -14,7 +14,7 @@ use crate::input::TerminalEvents;
 #[cfg(debug_assertions)]
 use crate::native_path::safe_display_os_str_text;
 use crate::native_path::{ResolvedRoot, safe_display_text};
-use crate::report::{ReportError, ScanReport};
+use crate::report::{ReportError, ScanReport, write_buffered};
 use crate::runtime::{RuntimeSettings, SystemClock, run_with_frame_gate, scan_headless};
 use crate::terminal::{SplitColorWriter, TerminalSession, spawn_frame_writer, validate_terminal};
 use crate::test_events;
@@ -164,31 +164,27 @@ fn write_scan_report(
     output: Option<&Path>,
 ) -> Result<(), AppError> {
     if let Some(path) = output {
-        let mut file = File::create(path)
+        let file = File::create(path)
             .map_err(|error| AppError::io("could not create report output", error))?;
-        write_scan_report_to(report, format, &mut file)
+        write_scan_report_to(report, format, file)
     } else {
-        let stdout = io::stdout();
-        let mut output = stdout.lock();
-        write_scan_report_to(report, format, &mut output)
+        write_scan_report_to(report, format, io::stdout().lock())
     }
 }
 
 fn write_scan_report_to(
     report: &ScanReport,
     format: OutputFormat,
-    writer: &mut impl Write,
+    writer: impl Write,
 ) -> Result<(), AppError> {
-    let result = match format {
+    write_buffered(writer, |writer| match format {
         OutputFormat::Json => report.write_json(writer),
         OutputFormat::Table => report.write_table(writer),
-        OutputFormat::Tui => {
-            return Err(AppError::Invariant(
-                "TUI format reached headless report writer".to_string(),
-            ));
-        }
-    };
-    result.map_err(|error| match error {
+        OutputFormat::Tui => Err(ReportError::Invariant(
+            "TUI format reached headless report writer".to_string(),
+        )),
+    })
+    .map_err(|error| match error {
         ReportError::Io(error) => AppError::io("could not write report", error),
         ReportError::Serialization(error) => {
             AppError::Invariant(format!("could not serialize report: {error}"))
@@ -224,6 +220,8 @@ fn safe_error_text(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outcome::RunSummary;
+    use std::path::PathBuf;
 
     #[test]
     fn report_error_text_escapes_controls_and_preserves_marker() {
@@ -256,5 +254,26 @@ mod tests {
         assert_eq!(rendered.matches("\\u{202e}").count(), 1);
         assert!(!rendered.chars().any(char::is_control));
         assert!(!rendered.contains('\u{202e}'));
+    }
+
+    struct FlushFailsWriter;
+
+    impl Write for FlushFailsWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("disk full"))
+        }
+    }
+
+    #[test]
+    fn write_scan_report_to_surfaces_a_flush_failure() {
+        let report = ScanReport::cancelled(PathBuf::from("/scan"), None, RunSummary::default());
+        let error = write_scan_report_to(&report, OutputFormat::Json, FlushFailsWriter)
+            .expect_err("a flush failure must surface, not be silently discarded");
+        assert!(matches!(error, AppError::Io { .. }));
+        assert_eq!(error.exit_class(), ExitClass::Io);
     }
 }

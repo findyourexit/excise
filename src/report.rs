@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -255,6 +255,23 @@ pub(crate) fn canonical_scan_report_state(
     } else {
         ScanReportState::Exact
     }
+}
+
+/// Buffers `writer`, runs `body`, and flushes explicitly before returning.
+///
+/// A `BufWriter` dropped without an explicit `flush` call discards the final write's error, so
+/// without this a late I/O failure (a full disk, most plausibly) would truncate a report
+/// silently instead of surfacing as a failure. Every report writer (the headless file and
+/// stdout paths, and both TUI exports) goes through this: buffering only changes how many
+/// `write` syscalls produce the bytes, never the bytes themselves.
+pub(crate) fn write_buffered<W: Write>(
+    writer: W,
+    body: impl FnOnce(&mut BufWriter<W>) -> Result<(), ReportError>,
+) -> Result<(), ReportError> {
+    let mut buffered = BufWriter::new(writer);
+    body(&mut buffered)?;
+    buffered.flush()?;
+    Ok(())
 }
 
 pub(crate) fn write_canonical_scan_report_json(
@@ -1283,5 +1300,27 @@ mod tests {
             assert!(!detail.chars().any(char::is_control));
             assert!(!detail.contains('\u{202e}'));
         }
+    }
+
+    struct FlushFailsWriter;
+
+    impl Write for FlushFailsWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("disk full"))
+        }
+    }
+
+    #[test]
+    fn write_buffered_surfaces_a_flush_failure_instead_of_discarding_it() {
+        let error = write_buffered(FlushFailsWriter, |writer| {
+            writer.write_all(b"payload").map_err(ReportError::from)
+        })
+        .expect_err("a flush failure must surface, not be silently discarded");
+        assert!(matches!(error, ReportError::Io(_)));
+        assert_eq!(error.to_string(), "report output failed: disk full");
     }
 }
