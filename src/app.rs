@@ -1254,6 +1254,23 @@ where
         }
     }
 
+    /// Records a directory the scanner discovered (and sealed as `Complete`
+    /// through its parent's listing) but later failed to open or list. Its
+    /// own path, and every ancestor up to the scan root, is reported
+    /// `Uncertain` with an open upper bound once the generation publishes.
+    pub(crate) fn record_unreadable_directory(&mut self, path: &Path) {
+        if !self.scan_store_available {
+            return;
+        }
+        let Ok(relative) = path.strip_prefix(&self.scan_root) else {
+            return;
+        };
+        let Ok(relative) = RelativePath::from_path(relative) else {
+            return;
+        };
+        self.scan_store.record_unreadable_directory(relative);
+    }
+
     pub(crate) fn cancel_primary_scan(&mut self) -> Result<(), AppError> {
         self.scan_store
             .cancel_active()
@@ -2861,6 +2878,56 @@ mod tests {
                 .map(|file| file.name)
                 .collect::<Vec<_>>(),
             vec![std::ffi::OsString::from("visible")]
+        );
+    }
+
+    #[test]
+    fn unreadable_directory_marks_itself_and_every_ancestor_uncertain() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let parent = root.path().join("parent");
+        std::fs::create_dir(&parent).expect("parent dir should exist");
+        let locked = parent.join("locked");
+        std::fs::create_dir(&locked).expect("locked dir should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            crate::model::MIN_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &parent);
+        add_fixture_entry(&mut app, &locked);
+        app.record_unreadable_directory(&locked);
+        app.finalize_scan();
+
+        assert_eq!(
+            app.visible_tree().current_node().state,
+            crate::model::NodeState::Uncertain,
+            "the root is an ancestor of the unreadable folder"
+        );
+
+        app.load_snapshot_page(
+            &RelativePath::from_path(Path::new("parent"))
+                .expect("fixture folder should be canonical"),
+        )
+        .expect("parent page should materialize");
+        assert_eq!(
+            app.visible_tree().current_node().state,
+            crate::model::NodeState::Uncertain,
+            "parent is also an ancestor of the unreadable folder"
+        );
+        let locked_entry = app
+            .files_in_current_view(0)
+            .into_iter()
+            .find(|file| file.name == "locked")
+            .expect("the unreadable folder itself should be listed");
+        assert!(
+            locked_entry.uncertain,
+            "the tile for the unreadable folder itself must show uncertain"
         );
     }
 

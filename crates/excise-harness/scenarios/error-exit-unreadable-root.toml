@@ -11,8 +11,11 @@ cols = 120
 rows = 40
 
 [[steps]]
-step = "wait_header"
-state = "complete"
+# A root that contains folders excise cannot read never reaches the `COMPLETE` header
+# badge (it is, correctly, `uncertain`, shown as `? READ ERROR`): wait on the
+# scan-complete event itself rather than a header word that this scan can never show.
+step = "wait_event"
+event = "scan_complete"
 timeout_ms = 30000
 
 [[steps]]

@@ -52,7 +52,7 @@ A link that may exist outside the scan scope prevents an unjustified exact total
 
 !!! warning "Unknown is a first-class result"
 
-    A failed space or metadata query contributes unknown space. An unreadable folder contributes an unknown number of descendants. Parent folders retain a lower bound and show the uncertainty.
+    A failed space or metadata query contributes unknown space. An unreadable folder contributes an unknown number of descendants. Parent folders retain a lower bound and show the uncertainty. Excise tracks up to 4,096 unreadable folders per scan; past that, every folder's bounds become uncertain, not only those of the unreadable ones.
 
 User exclusions and one-filesystem boundaries define scan scope. Excise reports those boundaries separately rather than calling them read failures. Configured exclusions and foreign-filesystem boundaries remain visible as zero-byte records with a reason.
 

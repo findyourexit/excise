@@ -3,7 +3,7 @@ use thiserror::Error;
 use super::path_key::{PathKeyError, append_path_key, decode_path_key};
 use super::path_observation::{PathObservationCodecError, decode_path_observation};
 use super::path_reducer::{
-    DirectorySummary, PathReductionError, coverage_code, coverage_from_code,
+    DirectorySummary, PathReductionError, UnreadableDirectories, coverage_code, coverage_from_code,
     reduce_sorted_path_stream,
 };
 use super::run_file::{RunError, RunKind, RunReader, RunWriter};
@@ -175,6 +175,7 @@ pub(crate) fn visit_directory_summaries(
 pub(crate) fn reduce_path_observation_run(
     input: &mut RunReader,
     output: &mut RunWriter,
+    unreadable_directories: UnreadableDirectories<'_>,
 ) -> Result<(), DirectorySummaryRunError> {
     if input.descriptor().kind() != RunKind::PathObservation {
         return Err(DirectorySummaryRunError::WrongInputKind);
@@ -212,6 +213,7 @@ pub(crate) fn reduce_path_observation_run(
                 .ok_or(DirectorySummaryRunError::OrdinalOverflow)?;
             Ok(())
         },
+        unreadable_directories,
     )
 }
 
@@ -258,6 +260,7 @@ mod tests {
     use crate::scan_store::path_reducer::{PathEntryKind, PathObservation, SummaryMetrics};
     use crate::scan_store::run_file::RunDescriptor;
     use crate::temporary_storage::TemporaryStorage;
+    use std::collections::BTreeSet;
 
     fn path(value: &str) -> RelativePath {
         RelativePath::from_path(Path::new(value)).expect("fixture path should be relative")
@@ -331,7 +334,12 @@ mod tests {
             .into_reader()
             .expect("input should open");
         let mut output = writer(&storage, 2, RunKind::DirectorySummary);
-        reduce_path_observation_run(&mut input, &mut output).expect("reduction should succeed");
+        reduce_path_observation_run(
+            &mut input,
+            &mut output,
+            UnreadableDirectories::Tracked(&BTreeSet::new()),
+        )
+        .expect("reduction should succeed");
         let mut output = output
             .seal()
             .expect("summary output should seal")
@@ -366,7 +374,11 @@ mod tests {
             .expect("input should open");
         let mut output = writer(&storage, 2, RunKind::DirectorySummary);
         assert!(matches!(
-            reduce_path_observation_run(&mut input, &mut output),
+            reduce_path_observation_run(
+                &mut input,
+                &mut output,
+                UnreadableDirectories::Tracked(&BTreeSet::new())
+            ),
             Err(DirectorySummaryRunError::WrongInputKind)
         ));
 
@@ -391,8 +403,63 @@ mod tests {
             .into_reader()
             .expect("input should open");
         assert!(matches!(
-            reduce_path_observation_run(&mut different_generation_input, &mut output),
+            reduce_path_observation_run(
+                &mut different_generation_input,
+                &mut output,
+                UnreadableDirectories::Tracked(&BTreeSet::new())
+            ),
             Err(DirectorySummaryRunError::GenerationMismatch)
         ));
+    }
+
+    #[test]
+    fn run_reduction_forces_an_unreadable_directory_and_its_ancestor_uncertain() {
+        let storage = TemporaryStorage::with_limit_bytes(32 * 1024);
+        let mut input = writer(&storage, 1, RunKind::PathObservation);
+        let mut key = Vec::new();
+        let mut value = Vec::new();
+        for observation in [
+            observation("alpha", PathEntryKind::Directory, 0),
+            observation("alpha/locked", PathEntryKind::Directory, 0),
+        ] {
+            append_path_observation(&mut input, &observation, &mut key, &mut value)
+                .expect("observation should append");
+        }
+        let mut input = input
+            .seal()
+            .expect("input should seal")
+            .into_reader()
+            .expect("input should open");
+        let mut output = writer(&storage, 2, RunKind::DirectorySummary);
+        let mut unreadable = BTreeSet::new();
+        unreadable.insert(path("alpha/locked"));
+        reduce_path_observation_run(
+            &mut input,
+            &mut output,
+            UnreadableDirectories::Tracked(&unreadable),
+        )
+        .expect("reduction should succeed");
+        let mut output = output
+            .seal()
+            .expect("summary output should seal")
+            .into_reader()
+            .expect("summary output should open");
+        let mut summaries = Vec::new();
+        visit_directory_summaries(&mut output, |ordinal, summary| {
+            summaries.push((ordinal, summary));
+            Ok(())
+        })
+        .expect("summary output should validate");
+
+        assert_eq!(summaries.len(), 3);
+        for (_, summary) in &summaries {
+            assert_eq!(
+                summary.coverage,
+                Coverage::Uncertain,
+                "{:?} should be uncertain",
+                summary.path
+            );
+            assert_eq!(summary.metrics.allocated_bytes.upper, None);
+        }
     }
 }

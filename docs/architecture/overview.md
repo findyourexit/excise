@@ -49,7 +49,7 @@ The scanner walks directories without recursion and uses a fixed worker count. O
 
 ???+ info "Concrete pages, bounded retention"
 
-    If a path cannot be represented, available pages remain concrete, the report records the omitted-path count, and affected space totals become lower bounds.
+    If a path cannot be represented, available pages remain concrete, the report records the omitted-path count, and affected space totals become lower bounds. A directory the scanner could not open or list is tracked by path, up to a fixed cap, so every ancestor up to the root can be reported uncertain with an open upper bound; past that cap the session stops tracking individual paths and reports every folder uncertain instead, rather than growing the tracked set without bound.
 
     The interactive map reads one 512-entry page of direct children and its ancestor chain. It keeps only a small cache of recent pages. ++page-down++ and ++page-up++ move between concrete pages. No child is replaced with an undeletable summary. When an unfiltered page is not cached, the map reads only the requested slice from the published `ChildQuery`. Completed-folder navigation has no loading view or live-model fallback; filters read only the relevant stored page.
 
