@@ -12,22 +12,25 @@ use thiserror::Error;
 use super::directory_summary::{
     DirectorySummaryRunError, reduce_path_observation_run, visit_directory_summaries,
 };
+use super::folder_digest::FolderDigest;
 use super::identity_observation::{
     IdentityObservation, IdentityObservationRunError, IdentityReductionError,
     append_identity_observation, compare_identity_observations, reduce_identity_observations,
 };
 use super::manifest::{ManifestError, RunManifestEntry, ScanManifest};
 use super::page::{
-    PageIndexError, PageRequest, ProvisionalPage, ScanPage, ScanPageEntry, ScanPageError,
-    materialize_child_queries, read_page_entry, visit_child_query_entries,
+    MATERIALIZE_STEPS, PageIndexError, PageRequest, ProvisionalPage, ScanPage, ScanPageEntry,
+    ScanPageError, materialize_child_queries, read_page_entry, visit_child_query_entries,
     visit_child_query_page_entries,
 };
 use super::path_catalog::{
     PathCatalogEntry, PathCatalogError, build_path_catalog, read_path_catalog_entry,
 };
 use super::path_observation::{PathObservationRunError, append_path_observation};
-use super::path_reducer::{Coverage, PathObservation, SummaryMetrics, UnreadableDirectories};
-use super::run_file::{RunDescriptor, RunError, RunKind, RunWriter, SealedRun};
+use super::path_reducer::{
+    Coverage, PathEntryKind, PathObservation, SummaryMetrics, UnreadableDirectories,
+};
+use super::run_file::{DetachedRun, RunDescriptor, RunError, RunKind, RunWriter, SealedRun};
 use super::run_merge::{RunMergeError, merge_sorted_runs};
 use crate::scan_coordinator::{RelativePath, ScanGeneration};
 use crate::scan_coordinator::{WorkKind, WorkLease};
@@ -57,7 +60,7 @@ pub(crate) const MAX_OBSERVATIONS_PER_BATCH: usize = 128;
 /// `ScanStore` stops tracking individual paths and instead reports every
 /// folder `Uncertain`, the same conservative direction `unrecorded_path_count`
 /// already takes for the root alone when a fact cannot be retained.
-const MAX_TRACKED_UNREADABLE_DIRECTORIES: usize = 4096;
+pub(crate) const MAX_TRACKED_UNREADABLE_DIRECTORIES: usize = 4096;
 
 /// Runs retained for as long as a generation is published or summary-only: the concrete
 /// entries (`child_queries`), their compact parent/name lookup (`path_catalog`), physical-
@@ -79,6 +82,11 @@ const MAX_TRACKED_UNREADABLE_DIRECTORIES: usize = 4096;
 /// worker's peak is four, whatever the depth, path length, or tree size.
 const RESIDENT_PUBLISHED_RUNS: usize = 4;
 
+/// The stages `ScanStore::reduce_active_generation` reports: the path and identity families
+/// merged, then the directory summaries, the path catalog, and the allocation contributions
+/// reduced from them.
+const REDUCE_STAGES: u8 = 5;
+
 /// Scanner batches sealed but not yet admitted, capped independently of the event channel's
 /// own capacity (`event_buffer`, `config.rs`), which also bounds memory and latency for every
 /// kind of worker event, not just these two. Removing the per-run durable sync let the
@@ -87,14 +95,13 @@ const RESIDENT_PUBLISHED_RUNS: usize = 4;
 /// against 17.7-20.9 MB before); 16 keeps it within that baseline again (`cargo xtask
 /// bench-e2e --baseline bf63697 --fixture tiny-files-250k`), with ample headroom below the
 /// channel's own default 256-event capacity.
-const MAX_INFLIGHT_SCAN_BATCHES: usize = 16;
+pub(crate) const MAX_INFLIGHT_SCAN_BATCHES: usize = 16;
 
-/// Shared between the scanner (acquires one credit per batch it seals for admission, in
-/// [`ScanInputRunFactory::seal_observation_batch`]) and the owner (releases it once that batch
-/// reaches admission: [`ScanStore::release_inflight_batch_credit`]). Backpressure, not a hard
-/// guarantee: this counter's job is smoothing memory and descriptor use, not correctness, so a
-/// missed release (which a future change to an admission path could introduce) cannot stall
-/// the scanner forever -- `acquire` gives up after a bounded wait and proceeds anyway.
+/// Shared between the scanner, which takes one credit for every batch it seals for admission
+/// ([`ScanInputRunFactory::seal_observation_batch`]), and whatever finally disposes of that
+/// batch. Backpressure, not a correctness guarantee: its job is smoothing memory and descriptor
+/// use, so `acquire` gives up after a bounded wait and lets the batch through without a credit
+/// rather than stall the scanner.
 #[derive(Clone, Debug)]
 struct InflightBatchBudget(Arc<AtomicUsize>);
 
@@ -103,7 +110,7 @@ impl InflightBatchBudget {
         Self(Arc::new(AtomicUsize::new(0)))
     }
 
-    fn acquire(&self) {
+    fn acquire(&self) -> InflightCredit {
         const POLL: Duration = Duration::from_millis(1);
         const MAX_WAIT: Duration = Duration::from_millis(50);
         let mut waited = Duration::ZERO;
@@ -115,32 +122,101 @@ impl InflightBatchBudget {
                     .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    return;
+                    return InflightCredit {
+                        budget: Some(self.clone()),
+                    };
                 }
                 continue;
             }
             if waited >= MAX_WAIT {
-                return;
+                return InflightCredit { budget: None };
             }
             thread::sleep(POLL);
             waited += POLL;
         }
     }
+}
 
-    fn release(&self) {
-        // Saturating: `acquire` can give up without ever incrementing (the bounded-wait
-        // fallback above), and this budget's own philosophy is backpressure, not a correctness
-        // guarantee, so a release that outnumbers its acquires must settle at zero rather than
-        // wrap a `usize` and poison every later `acquire` into reading a falsely full budget.
-        // `fetch_update` is `try_update` on a newer nightly than this crate's pinned stable
-        // toolchain ships; keep the name that compiles on both rather than one only nightly
-        // accepts.
-        #[allow(deprecated)]
-        let _ = self
-            .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                Some(count.saturating_sub(1))
-            });
+/// One credit of the in-flight cap. It returns to the budget when dropped, exactly once, so no
+/// path that consumes a [`SealedBatch`] has a release to forget: a credit that `acquire` gave up
+/// waiting for was never taken, and returns nothing.
+#[derive(Debug)]
+struct InflightCredit {
+    budget: Option<InflightBatchBudget>,
+}
+
+impl Drop for InflightCredit {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.take() {
+            budget.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// The sealed runs of one scanner batch, and the in-flight credit that batch holds.
+///
+/// The credit returns when the batch is dropped, or when iterating it ends: after admission, or
+/// on whatever path discards the batch unadmitted (a stale lease, a store that became
+/// unavailable, a closed channel, a cancelled scan). A consumer that admits on the thread that
+/// received the batch returns it at once with [`Self::into_runs_returning_credit`].
+#[derive(Debug, Default)]
+pub(crate) struct SealedBatch {
+    runs: Vec<SealedRun>,
+    credit: Option<InflightCredit>,
+}
+
+impl SealedBatch {
+    /// A batch with no runs: it holds no credit.
+    #[must_use]
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.runs.len()
+    }
+
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// The runs, with the batch's in-flight credit returned now instead of when the last run is
+    /// admitted. For a consumer that admits on the thread that received the batch, as the
+    /// headless scan does: the credit has always come back as the batch arrived there, which is
+    /// how that scan paces the scanner, so the time admission takes does not change it.
+    #[must_use]
+    pub(crate) fn into_runs_returning_credit(self) -> Vec<SealedRun> {
+        let Self { runs, credit } = self;
+        drop(credit);
+        runs
+    }
+}
+
+impl IntoIterator for SealedBatch {
+    type Item = SealedRun;
+    type IntoIter = SealedBatchRuns;
+
+    fn into_iter(self) -> SealedBatchRuns {
+        SealedBatchRuns {
+            runs: self.runs.into_iter(),
+            _credit: self.credit,
+        }
+    }
+}
+
+/// The runs of a [`SealedBatch`], still holding its credit until the iterator is dropped.
+pub(crate) struct SealedBatchRuns {
+    runs: std::vec::IntoIter<SealedRun>,
+    _credit: Option<InflightCredit>,
+}
+
+impl Iterator for SealedBatchRuns {
+    type Item = SealedRun;
+
+    fn next(&mut self) -> Option<SealedRun> {
+        self.runs.next()
     }
 }
 
@@ -205,6 +281,11 @@ pub(crate) enum ScanStoreError {
     LeaseKindMismatch,
     #[error("scan store accepted this sealed input run already")]
     DuplicateInputRun,
+    /// What a deletion left cannot be put into the map without scanning again: the map would
+    /// record something the file system no longer has, and nothing in the map says what the file
+    /// system has instead.
+    #[error("the map cannot be updated in place: {0}")]
+    OverlayNeedsRescan(String),
 }
 
 /// Sealed-run I/O used by the internal benchmark harness.
@@ -320,14 +401,19 @@ impl PublishedGeneration {
         read_page_entry(&self.child_queries, path)
     }
 
-    fn with_child_query_entries<E>(
-        &mut self,
-        visit: impl FnMut(PathObservation, Option<IdentityObservation>) -> Result<(), E>,
-    ) -> Result<(), E>
-    where
-        E: From<RunError> + From<PageIndexError>,
-    {
-        visit_child_query_entries(&mut self.child_queries, visit)
+    /// What a successor of this generation needs to copy its facts: a description another
+    /// thread can read through descriptors of its own, so reading it never touches this
+    /// generation's. `None` for a generation whose runs have no files (tests and fuzzing).
+    ///
+    /// The description stays valid for as long as this generation does.
+    #[must_use]
+    pub(crate) fn overlay_base(&self) -> Option<OverlayBase> {
+        Some(OverlayBase {
+            child_queries: self.child_queries.detached()?,
+            unrecorded_path_count: self.unrecorded_path_count,
+            unreadable_directories: self.unreadable_directories.clone(),
+            unreadable_directories_overflowed: self.unreadable_directories_overflowed,
+        })
     }
 
     /// Visits every concrete entry with its publication-time page metrics.
@@ -372,6 +458,67 @@ impl SummaryOnlyGeneration {
     pub(crate) const fn unrecorded_path_count(&self) -> u64 {
         self.unrecorded_path_count
     }
+}
+
+/// A published generation as its successor reads it: the facts an overlay generation copies
+/// (`ScanStore::begin_overlay_generation`), and the coverage notes it inherits.
+///
+/// Reading it does not need the generation itself, only its files, so the thread that builds
+/// the overlay need not own, borrow, or share the generation the reader navigates. It stays
+/// valid for as long as that generation does: the reader sends the one it has installed with
+/// each overlay, and keeps the generation until its successor arrives.
+#[derive(Clone, Debug)]
+pub(crate) struct OverlayBase {
+    child_queries: DetachedRun,
+    unrecorded_path_count: u64,
+    unreadable_directories: BTreeSet<RelativePath>,
+    unreadable_directories_overflowed: bool,
+}
+
+/// A folder as the file system has it after a deletion changed it, to take the place of what the
+/// map recorded of it ([`ScanStore::begin_overlay_generation`]).
+#[derive(Clone, Debug)]
+pub(crate) struct RefreshedFolder {
+    pub(crate) path: RelativePath,
+    pub(crate) snapshot: crate::model::EntrySnapshot,
+    /// The entries the folder holds now, read in the same moment as the snapshot. The snapshot
+    /// may replace the recorded one only when these are the entries the overlay publishes.
+    pub(crate) entries: FolderDigest,
+}
+
+impl RefreshedFolder {
+    /// Puts the snapshot into the folder's observation, unless it is another folder's: one
+    /// replaced since the scan is not one the map can describe.
+    fn refresh(&self, observation: &mut PathObservation) -> Result<(), ScanStoreError> {
+        let Some(recorded) = observation
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.identity.as_ref())
+        else {
+            // Nothing was recorded to check a deletion against, and none is made up here.
+            return Ok(());
+        };
+        if self
+            .snapshot
+            .identity
+            .as_ref()
+            .is_none_or(|current| current.file_id != recorded.file_id)
+        {
+            return Err(ScanStoreError::OverlayNeedsRescan(
+                "the folder that held the removed entry was replaced".to_string(),
+            ));
+        }
+        observation.snapshot = Some(self.snapshot.clone());
+        Ok(())
+    }
+}
+
+/// What one successful `ScanStore::publish` produced, moved out of the store
+/// ([`ScanStore::take_publication`]) for the thread that reads it. Both generations are boxed:
+/// each is several hundred bytes, and the value moves through a queue.
+pub(crate) enum Publication {
+    Published(Box<PublishedGeneration>),
+    SummaryOnly(Box<SummaryOnlyGeneration>),
 }
 
 /// A bounded base-eight merge pyramid for one externally sorted fact family.
@@ -521,7 +668,26 @@ impl ScanInputRunFactory {
         self.generation
     }
 
+    /// The same factory for another generation of the same store: the one a rebuild begins.
+    #[must_use]
+    pub(crate) fn for_generation(&self, generation: ScanGeneration) -> Self {
+        Self {
+            generation,
+            ..self.clone()
+        }
+    }
+
+    /// How many sealed batches hold a credit of the in-flight cap right now.
+    #[cfg(test)]
+    pub(crate) fn in_flight_batches(&self) -> usize {
+        self.budget.0.load(Ordering::Acquire)
+    }
+
     /// Seals the two bounded raw fact families for one scanner batch.
+    ///
+    /// The batch holds one credit of the in-flight cap from here until it is dropped, so the
+    /// scanner waits (a bounded time) once [`MAX_INFLIGHT_SCAN_BATCHES`] batches are sealed and
+    /// not yet disposed of.
     ///
     /// # Errors
     ///
@@ -531,23 +697,22 @@ impl ScanInputRunFactory {
         &self,
         paths: Vec<PathObservation>,
         identities: Vec<IdentityObservation>,
-    ) -> Result<Vec<SealedRun>, ScanStoreError> {
+    ) -> Result<SealedBatch, ScanStoreError> {
         if paths.len() > MAX_OBSERVATIONS_PER_BATCH || identities.len() > MAX_OBSERVATIONS_PER_BATCH
         {
             return Err(ScanStoreError::BatchTooLarge);
         }
         if paths.is_empty() && identities.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SealedBatch::empty());
         }
-        // Acquired here (the scanner, about to seal a batch destined for admission);
-        // released in `ScanStore::release_inflight_batch_credit` once the batch reaches
-        // admission, or right below if sealing itself fails and the batch never ships.
-        self.budget.acquire();
-        let sealed = self.seal_sorted_batch(paths, identities);
-        if sealed.is_err() {
-            self.budget.release();
-        }
-        sealed
+        // Taken before sealing, by the scanner; a failure below drops it with the batch that
+        // never shipped.
+        let credit = self.budget.acquire();
+        let runs = self.seal_sorted_batch(paths, identities)?;
+        Ok(SealedBatch {
+            runs,
+            credit: Some(credit),
+        })
     }
 
     fn seal_sorted_batch(
@@ -607,6 +772,9 @@ pub(crate) struct ScanStore {
     published: Option<PublishedGeneration>,
     summary_only: Option<SummaryOnlyGeneration>,
     retired_generation: Option<ScanGeneration>,
+    /// The newest generation [`Self::take_publication`] moved out of this store: it still counts
+    /// for generation ordering, though the store no longer holds it.
+    handed_off_generation: Option<ScanGeneration>,
     inflight_batches: InflightBatchBudget,
     #[cfg(feature = "internal")]
     io_metrics: ScanStoreIoMetrics,
@@ -648,6 +816,7 @@ impl ScanStore {
             published: None,
             summary_only: None,
             retired_generation: None,
+            handed_off_generation: None,
             inflight_batches: InflightBatchBudget::new(),
             #[cfg(feature = "internal")]
             io_metrics: ScanStoreIoMetrics::default(),
@@ -696,6 +865,12 @@ impl ScanStore {
         )
     }
 
+    /// The session's quota, shared with every run this store and its factories write.
+    #[must_use]
+    pub(crate) fn quota(&self) -> TemporaryStorage {
+        self.temporary_storage.clone()
+    }
+
     #[must_use]
     pub(crate) const fn session(&self) -> ScanSessionId {
         self.session
@@ -704,8 +879,13 @@ impl ScanStore {
     /// Records one path omitted from canonical page data while preserving every
     /// successfully observed path.
     pub(crate) fn record_unrecorded_path(&mut self) {
+        self.record_unrecorded_paths(1);
+    }
+
+    /// Records `count` paths omitted from canonical page data.
+    pub(crate) fn record_unrecorded_paths(&mut self, count: u64) {
         if let Some(active) = self.active.as_mut() {
-            active.unrecorded_path_count = active.unrecorded_path_count.saturating_add(1);
+            active.unrecorded_path_count = active.unrecorded_path_count.saturating_add(count);
         }
     }
 
@@ -782,6 +962,26 @@ impl ScanStore {
             .ok_or(ScanStoreError::NoPublishedGeneration)
     }
 
+    /// Moves the newest publication out of the store, for a store whose reader is another
+    /// thread (the interactive session's store thread). The store keeps only the generation's
+    /// number, which still counts for ordering. It keeps nothing to build a successor from: the
+    /// reader that holds the generation says which one a successor derives from
+    /// ([`Self::begin_overlay_generation`]), so a generation the reader drops, or never
+    /// installs, cannot be the one a later overlay is built from.
+    pub(crate) fn take_publication(&mut self) -> Option<Publication> {
+        if let Some(summary) = self.summary_only.take() {
+            self.note_handed_off(summary.generation());
+            return Some(Publication::SummaryOnly(Box::new(summary)));
+        }
+        let published = self.published.take()?;
+        self.note_handed_off(published.generation());
+        Some(Publication::Published(Box::new(published)))
+    }
+
+    fn note_handed_off(&mut self, generation: ScanGeneration) {
+        self.handed_off_generation = self.handed_off_generation.max(Some(generation));
+    }
+
     /// Abandons unsealed work and begins a strictly newer generation. The last
     /// published snapshot remains queryable until its replacement publishes.
     ///
@@ -812,6 +1012,7 @@ impl ScanStore {
                 .as_ref()
                 .map(SummaryOnlyGeneration::generation),
             self.retired_generation,
+            self.handed_off_generation,
         ]
         .into_iter()
         .flatten()
@@ -857,32 +1058,50 @@ impl ScanStore {
         Ok(())
     }
 
-    /// Starts a newer generation by rebuilding every fact outside
-    /// `replaced_prefix` from the compact published child-query run. Callers
-    /// may then publish a deletion overlay or add replacement facts from live data.
+    /// Starts a newer generation by rebuilding every fact outside `replaced_prefix` from the
+    /// compact child-query run of `base`, the published generation it derives from. Callers may
+    /// then publish a deletion overlay or add replacement facts from live data.
+    ///
+    /// `base` is a description of the generation's files ([`OverlayBase`]), never the generation
+    /// itself: the thread that builds the overlay need not own it, and the reader that does goes
+    /// on navigating it. The reader says which generation that is, because only it knows which
+    /// one it kept.
+    ///
+    /// Entries are copied as the scan recorded them, which is right for all but what the removal
+    /// itself changed on disk. Removing an entry moves the modification time of the folder that
+    /// held it, and that folder's link count when the entry was a folder, and the check that the
+    /// reader is deleting what they saw compares both, so `folder` (that folder as the file
+    /// system has it now) replaces the snapshot the map recorded. That time describes every
+    /// change to the folder's entries, not only the removal: another process that made,
+    /// removed, renamed, or replaced an entry beside it moved it too, and a map that recorded
+    /// the new time would pass a later deletion of the folder as unchanged while the folder
+    /// holds what the map never showed. So `folder` also carries what the folder holds now (a
+    /// [`FolderDigest`] of the names, kinds, and identities of its entries), and the snapshot
+    /// replaces the recorded one only when that is exactly the base's entries of the folder
+    /// less the removed one. The links to a hard-linked file are another matter: the removal
+    /// changed the link count of every other link to it, and the map has no way to say where
+    /// they are. A removed hard link therefore ends the overlay with
+    /// [`ScanStoreError::OverlayNeedsRescan`], as does a folder that is not what the map
+    /// recorded, or that holds other entries than it lists.
     ///
     /// # Errors
     ///
-    /// Returns an error when no published base exists, generation ordering is
-    /// invalid, a retained query record is corrupt, or the copy cannot fit the
-    /// shared temporary-storage budget. Copy failure leaves the new generation
-    /// incomplete and preserves the prior published snapshot.
+    /// Returns an error when generation ordering is invalid, a retained query record is corrupt,
+    /// the copy cannot fit the shared temporary-storage budget, or the overlay cannot be exact.
+    /// Copy failure leaves the new generation incomplete and preserves the prior published
+    /// snapshot.
     pub(crate) fn begin_overlay_generation(
         &mut self,
+        base: &OverlayBase,
         generation: ScanGeneration,
         replaced_prefix: &crate::scan_coordinator::RelativePath,
+        folder: Option<&RefreshedFolder>,
     ) -> Result<(), ScanStoreError> {
-        self.start_overlay_generation(generation)?;
+        self.start_overlay_generation(base, generation)?;
         if replaced_prefix.is_root() {
             return Ok(());
         }
-        let mut published = self
-            .published
-            .take()
-            .ok_or(ScanStoreError::NoPublishedGeneration)?;
-        let copied = self.copy_overlay_facts(&mut published, replaced_prefix);
-        self.published = Some(published);
-        if let Err(error) = copied {
+        if let Err(error) = self.copy_overlay_facts(base, replaced_prefix, folder) {
             self.mark_active_incomplete();
             return Err(error);
         }
@@ -891,26 +1110,76 @@ impl ScanStore {
 
     fn copy_overlay_facts(
         &mut self,
-        published: &mut PublishedGeneration,
+        base: &OverlayBase,
         replaced_prefix: &crate::scan_coordinator::RelativePath,
+        folder: Option<&RefreshedFolder>,
     ) -> Result<(), ScanStoreError> {
+        let storage = self.temporary_storage.clone();
         let mut paths = Vec::with_capacity(MAX_OBSERVATIONS_PER_BATCH);
         let mut identities = Vec::with_capacity(MAX_OBSERVATIONS_PER_BATCH);
-        published.with_child_query_entries(|path, identity| -> Result<(), ScanStoreError> {
-            if path.path.starts_with(replaced_prefix) {
-                return Ok(());
-            }
-            if let Some(identity) =
-                identity.filter(|identity| identity_requires_reduction(&path, identity))
-            {
-                identities.push(identity);
-            }
-            paths.push(path);
-            if paths.len() == MAX_OBSERVATIONS_PER_BATCH {
-                self.append_overlay_batch(&mut paths, &mut identities)?;
-            }
-            Ok(())
+        let mut folder_copied = folder.is_none();
+        // The entries of the refreshed folder that this overlay publishes: the ones the base has,
+        // less the removed one.
+        let mut folder_entries = FolderDigest::default();
+        base.child_queries.with_reader(&storage, |reader| {
+            visit_child_query_entries(reader, |mut path, identity| -> Result<(), ScanStoreError> {
+                if path.path.starts_with(replaced_prefix) {
+                    if may_have_other_links(&path, identity.as_ref()) {
+                        return Err(ScanStoreError::OverlayNeedsRescan(
+                            "the removed entries include a hard link, and the map does not \
+                                 say where the others are"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(());
+                }
+                if let Some(folder) = folder {
+                    if folder.path == path.path {
+                        folder.refresh(&mut path)?;
+                        folder_copied = true;
+                    } else if path.path.is_direct_child_of(&folder.path)
+                        && let Some(name) = path.path.components().last()
+                    {
+                        folder_entries.add(
+                            name,
+                            path.kind,
+                            path.snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.identity.as_ref())
+                                .map(|identity| &identity.file_id),
+                        );
+                    }
+                }
+                // A folder's page record keeps its scan-time identity only for the deletion
+                // check. It is not an identity fact to reduce: only a file's hard-link facts
+                // are, and indexing one for a folder fails the whole overlay.
+                if let Some(identity) = identity.filter(|identity| {
+                    path.kind != PathEntryKind::Directory
+                        && identity_requires_reduction(&path, identity)
+                }) {
+                    identities.push(identity);
+                }
+                paths.push(path);
+                if paths.len() == MAX_OBSERVATIONS_PER_BATCH {
+                    self.append_overlay_batch(&mut paths, &mut identities)?;
+                }
+                Ok(())
+            })
         })?;
+        if let Some(folder) = folder {
+            if !folder_copied {
+                return Err(ScanStoreError::OverlayNeedsRescan(
+                    "the folder that held the removed entry is not in the map".to_string(),
+                ));
+            }
+            if folder.entries != folder_entries {
+                return Err(ScanStoreError::OverlayNeedsRescan(
+                    "the folder that held the removed entry holds entries the map does not list, \
+                     or lacks ones it lists"
+                        .to_string(),
+                ));
+            }
+        }
         self.append_overlay_batch(&mut paths, &mut identities)
     }
 
@@ -930,23 +1199,16 @@ impl ScanStore {
 
     fn start_overlay_generation(
         &mut self,
+        base: &OverlayBase,
         generation: ScanGeneration,
     ) -> Result<(), ScanStoreError> {
-        let published = self
-            .published
-            .as_ref()
-            .ok_or(ScanStoreError::NoPublishedGeneration)?;
-        let unrecorded_path_count = published.unrecorded_path_count();
-        let (unreadable_directories, unreadable_directories_overflowed) =
-            match published.unreadable_directories() {
-                UnreadableDirectories::Tracked(set) => (set.clone(), false),
-                UnreadableDirectories::Overflowed => (BTreeSet::new(), true),
-            };
         self.begin_generation(generation)?;
         if let Some(active) = self.active.as_mut() {
-            active.unrecorded_path_count = unrecorded_path_count;
-            active.unreadable_directories = unreadable_directories;
-            active.unreadable_directories_overflowed = unreadable_directories_overflowed;
+            active.unrecorded_path_count = base.unrecorded_path_count;
+            active
+                .unreadable_directories
+                .clone_from(&base.unreadable_directories);
+            active.unreadable_directories_overflowed = base.unreadable_directories_overflowed;
         }
         Ok(())
     }
@@ -979,13 +1241,6 @@ impl ScanStore {
             next_run_id: Arc::clone(&self.next_run_id),
             budget: self.inflight_batches.clone(),
         })
-    }
-
-    /// Releases one credit [`ScanInputRunFactory::seal_observation_batch`] acquired, now that
-    /// its batch has reached admission -- whatever admission then does with the runs (accepts,
-    /// rejects as a duplicate, or abandons the generation) no longer matters to this budget.
-    pub(crate) fn release_inflight_batch_credit(&self) {
-        self.inflight_batches.release();
     }
 
     /// Adds one sealed raw scanner run to the active generation.
@@ -1103,19 +1358,12 @@ impl ScanStore {
         identities: Vec<IdentityObservation>,
     ) -> Result<(), ScanStoreError> {
         let factory = self.input_run_factory()?;
-        let runs = factory.seal_observation_batch(paths, identities)?;
-        let sealed_a_batch = !runs.is_empty();
-        let mut outcome = Ok(());
-        for run in runs {
-            if let Err(error) = self.accept_input_run(run) {
-                outcome = Err(error);
-                break;
-            }
+        // The batch holds its credit for this loop, and returns it when the loop ends: after
+        // the last run is admitted, or at the first failure.
+        for run in factory.seal_observation_batch(paths, identities)? {
+            self.accept_input_run(run)?;
         }
-        if sealed_a_batch {
-            self.release_inflight_batch_credit();
-        }
-        outcome
+        Ok(())
     }
 
     /// Returns a bounded, explicitly incomplete page from the active generation.
@@ -1150,6 +1398,12 @@ impl ScanStore {
             .map_err(ScanStoreError::from)
     }
 
+    /// The stages [`Self::publish_reporting`] reports, in order: the two merges and the three
+    /// reductions of the raw facts, each of the steps that materialize the child-query run
+    /// ([`MATERIALIZE_STEPS`]), and keeping the published runs open. A stage is one pass over the
+    /// scan's facts, or a part of one.
+    pub(crate) const PUBLISH_STAGES: u8 = REDUCE_STAGES + MATERIALIZE_STEPS + 1;
+
     /// Seals all raw runs, reduces them, and atomically installs the resulting
     /// immutable generation as the newest published snapshot.
     ///
@@ -1160,6 +1414,20 @@ impl ScanStore {
     /// the active generation marked incomplete rather than publishing a mix of
     /// partial output and prior data.
     pub(crate) fn publish(&mut self) -> Result<ScanGeneration, ScanStoreError> {
+        self.publish_reporting(&mut |_| {})
+    }
+
+    /// [`Self::publish`], reporting each completed stage (`1` through [`Self::PUBLISH_STAGES`])
+    /// to `report` as it ends. Publishing a large scan takes long enough that the reader should
+    /// see it make progress.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish`].
+    pub(crate) fn publish_reporting(
+        &mut self,
+        report: &mut dyn FnMut(u8),
+    ) -> Result<ScanGeneration, ScanStoreError> {
         let mut active = self
             .active
             .take()
@@ -1176,7 +1444,7 @@ impl ScanStore {
             mut allocation_contributions,
             mut directory_summaries,
             mut path_catalog,
-        ) = match self.reduce_active_generation(&mut active) {
+        ) = match self.reduce_active_generation(&mut active, report) {
             Ok(reduced) => reduced,
             Err(error) => return self.finish_incomplete_generation(active, error),
         };
@@ -1191,6 +1459,7 @@ impl ScanStore {
                 &mut directory_summaries,
                 &mut allocation_contributions,
                 &mut child_writer,
+                &mut |step| report(REDUCE_STAGES + step),
             )?;
             Ok((child_writer.seal()?, page_metadata))
         })();
@@ -1225,6 +1494,7 @@ impl ScanStore {
         for run in resident {
             let _ = run.ensure_resident();
         }
+        report(Self::PUBLISH_STAGES);
         #[cfg(feature = "internal")]
         self.record_publication_io(
             &path_observations,
@@ -1306,14 +1576,17 @@ impl ScanStore {
     fn reduce_active_generation(
         &mut self,
         active: &mut ActiveGeneration,
+        report: &mut dyn FnMut(u8),
     ) -> Result<(SealedRun, SealedRun, SealedRun, SealedRun, SealedRun), ScanStoreError> {
         let generation = active.manifest.generation();
         let path_runs = std::mem::take(&mut active.path_runs);
         let path_observations =
             self.merge_tiered_family(active, RunKind::PathObservation, path_runs)?;
+        report(1);
         let identity_runs = std::mem::take(&mut active.identity_runs);
         let identity_observations =
             self.merge_tiered_family(active, RunKind::IdentityObservation, identity_runs)?;
+        report(2);
 
         #[cfg(feature = "internal")]
         {
@@ -1331,6 +1604,7 @@ impl ScanStore {
         )?;
         let path_observations = path_reader.into_sealed();
         let directory_summaries = directory_writer.seal()?;
+        report(3);
         #[cfg(feature = "internal")]
         {
             self.io_metrics.reduction_written_bytes = self
@@ -1352,6 +1626,7 @@ impl ScanStore {
         build_path_catalog(&mut catalog_reader, &mut catalog_writer)?;
         let path_observations = catalog_reader.into_sealed();
         let path_catalog = catalog_writer.seal()?;
+        report(4);
         #[cfg(feature = "internal")]
         {
             self.io_metrics.reduction_written_bytes = self
@@ -1373,6 +1648,7 @@ impl ScanStore {
         reduce_identity_observations(&mut identity_reader, &mut allocation_writer)?;
         let identity_observations = identity_reader.into_sealed();
         let allocation_contributions = allocation_writer.seal()?;
+        report(5);
         #[cfg(feature = "internal")]
         {
             self.io_metrics.reduction_written_bytes = self
@@ -1681,6 +1957,23 @@ impl ScanStore {
     }
 }
 
+/// Whether removing this entry changes what the map says of another one: a file with, or not
+/// known to have, a second link. The map has the files by path, so it cannot say where the other
+/// links are, and each of them now has one link fewer than the scan recorded. This reads what
+/// the scan observed. A link the file gained since is known only to the deletion that removed
+/// it, which reports the link count it read as it removed the file
+/// (`DeletionReport::deleted_files_may_have_other_links`): the owner asks for no overlay then.
+fn may_have_other_links(path: &PathObservation, identity: Option<&IdentityObservation>) -> bool {
+    path.kind != PathEntryKind::Directory
+        && (identity.is_some_and(|identity| identity.declared_links != Some(1))
+            || path
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.identity.as_ref())
+                .and_then(|identity| identity.link_count)
+                .is_some_and(|links| links > 1))
+}
+
 fn identity_requires_reduction(path: &PathObservation, identity: &IdentityObservation) -> bool {
     identity.declared_links != Some(1)
         || path.metrics.allocated_bytes != identity.allocated_bytes
@@ -1764,6 +2057,19 @@ mod tests {
         ScanStore::new(ScanGeneration::initial(), storage).expect("store should initialize")
     }
 
+    /// A store whose runs are files of a private session directory below `parent`. An overlay
+    /// generation reads the published generation through the paths of its files, so only a store
+    /// that keeps its runs in files can build one.
+    fn session_directory_store(parent: &Path) -> ScanStore {
+        let storage = ScanStoreStorage::new(
+            TemporaryStorage::scan_store_with_limit_bytes(INDEXED_PUBLICATION_STORAGE_BYTES),
+            Some(parent),
+        )
+        .expect("private scan session should initialize");
+        ScanStore::new_with_storage(ScanGeneration::initial(), storage)
+            .expect("store should initialize")
+    }
+
     fn add_path_run(store: &mut ScanStore, observations: &[PathObservation]) {
         let mut writer = store
             .begin_input_run(RunKind::PathObservation)
@@ -1792,6 +2098,16 @@ mod tests {
         store
             .accept_input_run(writer.seal().expect("identity run should seal"))
             .expect("identity run should be accepted");
+    }
+
+    /// The description of the generation a store published, as the thread that builds an overlay
+    /// receives it from the reader that installed that generation.
+    fn overlay_base_of(store: &ScanStore) -> OverlayBase {
+        store
+            .published()
+            .expect("a generation should be published")
+            .overlay_base()
+            .expect("a store that keeps its runs in files has a base to describe")
     }
 
     #[test]
@@ -1899,7 +2215,7 @@ mod tests {
 
         let mut active = store.active.take().expect("generation should be active");
         let (paths, identities, allocations, directories, catalog) = store
-            .reduce_active_generation(&mut active)
+            .reduce_active_generation(&mut active, &mut |_| {})
             .expect("directory summaries should reduce");
         store
             .finish_summary_only_generation(
@@ -1933,7 +2249,8 @@ mod tests {
                 Vec::new(),
             )
             .expect("worker run should seal")
-            .pop()
+            .into_iter()
+            .next()
             .expect("path observation should produce one run");
         assert!(matches!(
             store.accept_leased_input_run(&foreign_lease, foreign_run),
@@ -1947,7 +2264,8 @@ mod tests {
                 Vec::new(),
             )
             .expect("worker run should seal")
-            .pop()
+            .into_iter()
+            .next()
             .expect("path observation should produce one run");
         assert!(
             store
@@ -1971,6 +2289,55 @@ mod tests {
         coordinator
             .lease_next()
             .expect("scheduled test work should receive a lease")
+    }
+
+    #[test]
+    fn a_sealed_batch_returns_its_in_flight_credit_exactly_once_however_it_ends() {
+        let store = store(TemporaryStorage::with_limit_bytes(
+            INDEXED_PUBLICATION_STORAGE_BYTES,
+        ));
+        let factory = store
+            .input_run_factory()
+            .expect("initial generation should accept worker runs");
+        let in_flight = || factory.budget.0.load(Ordering::Acquire);
+        let seal = |path_text: &str| {
+            factory
+                .seal_observation_batch(
+                    vec![path_observation(path_text, PathEntryKind::File, 1)],
+                    vec![identity_observation(
+                        path_text,
+                        file_id::FileId::new_inode(1, 1),
+                    )],
+                )
+                .expect("worker batch should seal")
+        };
+        let discarded = seal("discarded");
+        let consumed = seal("consumed");
+        let abandoned = seal("abandoned");
+        let received = seal("received");
+        assert_eq!(in_flight(), 4);
+
+        drop(discarded);
+        assert_eq!(in_flight(), 3);
+
+        consumed.into_iter().for_each(drop);
+        assert_eq!(in_flight(), 2);
+
+        let first_run = abandoned.into_iter().next();
+        assert!(first_run.is_some());
+        assert_eq!(in_flight(), 1);
+
+        // A consumer that admits on the thread that received the batch gets the credit back as
+        // the batch arrives, while the runs are still to be admitted.
+        let runs = received.into_runs_returning_credit();
+        assert_eq!(in_flight(), 0);
+        assert!(!runs.is_empty(), "the runs themselves are untouched");
+        drop(runs);
+        assert_eq!(
+            in_flight(),
+            0,
+            "dropping them returns nothing a second time"
+        );
     }
 
     #[test]
@@ -2610,9 +2977,8 @@ mod tests {
     }
     #[test]
     fn overlay_generation_replaces_only_the_focused_subtree() {
-        let mut store = store(TemporaryStorage::with_limit_bytes(
-            INDEXED_PUBLICATION_STORAGE_BYTES,
-        ));
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = session_directory_store(parent.path());
         add_path_run(
             &mut store,
             &[
@@ -2631,8 +2997,9 @@ mod tests {
         store.publish().expect("base generation should publish");
 
         let next = ScanGeneration::from_value(1);
+        let base = overlay_base_of(&store);
         store
-            .begin_overlay_generation(next, &path("alpha"))
+            .begin_overlay_generation(&base, next, &path("alpha"), None)
             .expect("focused overlay should start");
         add_path_run(
             &mut store,
@@ -2685,9 +3052,8 @@ mod tests {
 
     #[test]
     fn overlay_generation_keeps_an_unrelated_unreadable_directory_uncertain() {
-        let mut store = store(TemporaryStorage::with_limit_bytes(
-            INDEXED_PUBLICATION_STORAGE_BYTES,
-        ));
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = session_directory_store(parent.path());
         add_path_run(
             &mut store,
             &[
@@ -2708,8 +3074,9 @@ mod tests {
         assert_eq!(base_beta.folder_coverage, Coverage::Uncertain);
 
         let next = ScanGeneration::from_value(1);
+        let base = overlay_base_of(&store);
         store
-            .begin_overlay_generation(next, &path("alpha"))
+            .begin_overlay_generation(&base, next, &path("alpha"), None)
             .expect("focused overlay should start");
         add_path_run(
             &mut store,
@@ -2737,6 +3104,271 @@ mod tests {
             .find(|entry| entry.path == path("beta/locked"))
             .expect("the unreadable directory itself should still be listed");
         assert_eq!(locked.coverage, Coverage::Uncertain);
+    }
+
+    fn folder_observation(
+        path_text: &str,
+        file_id: file_id::FileId,
+        link_count: u64,
+        modified_nanos: u128,
+    ) -> PathObservation {
+        PathObservation::with_snapshot(
+            path(path_text),
+            PathEntryKind::Directory,
+            SummaryMetrics::leaf(0, ByteBounds::exact(0), ByteBounds::exact(0)),
+            Coverage::Complete,
+            Some(folder_snapshot(file_id, link_count, modified_nanos)),
+        )
+    }
+
+    fn folder_snapshot(
+        file_id: file_id::FileId,
+        link_count: u64,
+        modified_nanos: u128,
+    ) -> EntrySnapshot {
+        EntrySnapshot {
+            identity: Some(NativeIdentity {
+                file_id,
+                link_count: Some(link_count),
+                reparse_point: false,
+            }),
+            kind: NodeKind::Directory,
+            apparent_bytes: 0,
+            allocated_bytes: Some(0),
+            modified_nanos: Some(modified_nanos),
+        }
+    }
+
+    /// A store whose map has the folder `holder` (two links: one more than its own, for the one
+    /// folder inside it) with a folder `inner` and a file `leaf` below it, and a file `stay`
+    /// beside the folder, published.
+    fn store_with_a_folder_inside_a_folder(parent: &Path) -> ScanStore {
+        let mut store = session_directory_store(parent);
+        add_path_run(
+            &mut store,
+            &[
+                folder_observation("holder", file_id::FileId::new_inode(1, 1), 3, 100),
+                folder_observation("holder/inner", file_id::FileId::new_inode(1, 2), 2, 100),
+                path_observation("holder/inner/leaf", PathEntryKind::File, 4),
+                single_link_path_observation("holder/stay", file_id::FileId::new_inode(1, 3)),
+            ],
+        );
+        store.publish().expect("base generation should publish");
+        store
+    }
+
+    /// What `holder` holds once the folder inside it is gone: the file `stay`, as the file
+    /// system names it.
+    fn holder_entries_without_inner() -> FolderDigest {
+        let mut entries = FolderDigest::default();
+        entries.add(
+            std::ffi::OsStr::new("stay"),
+            PathEntryKind::File,
+            Some(&file_id::FileId::new_inode(1, 3)),
+        );
+        entries
+    }
+
+    /// Removing an entry changes the folder that held it, and the map a deletion leaves says what
+    /// the folder is now: the check that the reader is deleting what they saw compares it.
+    #[test]
+    fn an_overlay_records_the_folder_that_held_the_removed_entry_as_it_is_now() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = store_with_a_folder_inside_a_folder(parent.path());
+        let now = folder_snapshot(file_id::FileId::new_inode(1, 1), 2, 200);
+        let folder = RefreshedFolder {
+            path: path("holder"),
+            snapshot: now.clone(),
+            entries: holder_entries_without_inner(),
+        };
+
+        let next = ScanGeneration::from_value(1);
+        let base = overlay_base_of(&store);
+        store
+            .begin_overlay_generation(&base, next, &path("holder/inner"), Some(&folder))
+            .expect("the overlay should start");
+        assert_eq!(store.publish().expect("overlay should publish"), next);
+
+        let root = store
+            .published_mut()
+            .expect("overlay should be published")
+            .page(PageRequest::first(RelativePath::root(), 8))
+            .expect("root page should load");
+        let holder = root
+            .entries
+            .iter()
+            .find(|entry| entry.path == path("holder"))
+            .expect("the folder should still be listed");
+        assert_eq!(holder.snapshot, Some(now));
+        let page = store
+            .published_mut()
+            .expect("overlay should be published")
+            .page(PageRequest::first(path("holder"), 8))
+            .expect("the folder's page should load");
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![path("holder/stay")],
+            "only what was removed leaves the map"
+        );
+    }
+
+    /// A folder that is not the one the map recorded, or not in it at all, is what the map cannot
+    /// describe: the overlay says so, and the map the reader has stays.
+    #[test]
+    fn an_overlay_cannot_describe_a_folder_that_was_replaced_or_that_the_map_lacks() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = store_with_a_folder_inside_a_folder(parent.path());
+        let replaced = RefreshedFolder {
+            path: path("holder"),
+            snapshot: folder_snapshot(file_id::FileId::new_inode(1, 99), 2, 200),
+            entries: holder_entries_without_inner(),
+        };
+        let elsewhere = RefreshedFolder {
+            path: path("elsewhere"),
+            snapshot: folder_snapshot(file_id::FileId::new_inode(1, 1), 2, 200),
+            entries: holder_entries_without_inner(),
+        };
+        let base = overlay_base_of(&store);
+
+        for (generation, folder) in [(1, replaced), (2, elsewhere)] {
+            let error = store
+                .begin_overlay_generation(
+                    &base,
+                    ScanGeneration::from_value(generation),
+                    &path("holder/inner"),
+                    Some(&folder),
+                )
+                .expect_err("the overlay cannot be exact");
+            assert!(
+                matches!(error, ScanStoreError::OverlayNeedsRescan(_)),
+                "{error:?}"
+            );
+            assert_eq!(
+                store.published_generation(),
+                Some(ScanGeneration::initial()),
+                "the map the reader has stays"
+            );
+        }
+    }
+
+    /// The folder's modification time describes whatever happened to its entries, not only the
+    /// removal: the overlay records it only for a folder that holds the entries the map lists
+    /// for it, less the removed one. Any other folder is what the map cannot describe.
+    #[test]
+    fn an_overlay_cannot_describe_a_folder_that_holds_other_entries_than_the_map_lists() {
+        type Entry = (&'static str, PathEntryKind, Option<file_id::FileId>);
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = store_with_a_folder_inside_a_folder(parent.path());
+        let base = overlay_base_of(&store);
+        let inode = |number| Some(file_id::FileId::new_inode(1, number));
+        let stay: Entry = ("stay", PathEntryKind::File, inode(3));
+        let cases: [(&str, Vec<Entry>); 6] = [
+            (
+                "an entry the map does not list",
+                vec![stay, ("new", PathEntryKind::File, inode(4))],
+            ),
+            ("an entry the map lists is gone", Vec::new()),
+            (
+                "an entry the map lists has another name",
+                vec![("renamed", PathEntryKind::File, inode(3))],
+            ),
+            (
+                "an entry the map lists was replaced by another of its name",
+                vec![("stay", PathEntryKind::File, inode(99))],
+            ),
+            (
+                "the removed entry is back",
+                vec![stay, ("inner", PathEntryKind::Directory, inode(2))],
+            ),
+            (
+                "an entry the map lists is not the kind it was",
+                vec![("stay", PathEntryKind::Link, inode(3))],
+            ),
+        ];
+
+        for (generation, (what, entries)) in (1..).zip(cases) {
+            let mut digest = FolderDigest::default();
+            for (name, kind, identity) in &entries {
+                digest.add(std::ffi::OsStr::new(name), *kind, identity.as_ref());
+            }
+            let folder = RefreshedFolder {
+                path: path("holder"),
+                snapshot: folder_snapshot(file_id::FileId::new_inode(1, 1), 2, 200),
+                entries: digest,
+            };
+
+            let error = store
+                .begin_overlay_generation(
+                    &base,
+                    ScanGeneration::from_value(generation),
+                    &path("holder/inner"),
+                    Some(&folder),
+                )
+                .expect_err(what);
+
+            assert!(
+                matches!(error, ScanStoreError::OverlayNeedsRescan(_)),
+                "{what}: {error:?}"
+            );
+            assert_eq!(
+                store.published_generation(),
+                Some(ScanGeneration::initial()),
+                "{what}: the map the reader has stays"
+            );
+        }
+    }
+
+    /// Removing one link to a file changes the link count of every other link to it, and the map
+    /// does not say where they are: it has the files by path, with the count the scan read.
+    #[test]
+    fn an_overlay_that_removes_a_hard_link_asks_for_a_rescan() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = session_directory_store(parent.path());
+        let first = file_id::FileId::new_inode(7, 7);
+        add_path_run(
+            &mut store,
+            &[
+                folder_observation("holder", file_id::FileId::new_inode(1, 1), 2, 100),
+                path_observation("holder/first", PathEntryKind::File, 3),
+                path_observation("holder/second", PathEntryKind::File, 3),
+            ],
+        );
+        add_identity_run(
+            &mut store,
+            &[
+                IdentityObservation {
+                    path: path("holder/first"),
+                    file_id: first,
+                    declared_links: Some(2),
+                    allocated_bytes: ByteBounds::exact(8),
+                },
+                IdentityObservation {
+                    path: path("holder/second"),
+                    file_id: first,
+                    declared_links: Some(2),
+                    allocated_bytes: ByteBounds::exact(8),
+                },
+            ],
+        );
+        store.publish().expect("base generation should publish");
+
+        let base = overlay_base_of(&store);
+        let error = store
+            .begin_overlay_generation(
+                &base,
+                ScanGeneration::from_value(1),
+                &path("holder/first"),
+                None,
+            )
+            .expect_err("the overlay cannot say what the other link has now");
+
+        assert!(
+            matches!(error, ScanStoreError::OverlayNeedsRescan(_)),
+            "{error:?}"
+        );
     }
 
     #[test]

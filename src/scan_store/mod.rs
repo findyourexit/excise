@@ -4,6 +4,7 @@
 //! mutable UI model may cache only queries derived from this store.
 
 pub(crate) mod directory_summary;
+pub(crate) mod folder_digest;
 pub(crate) mod identity_observation;
 pub(crate) mod manifest;
 pub(crate) mod page;
@@ -16,5 +17,6 @@ pub(crate) mod run_merge;
 pub(crate) mod session;
 pub(crate) mod session_lock;
 pub(crate) mod storage;
+pub(crate) mod store_thread;
 pub(crate) mod summary_metrics;
 pub(crate) mod sweep;

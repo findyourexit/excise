@@ -1,12 +1,10 @@
 schema_version = 1
 name = "latency-under-scan-load"
-description = "Navigation keys sent while a 50k-entry scan is in progress must still get a frame within the strict latency budgets. Today the owner thread stalls for about 380 ms while it publishes the completed scan (the longest gap between frames ends at scan_complete), and on macOS the scan store's per-batch durable syncs on the same thread add 100-200 ms more. Both are write-side scan-store work on the owner thread, which X8 moves to a store thread; removing the syncs alone (X1) leaves the publication stall."
+description = "Navigation keys sent while a 50k-entry scan is in progress must still get a frame within the strict latency budgets, and the longest gap between frames, which ends at scan_complete, must stay within the stall budget. Merging and publishing the scan's data is the scan store thread's work, so the loop that reads keys and draws frames never waits for it; while the completed scan publishes, the header shows how far finishing the map has got and how long it has taken, so the screen keeps moving through the longest stage, and a gap between frames means the loop was held up."
 fixture = "tiny-files-50k"
 profiles = ["default", "deterministic", "reduced-motion"]
 tier = "full"
 platforms = ["linux", "macos"]
-expect = "fail"
-slice = "X8"
 
 [terminal]
 cols = 120

@@ -76,6 +76,18 @@ impl DeletionDeparture {
     }
 }
 
+/// How far finishing the primary scan's map has got, once the scanner is done and the map is not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicationProgress {
+    /// Stages the store thread has completed.
+    pub done: u8,
+    /// Stages in all.
+    pub total: u8,
+    /// Whole tenths of a second since the scanner finished. A stage can run for longer than the
+    /// screen may stand still, so the clock is what moves it between stages.
+    pub elapsed_tenths: u32,
+}
+
 pub struct UiEffects {
     pub flash_space_freed: bool,
     pub current_path_is_red: bool,
@@ -84,6 +96,8 @@ pub struct UiEffects {
     /// Entries that reached the model during the active scan, with no guessed total.
     pub loading_entries_indexed: u64,
     pub last_read_path: Option<PathBuf>,
+    /// How far the store thread has got publishing the finished scan's map.
+    pub publication_progress: Option<PublicationProgress>,
     pub last_deletion_summary: Option<DeletionSummary>,
     /// Concise outcome for a background operation that could not proceed.
     pub last_deletion_notice: Option<&'static str>,
@@ -98,6 +112,7 @@ impl UiEffects {
             deletion_in_progress: false,
             loading_entries_indexed: 0,
             last_read_path: None,
+            publication_progress: None,
             deletion_work: DeletionWorkSummary::new(),
             last_deletion_summary: None,
             last_deletion_notice: None,

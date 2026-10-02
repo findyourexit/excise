@@ -1,3 +1,5 @@
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -6,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{
-    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError, bounded,
 };
 
 use super::scanner::{self, EntryMetadata, ScannerHandle, ScannerOptions, ScannerRequestError};
@@ -22,6 +24,7 @@ use crate::native_path::DECEPTIVE_DISPLAY_MARKER;
 #[cfg(all(test, unix))]
 use crate::native_path::safe_display_path_text;
 use crate::native_path::{NativeIdentity, safe_display_text};
+use crate::report::write_deletion_history_json;
 #[cfg(test)]
 use crate::scan_coordinator::ScanGeneration;
 use crate::scan_coordinator::{
@@ -29,7 +32,8 @@ use crate::scan_coordinator::{
     WorkKind, WorkLease, WorkPriority,
 };
 use crate::scan_session::ScanSessionId;
-use crate::scan_store::run_file::SealedRun;
+use crate::scan_store::session::SealedBatch;
+use crate::signals::{Joined, ShutdownWait};
 use crate::state::deletion_work::{
     DeletionExecutionProgress, DeletionWorkCommand, DeletionWorkId, MAX_DELETION_WORK_ITEMS,
 };
@@ -62,13 +66,13 @@ pub(super) enum WorkerEvent {
     ScanBatch {
         lease: Option<WorkLease>,
         entries: Vec<ScannedEntry>,
-        input_runs: Vec<SealedRun>,
+        input_runs: SealedBatch,
     },
     ScanUnscanned {
         lease: Option<WorkLease>,
         path: PathBuf,
         reason: crate::model::UnscannedReason,
-        input_runs: Vec<SealedRun>,
+        input_runs: SealedBatch,
     },
     ScanFailed {
         path: Option<PathBuf>,
@@ -106,11 +110,45 @@ enum ExecutorCommand {
         plan: Box<DeletionPlan>,
         progress: Arc<DeletionExecutionProgress>,
     },
+    /// Holds the thread inside a job that does not return, as a deletion entry stuck in a hung
+    /// file system would: it tells `entered`, then does nothing until `release` is sent to or
+    /// dropped.
+    #[cfg(test)]
+    Hold {
+        entered: Sender<()>,
+        release: Receiver<()>,
+    },
 }
 
 pub(crate) enum DeletionWorkSubmissionError {
     Busy(Box<DeletionWorkCommand>),
     Disconnected,
+}
+
+/// What a deletion-history export reports when it ends.
+#[derive(Debug)]
+pub(crate) struct HistoryExportOutcome {
+    /// How many of the history's reports it covered: the first that many, which the owner drops
+    /// once they are written, keeping any added since.
+    pub(crate) exported: usize,
+    /// The file written, or why none was.
+    pub(crate) result: Result<PathBuf, String>,
+}
+
+/// Why an export could not start.
+#[derive(Debug)]
+pub(crate) enum HistoryExportError {
+    /// An export is already running: there is room for one.
+    Busy,
+    /// The operating system could not start the export's thread.
+    Spawn(io::Error),
+}
+
+/// One deletion-history export, running on a thread of its own.
+struct HistoryExport {
+    /// Holds the export's one outcome.
+    outcome: Receiver<HistoryExportOutcome>,
+    join: thread::JoinHandle<()>,
 }
 
 /// The planner can build one non-mutating identity plan while the executor owns
@@ -127,6 +165,7 @@ pub struct WorkerPool {
     scan_session: ScanSessionId,
     coordinator: SessionCoordinator,
     generation_rebuild_lease: Mutex<Option<WorkLease>>,
+    history_export: Mutex<Option<HistoryExport>>,
     scanner_handle: thread::JoinHandle<()>,
     planner_handle: thread::JoinHandle<()>,
     executor_handle: thread::JoinHandle<()>,
@@ -164,7 +203,10 @@ impl WorkerPool {
         let active_deletion_progress = Arc::new(Mutex::new(None));
         let scan_root = scanner_options.root.clone();
         let scan_root_identity = scanner_options.root_identity.clone();
-        let temporary_storage = deletion_storage;
+        // A file the deletion keeps open in the user's tree is one the scanner must leave out: the
+        // two are one session's, so they share the registry of such files.
+        let temporary_storage =
+            deletion_storage.sharing_private_files_with(&scanner_options.temporary_storage);
         let scan_session = scanner_options.session;
         let coordinator = scanner_options.coordinator.clone();
 
@@ -244,6 +286,7 @@ impl WorkerPool {
             scan_session,
             coordinator,
             generation_rebuild_lease: Mutex::new(None),
+            history_export: Mutex::new(None),
             scanner_handle,
             planner_handle: planner,
             executor_handle: executor,
@@ -337,6 +380,10 @@ impl WorkerPool {
                                 progress,
                             },
                         )))
+                    }
+                    #[cfg(test)]
+                    Err(TrySendError::Full(ExecutorCommand::Hold { .. })) => {
+                        unreachable!("only an execution is submitted here")
                     }
                     Err(TrySendError::Disconnected(_)) => {
                         clear_active_deletion_progress(
@@ -475,7 +522,105 @@ impl WorkerPool {
         self.finish_coordinated_work(lease, completion)
     }
 
+    /// Exports `reports` into `directory` on a thread of its own (`excise-history-export`) and
+    /// reports the outcome to [`Self::poll_history_export`]. Serializing a long history takes
+    /// longer than the interface may go without a frame, so it never runs on the owner loop. One
+    /// export runs at a time: its outcome queue holds one result, and the thread exits once it
+    /// has sent it.
+    pub(crate) fn start_history_export(
+        &self,
+        reports: Vec<Arc<DeletionReport>>,
+        directory: PathBuf,
+    ) -> Result<(), HistoryExportError> {
+        let exported = reports.len();
+        self.start_history_export_with(exported, move |cancelled| {
+            export_deletion_history(&reports, &directory, cancelled)
+        })
+    }
+
+    /// [`Self::start_history_export`] with the writing supplied: `write` runs on the export's
+    /// thread, given the flag that shutdown raises, and its result is the export's outcome for
+    /// `exported` reports. The seam that lets a test hold an export inside its write.
+    pub(crate) fn start_history_export_with(
+        &self,
+        exported: usize,
+        write: impl FnOnce(&AtomicBool) -> Result<PathBuf, String> + Send + 'static,
+    ) -> Result<(), HistoryExportError> {
+        let mut slot = self
+            .history_export
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return Err(HistoryExportError::Busy);
+        }
+        let (sender, outcome) = bounded(1);
+        let cancelled = Arc::clone(&self.cancelled);
+        let join = thread::Builder::new()
+            .name("excise-history-export".to_string())
+            .spawn(move || {
+                let result = write(&cancelled);
+                // The queue's only send, so it never waits; a pool that is gone ignores it.
+                let _ = sender.send(HistoryExportOutcome { exported, result });
+            })
+            .map_err(HistoryExportError::Spawn)?;
+        *slot = Some(HistoryExport { outcome, join });
+        Ok(())
+    }
+
+    /// The outcome of the running export once it ended, which also frees the pool to start the
+    /// next one.
+    pub(crate) fn poll_history_export(&self) -> Option<HistoryExportOutcome> {
+        let mut slot = self
+            .history_export
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = match slot.as_ref()?.outcome.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => HistoryExportOutcome {
+                exported: 0,
+                result: Err("the deletion history export stopped unexpectedly".to_string()),
+            },
+        };
+        if let Some(export) = slot.take() {
+            let _ = export.join.join();
+        }
+        Some(outcome)
+    }
+
+    /// Whether an export is running, or has ended and not yet been collected.
+    pub(crate) fn history_export_running(&self) -> bool {
+        self.history_export
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Holds the deletion executor inside a job that does not return, as an entry stuck in a hung
+    /// file system would, and returns once it is inside. It goes on when `release` is sent to or
+    /// dropped.
+    #[cfg(test)]
+    pub(crate) fn hold_executor_for_test(&self, release: Receiver<()>) {
+        let (entered, inside) = bounded(1);
+        self.executor_commands
+            .try_send(ExecutorCommand::Hold { entered, release })
+            .expect("the executor's lane should be free");
+        inside
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the executor should enter the hold");
+    }
+
+    /// Stops every worker thread and waits for each as long as it takes.
     pub fn shutdown(self) -> Result<(), AppError> {
+        self.shutdown_with(&mut ShutdownWait::patient())
+    }
+
+    /// Stops every worker thread and waits for each, unless `wait` gives up on it: a forced stop
+    /// leaves the scanner, the planner and an export that have not ended after its grace to the
+    /// exit of the process. The deletion executor is the exception: it is waited for however long
+    /// it takes, because a process that ended inside one of its entries could leave a target that
+    /// is neither intact nor gone.
+    pub(crate) fn shutdown_with(self, wait: &mut ShutdownWait) -> Result<(), AppError> {
         let Self {
             events,
             planner_commands,
@@ -488,6 +633,7 @@ impl WorkerPool {
             scan_session: _,
             coordinator,
             generation_rebuild_lease: _,
+            history_export,
             scanner_handle,
             planner_handle,
             executor_handle,
@@ -501,15 +647,87 @@ impl WorkerPool {
         drop(executor_commands);
         drop(scanner);
         drop(coordinator);
-        scanner_handle
-            .join()
-            .map_err(|_| AppError::Worker("scanner thread panicked".to_string()))?;
-        planner_handle
-            .join()
-            .map_err(|_| AppError::Worker("deletion planner thread panicked".to_string()))?;
-        executor_handle
-            .join()
-            .map_err(|_| AppError::Worker("deletion executor thread panicked".to_string()))
+        // Every thread is joined, whichever one panicked: a thread left running would go on
+        // writing after the terminal and the session's storage are cleaned up. The first failure
+        // is what the caller gets, once the last thread has stopped. A thread the wait gave up on
+        // is not one that failed: nothing is known of it, and the process is on its way out.
+        let mut failure = None;
+        for (name, handle) in [
+            ("scanner", scanner_handle),
+            ("deletion planner", planner_handle),
+        ] {
+            if matches!(wait.join(handle), Joined::Ended(Err(_))) {
+                failure.get_or_insert_with(|| AppError::Worker(format!("{name} thread panicked")));
+            }
+        }
+        // The executor is waited for however long it takes, whatever the stop requests. Each entry
+        // is moved aside before it is removed, so a process that ended inside one could leave a
+        // target that is neither intact nor gone, and a deletion stuck in a call that never returns
+        // therefore still holds a forced exit. The grace of a forced stop does not run meanwhile.
+        if wait.join_patiently(executor_handle).is_err() {
+            failure.get_or_insert_with(|| {
+                AppError::Worker("deletion executor thread panicked".to_string())
+            });
+        }
+        // The cancellation above ends an export in progress at its next write.
+        let export = history_export
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(export) = export {
+            drop(export.outcome);
+            if matches!(wait.join(export.join), Joined::Ended(Err(_))) {
+                failure.get_or_insert_with(|| {
+                    AppError::Worker("deletion history export thread panicked".to_string())
+                });
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+/// Writes the deletion history to the next free export file in `directory` and returns its path.
+/// Only a cancellation (the pool shutting down) removes the file it was writing, so that no half
+/// of one is left for a reader to mistake for a whole export; a write that failed reports its
+/// error with the file in place, as every export always has.
+fn export_deletion_history(
+    reports: &[Arc<DeletionReport>],
+    directory: &Path,
+    cancelled: &AtomicBool,
+) -> Result<PathBuf, String> {
+    let path = super::next_export_path_in(directory, "deletion-history")?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| error.to_string())?;
+    super::export_report(ExportWriter { file, cancelled }, |writer| {
+        write_deletion_history_json(reports, writer)
+    })
+    .inspect_err(|_| {
+        if cancelled.load(Ordering::Acquire) {
+            let _ = std::fs::remove_file(&path);
+        }
+    })?;
+    Ok(path)
+}
+
+/// The export's file, which refuses every write once the pool shuts down, so a long export ends
+/// within one buffer's write instead of finishing a file nobody will read.
+struct ExportWriter<'a> {
+    file: std::fs::File,
+    cancelled: &'a AtomicBool,
+}
+
+impl Write for ExportWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::other("the export was cancelled"));
+        }
+        self.file.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
     }
 }
 
@@ -589,11 +807,20 @@ fn execution_worker(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        let ExecutorCommand::Execute {
-            work_id,
-            plan,
-            progress,
-        } = command;
+        let (work_id, plan, progress) = match command {
+            ExecutorCommand::Execute {
+                work_id,
+                plan,
+                progress,
+            } => (work_id, plan, progress),
+            #[cfg(test)]
+            ExecutorCommand::Hold { entered, release } => {
+                let _ = entered.send(());
+                // Returns once the test sends, or drops its end.
+                let _ = release.recv();
+                continue;
+            }
+        };
         let event = match revalidate_plan_cancellable(scan_root, &plan, soft_cancelled) {
             Ok(()) => WorkerEvent::DeletionFinished {
                 work_id,
@@ -1267,6 +1494,54 @@ mod tests {
         workers.shutdown().expect("workers should stop");
     }
 
+    /// A session keeps files open in the tree it scans, and they come and go while the scan runs:
+    /// a deletion's spill on Windows lives in the folder that held its target for as long as the
+    /// report stays in the history. The scan leaves out the paths the session registers, by exact
+    /// path and not by the shape of a name: a user's own file may look just like it.
+    #[test]
+    fn scanner_skips_a_registered_private_file_and_no_other_file_of_its_shape() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let ours = root.path().join(".excise-deletion-spill-0001");
+        let users = root.path().join(".excise-deletion-spill-0002");
+        std::fs::write(&ours, b"ours").expect("the session's file should be written");
+        std::fs::write(&users, b"a user's file").expect("the user's file should be written");
+
+        let scanner_options = options(root.path(), 1);
+        let registration = scanner_options
+            .temporary_storage
+            .private_files()
+            .register(ours.clone());
+        let workers = WorkerPool::start(scanner_options, 16).expect("workers should start");
+        let mut saw_ours = false;
+        let mut saw_users = false;
+        loop {
+            match workers
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("scanner should complete")
+            {
+                WorkerEvent::ScanBatch { entries, .. } => {
+                    saw_ours |= entries.iter().any(|entry| entry.path == ours);
+                    saw_users |= entries.iter().any(|entry| entry.path == users);
+                }
+                WorkerEvent::ScanFinished { cancelled: false } => break,
+                WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
+                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanUnscanned { path, .. } => {
+                    assert_ne!(path, ours, "the session's own file is not even reported");
+                }
+                WorkerEvent::DeletionPlanned { .. }
+                | WorkerEvent::DeletionExecutionRejected { .. }
+                | WorkerEvent::DeletionFinished { .. } => {}
+            }
+        }
+
+        assert!(!saw_ours);
+        assert!(saw_users);
+        drop(registration);
+        workers.shutdown().expect("workers should stop");
+    }
+
     #[cfg(unix)]
     #[test]
     fn scanner_never_traverses_descendant_symlinks() {
@@ -1494,7 +1769,7 @@ mod tests {
                 reason: crate::model::UnscannedReason::Metadata(
                     "metadata failed\t\u{202e}name".to_string(),
                 ),
-                input_runs: Vec::new(),
+                input_runs: SealedBatch::empty(),
             },
             &cancelled,
         ));
@@ -1543,5 +1818,126 @@ mod tests {
         assert!(message.contains("\\x1b"));
         assert!(!message.chars().any(char::is_control));
         assert!(!message.contains('\u{202e}'));
+    }
+
+    fn history_report(target: &str) -> Arc<DeletionReport> {
+        Arc::new(DeletionReport {
+            target_node_id: crate::model::NodeId(1),
+            root_relative_path: PathBuf::from(target),
+            scan_root: PathBuf::from("root"),
+            entries: Vec::new().into(),
+            soft_cancelled: false,
+            precise: true,
+            estimated_bytes: 0,
+        })
+    }
+
+    /// Waits, bounded, for the running export's outcome.
+    fn collect_export(workers: &WorkerPool) -> HistoryExportOutcome {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(outcome) = workers.poll_history_export() {
+                return outcome;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the export should end"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn an_export_writes_what_the_report_writer_streams_and_never_overwrites_a_file() {
+        let directory = tempfile::tempdir().expect("export directory should exist");
+        let reports = vec![history_report("one"), history_report("two")];
+        let mut expected = Vec::new();
+        write_deletion_history_json(&reports, &mut expected).expect("history should serialize");
+        let never = AtomicBool::new(false);
+
+        let first = export_deletion_history(&reports, directory.path(), &never)
+            .expect("the first export should be written");
+        let second = export_deletion_history(&reports, directory.path(), &never)
+            .expect("the second export should be written");
+
+        assert_eq!(first, directory.path().join("excise-deletion-history.json"));
+        assert_eq!(
+            second,
+            directory.path().join("excise-deletion-history-1.json")
+        );
+        assert_eq!(
+            std::fs::read(&first).expect("the first export should be readable"),
+            expected
+        );
+        assert_eq!(
+            std::fs::read(&second).expect("the second export should be readable"),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_cancelled_export_stops_writing_and_leaves_no_half_file_behind() {
+        let directory = tempfile::tempdir().expect("export directory should exist");
+        let cancelled = AtomicBool::new(true);
+
+        let result =
+            export_deletion_history(&[history_report("one")], directory.path(), &cancelled);
+
+        assert!(result.is_err(), "a cancelled export writes no file");
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("export directory should be readable")
+                .count(),
+            0,
+            "no partial file is left for a reader to mistake for a whole export"
+        );
+    }
+
+    #[test]
+    fn one_export_runs_at_a_time_until_its_outcome_is_collected() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let exports = tempfile::tempdir().expect("export directory should exist");
+        let workers = WorkerPool::start(options(root.path(), 1), 1).expect("workers should start");
+        let reports = vec![history_report("one")];
+        let start = |workers: &WorkerPool| {
+            workers.start_history_export(reports.clone(), exports.path().to_path_buf())
+        };
+
+        start(&workers).expect("the first export should start");
+        assert!(workers.history_export_running());
+        assert!(
+            matches!(start(&workers), Err(HistoryExportError::Busy)),
+            "a second export is refused while the first one's outcome is uncollected"
+        );
+
+        let outcome = collect_export(&workers);
+        assert_eq!(outcome.exported, 1);
+        assert_eq!(
+            outcome.result.expect("the export should be written"),
+            exports.path().join("excise-deletion-history.json")
+        );
+        assert!(!workers.history_export_running());
+
+        start(&workers).expect("collecting the outcome frees the pool for the next export");
+        let next = collect_export(&workers);
+        assert_eq!(
+            next.result.expect("the next export should be written"),
+            exports.path().join("excise-deletion-history-1.json")
+        );
+        workers.shutdown().expect("workers should stop");
+    }
+
+    #[test]
+    fn shutdown_joins_an_export_that_nobody_collected() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        let exports = tempfile::tempdir().expect("export directory should exist");
+        let workers = WorkerPool::start(options(root.path(), 1), 1).expect("workers should start");
+        workers
+            .start_history_export(vec![history_report("one")], exports.path().to_path_buf())
+            .expect("the export should start");
+
+        workers
+            .shutdown()
+            .expect("shutdown should join the export thread");
     }
 }

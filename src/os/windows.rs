@@ -47,6 +47,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
+use crate::private_files::{PrivateFile, PrivateFiles};
 use crate::signals::StopRequest;
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -75,7 +76,18 @@ pub(crate) fn raise_soft_descriptor_limit() {}
 /// directory. The exclusive handle denies every sharing mode, so another process
 /// running as the same user cannot reopen or replace its record stream. Windows
 /// removes the file when this handle closes, including process termination.
-pub(crate) fn create_private_temporary_file(directory: &Path) -> io::Result<File> {
+///
+/// The file is a file of Excise's in the user's tree for as long as the handle lives, so its
+/// exact path is registered in `private_files` before it exists. The returned [`PrivateFile`]
+/// keeps the path registered until the file is closed, and so removed, which it does with the
+/// registry locked: the close and the release of the path are one step for every lookup, and no
+/// lookup finds a path that another process has taken since the file went still registered as
+/// Excise's own. The file is handed to it as soon as it exists, so that every way out of this
+/// function, a failed verification included, ends the same way.
+pub(crate) fn create_private_temporary_file(
+    directory: &Path,
+    private_files: &PrivateFiles,
+) -> io::Result<PrivateFile> {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const ERROR_FILE_EXISTS: i32 = 80;
@@ -86,6 +98,7 @@ pub(crate) fn create_private_temporary_file(directory: &Path) -> io::Result<File
     for _ in 0..128 {
         let path = private_temporary_path(directory)?;
         let wide_path = wide_path(&path);
+        let mut private_file = private_files.register(path);
         let attributes = SECURITY_ATTRIBUTES {
             nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
             lpSecurityDescriptor: (&raw const security.descriptor).cast_mut().cast(),
@@ -116,10 +129,11 @@ pub(crate) fn create_private_temporary_file(directory: &Path) -> io::Result<File
             return Err(error);
         }
         let handle = OwnedHandle(handle);
-        verify_private_handle(handle.raw(), false, &user)?;
         // SAFETY: `OwnedHandle::into_raw` transfers this valid owned Windows file handle
         // exactly once to `File`, whose Drop closes it and triggers delete-on-close.
-        return Ok(unsafe { File::from_raw_handle(handle.into_raw()) });
+        private_file.hold(unsafe { File::from_raw_handle(handle.into_raw()) });
+        verify_private_handle(private_file.as_raw_handle(), false, &user)?;
+        return Ok(private_file);
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,

@@ -273,6 +273,11 @@ struct DeletionWorkItem {
     plan: Option<Box<DeletionPlan>>,
     stage: DeletionWorkStage,
     confirmed_at: Option<Duration>,
+    /// The most the deletion's report can add to the history: the resident budget its plan was
+    /// granted. The report is charged for what the plan held in memory, which the budget bounds
+    /// (a plan that spills counts nothing for the entries it put on disk), so the report always
+    /// fits the place kept for it. Held until the item leaves the rail.
+    history_bytes: usize,
 }
 
 enum DeletionWorkStage {
@@ -363,6 +368,7 @@ impl DeletionWork {
             Some(display_target),
             stage,
             reduced_guardrails.then_some(now),
+            maximum_bytes,
         )
     }
 
@@ -372,6 +378,7 @@ impl DeletionWork {
         target: Option<FileToDelete>,
         stage: DeletionWorkStage,
         confirmed_at: Option<Duration>,
+        history_bytes: usize,
     ) -> Result<DeletionWorkId, DeletionWorkError> {
         if self.items.len() >= MAX_DELETION_WORK_ITEMS {
             return Err(DeletionWorkError::QueueFull);
@@ -397,8 +404,18 @@ impl DeletionWork {
             plan: None,
             stage,
             confirmed_at,
+            history_bytes,
         });
         Ok(id)
+    }
+
+    /// How many bytes of the deletion history the work on the rail may still add: what the
+    /// reports of its deletions can take, the sum of the budgets their plans were granted.
+    #[must_use]
+    pub(crate) fn history_bytes_in_flight(&self) -> usize {
+        self.items
+            .iter()
+            .fold(0_usize, |sum, item| sum.saturating_add(item.history_bytes))
     }
 
     /// Starts at most one identity-planning request without blocking the executor lane.

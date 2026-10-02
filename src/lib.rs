@@ -66,6 +66,7 @@ pub mod outcome;
 #[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod outcome;
+mod private_files;
 #[cfg(feature = "internal")]
 pub mod report;
 #[cfg(not(feature = "internal"))]
@@ -231,6 +232,7 @@ pub(crate) fn start<B>(
         config_path: None,
         monochrome_locked: true,
     };
+    app::SCAN_STORE_ON_OWNER_THREAD.set(true);
     runtime::run(
         terminal_backend,
         terminal_events,
