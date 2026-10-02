@@ -1,11 +1,12 @@
+use std::collections::VecDeque;
 #[cfg(test)]
 use std::fs::Metadata;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 
 use ratatui::backend::Backend;
 
@@ -24,31 +25,31 @@ use crate::native_path::NativeIdentity;
 #[cfg(test)]
 use crate::os::physical_size;
 use crate::outcome::RunSummary;
-use crate::report::{
-    ReportError, canonical_scan_report_state, write_canonical_scan_report_json,
-    write_deletion_history_json,
-};
+use crate::report::{ReportError, canonical_scan_report_state, write_canonical_scan_report_json};
 use crate::scan_coordinator::{
     RelativePath, ScanGeneration, SchedulerSnapshot, SessionCoordinator, WorkCompletion, WorkLease,
 };
 #[cfg(test)]
 use crate::scan_store::identity_observation::IdentityObservation;
-use crate::scan_store::page::{PageCursor, PageRequest};
+use crate::scan_store::page::{PageCursor, PageRequest, ScanPage};
 #[cfg(test)]
 use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, SummaryMetrics};
-use crate::scan_store::run_file::SealedRun;
 use crate::scan_store::session::{
-    ScanInputRunFactory, ScanStore, ScanStoreError, scan_store_capacity_message,
+    Publication, ScanInputRunFactory, ScanStore, ScanStoreError, SealedBatch,
 };
 use crate::scan_store::storage::ScanStoreStorage;
+use crate::scan_store::store_thread::{
+    STORE_RESULT_CAPACITY, ScanRoot, StoreEvent, StoreHandle, StoreUnavailable,
+};
+use crate::signals::ShutdownWait;
 use crate::state::deletion_work::{
     DeletionExecutionProgress, DeletionWork, DeletionWorkCommand, DeletionWorkId,
 };
 use crate::state::files::snapshot_page_cache::SnapshotPageCache;
 use crate::state::files::snapshot_tree::SnapshotTree;
 use crate::state::files::tree_view::TreeView;
-use crate::state::tiles::{Board, HALF_ROWS_PER_CELL, Pivot};
-use crate::state::{FileToDelete, UiEffects};
+use crate::state::tiles::{Board, HALF_ROWS_PER_CELL, Pivot, TileGeometry};
+use crate::state::{FileToDelete, PublicationProgress, UiEffects};
 use crate::temporary_storage::TemporaryStorage;
 use crate::theme::{Theme, ThemeId};
 use crate::ui::Display;
@@ -59,6 +60,72 @@ const MINIMUM_PLAN_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_DELETION_REPORTS: usize = 32;
 const SNAPSHOT_PAGE_ENTRIES: usize = 512;
 const MAX_SNAPSHOT_PAGE_HISTORY: usize = 32;
+
+/// How long a finished scan's map may take to publish before the header shows how far it has got.
+/// Most publications end well within it, and for those a progress line would only flash by.
+const PUBLICATION_PROGRESS_DELAY: Duration = Duration::from_millis(100);
+
+#[cfg(test)]
+thread_local! {
+    /// Set on a test's thread while it compares the frames a scan draws: the scan store then stays
+    /// on the owner loop's thread, so each publication ends before the loop's next pass and no
+    /// frame depends on how long a store thread took.
+    pub(crate) static SCAN_STORE_ON_OWNER_THREAD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// What a publication the store thread owes is for, which decides what the owner does with the
+/// generation when it arrives. The store thread answers in the order it was asked, so each result
+/// belongs to the oldest one outstanding.
+#[derive(Debug)]
+enum PendingPublication {
+    /// The primary scan's map.
+    Primary,
+    /// A rebuild's replacement map.
+    Rebuild,
+    /// A deletion's overlay: the map without `prefix`.
+    Overlay { prefix: RelativePath },
+}
+
+/// A publication whose generation the owner has swapped in, or given up on, for the owner loop to
+/// finish its own part of: the coordinator's reduction lease, the completion animation, the next
+/// rebuild. Every publication the app starts ends in exactly one of these.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum FinishedPublication {
+    Primary,
+    Rebuild {
+        /// Why the replacement map could not be published, if it could not.
+        failure: Option<String>,
+    },
+    /// The reader cancelled the rebuild before its replacement map was swapped in: a map the
+    /// store thread built meanwhile was dropped, and the stale map stays.
+    RebuildCancelled,
+}
+
+/// A drill the reader asked for while the page it opens could only come from the store thread: the
+/// live view of a folder belongs to the scan the store thread is writing, and a finished scan's
+/// map is not published until the store thread says so. The map moves when that page arrives.
+#[derive(Debug)]
+struct PendingNavigation {
+    folder: RelativePath,
+    kind: NavigationKind,
+}
+
+#[derive(Debug)]
+enum NavigationKind {
+    /// Opening the selected folder.
+    Enter { pivot: Option<TileGeometry> },
+    /// Leaving a folder for its parent; the map selects the folder it left.
+    Up { leaving_relative: RelativePath },
+}
+
+/// What a background job reports to the reader when it ends. The reader did not ask at this
+/// moment, so [`App::announce`] shows it only once they are not in the middle of a decision.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Announcement {
+    Notice(String),
+    Error(String),
+}
 
 pub enum UiMode {
     Loading,
@@ -203,7 +270,7 @@ where
     show_apparent_size: bool,
     page_memory_limit: usize,
     root_identity: NativeIdentity,
-    scan_store: ScanStore,
+    scan_store: StoreHandle,
     session_coordinator: SessionCoordinator,
     snapshot_page_cache: Option<SnapshotPageCache>,
     snapshot_page_is_provisional: bool,
@@ -216,6 +283,22 @@ where
     generation_rebuild_restart_suppressed: bool,
     generation_rebuild_invalidated: bool,
     generation_rebuild_target: Option<RelativePath>,
+    /// Publications the store thread owes, oldest first: it answers in the order it was asked.
+    publications: VecDeque<PendingPublication>,
+    /// Publications that ended, for the owner loop to finish its own part of: the loop drains them
+    /// with [`App::take_finished_publication`].
+    finished_publications: VecDeque<FinishedPublication>,
+    /// When the primary scan's publication has run long enough to show its progress.
+    publication_progress_from: Option<Instant>,
+    /// An announcement that waits for the reader to finish what they are deciding. A later one
+    /// replaces it: the reader sees the latest result.
+    waiting_announcement: Option<Announcement>,
+    /// The live view of a folder the store thread reported while the map was moving: applied once
+    /// it settles.
+    provisional_page_waiting: Option<(RelativePath, ScanPage)>,
+    /// A drill that waits for the store thread's page, at most one: further drills are ignored
+    /// until it lands.
+    pending_navigation: Option<PendingNavigation>,
     snapshot_page_history: Vec<(RelativePath, Option<PageCursor>)>,
     scheduler_snapshot: Option<SchedulerSnapshot>,
 
@@ -316,8 +399,11 @@ where
             .map_err(|error| AppError::Model(error.to_string()))?;
         let display = Display::new(terminal_backend)?;
         let board = Board::new();
-        let scan_store = ScanStore::new_with_storage(ScanGeneration::initial(), scan_store_storage)
-            .map_err(scan_store_error)?;
+        let scan_store = StoreHandle::new(
+            ScanStore::new_with_storage(ScanGeneration::initial(), scan_store_storage)
+                .map_err(scan_store_error)?,
+        )
+        .map_err(scan_store_error)?;
         let page_memory_limit = MemoryBudget::from_mib(process_memory_mib)
             .map_err(model_error)?
             .model_limit();
@@ -345,7 +431,7 @@ where
         show_apparent_size: bool,
         page_memory_limit: usize,
         root_identity: NativeIdentity,
-        scan_store: ScanStore,
+        scan_store: StoreHandle,
         disable_delete_confirmation: bool,
         keymap: KeyPreset,
         custom_keys: Option<CustomKeyBindings>,
@@ -386,6 +472,12 @@ where
             generation_rebuild_restart_suppressed: false,
             generation_rebuild_invalidated: false,
             generation_rebuild_target: None,
+            publications: VecDeque::new(),
+            finished_publications: VecDeque::new(),
+            publication_progress_from: None,
+            waiting_announcement: None,
+            provisional_page_waiting: None,
+            pending_navigation: None,
             snapshot_page_history: Vec::with_capacity(MAX_SNAPSHOT_PAGE_HISTORY),
             scheduler_snapshot: None,
             display,
@@ -593,17 +685,128 @@ where
     /// Applies background scan data only after a reader-visible drill settles.
     ///
     /// A scan refresh lands directly at its final geometry rather than perpetually
-    /// retargeting the map tween while the scanner is active.
-    pub fn refresh_board_from_scan(&mut self) -> Result<bool, AppError> {
+    /// retargeting the map tween while the scanner is active. The live view belongs to the scan
+    /// the store thread is writing: this asks it for the page, and
+    /// [`Self::process_scan_store_events`] applies the page when it arrives, so the owner loop
+    /// never waits for it.
+    pub fn refresh_board_from_scan(&mut self) -> bool {
         if self.board.is_transitioning() {
-            return Ok(false);
+            return false;
         }
         if !self.uses_provisional_scan_page() {
             if self.update_board() {
                 self.board.settle_geometry();
                 self.mark_dirty();
             }
-            return Ok(true);
+            return true;
+        }
+        self.request_live_page();
+        true
+    }
+
+    /// The folder whose live view the reader waits for: the one a drill opens, else the one on
+    /// screen.
+    fn live_view_folder(&self) -> RelativePath {
+        self.pending_navigation.as_ref().map_or_else(
+            || self.current_relative(),
+            |navigation| navigation.folder.clone(),
+        )
+    }
+
+    fn current_relative(&self) -> RelativePath {
+        self.snapshot_page_cache
+            .as_ref()
+            .map_or_else(RelativePath::root, |cache| {
+                cache.current().current_relative().clone()
+            })
+    }
+
+    /// The path of the folder the scan should look at first: what a drill opens, once it lands,
+    /// else what is on screen.
+    pub(crate) fn scan_view_folder_path(&self) -> PathBuf {
+        self.pending_navigation.as_ref().map_or_else(
+            || self.current_folder_path(),
+            |navigation| self.scan_root.join(navigation.folder.to_path_buf()),
+        )
+    }
+
+    /// Asks the store thread for the live view of the folder the reader looks at or opens.
+    fn request_live_page(&mut self) {
+        let folder = self.live_view_folder();
+        if let Err(error) = self
+            .scan_store
+            .request_provisional_page(&folder, SNAPSHOT_PAGE_ENTRIES)
+        {
+            self.fail_scan_store(error.to_string());
+        }
+    }
+
+    /// The scan store cannot go on: its map is unavailable, and the reason is kept for the
+    /// message the reader sees when the scan ends.
+    fn fail_scan_store(&mut self, failure: String) {
+        if self.scan_store_available {
+            self.abandon_scan_store_generation_with_failure(failure);
+        }
+        self.pending_navigation = None;
+        self.provisional_page_waiting = None;
+    }
+
+    /// Applies the live view the store thread built, unless the reader has moved on since asking.
+    fn apply_provisional_page(
+        &mut self,
+        folder: RelativePath,
+        page: Result<Box<ScanPage>, ScanStoreError>,
+    ) {
+        if !self.uses_provisional_scan_page() || folder != self.live_view_folder() {
+            return;
+        }
+        match page {
+            Ok(page) => {
+                let page = *page;
+                let navigating = self.pending_navigation.is_some();
+                if !navigating && self.board.is_transitioning() {
+                    self.provisional_page_waiting = Some((folder, page));
+                } else {
+                    self.show_provisional_page(&folder, page);
+                }
+            }
+            Err(error) => self.fail_scan_store(error.to_string()),
+        }
+    }
+
+    /// Applies a live view that waited for the map to stop moving, once it has. Returns whether
+    /// it applied one.
+    pub(crate) fn apply_waiting_provisional_page(&mut self) -> bool {
+        if self.board.is_transitioning() {
+            return false;
+        }
+        let Some((folder, page)) = self.provisional_page_waiting.take() else {
+            return false;
+        };
+        if !self.uses_provisional_scan_page() || folder != self.live_view_folder() {
+            return false;
+        }
+        self.show_provisional_page(&folder, page);
+        true
+    }
+
+    fn show_provisional_page(&mut self, folder: &RelativePath, page: ScanPage) {
+        self.provisional_page_waiting = None;
+        if let Some(navigation) = self
+            .pending_navigation
+            .take_if(|navigation| navigation.folder == *folder)
+        {
+            let leaving = self
+                .snapshot_page_cache
+                .as_ref()
+                .map(|cache| cache.current().current_id());
+            if let Err(error) = self.install_provisional_snapshot(page) {
+                self.show_error(format!("Could not open this scan page: {error}"));
+                return;
+            }
+            self.snapshot_page_history.clear();
+            self.finish_navigation(navigation.kind, leaving);
+            return;
         }
         let selected_relative = self.board.currently_selected().and_then(|tile| {
             self.snapshot_page_cache
@@ -612,13 +815,10 @@ where
                 .cloned()
         });
         let had_selection = selected_relative.is_some();
-        let folder = self
-            .snapshot_page_cache
-            .as_ref()
-            .map_or_else(RelativePath::root, |cache| {
-                cache.current().current_relative().clone()
-            });
-        self.load_provisional_snapshot_page(&folder)?;
+        if let Err(error) = self.install_provisional_snapshot(page) {
+            self.fail_scan_store(error.to_string());
+            return;
+        }
         self.board.reset_selected_index();
         let changed = self.update_board();
         if let Some(selected_relative) = selected_relative.as_ref()
@@ -633,7 +833,6 @@ where
             self.board.settle_geometry();
             self.mark_dirty();
         }
-        Ok(true)
     }
 
     fn update_board(&mut self) -> bool {
@@ -662,10 +861,92 @@ where
             && self.scan_store.published().is_some()
     }
 
-    fn deletion_is_blocked(&self) -> bool {
+    /// Whether no deletion can go on from the map the reader sees: the store is lost, or a
+    /// rebuild is replacing the map. Pending deletion work is cancelled, not kept.
+    fn deletion_is_unavailable(&self) -> bool {
         !self.scan_store_available
             || self.generation_rebuild_required
             || self.generation_rebuild_active
+    }
+
+    /// Whether the reader may start a new deletion: not while it is unavailable, and not while
+    /// the finished scan's map has not arrived to be deleted from.
+    fn deletion_is_blocked(&self) -> bool {
+        self.deletion_is_unavailable() || self.primary_publication_pending()
+    }
+
+    /// Whether the store thread still owes a map that deletion starts from: the finished scan's,
+    /// or the one without the last deletion's target, which the next overlay derives from. Work
+    /// already queued waits for it rather than being cancelled, because the wait ends by itself
+    /// and the owner loop starts that work when it does.
+    fn deletion_waits_for_store(&self) -> bool {
+        self.primary_publication_pending() || self.overlay_publication_pending()
+    }
+
+    /// Whether the finished scan's map has not arrived from the store thread yet: until it does,
+    /// no page of it can be read, and nothing can be deleted from it.
+    pub(crate) fn primary_publication_pending(&self) -> bool {
+        self.publications
+            .iter()
+            .any(|pending| matches!(pending, PendingPublication::Primary))
+    }
+
+    /// Whether a deletion's map is still being built: until it arrives, the map on screen lists
+    /// what the deletion removed.
+    fn overlay_publication_pending(&self) -> bool {
+        self.publications
+            .iter()
+            .any(|pending| matches!(pending, PendingPublication::Overlay { .. }))
+    }
+
+    /// Whether the primary scan's publication ended and the owner loop has not taken it yet.
+    #[cfg(feature = "internal")]
+    pub(crate) fn primary_publication_finished(&self) -> bool {
+        self.finished_publications
+            .iter()
+            .any(|finished| matches!(finished, FinishedPublication::Primary))
+    }
+
+    /// Brings the progress shown for the finishing map up to date: how many stages the store
+    /// thread has completed publishing the primary scan's map, and how long the map has been
+    /// finishing, once the publication has run [`PUBLICATION_PROGRESS_DELAY`] and until it ends.
+    /// The stage count is the work advancing, but one stage can take longer than the screen may
+    /// stand still while the loop is idle and ready for a key, so the clock moves the display
+    /// every tenth of a second in between. Returns whether the display changed.
+    pub(crate) fn refresh_publication_progress(&mut self) -> bool {
+        let now = Instant::now();
+        let progress = self
+            .publication_progress_from
+            .filter(|from| now >= *from && self.primary_publication_pending())
+            .and_then(|from| {
+                let (done, total) = self.scan_store.publication_progress()?;
+                let elapsed = now.duration_since(from) + PUBLICATION_PROGRESS_DELAY;
+                Some(PublicationProgress {
+                    done,
+                    total,
+                    elapsed_tenths: u32::try_from(elapsed.as_millis() / 100).unwrap_or(u32::MAX),
+                })
+            });
+        if progress == self.ui_effects.publication_progress {
+            return false;
+        }
+        self.ui_effects.publication_progress = progress;
+        self.mark_dirty();
+        true
+    }
+
+    /// Whether the page a drill opens can only come from the store thread: the live view while a
+    /// scan is open, and nothing yet while the map it produced is being published.
+    fn navigation_waits_for_store(&self) -> bool {
+        self.snapshot_page_is_provisional
+            && self.scan_store_available
+            && (self.scan_store.active_generation().is_some()
+                || self.publications.iter().any(|pending| {
+                    matches!(
+                        pending,
+                        PendingPublication::Primary | PendingPublication::Rebuild
+                    )
+                }))
     }
 
     fn files_in_current_view(&self, offset: usize) -> Vec<crate::state::tiles::FileMetadata> {
@@ -735,21 +1016,33 @@ where
             .into_iter()
             .collect();
         self.scan_store
-            .append_observation_batch(
-                vec![PathObservation::with_snapshot(
-                    relative,
-                    kind,
-                    SummaryMetrics::leaf(
-                        snapshot.apparent_bytes,
-                        allocated_bounds,
-                        reclaimable_bounds,
-                    ),
-                    Coverage::Complete,
-                    Some(snapshot),
-                )],
-                identities,
-            )
+            .with_inline_store(|store| {
+                store.append_observation_batch(
+                    vec![PathObservation::with_snapshot(
+                        relative,
+                        kind,
+                        SummaryMetrics::leaf(
+                            snapshot.apparent_bytes,
+                            allocated_bounds,
+                            reclaimable_bounds,
+                        ),
+                        Coverage::Complete,
+                        Some(snapshot),
+                    )],
+                    identities,
+                )
+            })
             .expect("fixture entry should append to the canonical scan store");
+    }
+
+    /// Publishes the finished primary scan the way the owner loop does: the store thread's
+    /// result is applied, then the publication that ended is taken, as the loop would to finish
+    /// the coordinator's reduction.
+    #[cfg(test)]
+    pub(crate) fn finalize_scan(&mut self) {
+        self.begin_primary_publication();
+        self.process_scan_store_events();
+        while self.take_finished_publication().is_some() {}
     }
 
     fn abandon_scan_store_generation(&mut self) {
@@ -816,51 +1109,271 @@ where
         self.mark_dirty();
     }
 
-    fn publish_scan_store(&mut self) {
-        let current = self
-            .snapshot_page_cache
-            .as_ref()
-            .map_or_else(RelativePath::root, |cache| {
-                cache.current().current_relative().clone()
-            });
-        if !self.publish_scan_store_generation() {
+    /// Moves the scan store onto its own thread, from where it admits what the scanner seals and
+    /// publishes what it finishes. Called once, before the scan begins.
+    pub(crate) fn start_scan_store_thread(&mut self) -> Result<(), AppError> {
+        #[cfg(test)]
+        if SCAN_STORE_ON_OWNER_THREAD.get() {
+            return Ok(());
+        }
+        self.scan_store
+            .start_thread()
+            .map_err(|error| AppError::io("could not start the scan store thread", error))
+    }
+
+    /// Stops the store thread and waits for it, for as long as `wait` allows: nothing writes the
+    /// session's scratch storage afterwards, unless a forced stop left the thread behind.
+    pub(crate) fn shutdown_scan_store(&mut self, wait: &mut ShutdownWait) -> Result<(), AppError> {
+        self.scan_store
+            .shutdown_with(wait)
+            .map_err(AppError::Worker)
+    }
+
+    /// Holds the store thread inside a call, as a hung file system would; it goes on when the
+    /// guard is dropped.
+    #[cfg(test)]
+    pub(crate) fn hold_scan_store_thread_for_test(
+        &mut self,
+    ) -> crate::scan_store::store_thread::HeldStoreThread {
+        self.scan_store.hold_for_test()
+    }
+
+    /// Whether the store thread can take another scanner batch: the owner loop takes the next
+    /// scanner event only when it can, so a store thread that falls behind backs the scanner up.
+    #[must_use]
+    pub(crate) fn scan_store_has_room_for_batch(&self) -> bool {
+        self.scan_store.has_room_for_batch()
+    }
+
+    /// Whether the store thread still owes a publication, or one ended and the loop has not taken
+    /// it yet: the loop keeps polling while this holds.
+    #[must_use]
+    pub(crate) fn scan_store_busy(&self) -> bool {
+        !self.publications.is_empty() || !self.finished_publications.is_empty()
+    }
+
+    /// The next publication that ended, for the owner loop to finish its own part of.
+    pub(crate) fn take_finished_publication(&mut self) -> Option<FinishedPublication> {
+        self.finished_publications.pop_front()
+    }
+
+    /// Applies what the store thread has reported since the last call. Returns whether it
+    /// reported anything.
+    pub(crate) fn process_scan_store_events(&mut self) -> bool {
+        let mut handled = false;
+        for _ in 0..STORE_RESULT_CAPACITY {
+            let Some(event) = self.scan_store.poll() else {
+                break;
+            };
+            handled = true;
+            match event {
+                StoreEvent::AdmissionFailed(message) => self.fail_scan_store(message),
+                StoreEvent::ProvisionalPage { folder, page } => {
+                    self.apply_provisional_page(folder, page);
+                }
+                StoreEvent::Published(result) | StoreEvent::Overlaid(result) => {
+                    self.apply_publication_result(result.map_err(|error| error.to_string()));
+                }
+                StoreEvent::Failure(message) => self.scan_store_stopped(&message),
+            }
+        }
+        handled
+    }
+
+    /// The store thread reported a failure nothing else carries, or stopped: the results it still
+    /// owed are not coming, so every publication outstanding ends as a failed one.
+    fn scan_store_stopped(&mut self, failure: &str) {
+        self.fail_scan_store(failure.to_owned());
+        while let Some(pending) = self.publications.pop_front() {
+            self.settle_publication(pending, Err(failure.to_owned()));
+        }
+    }
+
+    /// Starts publishing the finished primary scan on the store thread. The map, and the
+    /// completion the reader sees, wait for the generation: [`Self::process_scan_store_events`]
+    /// swaps it in when it arrives. Ends in exactly one [`FinishedPublication::Primary`].
+    pub(crate) fn begin_primary_publication(&mut self) {
+        if self.begin_publication(PendingPublication::Primary) {
+            self.publication_progress_from = Some(Instant::now() + PUBLICATION_PROGRESS_DELAY);
+            return;
+        }
+        let message = self.scan_results_unavailable_message();
+        self.show_scan_results_unavailable(message);
+        self.finished_publications
+            .push_back(FinishedPublication::Primary);
+    }
+
+    /// Asks the store thread to publish the active generation. Returns whether it is now
+    /// publishing: `false` means the store was already unavailable, or could not be reached.
+    fn begin_publication(&mut self, pending: PendingPublication) -> bool {
+        if !self.scan_store_available {
+            return false;
+        }
+        if let Err(error) = self.scan_store.begin_publication() {
+            self.abandon_scan_store_generation_with_failure(error.to_string());
+            return false;
+        }
+        self.publications.push_back(pending);
+        true
+    }
+
+    /// The oldest publication outstanding has ended with `result`.
+    fn apply_publication_result(&mut self, result: Result<Publication, String>) {
+        let Some(pending) = self.publications.pop_front() else {
+            return;
+        };
+        self.settle_publication(pending, result);
+    }
+
+    fn settle_publication(
+        &mut self,
+        pending: PendingPublication,
+        result: Result<Publication, String>,
+    ) {
+        match pending {
+            PendingPublication::Primary => self.complete_primary_publication(result),
+            PendingPublication::Rebuild => self.complete_rebuild_publication(result),
+            PendingPublication::Overlay { prefix } => {
+                self.complete_overlay_publication(result, &prefix);
+            }
+        }
+    }
+
+    fn complete_primary_publication(&mut self, result: Result<Publication, String>) {
+        self.publication_progress_from = None;
+        let current = self.current_relative();
+        let published = match result {
+            Ok(publication) if self.scan_store_available => {
+                self.scan_store.install(publication);
+                if self.scan_store.is_summary_only() {
+                    self.scan_store_available = false;
+                    self.scan_store_failure = Some("scan store capacity exhausted".to_string());
+                    false
+                } else {
+                    true
+                }
+            }
+            // The store was given up on while the publication was under way: its failure stays
+            // the reason, and the generation, if any, is dropped.
+            Ok(_) => false,
+            Err(failure) => {
+                if self.scan_store_available {
+                    self.abandon_scan_store_generation_with_failure(failure);
+                }
+                false
+            }
+        };
+        if published {
+            self.show_published_map(&current);
+        } else {
             let message = self.scan_results_unavailable_message();
             self.show_scan_results_unavailable(message);
+        }
+        self.finished_publications
+            .push_back(FinishedPublication::Primary);
+        self.resume_pending_navigation();
+    }
+
+    fn complete_rebuild_publication(&mut self, result: Result<Publication, String>) {
+        if self.generation_rebuild_restart_suppressed {
+            // The reader pressed Esc while the replacement map was being published: the scanner
+            // had already finished, so only here can the cancellation take effect. The map the
+            // store thread built is dropped, and the stale one stays.
+            drop(result);
+            self.finished_publications
+                .push_back(FinishedPublication::RebuildCancelled);
             return;
         }
+        let failure = if self.scan_store_available {
+            match result {
+                Ok(publication) => {
+                    self.scan_store.install(publication);
+                    self.scan_store
+                        .is_summary_only()
+                        .then(|| "scan store capacity exhausted".to_string())
+                }
+                Err(failure) => Some(failure),
+            }
+        } else {
+            self.scan_store_failure.clone().or_else(|| {
+                Some(
+                    "scan store was unavailable before the replacement map could publish"
+                        .to_string(),
+                )
+            })
+        };
+        self.finished_publications
+            .push_back(FinishedPublication::Rebuild { failure });
+    }
+
+    fn complete_overlay_publication(
+        &mut self,
+        result: Result<Publication, String>,
+        prefix: &RelativePath,
+    ) {
+        let publication = match result {
+            Ok(publication) if self.scan_store_available => publication,
+            // The map was given up on while the overlay was under way: whatever gave it up
+            // already showed that, and nothing shows this map.
+            Ok(_) => return,
+            Err(failure) if !self.scan_store_available => {
+                // The store was lost while the overlay was under way (its thread stopped, or the
+                // map was given up on). No map follows the deletion, and the one on screen still
+                // lists what the deletion removed: it must not stay up as the current map.
+                self.scan_store_failure.get_or_insert(failure);
+                let message = self.scan_results_unavailable_message();
+                self.show_scan_results_unavailable(message);
+                self.render_and_update_board();
+                return;
+            }
+            Err(_) => {
+                self.invalidate_snapshot_view_for_live_mutation();
+                self.render_and_update_board();
+                return;
+            }
+        };
+        self.scan_store.install(publication);
         if self.scan_store.is_summary_only() {
-            self.scan_store_available = false;
-            self.scan_store_failure = Some("scan store capacity exhausted".to_string());
-            self.show_scan_results_unavailable(self.scan_results_unavailable_message());
+            self.invalidate_snapshot_view_for_live_mutation();
+            self.render_and_update_board();
             return;
         }
+        let fallback = relative_parent(prefix);
+        let current = self.current_relative();
+        let desired = if current.starts_with(prefix) {
+            fallback.clone()
+        } else {
+            current
+        };
+        self.invalidate_cached_pages_for_overlay(prefix);
+        if self.load_snapshot_page(&desired).is_err() && self.load_snapshot_page(&fallback).is_err()
+        {
+            self.invalidate_snapshot_view_for_live_mutation();
+        }
+        self.render_and_update_board();
+    }
+
+    /// Shows the map the store thread published, at the folder the reader was looking at, else at
+    /// the root.
+    fn show_published_map(&mut self, current: &RelativePath) {
         self.snapshot_page_cache = None;
         self.snapshot_page_is_provisional = false;
         self.snapshot_page_history.clear();
         self.snapshot_filter = None;
+        self.provisional_page_waiting = None;
         if let Err(error) = self
-            .load_snapshot_page(&current)
+            .load_snapshot_page(current)
             .or_else(|_| self.load_snapshot_page(&RelativePath::root()))
         {
             self.scan_store_available = false;
             self.scan_store_failure = Some(error.to_string());
             // The unavailable-results screen is drawn over a page, as every state is.
             self.reset_loading_snapshot();
+            self.pending_navigation = None;
             self.show_scan_results_unavailable(
                 "Excise could not open the completed folder map. Run it again.",
             );
         }
-    }
-
-    fn publish_scan_store_generation(&mut self) -> bool {
-        if !self.scan_store_available {
-            return false;
-        }
-        if let Err(error) = self.scan_store.publish() {
-            self.abandon_scan_store_generation_with_failure(error.to_string());
-            return false;
-        }
-        true
     }
 
     fn load_snapshot_page(&mut self, folder: &RelativePath) -> Result<(), AppError> {
@@ -874,12 +1387,10 @@ where
         after: Option<PageCursor>,
     ) -> Result<(), AppError> {
         if self.uses_provisional_scan_page() {
-            if after.is_some() {
-                return Err(AppError::Model(
-                    "live scan pages cannot be paginated before the scan finishes".to_string(),
-                ));
-            }
-            return self.load_provisional_snapshot_page(folder);
+            // A live view is the store thread's: it arrives as an event, never from here.
+            return Err(AppError::Model(
+                "a live scan page is not available until the store thread reports it".to_string(),
+            ));
         }
         if self.snapshot_page_is_provisional {
             self.snapshot_page_cache = None;
@@ -936,12 +1447,8 @@ where
         Ok(())
     }
 
-    fn load_provisional_snapshot_page(&mut self, folder: &RelativePath) -> Result<(), AppError> {
-        let request = PageRequest::first(folder.clone(), SNAPSHOT_PAGE_ENTRIES);
-        let page = self
-            .scan_store
-            .provisional_page(&request)
-            .map_err(scan_store_error)?;
+    /// Installs the live view of one folder as the page on screen.
+    fn install_provisional_snapshot(&mut self, page: ScanPage) -> Result<(), AppError> {
         let snapshot = SnapshotTree::from_provisional_page(
             self.scan_root.clone(),
             page,
@@ -961,6 +1468,84 @@ where
         }
         self.snapshot_page_is_provisional = true;
         Ok(())
+    }
+
+    /// Opens a folder now, or once the store thread has the page for it. Returns false only when
+    /// the folder could not be opened; a drill that waits has been accepted.
+    fn navigate(&mut self, navigation: PendingNavigation) -> bool {
+        if self.pending_navigation.is_some() {
+            return true;
+        }
+        if self.navigation_waits_for_store() {
+            self.pending_navigation = Some(navigation);
+            if self.uses_provisional_scan_page() {
+                self.request_live_page();
+            }
+            return true;
+        }
+        self.perform_navigation(navigation)
+    }
+
+    /// Opens a folder of the published map.
+    fn perform_navigation(&mut self, navigation: PendingNavigation) -> bool {
+        let leaving = self
+            .snapshot_page_cache
+            .as_ref()
+            .map(|cache| cache.current().current_id());
+        if !self.begin_snapshot_page_navigation(
+            &navigation.folder,
+            None,
+            SnapshotPageHistoryChange::Reset,
+        ) {
+            return false;
+        }
+        self.finish_navigation(navigation.kind, leaving);
+        true
+    }
+
+    /// What a drill does to the map once the page it opens is on screen. `leaving` is the folder
+    /// that was on screen before.
+    fn finish_navigation(&mut self, kind: NavigationKind, leaving: Option<NodeId>) {
+        match kind {
+            NavigationKind::Enter { pivot } => {
+                self.board.record_current_zoom_level();
+                if let Some(pivot) = pivot {
+                    self.board.pivot_transition_on_geometry(pivot);
+                }
+                self.board.reset_zoom_index();
+                self.board.reset_selected_index();
+                self.render_and_update_board();
+            }
+            NavigationKind::Up { leaving_relative } => {
+                if let Some(zoom_level) = self.board.pop_previous_zoom_level() {
+                    self.board.set_zoom_index(zoom_level);
+                }
+                if let Some(leaving) = leaving {
+                    self.board.pivot_transition_on(Pivot::Entry(leaving));
+                }
+                self.render_and_update_board();
+                if let Some(node_id) = self
+                    .snapshot_page_cache
+                    .as_ref()
+                    .and_then(|cache| cache.current().id_for_relative(&leaving_relative))
+                {
+                    self.board.select_node(node_id);
+                } else {
+                    self.board.select_largest();
+                }
+                self.mark_dirty();
+            }
+        }
+    }
+
+    /// Opens the folder a drill waited for, now that the map it belongs to is published.
+    fn resume_pending_navigation(&mut self) {
+        let Some(navigation) = self.pending_navigation.take() else {
+            return;
+        };
+        if self.scan_store_available {
+            self.perform_navigation(navigation);
+        }
     }
 
     fn reset_loading_snapshot(&mut self) {
@@ -1057,6 +1642,8 @@ where
         true
     }
     fn invalidate_snapshot_view_for_live_mutation(&mut self) {
+        self.pending_navigation = None;
+        self.provisional_page_waiting = None;
         if let Err(error) = self.scan_store.discard_active() {
             self.scan_store_failure
                 .get_or_insert_with(|| error.to_string());
@@ -1088,15 +1675,23 @@ where
 
     /// Applies a completed mutation to the canonical generation boundary.
     ///
-    /// A complete removal of its exact target can safely publish an overlay
-    /// that drops that prefix. Any partial outcome invalidates the immutable
-    /// snapshot instead of presenting a fabricated mixture of pre- and
-    /// post-deletion facts.
+    /// A complete removal of its exact target can safely publish an overlay that drops that
+    /// prefix: the store thread builds it from the map the reader has installed, with the folder
+    /// that held the target recorded as the file system has it now, and the map swaps it in when
+    /// it arrives ([`Self::complete_overlay_publication`]); until then the reader keeps the map
+    /// they have. Any partial outcome invalidates the immutable snapshot instead of presenting a
+    /// fabricated mixture of pre- and post-deletion facts, and so does a removal the map cannot
+    /// describe exactly: one that may have left other links to a file it removed (the map has
+    /// its files by path, and does not say where those are), and one the store thread's overlay
+    /// then fails to describe. The map is scanned again.
     fn reconcile_generation_after_deletion(&mut self, report: &DeletionReport) {
         if report.deleted_entries() == 0 {
             return;
         }
-        if !self.scan_store_available || !report.target_was_removed() {
+        if !self.scan_store_available
+            || !report.target_was_removed()
+            || report.deleted_files_may_have_other_links()
+        {
             self.invalidate_snapshot_view_for_live_mutation();
             return;
         }
@@ -1107,53 +1702,50 @@ where
             self.invalidate_snapshot_view_for_live_mutation();
             return;
         };
+        // An overlay derives from the installed map, and only from it: while the primary scan has
+        // not published one, or another publication is still owed (the installed map is then
+        // about to be replaced, and an overlay of it would replace its successor with a map
+        // older than that one), the deletion invalidates the map, as it always has.
+        if self.scan_store.published().is_none() || !self.publications.is_empty() {
+            self.invalidate_snapshot_view_for_live_mutation();
+            return;
+        }
         let Ok(next_generation) = self.scan_store.next_generation() else {
             self.invalidate_snapshot_view_for_live_mutation();
             return;
         };
-        let current = self
-            .snapshot_page_cache
-            .as_ref()
-            .map_or_else(RelativePath::root, |cache| {
-                cache.current().current_relative().clone()
-            });
-
-        let fallback = relative_parent(&prefix);
-        let desired = if current.starts_with(&prefix) {
-            fallback.clone()
-        } else {
-            current
+        let root = ScanRoot {
+            path: self.scan_root.clone(),
+            identity: self.root_identity.clone(),
         };
-        self.invalidate_cached_pages_for_overlay(&prefix);
         if self
             .scan_store
-            .begin_overlay_generation(next_generation, &prefix)
-            .and_then(|()| self.scan_store.publish())
+            .begin_overlay(next_generation, &prefix, root)
             .is_err()
         {
             self.invalidate_snapshot_view_for_live_mutation();
             return;
         }
+        self.publications
+            .push_back(PendingPublication::Overlay { prefix });
         if self
             .session_coordinator
             .advance_generation(next_generation)
             .is_err()
         {
             self.invalidate_snapshot_view_for_live_mutation();
-            return;
-        }
-        if self.load_snapshot_page(&desired).is_err() && self.load_snapshot_page(&fallback).is_err()
-        {
-            self.invalidate_snapshot_view_for_live_mutation();
         }
     }
 
     /// Starts a fresh root generation after a partial deletion invalidated its
-    /// prior immutable snapshot. Returns false when no rebuild is pending.
+    /// prior immutable snapshot. Returns false when no rebuild is pending, or while the store
+    /// thread still owes a publication: the new generation would otherwise begin in the middle of
+    /// the previous one's.
     pub(crate) fn begin_generation_rebuild(&mut self) -> Result<bool, AppError> {
         if !self.generation_rebuild_required
             || self.generation_rebuild_active
             || self.generation_rebuild_restart_suppressed
+            || self.scan_store_busy()
         {
             return Ok(false);
         }
@@ -1164,7 +1756,7 @@ where
             .map_err(scan_store_error)?;
         self.scan_store
             .begin_generation(next_generation)
-            .map_err(scan_store_error)?;
+            .map_err(store_unavailable_error)?;
         self.session_coordinator
             .advance_generation(next_generation)
             .map_err(|error| AppError::Worker(error.to_string()))?;
@@ -1279,10 +1871,6 @@ where
             .map_err(|error| AppError::Model(error.to_string()))
     }
 
-    pub(crate) fn finalize_scan(&mut self) {
-        self.publish_scan_store();
-    }
-
     #[must_use]
     pub(crate) fn scan_store_stats(&self) -> (u64, u64) {
         self.scan_store.storage_stats()
@@ -1316,25 +1904,16 @@ where
             .map_err(scan_store_error)
     }
 
-    /// Admits worker-sealed runs only after the scanner coordinator validated
-    /// the corresponding work lease.
-    pub(crate) fn admit_scan_input_runs(&mut self, lease: &WorkLease, runs: Vec<SealedRun>) {
-        if runs.is_empty() {
+    /// Hands worker-sealed runs to the store thread for admission, which validates each run's
+    /// work lease. Whatever happens to the batch from here, its in-flight credit returns exactly
+    /// once, when the batch is dropped: after the store thread admits it, or here when the store
+    /// is already unavailable.
+    pub(crate) fn admit_scan_input_runs(&mut self, lease: &WorkLease, batch: SealedBatch) {
+        if batch.is_empty() || !self.scan_store_available {
             return;
         }
-        // Releases this batch's credit (`ScanInputRunFactory::seal_observation_batch`) now
-        // that it has reached admission, regardless of what admission does with it below.
-        self.scan_store.release_inflight_batch_credit();
-        if !self.scan_store_available {
-            return;
-        }
-        for run in runs {
-            if let Err(error) = self.scan_store.accept_leased_input_run(lease, run) {
-                self.abandon_scan_store_generation_with_failure(scan_store_capacity_message(
-                    &error,
-                ));
-                return;
-            }
+        if let Err(error) = self.scan_store.admit(lease, batch) {
+            self.abandon_scan_store_generation_with_failure(error.to_string());
         }
     }
 
@@ -1600,26 +2179,19 @@ where
         let Some(folder) = folder else {
             return;
         };
-        if !self.begin_snapshot_page_navigation(&folder, None, SnapshotPageHistoryChange::Reset) {
-            return;
-        }
-        self.board.record_current_zoom_level();
-        if let Some(pivot) = pivot {
-            self.board.pivot_transition_on_geometry(pivot);
-        }
-        self.board.reset_zoom_index();
-        self.board.reset_selected_index();
-        self.render_and_update_board();
+        self.navigate(PendingNavigation {
+            folder,
+            kind: NavigationKind::Enter { pivot },
+        });
     }
 
     pub fn go_up(&mut self) -> bool {
-        let (leaving, leaving_relative, parent) = self
+        let (leaving_relative, parent) = self
             .snapshot_page_cache
             .as_ref()
             .map(|cache| {
                 let snapshot = cache.current();
                 (
-                    snapshot.current_id(),
                     snapshot.current_relative().clone(),
                     snapshot.parent_folder(),
                 )
@@ -1628,25 +2200,10 @@ where
         let Some(parent) = parent else {
             return false;
         };
-        if !self.begin_snapshot_page_navigation(&parent, None, SnapshotPageHistoryChange::Reset) {
-            return false;
-        }
-        if let Some(zoom_level) = self.board.pop_previous_zoom_level() {
-            self.board.set_zoom_index(zoom_level);
-        }
-        self.board.pivot_transition_on(Pivot::Entry(leaving));
-        self.render_and_update_board();
-        if let Some(node_id) = self
-            .snapshot_page_cache
-            .as_ref()
-            .and_then(|cache| cache.current().id_for_relative(&leaving_relative))
-        {
-            self.board.select_node(node_id);
-        } else {
-            self.board.select_largest();
-        }
-        self.mark_dirty();
-        true
+        self.navigate(PendingNavigation {
+            folder: parent,
+            kind: NavigationKind::Up { leaving_relative },
+        })
     }
 
     /// Returns the identity-bound target represented by the rendered tile.
@@ -1662,7 +2219,14 @@ where
             self.show_error("Resize to at least 50 x 15 before permanent deletion");
             return None;
         }
-        if self.deletion_history.len() >= MAX_RETAINED_DELETION_REPORTS
+        // Every deletion allowed to start keeps its report, so the history counts the deletions
+        // still running with the reports it holds. An export leaves the reports it is writing in
+        // place until it ends, and a deletion that finishes meanwhile must still find room.
+        if self
+            .deletion_history
+            .len()
+            .saturating_add(self.deletion_work.len())
+            >= MAX_RETAINED_DELETION_REPORTS
             || self.remaining_deletion_history_bytes() < MINIMUM_PLAN_BYTES
         {
             self.show_error("Deletion history is full; export or restart before deleting");
@@ -1745,14 +2309,24 @@ where
         self.delete_confirmation_disabled
     }
 
-    #[must_use]
-    pub const fn remaining_deletion_history_bytes(&self) -> usize {
+    /// What the history can still take that no report holds.
+    const fn deletion_history_room_bytes(&self) -> usize {
         self.deletion_history_limit
             .saturating_sub(self.deletion_history_bytes)
     }
 
+    /// What a deletion that has not started may plan with: the room no report holds, less what
+    /// the reports of the deletions already running may still take.
     #[must_use]
-    pub const fn maximum_deletion_plan_bytes(&self) -> usize {
+    pub fn remaining_deletion_history_bytes(&self) -> usize {
+        self.deletion_history_room_bytes()
+            .saturating_sub(self.deletion_work.history_bytes_in_flight())
+    }
+
+    /// Each plan may use half of what the history has left, so that the plans of the deletions
+    /// running together, each budgeted from what the one before it left, fit it together.
+    #[must_use]
+    pub fn maximum_deletion_plan_bytes(&self) -> usize {
         self.remaining_deletion_history_bytes() / 2
     }
 
@@ -1785,8 +2359,11 @@ where
 
     #[must_use]
     pub(crate) fn next_deletion_planning_work(&mut self) -> Option<DeletionWorkCommand> {
-        if self.deletion_is_blocked() {
+        if self.deletion_is_unavailable() {
             self.cancel_pending_deletion_work_and_dismiss_confirmation();
+            return None;
+        }
+        if self.deletion_waits_for_store() {
             return None;
         }
         let command = self.deletion_work.next_planning_command();
@@ -1796,8 +2373,11 @@ where
 
     #[must_use]
     pub(crate) fn next_deletion_execution_work(&mut self) -> Option<DeletionWorkCommand> {
-        if self.deletion_is_blocked() {
+        if self.deletion_is_unavailable() {
             self.cancel_pending_deletion_work_and_dismiss_confirmation();
+            return None;
+        }
+        if self.deletion_waits_for_store() {
             return None;
         }
         let command = self.deletion_work.next_execution_command();
@@ -2007,7 +2587,7 @@ where
         target: Box<FileToDelete>,
         now: Duration,
     ) -> bool {
-        if self.deletion_is_blocked() {
+        if self.deletion_is_unavailable() {
             self.cancel_pending_deletion_work_and_dismiss_confirmation();
             return false;
         }
@@ -2080,7 +2660,7 @@ where
     pub fn take_confirmed_deletion_target(
         &mut self,
     ) -> Option<(DeletionWorkId, Box<FileToDelete>)> {
-        if self.deletion_is_blocked() {
+        if self.deletion_is_unavailable() {
             self.cancel_pending_deletion_work_and_dismiss_confirmation();
             return None;
         }
@@ -2142,8 +2722,11 @@ where
         self.reconcile_generation_after_deletion(&report);
         self.ui_effects.record_deletion_result(&report);
         let report = Arc::new(report);
+        // The history keeps room for every deletion allowed to start (see `request_deletion`),
+        // so a report finds it; the bounds are what keep the history within its limits however
+        // that came to be.
         if self.deletion_history.len() < MAX_RETAINED_DELETION_REPORTS
-            && report.estimated_bytes <= self.remaining_deletion_history_bytes()
+            && report.estimated_bytes <= self.deletion_history_room_bytes()
         {
             self.deletion_history_bytes = self
                 .deletion_history_bytes
@@ -2200,6 +2783,13 @@ where
                     .to_string(),
             ));
         }
+        if self.overlay_publication_pending() {
+            // The map on screen still lists what the last deletion removed, and a report of it
+            // would too.
+            return Err(ReportError::Invariant(
+                "scan export is unavailable until the map reflects the last deletion".to_string(),
+            ));
+        }
         let root = self.scan_root.clone();
         let published = self.scan_store.published_mut().ok_or_else(|| {
             ReportError::Invariant(
@@ -2217,13 +2807,23 @@ where
         )
     }
 
-    pub fn write_deletion_history(&self, writer: impl Write) -> Result<(), ReportError> {
-        write_deletion_history_json(&self.deletion_history, writer)
+    /// A handle on each report of the deletion history, for the export thread to serialize
+    /// without the owner loop: a few pointers, however long the history is.
+    #[must_use]
+    pub(crate) fn deletion_history_snapshot(&self) -> Vec<Arc<DeletionReport>> {
+        self.deletion_history.clone()
     }
 
-    pub fn clear_deletion_history(&mut self) {
-        self.deletion_history.clear();
-        self.deletion_history_bytes = 0;
+    /// Drops the first `exported` reports of the history: the ones an export just wrote. Reports
+    /// that finished while it ran stay, for the next export.
+    pub(crate) fn drop_exported_deletion_history(&mut self, exported: usize) {
+        let exported = exported.min(self.deletion_history.len());
+        let freed = self
+            .deletion_history
+            .drain(..exported)
+            .map(|report| report.estimated_bytes)
+            .fold(0_usize, usize::saturating_add);
+        self.deletion_history_bytes = self.deletion_history_bytes.saturating_sub(freed);
     }
 
     pub fn show_notice(&mut self, message: impl Into<String>) {
@@ -2325,12 +2925,82 @@ where
         self.mark_dirty();
     }
 
+    /// Tells the reader what a background job reported, now if they are not in the middle of a
+    /// decision, else as soon as they are not ([`Self::show_waiting_announcement`]). A notice
+    /// shown over a confirmation, the quit prompt, a filter being typed, or help would replace it,
+    /// and the keys meant for it would land on the notice and the map instead.
+    pub(crate) fn announce(&mut self, announcement: Announcement) {
+        self.waiting_announcement = Some(announcement);
+        self.show_waiting_announcement();
+    }
+
+    /// Shows the announcement that waits, if there is one and the reader can take it. Returns
+    /// whether it showed one.
+    pub(crate) fn show_waiting_announcement(&mut self) -> bool {
+        if self.waiting_announcement.is_none() || !self.accepts_announcement() {
+            return false;
+        }
+        match self.waiting_announcement.take() {
+            Some(Announcement::Notice(message)) => self.show_notice(message),
+            Some(Announcement::Error(message)) => self.show_error(message),
+            None => return false,
+        }
+        true
+    }
+
+    /// Whether the reader is looking at the map, or at a notice that an announcement may replace,
+    /// rather than deciding something that a new modal would interrupt.
+    const fn accepts_announcement(&self) -> bool {
+        matches!(
+            self.ui_mode,
+            UiMode::Loading
+                | UiMode::Normal
+                | UiMode::Rebuilding { .. }
+                | UiMode::StaleSnapshot
+                | UiMode::ScanResultsUnavailable(_)
+                | UiMode::Notice { .. }
+        )
+    }
+
     pub fn normal_mode(&mut self) {
         self.replace_ui_mode(self.navigation_mode());
         self.render_and_update_board();
     }
 
-    pub fn finish_generation_rebuild(&mut self) -> Result<(), AppError> {
+    /// Starts publishing the replacement map a finished rebuild scan produced. Ends in exactly
+    /// one [`FinishedPublication::Rebuild`] (or [`FinishedPublication::RebuildCancelled`]), at
+    /// once when there is nothing to publish.
+    pub(crate) fn begin_rebuild_publication(&mut self) {
+        if self.generation_rebuild_invalidated {
+            // A deletion discarded this generation while its worker was still draining: there is
+            // nothing to publish.
+            self.finished_publications
+                .push_back(FinishedPublication::Rebuild { failure: None });
+            return;
+        }
+        if self.generation_rebuild_restart_suppressed {
+            // The reader pressed Esc while the scan's last events were still on their way here:
+            // the replacement map is no longer wanted, so it is never built.
+            self.finished_publications
+                .push_back(FinishedPublication::RebuildCancelled);
+            return;
+        }
+        if self.begin_publication(PendingPublication::Rebuild) {
+            return;
+        }
+        let failure = self.scan_store_failure.clone().or_else(|| {
+            Some("scan store was unavailable before the replacement map could publish".to_string())
+        });
+        self.finished_publications
+            .push_back(FinishedPublication::Rebuild { failure });
+    }
+
+    /// Settles a finished rebuild once its publication ended. `publication_failure` is why the
+    /// replacement map could not be published, if it could not.
+    pub fn finish_generation_rebuild(
+        &mut self,
+        publication_failure: Option<String>,
+    ) -> Result<(), AppError> {
         let target = self.generation_rebuild_target.take().ok_or_else(|| {
             AppError::Invariant("scan rebuild finished without an active revision".to_string())
         })?;
@@ -2347,23 +3017,8 @@ where
             // draining. Its terminal event only releases the stale worker. The
             // owner starts a newer root generation next.
         } else {
-            let publication_failure = if self.scan_store_available {
-                match self.scan_store.publish() {
-                    Ok(_) if self.scan_store.is_summary_only() => {
-                        Some("scan store capacity exhausted".to_string())
-                    }
-                    Ok(_) => None,
-                    Err(error) => Some(error.to_string()),
-                }
-            } else {
-                self.scan_store_failure.clone().or_else(|| {
-                    Some(
-                        "scan store was unavailable before the replacement map could publish"
-                            .to_string(),
-                    )
-                })
-            };
             if let Some(failure) = publication_failure {
+                self.pending_navigation = None;
                 self.abandon_scan_store_generation_with_failure(failure);
                 self.show_scan_results_unavailable(self.scan_results_unavailable_message());
                 self.render_and_update_board();
@@ -2387,6 +3042,8 @@ where
                 self.render_and_update_board();
                 return Ok(());
             }
+            self.provisional_page_waiting = None;
+            self.resume_pending_navigation();
         }
         self.retarget_completed_scan_transient_modals();
         if matches!(self.ui_mode, UiMode::Rebuilding { .. }) {
@@ -2541,6 +3198,12 @@ where
             .current()
             .current_relative()
             .clone();
+        if self.uses_provisional_scan_page() {
+            // A filter applies to the published map: the live view stays as it is.
+            self.snapshot_filter = None;
+            self.render_and_update_board();
+            return;
+        }
         // The cached pages belong to the old filter, so the load must not reuse them. They stay
         // aside until the filtered page has loaded: a page the store cannot serve leaves the
         // map, and the filter it was built with, as they were.
@@ -2599,6 +3262,11 @@ fn scan_store_error(error: ScanStoreError) -> AppError {
     AppError::Model(error.to_string())
 }
 
+#[allow(clippy::needless_pass_by_value)]
+fn store_unavailable_error(error: StoreUnavailable) -> AppError {
+    AppError::Model(error.to_string())
+}
+
 fn relative_parent(path: &RelativePath) -> RelativePath {
     RelativePath::from_components(path.components()[..path.depth().saturating_sub(1)].to_vec())
         .expect("a prefix of a valid scan path remains valid")
@@ -2610,6 +3278,10 @@ mod tests {
 
     use ratatui::backend::{Backend, TestBackend};
 
+    use crate::scan_coordinator::{
+        ScanCoordinator, ScheduleOutcome, WorkKey, WorkKind, WorkPriority,
+    };
+    use crate::scan_store::session::scan_store_capacity_message;
     use crate::tests::fakes::TestBackend as ResizableTestBackend;
 
     #[cfg(unix)]
@@ -2655,6 +3327,76 @@ mod tests {
             false,
         )
         .expect("render should succeed");
+    }
+
+    /// Asks for the live view of the folder on screen and applies the page the store thread
+    /// answers with. An inline store answers as soon as it is asked.
+    fn refresh_live_page(app: &mut App<TestBackend>, expectation: &str) {
+        assert!(app.refresh_board_from_scan(), "{expectation}");
+        app.process_scan_store_events();
+    }
+
+    /// Ends a rebuild scan the way the owner loop does: publishes the replacement map, applies
+    /// what the store thread answers, and settles the rebuild with how the publication ended.
+    fn finish_rebuild(app: &mut App<TestBackend>) -> Result<(), AppError> {
+        app.begin_rebuild_publication();
+        app.process_scan_store_events();
+        let finished = app.take_finished_publication();
+        let Some(FinishedPublication::Rebuild { failure }) = finished else {
+            panic!("a rebuild should end in a rebuild completion, not {finished:?}");
+        };
+        app.finish_generation_rebuild(failure)
+    }
+
+    /// Publishes the active generation straight from the store and swaps the result in. The
+    /// app's own bookkeeping for a finished scan does not run: the page on screen stays as it is.
+    fn publish_store_directly(app: &mut App<TestBackend>) -> Result<(), ScanStoreError> {
+        let publication = app.scan_store.with_inline_store(|store| {
+            store.publish()?;
+            store
+                .take_publication()
+                .ok_or(ScanStoreError::NoPublishedGeneration)
+        })?;
+        app.scan_store.install(publication);
+        Ok(())
+    }
+
+    /// The names the page on screen lists, in a stable order.
+    fn listed_names(app: &App<TestBackend>) -> Vec<std::ffi::OsString> {
+        let mut names = app
+            .files_in_current_view(0)
+            .into_iter()
+            .map(|file| file.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn node_id_of(app: &App<TestBackend>, name: &str) -> NodeId {
+        app.files_in_current_view(0)
+            .into_iter()
+            .find(|file| file.name == name)
+            .expect("the page on screen should list the entry")
+            .node_id
+    }
+
+    /// A lease to enumerate the root in `generation` of the app's own session.
+    fn root_enumeration_lease(app: &App<TestBackend>, generation: ScanGeneration) -> WorkLease {
+        let session = app.scan_session_id();
+        let mut coordinator = ScanCoordinator::new(session, generation);
+        let key = WorkKey::new(
+            session,
+            generation,
+            WorkKind::EnumerateDirectory,
+            RelativePath::root(),
+        );
+        assert_eq!(
+            coordinator.schedule(key, WorkPriority::Background),
+            ScheduleOutcome::Enqueued
+        );
+        coordinator
+            .lease_next()
+            .expect("scheduled test work should receive a lease")
     }
 
     #[test]
@@ -2704,10 +3446,7 @@ mod tests {
             .change_area(ratatui::layout::Rect::new(0, 0, 80, 24));
         add_fixture_entry(&mut app, &first);
 
-        assert!(
-            app.refresh_board_from_scan()
-                .expect("active scan page should refresh")
-        );
+        refresh_live_page(&mut app, "active scan page should refresh");
         assert!(matches!(app.ui_mode, UiMode::Loading));
         assert_eq!(
             app.files_in_current_view(0)
@@ -2718,9 +3457,9 @@ mod tests {
         );
 
         add_fixture_entry(&mut app, &second);
-        assert!(
-            app.refresh_board_from_scan()
-                .expect("later canonical facts should refresh the active page")
+        refresh_live_page(
+            &mut app,
+            "later canonical facts should refresh the active page",
         );
         let mut names = app
             .files_in_current_view(0)
@@ -2770,8 +3509,7 @@ mod tests {
         for path in [folder.as_path(), leaf.as_path(), sibling.as_path()] {
             add_fixture_entry(&mut app, path);
         }
-        app.refresh_board_from_scan()
-            .expect("root provisional page should refresh");
+        refresh_live_page(&mut app, "root provisional page should refresh");
         let folder_id = app
             .files_in_current_view(0)
             .into_iter()
@@ -2787,6 +3525,7 @@ mod tests {
         assert!(app.board.select_node(folder_id));
 
         app.enter_selected();
+        app.process_scan_store_events();
 
         assert_eq!(app.current_folder_path(), folder);
         assert_eq!(
@@ -2797,6 +3536,7 @@ mod tests {
             vec![std::ffi::OsString::from("leaf")]
         );
         assert!(app.go_up());
+        app.process_scan_store_events();
         assert_eq!(app.current_folder_path(), root.path());
     }
 
@@ -2820,8 +3560,7 @@ mod tests {
         app.board
             .change_area(ratatui::layout::Rect::new(0, 0, 80, 24));
         add_fixture_entry(&mut app, &concrete);
-        app.refresh_board_from_scan()
-            .expect("concrete preview should refresh");
+        refresh_live_page(&mut app, "concrete preview should refresh");
         let concrete_id = app
             .files_in_current_view(0)
             .into_iter()
@@ -2837,23 +3576,24 @@ mod tests {
         );
 
         app.scan_store
-            .append_observation_batch(
-                vec![PathObservation::new(
-                    RelativePath::from_path(Path::new("inferred/leaf"))
-                        .expect("fixture path should be relative"),
-                    PathEntryKind::File,
-                    SummaryMetrics::leaf(
-                        8 * 1024 * 1024,
-                        ByteBounds::exact(8 * 1024 * 1024),
-                        ByteBounds::exact(8 * 1024 * 1024),
-                    ),
-                    Coverage::Complete,
-                )],
-                Vec::new(),
-            )
+            .with_inline_store(|store| {
+                store.append_observation_batch(
+                    vec![PathObservation::new(
+                        RelativePath::from_path(Path::new("inferred/leaf"))
+                            .expect("fixture path should be relative"),
+                        PathEntryKind::File,
+                        SummaryMetrics::leaf(
+                            8 * 1024 * 1024,
+                            ByteBounds::exact(8 * 1024 * 1024),
+                            ByteBounds::exact(8 * 1024 * 1024),
+                        ),
+                        Coverage::Complete,
+                    )],
+                    Vec::new(),
+                )
+            })
             .expect("inferred fixture should append");
-        app.refresh_board_from_scan()
-            .expect("inferred preview should refresh");
+        refresh_live_page(&mut app, "inferred preview should refresh");
         let inferred_id = app
             .files_in_current_view(0)
             .into_iter()
@@ -2867,6 +3607,187 @@ mod tests {
             UiMode::Notice { message, .. }
                 if message == "Wait for this item to receive a verified scan preview before deleting"
         ));
+    }
+
+    #[test]
+    fn primary_map_is_unpublished_until_the_store_thread_reports_it() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let entry = root.path().join("entry");
+        std::fs::write(&entry, b"payload").expect("fixture entry should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &entry);
+
+        app.begin_primary_publication();
+
+        assert!(app.primary_publication_pending());
+        assert!(app.scan_store.published().is_none());
+        assert!(app.scan_store_busy());
+        assert_eq!(app.take_finished_publication(), None);
+
+        assert!(app.process_scan_store_events());
+
+        assert!(!app.primary_publication_pending());
+        assert!(app.scan_store.published().is_some());
+        assert!(
+            app.scan_store_busy(),
+            "the loop keeps polling until it has taken the publication that ended"
+        );
+        assert_eq!(
+            app.take_finished_publication(),
+            Some(FinishedPublication::Primary)
+        );
+        assert_eq!(app.take_finished_publication(), None);
+        assert!(!app.scan_store_busy());
+    }
+
+    #[test]
+    fn the_finishing_map_shows_a_clock_that_moves_while_a_stage_runs() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let entry = root.path().join("entry");
+        std::fs::write(&entry, b"payload").expect("fixture entry should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &entry);
+        app.begin_primary_publication();
+
+        assert!(
+            !app.refresh_publication_progress(),
+            "a publication that has only just begun shows nothing"
+        );
+        assert_eq!(app.ui_effects.publication_progress, None);
+
+        // It has now run for 0.35 s, and the stage under way has not ended.
+        app.publication_progress_from = Instant::now().checked_sub(Duration::from_millis(250));
+        assert!(app.refresh_publication_progress());
+        let first = app
+            .ui_effects
+            .publication_progress
+            .expect("a publication past the delay shows its progress");
+        assert!(first.elapsed_tenths >= 3, "{first:?}");
+
+        // Half a second on it is still the same stage, and the display moves all the same: a
+        // stage can outlast the longest the screen may stand still.
+        app.publication_progress_from = Instant::now().checked_sub(Duration::from_millis(750));
+        assert!(app.refresh_publication_progress());
+        let later = app
+            .ui_effects
+            .publication_progress
+            .expect("the publication is still running");
+        assert_eq!((later.done, later.total), (first.done, first.total));
+        assert!(later.elapsed_tenths >= 8, "{later:?}");
+
+        // Its end takes the progress off the screen.
+        assert!(app.process_scan_store_events());
+        assert!(app.refresh_publication_progress());
+        assert_eq!(app.ui_effects.publication_progress, None);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn deletion_is_refused_until_the_primary_map_is_published() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let concrete = root.path().join("concrete");
+        std::fs::write(&concrete, b"payload").expect("concrete fixture should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 80, 24));
+        add_fixture_entry(&mut app, &concrete);
+        refresh_live_page(&mut app, "concrete preview should refresh");
+        let concrete_id = node_id_of(&app, "concrete");
+        assert!(app.board.select_node(concrete_id));
+        assert!(
+            app.request_deletion().is_some(),
+            "a concrete live preview is deletable while the scan runs"
+        );
+
+        app.begin_primary_publication();
+        assert!(
+            app.request_deletion().is_none(),
+            "nothing is deletable while the finished scan's map is being published"
+        );
+
+        app.process_scan_store_events();
+        app.start_ui();
+        let concrete_id = node_id_of(&app, "concrete");
+        assert!(app.board.select_node(concrete_id));
+        assert!(
+            app.request_deletion().is_some(),
+            "the published map allows deletion again"
+        );
+    }
+
+    #[test]
+    fn a_drill_during_the_primary_publication_waits_for_the_published_map() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let folder = root.path().join("folder");
+        let leaf = folder.join("leaf");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir(&folder).expect("folder fixture should exist");
+        std::fs::write(&leaf, b"leaf").expect("leaf fixture should exist");
+        std::fs::write(&sibling, b"sibling").expect("sibling fixture should exist");
+        let mut app = App::new(
+            TestBackend::new(120, 32),
+            root.path().to_path_buf(),
+            false,
+            false,
+            crate::model::MIN_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 120, 32));
+        for path in [folder.as_path(), leaf.as_path(), sibling.as_path()] {
+            add_fixture_entry(&mut app, path);
+        }
+        refresh_live_page(&mut app, "root provisional page should refresh");
+        let folder_id = node_id_of(&app, "folder");
+        assert!(app.board.select_node(folder_id));
+        app.begin_primary_publication();
+
+        app.enter_selected();
+
+        // The folder's page belongs to the map being published, so the drill waits for it.
+        assert_eq!(app.current_folder_path(), root.path());
+
+        app.process_scan_store_events();
+
+        assert_eq!(app.current_folder_path(), folder);
+        assert_eq!(listed_names(&app), ["leaf"]);
+        assert_eq!(
+            app.take_finished_publication(),
+            Some(FinishedPublication::Primary)
+        );
     }
 
     #[test]
@@ -3076,9 +3997,12 @@ mod tests {
 
         app.append_scan_store_entry_for_test(&metadata, &entry, &identity);
 
-        assert_eq!(app.scan_store.active_run_counts(), Some((1, 0)));
-        app.scan_store
-            .publish()
+        assert_eq!(
+            app.scan_store
+                .with_inline_store(|store| store.active_run_counts()),
+            Some((1, 0))
+        );
+        publish_store_directly(&mut app)
             .expect("single-link path should publish without an identity run");
         let page = app
             .scan_store
@@ -3207,6 +4131,53 @@ mod tests {
         assert!(matches!(command, crate::input::InputCommand::None));
         assert!(!app.is_running);
     }
+
+    #[test]
+    fn a_batch_the_store_rejects_makes_the_scan_store_unavailable() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let factory = app
+            .scan_input_run_factory()
+            .expect("the first generation should accept worker runs");
+        let batch = factory
+            .seal_observation_batch(
+                vec![PathObservation::new(
+                    RelativePath::from_path(Path::new("entry"))
+                        .expect("fixture path should be relative"),
+                    PathEntryKind::File,
+                    SummaryMetrics::leaf(1, ByteBounds::exact(0), ByteBounds::exact(0)),
+                    Coverage::Complete,
+                )],
+                Vec::new(),
+            )
+            .expect("worker batch should seal");
+        // The run was sealed for the first generation and the lease names a later one, so the
+        // store refuses the run.
+        let stale_lease = root_enumeration_lease(&app, ScanGeneration::from_value(7));
+
+        app.admit_scan_input_runs(&stale_lease, batch);
+
+        // The store thread reports the refusal; until the owner applies it the scan store is
+        // still available.
+        assert!(app.scan_store_available);
+        assert!(app.process_scan_store_events());
+        assert!(!app.scan_store_available);
+        assert_eq!(
+            app.scan_store_failure,
+            Some(ScanStoreError::LeaseGenerationMismatch.to_string())
+        );
+    }
+
     #[test]
     fn a_map_tween_keeps_the_frame_clock_running_until_it_settles() {
         let root = tempfile::tempdir().expect("temp dir should be created");
@@ -3689,7 +4660,8 @@ mod tests {
         assert_eq!(app.deletion_history.len(), 1);
         assert_eq!(app.remaining_deletion_history_bytes(), 0);
 
-        app.clear_deletion_history();
+        let exported = app.deletion_history_snapshot().len();
+        app.drop_exported_deletion_history(exported);
         assert!(app.deletion_history.is_empty());
         assert_eq!(app.remaining_deletion_history_bytes(), limit);
 
@@ -3726,6 +4698,162 @@ mod tests {
             app.deletion_history_limit
         );
     }
+
+    #[test]
+    fn exported_deletion_history_is_dropped_and_later_reports_stay() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        let limit = app.deletion_history_limit;
+        app.complete_deletion(report(1024));
+        app.complete_deletion(report(2048));
+        let exported = app.deletion_history_snapshot();
+        assert_eq!(exported.len(), 2);
+
+        // This report finished while the export ran, so the export did not write it.
+        app.complete_deletion(report(4096));
+        app.drop_exported_deletion_history(exported.len());
+
+        let kept = app.deletion_history_snapshot();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].estimated_bytes, 4096);
+        assert_eq!(app.remaining_deletion_history_bytes(), limit - 4096);
+    }
+
+    /// An app whose published map lists the files `a`, `b` and `c`, `c` the largest and so the
+    /// one the map has selected, with a queued deletion target for each name asked for.
+    #[cfg(any(unix, windows))]
+    fn app_with_three_files_and_targets(
+        root: &std::path::Path,
+        queued: &[&str],
+    ) -> (App<TestBackend>, Vec<FileToDelete>) {
+        for (name, size) in [("a", 1_usize), ("b", 2), ("c", 4096)] {
+            std::fs::write(root.join(name), vec![0_u8; size]).expect("fixture file should exist");
+        }
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        for name in ["a", "b", "c"] {
+            add_fixture_entry(&mut app, &root.join(name));
+        }
+        app.finalize_scan();
+        app.start_ui();
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        draw(&mut app, &mut animation, 0);
+        for index in 0..3 {
+            app.board.set_selected_index(index);
+            if app
+                .board
+                .currently_selected()
+                .is_some_and(|tile| tile.name == "c")
+            {
+                break;
+            }
+        }
+        assert!(
+            app.board
+                .currently_selected()
+                .is_some_and(|tile| tile.name == "c"),
+            "the largest file should be the one selected"
+        );
+        let targets = queued
+            .iter()
+            .map(|name| {
+                let relative =
+                    RelativePath::from_path(Path::new(name)).expect("fixture path is canonical");
+                let entry = app
+                    .scan_store
+                    .published()
+                    .expect("published generation should exist")
+                    .page_entry(&relative)
+                    .expect("canonical query should succeed")
+                    .expect("the file should be in the published generation");
+                SnapshotTree::deletion_target_from_entry(
+                    root.to_path_buf(),
+                    node_id_of(&app, name),
+                    &relative,
+                    entry,
+                    false,
+                )
+                .expect("the file should retain its canonical snapshot")
+            })
+            .collect();
+        (app, targets)
+    }
+
+    /// The history keeps a place for the report of every deletion that was allowed to start: the
+    /// cap counts the deletions in flight, so none can finish into a full history and have its
+    /// report dropped, neither from the file an export writes nor from the history it leaves.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn every_deletion_allowed_to_start_finds_room_for_its_report() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let (mut app, targets) = app_with_three_files_and_targets(root.path(), &["a", "b"]);
+        let retained = MAX_RETAINED_DELETION_REPORTS - 2;
+        for _ in 0..retained {
+            app.complete_deletion(report(0));
+        }
+        // Two deletions were asked for while the history still had room.
+        let mut started = 0;
+        for target in targets {
+            assert!(app.queue_deletion_confirmation(target, false, 1024, Duration::ZERO));
+            started += 1;
+        }
+        // A third is asked for while those two are in flight, the history two reports short of full.
+        if let Some(target) = app.request_deletion() {
+            assert!(app.queue_deletion_confirmation(target, false, 1024, Duration::ZERO));
+            started += 1;
+        }
+
+        for _ in 0..started {
+            app.complete_deletion(report(0));
+        }
+
+        assert_eq!(
+            app.deletion_history.len(),
+            retained + started,
+            "a deletion that was allowed to start finished without room for its report"
+        );
+    }
+
+    /// Each deletion's plan may use half of what the history has left, so with two in flight the
+    /// second must be budgeted from what the first leaves, or both reports could not be kept.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn the_plan_budgets_of_deletions_in_flight_fit_the_history_together() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let (mut app, targets) = app_with_three_files_and_targets(root.path(), &["a", "b"]);
+        let limit = app.deletion_history_limit;
+        let mut budgets = Vec::new();
+        for target in targets {
+            let budget = app.maximum_deletion_plan_bytes();
+            assert!(app.queue_deletion_confirmation(target, false, budget, Duration::ZERO));
+            budgets.push(budget);
+        }
+
+        assert!(
+            budgets.iter().sum::<usize>() < limit,
+            "two plans each allowed half of the history cannot both be kept: {budgets:?} of {limit}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn confirmed_target_starts_background_planning_after_returning_to_map() {
@@ -4186,13 +5314,114 @@ mod tests {
         assert_eq!(app.cancel_theme_picker(), Some(ThemeId::ExciseDark));
         assert!(matches!(app.ui_mode, UiMode::StaleSnapshot));
     }
-    #[cfg(any(unix, windows))]
+
+    /// An app with a published one-file map that has begun rebuilding it.
+    fn app_rebuilding_a_published_map() -> (tempfile::TempDir, App<TestBackend>) {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let target_path = root.path().join("target");
+        std::fs::write(&target_path, b"payload").expect("fixture target should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &target_path);
+        app.finalize_scan();
+        app.start_ui();
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("rebuild should start with the retained map")
+        );
+        (root, app)
+    }
+
+    /// The scanner has finished by the time the replacement map is published, so its own
+    /// cancellation flag no longer reaches the rebuild: Esc has to be honored by the app, which
+    /// still shows `Rebuilding` and its `[Esc] cancel` hint until the map arrives.
     #[test]
-    fn completed_deletion_republishes_the_snapshot_without_the_removed_target() {
+    fn cancelling_a_rebuild_while_its_map_is_published_drops_that_map_and_keeps_the_stale_one() {
+        let (_root, mut app) = app_rebuilding_a_published_map();
+        app.begin_rebuild_publication();
+        assert!(app.scan_store_busy(), "the replacement map is being built");
+
+        app.suppress_generation_rebuild_restart();
+        app.process_scan_store_events();
+
+        assert_eq!(
+            app.take_finished_publication(),
+            Some(FinishedPublication::RebuildCancelled)
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial()),
+            "the replacement map was dropped, not swapped in"
+        );
+        app.cancel_generation_rebuild()
+            .expect("the cancelled rebuild should settle");
+        assert!(matches!(app.ui_mode, UiMode::StaleSnapshot));
+        assert!(
+            app.begin_generation_rebuild().is_ok_and(|started| !started),
+            "a cancelled rebuild is not restarted by itself"
+        );
+    }
+
+    /// Esc can land after the scanner's last event was queued and before the loop handled it:
+    /// the rebuild is then cancelled without ever asking the store to build its map.
+    #[test]
+    fn a_rebuild_cancelled_before_its_scan_end_is_handled_never_publishes() {
+        let (_root, mut app) = app_rebuilding_a_published_map();
+        app.suppress_generation_rebuild_restart();
+
+        app.begin_rebuild_publication();
+
+        assert!(app.publications.is_empty(), "no map was asked for");
+        assert_eq!(
+            app.take_finished_publication(),
+            Some(FinishedPublication::RebuildCancelled)
+        );
+    }
+
+    /// What a test removes when it is about the map that follows a removal that left no link
+    /// behind: a file where the executor can show that (Linux, and Windows through the handle
+    /// that removes it), and on macOS, which opens nothing it removes and counts every file or
+    /// link it removes as possibly linked, an empty folder.
+    #[cfg(any(unix, windows))]
+    fn make_a_removable_target(path: &Path) {
+        if cfg!(target_vendor = "apple") {
+            std::fs::create_dir(path).expect("target fixture should exist");
+        } else {
+            std::fs::write(path, b"target").expect("target fixture should exist");
+        }
+    }
+
+    /// An app whose published map lists `target` and `survivor`, and the report of deleting
+    /// `target` from disk completely. The target is a file where the executor can show that its
+    /// removal left no link behind (Linux, and Windows through the handle that removes it); on
+    /// macOS, which opens nothing it removes and so counts every file or link it removes as
+    /// possibly linked, it is an empty folder, which has no other links to speak of. Either way
+    /// the report is one the owner may answer with a map updated in place.
+    #[cfg(any(unix, windows))]
+    fn app_and_target_removal_report() -> (tempfile::TempDir, App<TestBackend>, DeletionReport) {
+        app_and_target_removal_report_beside(false)
+    }
+
+    /// As [`app_and_target_removal_report`], with a `folder` holding one file beside them when
+    /// `with_folder` is set.
+    #[cfg(any(unix, windows))]
+    fn app_and_target_removal_report_beside(
+        with_folder: bool,
+    ) -> (tempfile::TempDir, App<TestBackend>, DeletionReport) {
         let root = tempfile::tempdir().expect("app root should exist");
         let target_path = root.path().join("target");
         let survivor_path = root.path().join("survivor");
-        std::fs::write(&target_path, b"target").expect("target fixture should exist");
+        make_a_removable_target(&target_path);
         std::fs::write(&survivor_path, b"survivor").expect("survivor fixture should exist");
         let mut app = App::new(
             TestBackend::new(160, 48),
@@ -4205,7 +5434,14 @@ mod tests {
             false,
         )
         .expect("app should initialize");
-        for path in [target_path.as_path(), survivor_path.as_path()] {
+        let mut entries = vec![target_path.clone(), survivor_path.clone()];
+        if with_folder {
+            let folder = root.path().join("folder");
+            std::fs::create_dir(&folder).expect("folder fixture should exist");
+            std::fs::write(folder.join("inner"), b"inner").expect("inner fixture should exist");
+            entries.extend([folder.clone(), folder.join("inner")]);
+        }
+        for path in &entries {
             add_fixture_entry(&mut app, path);
         }
         app.finalize_scan();
@@ -4217,10 +5453,6 @@ mod tests {
             .node_id;
         let relative =
             RelativePath::from_path(Path::new("target")).expect("target path should be canonical");
-        app.snapshot_filter = Some((
-            FilterPattern::new("target").expect("filter should compile"),
-            relative.clone(),
-        ));
         let entry = app
             .scan_store
             .published()
@@ -4245,7 +5477,32 @@ mod tests {
             &std::sync::atomic::AtomicBool::new(false),
         );
         assert!(report.target_was_removed());
+        // These tests are about what the owner does with a report of a removal that left no link
+        // behind. Whether the executor can prove that of a file is a fact about the platform: on
+        // Linux it does, and the report says so; on Windows it depends on what the file system
+        // says through the handle that removed the file, and is tested where the executor reads
+        // it (`deletion`); macOS proves it of no file (the target there is a folder, which has
+        // no other links to speak of).
+        #[cfg(unix)]
+        assert!(
+            !report.deleted_files_may_have_other_links(),
+            "an entry removed whole that left no link behind"
+        );
+        #[cfg(windows)]
+        let report = report.assuming_no_link_survived();
+        (root, app, report)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn completed_deletion_republishes_the_snapshot_without_the_removed_target() {
+        let (_root, mut app, report) = app_and_target_removal_report();
+        app.snapshot_filter = Some((
+            FilterPattern::new("target").expect("filter should compile"),
+            RelativePath::from_path(Path::new("target")).expect("target path should be canonical"),
+        ));
         assert!(app.complete_deletion(report));
+        app.process_scan_store_events();
         assert_eq!(
             app.scan_store.published_generation(),
             Some(ScanGeneration::from_value(1))
@@ -4260,6 +5517,660 @@ mod tests {
                 .map(|file| file.name)
                 .collect::<Vec<_>>(),
             vec![std::ffi::OsString::from("survivor")]
+        );
+    }
+
+    /// The map a deletion leaves is built from the map before it, folders included: a folder
+    /// beside the deleted entry must not stop the overlay from publishing, or the deletion falls
+    /// back to rebuilding the whole map.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_deletion_beside_a_folder_republishes_the_map_instead_of_rebuilding_it() {
+        let (_root, mut app, report) = app_and_target_removal_report_beside(true);
+
+        assert!(app.complete_deletion(report));
+        assert!(app.process_scan_store_events());
+
+        assert!(
+            !app.generation_rebuild_required,
+            "the overlay published, so no rebuild is needed"
+        );
+        assert_eq!(listed_names(&app), ["folder", "survivor"]);
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(1))
+        );
+    }
+
+    /// A rebuild the reader cancelled while its replacement map was being published leaves the
+    /// map they had installed. The map a later deletion leaves derives from that map, not from
+    /// the replacement the reader's cancellation dropped, whose files are gone.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_deletion_after_a_cancelled_rebuild_republishes_the_map_that_stayed_installed() {
+        let (_root, mut app, report) = app_and_target_removal_report();
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("the rebuild should start with the retained map")
+        );
+        app.begin_rebuild_publication();
+        app.suppress_generation_rebuild_restart();
+        app.process_scan_store_events();
+        assert_eq!(
+            app.take_finished_publication(),
+            Some(FinishedPublication::RebuildCancelled)
+        );
+        app.cancel_generation_rebuild()
+            .expect("the cancelled rebuild should settle");
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial()),
+            "the replacement map was dropped, so the first map stays installed"
+        );
+
+        // A deletion that was already running ends.
+        assert!(app.complete_deletion(report));
+        assert!(app.process_scan_store_events());
+
+        assert_eq!(
+            listed_names(&app),
+            ["survivor"],
+            "the map without the deleted entry was not published"
+        );
+        assert!(
+            app.scan_store.published_generation() > Some(ScanGeneration::initial()),
+            "the overlay should have replaced the installed map"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn removed_entry_stays_listed_until_the_overlay_result_arrives() {
+        let (_root, mut app, report) = app_and_target_removal_report();
+
+        assert!(app.complete_deletion(report));
+
+        // The store thread builds the overlay: until its result arrives, the reader keeps the
+        // map they had.
+        assert_eq!(listed_names(&app), ["survivor", "target"]);
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial())
+        );
+        assert!(app.scan_store_busy());
+
+        assert!(app.process_scan_store_events());
+
+        assert_eq!(listed_names(&app), ["survivor"]);
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(1))
+        );
+        assert!(!app.scan_store_busy());
+    }
+
+    /// The next overlay derives from the last one's map, so a deletion queued behind one whose
+    /// map is still being built starts only once that map has arrived. It waits: blocking would
+    /// cancel it, and the reader never asked for that.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_queued_deletion_waits_for_the_map_of_the_one_before_it() {
+        let (root, mut app, report) = app_and_target_removal_report();
+        let survivor =
+            RelativePath::from_path(Path::new("survivor")).expect("survivor path is canonical");
+        let entry = app
+            .scan_store
+            .published()
+            .expect("published generation should exist")
+            .page_entry(&survivor)
+            .expect("canonical survivor query should succeed")
+            .expect("survivor should be in the published generation");
+        let survivor_target = SnapshotTree::deletion_target_from_entry(
+            root.path().to_path_buf(),
+            node_id_of(&app, "survivor"),
+            &survivor,
+            entry,
+            false,
+        )
+        .expect("survivor should retain its canonical snapshot");
+        app.start_ui();
+        assert!(app.complete_deletion(report));
+        assert!(
+            app.scan_store_busy(),
+            "the first deletion's map is still being built"
+        );
+        assert!(app.queue_deletion_confirmation(survivor_target, false, 1 << 20, Duration::ZERO));
+        assert!(app.show_next_deletion_confirmation());
+        let (work_id, confirmed) = app
+            .arm_and_confirm_deletion_target()
+            .expect("the reader confirms the second deletion");
+        assert!(app.queue_confirmed_deletion(work_id, confirmed, Duration::ZERO));
+
+        assert!(
+            app.next_deletion_planning_work().is_none(),
+            "nothing starts from the map the last deletion made stale"
+        );
+        assert!(
+            app.deletion_work_summary().has_work(),
+            "the second deletion waits for the map; it is not cancelled"
+        );
+
+        assert!(app.process_scan_store_events());
+
+        assert!(matches!(
+            app.next_deletion_planning_work(),
+            Some(DeletionWorkCommand::Plan { work_id: id, .. }) if id == work_id
+        ));
+    }
+
+    /// The map on screen lists what the last deletion removed until the overlay arrives, and a
+    /// report written from it would too.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_scan_report_waits_for_the_map_that_reflects_the_last_deletion() {
+        let (_root, mut app, report) = app_and_target_removal_report();
+        assert!(app.complete_deletion(report));
+        let mut exported = Vec::new();
+
+        assert!(matches!(
+            app.write_scan_report(&RunSummary::default(), &mut exported),
+            Err(ReportError::Invariant(message)) if message.contains("last deletion")
+        ));
+        assert!(exported.is_empty());
+
+        assert!(app.process_scan_store_events());
+        app.write_scan_report(&RunSummary::default(), &mut exported)
+            .expect("the map without the deleted target can be reported");
+        assert!(
+            String::from_utf8(exported)
+                .expect("the report is JSON text")
+                .contains("survivor")
+        );
+    }
+
+    /// No map follows a deletion whose store was lost while the map was being built: the one on
+    /// screen lists what the deletion removed, and nothing will replace it, so it must not stay
+    /// up as if it were current.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn losing_the_store_while_a_deletions_map_is_built_hides_the_map_that_lists_it() {
+        let (_root, mut app, report) = app_and_target_removal_report();
+        assert!(app.complete_deletion(report));
+        assert!(app.scan_store_busy());
+        assert_eq!(listed_names(&app), ["survivor", "target"]);
+
+        app.scan_store_stopped("the scan store thread stopped");
+
+        assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
+        assert!(!app.scan_store_busy());
+        assert!(!app.scan_store_available);
+        assert!(app.request_deletion().is_none());
+    }
+
+    /// An app whose published map lists the folder `holder` and what is in it: `target` and
+    /// `survivor`, and what `before_scan` adds beside them. The target is what a test removes
+    /// when it is about the map that follows a removal that left no link behind
+    /// ([`make_a_removable_target`]).
+    #[cfg(any(unix, windows))]
+    fn app_listing_a_folder(
+        before_scan: impl FnOnce(&Path),
+    ) -> (tempfile::TempDir, App<TestBackend>) {
+        app_listing_a_folder_with(make_a_removable_target, before_scan)
+    }
+
+    /// As [`app_listing_a_folder`], with a file as the target on every platform: for a test that
+    /// is about what the executor says of the links of a file it removes.
+    #[cfg(unix)]
+    fn app_listing_a_folder_holding_a_file(
+        before_scan: impl FnOnce(&Path),
+    ) -> (tempfile::TempDir, App<TestBackend>) {
+        app_listing_a_folder_with(
+            |path| std::fs::write(path, b"target").expect("target fixture should exist"),
+            before_scan,
+        )
+    }
+
+    #[cfg(any(unix, windows))]
+    fn app_listing_a_folder_with(
+        make_the_target: impl FnOnce(&Path),
+        before_scan: impl FnOnce(&Path),
+    ) -> (tempfile::TempDir, App<TestBackend>) {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let holder = root.path().join("holder");
+        std::fs::create_dir(&holder).expect("holder fixture should exist");
+        make_the_target(&holder.join("target"));
+        std::fs::write(holder.join("survivor"), b"survivor")
+            .expect("survivor fixture should exist");
+        before_scan(&holder);
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &holder);
+        for entry in std::fs::read_dir(&holder).expect("holder should list") {
+            add_fixture_entry(&mut app, &entry.expect("holder entry should read").path());
+        }
+        app.finalize_scan();
+        (root, app)
+    }
+
+    /// The target of a deletion of `relative` below `root`, as the published map describes it.
+    #[cfg(any(unix, windows))]
+    fn deletion_target_in_the_map(
+        root: &Path,
+        app: &App<TestBackend>,
+        relative: &str,
+    ) -> FileToDelete {
+        let relative =
+            RelativePath::from_path(Path::new(relative)).expect("target path should be canonical");
+        let entry = app
+            .scan_store
+            .published()
+            .expect("published generation should exist")
+            .page_entry(&relative)
+            .expect("canonical target query should succeed")
+            .expect("target should be in the published generation");
+        SnapshotTree::deletion_target_from_entry(
+            root.to_path_buf(),
+            crate::model::NodeId(1),
+            &relative,
+            entry,
+            false,
+        )
+        .expect("target should retain its canonical snapshot")
+    }
+
+    /// Deletes `holder/target` from disk, completely, the way the executor does, and returns the
+    /// report that ends the deletion. `after_planning` is what happens to the file system between
+    /// the plan the reader confirmed and the execution of it.
+    #[cfg(any(unix, windows))]
+    fn delete_the_target_in_the_folder(
+        root: &Path,
+        app: &App<TestBackend>,
+        after_planning: impl FnOnce(),
+    ) -> DeletionReport {
+        let target = deletion_target_in_the_map(root, app, "holder/target");
+        let plan =
+            crate::deletion::build_plan(root, target, false).expect("target plan should build");
+        after_planning();
+        let report = crate::deletion::execute_plan(
+            root,
+            plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(report.target_was_removed());
+        report
+    }
+
+    /// What the deletion ends in: the app is told, and the store thread's answer is applied.
+    #[cfg(any(unix, windows))]
+    fn finish_the_deletion(app: &mut App<TestBackend>, report: DeletionReport) {
+        assert!(app.complete_deletion(report));
+        app.process_scan_store_events();
+    }
+
+    /// The map a deletion leaves says what the folder that held the entry is now, so that the
+    /// folder can be deleted next. That is only true of a folder whose entries are the ones the
+    /// map lists but the removed one: the folder's modification time is what ties a later
+    /// deletion of it to the map, and the time the file system now reports also describes
+    /// whatever another process did to the folder meanwhile. A map that recorded it as it is
+    /// would let the folder be deleted with entries in it that the map never showed.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_folder_that_changed_beside_the_removed_entry_is_scanned_again_not_blessed() {
+        type Change = fn(&Path);
+        let changes: [(&str, Change); 5] = [
+            ("a sibling was created", |holder| {
+                std::fs::write(holder.join("intruder"), b"new").expect("sibling should be created");
+            }),
+            ("a sibling was removed", |holder| {
+                std::fs::remove_file(holder.join("survivor")).expect("sibling should be removed");
+            }),
+            ("a sibling was renamed", |holder| {
+                std::fs::rename(holder.join("survivor"), holder.join("renamed"))
+                    .expect("sibling should be renamed");
+            }),
+            (
+                "a sibling was replaced by another file of the same name",
+                |holder| {
+                    let replacement = holder.join("replacement");
+                    std::fs::write(&replacement, b"another file")
+                        .expect("replacement should exist");
+                    std::fs::rename(&replacement, holder.join("survivor"))
+                        .expect("sibling should be replaced");
+                },
+            ),
+            ("the removed entry was created again", |holder| {
+                std::fs::write(holder.join("target"), b"again").expect("entry should return");
+            }),
+        ];
+
+        let mut failures = Vec::new();
+        for (what, change) in changes {
+            let (root, mut app) = app_listing_a_folder(|_| {});
+            let report = delete_the_target_in_the_folder(root.path(), &app, || {});
+            change(&root.path().join("holder"));
+
+            finish_the_deletion(&mut app, report);
+
+            if !app.generation_rebuild_required {
+                failures.push(format!("{what}: the map recorded a folder it had not seen"));
+            }
+            if app.scan_store.published_generation() != Some(ScanGeneration::initial()) {
+                failures.push(format!(
+                    "{what}: the map the reader has was replaced before the scan that follows"
+                ));
+            }
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The check above must not turn every deletion into a scan: a folder that holds only what
+    /// the map lists, of every kind, and one the program cannot open (the scan listed it from
+    /// its parent), is still described in place.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_whose_other_entries_did_not_change_is_still_described_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (root, mut app) = app_listing_a_folder(|holder| {
+            std::fs::create_dir(holder.join("sub")).expect("subfolder should exist");
+            std::os::unix::fs::symlink("survivor", holder.join("link")).expect("link should exist");
+            let sealed = holder.join("sealed");
+            std::fs::create_dir(&sealed).expect("sealed folder should exist");
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000))
+                .expect("sealed folder should be locked");
+        });
+        let report = delete_the_target_in_the_folder(root.path(), &app, || {});
+
+        finish_the_deletion(&mut app, report);
+        std::fs::set_permissions(
+            root.path().join("holder/sealed"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("sealed folder should be unlocked for its removal");
+
+        assert!(
+            !app.generation_rebuild_required,
+            "nothing but the removed entry changed, so no scan should be needed"
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(1))
+        );
+    }
+
+    /// A file can gain a link after the plan the reader confirmed and before the executor removes
+    /// it: the plan saw one, the executor removes one of two. Whatever names the other link is
+    /// outside what the map can say, and the space the removal frees is not what the map would
+    /// count: the map is scanned again.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_gained_a_link_before_its_removal_sends_the_map_back_to_a_scan() {
+        let (root, mut app) = app_listing_a_folder_holding_a_file(|_| {});
+        let report = delete_the_target_in_the_folder(root.path(), &app, || {
+            std::fs::hard_link(
+                root.path().join("holder/target"),
+                root.path().join("another-name-for-target"),
+            )
+            .expect("the second link should be created");
+        });
+
+        finish_the_deletion(&mut app, report);
+
+        assert!(
+            app.generation_rebuild_required,
+            "the file had a second link when it was removed, so the map cannot be updated in place"
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial())
+        );
+    }
+
+    /// macOS opens nothing it removes, so it cannot show that a file with one link left no link
+    /// behind, and every file or link it removes counts as possibly linked: the map is scanned
+    /// again after a deletion of a file, as it was before the map could be updated in place at
+    /// all. (A folder with no file in it is still described in place:
+    /// `a_deletion_whose_report_spilled_is_still_described_in_place`.)
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_deletion_of_a_file_sends_the_map_back_to_a_scan_on_macos() {
+        let (root, mut app) = app_listing_a_folder_holding_a_file(|_| {});
+        let report = delete_the_target_in_the_folder(root.path(), &app, || {});
+        assert!(
+            report.deleted_files_may_have_other_links(),
+            "the file had one link, and the executor opened nothing to show that none survived"
+        );
+
+        finish_the_deletion(&mut app, report);
+
+        assert!(
+            app.generation_rebuild_required,
+            "a removed file counts as possibly linked, so the map is scanned again"
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial())
+        );
+    }
+
+    /// An entry another process unlinked before the executor reached it records `Missing`, though
+    /// the deletion removed the rest of its folder, and the link another process made to it
+    /// keeps its object alive: whatever names it now is outside what the map can say. The map is
+    /// scanned again.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_entry_that_vanished_before_its_removal_sends_the_map_back_to_a_scan() {
+        let (root, mut app) = app_listing_a_folder(|holder| {
+            let folder = holder.join("folder");
+            std::fs::create_dir(&folder).expect("folder fixture should exist");
+            std::fs::write(folder.join("kept"), b"kept").expect("kept fixture should exist");
+            std::fs::write(folder.join("vanishes"), b"vanishes")
+                .expect("vanishing fixture should exist");
+        });
+        let target = deletion_target_in_the_map(root.path(), &app, "holder/folder");
+        let plan = crate::deletion::build_plan(root.path(), target, false)
+            .expect("the folder's plan should build");
+        // Between the plan and the run, another process gives the file another name and unlinks
+        // this one.
+        let vanishing = root.path().join("holder/folder/vanishes");
+        std::fs::hard_link(&vanishing, root.path().join("another-name"))
+            .expect("the other name should be made");
+        std::fs::remove_file(&vanishing).expect("the file should be unlinked");
+        let report = crate::deletion::execute_plan(
+            root.path(),
+            plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(report.target_was_removed());
+
+        finish_the_deletion(&mut app, report);
+
+        assert!(
+            app.generation_rebuild_required,
+            "an entry that was gone when the executor reached it may live on under another name"
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial())
+        );
+    }
+
+    /// The executor can fail after it has removed a file: the placeholder that held the file's
+    /// name is removed once the file is gone, and when that fails the file is recorded as failed
+    /// though it is gone, and the folder that held it is still removed. What became of the file's
+    /// other links is then no more known than of a file that was removed whole: the map is
+    /// scanned again, not updated in place.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn a_file_removed_and_then_failed_on_its_cleanup_sends_the_map_back_to_a_scan() {
+        let (root, mut app) = app_listing_a_folder(|holder| {
+            let folder = holder.join("folder");
+            std::fs::create_dir(&folder).expect("folder fixture should exist");
+            std::fs::write(folder.join("file"), b"payload").expect("file fixture should exist");
+        });
+        let folder = root.path().join("holder/folder");
+        let target = deletion_target_in_the_map(root.path(), &app, "holder/folder");
+        let plan = crate::deletion::build_plan(root.path(), target, false)
+            .expect("the folder's plan should build");
+        // The file has another link, outside the folder: whatever the cleanup does, it lives on.
+        std::fs::hard_link(folder.join("file"), root.path().join("another-name"))
+            .expect("the other link should be made");
+        let spoiled = std::cell::Cell::new(false);
+
+        let report = crate::deletion::execute_plan_with_hook_after_inspection(
+            root.path(),
+            plan,
+            |detached| {
+                // At the file's turn its name holds the placeholder. Take it away, so that the
+                // check that follows the file's removal finds nothing there.
+                if !spoiled.get() && folder.join(detached).exists() {
+                    std::fs::remove_file(folder.join("file"))
+                        .expect("the placeholder should be removed");
+                    spoiled.set(true);
+                }
+            },
+        );
+
+        assert!(spoiled.get(), "the placeholder was never taken away");
+        assert_eq!(report.failed_entries(), 1, "the file's cleanup failed");
+        assert!(report.target_was_removed(), "the folder went all the same");
+        finish_the_deletion(&mut app, report);
+
+        assert!(
+            app.generation_rebuild_required,
+            "a file with another link was removed, so the map cannot be updated in place"
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial())
+        );
+    }
+
+    /// A deletion large enough to spill keeps a file of its own beside the folder that held its
+    /// target on Windows, for as long as its report stays in the history. That file is Excise's,
+    /// not the user's: the map that follows the deletion is checked against what the folder holds
+    /// of the user's, and is described in place. (Only folders are removed, so that what the
+    /// executor can prove of a file's links does not matter here.)
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_deletion_whose_report_spilled_is_still_described_in_place() {
+        let (root, mut app) = app_listing_a_folder(|holder| {
+            let big = holder.join("big");
+            std::fs::create_dir(&big).expect("big folder should exist");
+            for index in 0..64 {
+                std::fs::create_dir(big.join(format!("folder-{index:02}")))
+                    .expect("fixture folder should exist");
+            }
+        });
+        let target = deletion_target_in_the_map(root.path(), &app, "holder/big");
+        // The deletion's storage and the scan store's are one session's: they share the registry
+        // of the files Excise keeps open in the tree.
+        let temporary_storage =
+            crate::temporary_storage::TemporaryStorage::with_limit_bytes(8 * 1024 * 1024)
+                .sharing_private_files_with(&app.scan_store.quota());
+        let plan = crate::deletion::build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &std::sync::atomic::AtomicBool::new(false),
+            1,
+            &temporary_storage,
+        )
+        .expect("the folder's plan should spill, not fail");
+        let report = crate::deletion::execute_plan(
+            root.path(),
+            plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(report.target_was_removed());
+        assert!(
+            report.entries.is_spilled(),
+            "the report must have spilled for this to test anything"
+        );
+
+        // The history keeps the report, and so its spill, while the overlay is built.
+        finish_the_deletion(&mut app, report);
+
+        assert!(
+            !app.generation_rebuild_required,
+            "Excise's own file beside the removed folder made the map a scan"
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(1))
+        );
+    }
+
+    /// A directory plan that outgrows its budget spills to temporary storage, and what stays on
+    /// disk is not what the history holds in memory. The report of a deletion that ran is always
+    /// kept: it must not be charged for entries that are not resident, and so be larger than the
+    /// place the history kept for it.
+    #[cfg(unix)]
+    #[test]
+    fn the_report_of_a_deletion_whose_plan_spilled_finds_room_in_the_history() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let folder = root.path().join("folder");
+        std::fs::create_dir(&folder).expect("folder fixture should exist");
+        for index in 0..200 {
+            std::fs::write(folder.join(format!("file-{index:03}")), b"payload")
+                .expect("fixture file should exist");
+        }
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        add_fixture_entry(&mut app, &folder);
+        app.finalize_scan();
+        // The history is nearly full: its room is a little more than one plan may take.
+        app.complete_deletion(report(app.deletion_history_limit - 64 * 1024));
+        let budget = app.maximum_deletion_plan_bytes();
+        let target = deletion_target_in_the_map(root.path(), &app, "folder");
+        let temporary_storage =
+            crate::temporary_storage::TemporaryStorage::with_limit_bytes(8 * 1024 * 1024);
+        let plan = crate::deletion::build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target,
+            false,
+            &std::sync::atomic::AtomicBool::new(false),
+            budget,
+            &temporary_storage,
+        )
+        .expect("the folder's plan should spill, not fail");
+        let report = crate::deletion::execute_plan(
+            root.path(),
+            plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(report.target_was_removed());
+
+        assert!(app.complete_deletion(report));
+
+        assert_eq!(
+            app.deletion_history.len(),
+            2,
+            "the report of a deletion that ran was dropped"
         );
     }
 
@@ -4500,7 +6411,7 @@ mod tests {
             .discard_active()
             .expect("test should make the replacement generation unavailable");
 
-        app.finish_generation_rebuild()
+        finish_rebuild(&mut app)
             .expect("failed publication should settle into the unavailable state");
 
         assert!(matches!(app.ui_mode, UiMode::ScanResultsUnavailable(_)));
@@ -4547,8 +6458,7 @@ mod tests {
             .discard_active()
             .expect("test should make the replacement generation unavailable");
 
-        app.finish_generation_rebuild()
-            .expect("failed publication should preserve the theme picker");
+        finish_rebuild(&mut app).expect("failed publication should preserve the theme picker");
 
         assert!(matches!(
             &app.ui_mode,
@@ -4593,7 +6503,7 @@ mod tests {
             "scan store capacity exhausted while publishing",
         );
 
-        app.finish_generation_rebuild()
+        finish_rebuild(&mut app)
             .expect("capacity failure should settle into the unavailable state");
 
         assert!(matches!(
@@ -4668,7 +6578,7 @@ mod tests {
         app.invalidate_snapshot_view_for_live_mutation();
         assert!(app.generation_rebuild_active);
         assert!(app.generation_rebuild_required);
-        app.finish_generation_rebuild()
+        finish_rebuild(&mut app)
             .expect("stale rebuild completion should settle without publication");
         assert!(!app.generation_rebuild_active);
         assert!(app.generation_rebuild_required);
@@ -4706,8 +6616,7 @@ mod tests {
         app.invalidate_snapshot_view_for_live_mutation();
         app.suppress_generation_rebuild_restart();
 
-        app.finish_generation_rebuild()
-            .expect("stale rebuild completion should settle safely");
+        finish_rebuild(&mut app).expect("stale rebuild completion should settle safely");
 
         assert!(app.generation_rebuild_required);
         assert!(
@@ -4848,9 +6757,11 @@ mod tests {
         for path in [&retained, &hidden] {
             add_fixture_entry(&mut app, path);
         }
-        app.scan_store
-            .publish()
-            .expect("canonical snapshot should publish");
+        app.finalize_scan();
+        assert!(
+            app.scan_store.published().is_some(),
+            "canonical snapshot should publish"
+        );
         app.load_snapshot_page(&RelativePath::root())
             .expect("root page should materialize");
         app.start_ui();
@@ -4894,9 +6805,11 @@ mod tests {
         for path in [&folder, &needle, &other] {
             add_fixture_entry(&mut app, path);
         }
-        app.scan_store
-            .publish()
-            .expect("canonical snapshot should publish");
+        app.finalize_scan();
+        assert!(
+            app.scan_store.published().is_some(),
+            "canonical snapshot should publish"
+        );
         app.load_snapshot_page(&RelativePath::root())
             .expect("root page should materialize");
         app.start_ui();
@@ -4968,9 +6881,11 @@ mod tests {
         for path in &paths {
             add_fixture_entry(&mut app, path);
         }
-        app.scan_store
-            .publish()
-            .expect("canonical snapshot should publish");
+        app.finalize_scan();
+        assert!(
+            app.scan_store.published().is_some(),
+            "canonical snapshot should publish"
+        );
         app.load_snapshot_page(&RelativePath::root())
             .expect("root page should materialize");
         app.start_ui();
@@ -5111,9 +7026,7 @@ mod tests {
         )
         .expect("app should initialize");
         add_fixture_entry(&mut app, &entry);
-        app.scan_store
-            .publish()
-            .expect("canonical generation should publish");
+        publish_store_directly(&mut app).expect("canonical generation should publish");
 
         let mut encoded = Vec::new();
         app.write_scan_report(&RunSummary::default(), &mut encoded)
@@ -5152,9 +7065,11 @@ mod tests {
         for path in [folder.as_path(), child.as_path(), leaf.as_path()] {
             add_fixture_entry(&mut app, path);
         }
-        app.scan_store
-            .publish()
-            .expect("canonical snapshot should publish");
+        app.finalize_scan();
+        assert!(
+            app.scan_store.published().is_some(),
+            "canonical snapshot should publish"
+        );
         app.load_snapshot_page(&RelativePath::root())
             .expect("root page should materialize");
         app.start_ui();
@@ -5204,6 +7119,96 @@ mod tests {
                 .map(|file| file.name)
                 .collect::<Vec<_>>(),
             vec![std::ffi::OsString::from("leaf")]
+        );
+    }
+
+    fn announcing_app(root: &std::path::Path) -> App<TestBackend> {
+        let mut app = App::new(
+            TestBackend::new(80, 24),
+            root.to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.ui_mode = UiMode::Normal;
+        app
+    }
+
+    #[test]
+    fn an_announcement_shows_at_once_over_the_map() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = announcing_app(root.path());
+
+        app.announce(Announcement::Notice("exported".to_string()));
+
+        assert!(
+            matches!(&app.ui_mode, UiMode::Notice { message, .. } if message == "exported"),
+            "a reader looking at the map is told at once"
+        );
+        assert!(!app.show_waiting_announcement(), "nothing is left waiting");
+    }
+
+    #[test]
+    fn an_announcement_never_replaces_a_modal_the_reader_is_deciding_in() {
+        type StillShown = fn(&UiMode) -> bool;
+        let root = tempfile::tempdir().expect("app root should exist");
+        let deciding: [(UiMode, StillShown); 3] = [
+            (UiMode::Help, |mode| matches!(mode, UiMode::Help)),
+            (
+                UiMode::FilterInput {
+                    input: "ab".to_string(),
+                    error: None,
+                },
+                |mode| matches!(mode, UiMode::FilterInput { input, .. } if input == "ab"),
+            ),
+            (
+                UiMode::Exiting {
+                    work: ExitWork::None,
+                    return_to: ThemePickerReturn::Normal,
+                },
+                |mode| matches!(mode, UiMode::Exiting { .. }),
+            ),
+        ];
+        for (mode, still_shown) in deciding {
+            let mut app = announcing_app(root.path());
+            app.ui_mode = mode;
+
+            app.announce(Announcement::Error("export failed".to_string()));
+
+            assert!(
+                still_shown(&app.ui_mode),
+                "the modal stays as the reader left it"
+            );
+            assert!(!app.show_waiting_announcement(), "it still waits");
+
+            app.ui_mode = UiMode::Normal;
+            assert!(app.show_waiting_announcement());
+            assert!(
+                matches!(&app.ui_mode, UiMode::ErrorMessage { message, .. } if message == "export failed"),
+                "it shows once the reader is back at the map"
+            );
+            assert!(!app.show_waiting_announcement(), "it is shown once");
+        }
+    }
+
+    #[test]
+    fn a_later_announcement_replaces_one_that_still_waits() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = announcing_app(root.path());
+        app.ui_mode = UiMode::Help;
+
+        app.announce(Announcement::Notice("first".to_string()));
+        app.announce(Announcement::Notice("second".to_string()));
+        app.ui_mode = UiMode::Normal;
+
+        assert!(app.show_waiting_announcement());
+        assert!(
+            matches!(&app.ui_mode, UiMode::Notice { message, .. } if message == "second"),
+            "the reader sees the latest result"
         );
     }
 }

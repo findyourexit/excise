@@ -9,7 +9,6 @@ use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-#[cfg(feature = "internal")]
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
@@ -23,11 +22,13 @@ pub(crate) use clock::{Clock, SystemClock};
 pub use probe::{
     HISTOGRAM_BUCKETS, OwnerLoopProbe, OwnerLoopReport, OwnerPhase, PhaseHistogram, WorkerEventKind,
 };
-use worker::{DeletionWorkSubmissionError, ScannedEntry, WorkerEvent, WorkerPool};
+use worker::{
+    DeletionWorkSubmissionError, HistoryExportError, ScannedEntry, WorkerEvent, WorkerPool,
+};
 
 use crate::App;
 use crate::animation::AnimationScheduler;
-use crate::app::ExitWork;
+use crate::app::{Announcement, ExitWork, FinishedPublication};
 use crate::config::{CustomKeyBindings, KeyPreset, save_theme_preference};
 use crate::deletion::{DeletionPlanError, DeletionReport};
 use crate::error::{AppError, ExitClass};
@@ -43,18 +44,26 @@ use crate::scan_coordinator::{
     RelativePath, ScanGeneration, SchedulerSnapshot, SessionCoordinator, WorkCompletion, WorkKind,
     WorkLease, WorkPriority,
 };
-use crate::scan_store::run_file::SealedRun;
 use crate::scan_store::session::{
-    ScanStore, is_scan_store_capacity_error, scan_store_capacity_message,
+    ScanStore, SealedBatch, is_scan_store_capacity_error, scan_store_capacity_message,
 };
 use crate::scan_store::storage::ScanStoreStorage;
-use crate::signals::{self, StopRequest};
+use crate::signals::{self, ShutdownWait, StopRequest};
 use crate::temporary_storage::TemporaryStorage;
 use crate::terminal::FrameSink;
 use crate::theme::ThemeId;
 use crate::ui::palette::ColorCycle;
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// The longest the loop sleeps while a scan streams in, or the store thread publishes its map.
+/// Nothing wakes the loop for the scanner's results (it sleeps in the input poll), and a result
+/// arrives every few hundred microseconds: the scanner may have only
+/// [`MAX_INFLIGHT_SCAN_BATCHES`](crate::scan_store::session::MAX_INFLIGHT_SCAN_BATCHES) batches
+/// sealed and not yet handed on, so a nap of the ordinary interval left it waiting for credits
+/// through most of every nap.
+const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// How often the loop asks the coordinator for its scheduler summary while a scan streams in.
+const SCHEDULER_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_INPUT_WAIT: Duration = Duration::from_hours(1);
 /// Limits expensive layout rebuilds while a large scan streams in.
 const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(150);
@@ -185,6 +194,11 @@ where
     scheduler_snapshot: Option<SchedulerSnapshot>,
     /// The primary breadth-first generation remains active while a versioned refresh may run.
     primary_scan_active: bool,
+    /// When the loop last asked the coordinator for its scheduler summary.
+    scheduler_refreshed_at: Option<Instant>,
+    /// The coordinator's reduction lease for the primary scan, held while the store thread
+    /// publishes its map: the owner loop finishes it when the publication ends.
+    primary_reduction: Option<WorkLease>,
     /// Scan data relevant to the displayed folder arrived since its last refresh.
     scan_view_dirty: bool,
     /// Folder whose incoming scan changes may refresh the visible map.
@@ -212,6 +226,10 @@ where
     /// because an external signal is always a confirmed quit (the existing `Interrupted` exit
     /// class), even when nothing was scanning or being deleted.
     signal_quit: bool,
+    /// Set by [`OwnerLoop::force_signal_exit`]: a second confirmed-quit request ended the run, so
+    /// the shutdown that follows waits for a thread that does not end no longer than the grace,
+    /// except for the deletion executor, which it always waits for.
+    forced_stop: bool,
 }
 
 /// # Errors
@@ -274,6 +292,7 @@ where
         scan_store_session,
     )?;
     app.set_loading_animation_enabled(settings.animate_loading);
+    app.start_scan_store_thread()?;
     let input_runs = app.scan_input_run_factory()?;
     let workers = WorkerPool::start_with_deletion_storage(
         scanner::ScannerOptions {
@@ -307,6 +326,8 @@ where
         scan_active: true,
         scheduler_snapshot: None,
         primary_scan_active: true,
+        primary_reduction: None,
+        scheduler_refreshed_at: None,
         scan_view_dirty: false,
         scan_view_root,
         pending_scan_entries: VecDeque::new(),
@@ -321,6 +342,7 @@ where
         last_deletion_progress: None,
         stop_signals,
         signal_quit: false,
+        forced_stop: false,
     }
     .run()
 }
@@ -331,14 +353,24 @@ where
 {
     fn run(mut self) -> Result<OperationOutcome<RunSummary>, AppError> {
         let loop_result = self.run_loop();
+        // From here this thread is the one waiting for the others, so a second stop request has
+        // no loop left to be acted on by: the waits below that a second request bounds watch for
+        // it, and the terminal is restored after them whatever they ended with. The wait for the
+        // deletion executor is not one of them.
+        let mut wait = ShutdownWait::until_forced(self.stop_signals.take(), self.forced_stop);
         let workers = self
             .workers
             .take()
             .ok_or_else(|| AppError::Invariant("worker pool already stopped".to_string()))?;
-        let shutdown_result = workers.shutdown();
+        let shutdown_result = workers.shutdown_with(&mut wait);
+        // The store thread stops last: once the scanner and the deletion workers are gone nothing
+        // else writes the session's scratch storage. The directory itself goes when the last
+        // holder of that storage, this loop's own app, is dropped.
+        let store_result = self.app.shutdown_scan_store(&mut wait);
         let finish_result = self.app.finish();
         let outcome = loop_result?;
         shutdown_result?;
+        store_result?;
         finish_result?;
         Ok(outcome)
     }
@@ -351,15 +383,19 @@ where
             did_work |= input_processed;
             // A keystroke must be drawn before background work can spend another
             // scheduling slice. This keeps cursor feedback independent of scan load.
-            if input_processed {
+            // A confirmed quit draws nothing more: the terminal is restored right after, and a frame
+            // queued now would only delay that restoration by however long it takes to drain.
+            if input_processed && self.app.is_running {
                 did_work |= self.render_reflecting_input()?;
             }
             if !self.app.is_running && self.scan_active {
                 self.cancelled_while_scanning = true;
             }
+            did_work |= self.process_scan_store_events()?;
+            did_work |= self.process_history_export()?;
             did_work |= self.process_worker_batch()?;
             did_work |= self.process_deletion_departure(false)?;
-            did_work |= self.process_deadlines()?;
+            did_work |= self.process_deadlines();
             // Scanner batches can keep the loop busy indefinitely. Service a due
             // visual frame before rendering so the map's scan field never waits
             // for the input-poll sleep path to run.
@@ -372,12 +408,17 @@ where
                 let input_ready = self.input.poll(self.next_timeout())?;
                 if input_ready {
                     self.process_one_input()?;
+                    // The same rule as at the top of the loop: a keystroke is drawn at once, not
+                    // coalesced behind a frame the terminal is still draining.
+                    if self.app.is_running {
+                        self.render_reflecting_input()?;
+                    }
                 }
                 // A timeout is work too: while `poll` sleeps, geometry and other
                 // deadlines become due. Service them even when no key woke us, or
                 // a finished scan leaves the map frozen until the next input.
                 self.process_deletion_departure(false)?;
-                self.process_deadlines()?;
+                self.process_deadlines();
                 self.render_due_frame()?;
             }
         }
@@ -536,27 +577,7 @@ where
                     Err(error) => self.app.show_error(format!("Scan export failed: {error}")),
                 }
             }
-            InputCommand::ExportDeletionHistory => {
-                let result = next_export_path("deletion-history").and_then(|path| {
-                    let file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                        .map_err(|error| error.to_string())?;
-                    export_report(file, |writer| self.app.write_deletion_history(writer))?;
-                    Ok(path)
-                });
-                match result {
-                    Ok(path) => {
-                        self.app.clear_deletion_history();
-                        self.app
-                            .show_notice(export_notice("Deletion history exported to", &path));
-                    }
-                    Err(error) => self
-                        .app
-                        .show_error(format!("Deletion history export failed: {error}")),
-                }
-            }
+            InputCommand::ExportDeletionHistory => self.start_history_export()?,
             InputCommand::OpenThemePicker => self.app.open_theme_picker(self.settings.theme),
             InputCommand::PreviewTheme(theme) | InputCommand::RestoreTheme(theme) => {
                 self.set_theme(theme);
@@ -579,7 +600,7 @@ where
             InputCommand::StopDeletionAndExit => self.cancel_pending_work_and_exit(true)?,
         }
         if drilled {
-            self.scan_view_root = self.app.current_folder_path();
+            self.scan_view_root = self.app.scan_view_folder_path();
             if self.primary_scan_active {
                 self.workers()?.prioritize_scan(&self.scan_view_root);
             }
@@ -594,6 +615,55 @@ where
             self.animation.cancel_all();
         }
         Ok(())
+    }
+
+    /// Starts exporting the deletion history on a thread of its own
+    /// ([`WorkerPool::start_history_export`]): serializing it takes longer than the interface may
+    /// go without a frame. The reader sees a notice at once, and another when the file is written
+    /// or the export failed. The export goes to the directory the key was pressed in, as the
+    /// scan export does.
+    fn start_history_export(&mut self) -> Result<(), AppError> {
+        let directory = match std::env::current_dir() {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.app
+                    .show_error(format!("Deletion history export failed: {error}"));
+                return Ok(());
+            }
+        };
+        let reports = self.app.deletion_history_snapshot();
+        match self.workers()?.start_history_export(reports, directory) {
+            Ok(()) => self.app.show_notice("Exporting the deletion history..."),
+            Err(HistoryExportError::Busy) => self
+                .app
+                .show_notice("The deletion history is already being exported"),
+            Err(HistoryExportError::Spawn(error)) => self
+                .app
+                .show_error(format!("Deletion history export failed: {error}")),
+        }
+        Ok(())
+    }
+
+    /// Reports an export that ended, the file it wrote or why it wrote none, and shows what an
+    /// earlier one reported once the reader is free to read it. Returns whether it did either.
+    fn process_history_export(&mut self) -> Result<bool, AppError> {
+        let shown = self.app.show_waiting_announcement();
+        let Some(outcome) = self.workers()?.poll_history_export() else {
+            return Ok(shown);
+        };
+        match outcome.result {
+            Ok(path) => {
+                self.app.drop_exported_deletion_history(outcome.exported);
+                self.app.announce(Announcement::Notice(export_notice(
+                    "Deletion history exported to",
+                    &path,
+                )));
+            }
+            Err(error) => self.app.announce(Announcement::Error(format!(
+                "Deletion history export failed: {error}"
+            ))),
+        }
+        Ok(true)
     }
 
     fn set_theme(&mut self, theme: ThemeId) {
@@ -691,10 +761,13 @@ where
     /// would otherwise gate on, and ends the run immediately. Filesystem safety for an in-flight
     /// deletion entry still comes from the executor's own entry-boundary check against the stop
     /// this (idempotently, in case both requests were drained together) and the first request
-    /// already set, and from `WorkerPool::shutdown` always joining that executor before this
-    /// run's process can exit - not from waiting here.
+    /// already set, and from `WorkerPool::shutdown_with` always joining that executor, whatever
+    /// the stop requests, before the run's process can exit - not from waiting here. A deletion
+    /// stuck in a call that never returns therefore still holds a forced exit; the waits for the
+    /// other threads are the ones a forced stop bounds ([`signals::FORCED_STOP_GRACE`]).
     fn force_signal_exit(&mut self) -> Result<(), AppError> {
         self.signal_quit = true;
+        self.forced_stop = true;
         self.workers()?.safely_stop_deletion();
         self.exit_after_work = false;
         self.app.exit();
@@ -788,6 +861,18 @@ where
     }
 
     fn refresh_scheduler_snapshot(&mut self) {
+        // The snapshot is a round trip to the coordinator thread, which answers behind the
+        // commands the scan's workers keep sending it: costly, and a wait for the owner loop,
+        // when asked on every pass. While a scan streams in, a summary that is at most a frame
+        // old is as good, so ask once per interval.
+        if self.scan_active
+            && self
+                .scheduler_refreshed_at
+                .is_some_and(|at| at.elapsed() < SCHEDULER_SNAPSHOT_INTERVAL)
+        {
+            return;
+        }
+        self.scheduler_refreshed_at = Some(Instant::now());
         let snapshot = self
             .workers
             .as_ref()
@@ -798,6 +883,7 @@ where
         }
     }
 
+    /// Applies at most one stored scanner event, unless input is waiting or the map is moving.
     fn process_worker_batch(&mut self) -> Result<bool, AppError> {
         self.refresh_scheduler_snapshot();
         if self.app.map_is_transitioning() || self.input.poll(Duration::ZERO)? {
@@ -805,6 +891,12 @@ where
         }
         if self.process_pending_scan_entries()? {
             return Ok(true);
+        }
+        if !self.app.scan_store_has_room_for_batch() {
+            // The store thread has a backlog of batches to admit. Leave the scanner's events where
+            // they are: the scanner backs up through its own bounded channel and the in-flight
+            // cap, instead of a queue growing here.
+            return Ok(false);
         }
         let event = match self.workers()?.events().try_recv() {
             Ok(event) => event,
@@ -867,7 +959,7 @@ where
     fn admit_coverage_runs(
         &mut self,
         lease: Option<&WorkLease>,
-        input_runs: Vec<SealedRun>,
+        input_runs: SealedBatch,
     ) -> Result<(), AppError> {
         if input_runs.is_empty() {
             self.app.record_scan_store_unrecorded_path();
@@ -885,7 +977,7 @@ where
     fn handle_primary_unscanned(
         &mut self,
         lease: Option<&WorkLease>,
-        input_runs: Vec<SealedRun>,
+        input_runs: SealedBatch,
         path: &Path,
         reason: &crate::model::UnscannedReason,
     ) -> Result<(), AppError> {
@@ -944,32 +1036,61 @@ where
     fn finish_primary_scan(&mut self, cancelled: bool) -> Result<(), AppError> {
         self.primary_scan_active = false;
         self.scan_view_dirty = false;
+        self.scan_cancelled = cancelled;
+        if cancelled {
+            if !self.generation_rebuild_active {
+                self.scan_active = false;
+            }
+            self.app.cancel_primary_scan()?;
+            self.record_scan_store_summary();
+            self.start_pending_generation_rebuild()?;
+            return Ok(());
+        }
+        // The scanner is done but the map is not: the store thread publishes it. The scan stays
+        // open for the reader (the header reads SCANNING, loading frames go on, and a quit counts
+        // as cancelled) until `complete_primary_scan` runs when that publication ends. The
+        // reduction lease is held across the wait, as it was across the work.
+        self.primary_reduction = Some(self.workers()?.acquire_reducer()?);
+        self.app.begin_primary_publication();
+        Ok(())
+    }
+
+    /// The primary scan's map was published, or could not be: the scan is over for the reader.
+    fn complete_primary_scan(&mut self) -> Result<(), AppError> {
         if !self.generation_rebuild_active {
             self.scan_active = false;
         }
-        self.scan_cancelled = cancelled;
-        if cancelled {
-            self.app.cancel_primary_scan()?;
-        } else {
-            let reduction = self.workers()?.acquire_reducer()?;
-            #[cfg(feature = "internal")]
-            let publication = self.probe_phase(OwnerPhase::Publication);
-            self.app.finalize_scan();
-            #[cfg(feature = "internal")]
-            drop(publication);
-            self.workers()?
-                .finish_coordinated_work(reduction, WorkCompletion::Succeeded)?;
-            self.app.start_ui();
-            crate::test_events::scan_complete(self.summary.scanned_entries);
-            self.animation.schedule_completion();
-        }
-        let (used, limit) = self.app.scan_store_stats();
-        self.summary.scan_store_bytes = used;
-        self.summary.scan_store_limit_bytes = limit;
+        let reduction = self.primary_reduction.take().ok_or_else(|| {
+            AppError::Invariant("a published scan had no reduction lease".to_string())
+        })?;
+        self.workers()?
+            .finish_coordinated_work(reduction, WorkCompletion::Succeeded)?;
+        self.app.start_ui();
+        crate::test_events::scan_complete(self.summary.scanned_entries);
+        self.animation.schedule_completion();
+        #[cfg(feature = "internal")]
+        self.probe_scan_complete();
+        self.record_scan_store_summary();
         self.start_pending_generation_rebuild()?;
         Ok(())
     }
+
     fn finish_generation_rebuild(&mut self, cancelled: bool) -> Result<(), AppError> {
+        if cancelled {
+            return self.complete_generation_rebuild(true, None);
+        }
+        // As for the primary scan, the rebuild is over for the reader once its replacement map
+        // was published: `complete_generation_rebuild` runs when that publication ends.
+        self.app.begin_rebuild_publication();
+        Ok(())
+    }
+
+    /// A rebuild ended: cancelled, or with its replacement map published (or not).
+    fn complete_generation_rebuild(
+        &mut self,
+        cancelled: bool,
+        publication_failure: Option<String>,
+    ) -> Result<(), AppError> {
         self.generation_rebuild_active = false;
         self.generation_rebuild_target = None;
         if let Some(workers) = self.workers.as_ref() {
@@ -985,12 +1106,67 @@ where
         if cancelled {
             self.app.cancel_generation_rebuild()?;
         } else {
-            self.app.finish_generation_rebuild()?;
+            self.app.finish_generation_rebuild(publication_failure)?;
         }
+        self.record_scan_store_summary();
+        self.start_pending_generation_rebuild()?;
+        Ok(())
+    }
+
+    fn record_scan_store_summary(&mut self) {
         let (used, limit) = self.app.scan_store_stats();
         self.summary.scan_store_bytes = used;
         self.summary.scan_store_limit_bytes = limit;
+    }
+
+    /// Applies what the store thread reported, and finishes the publications that ended. Returns
+    /// whether there was anything to do.
+    fn process_scan_store_events(&mut self) -> Result<bool, AppError> {
+        #[cfg(feature = "internal")]
+        let publication = self
+            .app
+            .primary_publication_pending()
+            .then(|| self.probe_phase(OwnerPhase::Publication))
+            .flatten();
+        let applied = self.app.process_scan_store_events();
+        #[cfg(feature = "internal")]
+        if let Some(mut timer) = publication
+            && !self.app.primary_publication_finished()
+        {
+            timer.cancel();
+        }
+        let mut did_work = applied;
+        did_work |= self.app.apply_waiting_provisional_page();
+        did_work |= self.app.refresh_publication_progress();
+        while let Some(finished) = self.app.take_finished_publication() {
+            did_work = true;
+            match finished {
+                FinishedPublication::Primary => self.complete_primary_scan()?,
+                FinishedPublication::Rebuild { failure } => {
+                    self.complete_generation_rebuild(false, failure)?;
+                }
+                FinishedPublication::RebuildCancelled => {
+                    self.complete_generation_rebuild(true, None)?;
+                }
+            }
+        }
+        if did_work {
+            self.start_work_that_waited_for_the_store()?;
+        }
+        Ok(did_work)
+    }
+
+    /// Starts what only a publication's end allowed. A rebuild a deletion required waits for
+    /// every publication to end; so does the next queued deletion, which starts once the map
+    /// without the last one's target has arrived; and a confirmed quit that waited for a rebuild
+    /// can finish only after the rebuild's own publication.
+    fn start_work_that_waited_for_the_store(&mut self) -> Result<(), AppError> {
         self.start_pending_generation_rebuild()?;
+        if !self.exit_after_work {
+            self.start_next_deletion_planning()?;
+            self.start_next_deletion_execution()?;
+        }
+        self.finish_exit_after_work();
         Ok(())
     }
 
@@ -1225,7 +1401,7 @@ where
         Ok(true)
     }
 
-    fn process_deadlines(&mut self) -> Result<bool, AppError> {
+    fn process_deadlines(&mut self) -> bool {
         let now = self.clock.now();
         let mut processed = false;
         let mut pending = Vec::with_capacity(self.timed_actions.len());
@@ -1243,7 +1419,7 @@ where
         self.timed_actions = pending;
 
         if self.scan_active && now >= self.next_loading_frame {
-            if self.scan_view_dirty && self.app.refresh_board_from_scan()? {
+            if self.scan_view_dirty && self.app.refresh_board_from_scan() {
                 self.scan_view_dirty = false;
             }
             self.next_loading_frame = now.saturating_add(LOADING_FRAME_INTERVAL);
@@ -1271,7 +1447,7 @@ where
             self.last_deletion_progress = None;
             self.next_deletion_progress_frame = now.saturating_add(DELETION_PROGRESS_INTERVAL);
         }
-        Ok(processed)
+        processed
     }
 
     fn update_animation_frame(&mut self) {
@@ -1361,9 +1537,24 @@ where
         });
     }
 
+    /// Work that ends by itself and that the loop keeps polling for: the scan, a deletion, and a
+    /// publication the store thread still owes. A publication outlives the scan that began it, so
+    /// the loop must not idle through one.
+    fn background_work_pending(&self) -> bool {
+        self.scan_active
+            || self.app.deletion_work.has_background_activity()
+            || self.app.scan_store_busy()
+            || self
+                .workers
+                .as_ref()
+                .is_some_and(WorkerPool::history_export_running)
+    }
+
     fn next_timeout(&self) -> Duration {
         let now = self.clock.now();
-        let mut timeout = if self.scan_active || self.app.deletion_work.has_background_activity() {
+        let mut timeout = if self.scan_active || self.app.scan_store_busy() {
+            SCAN_POLL_INTERVAL
+        } else if self.background_work_pending() {
             WORKER_POLL_INTERVAL
         } else {
             IDLE_INPUT_WAIT
@@ -1399,9 +1590,21 @@ where
 
     fn wait_for_quiescence(&mut self) -> Result<(), AppError> {
         'quiescence: loop {
-            while self.scan_active || self.app.deletion_work.has_background_activity() {
+            while self.background_work_pending() {
                 if self.process_pending_scan_entry() {
                     self.render_due_frame()?;
+                    continue;
+                }
+                if self.process_scan_store_events()? {
+                    self.render_due_frame()?;
+                    continue;
+                }
+                if self.process_history_export()? {
+                    self.render_due_frame()?;
+                    continue;
+                }
+                if !self.app.scan_store_has_room_for_batch() {
+                    std::thread::sleep(WORKER_POLL_INTERVAL);
                     continue;
                 }
                 match self.workers()?.events().recv_timeout(WORKER_POLL_INTERVAL) {
@@ -1422,7 +1625,7 @@ where
                 if self.process_deletion_departure(false)? {
                     self.render_due_frame()?;
                 }
-                if self.scan_active || self.app.deletion_work.has_background_activity() {
+                if self.background_work_pending() {
                     continue 'quiescence;
                 }
                 let next_timed = self.timed_actions.iter().map(|action| action.at).min();
@@ -1440,7 +1643,7 @@ where
                     break;
                 }
                 self.process_deletion_departure(false)?;
-                self.process_deadlines()?;
+                self.process_deadlines();
                 self.render_due_frame()?;
             }
             break;
@@ -1776,12 +1979,10 @@ fn scan_headless_with_scan_store_session(
                     entries,
                     input_runs,
                 } => {
-                    if !input_runs.is_empty() {
-                        // Headless admits directly, with no `App::admit_scan_input_runs` in
-                        // between, so this is this batch's only release point for the credit
-                        // `ScanInputRunFactory::seal_observation_batch` acquired.
-                        scan_store.release_inflight_batch_credit();
-                    }
+                    // This loop admits what it receives, so the batch's in-flight credit comes
+                    // back as the batch arrives: that is how the headless scan has always paced
+                    // the scanner, and how long admission takes does not change it.
+                    let input_runs = input_runs.into_runs_returning_credit();
                     if !scan_store_capacity_exhausted && !input_runs.is_empty() {
                         let lease = lease.as_ref().ok_or_else(|| {
                             AppError::Invariant(
@@ -1815,10 +2016,8 @@ fn scan_headless_with_scan_store_session(
                     reason,
                     input_runs,
                 } => {
+                    let input_runs = input_runs.into_runs_returning_credit();
                     let represented = !input_runs.is_empty();
-                    if represented {
-                        scan_store.release_inflight_batch_credit();
-                    }
                     if !scan_store_capacity_exhausted && represented {
                         let lease = lease.as_ref().ok_or_else(|| {
                             AppError::Invariant(
@@ -2011,6 +2210,12 @@ fn scan_headless_with_scan_store_session(
 
 fn next_export_path(kind: &str) -> Result<PathBuf, String> {
     let directory = std::env::current_dir().map_err(|error| error.to_string())?;
+    next_export_path_in(&directory, kind)
+}
+
+/// The first of `excise-{kind}.json`, `excise-{kind}-1.json`, and so on that is free in
+/// `directory`.
+fn next_export_path_in(directory: &Path, kind: &str) -> Result<PathBuf, String> {
     for suffix in 0..1_000_u16 {
         let name = if suffix == 0 {
             format!("excise-{kind}.json")
@@ -2046,7 +2251,13 @@ pub const fn outcome_exit_class(outcome: &OperationOutcome<RunSummary>) -> ExitC
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use std::cell::RefCell;
     use std::io;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use crate::tests::cases::test_utils::test_backend_factory;
+    use crate::tests::fakes::{TerminalEvents, TestBackend as LoggingBackend};
 
     struct PendingInput;
 
@@ -2109,6 +2320,148 @@ mod tests {
                 ),
             )))
         }
+    }
+
+    /// Hands out its keys only to a poll that waits, the way a key typed while the loop sleeps in
+    /// its idle poll reaches it, and notes how many frames had been drawn each time one is read.
+    struct KeysWhileIdle {
+        keys: VecDeque<Event>,
+        frames: Arc<Mutex<Vec<String>>>,
+        frames_at_read: Rc<RefCell<Vec<usize>>>,
+        started: Instant,
+    }
+
+    impl KeysWhileIdle {
+        fn new(
+            keys: impl IntoIterator<Item = Event>,
+            frames: &Arc<Mutex<Vec<String>>>,
+            frames_at_read: &Rc<RefCell<Vec<usize>>>,
+        ) -> Self {
+            Self {
+                keys: keys.into_iter().collect(),
+                frames: Arc::clone(frames),
+                frames_at_read: Rc::clone(frames_at_read),
+                started: Instant::now(),
+            }
+        }
+    }
+
+    impl InputSource for KeysWhileIdle {
+        fn poll(&mut self, timeout: Duration) -> Result<bool, AppError> {
+            // Gives up on a loop that never reaches its idle poll, which would spin here for good.
+            if self.started.elapsed() > Duration::from_secs(30) {
+                return Err(AppError::Invariant(
+                    "the loop never waited for input".to_string(),
+                ));
+            }
+            Ok(!timeout.is_zero() && !self.keys.is_empty())
+        }
+
+        fn read(&mut self) -> Result<InputEvent, AppError> {
+            self.frames_at_read
+                .borrow_mut()
+                .push(logged_frames(&self.frames));
+            self.keys
+                .pop_front()
+                .map(InputEvent::Terminal)
+                .ok_or_else(|| AppError::Invariant("no key was left to read".to_string()))
+        }
+    }
+
+    fn key(character: char) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(character),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    /// A terminal writer that blocks on the bytes it is given until the sending half of
+    /// `stalled` drops, as a terminal that has stopped reading does.
+    struct StalledWriter {
+        stalled: mpsc::Receiver<()>,
+    }
+
+    impl io::Write for StalledWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            // Nothing is ever sent: this returns once the sender drops.
+            let _ = self.stalled.recv();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A frame sink whose writer is stuck on the frame it was handed, so its render gate is shut
+    /// until the returned sender drops.
+    fn undrained_frame_sink() -> (FrameSink, mpsc::Sender<()>) {
+        let (release, stalled) = mpsc::channel();
+        let (_writer, sink) =
+            crate::terminal::spawn_frame_writer(StalledWriter { stalled }, io::sink())
+                .expect("the terminal writer thread should spawn");
+        sink.enqueue(b"the previous frame".to_vec())
+            .expect("the writer should accept a frame");
+        assert!(
+            !sink.previous_frame_drained(),
+            "the writer should still be busy with that frame"
+        );
+        (sink, release)
+    }
+
+    /// How many frames the logging backend has recorded.
+    fn logged_frames(frames: &Arc<Mutex<Vec<String>>>) -> usize {
+        frames.lock().expect("the frame log should lock").len()
+    }
+
+    /// An owner loop over a backend that logs its frames, whose terminal writer is still busy with
+    /// the last one: the render gate holds back every frame but a key's until the writer is
+    /// released, which is when this drops.
+    struct BusyTerminal {
+        owner: OwnerLoop<LoggingBackend>,
+        frames: Arc<Mutex<Vec<String>>>,
+        _writer_release: mpsc::Sender<()>,
+    }
+
+    impl BusyTerminal {
+        fn new(root: &Path) -> Self {
+            let (_, frames, backend) = test_backend_factory(80, 24);
+            let mut owner = owner_with_workers(backend, root, None);
+            // The backend leaves its first frame out of the log, so that one is drawn before any
+            // frame is counted.
+            owner.render().expect("the first frame should draw");
+            let (sink, writer_release) = undrained_frame_sink();
+            owner.frame_sink = Some(sink);
+            Self {
+                owner,
+                frames,
+                _writer_release: writer_release,
+            }
+        }
+
+        fn frames_drawn(&self) -> usize {
+            logged_frames(&self.frames)
+        }
+    }
+
+    fn shut_down_workers<B: Backend>(owner: &mut OwnerLoop<B>) {
+        owner
+            .workers
+            .take()
+            .expect("workers should still be owned")
+            .shutdown()
+            .expect("workers should shut down cleanly");
+    }
+
+    /// The coordinator's active leases, and how much work it has recorded as succeeded.
+    fn scheduler_counts<B: Backend>(owner: &OwnerLoop<B>) -> (usize, u64) {
+        let snapshot = owner
+            .workers
+            .as_ref()
+            .expect("workers should still be owned")
+            .scheduler_snapshot()
+            .expect("the coordinator should answer");
+        (snapshot.active_leases, snapshot.terminal.succeeded())
     }
 
     #[test]
@@ -2193,6 +2546,8 @@ mod tests {
             scan_active: true,
             scheduler_snapshot: None,
             primary_scan_active: true,
+            primary_reduction: None,
+            scheduler_refreshed_at: None,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
@@ -2207,6 +2562,7 @@ mod tests {
             last_deletion_progress: None,
             stop_signals: None,
             signal_quit: false,
+            forced_stop: false,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while owner
@@ -2225,6 +2581,12 @@ mod tests {
             .process_worker_batch()
             .expect("worker batch should yield cleanly");
         let scanned_entries = owner.summary.scanned_entries;
+        let event_left_queued = !owner
+            .workers
+            .as_ref()
+            .expect("workers should still be owned")
+            .events()
+            .is_empty();
         owner
             .workers
             .take()
@@ -2234,6 +2596,10 @@ mod tests {
 
         assert!(!processed, "queued input must preempt scan work");
         assert_eq!(scanned_entries, 0);
+        assert!(
+            event_left_queued,
+            "the scanner's event must wait for the input instead of being consumed"
+        );
     }
 
     #[allow(
@@ -2306,6 +2672,8 @@ mod tests {
             scan_active: true,
             scheduler_snapshot: None,
             primary_scan_active: true,
+            primary_reduction: None,
+            scheduler_refreshed_at: None,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
@@ -2320,6 +2688,7 @@ mod tests {
             last_deletion_progress: None,
             stop_signals: None,
             signal_quit: false,
+            forced_stop: false,
         };
 
         owner
@@ -2332,7 +2701,7 @@ mod tests {
                         identity: first_identity.clone(),
                     })
                     .collect(),
-                input_runs: Vec::new(),
+                input_runs: SealedBatch::empty(),
             })
             .expect("scan batch should be staged");
         assert_eq!(owner.summary.scanned_entries, 0);
@@ -2453,6 +2822,8 @@ mod tests {
             scan_active: true,
             scheduler_snapshot: None,
             primary_scan_active: true,
+            primary_reduction: None,
+            scheduler_refreshed_at: None,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries,
@@ -2467,6 +2838,7 @@ mod tests {
             last_deletion_progress: None,
             stop_signals: None,
             signal_quit: false,
+            forced_stop: false,
         };
 
         assert!(
@@ -2483,7 +2855,7 @@ mod tests {
             "a due scan field frame must be rendered before the busy scan batch returns"
         );
     }
-    #[cfg(any(unix, windows))]
+    #[cfg(any(target_os = "linux", windows))]
     fn complete_queued_deletion(
         app: &mut App<TestBackend>,
         root: &std::path::Path,
@@ -2565,6 +2937,8 @@ mod tests {
             scan_active: false,
             scheduler_snapshot: None,
             primary_scan_active: false,
+            primary_reduction: None,
+            scheduler_refreshed_at: None,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
@@ -2579,6 +2953,7 @@ mod tests {
             last_deletion_progress: None,
             stop_signals: None,
             signal_quit: false,
+            forced_stop: false,
         }
     }
 
@@ -2746,17 +3121,20 @@ mod tests {
             .expect("workers should shut down cleanly");
     }
 
-    fn owner_with_workers_for_signal_tests(
+    /// An owner loop over a running worker pool that is scanning `root`, with idle input and no
+    /// frame gate: tests replace the parts they exercise.
+    fn owner_with_workers<B: Backend>(
+        backend: B,
         root: &std::path::Path,
         stop_signals: Option<Receiver<StopRequest>>,
-    ) -> OwnerLoop<TestBackend> {
+    ) -> OwnerLoop<B> {
         let root_metadata =
             std::fs::symlink_metadata(root).expect("test root metadata should exist");
         let root_identity = crate::native_path::identity_for(root, &root_metadata)
             .expect("test root identity should be readable")
             .expect("test root should not be a link");
         let app = App::new_with_root_identity(
-            TestBackend::new(80, 24),
+            backend,
             root.to_path_buf(),
             root_identity.clone(),
             false,
@@ -2823,6 +3201,8 @@ mod tests {
             scan_active: true,
             scheduler_snapshot: None,
             primary_scan_active: true,
+            primary_reduction: None,
+            scheduler_refreshed_at: None,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
@@ -2837,6 +3217,7 @@ mod tests {
             last_deletion_progress: None,
             stop_signals,
             signal_quit: false,
+            forced_stop: false,
         }
     }
 
@@ -2847,7 +3228,7 @@ mod tests {
         sender
             .send(StopRequest::Graceful)
             .expect("the channel should accept the queued request");
-        let mut owner = owner_with_workers_for_signal_tests(root.path(), Some(receiver));
+        let mut owner = owner_with_workers(TestBackend::new(80, 24), root.path(), Some(receiver));
 
         let outcome = owner.run_loop().expect("the loop should end cleanly");
         owner
@@ -2874,7 +3255,7 @@ mod tests {
         sender
             .send(StopRequest::Forced)
             .expect("the channel should accept the queued request");
-        let mut owner = owner_with_workers_for_signal_tests(root.path(), Some(receiver));
+        let mut owner = owner_with_workers(TestBackend::new(80, 24), root.path(), Some(receiver));
         // Simulates a rescan the first request's graceful handling would otherwise wait out
         // (a partial deletion schedules one; nothing in this test ever resolves it), so only
         // the second, forced request can end the run.
@@ -2902,7 +3283,432 @@ mod tests {
             .expect("workers should shut down cleanly");
     }
 
-    #[cfg(any(unix, windows))]
+    /// Idle input that sleeps through its poll, so a loop waiting on a signal does not spin.
+    struct NapInput;
+
+    impl InputSource for NapInput {
+        fn poll(&mut self, timeout: Duration) -> Result<bool, AppError> {
+            std::thread::sleep(timeout.min(Duration::from_millis(5)));
+            Ok(false)
+        }
+
+        fn read(&mut self) -> Result<InputEvent, AppError> {
+            panic!("idle input must not be read")
+        }
+    }
+
+    /// An owner loop over a settled scan of `root`, run to its end on a thread of its own. A test
+    /// then tells a run that never ends from one that ends late, and sends it stop requests while
+    /// it waits. `prepare` runs on that thread after the scan settled, and what it returns lives
+    /// until the run is over; the thread reports `prepared` once `prepare` has run, and the exit
+    /// class (or the error) when the run returns.
+    struct OwnerApart {
+        prepared: mpsc::Receiver<()>,
+        ended: mpsc::Receiver<Result<ExitClass, String>>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    fn run_owner_apart<G: 'static>(
+        root: &std::path::Path,
+        stops: Receiver<StopRequest>,
+        prepare: impl FnOnce(&mut OwnerLoop<TestBackend>) -> G + Send + 'static,
+    ) -> OwnerApart {
+        let root = root.to_path_buf();
+        let (prepared_sender, prepared) = mpsc::channel();
+        let (ended_sender, ended) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut owner = owner_with_workers(TestBackend::new(80, 24), &root, Some(stops));
+            owner.input = Box::new(NapInput);
+            owner
+                .app
+                .start_scan_store_thread()
+                .expect("the store thread should start");
+            owner.wait_for_quiescence().expect("the scan should settle");
+            let kept = prepare(&mut owner);
+            let _ = prepared_sender.send(());
+            let result = owner
+                .run()
+                .map(|outcome| outcome.exit_class())
+                .map_err(|error| error.to_string());
+            let _ = ended_sender.send(result);
+            drop(kept);
+        });
+        OwnerApart {
+            prepared,
+            ended,
+            thread,
+        }
+    }
+
+    /// The exit class a run that was told to stop ended with, within the time a stuck thread
+    /// that never ends would otherwise cost it all of.
+    fn forced_run_class(apart: &OwnerApart) -> ExitClass {
+        apart
+            .ended
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a forced stop must end the run although the thread it waits on never ends")
+            .expect("the run should end without an error")
+    }
+
+    /// A second signal while the shutdown waits on the store thread, which is stuck inside a call
+    /// (a hung file system), stops the wait. Nothing else can: the terminal is still the
+    /// owner's to restore, and the owner is the one waiting.
+    #[test]
+    fn a_forced_stop_ends_a_shutdown_waiting_on_a_stuck_store_thread() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let (stops, receiver) = crossbeam_channel::unbounded();
+        let apart = run_owner_apart(root.path(), receiver, |owner| {
+            owner.app.hold_scan_store_thread_for_test()
+        });
+        apart
+            .prepared
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the store thread should be held");
+
+        stops
+            .send(StopRequest::Graceful)
+            .expect("the first stop request should be accepted");
+        assert!(
+            apart
+                .ended
+                .recv_timeout(Duration::from_millis(500))
+                .is_err(),
+            "a quit waits for the store thread, which is stuck"
+        );
+        stops
+            .send(StopRequest::Forced)
+            .expect("the second stop request should be accepted");
+
+        assert_eq!(forced_run_class(&apart), ExitClass::Interrupted);
+        apart.thread.join().expect("the run's thread should end");
+    }
+
+    /// The loop can take the second request itself, before the shutdown starts waiting. No
+    /// signal is left to arrive then, so the request taken stays the answer to the wait.
+    #[test]
+    fn a_forced_stop_the_loop_already_took_still_ends_the_wait_on_a_stuck_store_thread() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let (stops, receiver) = crossbeam_channel::unbounded();
+        stops
+            .send(StopRequest::Graceful)
+            .expect("the first stop request should be accepted");
+        stops
+            .send(StopRequest::Forced)
+            .expect("the second stop request should be accepted");
+        let apart = run_owner_apart(root.path(), receiver, |owner| {
+            owner.app.hold_scan_store_thread_for_test()
+        });
+
+        assert_eq!(forced_run_class(&apart), ExitClass::Interrupted);
+        apart.thread.join().expect("the run's thread should end");
+    }
+
+    /// As for the store thread, for the deletion-history export, which writes into the folder the
+    /// program was started in, however slow its file system.
+    #[test]
+    fn a_forced_stop_ends_a_shutdown_waiting_on_a_stuck_history_export() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let (stops, receiver) = crossbeam_channel::unbounded();
+        let apart = run_owner_apart(root.path(), receiver, |owner| {
+            let (entered_sender, entered) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            owner
+                .workers
+                .as_ref()
+                .expect("workers should be running")
+                .start_history_export_with(1, move |_| {
+                    let _ = entered_sender.send(());
+                    // Returns when the test drops its end.
+                    let _ = released.recv();
+                    Err("the export was held".to_string())
+                })
+                .expect("the export should start");
+            entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the export should be inside its write");
+            release
+        });
+        apart
+            .prepared
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the export should be held");
+
+        stops
+            .send(StopRequest::Graceful)
+            .expect("the first stop request should be accepted");
+        assert!(
+            apart
+                .ended
+                .recv_timeout(Duration::from_millis(500))
+                .is_err(),
+            "a quit waits for the export, which is stuck"
+        );
+        stops
+            .send(StopRequest::Forced)
+            .expect("the second stop request should be accepted");
+
+        assert_eq!(forced_run_class(&apart), ExitClass::Interrupted);
+        apart.thread.join().expect("the run's thread should end");
+    }
+
+    /// A run whose deletion executor and store thread are both held inside a call that does not
+    /// return: the executor inside an entry, the store thread inside a write. The sender returned
+    /// lets the entry go.
+    fn run_with_the_executor_and_the_store_thread_held(
+        root: &std::path::Path,
+        stops: Receiver<StopRequest>,
+    ) -> (OwnerApart, crossbeam_channel::Sender<()>) {
+        let (release_entry, entry_released) = crossbeam_channel::bounded::<()>(0);
+        let apart = run_owner_apart(root, stops, move |owner| {
+            owner
+                .workers
+                .as_ref()
+                .expect("workers should be running")
+                .hold_executor_for_test(entry_released);
+            owner.app.hold_scan_store_thread_for_test()
+        });
+        apart
+            .prepared
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the executor and the store thread should be held");
+        (apart, release_entry)
+    }
+
+    /// A second signal does not end the wait for the deletion executor, however long its entry
+    /// takes: an entry is moved aside before it is removed, so a process that ended inside one
+    /// could leave a target that is neither intact nor gone. The run ends once the entry returns,
+    /// and only then gives up on the store thread, held in the same run, after its grace.
+    #[test]
+    fn a_forced_stop_still_waits_for_a_deletion_executor_held_inside_an_entry() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let (stops, receiver) = crossbeam_channel::unbounded();
+        let (apart, release_entry) =
+            run_with_the_executor_and_the_store_thread_held(root.path(), receiver);
+
+        stops
+            .send(StopRequest::Graceful)
+            .expect("the first stop request should be accepted");
+        assert!(
+            apart
+                .ended
+                .recv_timeout(Duration::from_millis(500))
+                .is_err(),
+            "a quit waits for the executor, which is inside an entry"
+        );
+        stops
+            .send(StopRequest::Forced)
+            .expect("the second stop request should be accepted");
+        assert!(
+            apart
+                .ended
+                .recv_timeout(signals::FORCED_STOP_GRACE + Duration::from_millis(500))
+                .is_err(),
+            "a forced stop ended the wait for a deletion executor that was inside an entry"
+        );
+        drop(release_entry);
+
+        assert_eq!(forced_run_class(&apart), ExitClass::Interrupted);
+        apart.thread.join().expect("the run's thread should end");
+    }
+
+    /// As above when the loop took the second request itself, before the shutdown began: the
+    /// grace that request starts does not run while the executor is waited for, so the store
+    /// thread is still given its full grace afterwards and not left at once.
+    #[test]
+    fn a_forced_stop_the_loop_already_took_still_waits_for_a_deletion_executor_held_inside_an_entry()
+     {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let (stops, receiver) = crossbeam_channel::unbounded();
+        stops
+            .send(StopRequest::Graceful)
+            .expect("the first stop request should be accepted");
+        stops
+            .send(StopRequest::Forced)
+            .expect("the second stop request should be accepted");
+        let (apart, release_entry) =
+            run_with_the_executor_and_the_store_thread_held(root.path(), receiver);
+
+        assert!(
+            apart
+                .ended
+                .recv_timeout(signals::FORCED_STOP_GRACE + Duration::from_millis(500))
+                .is_err(),
+            "a forced stop ended the wait for a deletion executor that was inside an entry"
+        );
+        drop(release_entry);
+
+        assert_eq!(forced_run_class(&apart), ExitClass::Interrupted);
+        apart.thread.join().expect("the run's thread should end");
+    }
+
+    /// A reader's keystroke is drawn at once, even while the terminal is still draining the last
+    /// frame: the render gate coalesces the frames a scan and its animations ask for, and a key
+    /// that wakes the idle poll is not one of them.
+    #[test]
+    fn a_key_that_wakes_the_idle_poll_is_drawn_while_the_terminal_is_still_draining() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let mut busy = BusyTerminal::new(root.path());
+        let baseline = busy.frames_drawn();
+        let frames_at_read = Rc::new(RefCell::new(Vec::new()));
+        busy.owner.input = Box::new(KeysWhileIdle::new(
+            [key('q'), key('y')],
+            &busy.frames,
+            &frames_at_read,
+        ));
+
+        busy.owner
+            .run_loop()
+            .expect("the loop should end at the confirmed quit");
+        shut_down_workers(&mut busy.owner);
+
+        let frames_at_read = frames_at_read.take();
+        assert_eq!(frames_at_read.len(), 2, "both keys should reach the loop");
+        assert_eq!(
+            frames_at_read[0], baseline,
+            "the gate holds back every frame the loop draws on its own"
+        );
+        assert!(
+            frames_at_read[1] > baseline,
+            "the key that woke the idle poll must be drawn before the loop waits for the next one"
+        );
+    }
+
+    /// A confirmed quit draws nothing more: the terminal is restored right after, and a frame
+    /// queued behind the one still draining would only delay that.
+    #[test]
+    fn a_confirmed_quit_read_in_an_input_batch_draws_no_further_frame() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let mut busy = BusyTerminal::new(root.path());
+        let baseline = busy.frames_drawn();
+        busy.owner.input = Box::new(TerminalEvents::new(vec![Some(key('q')), Some(key('y'))]));
+
+        busy.owner
+            .run_loop()
+            .expect("the loop should end at the confirmed quit");
+        shut_down_workers(&mut busy.owner);
+
+        assert!(
+            busy.owner.app.is_dirty(),
+            "the quit prompt was still waiting to be drawn when the quit was confirmed"
+        );
+        assert_eq!(
+            busy.frames_drawn(),
+            baseline,
+            "the confirmed quit must not queue a frame behind the draining one"
+        );
+    }
+
+    /// As above, for a quit confirmed by a key that wakes the idle poll.
+    #[test]
+    fn a_confirmed_quit_read_by_the_idle_poll_draws_no_further_frame() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let mut busy = BusyTerminal::new(root.path());
+        let baseline = busy.frames_drawn();
+        let work = busy.owner.exit_work();
+        busy.owner.app.prompt_exit(work);
+        let frames_at_read = Rc::new(RefCell::new(Vec::new()));
+        busy.owner.input = Box::new(KeysWhileIdle::new(
+            [key('y')],
+            &busy.frames,
+            &frames_at_read,
+        ));
+
+        busy.owner
+            .run_loop()
+            .expect("the loop should end at the confirmed quit");
+        shut_down_workers(&mut busy.owner);
+
+        assert_eq!(
+            frames_at_read.take(),
+            vec![baseline],
+            "the confirming key is the only one read, before anything was drawn"
+        );
+        assert!(
+            busy.owner.app.is_dirty(),
+            "the quit prompt was still waiting to be drawn when the quit was confirmed"
+        );
+        assert_eq!(
+            busy.frames_drawn(),
+            baseline,
+            "the confirmed quit must not queue a frame behind the draining one"
+        );
+    }
+
+    /// The scan is over for the reader when its map is published, not when the scanner is done:
+    /// the loop holds the reduction lease across the wait, and finishes the scan once, when the
+    /// publication's result is applied.
+    #[test]
+    fn the_scan_finishes_when_its_map_is_published_not_when_the_scanner_is_done() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let mut owner = owner_with_workers(TestBackend::new(80, 24), root.path(), None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while owner.primary_scan_active {
+            assert!(Instant::now() < deadline, "the scanner never finished");
+            if !owner
+                .process_worker_batch()
+                .expect("the scanner's events should be applied")
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(
+            !owner.scan_cancelled,
+            "the scanner should complete its scan"
+        );
+        let (leases_held, succeeded_before) = scheduler_counts(&owner);
+        assert!(
+            leases_held >= 1,
+            "the coordinator counts the reduction lease as active"
+        );
+
+        assert!(
+            owner.scan_active,
+            "the scan stays open for the reader until its map is published"
+        );
+        assert!(
+            owner.primary_reduction.is_some(),
+            "the reduction lease is held across the publication"
+        );
+        assert!(owner.app.primary_publication_pending());
+
+        assert!(
+            owner
+                .process_scan_store_events()
+                .expect("the publication's result should be applied")
+        );
+
+        assert!(!owner.scan_active, "the published map ends the scan");
+        assert!(
+            owner.primary_reduction.is_none(),
+            "the reduction lease is finished with the scan"
+        );
+        assert!(!owner.app.scan_store_busy());
+        let finished = scheduler_counts(&owner);
+        assert_eq!(
+            finished,
+            (
+                leases_held.saturating_sub(1),
+                succeeded_before.saturating_add(1)
+            ),
+            "the coordinator records the reduction as succeeded"
+        );
+
+        assert!(
+            !owner
+                .process_scan_store_events()
+                .expect("an ended publication has nothing left to apply"),
+            "the publication finishes the scan once"
+        );
+        assert_eq!(scheduler_counts(&owner), finished);
+        shut_down_workers(&mut owner);
+    }
+
+    /// The map without the removed target is the overlay the store thread builds, and the owner
+    /// loop reflows the map around the survivor as that overlay arrives. That takes a removal
+    /// the executor can show left no link behind, which for a file is Linux and Windows: macOS
+    /// opens nothing it removes, and sends the map back to a scan after a removed file (see
+    /// `a_deletion_of_a_file_sends_the_map_back_to_a_scan_on_macos` in the app's tests).
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn completed_target_reflows_immediately_while_its_copied_tile_departs() {
         let root = tempfile::tempdir().expect("test root should be created");
@@ -2969,6 +3775,13 @@ mod tests {
         assert!(owner.app.deletion_departure_deadline().is_some());
         assert!(!owner.app.deletion_work.has_work());
         assert!(!owner.app.can_exit_immediately());
+        // The map without the target is published by the store thread; the owner loop swaps it in
+        // when the result arrives, which is what reflows the map around the survivor.
+        assert!(
+            owner
+                .process_scan_store_events()
+                .expect("the deletion's overlay map should be applied")
+        );
         let next_target = owner
             .app
             .request_deletion()
@@ -2994,18 +3807,18 @@ mod tests {
         assert_eq!(next_target.full_path(), survivor_path);
     }
 
+    /// An owner loop with no worker pool, over an app that has published a map and is now
+    /// rebuilding it: the rebuild's scan is the only work, and its end is what a test delivers.
     #[allow(clippy::too_many_lines)]
-    #[test]
-    fn generation_rebuild_lifecycle_does_not_schedule_header_completion() {
-        let root = tempfile::tempdir().expect("scan rebuild root should exist");
-        let root_metadata = std::fs::symlink_metadata(root.path())
-            .expect("scan rebuild root metadata should exist");
-        let root_identity = crate::native_path::identity_for(root.path(), &root_metadata)
+    fn rebuilding_owner_without_workers(root: &Path) -> OwnerLoop<TestBackend> {
+        let root_metadata =
+            std::fs::symlink_metadata(root).expect("scan rebuild root metadata should exist");
+        let root_identity = crate::native_path::identity_for(root, &root_metadata)
             .expect("scan rebuild root identity should be readable")
             .expect("scan rebuild root should not be a link");
         let mut app = App::new_with_root_identity(
             TestBackend::new(80, 24),
-            root.path().to_path_buf(),
+            root.to_path_buf(),
             root_identity.clone(),
             false,
             false,
@@ -3023,7 +3836,7 @@ mod tests {
                 .expect("rebuild should begin")
         );
         let scan_view_root = app.current_folder_path();
-        let mut owner = OwnerLoop {
+        OwnerLoop {
             app,
             input: Box::new(PendingInput),
             workers: None,
@@ -3031,7 +3844,7 @@ mod tests {
             animation: AnimationScheduler::new(false, false, Duration::ZERO),
             frame_sink: None,
             settings: RuntimeSettings {
-                root: root.path().to_path_buf(),
+                root: root.to_path_buf(),
                 root_identity,
                 scan_threads: 1,
                 event_capacity: 1,
@@ -3061,12 +3874,14 @@ mod tests {
             scan_active: true,
             scheduler_snapshot: None,
             primary_scan_active: false,
+            primary_reduction: None,
+            scheduler_refreshed_at: None,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
             scan_cancelled: false,
             generation_rebuild_active: true,
-            generation_rebuild_target: Some(root.path().to_path_buf()),
+            generation_rebuild_target: Some(root.to_path_buf()),
             cancelled_while_scanning: false,
             exit_after_work: false,
             timed_actions: Vec::new(),
@@ -3075,7 +3890,14 @@ mod tests {
             last_deletion_progress: None,
             stop_signals: None,
             signal_quit: false,
-        };
+            forced_stop: false,
+        }
+    }
+
+    #[test]
+    fn generation_rebuild_lifecycle_does_not_schedule_header_completion() {
+        let root = tempfile::tempdir().expect("scan rebuild root should exist");
+        let mut owner = rebuilding_owner_without_workers(root.path());
 
         owner
             .handle_worker_event(WorkerEvent::ScanFinished { cancelled: true })
@@ -3099,11 +3921,80 @@ mod tests {
         owner
             .handle_worker_event(WorkerEvent::ScanFinished { cancelled: false })
             .expect("completed generation rebuild should settle");
+        // The rebuild is over for the reader once the store thread has published its map.
+        assert!(
+            owner
+                .process_scan_store_events()
+                .expect("the rebuilt map should be applied")
+        );
+        assert!(
+            !owner.generation_rebuild_active,
+            "the publication's result completes the rebuild"
+        );
         assert_eq!(
             owner.animation.pending_slots(),
             0,
             "finishing generation work must not flash completion through the header"
         );
+    }
+
+    /// A confirmed quit waits for the rebuild a deletion required. The rebuild is over only when
+    /// its map is published, which is later than its scan: the quit has to finish then, because
+    /// nothing else would wake the loop for it.
+    #[test]
+    fn a_confirmed_quit_that_waited_for_a_rebuild_exits_when_its_map_is_published() {
+        let root = tempfile::tempdir().expect("scan rebuild root should exist");
+        let mut owner = rebuilding_owner_without_workers(root.path());
+        owner
+            .cancel_pending_work_and_exit(true)
+            .expect("the quit should be accepted");
+        owner.finish_exit_after_work();
+        assert!(owner.app.is_running, "the rebuild is still under way");
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanFinished { cancelled: false })
+            .expect("the rebuild's scan should end");
+        assert!(
+            owner.app.is_running,
+            "the rebuild's map is still being published"
+        );
+        assert!(owner.exit_after_work);
+
+        assert!(
+            owner
+                .process_scan_store_events()
+                .expect("the rebuilt map should be applied")
+        );
+
+        assert!(!owner.generation_rebuild_active);
+        assert!(
+            !owner.app.is_running,
+            "the publication ended the last work the quit waited for"
+        );
+        assert!(!owner.exit_after_work);
+    }
+
+    /// As above, when the rebuild ends because the reader cancelled it while its map was being
+    /// published.
+    #[test]
+    fn a_confirmed_quit_that_waited_for_a_rebuild_exits_when_its_cancellation_lands() {
+        let root = tempfile::tempdir().expect("scan rebuild root should exist");
+        let mut owner = rebuilding_owner_without_workers(root.path());
+        owner
+            .cancel_pending_work_and_exit(true)
+            .expect("the quit should be accepted");
+        owner
+            .handle_worker_event(WorkerEvent::ScanFinished { cancelled: false })
+            .expect("the rebuild's scan should end");
+        owner.app.suppress_generation_rebuild_restart();
+        assert!(owner.app.is_running);
+
+        owner
+            .process_scan_store_events()
+            .expect("the cancelled rebuild should settle");
+
+        assert!(!owner.generation_rebuild_active);
+        assert!(!owner.app.is_running);
     }
     #[test]
     fn scan_store_capacity_returns_a_summary_only_partial_outcome() {
@@ -3228,6 +4119,8 @@ mod tests {
             scan_active: true,
             scheduler_snapshot: None,
             primary_scan_active: true,
+            primary_reduction: None,
+            scheduler_refreshed_at: None,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
@@ -3242,6 +4135,7 @@ mod tests {
             last_deletion_progress: None,
             stop_signals: None,
             signal_quit: false,
+            forced_stop: false,
         };
 
         let out_of_space = crate::scan_store::session::ScanStoreError::Run(
@@ -3347,6 +4241,8 @@ mod tests {
             scan_active: true,
             scheduler_snapshot: None,
             primary_scan_active: true,
+            primary_reduction: None,
+            scheduler_refreshed_at: None,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
@@ -3361,6 +4257,7 @@ mod tests {
             last_deletion_progress: None,
             stop_signals: None,
             signal_quit: false,
+            forced_stop: false,
         };
 
         owner
@@ -3644,6 +4541,8 @@ mod tests {
             scan_active: false,
             scheduler_snapshot: None,
             primary_scan_active: false,
+            primary_reduction: None,
+            scheduler_refreshed_at: None,
             scan_view_dirty: false,
             scan_view_root,
             pending_scan_entries: VecDeque::new(),
@@ -3658,6 +4557,7 @@ mod tests {
             last_deletion_progress: None,
             stop_signals: None,
             signal_quit: false,
+            forced_stop: false,
         };
 
         owner.app.mark_dirty();

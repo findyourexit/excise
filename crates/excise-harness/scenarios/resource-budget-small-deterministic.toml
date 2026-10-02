@@ -11,7 +11,9 @@ cols = 120
 rows = 40
 
 [budgets]
-threads = 12
+# Includes the scan-store thread (`excise-scan-store`). The deletion-history export thread
+# (`excise-history-export`) runs only while an export does, so this scenario never has it.
+threads = 13
 fds = 48
 scan_store_bytes_per_entry = 1665
 

@@ -1,12 +1,10 @@
 schema_version = 1
 name = "latency-under-slow-terminal"
-description = "Input must stay responsive while scanning, however fast the terminal drains. Capping the pseudo-terminal's drain at 150000 bytes/sec simulates a slow terminal. Frame output is paced to what the terminal can absorb, so terminal writes no longer block scan ingestion or input handling. The strict input p99 still fails: scan-store work on the owner thread (the per-batch durable syncs and the publication of the completed scan) stalls it for 50-170 ms during the scan's opening, even unthrottled, and disabling the syncs alone made 5 of 10 runs pass. Fixed when that work leaves the owner thread."
+description = "Input must stay responsive while scanning, however fast the terminal drains. Capping the pseudo-terminal's drain at 150000 bytes/sec simulates a slow terminal. Frame output is paced to what the terminal can absorb, so terminal writes do not block scan ingestion or input handling, and scan-store work (admitting batches, merging runs, publishing the completed scan) runs on its own thread, so it cannot stall the loop that reads keys, with a slow terminal or without one."
 fixture = "node-modules-2k"
 profiles = ["default", "deterministic"]
 tier = "full"
 platforms = ["linux", "macos"]
-expect = "fail"
-slice = "X8"
 
 [terminal]
 cols = 120

@@ -29,14 +29,14 @@ use super::worker::{ScannedEntry, WorkerEvent, send_event};
 pub(super) use crate::entry_metadata::EntryMetadata;
 use crate::model::{ByteBounds, EntrySnapshot, NodeKind, UnscannedReason};
 use crate::native_path::{NativeIdentity, identity_for};
+use crate::private_files::PrivateFiles;
 use crate::scan_coordinator::{
     RelativePath, ScanGeneration, SessionCoordinator, WorkCompletion, WorkLease,
 };
 use crate::scan_session::ScanSessionId;
 use crate::scan_store::identity_observation::IdentityObservation;
 use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, SummaryMetrics};
-use crate::scan_store::run_file::SealedRun;
-use crate::scan_store::session::{ScanInputRunFactory, scan_store_capacity_message};
+use crate::scan_store::session::{ScanInputRunFactory, SealedBatch, scan_store_capacity_message};
 use crate::temporary_storage::TemporaryStorage;
 /// The owner consumes each bounded batch before checking input again. Keep the
 /// batch small so scanning never makes keyboard feedback wait indefinitely.
@@ -63,6 +63,10 @@ struct Exclusions {
     matcher: Gitignore,
     rules: Vec<(String, Gitignore)>,
     internal_paths: Vec<PathBuf>,
+    /// Files Excise holds open in the tree being scanned, which come and go while the scan runs:
+    /// a deletion's spill on Windows lives in the folder that held its target for as long as the
+    /// report stays in the history. Asked of every entry, by its exact path.
+    private_files: PrivateFiles,
 }
 
 impl Exclusions {
@@ -90,13 +94,22 @@ impl Exclusions {
             matcher,
             rules,
             internal_paths,
+            private_files: PrivateFiles::default(),
         })
     }
 
+    /// These exclusions, also leaving out the files `private_files` registers.
+    fn with_private_files(mut self, private_files: PrivateFiles) -> Self {
+        self.private_files = private_files;
+        self
+    }
+
     fn is_internal(&self, path: &Path) -> bool {
-        self.internal_paths
-            .iter()
-            .any(|internal_path| path == internal_path || path.starts_with(internal_path))
+        self.private_files.contains(path)
+            || self
+                .internal_paths
+                .iter()
+                .any(|internal_path| path == internal_path || path.starts_with(internal_path))
     }
 
     fn reason(&self, path: &Path, is_dir: bool) -> Option<String> {
@@ -408,7 +421,7 @@ fn run_with_scheduler(
         return;
     }
     let mut exclusions = match Exclusions::new(&root, exclusion_patterns, internal_paths) {
-        Ok(exclusions) => exclusions,
+        Ok(exclusions) => exclusions.with_private_files(temporary_storage.private_files().clone()),
         Err(message) => {
             let _ = send_event(
                 sender,
@@ -1127,7 +1140,7 @@ fn report_directory_task_error(
                     lease: lease.cloned(),
                     path,
                     reason: UnscannedReason::Replacement(message),
-                    input_runs: Vec::new(),
+                    input_runs: SealedBatch::empty(),
                 },
                 cancelled,
             );
@@ -1534,7 +1547,7 @@ fn process_entry(
                     reason: UnscannedReason::Metadata(
                         "scan entry identity is unavailable".to_string(),
                     ),
-                    input_runs: Vec::new(),
+                    input_runs: SealedBatch::empty(),
                 },
                 cancelled,
             );
@@ -1680,9 +1693,9 @@ fn seal_scanned_entries(
     entries: &[ScannedEntry],
     coverage: Coverage,
     factory: Option<&ScanInputRunFactory>,
-) -> Result<Vec<SealedRun>, String> {
+) -> Result<SealedBatch, String> {
     let Some(factory) = factory else {
-        return Ok(Vec::new());
+        return Ok(SealedBatch::empty());
     };
     let mut paths = Vec::with_capacity(entries.len());
     let mut identities = Vec::with_capacity(entries.len());
@@ -2416,18 +2429,15 @@ mod tests {
         unscanned: Vec<(PathBuf, UnscannedReason)>,
     }
 
-    /// Admits the sealed runs of one worker event the way the owner does, then returns the batch's
-    /// credit: a scanner whose credits come back only after it finishes waits for each batch
-    /// past the sixteenth (`InflightBatchBudget`).
+    /// Admits the sealed runs of one worker event the way the owner does. The batch returns its
+    /// credit once it is consumed: a scanner whose credits never came back would wait for each
+    /// batch past the sixteenth (`InflightBatchBudget`).
     #[cfg(unix)]
     fn admit(
         store: &mut crate::scan_store::session::ScanStore,
         lease: &WorkLease,
-        runs: Vec<SealedRun>,
+        runs: SealedBatch,
     ) {
-        if runs.is_empty() {
-            return;
-        }
         for run in runs {
             assert!(
                 store
@@ -2435,7 +2445,6 @@ mod tests {
                     .expect("lease-validated run should be admitted")
             );
         }
-        store.release_inflight_batch_credit();
     }
 
     #[cfg(unix)]

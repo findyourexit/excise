@@ -6,7 +6,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::scan_coordinator::ScanGeneration;
-use crate::temporary_storage::TemporaryStorageReservation;
+use crate::temporary_storage::{TemporaryStorage, TemporaryStorageReservation};
 
 const RUN_MAGIC: [u8; 4] = *b"EXSR";
 const BLOCK_MAGIC: [u8; 4] = *b"EXSB";
@@ -530,6 +530,65 @@ impl SealedRun {
         };
         Ok(RunRangeReader::new(file, offset, index.block_capacity))
     }
+
+    /// Where this run's file is, for a thread that does not own the run to read it through a
+    /// descriptor of its own. `None` for a run that has no path (tests and fuzzing keep one).
+    ///
+    /// The description stays readable for as long as the owner keeps this run: dropping the run
+    /// removes the file.
+    #[must_use]
+    pub(crate) fn detached(&self) -> Option<DetachedRun> {
+        self.path.as_ref().map(|path| DetachedRun {
+            path: path.clone(),
+            bytes: self.bytes,
+        })
+    }
+}
+
+/// A sealed run's location, readable from any thread through a descriptor opened for the pass.
+///
+/// It owns nothing: not the file, which belongs to the [`SealedRun`] it describes, and not a
+/// storage charge. A pass over it opens a descriptor of its own, so it never shares a file
+/// position with the owner's resident descriptor.
+#[derive(Clone, Debug)]
+pub(crate) struct DetachedRun {
+    path: PathBuf,
+    bytes: u64,
+}
+
+impl DetachedRun {
+    /// Runs one sequential pass over the run, validating every block as any reader does.
+    ///
+    /// `storage` is the session's quota: a pass ends when it is stopped
+    /// (`TemporaryStorage::stop`), exactly like a pass over a run the quota is charged for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be opened or its header is invalid, or the
+    /// visitor's error.
+    pub(crate) fn with_reader<T, E>(
+        &self,
+        storage: &TemporaryStorage,
+        visit: impl FnOnce(&mut RunReader) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<RunError>,
+    {
+        let file = File::open(&self.path).map_err(|error| E::from(RunError::Io(error)))?;
+        let reservation = storage
+            .reservation(0)
+            .map_err(|error| E::from(RunError::Io(error)))?;
+        let mut reader =
+            RunReader::open(file, None, reservation, self.bytes, None).map_err(|mut error| {
+                E::from(
+                    error
+                        .error
+                        .take()
+                        .expect("open error should retain its error"),
+                )
+            })?;
+        visit(&mut reader)
+    }
 }
 
 struct RunOpenError {
@@ -727,6 +786,9 @@ impl RunReader {
     }
 
     fn load_next_block(&mut self) -> Result<bool, RunError> {
+        // One check per block: a session told to stop (`TemporaryStorage::stop`) ends every
+        // sequential pass over its runs here, not after the pass has read the whole run.
+        self.reservation.ensure_running()?;
         let mut tag = [0_u8; 4];
         read_exact(&mut self.reader, &mut tag)?;
         if tag == FOOTER_MAGIC {

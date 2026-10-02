@@ -49,6 +49,10 @@ Excise produces **bounded** reports. When a scan is uncertain, incomplete, or un
 
 In the normal view, press ++e++ to export the current scan and ++shift+e++ to export bounded deletion history. No result modal is required. Excise selects the first available filename in the current directory and never overwrites an existing file.
 
+The scan export describes the current map, so right after a deletion it waits until the map no longer lists what was deleted: pressing ++e++ in that moment reports that the export is unavailable, and pressing it again a moment later writes the report.
+
+The deletion history is written in the background, so a long history never delays the map. A notice confirms that the export began and another names the file once it is complete; the history is cleared only then, and only of the results the file holds. Asking again while an export is still being written reports that one is already running.
+
 | Export | First filename | Later filenames |
 |---|---|---|
 | Scan report | `excise-scan-report.json` | `excise-scan-report-1.json`, then increasing suffixes |
