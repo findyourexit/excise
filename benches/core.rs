@@ -79,15 +79,13 @@ fn report_canonical_metrics(label: &str, metrics: CanonicalStoreMetrics) {
         .checked_div(metrics.input_written_bytes)
         .unwrap_or(0);
     eprintln!(
-        "{label}: observations={}, logical_read_bytes={}, logical_written_bytes={}, read_bytes_per_observation_milli={}, written_bytes_per_observation_milli={}, merge_write_amplification_milli={}, durable_syncs={}, manifest_persists={}, retained_bytes={}, peak_temporary_bytes={}, ingestion_elapsed_ms={}, publication_elapsed_ms={}, ingestion_cpu_us={:?}, publication_cpu_us={:?}",
+        "{label}: observations={}, logical_read_bytes={}, logical_written_bytes={}, read_bytes_per_observation_milli={}, written_bytes_per_observation_milli={}, merge_write_amplification_milli={}, retained_bytes={}, peak_temporary_bytes={}, ingestion_elapsed_ms={}, publication_elapsed_ms={}, ingestion_cpu_us={:?}, publication_cpu_us={:?}",
         metrics.observations,
         logical_read_bytes,
         logical_written_bytes,
         per_observation_milli(logical_read_bytes, metrics.observations),
         per_observation_milli(logical_written_bytes, metrics.observations),
         merge_write_amplification_milli,
-        metrics.durable_syncs,
-        metrics.manifest_persists,
         metrics.retained_bytes,
         metrics.peak_temporary_bytes,
         metrics.ingestion_elapsed.as_millis(),
@@ -232,7 +230,7 @@ fn report_owner_loop(label: &str, fixture_entries: usize, run: &OwnerLoopScanRun
         .collect::<Vec<_>>()
         .join(",");
     eprintln!(
-        "owner-loop/{label}: complete={}, fixture_entries={fixture_entries}, entries_handled={}, entries_per_second={}, wall_ms={}, time_to_complete_ms={:?}, frames={}, runs_admitted={}, durable_syncs={}, manifest_persists={}, worker_events={{{worker_events}}}",
+        "owner-loop/{label}: complete={}, fixture_entries={fixture_entries}, entries_handled={}, entries_per_second={}, wall_ms={}, time_to_complete_ms={:?}, frames={}, runs_admitted={}, worker_events={{{worker_events}}}",
         run.complete(),
         report.scan_entries_handled(),
         run.entries_per_second(),
@@ -242,8 +240,6 @@ fn report_owner_loop(label: &str, fixture_entries: usize, run: &OwnerLoopScanRun
             .map(|elapsed| elapsed.as_millis()),
         report.frames_rendered(),
         report.scan_runs_admitted(),
-        report.durable_syncs(),
-        report.manifest_persists(),
     );
     for phase in OwnerPhase::ALL {
         report_phase(label, "phase", phase.label(), report.phase(phase));

@@ -1,12 +1,12 @@
 schema_version = 1
 id = "selection-drift"
-description = "A 5,000,000-byte file (`big-file.bin`) beside a folder (`victim/`) of 20,000 files of 1,050 bytes each (21,000,000 bytes of content; 50 directories, 20,001 files, 20,052 entries below the root, 20,053 counting the root). Excise's default view sizes by disk allocation, not content: each small file rounds up to a full allocation block (4,096 bytes), so the folder's final allocated total is 81,920,000 bytes, more than 16 times the file's. Admitting the folder's files raises its running allocated total by one block each, so it only overtakes the file's size once about 1,221 of its 20,000 files are admitted. The file is the largest entry when it is first measured; the folder is the largest once the scan completes."
+description = "An 81,500,000-byte file (`big-file.bin`) beside a folder (`victim/`) of 20,000 files of 1,050 bytes each (21,000,000 bytes of content; 50 directories, 20,001 files, 20,052 entries below the root, 20,053 counting the root). Excise's default view sizes by disk allocation, not content: each small file rounds up to a full allocation block (4,096 bytes), so the folder's final allocated total is 81,920,000 bytes, a little more than the file's. Admitting the folder's files raises its running allocated total by one block each, so it only overtakes the file's size once about 19,899 of its 20,000 files (99.5 percent) are admitted, right at the tail of the walk. Admission is fast, so the provisional model settles on \"folder bigger\" well before publication unless the crossover sits this close to the end; the file is sized to put it there. The file is the largest entry when it is first measured; the folder is the largest once the scan completes."
 seed = 20261002
 
 [[parts]]
 kind = "file"
 root = "big-file.bin"
-size = 5000000
+size = 81500000
 
 [[parts]]
 kind = "tree"

@@ -300,9 +300,6 @@ where
             .ok_or_else(|| AppError::Invariant("worker pool already stopped".to_string()))?;
         let shutdown_result = workers.shutdown();
         let finish_result = self.app.finish();
-        #[cfg(feature = "internal")]
-        self.finish_probe();
-
         let outcome = loop_result?;
         shutdown_result?;
         finish_result?;

@@ -1,14 +1,11 @@
 schema_version = 1
 name = "latency-under-deletion-load-deterministic"
-description = "Under the deterministic profile (one scan thread), navigation keys sent while the 5,011-entry delete-folder victim is being removed miss the strict latency budgets on macOS: the post-deletion rebuild admits scan-store runs on the owner thread, and each admission's durable sync (sync_data, F_FULLFSYNC on macOS) blocks it. With both syncs disabled the same runs pass (worst max stall 187 ms against 1.54 s), so X1 flips it. Linux's cheaper fsync already holds the budget, hence fails_on = [\"macos\"]."
+description = "Under the deterministic profile (one scan thread), navigation keys sent while the 5,011-entry delete-folder victim is being removed meet the strict latency budgets on macOS and Linux: the post-deletion rebuild admits scan-store runs on the owner thread, so any admission that waits on the disk stalls input."
 fixture = "delete-folder"
 sentinels = ["keep-a.bin", "keep-b/keep.txt"]
 profiles = ["deterministic"]
 tier = "full"
 platforms = ["linux", "macos"]
-expect = "fail"
-fails_on = ["macos"]
-slice = "X1"
 
 [terminal]
 cols = 120

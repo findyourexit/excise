@@ -45,7 +45,7 @@ The scanner walks directories without recursion and uses a fixed worker count. O
 
 ### ScanStore
 
-`ScanStore` is private session storage for scan data. Workers turn each fixed-size batch into sorted path and identity runs. The coordinator accepts a run only while the directory task that produced it remains valid, combines a fixed number of inputs at a time, and creates a compact block-indexed `ChildQuery` for navigation. Raw runs are released as publication proceeds, so a completed scan retains only the compact query. Each published scan has a checksummed manifest.
+`ScanStore` is private session storage for scan data. Workers turn each fixed-size batch into sorted path and identity runs. The coordinator accepts a run only while the directory task that produced it remains valid, combines a fixed number of inputs at a time, and creates a compact block-indexed `ChildQuery` for navigation. Raw runs are released as publication proceeds, so a completed scan retains only the compact query. Each run's blocks carry SHA-256 checksums that every read verifies. The store belongs to one session and is never reopened, so no write waits on a durable sync.
 
 ???+ info "Concrete pages, bounded retention"
 

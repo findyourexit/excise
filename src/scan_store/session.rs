@@ -17,8 +17,8 @@ use super::identity_observation::{
 use super::manifest::{ManifestError, RunManifestEntry, ScanManifest};
 use super::page::{
     PageIndexError, PageRequest, ProvisionalPage, ScanPage, ScanPageEntry, ScanPageError,
-    materialize_child_queries, read_child_query_root_metadata, read_page_entry,
-    visit_child_query_entries, visit_child_query_page_entries,
+    materialize_child_queries, read_page_entry, visit_child_query_entries,
+    visit_child_query_page_entries,
 };
 use super::path_catalog::{
     PathCatalogEntry, PathCatalogError, build_path_catalog, read_path_catalog_entry,
@@ -110,10 +110,7 @@ pub(crate) enum ScanStoreError {
 /// Sealed-run I/O used by the internal benchmark harness.
 ///
 /// The byte counters measure serialized run bytes rather than operating-system
-/// syscalls, so they stay deterministic across page-cache behavior. The two
-/// operation counters are exact totals for the session's quota: they count every
-/// completed durable `sync_data` on a run or manifest file, wherever it ran, and
-/// every completed manifest commit (temporary write, sync, and rename).
+/// syscalls, so they stay deterministic across page-cache behavior.
 #[cfg(feature = "internal")]
 #[allow(
     clippy::struct_field_names,
@@ -128,8 +125,6 @@ pub(crate) struct ScanStoreIoMetrics {
     pub(crate) reduction_written_bytes: u64,
     pub(crate) publication_read_bytes: u64,
     pub(crate) publication_written_bytes: u64,
-    pub(crate) durable_syncs: u64,
-    pub(crate) manifest_persists: u64,
 }
 
 /// A coherent, immutable scan generation retained after successful reduction.
@@ -225,14 +220,6 @@ impl PublishedGeneration {
         E: From<RunError> + From<PageIndexError>,
     {
         visit_child_query_page_entries(&mut self.child_queries, visit)
-    }
-
-    #[cfg(test)]
-    fn preserve_for_recovery(&mut self) {
-        self.child_queries.preserve_path_for_recovery();
-        self.path_catalog.preserve_path_for_recovery();
-        self.identity_index.preserve_path_for_recovery();
-        self.directory_summary_index.preserve_path_for_recovery();
     }
 }
 
@@ -488,9 +475,6 @@ impl ScanStore {
         let session =
             ScanSessionId::random().map_err(|error| ScanStoreError::Session(error.to_string()))?;
         let active = ActiveGeneration::new(session, generation);
-        if let Some(storage) = session_storage.as_ref() {
-            storage.persist_manifest(&active.manifest.encode()?)?;
-        }
         Ok(Self {
             temporary_storage,
             session,
@@ -505,16 +489,10 @@ impl ScanStore {
         })
     }
 
-    /// Returns the byte metrics tallied by this store plus the session's exact
-    /// sync and manifest-commit totals, which scanner workers also contribute to.
     #[cfg(feature = "internal")]
     #[must_use]
     pub(crate) fn io_metrics(&self) -> ScanStoreIoMetrics {
-        ScanStoreIoMetrics {
-            durable_syncs: self.temporary_storage.durable_syncs(),
-            manifest_persists: self.temporary_storage.manifest_persists(),
-            ..self.io_metrics
-        }
+        ScanStoreIoMetrics { ..self.io_metrics }
     }
 
     #[cfg(feature = "internal")]
@@ -539,134 +517,6 @@ impl ScanStore {
             .saturating_add(child_queries.bytes());
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Recovery validates every published run and its root metadata together so an interrupted session cannot expose a partial generation."
-    )]
-    /// Reopens the last complete immutable generation from a private session.
-    pub(crate) fn recover_published(storage: ScanStoreStorage) -> Result<Self, ScanStoreError> {
-        let manifest = ScanManifest::decode(&storage.read_manifest()?)?;
-        if manifest.state() != ScanGenerationState::Published {
-            return Err(ScanStoreError::Recovery(
-                "manifest does not contain a published generation".to_string(),
-            ));
-        }
-        let child_entry = manifest
-            .runs()
-            .iter()
-            .copied()
-            .find(|entry| entry.descriptor.kind() == RunKind::ChildQuery)
-            .ok_or_else(|| {
-                ScanStoreError::Recovery(
-                    "published manifest does not reference a child-query run".to_string(),
-                )
-            })?;
-        let catalog_entry = manifest
-            .runs()
-            .iter()
-            .copied()
-            .find(|entry| entry.descriptor.kind() == RunKind::PathCatalog)
-            .ok_or_else(|| {
-                ScanStoreError::Recovery(
-                    "published manifest does not reference a path-catalog run".to_string(),
-                )
-            })?;
-        let identity_entry = manifest
-            .runs()
-            .iter()
-            .copied()
-            .find(|entry| entry.descriptor.kind() == RunKind::IdentityObservation)
-            .ok_or_else(|| {
-                ScanStoreError::Recovery(
-                    "published manifest does not reference an identity index".to_string(),
-                )
-            })?;
-        let directory_entry = manifest
-            .runs()
-            .iter()
-            .copied()
-            .find(|entry| entry.descriptor.kind() == RunKind::DirectorySummary)
-            .ok_or_else(|| {
-                ScanStoreError::Recovery(
-                    "published manifest does not reference a directory summary index".to_string(),
-                )
-            })?;
-        if manifest.runs().len() != 4 {
-            return Err(ScanStoreError::Recovery(
-                "published manifest retains obsolete runs".to_string(),
-            ));
-        }
-        let reservation = storage.quota().reservation(child_entry.bytes)?;
-        let (file, path) = storage.open_run_file(child_entry.descriptor.run_id(), true)?;
-        let child_queries = SealedRun::open_named(
-            file,
-            path,
-            reservation,
-            child_entry.descriptor,
-            child_entry.bytes,
-        )?;
-        let catalog_reservation = storage.quota().reservation(catalog_entry.bytes)?;
-        let (catalog_file, catalog_path) =
-            storage.open_run_file(catalog_entry.descriptor.run_id(), true)?;
-        let path_catalog = SealedRun::open_named(
-            catalog_file,
-            catalog_path,
-            catalog_reservation,
-            catalog_entry.descriptor,
-            catalog_entry.bytes,
-        )?;
-        let identity_reservation = storage.quota().reservation(identity_entry.bytes)?;
-        let (identity_file, identity_path) =
-            storage.open_run_file(identity_entry.descriptor.run_id(), true)?;
-        let identity_index = SealedRun::open_named(
-            identity_file,
-            identity_path,
-            identity_reservation,
-            identity_entry.descriptor,
-            identity_entry.bytes,
-        )?;
-        let directory_reservation = storage.quota().reservation(directory_entry.bytes)?;
-        let (directory_file, directory_path) =
-            storage.open_run_file(directory_entry.descriptor.run_id(), true)?;
-        let directory_summary_index = SealedRun::open_named(
-            directory_file,
-            directory_path,
-            directory_reservation,
-            directory_entry.descriptor,
-            directory_entry.bytes,
-        )?;
-        let (root_page_metrics, root_page_coverage) =
-            read_child_query_root_metadata(&child_queries)?;
-        let next_run_id = manifest
-            .runs()
-            .iter()
-            .map(|entry| entry.descriptor.run_id())
-            .max()
-            .and_then(|run_id| run_id.checked_add(1))
-            .ok_or(ScanStoreError::RunIdOverflow)?;
-        Ok(Self {
-            temporary_storage: storage.quota(),
-            session: manifest.session(),
-            next_run_id: Arc::new(AtomicU64::new(next_run_id)),
-            active: None,
-            session_storage: Some(storage),
-            published: Some(PublishedGeneration {
-                manifest,
-                child_queries,
-                path_catalog,
-                identity_index,
-                directory_summary_index,
-                root_page_metrics,
-                root_page_coverage,
-                unrecorded_path_count: 0,
-            }),
-            summary_only: None,
-            retired_generation: None,
-            #[cfg(feature = "internal")]
-            io_metrics: ScanStoreIoMetrics::default(),
-        })
-    }
-
     #[must_use]
     pub(crate) fn internal_paths(&self) -> Vec<PathBuf> {
         self.session_storage
@@ -686,12 +536,6 @@ impl ScanStore {
         self.session
     }
 
-    #[cfg(test)]
-    fn preserve_for_recovery(&mut self) {
-        if let Some(published) = self.published.as_mut() {
-            published.preserve_for_recovery();
-        }
-    }
     /// Records one path omitted from canonical page data while preserving every
     /// successfully observed path.
     pub(crate) fn record_unrecorded_path(&mut self) {
@@ -765,7 +609,6 @@ impl ScanStore {
             return Err(ScanStoreError::NonMonotonicGeneration);
         }
         let active = ActiveGeneration::new(self.session, generation);
-        self.persist_manifest(&active.manifest)?;
         self.active = Some(active);
         Ok(())
     }
@@ -818,10 +661,6 @@ impl ScanStore {
         };
         if active.manifest.state() != terminal {
             active.manifest.transition(terminal)?;
-        }
-        if let Err(error) = self.persist_manifest(&active.manifest) {
-            self.active = Some(active);
-            return Err(error);
         }
         self.retired_generation = Some(active.manifest.generation());
         Ok(())
@@ -973,7 +812,7 @@ impl ScanStore {
             self.active = Some(active);
             return Err(error.into());
         }
-        if let Err(error) = self.persist_added_run(&mut active, &run) {
+        if let Err(error) = Self::record_added_run(&mut active, &run) {
             if descriptor.kind() == RunKind::PathObservation {
                 active.provisional_page = None;
             }
@@ -1109,10 +948,6 @@ impl ScanStore {
             return Err(ScanStoreError::ClosedGeneration);
         }
         active.manifest.transition(ScanGenerationState::Reducing)?;
-        if let Err(error) = self.persist_manifest(&active.manifest) {
-            self.active = Some(active);
-            return Err(error);
-        }
         let generation = active.manifest.generation();
         let (
             mut path_observations,
@@ -1142,7 +977,7 @@ impl ScanStore {
             Ok(result) => result,
             Err(error) if is_scan_store_capacity_error(&error) => {
                 return self.finish_summary_only_generation(
-                    active,
+                    &active,
                     directory_summaries,
                     (
                         path_observations,
@@ -1175,12 +1010,6 @@ impl ScanStore {
             })?;
         }
         manifest.transition(ScanGenerationState::Published)?;
-        if let Err(error) = self.persist_manifest(&manifest) {
-            let _ = active.manifest.transition(ScanGenerationState::Incomplete);
-            let _ = self.persist_manifest(&active.manifest);
-            self.active = Some(active);
-            return Err(error);
-        }
         drop((path_observations, allocation_contributions));
         self.summary_only = None;
         self.published = Some(PublishedGeneration {
@@ -1202,14 +1031,13 @@ impl ScanStore {
         error: ScanStoreError,
     ) -> Result<ScanGeneration, ScanStoreError> {
         let _ = active.manifest.transition(ScanGenerationState::Incomplete);
-        let _ = self.persist_manifest(&active.manifest);
         self.active = Some(active);
         Err(error)
     }
 
     fn finish_summary_only_generation(
         &mut self,
-        mut active: ActiveGeneration,
+        active: &ActiveGeneration,
         mut directory_summaries: SealedRun,
         sources: (SealedRun, SealedRun, SealedRun, SealedRun),
     ) -> Result<ScanGeneration, ScanStoreError> {
@@ -1221,12 +1049,6 @@ impl ScanStore {
             bytes: directory_summaries.bytes(),
         })?;
         manifest.transition(ScanGenerationState::SummaryOnly)?;
-        if let Err(error) = self.persist_manifest(&manifest) {
-            let _ = active.manifest.transition(ScanGenerationState::Incomplete);
-            let _ = self.persist_manifest(&active.manifest);
-            self.active = Some(active);
-            return Err(error);
-        }
         drop(sources);
         self.summary_only = Some(SummaryOnlyGeneration {
             manifest,
@@ -1269,7 +1091,7 @@ impl ScanStore {
                 .reduction_written_bytes
                 .saturating_add(directory_summaries.bytes());
         }
-        self.persist_added_run(active, &directory_summaries)?;
+        Self::record_added_run(active, &directory_summaries)?;
 
         #[cfg(feature = "internal")]
         {
@@ -1290,7 +1112,7 @@ impl ScanStore {
                 .reduction_written_bytes
                 .saturating_add(path_catalog.bytes());
         }
-        self.persist_added_run(active, &path_catalog)?;
+        Self::record_added_run(active, &path_catalog)?;
 
         #[cfg(feature = "internal")]
         {
@@ -1311,7 +1133,7 @@ impl ScanStore {
                 .reduction_written_bytes
                 .saturating_add(allocation_contributions.bytes());
         }
-        self.persist_added_run(active, &allocation_contributions)?;
+        Self::record_added_run(active, &allocation_contributions)?;
 
         Ok((
             path_observations,
@@ -1395,7 +1217,7 @@ impl ScanStore {
         match runs.len() {
             0 => {
                 let output = self.new_writer(generation, kind)?.seal()?;
-                self.persist_added_run(active, &output)?;
+                Self::record_added_run(active, &output)?;
                 Ok(output)
             }
             1 => Ok(runs.into_iter().next().expect("one run was checked above")),
@@ -1421,22 +1243,14 @@ impl ScanStore {
                         .merge_written_bytes
                         .saturating_add(output.bytes());
                 }
-                self.persist_replaced_runs(active, &descriptors, &output)?;
+                Self::record_replaced_runs(active, &descriptors, &output)?;
                 drop(readers);
                 Ok(output)
             }
         }
     }
 
-    fn persist_manifest(&self, manifest: &ScanManifest) -> Result<(), ScanStoreError> {
-        if let Some(storage) = self.session_storage.as_ref() {
-            storage.persist_manifest(&manifest.encode()?)?;
-        }
-        Ok(())
-    }
-
-    fn persist_added_run(
-        &self,
+    fn record_added_run(
         active: &mut ActiveGeneration,
         run: &SealedRun,
     ) -> Result<(), ScanStoreError> {
@@ -1445,13 +1259,11 @@ impl ScanStore {
             descriptor: run.descriptor(),
             bytes: run.bytes(),
         })?;
-        self.persist_manifest(&manifest)?;
         active.manifest = manifest;
         Ok(())
     }
 
-    fn persist_replaced_runs(
-        &self,
+    fn record_replaced_runs(
         active: &mut ActiveGeneration,
         removed: &[RunDescriptor],
         output: &SealedRun,
@@ -1464,7 +1276,6 @@ impl ScanStore {
                 bytes: output.bytes(),
             },
         )?;
-        self.persist_manifest(&manifest)?;
         active.manifest = manifest;
         Ok(())
     }
@@ -1828,7 +1639,6 @@ mod tests {
             Some(parent.path()),
         )
         .expect("summary-only session should initialize");
-        let manifest_path = storage.manifest_path();
         let mut store = ScanStore::new_with_storage(ScanGeneration::initial(), storage)
             .expect("summary-only store should initialize");
         add_path_run(
@@ -1846,7 +1656,7 @@ mod tests {
             .expect("directory summaries should reduce");
         store
             .finish_summary_only_generation(
-                active,
+                &active,
                 directories,
                 (paths, identities, allocations, catalog),
             )
@@ -1857,14 +1667,7 @@ mod tests {
         assert_eq!(summary.generation(), ScanGeneration::initial());
         assert_eq!(summary.root_metrics().apparent_bytes, 8);
         assert_eq!(summary.root_coverage(), Coverage::Complete);
-        assert_eq!(
-            ScanManifest::decode(
-                &fs::read(manifest_path).expect("summary-only manifest should exist"),
-            )
-            .expect("summary-only manifest should decode")
-            .state(),
-            ScanGenerationState::SummaryOnly
-        );
+        assert_eq!(summary.manifest.state(), ScanGenerationState::SummaryOnly);
     }
 
     #[test]
@@ -1924,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn private_session_persists_only_complete_manifest_transitions() {
+    fn private_session_tracks_only_complete_manifest_transitions() {
         let parent = tempfile::tempdir().expect("session parent should exist");
         let storage = ScanStoreStorage::new(
             TemporaryStorage::scan_store_with_limit_bytes(INDEXED_PUBLICATION_STORAGE_BYTES),
@@ -1938,10 +1741,12 @@ mod tests {
         assert!(root.join("index").is_dir());
         let mut store = ScanStore::new_with_storage(ScanGeneration::initial(), storage.clone())
             .expect("scan store should initialize");
-        let initial = fs::read(storage.manifest_path()).expect("initial manifest should exist");
         assert_eq!(
-            ScanManifest::decode(&initial)
-                .expect("initial manifest should decode")
+            store
+                .active
+                .as_ref()
+                .expect("a fresh store has an active generation")
+                .manifest
                 .state(),
             ScanGenerationState::Scanning
         );
@@ -1951,17 +1756,20 @@ mod tests {
                 Vec::new(),
             )
             .expect("canonical observation should append");
-        let active = ScanManifest::decode(
-            &fs::read(storage.manifest_path()).expect("active manifest should exist"),
-        )
-        .expect("active manifest should decode");
-        assert_eq!(active.state(), ScanGenerationState::Scanning);
-        assert_eq!(active.runs().len(), 1);
-        assert_eq!(
-            active.runs()[0].descriptor.kind(),
-            RunKind::PathObservation,
-            "an accepted raw run must be durable before compaction"
-        );
+        {
+            let active = &store
+                .active
+                .as_ref()
+                .expect("generation should remain active while scanning")
+                .manifest;
+            assert_eq!(active.state(), ScanGenerationState::Scanning);
+            assert_eq!(active.runs().len(), 1);
+            assert_eq!(
+                active.runs()[0].descriptor.kind(),
+                RunKind::PathObservation,
+                "an accepted raw run must be tracked before compaction"
+            );
+        }
         assert_eq!(
             fs::read_dir(root.join("runs"))
                 .expect("raw run directory should be readable")
@@ -1991,18 +1799,13 @@ mod tests {
                 .is_some(),
             "the published generation should retain a private page index"
         );
-        let published = fs::read(storage.manifest_path()).expect("published manifest should exist");
+        let published = store
+            .published
+            .as_ref()
+            .expect("generation should be retained after publish");
+        assert_eq!(published.manifest.state(), ScanGenerationState::Published);
         assert_eq!(
-            ScanManifest::decode(&published)
-                .expect("published manifest should decode")
-                .state(),
-            ScanGenerationState::Published
-        );
-        assert_eq!(
-            ScanManifest::decode(&published)
-                .expect("published manifest should decode")
-                .runs()
-                .len(),
+            published.manifest.runs().len(),
             4,
             "the published manifest should retain compact canonical query indexes"
         );
@@ -2043,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn private_session_persists_incomplete_capacity_and_cancelled_states_separately() {
+    fn discarding_or_cancelling_the_active_generation_closes_it() {
         let parent = tempfile::tempdir().expect("session parent should exist");
 
         let incomplete_storage = ScanStoreStorage::new(
@@ -2051,7 +1854,6 @@ mod tests {
             Some(parent.path()),
         )
         .expect("capacity-limited session should initialize");
-        let incomplete_manifest = incomplete_storage.manifest_path();
         let mut incomplete =
             ScanStore::new_with_storage(ScanGeneration::initial(), incomplete_storage)
                 .expect("capacity-limited store should initialize");
@@ -2064,14 +1866,13 @@ mod tests {
         assert!(is_scan_store_capacity_error(&error));
         incomplete
             .discard_active()
-            .expect("incomplete terminal state should persist");
-        assert_eq!(
-            ScanManifest::decode(
-                &fs::read(&incomplete_manifest).expect("incomplete manifest should exist"),
-            )
-            .expect("incomplete manifest should decode")
-            .state(),
-            ScanGenerationState::Incomplete
+            .expect("an exhausted generation should discard");
+        assert!(
+            matches!(
+                incomplete.input_run_factory(),
+                Err(ScanStoreError::NoActiveGeneration)
+            ),
+            "a discarded generation must no longer accept input"
         );
 
         let cancelled_storage = ScanStoreStorage::new(
@@ -2079,20 +1880,18 @@ mod tests {
             Some(parent.path()),
         )
         .expect("cancellable session should initialize");
-        let cancelled_manifest = cancelled_storage.manifest_path();
         let mut cancelled =
             ScanStore::new_with_storage(ScanGeneration::initial(), cancelled_storage)
                 .expect("cancellable store should initialize");
         cancelled
             .cancel_active()
-            .expect("cancelled terminal state should persist");
-        assert_eq!(
-            ScanManifest::decode(
-                &fs::read(&cancelled_manifest).expect("cancelled manifest should exist"),
-            )
-            .expect("cancelled manifest should decode")
-            .state(),
-            ScanGenerationState::Cancelled
+            .expect("an active generation should cancel");
+        assert!(
+            matches!(
+                cancelled.input_run_factory(),
+                Err(ScanStoreError::NoActiveGeneration)
+            ),
+            "a cancelled generation must no longer accept input"
         );
     }
 
@@ -2152,53 +1951,6 @@ mod tests {
         ));
     }
     #[test]
-    fn published_private_session_recovers_its_child_query_after_interruption() {
-        let parent = tempfile::tempdir().expect("session parent should exist");
-        let quota =
-            TemporaryStorage::scan_store_with_limit_bytes(INDEXED_PUBLICATION_STORAGE_BYTES);
-        let storage = ScanStoreStorage::new(quota.clone(), Some(parent.path()))
-            .expect("private scan session should initialize");
-        let mut store = ScanStore::new_with_storage(ScanGeneration::initial(), storage.clone())
-            .expect("scan store should initialize");
-        store
-            .append_observation_batch(
-                vec![path_observation("entry", PathEntryKind::File, 4)],
-                Vec::new(),
-            )
-            .expect("canonical observation should append");
-        store.publish().expect("generation should publish");
-        store.preserve_for_recovery();
-        drop(store);
-        let root = storage.preserve_for_recovery();
-        assert!(
-            root.exists(),
-            "interrupted private session should remain recoverable"
-        );
-
-        let recovered_storage = ScanStoreStorage::reopen(quota, &root)
-            .expect("interrupted session layout should reopen");
-        let recovered = ScanStore::recover_published(recovered_storage)
-            .expect("published manifest and child query should recover");
-        let page = recovered
-            .published()
-            .expect("recovered generation should be published")
-            .page(PageRequest::first(RelativePath::root(), 8))
-            .expect("recovered root page should load");
-        assert_eq!(
-            page.entries
-                .into_iter()
-                .map(|entry| entry.path)
-                .collect::<Vec<_>>(),
-            vec![path("entry")]
-        );
-        drop(recovered);
-        assert!(
-            !root.exists(),
-            "recovered session should clean up on normal drop"
-        );
-    }
-
-    #[test]
     fn private_manifest_replaces_compacted_runs_before_releasing_inputs() {
         let parent = tempfile::tempdir().expect("session parent should exist");
         let storage = ScanStoreStorage::new(
@@ -2222,15 +1974,13 @@ mod tests {
                 .expect("input run should append");
         }
 
-        let manifest = ScanManifest::decode(
-            &fs::read(storage.manifest_path()).expect("active manifest should exist"),
-        )
-        .expect("active manifest should decode");
-        assert_eq!(manifest.runs().len(), 1);
-        assert_eq!(
-            manifest.runs()[0].descriptor.kind(),
-            RunKind::PathObservation
-        );
+        let active = &store
+            .active
+            .as_ref()
+            .expect("generation should remain active")
+            .manifest;
+        assert_eq!(active.runs().len(), 1);
+        assert_eq!(active.runs()[0].descriptor.kind(), RunKind::PathObservation);
         assert_eq!(
             fs::read_dir(root.join("runs"))
                 .expect("raw run directory should be readable")
@@ -2763,206 +2513,5 @@ mod tests {
             .page(PageRequest::first(path("alpha"), 8))
             .expect("second nested page should load");
         assert_eq!(first_alpha, second_alpha);
-    }
-
-    #[cfg(feature = "internal")]
-    fn session_backed_store(parent: &tempfile::TempDir) -> ScanStore {
-        let quota =
-            TemporaryStorage::scan_store_with_limit_bytes(INDEXED_PUBLICATION_STORAGE_BYTES);
-        let storage = ScanStoreStorage::new(quota, Some(parent.path()))
-            .expect("private scan session should initialize");
-        ScanStore::new_with_storage(ScanGeneration::initial(), storage)
-            .expect("scan store should initialize")
-    }
-
-    fn seal_entry(factory: &ScanInputRunFactory, name: &str) -> SealedRun {
-        factory
-            .seal_observation_batch(
-                vec![path_observation(name, PathEntryKind::File, 1)],
-                Vec::new(),
-            )
-            .expect("a one-entry batch should seal")
-            .pop()
-            .expect("a path batch seals one run")
-    }
-
-    /// F1: admitting a sealed run performs a durable `sync_data` today — one for the run's own
-    /// seal, one more for the manifest commit that admission writes. This is a strict expected
-    /// failure: it holds while the defect is present, and its failure message names the finding
-    /// and the slice that fixes it. Unlike the `internal`-only tests below (which read the same
-    /// counter through `io_metrics`), this one runs in plain `cargo test`: the counter is
-    /// `cfg(any(test, feature = "internal"))`.
-    #[test]
-    fn admitting_a_run_performs_a_durable_sync_today() {
-        let parent = tempfile::tempdir().expect("session parent should exist");
-        let quota =
-            TemporaryStorage::scan_store_with_limit_bytes(INDEXED_PUBLICATION_STORAGE_BYTES);
-        let storage = ScanStoreStorage::new(quota.clone(), Some(parent.path()))
-            .expect("private scan session should initialize");
-        let mut store = ScanStore::new_with_storage(ScanGeneration::initial(), storage)
-            .expect("scan store should initialize");
-        let before = quota.durable_syncs();
-
-        let factory = store
-            .input_run_factory()
-            .expect("the active generation should accept input");
-        store
-            .accept_input_run(seal_entry(&factory, "entry-0"))
-            .expect("a sealed run should be admitted");
-
-        assert!(
-            quota.durable_syncs() > before,
-            "F1 is fixed: flip R2 to assert that admitting a run performs zero durable syncs (X1)"
-        );
-    }
-
-    #[cfg(feature = "internal")]
-    #[test]
-    fn admitting_runs_counts_one_seal_sync_and_one_manifest_commit_each() {
-        let parent = tempfile::tempdir().expect("session parent should exist");
-        let mut store = session_backed_store(&parent);
-        let created = store.io_metrics();
-        assert_eq!(
-            (created.durable_syncs, created.manifest_persists),
-            (1, 1),
-            "creating a session commits its first manifest once"
-        );
-
-        let factory = store
-            .input_run_factory()
-            .expect("the active generation should accept input");
-        // One run short of the fan-in: the level never fills, so nothing merges.
-        let batch = MAX_ACTIVE_INPUT_RUNS - 1;
-        let expected = u64::try_from(batch).expect("run count fits in u64");
-        let runs = (0..batch)
-            .map(|index| seal_entry(&factory, &format!("entry-{index}")))
-            .collect::<Vec<_>>();
-        let sealed = store.io_metrics();
-        assert_eq!(
-            sealed.durable_syncs - created.durable_syncs,
-            expected,
-            "each sealed run is synced once"
-        );
-        assert_eq!(
-            sealed.manifest_persists, created.manifest_persists,
-            "sealing commits no manifest"
-        );
-
-        for run in runs {
-            store
-                .accept_input_run(run)
-                .expect("a sealed run should be admitted");
-        }
-        let admitted = store.io_metrics();
-        assert_eq!(
-            admitted.manifest_persists - sealed.manifest_persists,
-            expected,
-            "each admission commits the manifest once"
-        );
-        assert_eq!(
-            admitted.durable_syncs - sealed.durable_syncs,
-            expected,
-            "each manifest commit syncs once, and a level below the fan-in seals no merged run"
-        );
-    }
-
-    #[cfg(feature = "internal")]
-    #[test]
-    fn a_compaction_merge_adds_one_seal_sync_and_one_manifest_commit() {
-        let parent = tempfile::tempdir().expect("session parent should exist");
-        let mut store = session_backed_store(&parent);
-        let factory = store
-            .input_run_factory()
-            .expect("the active generation should accept input");
-        let runs = (0..MAX_ACTIVE_INPUT_RUNS)
-            .map(|index| seal_entry(&factory, &format!("entry-{index}")))
-            .collect::<Vec<_>>();
-        let sealed = store.io_metrics();
-        for run in runs {
-            store
-                .accept_input_run(run)
-                .expect("a sealed run should be admitted");
-        }
-        let admitted = store.io_metrics();
-        let admissions = u64::try_from(MAX_ACTIVE_INPUT_RUNS).expect("fan-in fits in u64");
-        assert_eq!(
-            admitted.manifest_persists - sealed.manifest_persists,
-            admissions + 1,
-            "every admission commits once and the full level's merge commits once more"
-        );
-        assert_eq!(
-            admitted.durable_syncs - sealed.durable_syncs,
-            admissions + 2,
-            "one sync per manifest commit plus the merged run's own seal"
-        );
-    }
-
-    #[cfg(feature = "internal")]
-    #[test]
-    fn a_manifest_commit_the_quota_rejects_counts_nothing() {
-        let parent = tempfile::tempdir().expect("session parent should exist");
-        let quota = TemporaryStorage::scan_store_with_limit_bytes(1);
-        let storage = ScanStoreStorage::new(quota.clone(), Some(parent.path()))
-            .expect("private scan session should initialize");
-        assert!(
-            ScanStore::new_with_storage(ScanGeneration::initial(), storage).is_err(),
-            "the first manifest cannot be charged to a one-byte quota"
-        );
-        assert_eq!(quota.durable_syncs(), 0);
-        assert_eq!(quota.manifest_persists(), 0);
-    }
-
-    #[cfg(feature = "internal")]
-    #[test]
-    fn worker_thread_seals_count_toward_their_own_session_only() {
-        let parent = tempfile::tempdir().expect("session parent should exist");
-        let first = session_backed_store(&parent);
-        let second = session_backed_store(&parent);
-        let (first_before, second_before) = (first.io_metrics(), second.io_metrics());
-        let first_factory = first
-            .input_run_factory()
-            .expect("first store should accept input");
-        let second_factory = second
-            .input_run_factory()
-            .expect("second store should accept input");
-
-        // Both sessions seal concurrently from several threads, as scanner workers do.
-        let (first_workers, first_per_worker) = (4_usize, 3_usize);
-        let (second_workers, second_per_worker) = (3_usize, 5_usize);
-        let sealed = std::thread::scope(|scope| {
-            let mut workers = Vec::new();
-            for worker in 0..first_workers {
-                let factory = first_factory.clone();
-                workers.push(scope.spawn(move || {
-                    (0..first_per_worker)
-                        .map(|batch| seal_entry(&factory, &format!("a-{worker}-{batch}")))
-                        .collect::<Vec<_>>()
-                }));
-            }
-            for worker in 0..second_workers {
-                let factory = second_factory.clone();
-                workers.push(scope.spawn(move || {
-                    (0..second_per_worker)
-                        .map(|batch| seal_entry(&factory, &format!("b-{worker}-{batch}")))
-                        .collect::<Vec<_>>()
-                }));
-            }
-            workers
-                .into_iter()
-                .flat_map(|worker| worker.join().expect("sealing worker should finish"))
-                .collect::<Vec<_>>()
-        });
-
-        let first_seals = first_workers * first_per_worker;
-        let second_seals = second_workers * second_per_worker;
-        assert_eq!(sealed.len(), first_seals + second_seals);
-        assert_eq!(
-            first.io_metrics().durable_syncs - first_before.durable_syncs,
-            u64::try_from(first_seals).expect("count fits in u64"),
-        );
-        assert_eq!(
-            second.io_metrics().durable_syncs - second_before.durable_syncs,
-            u64::try_from(second_seals).expect("count fits in u64"),
-        );
     }
 }

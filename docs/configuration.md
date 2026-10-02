@@ -114,7 +114,7 @@ right = "d"
 
     Temporary storage defaults to 4 GiB per session. The scan-store budget adapts to its scratch volume: it uses up to 75 percent of safe free space and reserves the remaining 25 percent for the user and other processes. `model.scan_store_mib`, `EXCISE_SCAN_STORE_MIB`, and `--scan-store-mib` set an optional upper limit. `model.scan_store_reserve_mib`, `EXCISE_SCAN_STORE_RESERVE_MIB`, and `--scan-store-reserve-mib` replace the default reserve.
 
-    When the volume permits it, the effective budget still leaves the minimum usable scan-store capacity. The scan-store directory contains durable scan data and completed page indexes only for the private active session.
+    When the volume permits it, the effective budget still leaves the minimum usable scan-store capacity. The scan-store directory contains checksummed scan data and completed page indexes only for the private active session.
 
 The interactive ++t++ picker previews existing `runtime.theme` values without changing configuration. Press ++enter++ to save the selected theme for later TUI sessions, or ++esc++ to restore the original value without writing a preference.
 

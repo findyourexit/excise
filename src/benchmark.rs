@@ -380,11 +380,7 @@ impl CanonicalWorkload {
     }
 }
 
-/// Deterministic logical I/O, durable-operation counts, and phase timing for one published scan.
-///
-/// `durable_syncs` and `manifest_persists` are exact completed-operation totals
-/// for the store's quota. Canonical fixtures keep the manifest in memory, so
-/// their `manifest_persists` stays zero while `durable_syncs` counts run seals.
+/// Deterministic logical I/O and phase timing for one published scan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreMetrics {
     pub observations: usize,
@@ -395,8 +391,6 @@ pub struct CanonicalStoreMetrics {
     pub reduction_written_bytes: u64,
     pub publication_read_bytes: u64,
     pub publication_written_bytes: u64,
-    pub durable_syncs: u64,
-    pub manifest_persists: u64,
     pub retained_bytes: u64,
     pub peak_temporary_bytes: u64,
     pub ingestion_elapsed: Duration,
@@ -438,8 +432,6 @@ fn benchmark_metrics(
         reduction_written_bytes: io.reduction_written_bytes,
         publication_read_bytes: io.publication_read_bytes,
         publication_written_bytes: io.publication_written_bytes,
-        durable_syncs: io.durable_syncs,
-        manifest_persists: io.manifest_persists,
         retained_bytes: storage.used(),
         peak_temporary_bytes: storage.peak_used(),
         ingestion_elapsed,
@@ -912,14 +904,6 @@ mod tests {
         assert!(metrics.publication_written_bytes > 0);
         assert!(metrics.retained_bytes > 0);
         assert!(metrics.peak_temporary_bytes >= metrics.retained_bytes);
-        assert!(
-            metrics.durable_syncs >= u64::try_from(batches).unwrap_or(u64::MAX),
-            "every input batch is sealed durably before the store reads it"
-        );
-        assert_eq!(
-            metrics.manifest_persists, 0,
-            "canonical fixtures keep the manifest in memory"
-        );
     }
 
     fn tree(directories: usize, files_per_directory: usize) -> tempfile::TempDir {
@@ -985,11 +969,6 @@ mod tests {
         assert!(admissions >= 1);
         assert!(report.scan_runs_admitted() >= admissions);
         assert!(report.worker_event(WorkerEventKind::ScanBatch).count() >= admissions);
-
-        // Every admitted run was sealed once and committed to the manifest once, and
-        // the session's first manifest and its publication commit more.
-        assert!(report.manifest_persists() > report.scan_runs_admitted());
-        assert!(report.durable_syncs() >= report.manifest_persists() + report.scan_runs_admitted());
     }
 
     #[test]
