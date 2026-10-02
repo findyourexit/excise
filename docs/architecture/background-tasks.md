@@ -71,3 +71,28 @@ The visible work panel exposes bounded activity and progress without copying pla
 !!! note "Review boundary"
 
     Changes to target-overlap rules, queue capacities, serial mutation, no-follow validation, report retention, or exit behavior require public architecture review.
+
+## Terminal Output Writer
+
+!!! abstract "Status: Accepted"
+
+    A dedicated writer thread transmits already-rendered frame and terminal-session bytes so a slow terminal cannot block the owner loop. It is not a session-coordinator task type: it carries no work items and makes no scanning, deletion, or rendering decisions.
+
+`ratatui::Terminal::draw` queues a frame's commands into the backend's writer, then flushes; the terminal was the blocking point between that flush and the OS accepting it. When the real terminal reads output slower than excise produces it, the flush call blocks until the terminal catches up, blocking the owner loop and, with it, every input and scan batch it has not yet processed.
+
+The owner loop renders into an `io::Write` handle that only buffers in memory, then hands one flush's bytes to a single dedicated writer thread as one ordered message. That thread performs the real, potentially slow, write and flush; it owns no other state and makes no other decision. The owner loop renders a new frame only once the thread confirms the previous one has drained (coalescing: the next frame it does render reflects however much changed while it waited, not a queued backlog of stale ones), so it is never more than one frame's bytes behind the terminal.
+
+Terminal-session entry and restoration (leave the alternate screen, show the cursor, disable mouse capture, restore line wrap) go through the same thread and the same ordered channel as frames, so restoration always follows every frame byte and is never interleaved with or reordered ahead of them, including when the program exits while a frame is still draining. Restoration then waits for the thread to confirm it drained, bounded, so a terminal that never reads anything cannot hang exit; raw mode is still disabled either way.
+
+Two situations cannot use that ordered path, because nothing is left able to drain it: the writer thread itself panicking (the global panic hook then runs on that same thread, which would otherwise wait on a queue only it could ever service) and the writer thread having already stopped entirely (an earlier panic already unwound it). Both are detected directly (by thread identity, and by the channel send failing) rather than by waiting out the bound, and restoration writes straight to the terminal instead.
+
+=== "Alternatives considered"
+
+    - **Non-blocking writes polled alongside input.** Making the terminal's descriptor non-blocking and folding its readiness into the owner loop's existing poll would keep every write on the owner loop, satisfying the single-writer rule most literally. Rejected: Windows ConPTY's anonymous output pipe has no supported non-blocking write mode, so the same mechanism could not work on both platforms excise supports without a separate, harder-to-verify Windows path.
+    - **Buffer every frame and let the writer thread catch up in its own time.** Simpler (no gate), but a terminal slower than excise's production rate would accumulate an unbounded backlog of stale frames that the writer thread would still be draining well into what should be an idle, silent period, violating the idle-output budget and bounding neither memory nor how far behind the terminal the display can fall.
+    - **Drop a produced frame instead of coalescing before producing it.** Skipping delivery of a frame already handed to a writer would let the terminal's displayed state silently diverge from what Ratatui's diff believes it last drew, corrupting every later incremental update. Deciding not to render is free; discarding a frame already committed to is not.
+
+!!! note "Review boundary"
+
+    Changes to this thread's buffering, ordering, or restoration-wait behavior require the same public architecture review as a session-coordinator task type.
+

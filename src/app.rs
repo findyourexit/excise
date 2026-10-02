@@ -536,6 +536,13 @@ where
         self.dirty = true;
     }
 
+    /// Whether a render is pending: `render_if_dirty` will draw the next time it runs. Lets the
+    /// owner loop avoid sleeping past a frame that is only waiting on the terminal writer to
+    /// drain the previous one (see `runtime::OwnerLoop::next_timeout`).
+    pub(crate) const fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
     /// Input or a state change (scan progress, completion, deletion progress)
     /// wakes the selected tile's sheen for one more full cycle before it
     /// settles (F3). Called by the owner loop, which observes those events.
