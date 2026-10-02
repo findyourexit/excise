@@ -1,11 +1,9 @@
 schema_version = 1
 name = "signal-close-idle"
-description = "The Windows console close event delivered once the scan is idle (after COMPLETE) is a confirmed quit: it should remove session storage and exit 130, instead of leaving the process to the system's default handling with neither done (F6). The console is gone after the event, so the terminal itself cannot be checked."
+description = "The Windows console close event delivered once the scan is idle (after COMPLETE) is a confirmed quit: it removes session storage and exits 130. The console is gone after the event, so the terminal itself cannot be checked."
 fixture = "navigate-folders"
 profiles = ["deterministic"]
 tier = "full"
-expect = "fail"
-slice = "X3"
 platforms = ["windows"]
 
 [[steps]]

@@ -80,6 +80,7 @@ mod scan_coordinator;
 mod scan_session;
 #[allow(dead_code)]
 mod scan_store;
+mod signals;
 #[allow(dead_code)]
 mod state;
 mod temporary_storage;

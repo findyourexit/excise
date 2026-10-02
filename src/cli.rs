@@ -15,10 +15,14 @@ use crate::input::TerminalEvents;
 use crate::native_path::safe_display_os_str_text;
 use crate::native_path::{ResolvedRoot, safe_display_text};
 use crate::report::{ReportError, ScanReport, write_buffered};
-use crate::runtime::{RuntimeSettings, SystemClock, run_with_frame_gate, scan_headless};
+use crate::runtime::{
+    RuntimeSettings, SystemClock, run_with_frame_gate, scan_headless_with_stop_signals,
+};
+use crate::signals::{self, StopRequest};
 use crate::terminal::{SplitColorWriter, TerminalSession, spawn_frame_writer, validate_terminal};
 use crate::test_events;
 use crate::theme::ThemeId;
+use crossbeam_channel::Receiver;
 
 pub(crate) fn run_main() -> i32 {
     let cli = match Cli::try_parse() {
@@ -81,26 +85,69 @@ pub(crate) fn run_main() -> i32 {
     if let Err(error) = test_events::init_from_env() {
         return report_error(&error);
     }
-    if output_format != OutputFormat::Tui {
-        let outcome = match scan_headless(settings) {
-            Ok(outcome) => outcome,
-            Err(error) => return report_error(&error),
-        };
-        let Some(report) = outcome.value() else {
-            eprintln!("Error: headless scan returned no report");
-            return ExitClass::Runtime.code();
-        };
-        if let Err(error) = write_scan_report(report, output_format, output_path.as_deref()) {
-            return report_error(&error);
+    let stop_signals = match signals::install() {
+        Ok(stop_signals) => stop_signals,
+        Err(error) => {
+            return report_error(&AppError::io(
+                "could not install the quit-signal handler",
+                error,
+            ));
         }
-        return outcome.exit_class().code();
+    };
+    if output_format != OutputFormat::Tui {
+        let code = run_headless(
+            settings,
+            stop_signals.receiver(),
+            output_format,
+            output_path.as_deref(),
+        );
+        stop_signals.acknowledge_done();
+        return code;
     }
-    let code = run_tui(settings);
+    let code = run_tui(settings, stop_signals.receiver());
+    stop_signals.acknowledge_done();
     test_events::exit(code);
     code
 }
 
-fn run_tui(settings: RuntimeSettings) -> i32 {
+fn run_headless(
+    settings: RuntimeSettings,
+    stop_signals: Receiver<StopRequest>,
+    output_format: OutputFormat,
+    output_path: Option<&Path>,
+) -> i32 {
+    // Held for one more check below, after `scan_headless_with_stop_signals` (which keeps its
+    // own copy) returns: a request that lands after its last check (returning through the call
+    // stack, or anything here before `write_scan_report`) still ends this run as a cancelled,
+    // 130 exit instead of writing whatever a normal outcome produced.
+    let late_stop_signal = stop_signals.clone();
+    let outcome = match scan_headless_with_stop_signals(settings, Some(stop_signals)) {
+        Ok(outcome) => outcome,
+        Err(error) => return report_error(&error),
+    };
+    let Some(report) = outcome.value() else {
+        eprintln!("Error: headless scan returned no report");
+        return ExitClass::Runtime.code();
+    };
+    if late_stop_signal.try_recv().is_ok() {
+        let cancelled = ScanReport::cancelled(
+            report.root().to_path_buf(),
+            report.root_identity().cloned(),
+            report.summary().clone(),
+        );
+        return if let Err(error) = write_scan_report(&cancelled, output_format, output_path) {
+            report_error(&error)
+        } else {
+            ExitClass::Interrupted.code()
+        };
+    }
+    if let Err(error) = write_scan_report(report, output_format, output_path) {
+        return report_error(&error);
+    }
+    outcome.exit_class().code()
+}
+
+fn run_tui(settings: RuntimeSettings, stop_signals: Receiver<StopRequest>) -> i32 {
     if let Err(error) = validate_terminal() {
         return report_error(&error);
     }
@@ -140,6 +187,7 @@ fn run_tui(settings: RuntimeSettings) -> i32 {
         settings,
         Box::new(SystemClock::new()),
         Some(frame_sink),
+        Some(stop_signals),
     );
     let restore_result = session.restore();
     drop(session);

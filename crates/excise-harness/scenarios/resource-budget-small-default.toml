@@ -11,7 +11,7 @@ cols = 120
 rows = 40
 
 [budgets]
-threads = 17
+threads = 19
 fds = 48
 scan_store_bytes_per_entry = 1665
 

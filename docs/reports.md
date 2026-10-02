@@ -65,7 +65,9 @@ In the normal view, press ++e++ to export the current scan and ++shift+e++ to ex
 | `70` | Runtime failure |
 | `74` | Input or output failure |
 | `78` | Configuration failure |
-| `130` | Interrupted operation |
+| `130` | Interrupted operation, including a signal-driven quit (Unix SIGTERM, SIGHUP, or SIGQUIT; a Windows console close, break, logoff, or shutdown event) |
+
+A headless run (`--format table` or `--format json`) that receives one of these signals or events quits like an interactive one: it writes a `scan-report` document with `"state": "cancelled"`, covering what the scan had reduced by then, to `--output FILE` or standard output, and exits `130`. A second signal exits `130` at once, without waiting for publication or the report, so it can cut a report off mid-write: discard the output of a run that received two signals instead of reading it as a smaller valid document.
 
 !!! tip "Safe consumer pattern"
 
