@@ -23,11 +23,6 @@ impl ScanSessionId {
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
-
-    #[must_use]
-    pub const fn bytes(self) -> [u8; 16] {
-        self.0
-    }
 }
 
 /// Lifecycle of one deterministic scan result.
@@ -49,20 +44,6 @@ pub enum ScanGenerationState {
 }
 
 impl ScanGenerationState {
-    #[must_use]
-    pub const fn from_code(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(Self::Creating),
-            2 => Some(Self::Scanning),
-            3 => Some(Self::Reducing),
-            4 => Some(Self::Published),
-            5 => Some(Self::Incomplete),
-            6 => Some(Self::Cancelled),
-            7 => Some(Self::SummaryOnly),
-            _ => None,
-        }
-    }
-
     #[must_use]
     pub const fn can_transition_to(self, next: Self) -> bool {
         matches!(
@@ -94,6 +75,5 @@ mod tests {
         assert!(ScanGenerationState::Reducing.can_transition_to(ScanGenerationState::SummaryOnly));
         assert!(ScanGenerationState::Scanning.can_transition_to(ScanGenerationState::Incomplete));
         assert!(!ScanGenerationState::Published.can_transition_to(ScanGenerationState::Scanning));
-        assert_eq!(ScanGenerationState::from_code(8), None);
     }
 }

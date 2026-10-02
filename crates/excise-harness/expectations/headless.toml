@@ -36,11 +36,41 @@ reason = "The scanner stats every entry by its full path (process_entry calls fs
 [[expect_ratio_fail]]
 fixture = "delete-folder"
 platforms = ["macos", "linux"]
-findings = ["F1"]
-reason = "Every admitted scan-store run, and the manifest commit that follows it, calls `sync_data` (`fcntl(F_FULLFSYNC)` on Apple, plain `fsync`-family on Linux) before the next run can be accepted. On this 5,011-entry fixture the per-run durable write dominates the scan, far over the ratio budget on both platforms."
+findings = ["F16"]
+reason = "With the per-run durable syncs gone, this 5,011-entry fixture still runs far over the 3x budget: 196.5x `du` on macOS (183.4-201.9x across the measured pairs), and over 100x on Linux. The scan and admission now finish in a small fraction of that time; sampling a headless run shows the main thread spending the rest in `cli::write_scan_report` -> `ScanReport::write_json` -> `write_canonical_scan_report_json`'s pretty-printed serde_json serialization, almost entirely in `std::fs::File::write` (a raw `write()` syscall) reached through `Write::write_all`: the output file is a bare `File::create` with no `BufWriter`, so every PrettyFormatter token becomes its own syscall."
 
 [[expect_ratio_fail]]
 fixture = "node-modules-2k"
 platforms = ["macos", "linux"]
-findings = ["F1"]
-reason = "The same per-run durable writes (every admitted run's seal and its manifest commit call `sync_data`) dominate this deeply nested, many-small-files tree too, far over the ratio budget on both platforms."
+findings = ["F16"]
+reason = "The same post-publication report-building cost (not the now-removed durable syncs) dominates this deeply nested, many-small-files tree too: 88.6x `du` on macOS (87.6-90.6x), over 75x on Linux."
+
+[[expect_ratio_fail]]
+fixture = "node-modules-50k"
+platforms = ["macos", "linux"]
+findings = ["F16"]
+reason = "The same post-publication cost, at a larger scale: 122.4x `du` on macOS (119.4-126.1x), over 95x on Linux."
+
+[[expect_ratio_fail]]
+fixture = "scan-store-quota"
+platforms = ["macos", "linux"]
+findings = ["F16"]
+reason = "The same post-publication cost, on this 35,000-tiny-file volume fixture: 258.4x `du` on macOS (250.4-259.9x), over 105x on Linux."
+
+[[expect_ratio_fail]]
+fixture = "selection-drift"
+platforms = ["macos", "linux"]
+findings = ["F16"]
+reason = "The same post-publication cost, on this fixture's 20,000-plus entries: 247.9x `du` on macOS (226.4-276.1x), over 120x on Linux."
+
+[[expect_ratio_fail]]
+fixture = "tiny-files-50k"
+platforms = ["macos", "linux"]
+findings = ["F16"]
+reason = "The same post-publication cost, at 49,052 entries: 263.0x `du` on macOS (242.2-265.7x), over 120x on Linux."
+
+[[expect_ratio_fail]]
+fixture = "tiny-files-250k"
+platforms = ["macos", "linux"]
+findings = ["F16"]
+reason = "The same post-publication cost at this scale too: 145.9x `du` on macOS (117.7-169.5x; only the first run's report is diffed, to bound the disk a fixture this size uses), about 126x on Linux (65.6 s for 249,252 entries)."

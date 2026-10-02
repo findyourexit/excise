@@ -258,11 +258,6 @@ impl RunWriter {
         let footer = encode_footer(self.total_records, self.total_blocks);
         self.write_reserved(&footer)?;
         self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
-        #[cfg(any(test, feature = "internal"))]
-        if let Some(reservation) = self.reservation.as_ref() {
-            reservation.record_durable_sync();
-        }
         let file = self.writer.get_ref().try_clone()?;
         let path = self.path.take();
         Ok(SealedRun {
@@ -356,44 +351,6 @@ impl SealedRun {
     #[must_use]
     pub(crate) const fn bytes(&self) -> u64 {
         self.bytes
-    }
-
-    /// Reopens one manifest-owned private-session run and validates its footer.
-    pub(crate) fn open_named(
-        file: File,
-        path: PathBuf,
-        reservation: TemporaryStorageReservation,
-        descriptor: RunDescriptor,
-        bytes: u64,
-    ) -> Result<Self, RunError> {
-        if file.metadata()?.len() != bytes {
-            return Err(RunError::Truncated);
-        }
-        let sparse_index = matches!(
-            descriptor.kind(),
-            RunKind::ChildQuery | RunKind::PathCatalog
-        )
-        .then(|| rebuild_sparse_index(&file, bytes))
-        .transpose()?;
-        let mut file = file;
-        file.seek(SeekFrom::Start(0))?;
-        let mut reader = RunReader::open(file, Some(path), reservation, bytes, sparse_index)
-            .map_err(|mut error| {
-                error
-                    .error
-                    .take()
-                    .expect("open error should retain its error")
-            })?;
-        if reader.descriptor() != descriptor {
-            return Err(RunError::InvalidHeader);
-        }
-        reader.visit_records(|_, _| Ok(()))?;
-        Ok(reader.into_sealed())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn preserve_path_for_recovery(&mut self) {
-        let _ = self.path.take();
     }
 
     /// # Errors
@@ -911,62 +868,6 @@ fn decode_header(reader: &mut impl Read) -> Result<(RunDescriptor, usize), RunEr
         return Err(RunError::InvalidHeader);
     }
     Ok((RunDescriptor::new(generation, run_id, kind), block_capacity))
-}
-
-fn rebuild_sparse_index(file: &File, bytes: u64) -> Result<SparseRunIndex, RunError> {
-    let mut reader = file.try_clone()?;
-    reader.seek(SeekFrom::Start(0))?;
-    let (_, block_capacity) = decode_header(&mut reader)?;
-    let mut blocks = Vec::new();
-    loop {
-        let offset = reader.stream_position()?;
-        let mut tag = [0_u8; 4];
-        read_exact(&mut reader, &mut tag)?;
-        if tag == FOOTER_MAGIC {
-            let _records = read_u64(&mut reader)?;
-            let _blocks = read_u64(&mut reader)?;
-            if reader.stream_position()? != bytes {
-                return Err(RunError::TrailingData);
-            }
-            break;
-        }
-        if tag != BLOCK_MAGIC {
-            return Err(RunError::InvalidBlock);
-        }
-        let records = read_u32(&mut reader)?;
-        let payload_length =
-            usize::try_from(read_u32(&mut reader)?).map_err(|_| RunError::InvalidBlock)?;
-        if records == 0 || payload_length == 0 || payload_length > block_capacity {
-            return Err(RunError::InvalidBlock);
-        }
-        let mut expected_digest = [0_u8; 32];
-        read_exact(&mut reader, &mut expected_digest)?;
-        let mut payload = vec![0_u8; payload_length];
-        read_exact(&mut reader, &mut payload)?;
-        if Sha256::digest(&payload).as_slice() != expected_digest {
-            return Err(RunError::ChecksumMismatch);
-        }
-        let mut cursor = 0;
-        let key_length = read_length(&payload, &mut cursor)?;
-        let value_length = read_length(&payload, &mut cursor)?;
-        let key_end = cursor
-            .checked_add(key_length)
-            .ok_or(RunError::InvalidBlock)?;
-        let value_end = key_end
-            .checked_add(value_length)
-            .ok_or(RunError::InvalidBlock)?;
-        if value_end > payload.len() {
-            return Err(RunError::InvalidBlock);
-        }
-        blocks.push(SparseRunBlock {
-            first_key: payload[cursor..key_end].to_vec(),
-            offset,
-        });
-    }
-    Ok(SparseRunIndex {
-        block_capacity,
-        blocks,
-    })
 }
 
 fn encode_footer(records: u64, blocks: u64) -> [u8; FOOTER_BYTES] {

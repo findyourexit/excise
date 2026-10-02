@@ -243,8 +243,6 @@ pub struct OwnerLoopReport {
     scan_runs_admitted: u64,
     scan_entries_handled: u64,
     time_to_scan_complete: Option<Duration>,
-    durable_syncs: u64,
-    manifest_persists: u64,
 }
 
 /// A report is a few kilobytes however long the run lasted.
@@ -265,8 +263,6 @@ impl OwnerLoopReport {
             scan_runs_admitted: 0,
             scan_entries_handled: 0,
             time_to_scan_complete: None,
-            durable_syncs: 0,
-            manifest_persists: 0,
         }
     }
 
@@ -305,18 +301,6 @@ impl OwnerLoopReport {
     #[must_use]
     pub const fn time_to_scan_complete(&self) -> Option<Duration> {
         self.time_to_scan_complete
-    }
-
-    /// Returns the session's completed durable syncs, read after the workers stopped.
-    #[must_use]
-    pub const fn durable_syncs(&self) -> u64 {
-        self.durable_syncs
-    }
-
-    /// Returns the session's completed manifest commits, read after the workers stopped.
-    #[must_use]
-    pub const fn manifest_persists(&self) -> u64 {
-        self.manifest_persists
     }
 }
 
@@ -394,12 +378,6 @@ impl OwnerLoopProbe {
     fn add_entry_handled(&self) {
         let report = &mut self.state.borrow_mut().report;
         report.scan_entries_handled = report.scan_entries_handled.saturating_add(1);
-    }
-
-    fn set_store_io(&self, durable_syncs: u64, manifest_persists: u64) {
-        let report = &mut self.state.borrow_mut().report;
-        report.durable_syncs = durable_syncs;
-        report.manifest_persists = manifest_persists;
     }
 }
 
@@ -486,16 +464,6 @@ where
     pub(super) fn probe_scan_entry(&self) {
         if let Some(probe) = self.input.owner_loop_probe() {
             probe.add_entry_handled();
-        }
-    }
-
-    /// Reads the session's durable-operation totals once the workers have stopped.
-    pub(super) fn finish_probe(&self) {
-        if let Some(probe) = self.input.owner_loop_probe() {
-            probe.set_store_io(
-                self.scan_store_storage.durable_syncs(),
-                self.scan_store_storage.manifest_persists(),
-            );
         }
     }
 }
@@ -763,18 +731,14 @@ mod tests {
     }
 
     #[test]
-    fn counters_accumulate_and_store_totals_replace() {
+    fn counters_accumulate_across_multiple_calls() {
         let probe = OwnerLoopProbe::new();
         probe.add_runs_admitted(3);
         probe.add_runs_admitted(2);
         probe.add_entry_handled();
         probe.add_entry_handled();
-        probe.set_store_io(7, 4);
-        probe.set_store_io(9, 5);
         let report = probe.report();
         assert_eq!(report.scan_runs_admitted(), 5);
         assert_eq!(report.scan_entries_handled(), 2);
-        assert_eq!(report.durable_syncs(), 9);
-        assert_eq!(report.manifest_persists(), 5);
     }
 }
