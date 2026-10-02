@@ -914,6 +914,9 @@ where
             self.scan_view_dirty |= path.is_some_and(|path| path.starts_with(&self.scan_view_root));
         }
         self.app.record_scan_store_unrecorded_path();
+        if let Some(path) = path {
+            self.app.record_unreadable_directory(path);
+        }
         let message = safe_display_text(message);
         self.summary.unscanned_entries = self.summary.unscanned_entries.saturating_add(1);
         self.summary.unreadable_entries = self.summary.unreadable_entries.saturating_add(1);
@@ -1866,6 +1869,13 @@ fn scan_headless_with_scan_store_session(
                         }
                     } else {
                         scan_store.record_unrecorded_path();
+                        if let Some(path) = path
+                            .as_deref()
+                            .and_then(|path| path.strip_prefix(&settings.root).ok())
+                            .and_then(|relative| RelativePath::from_path(relative).ok())
+                        {
+                            scan_store.record_unreadable_directory(path);
+                        }
                         summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
                         summary.unreadable_entries = summary.unreadable_entries.saturating_add(1);
                         summary.last_unscanned_path = path.as_deref().map(safe_display_path_text);

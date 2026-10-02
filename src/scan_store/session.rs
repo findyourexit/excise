@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::error::Error as StdError;
 use std::io;
 use std::path::PathBuf;
@@ -24,10 +24,10 @@ use super::path_catalog::{
     PathCatalogEntry, PathCatalogError, build_path_catalog, read_path_catalog_entry,
 };
 use super::path_observation::{PathObservationRunError, append_path_observation};
-use super::path_reducer::{Coverage, PathObservation, SummaryMetrics};
+use super::path_reducer::{Coverage, PathObservation, SummaryMetrics, UnreadableDirectories};
 use super::run_file::{RunDescriptor, RunError, RunKind, RunWriter, SealedRun};
 use super::run_merge::{RunMergeError, merge_sorted_runs};
-use crate::scan_coordinator::ScanGeneration;
+use crate::scan_coordinator::{RelativePath, ScanGeneration};
 use crate::scan_coordinator::{WorkKind, WorkLease};
 use crate::scan_session::{ScanGenerationState, ScanSessionId};
 use crate::scan_store::storage::ScanStoreStorage;
@@ -43,6 +43,19 @@ const RUN_BLOCK_BYTES: usize = 64 * 1024;
 /// Scanner workers emit bounded batches. Keep this input cap below the event
 /// channel's worst-case payload so the owner never needs an unbounded sort.
 pub(crate) const MAX_OBSERVATIONS_PER_BATCH: usize = 128;
+
+/// Bounds the per-session set of directories the scanner could not open or
+/// list (`ScanStore::record_unreadable_directory`). A real permission
+/// boundary (a locked-down system tree, a handful of misconfigured
+/// directories) produces at most dozens to a few hundred such paths; this
+/// cap is two orders of magnitude past that. At the cap, even a worst-case
+/// deeply nested path keeps the set a low single-digit number of megabytes:
+/// a small fraction of the 25 percent of the default 512 MiB process budget
+/// `docs/architecture/overview.md` reserves for working data. Past the cap,
+/// `ScanStore` stops tracking individual paths and instead reports every
+/// folder `Uncertain`, the same conservative direction `unrecorded_path_count`
+/// already takes for the root alone when a fact cannot be retained.
+const MAX_TRACKED_UNREADABLE_DIRECTORIES: usize = 4096;
 
 #[derive(Debug, Error)]
 pub(crate) enum ScanStoreError {
@@ -141,6 +154,15 @@ pub(crate) struct PublishedGeneration {
     root_page_coverage: Coverage,
     /// Paths the scanner could not encode into canonical runs.
     unrecorded_path_count: u64,
+    /// Directories the scanner could not list, while under
+    /// `MAX_TRACKED_UNREADABLE_DIRECTORIES`. Every ancestor of one is also
+    /// uncertain in the published generation's coverage and bounds; carried
+    /// forward into an overlay generation so an unrelated deletion refresh
+    /// cannot make a still-unreadable directory look complete again.
+    unreadable_directories: BTreeSet<RelativePath>,
+    /// Set once the generation's unreadable-directory count passed the cap;
+    /// `unreadable_directories` is then empty and every folder is uncertain.
+    unreadable_directories_overflowed: bool,
 }
 
 impl PublishedGeneration {
@@ -158,6 +180,16 @@ impl PublishedGeneration {
     #[must_use]
     pub(crate) const fn unrecorded_path_count(&self) -> u64 {
         self.unrecorded_path_count
+    }
+
+    /// Returns the directories the scanner could not list in this
+    /// generation, or `Overflowed` if there were more than the tracking cap.
+    #[must_use]
+    pub(crate) fn unreadable_directories(&self) -> UnreadableDirectories<'_> {
+        unreadable_directories_view(
+            &self.unreadable_directories,
+            self.unreadable_directories_overflowed,
+        )
     }
 
     #[must_use]
@@ -327,6 +359,8 @@ struct ActiveGeneration {
     path_runs: RunLevels,
     identity_runs: RunLevels,
     unrecorded_path_count: u64,
+    unreadable_directories: BTreeSet<RelativePath>,
+    unreadable_directories_overflowed: bool,
     accepted_run_ids: HashSet<u64>,
     provisional_page: Option<ProvisionalPage>,
 }
@@ -342,9 +376,18 @@ impl ActiveGeneration {
             path_runs: RunLevels::default(),
             identity_runs: RunLevels::default(),
             unrecorded_path_count: 0,
+            unreadable_directories: BTreeSet::new(),
+            unreadable_directories_overflowed: false,
             accepted_run_ids: HashSet::new(),
             provisional_page: None,
         }
+    }
+
+    fn unreadable_directories(&self) -> UnreadableDirectories<'_> {
+        unreadable_directories_view(
+            &self.unreadable_directories,
+            self.unreadable_directories_overflowed,
+        )
     }
     fn input_runs_mut(&mut self, kind: RunKind) -> Result<&mut RunLevels, ScanStoreError> {
         match kind {
@@ -355,6 +398,19 @@ impl ActiveGeneration {
             | RunKind::ChildQuery
             | RunKind::PathCatalog => Err(ScanStoreError::InvalidInputRunKind),
         }
+    }
+}
+
+/// Builds the view the reducer uses from one generation's tracked set and
+/// overflow flag: `Tracked` while under the cap, `Overflowed` past it.
+fn unreadable_directories_view(
+    tracked: &BTreeSet<RelativePath>,
+    overflowed: bool,
+) -> UnreadableDirectories<'_> {
+    if overflowed {
+        UnreadableDirectories::Overflowed
+    } else {
+        UnreadableDirectories::Tracked(tracked)
     }
 }
 
@@ -541,6 +597,32 @@ impl ScanStore {
     pub(crate) fn record_unrecorded_path(&mut self) {
         if let Some(active) = self.active.as_mut() {
             active.unrecorded_path_count = active.unrecorded_path_count.saturating_add(1);
+        }
+    }
+
+    /// Records one directory the scanner could not list. Every ancestor up to
+    /// the root becomes `Uncertain` with an open upper bound once this
+    /// generation reduces (`reduce_path_observation_run`), regardless of the
+    /// `Coverage::Complete` seed its own entry carried when its parent first
+    /// discovered it, before the failure to open or list it was known.
+    pub(crate) fn record_unreadable_directory(&mut self, path: RelativePath) {
+        self.record_unreadable_directory_with_cap(path, MAX_TRACKED_UNREADABLE_DIRECTORIES);
+    }
+
+    /// `record_unreadable_directory`, with its tracking cap as a parameter so
+    /// a test can reach the overflow fallback without creating thousands of
+    /// real unreadable directories.
+    fn record_unreadable_directory_with_cap(&mut self, path: RelativePath, cap: usize) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if active.unreadable_directories_overflowed {
+            return;
+        }
+        active.unreadable_directories.insert(path);
+        if active.unreadable_directories.len() > cap {
+            active.unreadable_directories.clear();
+            active.unreadable_directories_overflowed = true;
         }
     }
 
@@ -741,14 +823,21 @@ impl ScanStore {
         &mut self,
         generation: ScanGeneration,
     ) -> Result<(), ScanStoreError> {
-        let unrecorded_path_count = self
+        let published = self
             .published
             .as_ref()
-            .ok_or(ScanStoreError::NoPublishedGeneration)?
-            .unrecorded_path_count();
+            .ok_or(ScanStoreError::NoPublishedGeneration)?;
+        let unrecorded_path_count = published.unrecorded_path_count();
+        let (unreadable_directories, unreadable_directories_overflowed) =
+            match published.unreadable_directories() {
+                UnreadableDirectories::Tracked(set) => (set.clone(), false),
+                UnreadableDirectories::Overflowed => (BTreeSet::new(), true),
+            };
         self.begin_generation(generation)?;
         if let Some(active) = self.active.as_mut() {
             active.unrecorded_path_count = unrecorded_path_count;
+            active.unreadable_directories = unreadable_directories;
+            active.unreadable_directories_overflowed = unreadable_directories_overflowed;
         }
         Ok(())
     }
@@ -998,6 +1087,8 @@ impl ScanStore {
             &child_queries,
         );
         let unrecorded_path_count = active.unrecorded_path_count;
+        let unreadable_directories = std::mem::take(&mut active.unreadable_directories);
+        let unreadable_directories_overflowed = active.unreadable_directories_overflowed;
         let mut manifest = active.manifest.clone();
         manifest.replace_all_runs(RunManifestEntry {
             descriptor: child_queries.descriptor(),
@@ -1021,6 +1112,8 @@ impl ScanStore {
             root_page_metrics: page_metadata.root_metrics,
             root_page_coverage: page_metadata.root_coverage,
             unrecorded_path_count,
+            unreadable_directories,
+            unreadable_directories_overflowed,
         });
         Ok(generation)
     }
@@ -1081,7 +1174,11 @@ impl ScanStore {
         }
         let mut path_reader = path_observations.into_reader()?;
         let mut directory_writer = self.new_writer(generation, RunKind::DirectorySummary)?;
-        reduce_path_observation_run(&mut path_reader, &mut directory_writer)?;
+        reduce_path_observation_run(
+            &mut path_reader,
+            &mut directory_writer,
+            active.unreadable_directories(),
+        )?;
         let path_observations = path_reader.into_sealed();
         let directory_summaries = directory_writer.seal()?;
         #[cfg(feature = "internal")]
@@ -2433,6 +2530,111 @@ mod tests {
                 .map(|entry| entry.path.clone())
                 .collect::<Vec<_>>(),
             vec![path("alpha/new")]
+        );
+    }
+
+    #[test]
+    fn overlay_generation_keeps_an_unrelated_unreadable_directory_uncertain() {
+        let mut store = store(TemporaryStorage::with_limit_bytes(
+            INDEXED_PUBLICATION_STORAGE_BYTES,
+        ));
+        add_path_run(
+            &mut store,
+            &[
+                path_observation("alpha", PathEntryKind::Directory, 0),
+                path_observation("alpha/old", PathEntryKind::File, 4),
+                path_observation("beta", PathEntryKind::Directory, 0),
+                path_observation("beta/locked", PathEntryKind::Directory, 0),
+            ],
+        );
+        store.record_unreadable_directory(path("beta/locked"));
+        store.publish().expect("base generation should publish");
+
+        let base_beta = store
+            .published_mut()
+            .expect("base generation should be published")
+            .page(PageRequest::first(path("beta"), 8))
+            .expect("beta page should load");
+        assert_eq!(base_beta.folder_coverage, Coverage::Uncertain);
+
+        let next = ScanGeneration::from_value(1);
+        store
+            .begin_overlay_generation(next, &path("alpha"))
+            .expect("focused overlay should start");
+        add_path_run(
+            &mut store,
+            &[
+                path_observation("alpha", PathEntryKind::Directory, 0),
+                path_observation("alpha/new", PathEntryKind::File, 9),
+            ],
+        );
+        assert_eq!(store.publish().expect("overlay should publish"), next);
+
+        let overlay_beta = store
+            .published_mut()
+            .expect("overlay should be published")
+            .page(PageRequest::first(path("beta"), 8))
+            .expect("beta page should still load after an unrelated overlay");
+        assert_eq!(
+            overlay_beta.folder_coverage,
+            Coverage::Uncertain,
+            "an unreadable directory outside the overlay's replaced prefix must stay uncertain"
+        );
+        assert_eq!(overlay_beta.folder_metrics.allocated_bytes.upper, None);
+        let locked = overlay_beta
+            .entries
+            .iter()
+            .find(|entry| entry.path == path("beta/locked"))
+            .expect("the unreadable directory itself should still be listed");
+        assert_eq!(locked.coverage, Coverage::Uncertain);
+    }
+
+    #[test]
+    fn past_the_tracking_cap_every_folder_becomes_uncertain_instead_of_only_the_tracked_ones() {
+        let mut store = store(TemporaryStorage::with_limit_bytes(
+            INDEXED_PUBLICATION_STORAGE_BYTES,
+        ));
+        add_path_run(
+            &mut store,
+            &[
+                path_observation("alpha", PathEntryKind::Directory, 0),
+                path_observation("alpha/locked-one", PathEntryKind::Directory, 0),
+                path_observation("beta", PathEntryKind::Directory, 0),
+                path_observation("beta/locked-two", PathEntryKind::Directory, 0),
+                path_observation("gamma", PathEntryKind::Directory, 0),
+                path_observation("gamma/untouched", PathEntryKind::File, 4),
+            ],
+        );
+        // A cap of 1 is reached by the second distinct unreadable directory,
+        // well before any real scan would create thousands of them.
+        store.record_unreadable_directory_with_cap(path("alpha/locked-one"), 1);
+        store.record_unreadable_directory_with_cap(path("beta/locked-two"), 1);
+        store.publish().expect("generation should publish");
+
+        let gamma = store
+            .published_mut()
+            .expect("generation should be published")
+            .page(PageRequest::first(path("gamma"), 8))
+            .expect("gamma page should load");
+        assert_eq!(
+            gamma.folder_coverage,
+            Coverage::Uncertain,
+            "past the cap, even an untouched folder must be uncertain rather than trusted as complete"
+        );
+        assert_eq!(gamma.folder_metrics.allocated_bytes.upper, None);
+        assert_eq!(
+            gamma.root_coverage,
+            Coverage::Uncertain,
+            "the root is also uncertain once tracking overflows"
+        );
+        let untouched = gamma
+            .entries
+            .iter()
+            .find(|entry| entry.path == path("gamma/untouched"))
+            .expect("the untouched file should still be listed");
+        assert_eq!(
+            untouched.metrics.apparent_bytes, 4,
+            "a leaf file's own, directly observed size is unaffected by the fallback"
         );
     }
     #[test]

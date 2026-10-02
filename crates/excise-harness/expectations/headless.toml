@@ -6,18 +6,11 @@ schema_version = 1
 # and the entry has to go.
 
 [[expect_fail]]
-fixture = "hostile-small"
-platforms = ["macos", "linux"]
-findings = ["F10"]
-kinds = ["entry-state"]
-reason = "A directory that cannot be listed, and every folder above it, is reported `complete` with exact bounds. Only the document state, the exit code, and the summary carry the uncertainty, against docs/safety/accounting.md: \"Parent folders retain a lower bound and show the uncertainty.\""
-
-[[expect_fail]]
 fixture = "all-classes-small"
 platforms = ["macos", "linux"]
-findings = ["F10", "F11"]
-kinds = ["entry-state", "missing", "summary"]
-reason = "F10 for its hostile part, and F11 for its deep part: the scanner stats every entry by its full path, so nothing past PATH_MAX is scanned."
+findings = ["F11"]
+kinds = ["missing", "summary"]
+reason = "Its deep part: the scanner stats every entry by its full path, so nothing past PATH_MAX is scanned."
 
 [[expect_fail]]
 fixture = "deep-past-path-max"

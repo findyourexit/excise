@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use thiserror::Error;
 
 use crate::model::{ByteBounds, EntrySnapshot};
@@ -174,6 +176,29 @@ impl OpenDirectory {
     }
 }
 
+/// Directories the scanner could not open or list, as tracked for one
+/// generation's reduction.
+///
+/// Past a fixed cap (see `ScanStore::record_unreadable_directory_with_cap`),
+/// the owner stops tracking individual paths and reports `Overflowed`
+/// instead: every folder then folds to [`Coverage::Uncertain`] with an open
+/// upper bound, rather than silently limiting the uncertainty to whichever
+/// paths fit under the cap.
+#[derive(Clone, Copy)]
+pub(crate) enum UnreadableDirectories<'a> {
+    Tracked(&'a BTreeSet<RelativePath>),
+    Overflowed,
+}
+
+impl UnreadableDirectories<'_> {
+    fn contains(self, path: &RelativePath) -> bool {
+        match self {
+            Self::Tracked(tracked) => tracked.contains(path),
+            Self::Overflowed => true,
+        }
+    }
+}
+
 /// Reduces canonical path observations in one forward pass and bounded depth.
 ///
 /// Input must be strictly ordered by [`RelativePath`] and must contain every
@@ -186,9 +211,14 @@ impl OpenDirectory {
 pub(crate) fn reduce_sorted_paths(
     observations: impl IntoIterator<Item = PathObservation>,
     emit: impl FnMut(DirectorySummary) -> Result<(), PathReductionError>,
+    unreadable_directories: UnreadableDirectories<'_>,
 ) -> Result<(), PathReductionError> {
     let mut observations = observations.into_iter();
-    reduce_sorted_path_stream::<PathReductionError>(|| Ok(observations.next()), emit)
+    reduce_sorted_path_stream::<PathReductionError>(
+        || Ok(observations.next()),
+        emit,
+        unreadable_directories,
+    )
 }
 
 /// Reduces a fallible observation source without materializing its records.
@@ -203,6 +233,7 @@ pub(crate) fn reduce_sorted_paths(
 pub(crate) fn reduce_sorted_path_stream<E>(
     mut next: impl FnMut() -> Result<Option<PathObservation>, E>,
     mut emit: impl FnMut(DirectorySummary) -> Result<(), E>,
+    unreadable_directories: UnreadableDirectories<'_>,
 ) -> Result<(), E>
 where
     E: From<PathReductionError>,
@@ -231,7 +262,7 @@ where
             .path
             .starts_with(&directories.last().expect("root directory must remain").path)
         {
-            close_directory(&mut directories, &mut emit)?;
+            close_directory(&mut directories, unreadable_directories, &mut emit)?;
         }
         let parent = directories.last().expect("root directory must remain");
         if !observation.path.is_direct_child_of(&parent.path) {
@@ -251,17 +282,20 @@ where
     }
 
     while directories.len() > 1 {
-        close_directory(&mut directories, &mut emit)?;
+        close_directory(&mut directories, unreadable_directories, &mut emit)?;
     }
-    let root = directories.pop().expect("root directory must remain");
+    let mut root = directories.pop().expect("root directory must remain");
+    force_uncertain_if_unreadable(&mut root, unreadable_directories);
     emit(root.into_summary())
 }
 
 fn close_directory<E>(
     directories: &mut Vec<OpenDirectory>,
+    unreadable_directories: UnreadableDirectories<'_>,
     emit: &mut impl FnMut(DirectorySummary) -> Result<(), E>,
 ) -> Result<(), E> {
-    let directory = directories.pop().expect("root directory must remain");
+    let mut directory = directories.pop().expect("root directory must remain");
+    force_uncertain_if_unreadable(&mut directory, unreadable_directories);
     let metrics = directory.metrics;
     let coverage = directory.coverage;
     emit(DirectorySummary {
@@ -274,6 +308,23 @@ fn close_directory<E>(
         .expect("closed directory must have a parent")
         .add_child(metrics, coverage);
     Ok(())
+}
+
+/// A directory the scanner could not list keeps its lower bound but opens its
+/// upper bound and becomes [`Coverage::Uncertain`], regardless of what its own
+/// seed observation (necessarily sealed `Complete` by its parent before the
+/// failure was known) or its — necessarily absent — children reported.
+/// Folding this into its parent (`add_child`, which combines coverage and
+/// adds bounds) carries both facts to every ancestor up to the root.
+fn force_uncertain_if_unreadable(
+    directory: &mut OpenDirectory,
+    unreadable_directories: UnreadableDirectories<'_>,
+) {
+    if unreadable_directories.contains(&directory.path) {
+        directory.coverage = Coverage::Uncertain;
+        directory.metrics.allocated_bytes.upper = None;
+        directory.metrics.reclaimable_bytes.upper = None;
+    }
 }
 
 #[cfg(test)]
@@ -307,11 +358,25 @@ mod tests {
     fn reduce(
         observations: Vec<PathObservation>,
     ) -> Result<Vec<DirectorySummary>, PathReductionError> {
+        reduce_with_unreadable(
+            observations,
+            UnreadableDirectories::Tracked(&BTreeSet::new()),
+        )
+    }
+
+    fn reduce_with_unreadable(
+        observations: Vec<PathObservation>,
+        unreadable_directories: UnreadableDirectories<'_>,
+    ) -> Result<Vec<DirectorySummary>, PathReductionError> {
         let mut summaries = Vec::new();
-        reduce_sorted_paths(observations, |summary| {
-            summaries.push(summary);
-            Ok(())
-        })?;
+        reduce_sorted_paths(
+            observations,
+            |summary| {
+                summaries.push(summary);
+                Ok(())
+            },
+            unreadable_directories,
+        )?;
         Ok(summaries)
     }
 
@@ -421,5 +486,56 @@ mod tests {
             ]),
             Err(PathReductionError::DuplicatePath)
         );
+    }
+
+    #[test]
+    fn an_unreadable_directory_and_every_ancestor_become_uncertain_with_an_open_upper_bound() {
+        let mut unreadable = BTreeSet::new();
+        unreadable.insert(path("alpha/locked"));
+        let summaries = reduce_with_unreadable(
+            vec![
+                observation("alpha", PathEntryKind::Directory, 0, 0),
+                observation("alpha/locked", PathEntryKind::Directory, 0, 0),
+            ],
+            UnreadableDirectories::Tracked(&unreadable),
+        )
+        .expect("an unreadable directory with no children should still reduce");
+
+        assert_eq!(summaries.len(), 3);
+        for summary in &summaries {
+            assert_eq!(
+                summary.coverage,
+                Coverage::Uncertain,
+                "{:?} should be uncertain",
+                summary.path
+            );
+            assert_eq!(summary.metrics.allocated_bytes.lower, 0);
+            assert_eq!(summary.metrics.allocated_bytes.upper, None);
+            assert_eq!(summary.metrics.reclaimable_bytes.upper, None);
+        }
+    }
+
+    #[test]
+    fn overflowed_tracking_forces_every_directory_uncertain_even_ones_never_recorded() {
+        let summaries = reduce_with_unreadable(
+            vec![
+                observation("alpha", PathEntryKind::Directory, 0, 0),
+                observation("alpha/untouched", PathEntryKind::File, 4, 4),
+            ],
+            UnreadableDirectories::Overflowed,
+        )
+        .expect("even an ordinary tree should still reduce");
+
+        assert_eq!(summaries.len(), 2);
+        for summary in &summaries {
+            assert_eq!(
+                summary.coverage,
+                Coverage::Uncertain,
+                "{:?} should be uncertain once tracking has overflowed",
+                summary.path
+            );
+            assert_eq!(summary.metrics.allocated_bytes.upper, None);
+            assert_eq!(summary.metrics.reclaimable_bytes.upper, None);
+        }
     }
 }
