@@ -32,6 +32,7 @@ pub mod deletion;
 #[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod deletion;
+mod entry_metadata;
 #[cfg(feature = "internal")]
 pub mod error;
 #[cfg(not(feature = "internal"))]
