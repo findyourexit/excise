@@ -2152,6 +2152,197 @@ mod tests {
         assert!(second.next_after.is_none());
     }
 
+    /// `victim/partAA/partBB/blob-NNN.bin`: `top` folders of `middle` folders of `files` files each,
+    /// with sizes that differ from folder to folder. Returns the published store and every entry
+    /// with its size, which the tests use for their own account of what a filter must find.
+    fn nested_store(
+        top: usize,
+        middle: usize,
+        files: usize,
+        padding: usize,
+    ) -> (ScanStore, Vec<(String, PathEntryKind, u128)>) {
+        let padding = "x".repeat(padding);
+        let mut rows = vec![("victim".to_string(), PathEntryKind::Directory, 0)];
+        for first in 0..top {
+            let folder = format!("victim/part{first:02}");
+            rows.push((folder.clone(), PathEntryKind::Directory, 0));
+            for second in 0..middle {
+                let leaf_folder = format!("{folder}/part{second:02}");
+                rows.push((leaf_folder.clone(), PathEntryKind::Directory, 0));
+                for file in 0..files {
+                    let bytes = 100
+                        + u128::try_from((first * 131 + second * 37 + file * 7) % 8000)
+                            .expect("a remainder below 8000 fits");
+                    rows.push((
+                        format!("{leaf_folder}/blob-{padding}{file:03}.bin"),
+                        PathEntryKind::File,
+                        bytes,
+                    ));
+                }
+            }
+        }
+        let mut store = ScanStore::new(
+            ScanGeneration::initial(),
+            TemporaryStorage::with_limit_bytes(64 * 1024 * 1024),
+        )
+        .expect("store should initialize");
+        let observations = rows
+            .iter()
+            .map(|(text, kind, bytes)| {
+                super::super::path_reducer::PathObservation::new(
+                    path(text),
+                    *kind,
+                    SummaryMetrics::leaf(
+                        *bytes,
+                        ByteBounds::exact(*bytes),
+                        ByteBounds::exact(*bytes),
+                    ),
+                    Coverage::Complete,
+                )
+            })
+            .collect::<Vec<_>>();
+        add_path_run(&mut store, &observations);
+        store.publish().expect("generation should publish");
+        (store, rows)
+    }
+
+    /// The direct children of `folder`, largest first, that are or hold an entry named `name`
+    /// at or below `filter_root`, with their sizes: worked out from the entries alone.
+    fn children_holding(
+        rows: &[(String, PathEntryKind, u128)],
+        folder: &str,
+        filter_root: &str,
+        name: &str,
+    ) -> Vec<(String, u128)> {
+        let within = |entry: &str, base: &str| {
+            base.is_empty() || entry == base || entry.starts_with(&format!("{base}/"))
+        };
+        let mut children = std::collections::BTreeSet::new();
+        for (entry, _, _) in rows {
+            let strictly_below = if folder.is_empty() {
+                !entry.is_empty()
+            } else {
+                entry.starts_with(&format!("{folder}/"))
+            };
+            if strictly_below
+                && within(entry, filter_root)
+                && entry.rsplit('/').next() == Some(name)
+            {
+                let rest = entry.strip_prefix(&format!("{folder}/")).unwrap_or(entry);
+                let first = rest
+                    .split('/')
+                    .next()
+                    .expect("an entry has a first component");
+                children.insert(if folder.is_empty() {
+                    first.to_string()
+                } else {
+                    format!("{folder}/{first}")
+                });
+            }
+        }
+        let mut sized = children
+            .into_iter()
+            .map(|child| {
+                let total = rows
+                    .iter()
+                    .filter(|(entry, _, _)| within(entry, &child))
+                    .map(|(_, _, bytes)| *bytes)
+                    .sum::<u128>();
+                (child, total)
+            })
+            .collect::<Vec<_>>();
+        sized.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        sized
+    }
+
+    fn listed(page: &ScanPage) -> Vec<(String, u128)> {
+        page.entries
+            .iter()
+            .map(|entry| {
+                let text = entry
+                    .path
+                    .components()
+                    .iter()
+                    .map(|component| component.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                (text, entry.metrics.allocated_bytes.lower)
+            })
+            .collect()
+    }
+
+    /// Every page of the filtered listing of `folder`, `limit` entries at a time.
+    fn filtered_listing(
+        published: &PublishedGeneration,
+        folder: &str,
+        filter_root: &str,
+        filter: &FilterPattern,
+        limit: usize,
+    ) -> Result<Vec<(String, u128)>, String> {
+        let mut listing = Vec::new();
+        let mut after = None;
+        for _ in 0..1000 {
+            let request = match after.take() {
+                None => PageRequest::first(path(folder), limit),
+                Some(cursor) => PageRequest::after(path(folder), cursor, limit),
+            };
+            let page = published
+                .filtered_page(request, Path::new("/scan"), filter, &path(filter_root))
+                .map_err(|error| error.to_string())?;
+            listing.extend(listed(&page));
+            after = page.next_after;
+            if after.is_none() {
+                return Ok(listing);
+            }
+        }
+        Err("the listing did not end".to_string())
+    }
+
+    /// A filtered page reads the folder's whole subtree and looks up the direct child above each
+    /// match that lies deeper, in the same run, while the subtree is still being read. Whole or
+    /// in pieces, a page has to list exactly the children an independent count finds, with their
+    /// sizes: not an error, and not a listing that is missing some of them.
+    #[test]
+    fn filtered_pages_list_every_child_holding_a_match_at_any_depth() {
+        let mut failures = Vec::new();
+        for (top, middle, files, padding) in [(10, 10, 49, 0), (6, 9, 27, 40)] {
+            let (store, rows) = nested_store(top, middle, files, padding);
+            let published = store.published().expect("generation should publish");
+            let file_name = format!("blob-{}000.bin", "x".repeat(padding));
+            // The page's folder, the folder the filter was applied in, and the name it matches.
+            let cases = [
+                ("", "", "part00"),
+                ("victim", "victim", "part00"),
+                ("victim", "", "part00"),
+                ("victim", "victim", file_name.as_str()),
+                ("victim/part03", "victim", "part00"),
+            ];
+            for (folder, filter_root, name) in cases {
+                let expected = children_holding(&rows, folder, filter_root, name);
+                assert!(
+                    !expected.is_empty(),
+                    "{name:?} below {filter_root:?} should match"
+                );
+                let filter = FilterPattern::new(name).expect("filter should compile");
+                for limit in [512, 3] {
+                    let label = format!(
+                        "{name:?} in {folder:?} below {filter_root:?}, {top}x{middle}x{files}, {limit} to a page"
+                    );
+                    match filtered_listing(published, folder, filter_root, &filter, limit) {
+                        Ok(listing) if listing == expected => {}
+                        Ok(listing) => failures.push(format!(
+                            "{label}: listed {} children, expected {}",
+                            listing.len(),
+                            expected.len()
+                        )),
+                        Err(error) => failures.push(format!("{label}: {error}")),
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     #[test]
     fn indexed_directory_totals_preserve_the_original_deletion_snapshot() {
         let directory_id = file_id::FileId::new_inode(1, 1);

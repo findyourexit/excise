@@ -494,10 +494,13 @@ impl SealedRun {
     /// The reader may return records from the preceding block before `lower_bound`.
     /// Callers compare keys before consuming records.
     ///
+    /// Readers of one run are independent: each reads at offsets of its own, so another
+    /// reader of the same run, opened while this one is still reading, never moves it.
+    ///
     /// # Errors
     ///
     /// Returns an error when this is not an indexed child-query run or its backing file
-    /// cannot be reopened, cloned, or positioned.
+    /// cannot be reopened or cloned.
     pub(crate) fn range_reader(&self, lower_bound: &[u8]) -> Result<RunRangeReader, RunError> {
         if !matches!(
             self.descriptor.kind(),
@@ -517,7 +520,7 @@ impl SealedRun {
             .checked_sub(1)
             .and_then(|position| index.blocks.get(position));
         let offset = block.map_or(fallback, |block| block.offset);
-        let mut file = match self.file.as_ref() {
+        let file = match self.file.as_ref() {
             Some(file) => file.try_clone()?,
             None => File::open(
                 self.path
@@ -525,8 +528,7 @@ impl SealedRun {
                     .expect("a sealed run must retain its file or its path"),
             )?,
         };
-        file.seek(SeekFrom::Start(offset))?;
-        Ok(RunRangeReader::new(file, index.block_capacity))
+        Ok(RunRangeReader::new(file, offset, index.block_capacity))
     }
 }
 
@@ -767,11 +769,38 @@ impl RunReader {
     }
 }
 
+/// A run file read at an offset of its own.
+///
+/// A descriptor made by `try_clone` shares its file offset with the descriptor it was cloned from
+/// and with every other clone of it. A reader that seeks once and then reads on is therefore moved
+/// by any other reader of the same run, such as a point read made while a range read is still
+/// open, and goes on reading from the wrong place. Reading at an explicit offset never consults
+/// the shared one.
+struct PositionedFile {
+    file: File,
+    offset: u64,
+}
+
+impl Read for PositionedFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        let read = std::os::unix::fs::FileExt::read_at(&self.file, buffer, self.offset)?;
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(&self.file, buffer, self.offset)?;
+        let read_bytes = u64::try_from(read).map_err(io::Error::other)?;
+        self.offset = self
+            .offset
+            .checked_add(read_bytes)
+            .ok_or_else(|| io::Error::other("run file offset overflow"))?;
+        Ok(read)
+    }
+}
+
 /// Read cursor positioned from a sparse block index rather than the run head.
 /// It validates every traversed frame, including its SHA-256 payload digest,
 /// but deliberately cannot re-count records preceding its start block.
 pub(crate) struct RunRangeReader {
-    reader: BufReader<File>,
+    reader: BufReader<PositionedFile>,
     block_capacity: usize,
     block: Vec<u8>,
     block_cursor: usize,
@@ -782,9 +811,9 @@ pub(crate) struct RunRangeReader {
 }
 
 impl RunRangeReader {
-    fn new(file: File, block_capacity: usize) -> Self {
+    fn new(file: File, offset: u64, block_capacity: usize) -> Self {
         Self {
-            reader: BufReader::new(file),
+            reader: BufReader::new(PositionedFile { file, offset }),
             block_capacity,
             block: Vec::with_capacity(block_capacity),
             block_cursor: 0,
@@ -1223,6 +1252,125 @@ mod tests {
         );
         assert_eq!(key, b"gamma");
         assert_eq!(value, b"three");
+    }
+
+    type Records = Vec<(Vec<u8>, Vec<u8>)>;
+
+    /// An indexed run of forty blocks of exactly 1 KiB: fourteen records of 70 bytes fill a
+    /// 980-byte payload, and the 44-byte block header brings a block to 1,024 bytes. A buffered
+    /// reader reads ahead in whole kilobytes, so a reader that another one has moved lands on a
+    /// block boundary, and would carry on from the wrong block without failing a checksum.
+    fn run_of_kilobyte_blocks(storage: &TemporaryStorage) -> (SealedRun, Records) {
+        let mut writer = RunWriter::new(
+            tempfile::tempfile().expect("run file should open"),
+            storage
+                .reservation(0)
+                .expect("empty run reservation should fit"),
+            RunDescriptor::new(ScanGeneration::initial(), 11, RunKind::ChildQuery),
+            980,
+        )
+        .expect("run writer should initialize");
+        let mut records = Vec::new();
+        for number in 0_u64..40 * 14 {
+            let key = number.to_be_bytes().to_vec();
+            let fill = u8::try_from(number % 251).expect("a remainder below 251 fits a byte");
+            let value = vec![fill; 54];
+            writer
+                .append(&key, &value)
+                .expect("records should append in key order");
+            records.push((key, value));
+        }
+        (writer.seal().expect("run should seal"), records)
+    }
+
+    #[test]
+    fn a_range_reader_is_not_moved_by_a_reader_that_starts_ahead_of_it() {
+        let storage = TemporaryStorage::with_limit_bytes(1024 * 1024);
+        let (run, records) = run_of_kilobyte_blocks(&storage);
+        let mut outer = run
+            .range_reader(&records[0].0)
+            .expect("the run should have a sparse index");
+        let mut key = Vec::new();
+        let mut value = Vec::new();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            assert!(
+                outer
+                    .next_record_into(&mut key, &mut value)
+                    .expect("the first block should validate")
+            );
+            seen.push((key.clone(), value.clone()));
+        }
+
+        // Another reader of the same run starts twenty blocks further on and reads one record.
+        let ahead = &records[20 * 14].0;
+        let mut inner = run
+            .range_reader(ahead)
+            .expect("the run should have a sparse index");
+        assert!(
+            inner
+                .next_record_into(&mut key, &mut value)
+                .expect("the later block should validate")
+        );
+        assert_eq!(&key, ahead);
+
+        while outer
+            .next_record_into(&mut key, &mut value)
+            .expect("the first reader should read on undisturbed")
+        {
+            seen.push((key.clone(), value.clone()));
+        }
+        assert!(
+            seen == records,
+            "the first reader returned {} of {} records",
+            seen.len(),
+            records.len()
+        );
+    }
+
+    #[test]
+    fn a_range_reader_is_not_moved_by_a_reader_that_starts_behind_it() {
+        let storage = TemporaryStorage::with_limit_bytes(1024 * 1024);
+        let (run, records) = run_of_kilobyte_blocks(&storage);
+        let start = 30 * 14;
+        let mut outer = run
+            .range_reader(&records[start].0)
+            .expect("the run should have a sparse index");
+        let mut key = Vec::new();
+        let mut value = Vec::new();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            assert!(
+                outer
+                    .next_record_into(&mut key, &mut value)
+                    .expect("the block should validate")
+            );
+            seen.push((key.clone(), value.clone()));
+        }
+
+        // Another reader of the same run starts at the head of the run and reads one record.
+        let mut inner = run
+            .range_reader(&records[0].0)
+            .expect("the run should have a sparse index");
+        assert!(
+            inner
+                .next_record_into(&mut key, &mut value)
+                .expect("the first block should validate")
+        );
+        assert_eq!(key, records[0].0);
+
+        while outer
+            .next_record_into(&mut key, &mut value)
+            .expect("the first reader should read on undisturbed")
+        {
+            seen.push((key.clone(), value.clone()));
+        }
+        assert!(
+            seen == records[start..],
+            "the first reader returned {} of {} records",
+            seen.len(),
+            records.len() - start
+        );
     }
 
     #[test]

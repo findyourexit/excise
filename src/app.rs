@@ -453,7 +453,7 @@ where
         );
         let tree: &dyn TreeView = page_cache
             .as_ref()
-            .expect("every app state except the unavailable-result surface retains a page")
+            .expect("every app state retains a page")
             .current();
         display.render_with_scheduler(
             tree,
@@ -844,6 +844,8 @@ where
         {
             self.scan_store_available = false;
             self.scan_store_failure = Some(error.to_string());
+            // The unavailable-results screen is drawn over a page, as every state is.
+            self.reset_loading_snapshot();
             self.show_scan_results_unavailable(
                 "Excise could not open the completed folder map. Run it again.",
             );
@@ -2372,8 +2374,18 @@ where
             self.snapshot_page_is_provisional = false;
             self.snapshot_page_history.clear();
             self.snapshot_filter = None;
-            if self.load_snapshot_page(&current).is_err() {
-                let _ = self.load_snapshot_page(&target);
+            if self.load_snapshot_page(&current).is_err()
+                && let Err(error) = self.load_snapshot_page(&target)
+            {
+                self.scan_store_available = false;
+                self.scan_store_failure = Some(error.to_string());
+                // The unavailable-results screen is drawn over a page, as every state is.
+                self.reset_loading_snapshot();
+                self.show_scan_results_unavailable(
+                    "Excise could not open the completed folder map. Run it again.",
+                );
+                self.render_and_update_board();
+                return Ok(());
             }
         }
         self.retarget_completed_scan_transient_modals();
@@ -2529,10 +2541,25 @@ where
             .current()
             .current_relative()
             .clone();
-        self.snapshot_filter = filter.map(|filter| (filter, folder.clone()));
-        self.snapshot_page_cache = None;
-        self.snapshot_page_history.clear();
+        // The cached pages belong to the old filter, so the load must not reuse them. They stay
+        // aside until the filtered page has loaded: a page the store cannot serve leaves the
+        // map, and the filter it was built with, as they were.
+        let previous = (
+            std::mem::replace(
+                &mut self.snapshot_filter,
+                filter.map(|filter| (filter, folder.clone())),
+            ),
+            self.snapshot_page_cache.take(),
+            std::mem::take(&mut self.snapshot_page_history),
+            self.snapshot_page_is_provisional,
+        );
         if let Err(error) = self.load_snapshot_page(&folder) {
+            (
+                self.snapshot_filter,
+                self.snapshot_page_cache,
+                self.snapshot_page_history,
+                self.snapshot_page_is_provisional,
+            ) = previous;
             self.show_error(format!("Could not filter this scan page: {error}"));
             return;
         }
@@ -4900,6 +4927,171 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![std::ffi::OsString::from("needle.log")]
         );
+    }
+
+    /// An app whose scan finished over `victim/partAA/partBB/blob-NN.bin`: `top` folders of
+    /// `middle` folders of `files` files each, which is enough entries for the published page
+    /// index to need more than one block.
+    fn nested_app(root: &Path, top: usize, middle: usize, files: usize) -> App<TestBackend> {
+        let victim = root.join("victim");
+        std::fs::create_dir(&victim).expect("victim fixture should exist");
+        let mut paths = vec![victim.clone()];
+        for first in 0..top {
+            let folder = victim.join(format!("part{first:02}"));
+            std::fs::create_dir(&folder).expect("folder fixture should exist");
+            paths.push(folder.clone());
+            for second in 0..middle {
+                let leaf_folder = folder.join(format!("part{second:02}"));
+                std::fs::create_dir(&leaf_folder).expect("leaf folder fixture should exist");
+                paths.push(leaf_folder.clone());
+                for file in 0..files {
+                    let path = leaf_folder.join(format!("blob-{file:02}.bin"));
+                    std::fs::write(&path, vec![0_u8; 100 + first * 11 + second * 3 + file])
+                        .expect("file fixture should exist");
+                    paths.push(path);
+                }
+            }
+        }
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.to_path_buf(),
+            true,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 160, 48));
+        for path in &paths {
+            add_fixture_entry(&mut app, path);
+        }
+        app.scan_store
+            .publish()
+            .expect("canonical snapshot should publish");
+        app.load_snapshot_page(&RelativePath::root())
+            .expect("root page should materialize");
+        app.start_ui();
+        app
+    }
+
+    /// Types `text` into the filter prompt, in place of whatever filter is in force, and applies it.
+    fn apply_filter_text(app: &mut App<TestBackend>, text: &str) {
+        app.open_filter();
+        while matches!(&app.ui_mode, UiMode::FilterInput { input, .. } if !input.is_empty()) {
+            app.pop_filter_character();
+        }
+        for character in text.chars() {
+            app.push_filter_character(character);
+        }
+        app.apply_filter();
+    }
+
+    fn view_names(app: &App<TestBackend>) -> Vec<String> {
+        let mut names = app
+            .files_in_current_view(0)
+            .into_iter()
+            .map(|file| file.name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn open_folder(app: &mut App<TestBackend>, name: &str) {
+        let id = app
+            .files_in_current_view(0)
+            .into_iter()
+            .find(|file| file.name == name)
+            .expect("the page should list the folder")
+            .node_id;
+        assert!(app.board.select_node(id));
+        app.enter_selected();
+    }
+
+    #[test]
+    fn a_filter_matching_at_several_depths_filters_the_page_at_the_root_and_in_a_folder() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = nested_app(root.path(), 6, 6, 12);
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+
+        // Below the root, `part00` is two and three levels down, and only `victim` holds it.
+        apply_filter_text(&mut app, "part00");
+        assert!(!matches!(app.ui_mode, UiMode::ErrorMessage { .. }));
+        assert!(app.visible_tree().has_filter());
+        assert_eq!(view_names(&app), ["victim"]);
+        draw(&mut app, &mut animation, 0);
+
+        // Inside `victim` it is one of the folders and the name of a folder inside each other one.
+        open_folder(&mut app, "victim");
+        apply_filter_text(&mut app, "part00");
+        assert!(!matches!(app.ui_mode, UiMode::ErrorMessage { .. }));
+        assert_eq!(app.current_folder_path(), root.path().join("victim"));
+        assert_eq!(
+            view_names(&app),
+            ["part00", "part01", "part02", "part03", "part04", "part05"]
+        );
+        draw(&mut app, &mut animation, 1);
+
+        // The folder it leads into lists only the match.
+        open_folder(&mut app, "part03");
+        assert_eq!(view_names(&app), ["part00"]);
+        draw(&mut app, &mut animation, 2);
+    }
+
+    /// Makes every run file of the app's scan store unreadable, as a failing disk would.
+    fn truncate_scan_store_runs(app: &App<TestBackend>) {
+        let mut truncated = 0;
+        for session in app.internal_scan_paths() {
+            for directory in ["runs", "merge"] {
+                let Ok(entries) = std::fs::read_dir(session.join(directory)) else {
+                    continue;
+                };
+                for entry in entries {
+                    let path = entry.expect("scan store entry should read").path();
+                    if path.extension().is_some_and(|extension| extension == "run") {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .expect("run file should open")
+                            .set_len(0)
+                            .expect("run file should truncate");
+                        truncated += 1;
+                    }
+                }
+            }
+        }
+        assert!(truncated > 0, "the scan store should hold run files");
+    }
+
+    #[test]
+    fn a_filter_the_store_cannot_serve_leaves_the_page_and_the_filter_in_place() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = nested_app(root.path(), 2, 2, 3);
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        apply_filter_text(&mut app, "part00");
+        assert_eq!(view_names(&app), ["victim"]);
+
+        truncate_scan_store_runs(&app);
+        apply_filter_text(&mut app, "part01");
+
+        assert!(matches!(
+            &app.ui_mode,
+            UiMode::ErrorMessage { message, .. } if message.starts_with("Could not filter this scan page")
+        ));
+        // The frame that reports the failure needs a page to draw over.
+        draw(&mut app, &mut animation, 0);
+        assert!(app.visible_tree().has_filter());
+        assert_eq!(view_names(&app), ["victim"]);
+        assert_eq!(
+            app.snapshot_filter.as_ref().map(|(filter, _)| filter.raw()),
+            Some("part00"),
+            "the filter in force stays the one the page on screen was built with"
+        );
+        app.dismiss_transient_modal();
+        assert!(matches!(app.ui_mode, UiMode::Normal));
+        draw(&mut app, &mut animation, 1);
     }
 
     #[test]
