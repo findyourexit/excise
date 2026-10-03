@@ -1,4 +1,5 @@
-//! The facts the scanner reads about one directory entry.
+//! The facts about one directory entry that the scanner and the deletion planner read, and the
+//! checked conversion that builds them.
 
 use std::io;
 use std::path::Path;
@@ -11,13 +12,16 @@ use crate::native_path::NativeIdentity;
 #[cfg(unix)]
 use rustix::fs::FileType;
 
-/// What the scanner seals about one entry, read without following a link: its kind, apparent
-/// size, modification time, and the storage it occupies.
+/// What is known about one entry, read without following a link: its kind, apparent size,
+/// modification time, and the storage it occupies. The scanner seals these facts into the scan
+/// store and the deletion planner snapshots them, so both read an entry through this one
+/// conversion, and the identity each records for the same file is the same value.
 ///
-/// On Unix it is built from a single `fstatat` against the handle of the folder that lists the
-/// entry (`scanner::read_entry`), so the read depends on the entry's name and never on the length
-/// of its path, which the kernel rejects past `PATH_MAX`. Windows reads an entry's identity by
-/// opening its path, so there it wraps the metadata of a path-based `symlink_metadata` unchanged.
+/// On Unix it is built from a single `fstatat` against the handle of the folder that holds the
+/// entry (the scanner's `read_entry`, the planner's `inspect_child`), so the read depends on the
+/// entry's name and never on the length of its path, which the kernel rejects past `PATH_MAX`.
+/// Windows reads an entry's identity by opening its path, so there it wraps the metadata of a
+/// path-based `symlink_metadata` unchanged.
 #[derive(Clone, Debug)]
 pub struct EntryMetadata(Stat);
 
@@ -38,11 +42,12 @@ struct Stat {
 #[cfg(not(unix))]
 type Stat = std::fs::Metadata;
 
-/// The fields of a `stat` that the scanner keeps, with every number widened to `i128`: whatever
-/// integer types a platform gives them fit, and a value the scanner's types cannot hold (a
-/// negative size from a file system that misreports one) reaches the conversion as itself, not
-/// wrapped and not as a panic. `st_rdev` is not here: no scanner fact needs it, and a device
-/// number too large for the type a library converts it to is where that conversion panics.
+/// The fields of a `stat` that the scanner and the deletion planner keep, with every number
+/// widened to `i128`: whatever integer types a platform gives them fit, and a value the kept types
+/// cannot hold (a negative size from a file system that misreports one) reaches the conversion as
+/// itself, not wrapped and not as a panic. `st_rdev` is not here: no fact either of them keeps
+/// needs it, and a device number too large for the type a library converts it to is where that
+/// conversion panics.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 struct StatFields {
@@ -106,7 +111,7 @@ impl EntryMetadata {
     /// the conversions of a library `Metadata` can on a device node or a corrupt size. A
     /// modification time that does not convert is `None`, as `Metadata::modified().ok()` gives
     /// it, so an odd timestamp never hides an entry.
-    pub(super) fn from_stat(stat: &rustix::fs::Stat) -> Result<(Self, NativeIdentity), String> {
+    pub(crate) fn from_stat(stat: &rustix::fs::Stat) -> Result<(Self, NativeIdentity), String> {
         Self::from_fields(&StatFields::from_stat(stat))
     }
 

@@ -137,12 +137,23 @@ fn deletion_plan_failure_notice(error: &DeletionPlanError) -> &'static str {
             kind: std::io::ErrorKind::PermissionDenied,
             ..
         } => "Deletion did not start: access to part of the selected item was denied",
+        DeletionPlanError::Io {
+            kind: std::io::ErrorKind::InvalidFilename,
+            ..
+        } => {
+            "Deletion did not start: a path in the selected item is too long or invalid for the system"
+        }
+        DeletionPlanError::Unrepresentable { .. } => {
+            "Deletion did not start: the file system reported an impossible value for part of the selected item"
+        }
+        DeletionPlanError::Root => {
+            "Deletion did not start: the selected item is or contains a mount point or file system root"
+        }
         DeletionPlanError::MemoryLimit { .. } => {
             "Deletion did not start: the selected item exceeds the plan memory limit"
         }
         DeletionPlanError::Io { .. }
         | DeletionPlanError::Synthetic
-        | DeletionPlanError::Root
         | DeletionPlanError::InvalidRelativePath
         | DeletionPlanError::Changed
         | DeletionPlanError::Missing(_)
@@ -3456,6 +3467,44 @@ mod tests {
             deletion_plan_failure_notice(&error),
             "Deletion did not start: temporary storage limit reached; increase --temporary-storage-mib"
         );
+    }
+
+    #[test]
+    fn a_deletion_plan_refused_for_a_reason_that_is_known_names_it() {
+        let io = |kind| DeletionPlanError::Io {
+            path: "target".to_string(),
+            message: "refused".to_string(),
+            kind,
+        };
+        let general = "Deletion did not start: the selected item could not be checked";
+        assert_eq!(
+            deletion_plan_failure_notice(&io(std::io::ErrorKind::Other)),
+            general
+        );
+        // Invalid data is also what a corrupt temporary file answers with, which is not the
+        // file system's doing: it keeps the general notice.
+        assert_eq!(
+            deletion_plan_failure_notice(&io(std::io::ErrorKind::InvalidData)),
+            general
+        );
+
+        for (error, reason) in [
+            (io(std::io::ErrorKind::InvalidFilename), "too long"),
+            (
+                DeletionPlanError::Unrepresentable {
+                    path: "target".to_string(),
+                    message: "the file system reported a size of -1".to_string(),
+                },
+                "impossible value",
+            ),
+            (DeletionPlanError::Root, "mount point"),
+        ] {
+            let notice = deletion_plan_failure_notice(&error);
+            assert!(
+                notice.starts_with("Deletion did not start: ") && notice.contains(reason),
+                "{error:?} should say why, not just that it could not be checked: {notice}"
+            );
+        }
     }
 
     #[test]

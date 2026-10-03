@@ -10,13 +10,19 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
 
 use cap_primitives::ambient_authority;
-use cap_primitives::fs::{self as cap_fs, FollowSymlinks};
+#[cfg(not(unix))]
+use cap_primitives::fs::FollowSymlinks;
+use cap_primitives::fs::{self as cap_fs};
 use file_id::FileId;
+#[cfg(unix)]
+use rustix::fs::{AtFlags, statat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 #[cfg(not(unix))]
 use sysinfo::{DiskRefreshKind, Disks};
 
+#[cfg(unix)]
+use crate::entry_metadata::EntryMetadata;
 use crate::model::NodeId;
 use crate::model::NodeKind;
 use crate::native_path::{
@@ -1316,6 +1322,12 @@ pub enum DeletionPlanError {
         message: String,
         kind: io::ErrorKind,
     },
+    /// The file system reported a value for an entry that planning cannot keep, such as a
+    /// negative size. The entry, and so the plan, is refused.
+    Unrepresentable {
+        path: String,
+        message: String,
+    },
 }
 impl fmt::Display for DeletionPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1340,7 +1352,7 @@ impl fmt::Display for DeletionPlanError {
                 formatter,
                 "deletion plan exceeds its {limit} byte memory limit"
             ),
-            Self::Io { path, message, .. } => write!(
+            Self::Io { path, message, .. } | Self::Unrepresentable { path, message } => write!(
                 formatter,
                 "deletion planning failed for {}: {}",
                 safe_display_text(path),
@@ -1458,30 +1470,39 @@ pub(crate) fn build_plan_cancellable_with_root_identity_and_temporary_storage(
     let full_path = target.full_path();
     let spill_directory = deletion_spill_directory(&full_path)?;
     let directory_target = target.expected_snapshot.kind == NodeKind::Directory;
-    if directory_target {
-        let mount_root = match is_mount_root(&full_path) {
-            Ok(value) => value,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-            Err(error) => return Err(plan_io(&full_path, error)),
-        };
-        if mount_root {
-            let unchanged = target
-                .expected_snapshot
-                .identity
-                .as_ref()
-                .is_some_and(|expected| {
-                    current_scan_root_identity(&full_path)
-                        .is_ok_and(|actual| same_object(expected, &actual))
-                });
-            return Err(if unchanged {
-                DeletionPlanError::Root
-            } else {
-                DeletionPlanError::Changed
-            });
-        }
-    }
     let root = open_root(scan_root, &scan_root_identity)?;
-    let (snapshot, directory_handle) = inspect_relative(&root, &relative)?;
+    // The target, like every folder below it, is checked from the handle of the folder that holds
+    // it and its own name, never from a whole path: how long that path is must not decide whether
+    // a folder can be planned.
+    let (snapshot, directory_handle) = {
+        let (parent, name) = open_parent(&root, &relative)?;
+        if directory_target {
+            let mount_root = match entry_is_mount_root(scan_root, &relative, &parent, &name) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => return Err(plan_io(&relative, error)),
+            };
+            if mount_root {
+                let unchanged =
+                    target
+                        .expected_snapshot
+                        .identity
+                        .as_ref()
+                        .is_some_and(|expected| {
+                            inspect_entry(&parent, &name, &relative).is_ok_and(|(actual, _)| {
+                                actual.kind == PlannedKind::Directory
+                                    && same_object(expected, &actual.identity)
+                            })
+                        });
+                return Err(if unchanged {
+                    DeletionPlanError::Root
+                } else {
+                    DeletionPlanError::Changed
+                });
+            }
+        }
+        inspect_entry(&parent, &name, &relative)?
+    };
     validate_model_snapshot(&target, &snapshot)?;
     let challenge = challenge_for(&target, &snapshot, reduced_guardrails);
     let root_snapshot = snapshot.clone();
@@ -1529,16 +1550,22 @@ pub(crate) fn build_plan_cancellable_with_root_identity_and_temporary_storage(
                 }
                 let relative_path = directory.relative_path;
                 let expected = directory.snapshot;
-                if relative_path != relative {
-                    let mounted = is_mount_root(&scan_root.join(&relative_path))
-                        .map_err(|error| plan_io(&relative_path, error))?;
-                    if mounted {
-                        return Err(DeletionPlanError::Root);
+                let (actual, handle) = {
+                    let (parent, name) = open_parent(&root, &relative_path)?;
+                    if relative_path != relative {
+                        let mounted =
+                            entry_is_mount_root(scan_root, &relative_path, &parent, &name)
+                                .map_err(|error| plan_io(&relative_path, error))?;
+                        if mounted {
+                            return Err(DeletionPlanError::Root);
+                        }
                     }
-                }
-                let (actual, handle) = match inspect_relative(&root, &relative_path) {
-                    Err(DeletionPlanError::Missing(_)) => return Err(DeletionPlanError::Changed),
-                    result => result?,
+                    match inspect_entry(&parent, &name, &relative_path) {
+                        Err(DeletionPlanError::Missing(_)) => {
+                            return Err(DeletionPlanError::Changed);
+                        }
+                        result => result?,
+                    }
                 };
                 if actual != expected {
                     return Err(DeletionPlanError::Changed);
@@ -1723,6 +1750,7 @@ where
         |_| {
             progress.fetch_add(1, Ordering::Release);
         },
+        isolate_entry,
     )
 }
 
@@ -1821,15 +1849,16 @@ where
         || true,
         after_isolation,
         after_inspection,
+        isolate_entry,
     )
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[allow(
     clippy::too_many_arguments,
-    reason = "the executor needs cancellation flags and four allocation-free mutation hooks"
+    reason = "the executor needs cancellation flags and five allocation-free mutation hooks"
 )]
-fn execute_plan_unix_with_mutation_gate<C, M, F, G>(
+fn execute_plan_unix_with_mutation_gate<C, M, F, G, I>(
     scan_root: &Path,
     mut plan: DeletionPlan,
     soft_cancelled: &AtomicBool,
@@ -1838,12 +1867,14 @@ fn execute_plan_unix_with_mutation_gate<C, M, F, G>(
     mut try_begin_mutation: M,
     mut after_isolation: F,
     mut after_inspection: G,
+    mut isolate: I,
 ) -> DeletionReport
 where
     C: FnMut() -> bool,
     M: FnMut() -> bool,
     F: FnMut(),
     G: FnMut(&OsStr),
+    I: FnMut(&File, &OsStr, &OsStr) -> io::Result<()>,
 {
     let result_storage = std::mem::replace(&mut plan.result_storage, PlannedResultStorage::new(0));
     let root_relative_path = plan.root_relative_path.clone();
@@ -1888,6 +1919,10 @@ where
             }
             continue;
         }
+        let mut isolation = Isolation {
+            deep: past_path_max(scan_root, &entry.relative_path),
+            refused: false,
+        };
         let outcome = execute_unix_entry(
             &root,
             &mut entry,
@@ -1896,10 +1931,21 @@ where
             &mut try_begin_mutation,
             &mut after_isolation,
             &mut after_inspection,
+            &mut isolate,
+            &mut isolation,
         );
         if matches!(outcome, DeletionEntryOutcome::Unattempted) {
             stopped = true;
             soft_cancelled.store(true, Ordering::Release);
+        }
+        if isolation.deep && isolation.refused {
+            // The system refuses the rename that isolates an entry this deep, even with the
+            // placeholder named as the exchange's source (`isolate_entry`), and a folder goes only
+            // after everything in it, so the target cannot be removed whole. Stopping leaves the
+            // rest of it as it is, instead of stripping the entries around the one that cannot
+            // go. This entry is recorded failed, with the reason; every later one is not run. The
+            // run is not marked cancelled: the user did not cancel it.
+            stopped = true;
         }
         if matches!(outcome, DeletionEntryOutcome::Deleted) {
             note_deleted_link(&mut entry);
@@ -1925,8 +1971,12 @@ where
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-#[allow(clippy::too_many_lines)]
-fn execute_unix_entry<C, M, F, G>(
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one entry's whole isolation protocol, with the hooks that tests and the progress count use"
+)]
+fn execute_unix_entry<C, M, F, G, I>(
     root: &File,
     entry: &mut PlannedEntry,
     soft_cancelled: &AtomicBool,
@@ -1934,12 +1984,15 @@ fn execute_unix_entry<C, M, F, G>(
     try_begin_mutation: &mut M,
     after_isolation: &mut F,
     after_inspection: &mut G,
+    isolate: &mut I,
+    isolation: &mut Isolation,
 ) -> DeletionEntryOutcome
 where
     C: FnMut() -> bool,
     M: FnMut() -> bool,
     F: FnMut(),
     G: FnMut(&OsStr),
+    I: FnMut(&File, &OsStr, &OsStr) -> io::Result<()>,
 {
     let (parent, original_name) = match open_parent(root, &entry.relative_path) {
         Ok(value) => value,
@@ -1971,7 +2024,7 @@ where
             |()| DeletionEntryOutcome::Unattempted,
         );
     }
-    if let Err(error) = exchange_names(&parent, &original_name, &detached_name) {
+    if let Err(error) = isolate(&parent, &original_name, &detached_name) {
         let disappeared = error.kind() == io::ErrorKind::NotFound;
         let cleanup = remove_verified_placeholder(&parent, &detached_name, &placeholder);
         return if disappeared {
@@ -1984,10 +2037,16 @@ where
                 |()| DeletionEntryOutcome::Missing,
             )
         } else {
-            DeletionEntryOutcome::Failed(cleanup.map_or_else(
+            isolation.refused = true;
+            let detail = cleanup.map_or_else(
                 |cleanup_error| format!("{error}; placeholder cleanup failed: {cleanup_error}"),
                 |()| error.to_string(),
-            ))
+            );
+            DeletionEntryOutcome::Failed(if isolation.deep {
+                format!("the system refuses the rename that isolates an entry this deep: {detail}")
+            } else {
+                detail
+            })
         };
     }
     after_isolation();
@@ -2491,6 +2550,39 @@ fn report_from_parts(
     }
 }
 
+/// What the executor tells `execute_unix_entry` about an entry's depth, and learns back about its
+/// isolation.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[derive(Clone, Copy, Debug)]
+struct Isolation {
+    /// The entry's path is too long for a path-based call: see [`past_path_max`].
+    deep: bool,
+    /// The system refused the rename that isolates the entry, for a reason other than the entry
+    /// no longer being there.
+    refused: bool,
+}
+
+/// `PATH_MAX`: the longest path, terminator included, that a path-based system call accepts
+/// (4,096 bytes on Linux, 1,024 on macOS).
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const PATH_MAX: usize = nix::libc::PATH_MAX as usize;
+
+/// Whether the path of the entry at `relative` below `scan_root` is too long for a path-based
+/// system call. Planning and execution reach such an entry through directory handles, name by
+/// name, but a system may still refuse the rename that isolates it: macOS 14 refuses with
+/// `ENOSPC` any rename whose source is a folder whose path is that long, which is why
+/// [`isolate_entry`] names the placeholder as the source. A system that refuses it anyway ends
+/// the run at that entry.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn past_path_max(scan_root: &Path, relative: &Path) -> bool {
+    scan_root
+        .as_os_str()
+        .len()
+        .saturating_add(1)
+        .saturating_add(relative.as_os_str().len())
+        >= PATH_MAX
+}
+
 /// How many unpredictable names a placeholder operation tries before giving up.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 const PLACEHOLDER_NAME_ATTEMPTS: usize = 128;
@@ -2550,6 +2642,23 @@ fn exchange_names(parent: &File, left: &OsStr, right: &OsStr) -> io::Result<()> 
         rustix::fs::RenameFlags::EXCHANGE,
     )
     .map_err(io::Error::from)
+}
+
+/// Isolates the entry `original` of `parent`: exchanges its name with `detached`, the name of the
+/// placeholder reserved for it, so that `original` then holds the placeholder and `detached` the
+/// entry.
+///
+/// The placeholder, not the entry, is named as the exchange's source. An exchange swaps both names
+/// whichever is named first, but a system can tell them apart: macOS 14 refuses with `ENOSPC` ("No
+/// space left on device") any rename whose source is a folder whose path is longer than
+/// `PATH_MAX`, an exchange included, and accepts one whose source is a file at any depth. The
+/// placeholder is always a file ([`create_placeholder`]), so this isolates a folder of any depth
+/// wherever a file can be renamed. The executor's other renames name the placeholder as their
+/// source too: [`restore_detached`] and [`finalize_placeholder`] check that `original` still holds
+/// the placeholder before they rename from it.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn isolate_entry(parent: &File, original: &OsStr, detached: &OsStr) -> io::Result<()> {
+    exchange_names(parent, detached, original)
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -2655,19 +2764,17 @@ fn create_link_hold(parent: &File, source: &OsStr) -> io::Result<OsString> {
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn link_hold_matches_count(parent: &File, hold: &OsStr, expected: Option<u64>) -> io::Result<bool> {
-    let metadata = cap_fs::stat(parent, Path::new(hold), FollowSymlinks::No)?;
-    let snapshot = snapshot_from_cap_metadata(parent, hold, &metadata, PlannedKind::File)?;
+    let snapshot = snapshot_of_entry(parent, hold, PlannedKind::File)?;
     Ok(snapshot.identity.link_count == expected)
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn remove_link_hold(parent: &File, hold: &OsStr, expected: &NativeIdentity) -> io::Result<()> {
-    let metadata = match cap_fs::stat(parent, Path::new(hold), FollowSymlinks::No) {
-        Ok(metadata) => metadata,
+    let actual = match snapshot_of_entry(parent, hold, PlannedKind::File) {
+        Ok(snapshot) => snapshot,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    let actual = snapshot_from_cap_metadata(parent, hold, &metadata, PlannedKind::File)?;
     if !same_object(expected, &actual.identity) {
         return Err(io::Error::other(
             "hard-link verification name no longer contains the target",
@@ -2685,7 +2792,16 @@ fn inspect_relative(
     relative: &Path,
 ) -> Result<(PlannedSnapshot, Option<File>), DeletionPlanError> {
     let (parent, name) = open_parent(root, relative)?;
-    match inspect_child(&parent, &name, relative) {
+    inspect_entry(&parent, &name, relative)
+}
+
+/// [`inspect_child`], with an entry that is no longer there reported as missing.
+fn inspect_entry(
+    parent: &File,
+    name: &OsStr,
+    relative: &Path,
+) -> Result<(PlannedSnapshot, Option<File>), DeletionPlanError> {
+    match inspect_child(parent, name, relative) {
         Err(DeletionPlanError::Io {
             kind: io::ErrorKind::NotFound,
             ..
@@ -2694,6 +2810,56 @@ fn inspect_relative(
     }
 }
 
+/// Reads the entry `name` of `parent` without following a link: its snapshot, and for a folder
+/// the handle that snapshot was read through.
+///
+/// On Unix this is one `fstatat` against the parent's handle, converted by the same checked
+/// conversion the scanner records identities with, so the planner and the scanner agree on every
+/// value they compare, and an entry whose `stat` holds a value that cannot be kept is refused with
+/// an error instead of panicking the planner.
+#[cfg(unix)]
+fn inspect_child(
+    parent: &File,
+    name: &OsStr,
+    display_path: &Path,
+) -> Result<(PlannedSnapshot, Option<File>), DeletionPlanError> {
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| plan_io(display_path, io::Error::from(error)))?;
+    inspect_stat(parent, name, display_path, &stat)
+}
+
+/// What [`inspect_child`] makes of the `stat` of the entry `name` of `parent`.
+#[cfg(unix)]
+fn inspect_stat(
+    parent: &File,
+    name: &OsStr,
+    display_path: &Path,
+    stat: &rustix::fs::Stat,
+) -> Result<(PlannedSnapshot, Option<File>), DeletionPlanError> {
+    let (metadata, identity) =
+        EntryMetadata::from_stat(stat).map_err(|message| DeletionPlanError::Unrepresentable {
+            path: safe_display_path_text(display_path),
+            message: safe_display_text(&message),
+        })?;
+    if metadata.is_dir() {
+        let handle = cap_fs::open_dir_nofollow(parent, Path::new(name))
+            .map_err(|error| plan_io(display_path, error))?;
+        let snapshot = snapshot_from_open_file(&handle, PlannedKind::Directory)
+            .map_err(|error| plan_io(display_path, error))?;
+        Ok((snapshot, Some(handle)))
+    } else {
+        let kind = if metadata.is_symlink() {
+            PlannedKind::Link
+        } else {
+            PlannedKind::File
+        };
+        let snapshot = snapshot_from_entry(&metadata, identity, kind, display_path)
+            .map_err(|error| plan_io(display_path, error))?;
+        Ok((snapshot, None))
+    }
+}
+
+#[cfg(not(unix))]
 fn inspect_child(
     parent: &File,
     name: &OsStr,
@@ -2793,26 +2959,50 @@ fn open_parent(root: &File, relative: &Path) -> Result<(File, OsString), Deletio
     Ok((parent, name.clone()))
 }
 
+/// Whether `name`, an entry of the folder `parent` that lies at `relative` below `scan_root`, is
+/// the root of a mount: a mount point, a bind mount, or the root of a file system.
+///
+/// On Unix the answer comes from the parent's handle and the entry's own name, so no step names a
+/// whole path and the length of the path does not matter. Windows has no such call and checks the
+/// path.
+#[cfg(unix)]
+fn entry_is_mount_root(
+    _scan_root: &Path,
+    _relative: &Path,
+    parent: &File,
+    name: &OsStr,
+) -> io::Result<bool> {
+    mount_root_in(parent, name)
+}
+
+#[cfg(not(unix))]
+fn entry_is_mount_root(
+    scan_root: &Path,
+    relative: &Path,
+    _parent: &File,
+    _name: &OsStr,
+) -> io::Result<bool> {
+    is_mount_root(&scan_root.join(relative))
+}
+
+/// The mount-root check by path: Windows planning's, and the Unix tests', which ask about paths
+/// they can name.
+#[cfg(any(not(unix), test))]
 fn is_mount_root(path: &Path) -> io::Result<bool> {
     let canonical = std::fs::canonicalize(path)?;
-    if canonical.parent().is_none_or(|parent| parent == canonical) {
-        return Ok(true);
-    }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        linux_mount_root(&canonical)
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let path_dev = std::fs::symlink_metadata(&canonical)?.dev();
-        let parent = canonical.parent().expect("non-root path has a parent");
-        let parent_dev = std::fs::symlink_metadata(parent)?.dev();
-        Ok(path_dev != parent_dev)
+        let (Some(parent), Some(name)) = (canonical.parent(), canonical.file_name()) else {
+            // `/` has neither a parent nor a name: it is the root of the file system.
+            return Ok(true);
+        };
+        mount_root_in(&File::open(parent)?, name)
     }
     #[cfg(not(unix))]
     {
+        if canonical.parent().is_none_or(|parent| parent == canonical) {
+            return Ok(true);
+        }
         let disks = Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing());
         Ok(disks.list().iter().any(|disk| {
             std::fs::canonicalize(disk.mount_point()).is_ok_and(|mount| mount == canonical)
@@ -2820,16 +3010,36 @@ fn is_mount_root(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Whether the entry `name` of the folder `parent` is the root of a mount, from the handle of
+/// `parent` and the name alone.
+///
+/// Elsewhere than Linux, an entry on another device than its parent is a mount root. On Linux the
+/// kernel is asked: see [`linux_mount_root`].
+#[cfg(unix)]
+fn mount_root_in(parent: &File, name: &OsStr) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_mount_root(parent, name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let entry = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let folder = rustix::fs::fstat(parent)?;
+        Ok(entry.st_dev != folder.st_dev)
+    }
+}
+
 /// Recognises Linux bind mounts as well as mounts that change device ID.
 ///
-/// `STATX_ATTR_MOUNT_ROOT` is a kernel-supplied mount-root answer where available.
-/// Older kernels omit it, so `/proc/self/mountinfo` remains a fail-closed fallback.
+/// `STATX_ATTR_MOUNT_ROOT` is a kernel-supplied mount-root answer where available, and `statx` of
+/// the entry relative to its parent's handle, without following a link, reports it for the root of
+/// any mount. Older kernels omit it, so `/proc/self/mountinfo` remains a fail-closed fallback.
 #[cfg(target_os = "linux")]
-fn linux_mount_root(canonical: &Path) -> io::Result<bool> {
+fn linux_mount_root(parent: &File, name: &OsStr) -> io::Result<bool> {
     match rustix::fs::statx(
-        rustix::fs::CWD,
-        canonical,
-        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        parent,
+        name,
+        AtFlags::SYMLINK_NOFOLLOW,
         rustix::fs::StatxFlags::empty(),
     ) {
         Ok(status)
@@ -2841,16 +3051,43 @@ fn linux_mount_root(canonical: &Path) -> io::Result<bool> {
                 .stx_attributes
                 .contains(rustix::fs::StatxAttributes::MOUNT_ROOT))
         }
-        Ok(_) | Err(rustix::io::Errno::NOSYS) => linux_mountinfo_contains(canonical),
+        Ok(_) | Err(rustix::io::Errno::NOSYS) => linux_mountinfo_contains_entry(parent, name),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The fallback of [`linux_mount_root`]: `/proc/self/mountinfo` names mount points by path, so the
+/// entry's path is its parent's, as the kernel names it for the open handle, followed by its name.
+///
+/// A parent whose path the kernel cannot name (it is longer than the kernel will print, it was
+/// deleted, or it lies outside the process's root) cannot be checked this way and is refused: such
+/// an entry is never assumed to be no mount. The errors are not `NotFound`, which the planner reads
+/// as an entry that vanished, and so as no mount root.
+#[cfg(target_os = "linux")]
+fn linux_mountinfo_contains_entry(parent: &File, name: &OsStr) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let folder =
+        std::fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd())).map_err(|error| {
+            io::Error::other(format!(
+                "the path of the parent folder is unavailable: {error}"
+            ))
+        })?;
+    if !folder.is_absolute() || folder.as_os_str().as_bytes().ends_with(b" (deleted)") {
+        return Err(io::Error::other(
+            "the parent folder has no path that the mount table could name",
+        ));
+    }
+    linux_mountinfo_contains(&folder.join(name))
 }
 
 #[cfg(target_os = "linux")]
 fn linux_mountinfo_contains(path: &Path) -> io::Result<bool> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    let mountinfo = std::fs::read("/proc/self/mountinfo")?;
+    let mountinfo = std::fs::read("/proc/self/mountinfo")
+        .map_err(|error| io::Error::other(format!("the mount table is unreadable: {error}")))?;
     for line in mountinfo.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
@@ -3164,34 +3401,43 @@ fn snapshot_from_std_metadata(
     ))
 }
 
+/// The snapshot of an entry that is not a folder, from the facts and identity the checked
+/// conversion read.
 #[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)]
-fn snapshot_from_cap_metadata(
-    _parent: &File,
-    _name: &OsStr,
-    metadata: &cap_fs::Metadata,
+fn snapshot_from_entry(
+    metadata: &EntryMetadata,
+    identity: NativeIdentity,
     kind: PlannedKind,
+    path: &Path,
 ) -> io::Result<PlannedSnapshot> {
-    use cap_primitives::fs::MetadataExt as _;
-
     let modified_nanos = metadata
         .modified()
-        .ok()
-        .and_then(|modified| modified.into_std().duration_since(UNIX_EPOCH).ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos());
     Ok(PlannedSnapshot {
-        identity: NativeIdentity {
-            file_id: FileId::new_inode(metadata.dev(), metadata.ino()),
-            link_count: Some(metadata.nlink()),
-            reparse_point: metadata.is_symlink(),
-        },
+        identity,
         kind,
         apparent_bytes: u128::from(metadata.len()),
-
         allocated_bytes: matches!(kind, PlannedKind::File | PlannedKind::Link)
-            .then(|| u128::from(metadata.blocks()).saturating_mul(512)),
+            .then(|| metadata.physical_size(path))
+            .transpose()?
+            .map(u128::from),
         modified_nanos,
     })
+}
+
+/// The snapshot of the entry `name` of `parent`, read without following a link and converted by
+/// the same checked conversion as [`inspect_child`].
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn snapshot_of_entry(
+    parent: &File,
+    name: &OsStr,
+    kind: PlannedKind,
+) -> io::Result<PlannedSnapshot> {
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    let (metadata, identity) = EntryMetadata::from_stat(&stat)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+    snapshot_from_entry(&metadata, identity, kind, Path::new(name))
 }
 
 #[cfg(windows)]
@@ -3376,6 +3622,36 @@ mod tests {
                 modified_nanos: snapshot.modified_nanos,
             },
             reviewed_entries,
+        }
+    }
+
+    /// A target for the entry at `relative` below `root`, whose snapshot is read from `metadata`,
+    /// with nothing reviewed below it. Unlike [`target`] it does not walk the entry, so it can name
+    /// an entry whose path no call accepts, and a folder that holds a mount.
+    #[cfg(unix)]
+    fn lone_target(root: &Path, relative: &Path, metadata: &std::fs::Metadata) -> FileToDelete {
+        let snapshot = reviewed_snapshot(relative, metadata);
+        let (kind, file_type) = match snapshot.kind {
+            PlannedKind::Directory => (NodeKind::Directory, FileType::Folder),
+            PlannedKind::File => (NodeKind::File, FileType::File),
+            PlannedKind::Link => (NodeKind::Link, FileType::File),
+        };
+        FileToDelete {
+            node_id: NodeId(1),
+            synthetic: false,
+            path_in_filesystem: root.to_path_buf(),
+            path_to_file: relative.iter().map(OsStr::to_os_string).collect(),
+            file_type,
+            num_descendants: None,
+            size: 0,
+            expected_snapshot: crate::model::EntrySnapshot {
+                identity: Some(snapshot.identity),
+                kind,
+                apparent_bytes: snapshot.apparent_bytes,
+                allocated_bytes: snapshot.allocated_bytes,
+                modified_nanos: snapshot.modified_nanos,
+            },
+            reviewed_entries: Vec::new(),
         }
     }
 
@@ -4666,6 +4942,310 @@ mod tests {
         assert_eq!(plan.planned_entries(), 301);
     }
 
+    /// Deleting trees nested past `PATH_MAX`, planned and executed through directory handles.
+    ///
+    /// Each test builds the tree, asks the system whether it accepts the renames that deleting a
+    /// folder takes that deep (`rename_refusal_at` runs the executor's own), and then deletes.
+    /// What a test requires of the outcome depends on the answer: where the system accepts them, a
+    /// complete deletion; where it does not, only a history that is still true to the tree and
+    /// that says why. No test asserts one system's behavior on the other. macOS 14 refuses a
+    /// rename whose source is a folder that deep, which is what isolation avoids.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    mod past_path_max {
+        use std::collections::BTreeSet;
+
+        use crate::tests::deep_tree::{DeepTree, LEVELS};
+
+        use super::*;
+
+        /// A target for the file or folder at `relative`, with the snapshot a scan records, read
+        /// through the handles of the folders above it: no path to it can be named whole.
+        fn deep_target(tree: &DeepTree, relative: &Path) -> FileToDelete {
+            let metadata = tree
+                .open_entry(relative)
+                .metadata()
+                .expect("the target should be readable through its handle");
+            lone_target(tree.root(), relative, &metadata)
+        }
+
+        /// The tree before a deletion, what the deletion reported, and the tree after it.
+        struct Deletion {
+            /// The error of the first rename the system refused in the tree's deepest folder.
+            refusal: Option<io::Error>,
+            before: Vec<PathBuf>,
+            planned: u64,
+            report: DeletionReport,
+            after: Vec<PathBuf>,
+        }
+
+        /// The error of the first rename the system refuses when a folder is deleted in the
+        /// deepest folder of `tree`, or `None` when it accepts them all. It runs, on a folder made
+        /// for the purpose, the renames the executor makes to delete one: `isolate_entry`, the
+        /// removal, and `finalize_placeholder`.
+        ///
+        /// macOS 14 refuses a rename whose source is a folder that deep and accepts one whose
+        /// source is a file. So the probe also tries a reference sequence that only ever names a
+        /// file as a source (swap a file with a folder, then move the file), and requires
+        /// isolation to succeed wherever that does: an isolation that named the folder first would
+        /// be refused on macOS 14 and fail here, not pass as a refusal.
+        fn rename_refusal_at(tree: &DeepTree) -> Option<io::Error> {
+            const FOLDER: &str = ".probe-folder";
+            const REFERENCE: &str = ".probe-reference";
+            const MOVED: &str = ".probe-moved";
+
+            let parent = tree.open_folder(LEVELS);
+            let mode = rustix::fs::Mode::from_raw_mode(0o755);
+            let remove = |name: &OsStr| {
+                if rustix::fs::unlinkat(&parent, name, AtFlags::empty()).is_err() {
+                    let _ = rustix::fs::unlinkat(&parent, name, AtFlags::REMOVEDIR);
+                }
+            };
+
+            rustix::fs::mkdirat(&parent, FOLDER, mode).expect("the probe folder should be created");
+            let (detached, placeholder) =
+                create_placeholder(&parent).expect("a placeholder should be reserved");
+            let refusal = isolate_entry(&parent, OsStr::new(FOLDER), &detached)
+                .and_then(|()| cap_fs::remove_dir(&parent, Path::new(&detached)))
+                .and_then(|()| {
+                    finalize_placeholder(&parent, OsStr::new(FOLDER), &detached, &placeholder)
+                })
+                .err();
+            remove(OsStr::new(FOLDER));
+            remove(&detached);
+
+            let (file, _) =
+                create_placeholder(&parent).expect("a reference file should be created");
+            rustix::fs::mkdirat(&parent, REFERENCE, mode)
+                .expect("the reference folder should be created");
+            let reference = exchange_names(&parent, &file, OsStr::new(REFERENCE)).and_then(|()| {
+                rustix::fs::renameat_with(
+                    &parent,
+                    REFERENCE,
+                    &parent,
+                    MOVED,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                )
+                .map_err(io::Error::from)
+            });
+            for name in [OsStr::new(REFERENCE), file.as_os_str(), OsStr::new(MOVED)] {
+                remove(name);
+            }
+
+            assert!(
+                refusal.is_none() || reference.is_err(),
+                "isolation was refused where renames whose source is a file are accepted: {refusal:?}"
+            );
+            refusal
+        }
+
+        /// Plans and executes the deletion of `relative`. `None` when planning refused on a kernel
+        /// that leaves the mount-root answer to the mount table, which cannot name a path this long
+        /// (see `the_mountinfo_fallback_agrees_with_the_kernel_and_refuses_what_it_cannot_name`):
+        /// that refusal is the specified one, and it changes nothing. A kernel that reports mount
+        /// roots plans at any depth.
+        fn delete(tree: &DeepTree, relative: &Path) -> Option<Deletion> {
+            let refusal = rename_refusal_at(tree);
+            let before = tree.listing();
+            let plan = match build_plan(tree.root(), deep_target(tree, relative), false) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    assert!(
+                        !kernel_reports_mount_roots(&tree.open_folder(LEVELS - 1)),
+                        "an entry past PATH_MAX should plan, as no step of planning names its whole path: {error:?}"
+                    );
+                    assert_eq!(tree.listing(), before, "a refused plan changes nothing");
+                    return None;
+                }
+            };
+            let planned = plan.planned_entries();
+            let report = execute_plan(
+                tree.root(),
+                plan,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+            );
+            Some(Deletion {
+                refusal,
+                before,
+                planned,
+                report,
+                after: tree.listing(),
+            })
+        }
+
+        fn check(deletion: &Deletion, relative: &Path) {
+            let mut deleted = BTreeSet::new();
+            let mut reasons = Vec::new();
+            for result in &deletion.report.entries {
+                let result = result.expect("the history should read back");
+                match result.outcome {
+                    DeletionEntryOutcome::Deleted => {
+                        deleted.insert(result.entry.relative_path);
+                    }
+                    DeletionEntryOutcome::Failed(reason) => reasons.push(reason),
+                    DeletionEntryOutcome::Changed(_)
+                    | DeletionEntryOutcome::Missing
+                    | DeletionEntryOutcome::Unattempted => {}
+                }
+            }
+
+            // Whichever way the system answered, the tree keeps everything the history does not
+            // record as deleted, and nothing the history records as deleted.
+            let remaining: Vec<PathBuf> = deletion
+                .before
+                .iter()
+                .filter(|path| !deleted.contains(*path))
+                .cloned()
+                .collect();
+            assert_eq!(
+                deletion.after, remaining,
+                "the tree and the history disagree (probe: {:?}, failures: {reasons:?})",
+                deletion.refusal
+            );
+
+            let complete = deletion.report.deleted_entries() == deletion.planned;
+            if deletion.refusal.is_none() {
+                assert!(
+                    complete
+                        && deletion.report.failed_entries() == 0
+                        && deletion.report.changed_entries() == 0
+                        && deletion.report.missing_entries() == 0
+                        && deletion.report.unattempted_entries() == 0,
+                    "a system that accepts these renames deletes the tree completely: {reasons:?}"
+                );
+            }
+            if complete {
+                assert!(
+                    deletion
+                        .after
+                        .iter()
+                        .all(|path| !path.starts_with(relative)),
+                    "a complete deletion leaves nothing of the target, not even a placeholder"
+                );
+            } else {
+                assert!(
+                    deletion.after.iter().any(|path| path == relative),
+                    "a deletion that did not finish leaves its target in place"
+                );
+                assert!(
+                    reasons.iter().any(|reason| reason.contains("(os error")),
+                    "a deletion that did not finish says why: {reasons:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_folder_whose_own_path_is_past_path_max_is_deleted() {
+            let tree = DeepTree::build();
+            let relative = tree.relative_folder(LEVELS - 2);
+            assert!(
+                tree.root().join(&relative).as_os_str().len() > 4096,
+                "the folder's own path should pass PATH_MAX on every system"
+            );
+
+            let Some(deletion) = delete(&tree, &relative) else {
+                return;
+            };
+
+            assert_eq!(
+                deletion.planned, 7,
+                "three folders, their files, and the link"
+            );
+            check(&deletion, &relative);
+        }
+
+        #[test]
+        fn a_shallow_folder_holding_a_chain_past_path_max_is_deleted() {
+            let tree = DeepTree::build();
+            let relative = tree.relative_folder(1);
+
+            let Some(deletion) = delete(&tree, &relative) else {
+                return;
+            };
+
+            assert_eq!(
+                deletion.planned,
+                u64::try_from(2 * LEVELS + 1).expect("a small count fits"),
+                "every folder of the chain, its file, and the link"
+            );
+            check(&deletion, &relative);
+        }
+
+        #[test]
+        fn the_deepest_file_past_path_max_is_deleted() {
+            let tree = DeepTree::build();
+            let relative = tree.relative_file(LEVELS);
+            assert!(
+                tree.root().join(&relative).as_os_str().len() > 4096,
+                "the file's own path should pass PATH_MAX on every system"
+            );
+
+            let Some(deletion) = delete(&tree, &relative) else {
+                return;
+            };
+
+            assert_eq!(deletion.planned, 1);
+            check(&deletion, &relative);
+        }
+
+        #[test]
+        fn a_refused_isolation_this_deep_ends_the_deletion_before_anything_is_removed() {
+            let tree = DeepTree::build();
+            let relative = tree.relative_folder(1);
+            let before = tree.listing();
+            let plan = build_plan(tree.root(), deep_target(&tree, &relative), false)
+                .expect("a plan past PATH_MAX should build");
+            let planned = plan.planned_entries();
+            let mut attempts = 0_u32;
+
+            // Every isolation is refused with "No space left on device", as macOS 14 refuses a
+            // rename whose source is a folder this deep, and as a system that refused them all would.
+            let report = execute_plan_unix_with_mutation_gate(
+                tree.root(),
+                plan,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                || true,
+                || true,
+                || {},
+                |_| {},
+                |_, _, _| {
+                    attempts += 1;
+                    Err(io::Error::from(rustix::io::Errno::NOSPC))
+                },
+            );
+
+            assert_eq!(attempts, 1, "the deletion ends at the first refusal");
+            assert_eq!(
+                tree.listing(),
+                before,
+                "nothing was removed, and no placeholder was left behind"
+            );
+            assert_eq!(report.deleted_entries(), 0);
+            assert_eq!(report.failed_entries(), 1, "the entry that was refused");
+            assert_eq!(
+                report.unattempted_entries(),
+                planned - 1,
+                "every other entry is recorded as not run"
+            );
+            assert!(!report.soft_cancelled, "the user did not cancel it");
+            let reasons: Vec<String> = report
+                .entries
+                .iter()
+                .filter_map(
+                    |result| match result.expect("the history should read").outcome {
+                        DeletionEntryOutcome::Failed(reason) => Some(reason),
+                        _ => None,
+                    },
+                )
+                .collect();
+            assert!(
+                reasons.len() == 1 && reasons[0].contains("No space left on device"),
+                "the reason the system gave is in the history: {reasons:?}"
+            );
+        }
+    }
+
     #[test]
     fn directory_uses_confirm_file_and_reduced_guardrails_uses_reduced_guard() {
         let root = tempfile::tempdir().expect("deletion root should exist");
@@ -4740,6 +5320,292 @@ mod tests {
             .expect("mountinfo escape sequence should decode");
         assert_eq!(decoded, b"/mnt/a b\tc\nd\\e");
         assert!(decode_linux_mountinfo_path(br"/mnt/bad\x00").is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn a_refused_isolation_at_ordinary_depth_does_not_end_the_deletion() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let directory = root.path().join("target");
+        std::fs::create_dir(&directory).expect("target directory should be created");
+        for name in ["a", "b", "c"] {
+            std::fs::write(directory.join(name), name).expect("planned child should be written");
+        }
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::Folder),
+            false,
+        )
+        .expect("directory plan should build");
+        let mut attempts = 0_u32;
+
+        let report = execute_plan_unix_with_mutation_gate(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            || true,
+            || true,
+            || {},
+            |_| {},
+            |parent, left, right| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(io::Error::from(rustix::io::Errno::NOSPC))
+                } else {
+                    isolate_entry(parent, left, right)
+                }
+            },
+        );
+
+        assert_eq!(report.failed_entries(), 1, "the entry that was refused");
+        assert_eq!(report.deleted_entries(), 2, "the others are still deleted");
+        assert_eq!(report.unattempted_entries(), 0, "the deletion went on");
+        assert_eq!(
+            report.changed_entries(),
+            1,
+            "the folder stays while the refused entry is in it"
+        );
+        assert_eq!(
+            std::fs::read_dir(&directory)
+                .expect("the folder should list")
+                .count(),
+            1
+        );
+    }
+
+    /// The `stat` of a regular file, for a test to bend into one that no file system would give.
+    #[cfg(unix)]
+    fn stat_of_a_file() -> (tempfile::TempDir, File, rustix::fs::Stat) {
+        let root = tempfile::tempdir().expect("fixture root should exist");
+        std::fs::write(root.path().join("entry"), b"payload")
+            .expect("fixture file should be written");
+        let folder = File::open(root.path()).expect("fixture root should open");
+        let stat =
+            statat(&folder, "entry", AtFlags::SYMLINK_NOFOLLOW).expect("fixture file should stat");
+        (root, folder, stat)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_device_node_whose_major_does_not_fit_a_signed_device_number_is_planned() {
+        let (_root, folder, mut stat) = stat_of_a_file();
+        // macOS `dev_t` is a signed 32-bit value, so major 128 sets its sign bit. The `Metadata`
+        // that cap-primitives builds from a `stat` unwraps `u64::try_from(st_rdev)`, which cannot
+        // hold that, and panicked the planner. Nothing the planner keeps needs `st_rdev`.
+        stat.st_mode =
+            (stat.st_mode & !0o170_000) | rustix::fs::FileType::CharacterDevice.as_raw_mode();
+        stat.st_rdev = rustix::fs::makedev(128, 1);
+
+        let (snapshot, handle) =
+            inspect_stat(&folder, OsStr::new("entry"), Path::new("entry"), &stat)
+                .expect("a device node is planned like any other entry that is not a folder");
+
+        assert_eq!(snapshot.kind, PlannedKind::File);
+        assert!(handle.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_reporting_a_negative_size_is_refused_with_a_message() {
+        let (_root, folder, mut stat) = stat_of_a_file();
+        stat.st_size = -1;
+
+        let error = inspect_stat(&folder, OsStr::new("entry"), Path::new("entry"), &stat)
+            .expect_err("a size that no file has should refuse the entry");
+
+        let DeletionPlanError::Unrepresentable { path, message } = error else {
+            panic!("the refusal should name the value, not an I/O failure: {error:?}");
+        };
+        assert_eq!(path, "entry");
+        assert!(
+            message.contains("size") && message.contains("-1"),
+            "the message should name what the file system reported: {message}"
+        );
+    }
+
+    /// A mount point directly below the root of the file system, with the root's handle: `/dev` is
+    /// a device file system wherever this builds except Linux, where `/proc` is the mount every
+    /// environment has.
+    #[cfg(unix)]
+    fn a_mount_point_below_the_root() -> (File, &'static OsStr) {
+        let name = if cfg!(target_os = "linux") {
+            "proc"
+        } else {
+            "dev"
+        };
+        (
+            File::open("/").expect("the root of the file system should open"),
+            OsStr::new(name),
+        )
+    }
+
+    /// Whether this kernel reports the root of a mount itself. One that does not leaves the
+    /// answer to the mount table, which can refuse a parent whose path it cannot name.
+    #[cfg(unix)]
+    fn kernel_reports_mount_roots(parent: &File) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            rustix::fs::statx(
+                parent,
+                ".",
+                AtFlags::empty(),
+                rustix::fs::StatxFlags::empty(),
+            )
+            .is_ok_and(|status| {
+                status
+                    .stx_attributes_mask
+                    .contains(rustix::fs::StatxAttributes::MOUNT_ROOT)
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = parent;
+            true
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_point_is_a_mount_root_from_its_parents_handle() {
+        let (root, name) = a_mount_point_below_the_root();
+
+        assert!(mount_root_in(&root, name).expect("a mount point should be inspectable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ordinary_folder_is_no_mount_root() {
+        let root = tempfile::tempdir().expect("fixture root should exist");
+        std::fs::create_dir(root.path().join("folder")).expect("fixture folder should be created");
+        let parent = File::open(root.path()).expect("fixture root should open");
+
+        assert!(
+            !mount_root_in(&parent, OsStr::new("folder"))
+                .expect("an ordinary folder should be inspectable")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_that_is_a_mount_root_is_refused_before_anything_below_it_is_read() {
+        let (_, name) = a_mount_point_below_the_root();
+        let relative = Path::new(name);
+        let metadata = std::fs::symlink_metadata(Path::new("/").join(relative))
+            .expect("the mount point should stat");
+        let target = lone_target(Path::new("/"), relative, &metadata);
+
+        let result = build_plan(Path::new("/"), target, false);
+
+        assert!(
+            matches!(result, Err(DeletionPlanError::Root)),
+            "a mount root is not planned: {result:?}"
+        );
+    }
+
+    /// Needs a real mount, which only an operator who opts in with `EXCISE_HARNESS_PRIVILEGED=1`
+    /// gets: the harness attaches a small volume of its own under the folder, and detaches it
+    /// again when the test ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_holds_a_mounted_volume_is_refused_and_the_volume_is_left_alone() {
+        use excise_harness::fixture::{PRIVILEGED_ENV, PrivilegedOptIn, Volume, VolumeSpec};
+
+        let Some(opt_in) = PrivilegedOptIn::from_env() else {
+            eprintln!("skipped: {PRIVILEGED_ENV}=1 is not set");
+            return;
+        };
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let work = tempfile::tempdir().expect("volume work area should exist");
+        let folder = root.path().join("folder");
+        let mount = folder.join("mount");
+        std::fs::create_dir_all(&mount).expect("the mount point should be created");
+        std::fs::write(folder.join("file"), b"payload").expect("a file should be written");
+        let spec = VolumeSpec::new(8, "delmount").expect("the volume spec should be valid");
+        let _volume =
+            Volume::attach(opt_in, &spec, work.path(), &mount).expect("the volume should attach");
+        std::fs::write(mount.join("inside"), b"payload")
+            .expect("a file on the volume should be written");
+        let parent = File::open(&folder).expect("the folder should open");
+        let metadata = std::fs::symlink_metadata(&folder).expect("the folder should stat");
+
+        assert!(
+            mount_root_in(&parent, OsStr::new("mount"))
+                .expect("the mount point should be inspectable"),
+            "the root of the volume is the root of a mount"
+        );
+        assert!(
+            !mount_root_in(&parent, OsStr::new("file"))
+                .expect("an ordinary file should be inspectable")
+        );
+        let result = build_plan(
+            root.path(),
+            lone_target(root.path(), Path::new("folder"), &metadata),
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(DeletionPlanError::Root)),
+            "a folder that holds a mount is not planned: {result:?}"
+        );
+        assert!(
+            mount.join("inside").exists(),
+            "nothing on the volume was touched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_past_path_max_is_asked_about_without_its_path() {
+        use crate::tests::deep_tree::{DeepTree, LEVELS};
+
+        let tree = DeepTree::build();
+        let parent = tree.open_folder(LEVELS - 1);
+        let name = tree
+            .relative_folder(LEVELS)
+            .file_name()
+            .expect("a folder has a name")
+            .to_owned();
+
+        match mount_root_in(&parent, &name) {
+            Ok(mounted) => assert!(!mounted, "a folder of the chain is not the root of a mount"),
+            Err(error) => assert!(
+                !kernel_reports_mount_roots(&parent),
+                "a kernel that reports mount roots answers at any depth: {error}"
+            ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_mountinfo_fallback_agrees_with_the_kernel_and_refuses_what_it_cannot_name() {
+        use std::os::fd::AsRawFd as _;
+
+        use crate::tests::deep_tree::{DeepTree, LEVELS};
+
+        let (root, name) = a_mount_point_below_the_root();
+        assert!(
+            linux_mountinfo_contains_entry(&root, name)
+                .expect("the mount table should name a mount point")
+        );
+        let ordinary = tempfile::tempdir().expect("fixture root should exist");
+        std::fs::create_dir(ordinary.path().join("folder")).expect("fixture folder should exist");
+        let parent = File::open(ordinary.path()).expect("fixture root should open");
+        assert!(
+            !linux_mountinfo_contains_entry(&parent, OsStr::new("folder"))
+                .expect("the mount table should name an ordinary folder's parent")
+        );
+
+        // A parent whose path the kernel will not print, as a path past PATH_MAX is, cannot be
+        // looked up in the table. The fallback must answer exactly when it can name the parent,
+        // and refuse otherwise, never read an unnameable path as no mount.
+        let tree = DeepTree::build();
+        let deepest = tree.open_folder(LEVELS);
+        let nameable = std::fs::read_link(format!("/proc/self/fd/{}", deepest.as_raw_fd())).is_ok();
+        assert_eq!(
+            linux_mountinfo_contains_entry(&deepest, OsStr::new("leaf.dat")).is_ok(),
+            nameable
+        );
     }
 
     #[cfg(windows)]

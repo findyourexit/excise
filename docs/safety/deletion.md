@@ -34,12 +34,16 @@ A deletion plan can begin only when every condition holds:
 ## Plan Construction
 
 1. Inspect the selected target from the live filesystem and bind identity, type, size, allocation, and modification state to the displayed snapshot.
-2. For a directory, list current contents without following links. Record every relative path, identity, type, size, allocation, modification state, and required deletion order.
+2. For a directory, list current contents without following links. Record every relative path, identity, type, size, allocation, modification state, and required deletion order. On Unix every folder is reached, and every entry read, through the handle of the folder above it and the entry's own name, so no step names a whole path and how deep a folder sits does not limit a plan.
 3. Keep directory-plan records in limited memory. Store overflow plans and results under the configured temporary-storage limit. Unix uses anonymous files; Windows creates a current-user-only exclusive file in the selected target’s parent, outside the target, and deletes it when its handle closes.
 4. Authenticate every spilled record with a process-private key. Every decoded path must have safe components whose prefix is the selected target before later checks or execution.
 5. Reserve memory and temporary storage for every planned identity and result before confirmation. If the complete plan or report cannot be retained, discard it before confirmation and delete nothing.
 6. Recheck every planned entry immediately before deletion. Reject a directory plan that targets or contains a filesystem or mount root.
 7. If planning before consent or the final whole-plan check finds a change, discard the plan and require a fresh user request. Prior consent is never reused.
+
+A directory plan is rejected when its target or any folder in it is the root of a mount. The rule does not depend on how long a path is: on Unix each folder is asked about from its parent's handle and its own name. On Linux the kernel reports the root of any mount, a bind mount of a folder of the same filesystem included. Where it cannot, the mount table answers, and a folder whose path the kernel cannot name is refused, never assumed to be safe. Elsewhere on Unix, a folder on a different device than its parent is a mount root. A link to a mount root is a link, and stays plannable. Windows still checks the path.
+
+When planning refuses, the notice says why where Excise can tell: access denied, a temporary-storage or plan-memory limit, a path too long or invalid for the system, a mount point or filesystem root in the folder, or a value the filesystem reports that Excise cannot keep, such as a negative size. Anything else reads that the selected item could not be checked. Planning changes nothing, so a refusal leaves everything as it was.
 
 ## Confirmation
 
@@ -67,6 +71,8 @@ For every planned entry, Excise:
 4. Deletes only when every relevant value still matches. Otherwise it restores the temporary name, records the exact result, and skips the entry.
 5. Records success, changed identity, permission or sharing error, missing entry, recovery error, or another failure.
 6. Finishes recovery for that entry before continuing with other entries that remain safe.
+
+If the system refuses the rename that moves an entry aside, Excise records that entry as failed, with the system's reason, and goes on with the others, as it does for any other failure. It never removes an entry it could not move aside. Excise moves an entry aside by exchanging its name with a placeholder's, and names the placeholder, which is always a file, as the source of the exchange. That matters at depth: macOS 14 refuses, with "No space left on device", any rename whose source is a folder whose path is longer than the system's path length limit (1,024 bytes), an exchange included, and accepts one whose source is a file at any depth. An exchange swaps both names whichever is named first, so a folder that deep is moved aside, and removed, there too. A system that still refuses the rename for an entry whose path is longer than the limit (1,024 bytes on macOS, 4,096 on Linux) ends the run instead, because the folders above such an entry cannot be removed either, and stopping leaves the rest of the target as it was. The refused entry is recorded as failed, every later entry as unattempted, and the run is not recorded as cancelled.
 
 The working model changes only from confirmed deletion results.
 
