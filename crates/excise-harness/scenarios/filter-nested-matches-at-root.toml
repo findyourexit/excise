@@ -1,0 +1,94 @@
+schema_version = 1
+name = "filter-nested-matches-at-root"
+description = "A filter applied at the root, where it matches two and three levels below it, filters the map instead of ending the program, and the folder it leads into lists the folders that hold the matches."
+fixture = "delete-folder"
+sentinels = ["keep-a.bin", "keep-b/keep.txt"]
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# `part00` is the name of a folder of `victim` and of a folder inside each of the others, so below
+# the root it matches two and three levels down. Before the fix the program ended on the Enter with
+# exit code 101.
+[[steps]]
+step = "key"
+key = "/"
+
+[[steps]]
+step = "type"
+text = "part00"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "settle"
+
+# The filter is in effect and the page it filtered did not fail to load: the prompt reopens with
+# the text that was applied, and no error is showing.
+[[steps]]
+step = "key"
+key = "/"
+
+[[steps]]
+step = "wait_text"
+text = "/ part00_  [Enter] apply"
+region = "header"
+
+[[steps]]
+step = "key"
+key = "esc"
+
+[[steps]]
+step = "settle"
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["Could not filter this scan page"]
+
+# `victim` is the only entry of the root that holds a match, and it is the selection. Opening it
+# lists every one of its folders: each holds a `part00`, or is one.
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "wait_text"
+text = "victim"
+region = "header"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "wait_text"
+text = "part05/"
+
+[[steps]]
+step = "wait_text"
+text = "part09/"
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["Could not open this scan page"]
+
+[[steps]]
+step = "quit"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000

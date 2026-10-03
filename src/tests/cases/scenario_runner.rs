@@ -66,8 +66,14 @@ fn bundled_in_process_scenarios_pass_under_every_declared_profile() {
     for (name, reason) in &selection.skipped {
         println!("SKIP {name}: {reason}");
     }
-    // Lifecycle scenarios must run in-process, under the user defaults and under reduced motion.
-    for lifecycle in ["delete-file-lifecycle", "navigate-and-quit"] {
+    // Lifecycle scenarios, and the two that keep a filter from ending the program, must run
+    // in-process, under the user defaults and under reduced motion.
+    for lifecycle in [
+        "delete-file-lifecycle",
+        "navigate-and-quit",
+        "filter-inside-opened-folder",
+        "filter-nested-matches-at-root",
+    ] {
         let scenario = selection
             .runnable
             .iter()

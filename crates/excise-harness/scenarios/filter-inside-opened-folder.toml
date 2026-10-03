@@ -1,0 +1,93 @@
+schema_version = 1
+name = "filter-inside-opened-folder"
+description = "A filter applied inside an opened folder, where it matches at two depths below that folder, filters the map instead of ending the program."
+fixture = "delete-folder"
+sentinels = ["keep-a.bin", "keep-b/keep.txt"]
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 120
+rows = 40
+
+# `victim` is the largest entry, so it is the selection once the scan has finished. Enter opens it.
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "wait_text"
+text = "victim"
+region = "header"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# `part00` is one of the folders of `victim` and the name of a folder inside each of the others, so
+# the filter matches at two depths below the folder it is applied in. Before the fix the program
+# ended on the Enter with exit code 101. The filter is typed rather than chosen with `select`:
+# every folder of `victim` holds a match, a filter selects the largest of them, and which folder is
+# largest is not the same on every platform.
+[[steps]]
+step = "key"
+key = "/"
+
+[[steps]]
+step = "type"
+text = "part00"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "settle"
+
+# Every folder of `victim` stays on the map: `part00` matches itself, and each of the others holds
+# a match one level down.
+[[steps]]
+step = "wait_text"
+text = "part05/"
+
+[[steps]]
+step = "wait_text"
+text = "part09/"
+
+# The filter is in effect and the page it filtered did not fail to load: the prompt reopens with
+# the text that was applied, and no error is showing.
+[[steps]]
+step = "key"
+key = "/"
+
+[[steps]]
+step = "wait_text"
+text = "/ part00_  [Enter] apply"
+region = "header"
+
+[[steps]]
+step = "key"
+key = "esc"
+
+[[steps]]
+step = "settle"
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["Could not filter this scan page"]
+
+[[steps]]
+step = "quit"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000
