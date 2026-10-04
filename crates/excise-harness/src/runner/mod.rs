@@ -20,22 +20,28 @@
 //!
 //! # Semantics worth knowing
 //!
-//! * **`settle`** waits for a `frame` event whose `inputs` counter is at least the number of input
-//!   events the runner has sent and that was observed after the last one was written, then reads
-//!   the terminal output still in flight (at most 20 ms, ending after 3 ms of quiet) so that the
-//!   screen model has caught up with the frame. A key that changes nothing draws no frame and so
-//!   never settles.
+//! * **`settle`** waits for a `frame` event that reflects every input event the runner has sent
+//!   (its `inputs` counter, less the inputs the program counted of its own before the first one,
+//!   covers them, and it was observed after the last was written; see `exec`), then reads the
+//!   terminal output still in flight so that the screen model has caught up with the frame and the
+//!   step after it can read the screen once. On Unix it reads until the output has been quiet for
+//!   3 ms, for at most 20 ms. On Windows it first reads for 100 ms and then does the same, because
+//!   `ConPTY` can hold a frame back for tens of milliseconds after the program has reported it
+//!   (see `exec::CONPTY_FRAME_WINDOW` for the measurements). A key that changes nothing draws no
+//!   frame and so never settles.
 //! * **`select`** opens the filter with `/`, erases any text the filter opened with, types the
 //!   name, checks the prompt, presses Enter, and waits until the inspector pane shows exactly that
 //!   name.
 //! * **`delete`** presses Backspace, reads the dialog, and presses `y` only when the dialog names
 //!   exactly the requested entry, kind, and path and every sentinel is intact. Otherwise it fails
 //!   without ever sending `y`. It then waits for the `deletion_finished` event and for the first
-//!   frame after it, so the screen shows the result. The program rebuilds its map after a deletion
-//!   and treats a quit during the rebuild as a cancellation (exit 130), so a scenario that quits
-//!   next waits for the header to read `COMPLETE`.
+//!   frame after it, and reads the output in flight as `settle` does, so the screen shows the
+//!   result. The program rebuilds its map after a deletion and treats a quit during the rebuild as
+//!   a cancellation (exit 130), so a scenario that quits next waits for the header to read
+//!   `COMPLETE`.
 //! * **`quit`** presses `q`, waits for the quit dialog, and confirms with `y`.
-//! * **`resize`** resizes the terminal and waits for the frame that answers it.
+//! * **`resize`** resizes the terminal and waits for the frame that answers it, then reads the
+//!   output in flight as `settle` does.
 //! * **`wait_event`** matches any event read so far, including events before the step began.
 //! * **`expect_exit`** also compares the fixture with its state before the run: only confirmed
 //!   deletions may differ.
