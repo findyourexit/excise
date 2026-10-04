@@ -113,7 +113,7 @@ The interactive interface requires standard input and output connected to a term
 
     Opening or leaving a directory never starts another scanner or creates a second mutable model. Before a scan publishes its result, navigation reads the available partial stored pages and only reprioritizes existing work. A partial deletion can start one root rescan, which appears in the scan field until it publishes or is cancelled. Press ++esc++ to cancel that rescan and return to normal navigation.
 
-    Once you move the cursor, it stays on that exact entry through every later map refresh, including a scan publishing a result that resizes or reorders its siblings, instead of jumping to whichever entry is currently largest. If that entry is genuinely gone, the cursor clears rather than landing on something else.
+    Until you move or click, the cursor does not chase the largest entry while a scan runs, and when the scan completes it goes to the largest entry of the folder you are in. Once you move or click the cursor, it stays on that exact entry through every later map refresh, including a scan publishing a result that resizes or reorders its siblings, instead of jumping to whichever entry is currently largest. If that entry is genuinely gone, the cursor clears rather than landing on something else.
 
     Press ++t++ in the normal view, while scanning, or during a root rescan to preview the theme list. Arrow keys or ++j++ and ++k++ move the preview. Press ++enter++ to save the selected theme for later TUI sessions, or ++esc++ to restore the prior theme.
 
