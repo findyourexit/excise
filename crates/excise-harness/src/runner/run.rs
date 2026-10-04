@@ -182,7 +182,7 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
     let settings = ProfileSettings::for_profile(request.profile);
     let mut spec = SpawnSpec {
         program: binary,
-        args: vec![fixture.path().as_os_str().to_owned()],
+        args: program_arguments(scenario, fixture.path()),
         env: isolated_env(&scratch, request.profile, true, request.scan_store_dir),
         cwd: scratch.cwd(),
         cols: settings.cols.unwrap_or(scenario.terminal.cols),
@@ -251,6 +251,19 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
         let _ = recording.keep();
     }
     Ok(())
+}
+
+/// The arguments `excise` starts with: the fixture root, which the runner has already checked it
+/// owns, preceded by the only flag a scenario can ask for, `disable_delete_confirmation`. A
+/// scenario has no way to add another argument, so it cannot point the program at a root of its
+/// own.
+fn program_arguments(scenario: &Scenario, root: &Path) -> Vec<OsString> {
+    let mut arguments = Vec::with_capacity(2);
+    if scenario.disable_delete_confirmation {
+        arguments.push(OsString::from("--disable-delete-confirmation"));
+    }
+    arguments.push(root.as_os_str().to_owned());
+    arguments
 }
 
 /// Rewrites `spec` to run under the Linux cgroup memory cap, if `scenario.cgroup_memory_cap` asks
@@ -376,4 +389,49 @@ pub(crate) fn resolve_binary(path: &Path) -> Result<PathBuf, RunError> {
         }
     }
     Ok(absolute)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsString, path::Path};
+
+    use super::program_arguments;
+    use crate::scenario::Scenario;
+
+    fn scenario(top_level: &str) -> Scenario {
+        let scenario = Scenario::from_toml_str(&format!(
+            r#"
+schema_version = 1
+name = "arguments"
+description = "d"
+fixture = "f"
+sentinels = ["keep"]
+profiles = ["default"]
+{top_level}
+[[steps]]
+step = "settle"
+"#
+        ))
+        .expect("a scenario");
+        scenario.validate().expect("a valid scenario");
+        scenario
+    }
+
+    #[test]
+    fn the_fixture_root_is_the_only_argument_unless_the_scenario_reduces_the_confirmation() {
+        let root = Path::new("/tmp/xh-1/fx");
+
+        assert_eq!(
+            program_arguments(&scenario(""), root),
+            [OsString::from("/tmp/xh-1/fx")]
+        );
+        // The flag comes first, and the root, which the runner has checked it owns, stays last.
+        assert_eq!(
+            program_arguments(&scenario("disable_delete_confirmation = true"), root),
+            [
+                OsString::from("--disable-delete-confirmation"),
+                OsString::from("/tmp/xh-1/fx")
+            ]
+        );
+    }
 }

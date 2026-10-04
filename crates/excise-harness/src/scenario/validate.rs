@@ -9,8 +9,8 @@ use super::{
     Profile, SCHEMA_VERSION, Scenario,
     path::{PathViolation, check_fixture_relative_path},
     step::{
-        EventField, EventKind, ExpectFs, ExpectScreen, Idle, Marker, Region, Step, WaitEvent,
-        WaitText,
+        ConfirmKey, Delete, DeleteWait, EventField, EventKind, ExpectConfig, ExpectFs,
+        ExpectScreen, Idle, Marker, Region, Step, WaitEvent, WaitText,
     },
 };
 use crate::platform::PLATFORMS;
@@ -270,6 +270,35 @@ pub enum StepError {
         /// The offending value.
         value: u64,
     },
+    /// A `delete` step's `path` does not end in the entry's `name`.
+    #[error("`path` {path:?} must end in the entry's `name` {name:?}")]
+    PathNotNamed {
+        /// The entry's name.
+        name: String,
+        /// The path that does not end in it.
+        path: String,
+    },
+    /// `wait_for = "started"` in a scenario that has no confirmation dialog to close.
+    #[error(
+        "`wait_for = \"started\"` needs the confirmation dialog to close, but \
+         `disable_delete_confirmation` leaves no dialog"
+    )]
+    StartedWithoutDialog,
+    /// A `confirm_with` other than the default in a scenario that has no confirmation dialog.
+    #[error(
+        "`confirm_with = \"enter\"` needs the confirmation dialog, but \
+         `disable_delete_confirmation` leaves no dialog"
+    )]
+    ConfirmWithoutDialog,
+    /// An `expect_config` key is not a dotted path of setting names.
+    #[error(
+        "`key` {key:?} is not a dotted path: use names of lowercase ASCII letters, digits, `_` \
+         or `-`, joined by `.`"
+    )]
+    InvalidConfigKey {
+        /// The offending value.
+        key: String,
+    },
 }
 
 /// Every rule a scenario breaks, in scenario order.
@@ -429,6 +458,27 @@ impl Scenario {
                 error,
             });
         }
+        if self.disable_delete_confirmation {
+            for (index, step) in self.steps.iter().enumerate() {
+                let Step::Delete(delete) = step else {
+                    continue;
+                };
+                let mut broken = Vec::new();
+                if delete.wait_for == DeleteWait::Started {
+                    broken.push(StepError::StartedWithoutDialog);
+                }
+                if delete.confirm_with != ConfirmKey::default() {
+                    broken.push(StepError::ConfirmWithoutDialog);
+                }
+                for error in broken {
+                    errors.push(ValidationError::Step {
+                        index,
+                        kind: step.kind(),
+                        error,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -480,7 +530,7 @@ fn check_step(step: &Step) -> Vec<StepError> {
         Step::WaitText(step) => check_wait_text(step, &mut errors),
         Step::WaitEvent(step) => check_wait_event(step, &mut errors),
         Step::Select(step) => require_text(Field::new("name"), &step.name, &mut errors),
-        Step::Delete(step) => require_text(Field::new("name"), &step.name, &mut errors),
+        Step::Delete(step) => check_delete(step, &mut errors),
         Step::Type(step) => require_text(Field::new("text"), &step.text, &mut errors),
         Step::WaitFsAbsent(step) | Step::WaitFsPresent(step) => {
             check_path(Field::new("path"), &step.path, &mut errors);
@@ -496,6 +546,7 @@ fn check_step(step: &Step) -> Vec<StepError> {
         }
         Step::ExpectScreen(step) => check_expect_screen(step, &mut errors),
         Step::ExpectFs(step) => check_expect_fs(step, &mut errors),
+        Step::ExpectConfig(step) => check_expect_config(step, &mut errors),
         Step::ExpectBudget(step) => check_identifier("metric", &step.metric, &mut errors),
         Step::Measure(step) => check_identifier("name", &step.name, &mut errors),
         Step::Idle(step) => check_idle(step, &mut errors),
@@ -571,6 +622,35 @@ fn check_expect_fs(step: &ExpectFs, errors: &mut Vec<StepError>) {
             check_path(Field::at(name, index), path, errors);
         }
     }
+}
+
+fn check_delete(step: &Delete, errors: &mut Vec<StepError>) {
+    require_text(Field::new("name"), &step.name, errors);
+    if let Some(path) = &step.path {
+        let before = errors.len();
+        check_path(Field::new("path"), path, errors);
+        if errors.len() == before && path.rsplit('/').next() != Some(step.name.as_str()) {
+            errors.push(StepError::PathNotNamed {
+                name: step.name.clone(),
+                path: path.clone(),
+            });
+        }
+    }
+}
+
+fn check_expect_config(step: &ExpectConfig, errors: &mut Vec<StepError>) {
+    let is_name = |name: &str| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+    };
+    if !step.key.split('.').all(is_name) {
+        errors.push(StepError::InvalidConfigKey {
+            key: step.key.clone(),
+        });
+    }
+    require_text(Field::new("equals"), &step.equals, errors);
 }
 
 fn check_region(region: Region, errors: &mut Vec<StepError>) {

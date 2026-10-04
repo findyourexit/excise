@@ -1,0 +1,30 @@
+schema_version = 1
+name = "delete-reduced-wrong-target"
+description = "Negative control for the deletion safety rules with the confirmation disabled. It is not a product scenario: cargo xtask e2e never runs it, and tests/harness_scenarios.rs runs it and asserts that the delete step fails. The folder `victim` is selected but the delete step names a different entry, so the step must fail before Backspace, the one key that starts a deletion with no dialog, is sent."
+fixture = "delete-folder"
+sentinels = ["keep-a.bin", "keep-b/keep.txt"]
+disable_delete_confirmation = true
+profiles = ["default"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# The folder `victim` is selected...
+[[steps]]
+step = "select"
+name = "victim"
+timeout_ms = 10000
+
+# ...but the step names a different entry. The selected-item panel shows `victim` and never shows
+# `keep-a.bin`, so the step waits out its short bound and refuses, and Backspace is never sent.
+[[steps]]
+step = "delete"
+name = "keep-a.bin"
+kind = "file"
+timeout_ms = 2000

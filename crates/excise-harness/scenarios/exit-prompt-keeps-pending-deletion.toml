@@ -1,0 +1,92 @@
+schema_version = 1
+name = "exit-prompt-keeps-pending-deletion"
+description = "Asking to quit while a deletion waits for confirmation shows the exit prompt with the waiting check; choosing to keep working brings the same confirmation back, and declining it deletes nothing."
+fixture = "delete-file"
+sentinels = ["victim.bin", "keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 100
+rows = 30
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# The map armed the largest entry, `victim.bin`; Backspace opens its confirmation.
+[[steps]]
+step = "key"
+key = "backspace"
+
+[[steps]]
+step = "wait_text"
+text = "! DELETE FILE"
+region = "dialog"
+
+# Ctrl-C replaces the confirmation with the exit prompt, which says what is waiting and that
+# nothing has been removed yet. Each line is waited for: the screen is drawn a row at a time.
+[[steps]]
+step = "key"
+key = "c"
+ctrl = true
+
+[[steps]]
+step = "wait_text"
+text = "1 deletion check(s) are waiting."
+region = "dialog"
+
+[[steps]]
+step = "wait_text"
+text = "No filesystem mutation has started."
+region = "dialog"
+
+[[steps]]
+step = "wait_text"
+text = "[c] Cancel checks and quit"
+region = "dialog"
+
+[[steps]]
+step = "wait_text"
+text = "Keep working"
+region = "dialog"
+
+# Keeping work brings the pending confirmation back, naming the same entry.
+[[steps]]
+step = "key"
+key = "w"
+
+[[steps]]
+step = "wait_text"
+text = "! DELETE FILE"
+region = "dialog"
+
+# The path line ends in the file's name, after whichever separator the platform uses.
+[[steps]]
+step = "wait_text"
+regex = '[/\\]victim\.bin'
+region = "dialog"
+
+# Declining the restored confirmation cancels it; it was never executed. The `quit` below presses
+# `q`, which would cancel a confirmation that was still open instead of asking to quit, and a
+# deletion that had started would turn its prompt into one about pending work: it only passes on a
+# plain map. `victim.bin` is a sentinel, so a deletion that began late is caught at the end too.
+[[steps]]
+step = "key"
+key = "n"
+
+[[steps]]
+step = "settle"
+
+[[steps]]
+step = "expect_fs"
+present = ["victim.bin", "keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"

@@ -74,23 +74,35 @@ pub fn materialize(id: &str) -> Result<Fixture, FixtureError> {
 ///
 /// Returns a message when `path` is not a fixture-relative path or an entry cannot be inspected.
 pub fn entry_exists(root: &Path, path: &str) -> Result<bool, String> {
+    entry_metadata(root, path).map(|metadata| metadata.is_some())
+}
+
+/// What the fixture-relative `path` names now, without following a link (`entry_exists` says how
+/// the path is resolved), or `None` when it names nothing.
+///
+/// # Errors
+///
+/// Returns a message when `path` is not a fixture-relative path or an entry cannot be inspected.
+pub fn entry_metadata(root: &Path, path: &str) -> Result<Option<fs::Metadata>, String> {
     check_fixture_relative_path(path)
         .map_err(|violation| format!("`{path}` is not a fixture-relative path: {violation}"))?;
     let mut current = root.to_path_buf();
     let mut components = path.split('/').peekable();
+    let mut found = None;
     while let Some(component) = components.next() {
         current.push(component);
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if components.peek().is_some() && !metadata.is_dir() {
-                    return Ok(false);
+                    return Ok(None);
                 }
+                found = Some(metadata);
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("`{path}` cannot be inspected: {error}")),
         }
     }
-    Ok(true)
+    Ok(found)
 }
 
 /// The names of the entries directly under `directory`, or none when it does not exist.

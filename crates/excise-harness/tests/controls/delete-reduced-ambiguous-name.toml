@@ -1,0 +1,25 @@
+schema_version = 1
+name = "delete-reduced-ambiguous-name"
+description = "Negative control for the deletion safety rules with the confirmation disabled. It is not a product scenario: cargo xtask e2e never runs it, and tests/harness_scenarios.rs runs it and asserts that the delete step fails. Two files are called `twin.bin`, and the selected-item panel shows a name and a kind only, so it cannot say which one is selected: the step must fail before Backspace, the one key that starts a deletion with no dialog, is sent."
+fixture = "twins"
+sentinels = ["keep-a.bin"]
+disable_delete_confirmation = true
+profiles = ["default"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# The fresh map selects its largest entry, the `twin.bin` at the root, and the panel shows exactly
+# what the step asks for: a file called `twin.bin`. So does the other twin, in `docs/`. The step
+# cannot tell them apart, whatever `path` it is given, and refuses.
+[[steps]]
+step = "delete"
+name = "twin.bin"
+kind = "file"
+timeout_ms = 10000

@@ -14,6 +14,11 @@
 //! that nothing but the input baseline keeps a step from taking the first of the two frames for
 //! the answer and reading the screen before the second.
 //!
+//! One group has a program whose selected-item panel trails its header: the panel shows nothing
+//! selected at first, and names the entry 300 ms later, the way a fresh map arms its cursor in a
+//! frame after the one that says `COMPLETE`. A deletion with no dialog has to wait for the panel
+//! to name the entry, and refuse only when it never does.
+//!
 //! The last group checks `expect_budget` against metrics that the test records itself, so that the
 //! limit a step applies is the only thing that can decide the result and no timing is involved.
 //!
@@ -21,9 +26,14 @@
 //! sleeps in short steps rather than in one `wait` for a background `sleep`: a shell may run the
 //! trap of a signal that arrives just before its `wait` starts only once that `wait` is over.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, fmt::Write as _, time::Duration};
 
-use super::super::{budget::LatencyScale, exec::Executor, outcome::Stop, plan::prepare};
+use super::super::{
+    budget::LatencyScale,
+    exec::Executor,
+    outcome::{FailureCause, Stop},
+    plan::prepare,
+};
 use crate::{
     fixture::{FixtureCache, FixtureSpec, Fixtures},
     pty::{PtySession, SpawnSpec},
@@ -104,10 +114,16 @@ done
 ";
 
 fn scenario(steps: &str) -> Scenario {
+    scenario_with("", steps)
+}
+
+/// A scenario on the `delete-file` fixture whose first step waits for `READY`, with `top_level`
+/// fields (which come before the steps) and then `steps`.
+fn scenario_with(top_level: &str, steps: &str) -> Scenario {
     let scenario = Scenario::from_toml_str(&format!(
         "schema_version = 1\nname = \"scripted-program\"\n\
          description = \"a scripted program\"\n\
-         fixture = \"delete-file\"\nprofiles = [\"default\"]\n\
+         fixture = \"delete-file\"\nprofiles = [\"default\"]\n{top_level}\
          [[steps]]\nstep = \"wait_text\"\ntext = \"READY\"\n{steps}"
     ))
     .expect("a scenario");
@@ -134,6 +150,16 @@ fn run(script: &str, steps: &str, frame_window: Duration) -> Run {
 /// Runs `steps` after the script has printed `READY`, in an executor that `configure` has set up,
 /// and stops the program.
 fn run_with(script: &str, steps: &str, configure: impl FnOnce(&mut Executor<'_>)) -> Run {
+    run_scenario(script, &scenario(steps), configure)
+}
+
+/// Runs `scenario` against the script, in an executor that `configure` has set up, and stops the
+/// program.
+fn run_scenario(
+    script: &str,
+    scenario: &Scenario,
+    configure: impl FnOnce(&mut Executor<'_>),
+) -> Run {
     let work = tempfile::tempdir().expect("a work directory");
     let fixture_copy = Fixtures::new(
         FixtureSpec::bundled_dir(),
@@ -144,8 +170,7 @@ fn run_with(script: &str, steps: &str, configure: impl FnOnce(&mut Executor<'_>)
     let fixture = FixtureRoot::open(fixture_copy.root()).expect("an owned fixture");
     let scratch = Scratch::create(work.path()).expect("a scratch area");
     let baseline = FixtureSnapshot::take(fixture.path()).expect("a snapshot");
-    let scenario = scenario(steps);
-    let prepared = prepare(&scenario).expect("a runnable scenario");
+    let prepared = prepare(scenario).expect("a runnable scenario");
     let session = PtySession::spawn(&SpawnSpec {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), format!("{PRELUDE}{script}").into()],
@@ -159,7 +184,7 @@ fn run_with(script: &str, steps: &str, configure: impl FnOnce(&mut Executor<'_>)
     })
     .expect("the program starts");
     let mut executor = Executor::new(
-        &scenario,
+        scenario,
         &prepared,
         &fixture,
         &scratch,
@@ -293,6 +318,96 @@ fn a_resize_and_the_key_after_it_wait_for_their_frames_past_the_programs_own_inp
     );
 
     assert!(run.result.is_ok(), "{:?}", run.result);
+}
+
+/// The selected-item pane as `excise` draws it, as `printf` commands that put it at row 10.
+fn panel(lines: &[&str]) -> String {
+    const WIDTH: usize = 60;
+    let tab = " SELECTED ITEM ";
+    let mut rows = vec![format!(
+        "▟{tab}{}▜",
+        "▔".repeat(WIDTH - 2 - tab.chars().count())
+    )];
+    for line in lines {
+        let padding = WIDTH - 2 - line.chars().count();
+        rows.push(format!(
+            "▏{}{line}{}▕",
+            " ".repeat(padding / 2),
+            " ".repeat(padding - padding / 2)
+        ));
+    }
+    rows.push("▔".repeat(WIDTH));
+    let mut script = String::new();
+    for (offset, row) in rows.iter().enumerate() {
+        writeln!(script, "printf '\\033[{};1H%s' '{row}'", 10 + offset)
+            .expect("a string takes a write");
+    }
+    script
+}
+
+/// A program whose panel names `victim.bin` 300 ms after it first shows nothing selected. Its
+/// terminal is raw before it says `READY`, so that the Backspace byte, which a line discipline
+/// would take for an erase, reaches it; it starts a deletion that finishes at once.
+fn panel_arrives_late() -> String {
+    format!(
+        "stty raw -echo\nprintf READY\n{nothing}report 0\n/bin/sleep 0.3\n{victim}report 0\n\
+         dd bs=1 count=1 > /dev/null 2>&1\nreport 1\n\
+         printf '{{\"v\":1,\"kind\":\"deletion_finished\",\"removed\":1,\"failed\":0,\"t_us\":2}}\\n' \
+         >> \"$events\"\nreport 1\n/bin/sleep 30\n",
+        nothing = panel(&["Choose an item to see its space and scan status."]),
+        victim = panel(&["victim.bin", "◆ COMPLETE · file"]),
+    )
+}
+
+/// A program whose panel names another entry, and keeps naming it.
+fn panel_names_another_entry() -> String {
+    format!(
+        "printf READY\n{other}report 0\n/bin/sleep 30\n",
+        other = panel(&["other.bin", "◆ COMPLETE · file"]),
+    )
+}
+
+/// A scenario with no confirmation dialog whose only step deletes `victim.bin`, which the step
+/// gives `timeout_ms` to be the panel's entry.
+fn delete_victim_with_no_dialog(timeout_ms: u64) -> Scenario {
+    scenario_with(
+        "sentinels = [\"keep-a.bin\"]\ndisable_delete_confirmation = true\n",
+        &format!(
+            "\n[[steps]]\nstep = \"delete\"\nname = \"victim.bin\"\nkind = \"file\"\n\
+             timeout_ms = {timeout_ms}\n"
+        ),
+    )
+}
+
+#[test]
+fn a_deletion_with_no_dialog_waits_for_a_panel_that_trails_the_header() {
+    let scenario = delete_victim_with_no_dialog(10_000);
+
+    let run = run_scenario(&panel_arrives_late(), &scenario, |executor| {
+        executor.frame_window = SHORT_FRAME_WINDOW;
+    });
+
+    assert!(run.result.is_ok(), "{:?}", run.result);
+}
+
+#[test]
+fn a_deletion_with_no_dialog_refuses_a_panel_that_never_names_the_entry() {
+    let scenario = delete_victim_with_no_dialog(1_000);
+
+    let run = run_scenario(&panel_names_another_entry(), &scenario, |executor| {
+        executor.frame_window = SHORT_FRAME_WINDOW;
+    });
+
+    let Err(Stop::Fail(failure)) = &run.result else {
+        panic!("another entry must be refused: {:?}", run.result);
+    };
+    assert_eq!(failure.cause, FailureCause::DeleteRefused, "{failure}");
+    assert!(
+        failure.detail.contains(
+            "the selected-item panel shows `other.bin`, but the step deletes `victim.bin`"
+        ),
+        "{failure}"
+    );
 }
 
 /// A program that is ready and then waits: the budget tests need a session to check against, not

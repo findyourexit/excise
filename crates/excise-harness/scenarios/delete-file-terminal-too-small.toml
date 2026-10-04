@@ -1,0 +1,60 @@
+schema_version = 1
+name = "delete-file-terminal-too-small"
+description = "In a terminal too narrow for the confirmation, Backspace refuses to start a deletion and says to resize; Esc closes the message, and every file is still there."
+fixture = "delete-file"
+sentinels = ["victim.bin", "keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default", "deterministic"]
+
+# One column short of the 50 the confirmation needs.
+[terminal]
+cols = 49
+rows = 50
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# The refusal is an error dialog, not the confirmation, and the inspector offers no actions. Each
+# fact is waited for, because the screen is drawn a row at a time.
+[[steps]]
+step = "key"
+key = "backspace"
+
+[[steps]]
+step = "wait_text"
+text = "Resize to at least 50 x 15"
+region = "dialog"
+
+[[steps]]
+step = "wait_text"
+text = "ERROR"
+region = "dialog"
+
+[[steps]]
+step = "wait_text"
+text = "Actions unavailable"
+
+# Esc closes the message. The `quit` below presses `q`, which would close an error dialog that was
+# still open instead of asking to quit, so it only passes once the message is gone.
+[[steps]]
+step = "key"
+key = "esc"
+
+# A key sent right behind a lone Esc can be read with it as Alt plus that key, so the frame that
+# answers Esc is read before the next key.
+[[steps]]
+step = "settle"
+
+[[steps]]
+step = "expect_fs"
+present = ["victim.bin", "keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"

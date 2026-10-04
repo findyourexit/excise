@@ -1,0 +1,14 @@
+schema_version = 1
+id = "refused"
+description = "A file that cannot be deleted. `hostile/unwritable/` can be listed and entered but not changed (mode 555), so `stuck.txt` in it cannot be removed; `keep-a.bin` beside it is a sentinel. Needs permission modes and a user that is not root. The id is short on purpose: the deletion dialog cuts a long path, and the `delete` step refuses to confirm a path it cannot read whole."
+seed = 20261004
+
+[[parts]]
+kind = "file"
+root = "keep-a.bin"
+size = 4096
+
+[[parts]]
+kind = "hostile"
+root = "hostile"
+features = ["unwritable_dirs"]

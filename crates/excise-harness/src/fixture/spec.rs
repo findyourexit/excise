@@ -422,6 +422,9 @@ string_enum! {
         UnreadableDirs => "unreadable_dirs",
         /// Files that cannot be read (mode `000`) or written to read (mode `200`).
         UnreadableFiles => "unreadable_files",
+        /// A directory that can be listed and entered but not changed (mode `555`), holding a
+        /// file: nothing in it can be removed.
+        UnwritableDirs => "unwritable_dirs",
     }
 }
 
@@ -437,13 +440,14 @@ impl HostileFeature {
             Self::InvalidUtf8Names => "invalid-utf8",
             Self::LongNames => "long",
             Self::UnreadableDirs | Self::UnreadableFiles => "unreadable",
+            Self::UnwritableDirs => "unwritable",
         }
     }
 }
 
 /// The hostile class. Each name feature adds, for every name of its catalog, one directory with
 /// that name holding one file with the same name. The unreadable features add fixed shapes under
-/// `unreadable/`.
+/// `unreadable/`, and `unwritable_dirs` adds `unwritable/`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostilePart {
@@ -680,15 +684,34 @@ impl FixtureSpec {
 
     /// Whether a path-based recursive removal can remove a generated tree of this spec, the way
     /// `cargo clean` and `git worktree remove` remove a target directory. Such a removal fails on a
-    /// directory that its owner cannot list (`unreadable_dirs`) and on a path longer than
-    /// `PATH_MAX` (a `deep` part), so a fixture with either is never cached: see
+    /// directory that its owner cannot list (`unreadable_dirs`), on one it cannot remove anything
+    /// from (`unwritable_dirs`), and on a path longer than `PATH_MAX` (a `deep` part), so a
+    /// fixture with any of them is never cached: see
     /// [`Fixtures::master`](super::Fixtures::master).
     #[must_use]
     pub fn removable_by_path(&self) -> bool {
         self.parts.iter().all(|part| match part {
             Part::Deep(_) => false,
-            Part::Hostile(hostile) => !hostile.features.contains(&HostileFeature::UnreadableDirs),
+            Part::Hostile(hostile) => !hostile.features.iter().any(|feature| {
+                matches!(
+                    feature,
+                    HostileFeature::UnreadableDirs | HostileFeature::UnwritableDirs
+                )
+            }),
             Part::Tree(_) | Part::File(_) | Part::Identity(_) | Part::Volume(_) => true,
+        })
+    }
+
+    /// Whether the fixture does its job only for a user that is not root. A root process ignores
+    /// permission modes, so a directory it is not allowed to change (`unwritable_dirs`) refuses it
+    /// nothing, and a scenario that expects the refusal would be testing nothing.
+    #[must_use]
+    pub fn needs_unprivileged_user(&self) -> bool {
+        self.parts.iter().any(|part| {
+            matches!(
+                part,
+                Part::Hostile(hostile) if hostile.features.contains(&HostileFeature::UnwritableDirs)
+            )
         })
     }
 
@@ -1067,6 +1090,11 @@ fn hostile_entry_count(part: &HostilePart) -> u64 {
             }
             HostileFeature::UnreadableFiles => {
                 total += 2;
+                0
+            }
+            HostileFeature::UnwritableDirs => {
+                // `stuck.txt`; the directory that holds it is the feature's own.
+                total += 1;
                 0
             }
         };

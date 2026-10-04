@@ -1,0 +1,48 @@
+schema_version = 1
+name = "delete-default-path-nested-entry"
+description = "Negative control for the deletion safety rules. It is not a product scenario: cargo xtask e2e never runs it, and tests/harness_scenarios.rs runs it and asserts that the delete step fails. The file `docs/twin.bin` is selected and the delete step names `twin.bin` without a `path`, which means the entry directly below the root, so the step must fail before `y` is sent even though the dialog names a file of that name under the fixture root."
+fixture = "twins"
+sentinels = ["keep-a.bin"]
+profiles = ["default"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# Open `docs/`, where the other `twin.bin` is, and select it.
+[[steps]]
+step = "select"
+name = "docs"
+timeout_ms = 10000
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "wait_text"
+text = "docs"
+region = "header"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "twin.bin"
+timeout_ms = 10000
+
+# The dialog names `docs/twin.bin`: a file called `twin.bin` below the fixture root, but not the
+# one at the root that a step without a `path` means. The step refuses and `y` is never sent.
+[[steps]]
+step = "delete"
+name = "twin.bin"
+kind = "file"
+timeout_ms = 10000

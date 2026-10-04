@@ -55,6 +55,19 @@ pub struct RunCopy {
     options: GenerateOptions,
 }
 
+/// Refuses a fixture that does its job only for a user that is not root, when the process is root.
+pub(super) fn require_unprivileged_user(
+    spec: &FixtureSpec,
+    capabilities: &Capabilities,
+) -> Result<(), FixtureError> {
+    if spec.needs_unprivileged_user() && capabilities.running_as_root() == Some(true) {
+        return Err(FixtureError::NeedsUnprivilegedUser {
+            id: spec.id.clone(),
+        });
+    }
+    Ok(())
+}
+
 impl RunCopy {
     /// Generates `plan` into a new uniquely named directory below `parent`, which must exist.
     pub(crate) fn create(
@@ -70,6 +83,7 @@ impl RunCopy {
         };
         let capabilities = Capabilities::probe(parent)
             .map_err(|source| io_error("cannot probe the run directory's file system", source))?;
+        require_unprivileged_user(plan.spec(), &capabilities)?;
         for _ in 0..8 {
             let root = parent.join(format!(
                 "{}-{}-{}",

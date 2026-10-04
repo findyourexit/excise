@@ -1,0 +1,105 @@
+schema_version = 1
+name = "delete-refused-reduced-confirmation"
+description = "With the confirmation disabled, Backspace on a file in a folder that cannot be changed starts the deletion at once with no dialog; it is refused, the program reports one failure and no removal, and the file and its folder are still there."
+fixture = "refused"
+sentinels = ["keep-a.bin"]
+disable_delete_confirmation = true
+profiles = ["default", "deterministic"]
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# The mode is on and says so. The label is waited for: the header is drawn a row at a time.
+[[steps]]
+step = "wait_text"
+text = "REDUCED DELETE GUARD"
+region = "header"
+
+[[steps]]
+step = "select"
+name = "hostile"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "wait_text"
+text = "hostile"
+region = "header"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "unwritable"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "wait_text"
+text = "unwritable"
+region = "header"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "stuck.txt"
+
+# No dialog to read: nothing on screen says where the selected file is, so the step takes the path
+# from the scenario and checks it on disk before it presses Backspace.
+[[steps]]
+step = "delete"
+name = "stuck.txt"
+kind = "file"
+path = "hostile/unwritable/stuck.txt"
+timeout_ms = 30000
+
+# The removal was refused: the program says so, with nothing removed and one entry skipped. The
+# selected-item panel says so, in its own wording, because nothing was removed: the map is not
+# refreshed, so the entry stays selected on every platform. (The header's status row cannot be used
+# here: the unreadable path that the scan found, `Scan complete · 1 path unreadable`, outranks the
+# report in it.)
+[[steps]]
+step = "wait_text"
+text = "Last deletion: 0 removed, 1 skipped"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["DELETE FILE"]
+
+[[steps]]
+step = "expect_fs"
+present = ["hostile/unwritable/stuck.txt", "hostile/unwritable", "keep-a.bin"]
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "quit"
+
+# A deletion that failed leaves the operation partial, and the exit code says so (3, not 0).
+[[steps]]
+step = "expect_exit"
+code = 3
+terminal_restored = true
+residue = "none"

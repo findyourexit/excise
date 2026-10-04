@@ -74,6 +74,9 @@ pub struct PlannedStep {
 /// A scenario that passed every check.
 pub struct Plan {
     pub sentinels: Vec<String>,
+    /// Whether the scenario disables the confirmation dialog (`disable_delete_confirmation`), so
+    /// that a `delete` step has no dialog to read.
+    pub without_dialog: bool,
     pub steps: Vec<PlannedStep>,
 }
 
@@ -158,6 +161,7 @@ pub fn plan(scenario: &Scenario) -> Result<Plan, RunError> {
     }
     Ok(Plan {
         sentinels: scenario.sentinels.clone(),
+        without_dialog: scenario.disable_delete_confirmation,
         steps,
     })
 }
@@ -209,6 +213,9 @@ pub fn describe(step: &Step) -> String {
         Step::Signal(signal) => format!("signal {}", signal.signal),
         Step::ExpectScreen(expect) => format!("expect_screen{}", in_region(expect.region)),
         Step::ExpectFs(_) => "expect_fs".to_owned(),
+        Step::ExpectConfig(config) => {
+            format!("expect_config {} equals {:?}", config.key, config.equals)
+        }
         Step::ExpectExit(exit) => format!("expect_exit code {}", exit.code),
         Step::ExpectBudget(budget) => format!("expect_budget {}", budget.budget),
         Step::Measure(measure) => format!("measure {} {}", measure.name, measure.marker),

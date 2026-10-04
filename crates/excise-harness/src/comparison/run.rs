@@ -247,6 +247,7 @@ fn probe_scenario(comparison: &Comparison) -> Scenario {
         sentinels: Vec::new(),
         scan_store_on_volume: false,
         cgroup_memory_cap: false,
+        disable_delete_confirmation: false,
         profiles: vec![comparison.candidate_profile()],
         tier: scenario::Tier::default(),
         platforms: None,

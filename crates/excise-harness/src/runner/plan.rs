@@ -172,6 +172,7 @@ fn prepare_step(scenario: &Scenario, index: usize, step: &Step) -> Result<Prepar
         | Step::WaitFsPresent(_)
         | Step::Resize(_)
         | Step::ExpectFs(_)
+        | Step::ExpectConfig(_)
         | Step::Measure(_)
         | Step::Idle(_)
         | Step::Settle(_)
@@ -249,6 +250,9 @@ pub(crate) fn describe_step(step: &Step) -> String {
         Step::Signal(send) => format!("signal {}", send.signal),
         Step::ExpectScreen(expect) => format!("expect_screen{}", describe_region(expect.region)),
         Step::ExpectFs(_) => "expect_fs".to_owned(),
+        Step::ExpectConfig(config) => {
+            format!("expect_config {} equals {:?}", config.key, config.equals)
+        }
         Step::ExpectExit(exit) => format!(
             "expect_exit code {} terminal_restored {}",
             exit.code, exit.terminal_restored

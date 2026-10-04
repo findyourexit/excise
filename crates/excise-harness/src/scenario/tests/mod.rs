@@ -139,6 +139,11 @@ present = ["keep-a.bin", "nested/keep-b.txt"]
 absent = ["victim"]
 
 [[steps]]
+step = "expect_config"
+key = "runtime.theme"
+equals = "excise-light"
+
+[[steps]]
 step = "expect_budget"
 budget = "input_to_frame_p99_ms"
 metric = "delete-time"

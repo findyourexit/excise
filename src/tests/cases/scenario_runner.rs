@@ -66,14 +66,37 @@ fn bundled_in_process_scenarios_pass_under_every_declared_profile() {
     for (name, reason) in &selection.skipped {
         println!("SKIP {name}: {reason}");
     }
-    // Lifecycle scenarios, and the two that keep a filter from ending the program, must run
-    // in-process, under the user defaults and under reduced motion.
+    // Lifecycle scenarios, the two that keep a filter from ending the program, and the ports of the
+    // old deletion tests must run in-process, under the user defaults and under reduced motion.
+    // The two that need a folder the file system refuses to change run wherever it can express one,
+    // and the 60-column dialog only where its `platforms` let it run (its scenario file says why).
+    let unix_only: &[&str] = if cfg!(unix) {
+        &[
+            "delete-refused-by-permission",
+            "delete-refused-reduced-confirmation",
+            "delete-tree-narrow-terminal",
+        ]
+    } else {
+        &[]
+    };
     for lifecycle in [
         "delete-file-lifecycle",
+        "delete-file-cancelled",
+        "delete-file-terminal-too-small",
+        "delete-file-reduced-confirmation",
+        "delete-tree-confirmed-with-enter",
+        "delete-tree-reduced-confirmation",
+        "delete-tree-narrow-terminal-reduced-confirmation",
+        "exit-prompt-keeps-pending-deletion",
+        "theme-commit-saves",
         "navigate-and-quit",
         "filter-inside-opened-folder",
         "filter-nested-matches-at-root",
-    ] {
+    ]
+    .iter()
+    .chain(unix_only)
+    .copied()
+    {
         let scenario = selection
             .runnable
             .iter()
@@ -229,6 +252,396 @@ path = "keep-a.bin"
         "{run}"
     );
     assert!(!fixture.root().join("keep-a.bin").exists());
+}
+
+// --- The delete step with no dialog, the confirmation key, and the saved configuration -------------
+
+/// The top of a scenario over the `delete-file` fixture that disables the confirmation dialog, as
+/// `--disable-delete-confirmation` does.
+fn without_dialog() -> String {
+    format!("{DELETE_FILE}disable_delete_confirmation = true\n")
+}
+
+/// The keys the runner sent, in order.
+fn sent_codes(run: &ScenarioRun) -> Vec<KeyCode> {
+    run.sent_keys.iter().map(|key| key.code).collect()
+}
+
+/// The last `count` keys the runner sent.
+fn last_sent(run: &ScenarioRun, count: usize) -> Vec<KeyCode> {
+    let mut codes: Vec<KeyCode> = sent_codes(run).into_iter().rev().take(count).collect();
+    codes.reverse();
+    codes
+}
+
+#[test]
+fn a_deletion_with_no_dialog_presses_backspace_and_nothing_confirms_it() {
+    let (fixture, run) = execute(
+        &scenario(
+            &without_dialog(),
+            &select_then_delete("victim.bin", "victim.bin", "file"),
+        ),
+        Profile::Deterministic,
+    );
+    assert!(run.passed(), "{run}");
+    assert!(!fixture.root().join("victim.bin").exists());
+    for path in ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"] {
+        assert!(fixture.root().join(path).exists(), "`{path}` must survive");
+    }
+    assert_eq!(
+        last_sent(&run, 2)[1],
+        KeyCode::Backspace,
+        "{:?}",
+        run.sent_keys
+    );
+    assert!(
+        !sent_codes(&run).contains(&KeyCode::Char('y')),
+        "no key confirms a deletion that has no dialog: {:?}",
+        run.sent_keys
+    );
+}
+
+/// Runs a scenario with no dialog whose `delete` step must be refused, and checks that Backspace
+/// was never pressed and nothing was deleted.
+fn assert_delete_refused_without_dialog(header: &str, steps: &str, reason: &str) {
+    let (fixture, run) = execute(&scenario(header, steps), Profile::Deterministic);
+    let failure = failure_of(&run);
+    assert_eq!(failure.step.index, 2, "{run}");
+    assert!(failure.step.description.starts_with("delete "), "{run}");
+    assert!(failure.message.contains(reason), "{run}");
+    assert!(
+        !sent_codes(&run).contains(&KeyCode::Backspace),
+        "Backspace must never be pressed: {:?}",
+        run.sent_keys
+    );
+    for path in DELETE_FILE_FILES {
+        assert!(
+            fixture.root().join(path).exists(),
+            "`{path}` must be intact after a refused delete"
+        );
+    }
+}
+
+#[test]
+fn a_deletion_with_no_dialog_refuses_a_wrong_selection_before_it_presses_anything() {
+    // The panel shows another entry than the step says.
+    assert_delete_refused_without_dialog(
+        &without_dialog(),
+        &select_then_delete("keep-a.bin", "victim.bin", "file"),
+        "the selected-item panel shows \"keep-a.bin\", but the step deletes \"victim.bin\"",
+    );
+    // The panel shows the right name and another kind.
+    assert_delete_refused_without_dialog(
+        &without_dialog(),
+        &select_then_delete("victim.bin", "victim.bin", "folder"),
+        "the selected-item panel shows a file named \"victim.bin\", but the step deletes a folder",
+    );
+}
+
+#[test]
+fn a_deletion_with_no_dialog_checks_the_path_the_step_gives_on_disk() {
+    // Nothing on screen says where the selected entry is, so the step's `path` is the only claim:
+    // `victim.bin` is selected, and the step says it is in `docs`, where there is no such file.
+    assert_delete_refused_without_dialog(
+        &without_dialog(),
+        &format!(
+            "{}path = \"docs/victim.bin\"\n",
+            select_then_delete("victim.bin", "victim.bin", "file")
+        ),
+        "`docs/victim.bin` does not exist in the fixture",
+    );
+}
+
+/// The steps that open `docs/` and select `keep-1.txt` there, which the `delete-file` fixture
+/// keeps beside `keep-0.txt`, and then delete it. The `delete` step is the sixth.
+fn select_in_docs_then_delete(delete_fields: &str) -> String {
+    format!(
+        r#"
+[[steps]]
+step = "wait_header"
+state = "complete"
+
+[[steps]]
+step = "select"
+name = "docs"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+
+[[steps]]
+step = "select"
+name = "keep-1.txt"
+
+[[steps]]
+step = "delete"
+name = "keep-1.txt"
+kind = "file"
+{delete_fields}"#
+    )
+}
+
+#[test]
+fn a_delete_step_without_a_path_means_an_entry_directly_below_the_root() {
+    // The dialog names `docs/keep-1.txt`: a file of that name under the fixture root, but not the
+    // `keep-1.txt` at the root that a step without a `path` means.
+    let (fixture, run) = execute(
+        &scenario(DELETE_FILE, &select_in_docs_then_delete("")),
+        Profile::Deterministic,
+    );
+    let failure = failure_of(&run);
+    assert_eq!(failure.step.index, 5, "{run}");
+    assert!(failure.step.description.starts_with("delete "), "{run}");
+    assert!(
+        failure
+            .message
+            .contains("the dialog deletes \"docs/keep-1.txt\"")
+            && failure
+                .message
+                .contains("but the step expects \"keep-1.txt\""),
+        "{run}"
+    );
+    assert!(
+        !run.sent_keys
+            .iter()
+            .any(|key| key.code == KeyCode::Char('y')),
+        "`y` must never be sent: {:?}",
+        run.sent_keys
+    );
+    for path in DELETE_FILE_FILES {
+        assert!(
+            fixture.root().join(path).exists(),
+            "`{path}` must be intact after a refused delete"
+        );
+    }
+
+    // The same dialog is confirmed once the step says where the entry is.
+    let (fixture, run) = execute(
+        &scenario(
+            DELETE_FILE,
+            &select_in_docs_then_delete("path = \"docs/keep-1.txt\"\n"),
+        ),
+        Profile::Deterministic,
+    );
+    assert!(run.passed(), "{run}");
+    assert!(!fixture.root().join("docs/keep-1.txt").exists());
+    assert!(fixture.root().join("docs/keep-0.txt").exists());
+}
+
+/// The top of a scenario over the `twins` fixture, which has a file called `twin.bin` at its root
+/// and another in `docs/`, with no dialog to read.
+const TWINS_WITHOUT_DIALOG: &str = r#"
+schema_version = 1
+name = "scenario-under-test"
+description = "A scenario that a test built."
+fixture = "twins"
+sentinels = ["keep-a.bin"]
+disable_delete_confirmation = true
+profiles = ["default", "deterministic"]
+"#;
+
+#[test]
+fn a_deletion_with_no_dialog_refuses_a_name_and_kind_that_fit_two_entries() {
+    // The fresh map selects the `twin.bin` at the root, and the panel shows a file called
+    // `twin.bin`, which is also what the other one would show: with no dialog, Backspace would
+    // delete whichever is selected, whatever `path` says.
+    let steps = r#"
+[[steps]]
+step = "wait_header"
+state = "complete"
+
+[[steps]]
+step = "delete"
+name = "twin.bin"
+kind = "file"
+"#;
+    let (fixture, run) = execute(
+        &scenario(TWINS_WITHOUT_DIALOG, steps),
+        Profile::Deterministic,
+    );
+    let failure = failure_of(&run);
+    assert_eq!(failure.step.index, 1, "{run}");
+    assert!(failure.step.description.starts_with("delete "), "{run}");
+    assert!(
+        failure
+            .message
+            .contains("the fixture has 2 files called `twin.bin` (`docs/twin.bin`, `twin.bin`)"),
+        "{run}"
+    );
+    assert!(
+        !sent_codes(&run).contains(&KeyCode::Backspace),
+        "Backspace must never be pressed: {:?}",
+        run.sent_keys
+    );
+    for path in ["twin.bin", "docs/twin.bin", "keep-a.bin"] {
+        assert!(
+            fixture.root().join(path).exists(),
+            "`{path}` must be intact after a refused delete"
+        );
+    }
+}
+
+#[test]
+fn a_deletion_with_no_dialog_keeps_every_sentinel() {
+    let header = DELETE_FILE.replace(
+        "sentinels = [\"keep-a.bin\", \"docs/keep-0.txt\"]",
+        "sentinels = [\"keep-a.bin\", \"never-created.bin\"]",
+    );
+    assert_delete_refused_without_dialog(
+        &format!("{header}disable_delete_confirmation = true\n"),
+        &select_then_delete("victim.bin", "victim.bin", "file"),
+        "the sentinel `never-created.bin` does not exist; refusing to delete",
+    );
+    // A folder that holds a sentinel is not deleted either.
+    assert_delete_refused_without_dialog(
+        &without_dialog(),
+        &select_then_delete("docs", "docs", "folder"),
+        "the target `docs` contains the sentinel `docs/keep-0.txt`, which must survive",
+    );
+}
+
+#[test]
+fn a_deletion_with_no_dialog_fails_when_another_dialog_opens_instead_of_it_starting() {
+    // 49 columns are too few for a deletion: Backspace opens an error dialog and starts nothing.
+    // The filter prompt does not fit either, so the step acts on the entry the map armed, the
+    // largest, instead of one that `select` chose.
+    let header = format!("{}[terminal]\ncols = 49\nrows = 50\n", without_dialog());
+    let steps = format!(
+        r#"{WAIT_FOR_COMPLETE}
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+"#
+    );
+    let (fixture, run) = execute(&scenario(&header, &steps), Profile::Deterministic);
+    let failure = failure_of(&run);
+    assert_eq!(failure.step.index, 1, "{run}");
+    assert!(
+        failure
+            .message
+            .contains("the dialog `ERROR` opened instead of a deletion starting"),
+        "{run}"
+    );
+    assert!(fixture.root().join("victim.bin").exists());
+}
+
+#[test]
+fn the_reduced_confirmation_mode_reaches_the_program_only_when_the_scenario_asks_for_it() {
+    let steps = format!(
+        r#"{WAIT_FOR_COMPLETE}
+[[steps]]
+step = "expect_screen"
+contains = ["REDUCED DELETE GUARD"]
+region = "header"
+"#
+    );
+    let (_fixture, run) = execute(&scenario(&without_dialog(), &steps), Profile::Deterministic);
+    assert!(run.passed(), "{run}");
+
+    let (_fixture, run) = execute(&scenario(DELETE_FILE, &steps), Profile::Deterministic);
+    let failure = failure_of(&run);
+    assert_eq!(failure.step.index, 1, "{run}");
+}
+
+#[test]
+fn a_delete_step_confirms_with_the_key_it_names_and_no_other() {
+    for (confirm_with, key) in [("y", KeyCode::Char('y')), ("enter", KeyCode::Enter)] {
+        let steps = format!(
+            r#"{WAIT_FOR_COMPLETE}
+[[steps]]
+step = "select"
+name = "victim.bin"
+
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+confirm_with = "{confirm_with}"
+"#
+        );
+        let (fixture, run) = execute(&scenario(DELETE_FILE, &steps), Profile::Deterministic);
+        assert!(run.passed(), "{confirm_with}: {run}");
+        assert!(
+            !fixture.root().join("victim.bin").exists(),
+            "{confirm_with}"
+        );
+        // Backspace opened the dialog, and the named key confirmed it.
+        assert_eq!(
+            last_sent(&run, 2),
+            [KeyCode::Backspace, key],
+            "{confirm_with}: {:?}",
+            run.sent_keys
+        );
+    }
+}
+
+/// Opens the theme picker, moves to the next theme, and saves it.
+const COMMIT_THE_NEXT_THEME: &str = r#"
+[[steps]]
+step = "key"
+key = "t"
+
+[[steps]]
+step = "wait_text"
+text = "THEME PREVIEW"
+region = "dialog"
+
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "settle"
+"#;
+
+fn expect_theme(equals: &str) -> String {
+    format!(
+        r#"
+[[steps]]
+step = "expect_config"
+key = "runtime.theme"
+equals = "{equals}"
+"#
+    )
+}
+
+#[test]
+fn expect_config_reads_the_setting_a_theme_commit_saved() {
+    let steps = format!(
+        "{WAIT_FOR_COMPLETE}{COMMIT_THE_NEXT_THEME}{}",
+        expect_theme("excise-light")
+    );
+    let (_fixture, run) = execute(&scenario(DELETE_FILE, &steps), Profile::Deterministic);
+    assert!(run.passed(), "{run}");
+}
+
+#[test]
+fn expect_config_says_what_the_file_holds_when_it_differs_or_holds_nothing() {
+    // Nothing was saved: the file is the empty configuration the runner wrote.
+    let steps = format!("{WAIT_FOR_COMPLETE}{}", expect_theme("excise-light"));
+    let (_fixture, run) = execute(&scenario(DELETE_FILE, &steps), Profile::Deterministic);
+    let failure = failure_of(&run);
+    assert_eq!(failure.step.index, 1, "{run}");
+    assert!(failure.message.contains("has no table `runtime`"), "{run}");
+
+    // The commit saved another theme than the step expects.
+    let steps = format!(
+        "{WAIT_FOR_COMPLETE}{COMMIT_THE_NEXT_THEME}{}",
+        expect_theme("excise-dark")
+    );
+    let (_fixture, run) = execute(&scenario(DELETE_FILE, &steps), Profile::Deterministic);
+    let failure = failure_of(&run);
+    assert_eq!(failure.step.index, 6, "{run}");
+    assert!(failure.message.contains("it is \"excise-light\""), "{run}");
 }
 
 // --- Bounded waits ----------------------------------------------------------------------------

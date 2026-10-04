@@ -298,12 +298,12 @@ fn the_facade_turns_a_fixture_id_into_a_marked_fresh_root() {
 
 #[test]
 fn the_facade_never_caches_a_fixture_that_cargo_clean_could_not_remove() {
-    // A directory that cannot be listed and a path longer than `PATH_MAX` both defeat a path-based
-    // removal, and the shared cache lives below the target directory, which `cargo clean` and
-    // `git worktree remove` must always be able to remove.
+    // A directory that cannot be listed, one that nothing can be removed from, and a path longer
+    // than `PATH_MAX` each defeat a path-based removal, and the shared cache lives below the target
+    // directory, which `cargo clean` and `git worktree remove` must always be able to remove.
     let scratch = Scratch::new();
     let fixtures = Fixtures::new(FixtureSpec::bundled_dir(), scratch.cache());
-    for id in ["hostile-small", "deep-past-path-max"] {
+    for id in ["hostile-small", "refused", "deep-past-path-max"] {
         assert!(
             matches!(fixtures.master(id), Err(FixtureError::NotCacheable { .. })),
             "{id} is refused"

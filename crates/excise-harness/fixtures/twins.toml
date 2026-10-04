@@ -1,0 +1,22 @@
+schema_version = 1
+id = "twins"
+description = "Two files called `twin.bin`, one at the root and one in `docs/`, and `keep-a.bin` beside them. The selected-item panel shows a name and a kind and nothing else, so it cannot tell the twins apart: the checks that refuse a deletion with no dialog when two entries fit the panel run against this fixture. The id is short on purpose: the deletion dialog cuts a long path, and the `delete` step refuses a path it cannot read whole."
+seed = 20261005
+
+[[parts]]
+kind = "file"
+root = "twin.bin"
+size = 20480
+
+[[parts]]
+kind = "file"
+root = "keep-a.bin"
+size = 4096
+
+[[parts]]
+kind = "tree"
+root = "docs"
+depth = 0
+files_per_dir = 1
+file_names = { style = "literal", name = "twin.bin" }
+file_size = 8192

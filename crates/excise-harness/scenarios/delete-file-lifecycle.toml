@@ -1,6 +1,6 @@
 schema_version = 1
 name = "delete-file-lifecycle"
-description = "Deleting a file removes only that file, leaves its siblings alone, and keeps the map navigable."
+description = "Deleting a file removes only that file, leaves its siblings alone, reports what it removed, and keeps the map navigable."
 fixture = "delete-file"
 sentinels = ["keep-a.bin", "docs/keep-0.txt"]
 profiles = ["default", "deterministic"]
@@ -33,6 +33,21 @@ timeout_ms = 30000
 step = "expect_fs"
 present = ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
 absent = ["victim.bin"]
+
+# What the interface reports afterwards: one entry deleted, and none failed, changed, missing, or
+# left unattempted. The header's status row says so whether or not an entry is selected. The
+# selected-item panel's shorter wording ("1 removed") needs a selection, which the map keeps after
+# a deletion on some platforms and not on others, so it is not asserted.
+[[steps]]
+step = "wait_text"
+text = "Last deletion: 1 deleted · 0 changed · 0 missing · 0 failed · 0 not run"
+region = "header"
+timeout_ms = 30000
+
+# And no dialog is left.
+[[steps]]
+step = "expect_screen"
+not_contains = ["DELETE FILE"]
 
 # The map stays navigable: it still completes, and another entry can be selected.
 [[steps]]

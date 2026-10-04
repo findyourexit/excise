@@ -1,0 +1,67 @@
+schema_version = 1
+name = "theme-commit-saves"
+description = "Choosing a theme in the picker and pressing Enter saves it to the configuration file, and quitting afterwards shows only the ordinary quit prompt, with no extra question about saving preferences."
+fixture = "delete-file"
+sentinels = ["keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 100
+rows = 30
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "key"
+key = "t"
+
+[[steps]]
+step = "wait_text"
+text = "THEME PREVIEW"
+region = "dialog"
+
+# The picker opens on the current theme; Down moves the preview to the next one and Enter saves it.
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+# The commit runs before the frame that `settle` waits for, so the file holds the choice by now.
+[[steps]]
+step = "settle"
+
+[[steps]]
+step = "expect_config"
+key = "runtime.theme"
+equals = "excise-light"
+
+# Quitting goes to the ordinary prompt and nothing else. `q` would cancel a picker that was still
+# open instead of asking to quit, so the prompt also shows that the commit closed the picker.
+[[steps]]
+step = "key"
+key = "q"
+
+[[steps]]
+step = "wait_text"
+text = "Quit Excise?"
+region = "dialog"
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["Save interface preferences before quitting?"]
+
+[[steps]]
+step = "key"
+key = "y"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"

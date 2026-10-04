@@ -20,7 +20,10 @@ const SMALL: &[&str] = &[
     "hostile-small",
     "identity-small",
     "mount-boundary",
+    "nested",
     "node-modules-2k",
+    "refused",
+    "twins",
     "wide-1k",
 ];
 
@@ -455,6 +458,74 @@ fn hostile_fixtures_clean_up_completely_even_with_unreadable_directories() {
         "the scratch directory must be gone: {}",
         path.display()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_unwritable_class_refuses_every_change_and_still_cleans_up() {
+    let scratch = Scratch::new();
+    let path = scratch.path().to_path_buf();
+    let master = master(&scratch, "refused");
+    let capabilities = &master.marker.capabilities;
+    let oracle = oracle_of(&master.root);
+    assert!(oracle.compare(master.plan(), capabilities).is_clean());
+    assert_eq!(spec("refused").planned_entry_count(), 4);
+    assert!(
+        !spec("refused").removable_by_path(),
+        "a path-based removal cannot remove files from a mode 555 directory"
+    );
+
+    let directory = oracle
+        .find(&RelPath::from_bytes("hostile/unwritable").unwrap_or_else(|error| panic!("{error}")))
+        .unwrap_or_else(|| panic!("the unwritable directory is missing"));
+    assert_eq!(directory.mode, Some(0o555));
+
+    // A user that is not root cannot remove what is inside: the entry is listed and readable, and
+    // that is all. Root ignores the mode, which the marker records.
+    let stuck = master.root.join("hostile/unwritable/stuck.txt");
+    assert!(stuck.is_file(), "the file is there to be listed");
+    if capabilities.running_as_root() == Some(false) {
+        assert!(std::fs::remove_file(&stuck).is_err());
+        assert!(std::fs::remove_dir_all(&master.root).is_err());
+        assert!(stuck.is_file(), "the refused removal changed nothing");
+    }
+    drop(scratch);
+    assert!(
+        !path.exists(),
+        "the harness's own removal restores access first: {}",
+        path.display()
+    );
+}
+
+#[test]
+fn a_fixture_that_refuses_only_a_user_who_is_not_root_is_refused_to_root() {
+    use crate::fixture::{Capabilities, FixtureError, run::require_unprivileged_user};
+
+    let unwritable = spec("refused");
+    assert!(unwritable.needs_unprivileged_user());
+    // The unreadable directories of the hostile class are marked, not relied on: root reads them.
+    assert!(!spec("hostile-small").needs_unprivileged_user());
+    assert!(!spec("delete-folder").needs_unprivileged_user());
+
+    let capabilities = Capabilities::all_supported();
+    let as_root = capabilities.clone().with_running_as_root(Some(true));
+    let refusal = require_unprivileged_user(&unwritable, &as_root)
+        .expect_err("root is not refused by a mode");
+    assert!(
+        matches!(&refusal, FixtureError::NeedsUnprivilegedUser { id } if id == "refused"),
+        "{refusal}"
+    );
+    assert!(refusal.to_string().contains("not root"), "{refusal}");
+
+    for answer in [Some(false), None] {
+        let capabilities = capabilities.clone().with_running_as_root(answer);
+        assert!(
+            require_unprivileged_user(&unwritable, &capabilities).is_ok(),
+            "{answer:?}"
+        );
+    }
+    // A fixture that needs nothing of the user is never refused, root or not.
+    assert!(require_unprivileged_user(&spec("delete-file"), &as_root).is_ok());
 }
 
 #[test]

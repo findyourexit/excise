@@ -30,17 +30,18 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use excise_harness::fixture::mutate;
 use excise_harness::report::{FailedStep, ScreenComparison};
+use excise_harness::safety::FixtureRoot;
 use excise_harness::scenario::{
-    Delete, EntryKind, ExpectExit, ExpectFs, ExpectScreen, FsMutate, KeyName, PressKey, Quit,
-    Resize, ScanState, Select, Step, TypeText, WaitText,
+    ConfirmKey, Delete, EntryKind, ExpectConfig, ExpectExit, ExpectFs, ExpectScreen, FsMutate,
+    KeyName, PressKey, Quit, Resize, ScanState, Select, Step, TypeText, WaitText, config_setting,
 };
 
 use super::backend::SharedBackend;
 use super::checks::{
-    check_target, expectation, fs_expectation, fs_violations, is_delete_dialog, region_name,
-    screen_violations,
+    check_target, check_target_path, expectation, fs_expectation, fs_violations, is_delete_dialog,
+    region_name, screen_violations,
 };
-use super::fixture::entry_exists;
+use super::fixture::{entry_exists, entry_metadata};
 use super::plan::{Plan, PlannedStep};
 use super::report::StepFailure;
 use super::screen::{Panel, Screen};
@@ -178,6 +179,9 @@ enum DeletePhase {
     Dialog(Wait),
     /// The confirmation was sent; wait for the dialog to close.
     Closed(Wait),
+    /// No dialog confirms the deletion (`disable_delete_confirmation`): Backspace was sent; wait
+    /// for the program to settle, and fail if a dialog is open.
+    Begun(Wait),
 }
 
 enum QuitPhase {
@@ -211,6 +215,8 @@ pub struct ScenarioInput {
     plan: Rc<Plan>,
     backend: SharedBackend,
     root: PathBuf,
+    /// The configuration file the program was given (`EXCISE_CONFIG`'s counterpart).
+    config: PathBuf,
     limits: Limits,
     progress: Rc<RefCell<Progress>>,
     /// Events a step has decided on and not yet delivered.
@@ -228,6 +234,7 @@ impl ScenarioInput {
         plan: Rc<Plan>,
         backend: SharedBackend,
         root: PathBuf,
+        config: PathBuf,
         limits: Limits,
         progress: Rc<RefCell<Progress>>,
     ) -> Self {
@@ -235,6 +242,7 @@ impl ScenarioInput {
             plan,
             backend,
             root,
+            config,
             limits,
             progress,
             queued: VecDeque::new(),
@@ -303,6 +311,7 @@ impl ScenarioInput {
             Step::WaitFsPresent(wait) => self.wait_fs(&wait.path, true, wait.timeout_ms),
             Step::ExpectScreen(expect) => self.expect_screen(expect, planned),
             Step::ExpectFs(expect) => self.expect_fs(expect),
+            Step::ExpectConfig(expect) => self.expect_config(expect),
             Step::FsMutate(change) => self.fs_mutate(change),
             Step::ExpectExit(exit) => self.wait_for_exit(exit),
             Step::Select(select) => self.select(select),
@@ -509,6 +518,30 @@ impl ScenarioInput {
         fail(fs_expectation(expect), violations.join("; "))
     }
 
+    /// Reads the configuration file the program was given and compares one setting of it. The
+    /// program writes the file as it handles a key, so the check runs on a fresh screen: a barrier
+    /// comes first when input was delivered since the last one.
+    fn expect_config(&mut self, expect: &ExpectConfig) -> Drive {
+        if !self.fresh {
+            return Drive::Barrier;
+        }
+        let expected = format!(
+            "`{}` in the configuration file to be {:?}",
+            expect.key, expect.equals
+        );
+        let found = std::fs::read_to_string(&self.config)
+            .map_err(|error| format!("the configuration file cannot be read: {error}"))
+            .and_then(|text| config_setting(&text, &expect.key));
+        match found {
+            Ok(value) if value == expect.equals => {
+                self.complete();
+                Drive::Next
+            }
+            Ok(value) => fail(expected, format!("it is {value:?}")),
+            Err(message) => fail(expected, message),
+        }
+    }
+
     /// `expect_exit` is only ever read while the program is still running: once it has exited,
     /// nothing asks for input again and the runner judges the exit. So this waits, with barriers,
     /// for an exit that is still pending, and fails when it never comes.
@@ -613,21 +646,31 @@ impl ScenarioInput {
     /// Asks to delete the selected entry. It sends `y` only when the dialog names exactly this
     /// entry and kind under the fixture root and every sentinel exists. Any mismatch fails the step
     /// and `y` is never sent.
+    ///
+    /// A scenario that disables the confirmation (`disable_delete_confirmation`) has no dialog:
+    /// the step checks the selected-item panel, the disk, and the sentinels, sends Backspace
+    /// alone, and fails if a dialog opens.
     fn delete(&mut self, delete: &Delete) -> Drive {
         let phase = match std::mem::take(&mut self.state) {
             State::Delete(phase) => phase,
             _ => DeletePhase::Start,
         };
         let bound = delete.timeout_ms;
-        let expected = format!(
-            "the delete dialog names {:?} ({}) under the fixture root, and every sentinel exists",
-            delete.name, delete.kind
-        );
+        let expected = self.delete_expectation(delete);
         match phase {
             DeletePhase::Start => {
                 if !self.fresh {
                     self.state = State::Delete(DeletePhase::Start);
                     return Drive::Barrier;
+                }
+                if self.plan.without_dialog {
+                    return match self.verify_selection(delete) {
+                        Ok(()) => {
+                            self.state = State::Delete(DeletePhase::Begun(Wait::new(bound)));
+                            Drive::Emit(vec![key_event(KeyCode::Backspace)])
+                        }
+                        Err(message) => fail(expected, message),
+                    };
                 }
                 self.state = State::Delete(DeletePhase::Dialog(Wait::new(bound)));
                 Drive::Emit(vec![key_event(KeyCode::Backspace)])
@@ -649,7 +692,10 @@ impl ScenarioInput {
                     Advance::Ready(dialog) => match self.verify_delete(&dialog, delete) {
                         Ok(()) => {
                             self.state = State::Delete(DeletePhase::Closed(Wait::new(bound)));
-                            Drive::Emit(vec![char_event('y')])
+                            Drive::Emit(vec![match delete.confirm_with {
+                                ConfirmKey::Y => char_event('y'),
+                                ConfirmKey::Enter => key_event(KeyCode::Enter),
+                            }])
                         }
                         Err(message) => fail(expected, message),
                     },
@@ -664,9 +710,10 @@ impl ScenarioInput {
                     return self.barrier_for(wait, |wait| State::Delete(DeletePhase::Closed(wait)));
                 }
                 let check = match self.snapshot().dialog() {
-                    Some(dialog) if is_delete_dialog(&dialog) => {
-                        Check::Pending("the confirmation dialog is still open after `y`".to_owned())
-                    }
+                    Some(dialog) if is_delete_dialog(&dialog) => Check::Pending(format!(
+                        "the confirmation dialog is still open after `{}`",
+                        delete.confirm_with
+                    )),
                     _ => Check::Ready(()),
                 };
                 match self.advance(wait, check) {
@@ -679,6 +726,56 @@ impl ScenarioInput {
                     }
                     Advance::Fail(message) => fail("the confirmation dialog closes", message),
                 }
+            }
+            DeletePhase::Begun(wait) => self.delete_begun(wait, expected),
+        }
+    }
+
+    /// What the delete step looks for, in words: the dialog it reads, or with no dialog the panel.
+    fn delete_expectation(&self, delete: &Delete) -> String {
+        if self.plan.without_dialog {
+            format!(
+                "the selected-item panel shows the {} {:?}, which Backspace alone deletes at {:?}, \
+                 and every sentinel exists",
+                delete.kind,
+                delete.name,
+                delete.path.as_deref().unwrap_or(&delete.name)
+            )
+        } else {
+            format!(
+                "the delete dialog names {:?} ({}) under the fixture root, and every sentinel \
+                 exists",
+                delete.name, delete.kind
+            )
+        }
+    }
+
+    /// After the Backspace of a deletion with no dialog: any dialog that is open means the program
+    /// did not start the deletion, and none means it did.
+    fn delete_begun(&mut self, wait: Wait, expected: String) -> Drive {
+        if !self.fresh {
+            return self.barrier_for(wait, |wait| State::Delete(DeletePhase::Begun(wait)));
+        }
+        match self.snapshot().dialog() {
+            Some(dialog) if is_delete_dialog(&dialog) => fail(
+                expected,
+                format!(
+                    "a confirmation dialog opened although the scenario disables confirmation, \
+                     so the program did not honour the mode; no key was sent to confirm it:\n{}",
+                    dialog.lines().join("\n")
+                ),
+            ),
+            Some(dialog) => fail(
+                expected,
+                format!(
+                    "the dialog `{}` opened instead of a deletion starting:\n{}",
+                    dialog.title(),
+                    dialog.lines().join("\n")
+                ),
+            ),
+            None => {
+                self.complete();
+                Drive::Next
             }
         }
     }
@@ -704,6 +801,10 @@ impl ScenarioInput {
             return Err("the dialog shows no path".to_owned());
         };
         check_target(shown, &self.root, &delete.name)?;
+        // Where the entry is: the step's `path`, or `name` itself directly below the root. The
+        // dialog's name alone would accept a same-named entry in another folder.
+        let path = delete.path.as_deref().unwrap_or(&delete.name);
+        check_target_path(shown, &self.root, path)?;
         for sentinel in &self.plan.sentinels {
             match entry_exists(&self.root, sentinel) {
                 Ok(true) => {}
@@ -716,6 +817,57 @@ impl ScenarioInput {
             }
         }
         Ok(())
+    }
+
+    /// For a deletion no dialog confirms: checks the selected-item panel, the entry on disk, and
+    /// the sentinels before Backspace. Nothing on screen shows where the selected entry lives, so
+    /// that is the step's `path` (or its `name`, directly below the root), and the panel's name
+    /// and kind prove it only when no other entry of the fixture has them.
+    fn verify_selection(&self, delete: &Delete) -> Result<(), String> {
+        let selected = self.snapshot().selected_item().ok_or_else(|| {
+            "the selected-item panel shows no selection, or is not drawn at this terminal size"
+                .to_owned()
+        })?;
+        if selected.name != delete.name {
+            return Err(format!(
+                "the selected-item panel shows {:?}, but the step deletes {:?}",
+                selected.name, delete.name
+            ));
+        }
+        if selected.kind != delete.kind.to_string() {
+            return Err(format!(
+                "the selected-item panel shows a {} named {:?}, but the step deletes a {}",
+                selected.kind, delete.name, delete.kind
+            ));
+        }
+        let relative = delete.path.as_deref().unwrap_or(&delete.name);
+        match entry_metadata(&self.root, relative)? {
+            Some(metadata) if metadata.is_dir() == (delete.kind == EntryKind::Folder) => {}
+            Some(metadata) => {
+                return Err(format!(
+                    "`{relative}` is a {} on disk, but the step deletes a {}",
+                    if metadata.is_dir() { "folder" } else { "file" },
+                    delete.kind
+                ));
+            }
+            None => return Err(format!("`{relative}` does not exist in the fixture")),
+        }
+        for sentinel in &self.plan.sentinels {
+            if !entry_exists(&self.root, sentinel)? {
+                return Err(format!(
+                    "the sentinel `{sentinel}` does not exist; refusing to delete"
+                ));
+            }
+            if sentinel == relative || sentinel.starts_with(&format!("{relative}/")) {
+                return Err(format!(
+                    "the target `{relative}` contains the sentinel `{sentinel}`, which must survive"
+                ));
+            }
+        }
+        // The panel shows a name and a kind only, so they must point at one entry in the fixture.
+        FixtureRoot::open(&self.root)
+            .map_err(|error| error.to_string())?
+            .require_only_entry(&delete.name, delete.kind, relative)
     }
 
     /// Asks to quit, waits for the ordinary quit prompt, and confirms it.
@@ -879,6 +1031,7 @@ path = "extra.bin"
             plan,
             SharedBackend::new(120, 40),
             fixture.root().to_path_buf(),
+            std::path::PathBuf::new(),
             Limits::default(),
             Rc::new(RefCell::new(Progress::default())),
         );

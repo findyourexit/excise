@@ -4,11 +4,11 @@ use std::{collections::BTreeMap, collections::BTreeSet, fs};
 
 use super::{ALL_STEPS, BASE, TempDir, parse, valid};
 use crate::scenario::{
-    Budget, Comparison, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, EntryKind, EventField, EventKind,
-    Expect, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, FsMutate, Idle, KeyName, LoadError,
-    Marker, Measure, MutateOp, PressKey, Profile, Quit, Region, Residue, Resize, ScanState,
-    Scenario, Select, SendSignal, Settle, Signal, Step, Terminal, Tier, TypeText, WaitEvent,
-    WaitFs, WaitHeader, WaitText,
+    Budget, Comparison, ConfirmKey, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, EntryKind, EventField,
+    EventKind, Expect, ExpectBudget, ExpectConfig, ExpectExit, ExpectFs, ExpectScreen, FsMutate,
+    Idle, KeyName, LoadError, Marker, Measure, MutateOp, PressKey, Profile, Quit, Region, Residue,
+    Resize, ScanState, Scenario, Select, SendSignal, Settle, Signal, Step, Terminal, Tier,
+    TypeText, WaitEvent, WaitFs, WaitHeader, WaitText,
 };
 
 const HEAD: &str = r#"schema_version = 1
@@ -303,6 +303,8 @@ fn delete_parses_a_name_and_both_kinds() {
         Step::Delete(Delete {
             name: "victim".to_owned(),
             kind: EntryKind::Folder,
+            path: None,
+            confirm_with: ConfirmKey::Y,
             wait_for: DeleteWait::Finished,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         })
@@ -312,10 +314,62 @@ fn delete_parses_a_name_and_both_kinds() {
         Step::Delete(Delete {
             name: "keep.bin".to_owned(),
             kind: EntryKind::File,
+            path: None,
+            confirm_with: ConfirmKey::Y,
             wait_for: DeleteWait::Finished,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         })
     );
+}
+
+#[test]
+fn delete_parses_where_a_nested_entry_is() {
+    let source = "step = \"delete\"\nname = \"stuck.txt\"\nkind = \"file\"\n\
+                  path = \"hostile/unwritable/stuck.txt\"";
+    assert_eq!(
+        step(source),
+        Step::Delete(Delete {
+            name: "stuck.txt".to_owned(),
+            kind: EntryKind::File,
+            path: Some("hostile/unwritable/stuck.txt".to_owned()),
+            confirm_with: ConfirmKey::Y,
+            wait_for: DeleteWait::Finished,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        })
+    );
+}
+
+#[test]
+fn delete_confirms_with_y_unless_it_names_enter() {
+    let confirm_with = |line: &str| {
+        let source = format!("step = \"delete\"\nname = \"victim\"\nkind = \"folder\"\n{line}");
+        match step(&source) {
+            Step::Delete(delete) => delete.confirm_with,
+            other => panic!("expected a delete step, got {other:?}"),
+        }
+    };
+    assert_eq!(confirm_with(""), ConfirmKey::Y);
+    assert_eq!(confirm_with("confirm_with = \"y\""), ConfirmKey::Y);
+    assert_eq!(confirm_with("confirm_with = \"enter\""), ConfirmKey::Enter);
+}
+
+#[test]
+fn expect_config_parses_a_key_and_the_string_it_must_equal() {
+    assert_eq!(
+        step("step = \"expect_config\"\nkey = \"runtime.theme\"\nequals = \"excise-light\""),
+        Step::ExpectConfig(ExpectConfig {
+            key: "runtime.theme".to_owned(),
+            equals: "excise-light".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn the_delete_confirmation_is_on_unless_the_scenario_disables_it() {
+    assert!(!valid().disable_delete_confirmation);
+    let source =
+        format!("{HEAD}disable_delete_confirmation = true\n\n[[steps]]\nstep = \"settle\"\n");
+    assert!(parse(&source).disable_delete_confirmation);
 }
 
 #[test]

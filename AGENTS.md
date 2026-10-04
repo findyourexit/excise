@@ -13,7 +13,7 @@ This file is canonical: `CLAUDE.md` and `.github/copilot-instructions.md` only p
 ## Safety rules
 
 - Run `excise` only through the harness, against the fixtures it generates. Never run it against a real path (`~`, a project, a mounted volume).
-- Trigger deletions only through a scenario's `delete` step. It presses `y` only after the dialog names exactly the expected entry and every declared sentinel still exists, and a scenario with a `delete` step must declare sentinels.
+- Trigger deletions only through a scenario's `delete` step. It presses `y` (or Enter, with `confirm_with = "enter"`) only after the dialog names exactly the expected entry and every declared sentinel still exists. A scenario that sets `disable_delete_confirmation` has no dialog: the step then checks the selected-item panel, the entry on disk, and every sentinel, and presses Backspace alone. A scenario with a `delete` step must declare sentinels.
 - Every fixture root carries the ownership marker, a regular file named `.excise-harness-owned`, and every runner refuses a root without it. Never add the marker to a directory the harness did not generate.
 - Leave no residue. Runs use scratch directories that are removed afterwards. If you pass `--keep-fixture` or `--keep-scratch`, remove what it kept when you are done, and check that no `xh-*` entry is left in `/tmp` or `$TMPDIR`.
 - Bound every wait, and kill the child's whole process group on a timeout, as the runners do.
@@ -68,7 +68,9 @@ A scenario is a strict TOML file (unknown fields are errors), `crates/excise-har
 
 - Lifecycle scenarios declare the `default` and `deterministic` profiles and end with `quit` and `expect_exit` with `residue = "none"`.
 - Wait with `wait_header` before you act, never for the screen to go idle. Every wait takes a `timeout_ms` (10 s by default).
+- Put a `settle` after `key = "esc"`: a key sent right behind a lone Esc can be read with it as Alt plus that key.
 - A scenario whose verdict depends on timing includes a step only the pseudo-terminal runner performs (`wait_event`, `measure`, `expect_budget`, `signal`), so that the in-process runner, which never judges timing, skips it.
+- To start `excise` in its reduced-confirmation mode, set the typed `disable_delete_confirmation = true`. A scenario never passes arguments of its own, because they could point the program at a root the harness does not own.
 
 The steps:
 
@@ -78,7 +80,7 @@ The steps:
 - `key`: press one key, with optional `ctrl` and `alt`.
 - `type`: type literal text.
 - `select`: select an entry by name through the filter, and check the inspector shows exactly it.
-- `delete`: press Backspace, check the dialog and every sentinel, and only then press `y`. A mismatch fails the step and sends no `y`.
+- `delete`: press Backspace, check the dialog and every sentinel, and only then confirm with `y` (or Enter, with `confirm_with`). A mismatch fails the step and confirms nothing. `path` says where the entry is and defaults to `name` directly below the root: the dialog must show exactly that, so an entry below a folder needs its `path`. With `disable_delete_confirmation = true` there is no dialog: the step waits for the selected-item panel to name the entry, checks the entry on disk (at `path`, for an entry below the root) and every sentinel, refuses when another entry of the fixture has the same name and kind (the panel could not say which one Backspace deletes), then presses Backspace alone and fails if a dialog opens.
 - `wait_fs_absent`: wait until a fixture-relative path no longer exists.
 - `wait_fs_present`: wait until a fixture-relative path exists.
 - `fs_mutate`: change the fixture while excise runs (`appear`, `change`, `vanish`, `replace`).
@@ -86,6 +88,7 @@ The steps:
 - `signal`: deliver a Unix signal or a Windows console event (pseudo-terminal runner only).
 - `expect_screen`: assert what the screen shows now.
 - `expect_fs`: assert which fixture-relative paths exist now.
+- `expect_config`: assert one string setting of the configuration file the program saved, by dotted `key` (`runtime.theme`). Put a `settle` before it.
 - `expect_exit`: wait for the exit, and assert the exit code, the terminal restored, and no residue.
 - `expect_budget`: assert that a recorded metric is within a named budget (pseudo-terminal runner only).
 - `measure`: record the time between a `start` and a `stop` marker as a metric (pseudo-terminal runner only).
