@@ -1,0 +1,169 @@
+name: X8 store-thread round 4 probe (temporary)
+
+on:
+  push:
+    branches:
+      - "probe/x8-store-thread"
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: ubuntu-24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      EXCISE_HARNESS_CGROUP: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+          nproc; free -m; uptime
+      - name: Library and integration tests
+        shell: bash
+        run: |
+          status=0
+          cargo test --workspace --locked || status=1
+          echo "TESTS-STATUS $status"
+      - name: e2e nightly (every Linux scenario once)
+        shell: bash
+        run: |
+          status=0
+          cargo run --locked --package xtask -- e2e --nightly || status=1
+          echo "E2E-NIGHTLY-STATUS $status"
+      - name: Latency scenarios x5
+        shell: bash
+        run: |
+          status=0
+          cargo run --locked --package xtask -- e2e --full --scenario latency-under-scan-load --scenario latency-under-slow-terminal --scenario latency-under-export-after-deletion --repeat 5 || status=1
+          echo "E2E-LATENCY-STATUS $status"
+      - name: Deletion and signal scenarios x3
+        shell: bash
+        run: |
+          status=0
+          cargo run --locked --package xtask -- e2e --full --scenario delete-file-lifecycle --scenario delete-folder-lifecycle --scenario latency-under-deletion-load-default --scenario latency-under-deletion-load-deterministic --scenario signal-second-forces-exit --scenario signal-term-mid-deletion --scenario signal-hup-mid-deletion --scenario signal-quit-mid-deletion --scenario signal-term-mid-scan --repeat 3 || status=1
+          echo "E2E-DELETION-STATUS $status"
+      - name: Comparisons, two rounds
+        shell: bash
+        run: |
+          for round in 1 2; do
+            status=0
+            cargo run --locked --package xtask -- compare --nightly || status=1
+            echo "COMPARE-ROUND $round STATUS $status"
+          done
+      - name: Headless full
+        shell: bash
+        run: |
+          status=0
+          cargo run --locked --package xtask -- headless --full || status=1
+          echo "HEADLESS-STATUS $status"
+      - name: Scan-store quota on a privileged volume
+        shell: bash
+        run: |
+          status=0
+          EXCISE_HARNESS_PRIVILEGED=1 cargo run --locked --package xtask -- e2e --full --scenario scan-store-quota || status=1
+          echo "QUOTA-STATUS $status"
+      - name: Headless A/B against main (informational)
+        shell: bash
+        run: |
+          status=0
+          git fetch --no-tags origin main
+          cargo run --locked --package xtask -- bench-e2e --baseline origin/main --fixture tiny-files-50k --fixture tiny-files-250k --pairs 5 || status=1
+          echo "BENCH-STATUS $status"
+      - name: Keep the run documents
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: x8-r4-probe-linux
+          path: |
+            target/excise-e2e/
+            target/excise-compare/
+            target/excise-headless/
+            target/excise-bench-e2e/
+          retention-days: 14
+
+  windows:
+    name: windows-2025
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+      - name: Library and integration tests
+        shell: bash
+        run: |
+          status=0
+          cargo test --workspace --locked || status=1
+          echo "TESTS-STATUS $status"
+      - name: e2e full x3 (every Windows scenario)
+        shell: bash
+        env:
+          EXCISE_E2E_TMPDIR: ${{ runner.temp }}
+        run: |
+          status=0
+          cargo run --locked --package xtask -- e2e --full --repeat 3 || status=1
+          echo "E2E-WINDOWS-STATUS $status"
+      - name: Keep the run documents
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: x8-r4-probe-windows
+          path: target/excise-e2e/
+          retention-days: 14
+
+  macos:
+    name: macos-14 (informational)
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+          sysctl -n hw.ncpu; sw_vers; uptime
+      - name: Deletion and signal scenarios x3
+        shell: bash
+        run: |
+          status=0
+          cargo run --locked --package xtask -- e2e --full --scenario delete-file-lifecycle --scenario delete-folder-lifecycle --scenario latency-under-export-after-deletion --scenario signal-second-forces-exit --scenario signal-term-mid-deletion --scenario signal-term-mid-scan --repeat 3 || status=1
+          echo "E2E-DELETION-STATUS $status"
+      - name: Headless A/B against main (informational)
+        shell: bash
+        run: |
+          status=0
+          git fetch --no-tags origin main
+          cargo run --locked --package xtask -- bench-e2e --baseline origin/main --fixture tiny-files-50k --fixture tiny-files-250k --pairs 5 || status=1
+          echo "BENCH-STATUS $status"
+      - name: Keep the run documents
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: x8-r4-probe-macos
+          path: |
+            target/excise-e2e/
+            target/excise-bench-e2e/
+          retention-days: 14
