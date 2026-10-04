@@ -101,6 +101,11 @@ pub(crate) fn run_main() -> i32 {
             ));
         }
     };
+    // At `acknowledge_done` every Windows console handler thread learns that the run's quit has
+    // ended, those waiting for it and any that starts later, and from then on does not answer
+    // Windows, which would otherwise end the process at once with a status of its own. The exit
+    // that follows ends it with the run's `code` instead, whichever way the run ended
+    // (`signals::await_quit_end`).
     if output_format != OutputFormat::Tui {
         let code = run_headless(
             settings,

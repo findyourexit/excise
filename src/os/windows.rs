@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -48,7 +49,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::private_files::{PrivateFile, PrivateFiles};
-use crate::signals::StopRequest;
+use crate::signals::{QuitEnd, StopRequest};
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const PRIVATE_ACE_FLAGS: u8 = 0;
@@ -803,46 +804,51 @@ fn win32_error(code: u32) -> io::Error {
     io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(i32::MAX))
 }
 
-/// How long the console control handler (installed by [`install_console_ctrl_handler`]) blocks
-/// before returning, giving the owner loop or headless scan loop time to finish a confirmed
-/// quit (cancel pending plans, stop an active deletion at its next entry boundary,
-/// restore the terminal, remove session storage) before returning invites Windows to conclude
-/// nothing is still cleaning up. `CTRL_CLOSE_EVENT`'s own system timeout is 5 s
-/// (`SPI_GETHUNGAPPTIMEOUT`); logoff and shutdown use the same figure outside the rare "quick
-/// shutdown" registry setting. This stays comfortably under that with margin to spare;
-/// `CTRL_BREAK_EVENT` has no timeout at all, so the bound only matters for the other three.
-/// [INFERENCE from the Windows documentation (`HandlerRoutine`'s reference page); not measured
-/// on a Windows probe by this change].
+/// How long the console control handler (installed by [`install_console_ctrl_handler`]) waits
+/// for the owner loop or headless scan loop to finish a confirmed quit (cancel pending plans,
+/// stop an active deletion at its next entry boundary, restore the terminal, remove session
+/// storage) before it gives up on that quit and answers Windows. Answering a close, logoff, or
+/// shutdown event is what lets Windows end the process, so the quit is cut short from then on.
+/// Windows would cut it short itself: `HandlerRoutine`'s reference page lists a time-out of
+/// 5 s for a close event (`SPI_GETHUNGAPPTIMEOUT`) and for logoff and shutdown outside a service
+/// (`SPI_GETWAITTOKILLTIMEOUT`), and none for `CTRL_BREAK_EVENT`. This stays under that 5 s with a
+/// margin, so that the handler gives up first; the 4 s is that margin, not a measured figure.
+/// For a break the answer only says that the event was handled: Windows ends nothing, and the run
+/// still ends the process when its quit finishes. The bound is for a quit that does not finish.
+/// One that does finish is never answered: see `signals::await_quit_end`.
 const CONSOLE_HANDLER_WAIT: Duration = Duration::from_secs(4);
 
 /// The state [`handle_console_event`] needs: a plain function pointer cannot capture anything,
-/// so both channel ends it uses, and whether an earlier event already used them, live here
-/// instead, set once by [`install_console_ctrl_handler`].
-struct ConsoleHandlerChannels {
+/// so the channel it sends requests on, what tells it that the run's quit has ended, and whether
+/// an earlier event already used them, live here instead, set once by
+/// [`install_console_ctrl_handler`].
+struct ConsoleHandlerState {
     stop: Sender<StopRequest>,
-    done: Receiver<()>,
+    quit_end: QuitEnd,
     seen_first: AtomicBool,
 }
 
-static CONSOLE_HANDLER: OnceLock<ConsoleHandlerChannels> = OnceLock::new();
+static CONSOLE_HANDLER: OnceLock<ConsoleHandlerState> = OnceLock::new();
 
 /// Installs the process-wide console control handler for close, break, logoff, and shutdown
 /// events; `CTRL_C_EVENT` is left to the terminal's default handling, matching the Unix
 /// side's exclusion of `SIGINT`. Returns the receiver the owner loop or headless scan loop
-/// watches for a confirmed quit, and the sender the caller signals, exactly once, after that
-/// quit has finished (terminal restored, session storage removed, any report written): see
-/// `CONSOLE_HANDLER_WAIT` for why the handler waits to hear that before returning.
+/// watches for a confirmed quit, and the [`QuitEnd`] the caller ends, once, after that quit has
+/// finished (terminal restored, session storage removed, any report written). Every handler
+/// thread waits to hear that (`CONSOLE_HANDLER_WAIT`), those already waiting and those that start
+/// later alike, and then does not answer Windows, so the exit that follows ends the process
+/// (`signals::await_quit_end`).
 ///
 /// # Errors
 /// Returns an I/O error when this process already installed a handler, or the system call
 /// itself fails.
-pub(crate) fn install_console_ctrl_handler() -> io::Result<(Receiver<StopRequest>, Sender<()>)> {
+pub(crate) fn install_console_ctrl_handler() -> io::Result<(Receiver<StopRequest>, QuitEnd)> {
     let (stop_tx, stop_rx) = crossbeam_channel::unbounded();
-    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let quit_end = QuitEnd::default();
     CONSOLE_HANDLER
-        .set(ConsoleHandlerChannels {
+        .set(ConsoleHandlerState {
             stop: stop_tx,
-            done: done_rx,
+            quit_end: quit_end.clone(),
             seen_first: AtomicBool::new(false),
         })
         .map_err(|_| private_path_error("the console control handler is already installed"))?;
@@ -853,7 +859,7 @@ pub(crate) fn install_console_ctrl_handler() -> io::Result<(Receiver<StopRequest
     if installed == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((stop_rx, done_tx))
+    Ok((stop_rx, quit_end))
 }
 
 /// Whether a console control event is one of the four this handler recognizes (close, break,
@@ -869,6 +875,15 @@ const fn is_recognized_console_event(ctrl_type: u32) -> bool {
 /// The `HandlerRoutine` Windows calls, on a thread it creates for the purpose, when the console
 /// receives a close, break, logoff, or shutdown event (`windows-sys`'s `PHANDLER_ROUTINE`).
 ///
+/// It hands the event to the run as a stop request, then waits up to `CONSOLE_HANDLER_WAIT` for
+/// the run to end its quit, and answers `TRUE` only when that wait runs out. After a quit that
+/// ended it does not answer: Windows ends the process, at once and with a status of its own,
+/// when a close, logoff, or shutdown handler answers, and the run's own exit (130 for a quit) is
+/// to end it instead. A break would not need this: answering it does not make Windows end the
+/// process (the default handler that does runs only when no handler answers `TRUE`, and the
+/// event has no time-out). The same wait costs it nothing, though, and keeps one path for every
+/// event.
+///
 /// # Safety
 /// Called only by Windows, through the pointer [`install_console_ctrl_handler`] installs, per
 /// `SetConsoleCtrlHandler`'s documented contract.
@@ -876,8 +891,8 @@ unsafe extern "system" fn handle_console_event(ctrl_type: u32) -> i32 {
     if !is_recognized_console_event(ctrl_type) {
         return 0;
     }
-    if let Some(channels) = CONSOLE_HANDLER.get() {
-        let request = if channels.seen_first.swap(true, Ordering::AcqRel) {
+    if let Some(state) = CONSOLE_HANDLER.get() {
+        let request = if state.seen_first.swap(true, Ordering::AcqRel) {
             StopRequest::Forced
         } else {
             StopRequest::Graceful
@@ -885,10 +900,24 @@ unsafe extern "system" fn handle_console_event(ctrl_type: u32) -> i32 {
         if matches!(request, StopRequest::Forced) {
             crate::signals::act_on_second_request();
         }
-        let _ = channels.stop.send(request);
-        let _ = channels.done.recv_timeout(CONSOLE_HANDLER_WAIT);
+        let _ = state.stop.send(request);
+        crate::signals::await_quit_end(
+            &state.quit_end,
+            CONSOLE_HANDLER_WAIT,
+            hold_until_process_ends,
+        );
     }
     1
+}
+
+/// Blocks the calling thread for as long as the process lives. The console control handler's
+/// thread is one of this process's own, so the exit of the process ends it like any other
+/// thread. The handler waits here, instead of answering Windows, once its quit has ended
+/// (`signals::await_quit_end`).
+fn hold_until_process_ends() {
+    loop {
+        thread::park();
+    }
 }
 
 #[cfg(test)]
