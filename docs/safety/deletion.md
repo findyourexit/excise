@@ -108,3 +108,5 @@ If result storage fails after consent, Excise starts no further entries, returns
 - [ ] Safe-stop and wait choices with terminal restoration.
 - [ ] Tests of each supported platform deletion method.
 - [ ] Randomized tests for deletion-plan construction.
+
+Two fuzz targets supply part of this evidence. `deletion_plan` builds and executes plans for generated trees. `deletion_lifecycle` drives the whole runtime (navigation, filter, delete, confirm, cancel, quit, resize) while it changes the live tree between a plan's review and its final check, and fails if an identity that no confirmed deletion reviewed disappears, if anything outside a confirmed target changes, or if the interface or the terminal is not restored afterwards. See [Fuzzing](../development.md#fuzzing).

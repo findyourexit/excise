@@ -2,7 +2,8 @@ name: Nightly harness
 
 # Every night the validation harness runs its full tiers: on Linux, at the strict budgets, the
 # whole scenario matrix, the comparisons, the headless suite, the one-million-entry scans under
-# the memory cap, and the privileged volume steps; on Windows the lifecycle tier; on macOS the
+# the memory cap, the privileged volume steps, and a 30-minute fuzz run of the deletion lifecycle
+# against a reference model; on Windows the lifecycle tier; on macOS the
 # lifecycle tier and the performance checks, with timing reported and not gated, because a hosted
 # macOS runner is slower than the machine the budgets are held on (strict timing runs on Linux and
 # on a reference machine before a release). Pull requests run a bounded tier of it at twice the
@@ -76,6 +77,22 @@ jobs:
         env:
           EXCISE_HARNESS_PRIVILEGED: "1"
         run: cargo run --locked --package xtask -- headless --class volumes
+      - name: Read the pinned fuzz toolchain
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          fuzz_toolchain="$(cargo run --quiet --locked --package xtask -- fuzz-toolchain)"
+          printf 'FUZZ_TOOLCHAIN=%s\n' "$fuzz_toolchain" >> "$GITHUB_ENV"
+      - name: Install the pinned nightly and cargo-fuzz
+        if: ${{ !cancelled() }}
+        run: |
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+          cargo "+$FUZZ_TOOLCHAIN" install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz the whole deletion lifecycle against its reference model for 30 minutes
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p fuzz/corpus/deletion_lifecycle
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run deletion_lifecycle fuzz/corpus/deletion_lifecycle fuzz/seeds/deletion_lifecycle -- -max_total_time=1800 -max_len=128 -len_control=0
       - name: Keep the failure evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -86,6 +103,7 @@ jobs:
             target/excise-headless/*/summary.json
             target/excise-headless/*/*/discrepancies.txt
             target/excise-headless/*/*/repro.txt
+            fuzz/artifacts
           if-no-files-found: ignore
           retention-days: 14
 

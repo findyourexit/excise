@@ -533,12 +533,20 @@ where
             InputCommand::RequestDeletion(target) => {
                 let reduced_guardrails = self.app.reduced_deletion_guardrails();
                 let maximum_bytes = self.app.maximum_deletion_plan_bytes();
+                #[cfg(feature = "fuzzing")]
+                let requested = target.full_path();
                 if self.app.queue_deletion_confirmation(
                     *target,
                     reduced_guardrails,
                     maximum_bytes,
                     now,
                 ) {
+                    #[cfg(feature = "fuzzing")]
+                    crate::deletion_probe::requested(
+                        &self.app.deletion_work,
+                        &requested,
+                        reduced_guardrails,
+                    );
                     self.app.show_next_deletion_confirmation();
                 }
             }
@@ -552,6 +560,8 @@ where
                         target_path.starts_with(root) || root.starts_with(&target_path)
                     });
                 if self.app.queue_confirmed_deletion(work_id, target, now) {
+                    #[cfg(feature = "fuzzing")]
+                    crate::deletion_probe::confirmed(work_id.0, &target_path);
                     if overlaps_scan_rebuild {
                         self.workers()?.cancel_generation_rebuild();
                     }

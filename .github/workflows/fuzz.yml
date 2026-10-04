@@ -42,7 +42,7 @@ jobs:
           cargo "+$FUZZ_TOOLCHAIN" install cargo-fuzz --version 0.13.2 --locked
       - name: Run bounded fuzz smoke targets
         run: |
-          mkdir -p fuzz/corpus/{treemap,accounting,filter,deletion_state,deletion_plan,report}
+          mkdir -p fuzz/corpus/{treemap,accounting,filter,deletion_state,deletion_plan,deletion_lifecycle,report}
           cargo "+$FUZZ_TOOLCHAIN" fuzz run truncate -- -max_total_time=60 -max_len=4096
           cargo "+$FUZZ_TOOLCHAIN" fuzz run config -- -max_total_time=60 -max_len=4096
           cargo "+$FUZZ_TOOLCHAIN" fuzz run native_path -- -max_total_time=60 -max_len=4096
@@ -54,6 +54,7 @@ jobs:
           cargo "+$FUZZ_TOOLCHAIN" fuzz run filter fuzz/corpus/filter fuzz/seeds/filter -- -max_total_time=60 -max_len=4096
           cargo "+$FUZZ_TOOLCHAIN" fuzz run deletion_state fuzz/corpus/deletion_state fuzz/seeds/deletion_state -- -max_total_time=60 -max_len=4096
           cargo "+$FUZZ_TOOLCHAIN" fuzz run deletion_plan fuzz/corpus/deletion_plan fuzz/seeds/deletion_plan -- -max_total_time=60 -max_len=256
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run deletion_lifecycle fuzz/corpus/deletion_lifecycle fuzz/seeds/deletion_lifecycle -- -max_total_time=60 -max_len=128 -len_control=0
           cargo "+$FUZZ_TOOLCHAIN" fuzz run report fuzz/corpus/report fuzz/seeds/report -- -max_total_time=60 -max_len=16384
 
       - name: Preserve crash artifacts
