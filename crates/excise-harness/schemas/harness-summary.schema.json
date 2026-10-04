@@ -38,6 +38,15 @@
       "type": "string",
       "pattern": "^[0-9a-f]{40}$"
     },
+    "latency_budget_scale": {
+      "description": "The factor the latency budgets (input_to_frame_p99_ms, max_stall_ms, first_frame_ms, quit_ms) of the scenarios that were expected to pass were multiplied by. Present only when it is above 1, so a strict run has no such field; no other budget is ever scaled, and a scenario expected to fail is judged against the strict budgets either way.",
+      "type": "number",
+      "exclusiveMinimum": 1
+    },
+    "timing_informational": {
+      "description": "Present, and true, when the run held timing informational: a timing budget a result missed (a scenario's four latency budgets, a headless scan's ratio against du) is a warning in that result's timing_warnings, not a failure. Absent in a strict run. Every other budget blocked as usual, and a result that was expected to fail was judged strictly either way.",
+      "const": true
+    },
     "scenarios": {
       "type": "array",
       "items": { "$ref": "#/$defs/scenario_result" }
@@ -96,7 +105,36 @@
           "propertyNames": { "$ref": "#/$defs/identifier" },
           "additionalProperties": { "type": "number" }
         },
-        "failure_bundle": { "$ref": "#/$defs/text" }
+        "failure_bundle": { "$ref": "#/$defs/text" },
+        "timing_warnings": {
+          "description": "The timing budgets this result missed while the run held timing informational: warnings that left the verdict as it was. Absent when there are none, and always absent from a strict run.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/timing_warning" }
+        }
+      }
+    },
+    "timing_warning": {
+      "description": "A timing budget a result missed and was not failed for, because the run held timing informational. The value is above the limit.",
+      "type": "object",
+      "required": ["budget", "metric", "value", "limit"],
+      "additionalProperties": false,
+      "properties": {
+        "budget": {
+          "description": "Only a budget that the speed of the machine decides: the four latency budgets and the three ratio budgets. Every other budget fails the run when it is missed.",
+          "enum": [
+            "headless_scan_ratio",
+            "tui_complete_ratio",
+            "motion_complete_ratio",
+            "input_to_frame_p99_ms",
+            "max_stall_ms",
+            "first_frame_ms",
+            "quit_ms"
+          ]
+        },
+        "metric": { "$ref": "#/$defs/identifier" },
+        "value": { "type": "number" },
+        "limit": { "type": "number" }
       }
     }
   }

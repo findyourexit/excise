@@ -23,7 +23,7 @@ use excise_harness::{
 use crate::e2e::{BINARY_ENV, build_release_binary};
 
 const USAGE: &str = "usage: cargo xtask compare [--quick|--full|--nightly] [--comparison NAME]... [--pairs N] \
-     [--seed S]";
+     [--seed S] [--timing-informational]";
 
 /// `--seed` when it is not given: fixed, so an unqualified run is still reproducible.
 const DEFAULT_SEED: u64 = 0;
@@ -35,6 +35,7 @@ struct Selection {
     comparisons: Vec<String>,
     pairs: Option<u32>,
     seed: u64,
+    timing_informational: bool,
 }
 
 /// Runs the command.
@@ -69,6 +70,7 @@ pub fn compare(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>>
             fixtures: &fixtures,
             work_dir: &work_dir,
             seed: selection.seed,
+            timing_informational: selection.timing_informational,
         },
         tier: selection.tier,
         named: !selection.comparisons.is_empty(),
@@ -78,8 +80,12 @@ pub fn compare(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>>
     let started = Instant::now();
     let report = run_compare(&options, &comparisons);
     for record in &report.records {
+        let warned = match record.timing_warnings.len() {
+            0 => String::new(),
+            count => format!(", {count} timing warning(s)"),
+        };
         eprintln!(
-            "  {} [{}]: {} ({:.2}s){}",
+            "  {} [{}]: {} ({:.2}s){warned}{}",
             record.name,
             record.budget,
             record.verdict,
@@ -126,6 +132,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
         comparisons: Vec::new(),
         pairs: None,
         seed: DEFAULT_SEED,
+        timing_informational: false,
     };
     let mut tier: Option<Tier> = None;
     while let Some(argument) = args.next() {
@@ -165,6 +172,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
                     .parse()
                     .map_err(|_| format!("`--seed` takes a whole number, not `{text}`"))?;
             }
+            "--timing-informational" => selection.timing_informational = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -210,6 +218,17 @@ mod tests {
         assert_eq!(selection.tier, Tier::Nightly);
         assert_eq!(selection.comparisons, ["a", "b"]);
         assert_eq!(selection.pairs, Some(3));
+        assert_eq!(selection.seed, 7);
+    }
+
+    #[test]
+    fn timing_is_gated_unless_the_flag_makes_it_informational() {
+        assert!(!parsed(&["--nightly"]).expect("valid").timing_informational);
+
+        let selection =
+            parsed(&["--timing-informational", "--nightly", "--seed", "7"]).expect("valid");
+        assert!(selection.timing_informational);
+        assert_eq!(selection.tier, Tier::Nightly, "the flag takes no value");
         assert_eq!(selection.seed, 7);
     }
 

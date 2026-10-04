@@ -9,6 +9,12 @@
 //! is a failed ratio, not a harness error, because that non-completion is F2's own symptom.
 //! [`run_compare`] runs every comparison a tier and platform select, mirroring
 //! [`crate::runner::run_e2e`]'s selection.
+//!
+//! With [`CompareOptions::timing_informational`], a median ratio over its limit is reported as a
+//! warning and does not fail the comparison, for a hosted machine that is slower than the one the
+//! limits were set on. A run that never completes within the bound is a timeout, not a ratio, and
+//! still fails it, and so does a comparison that is expected to fail on the platform: it keeps its
+//! strict verdict.
 
 use std::{
     collections::BTreeMap,
@@ -27,7 +33,7 @@ use crate::{
     },
     fixture::Fixtures,
     headless::pairs::millis,
-    report::{self, ConfidenceInterval, Side, Verdict},
+    report::{self, ConfidenceInterval, Side, TimingWarning, Verdict},
     run_support::render_rows,
     runner::{self, Outcome},
     scenario::{self, Budget, EventKind, Expect, Profile, Scenario, Step, WaitEvent},
@@ -84,7 +90,8 @@ pub struct ComparisonReport {
     pub ci: ConfidenceInterval,
     /// The limit the ratio was checked against.
     pub limit: f64,
-    /// What happened, without the strict-xfail interpretation.
+    /// What happened, without the strict-xfail interpretation. A median ratio over its limit that
+    /// informational timing excused (see `timing_warnings`) counts as `Passed`.
     pub outcome: Outcome,
     /// The verdict, with strict xfail applied.
     pub verdict: Verdict,
@@ -92,6 +99,9 @@ pub struct ComparisonReport {
     pub duration: Duration,
     /// Why the comparison could not be computed, when it could not.
     pub error: Option<String>,
+    /// The ratio checks the comparison missed without failing for it, because the options held
+    /// timing informational: its median ratio over its limit, at most once.
+    pub timing_warnings: Vec<TimingWarning>,
 }
 
 /// What every call needs to run a comparison.
@@ -105,6 +115,10 @@ pub struct CompareOptions<'a> {
     pub work_dir: &'a Path,
     /// Seeds the bootstrap confidence interval, so the same seed always gives the same interval.
     pub seed: u64,
+    /// Whether a median ratio over its limit is reported as a warning and does not fail the
+    /// comparison: for a hosted machine whose speed the limits were not set on. A comparison that
+    /// is expected to fail on this platform keeps its strict verdict whatever this says.
+    pub timing_informational: bool,
 }
 
 /// Runs `comparison`'s interleaved pairs and checks its ratio against its budget.
@@ -136,6 +150,7 @@ pub fn run_comparison(comparison: &Comparison, options: &CompareOptions<'_>) -> 
         verdict: Verdict::Error,
         duration: Duration::ZERO,
         error: None,
+        timing_warnings: Vec::new(),
     };
     match execute(comparison, options) {
         Ok((baseline, candidate)) => {
@@ -146,9 +161,11 @@ pub fn run_comparison(comparison: &Comparison, options: &CompareOptions<'_>) -> 
             report.candidate = candidate.iter().map(|run| run.ms).collect();
             report.median_ratio = median_ratio(&report.baseline, &report.candidate);
             report.ci = bootstrap_ci(&report.baseline, &report.candidate, options.seed);
-            report.outcome = classify(report.any_incomplete, report.median_ratio, limit);
-            report.verdict =
-                runner::verdict(comparison.expect_on(std::env::consts::OS), report.outcome);
+            judge(
+                &mut report,
+                comparison.expect_on(std::env::consts::OS),
+                options.timing_informational,
+            );
         }
         Err(error) => report.error = Some(error.to_string()),
     }
@@ -339,6 +356,33 @@ fn classify(any_incomplete: bool, median_ratio: f64, limit: f64) -> Outcome {
     }
 }
 
+/// Judges a finished comparison: the outcome of its budget check, and the verdict that follows
+/// from it and from `expect`.
+///
+/// With `timing_informational`, a median ratio over its limit is not a failure: it is recorded in
+/// `report.timing_warnings` and the comparison counts as passed. A run that never completed within
+/// the bound stays a failure, because that is a timeout and not a ratio. A comparison that is
+/// expected to fail keeps its strict verdict (`xfail`, or `xpass` when its ratio is within the
+/// limit): it documents a defect measured against the strict limit, and excusing the miss would
+/// turn it into an `xpass`, the signal that the defect is fixed.
+fn judge(report: &mut ComparisonReport, expect: Expect, timing_informational: bool) {
+    report.outcome = classify(report.any_incomplete, report.median_ratio, report.limit);
+    if timing_informational
+        && expect == Expect::Pass
+        && report.outcome == Outcome::Failed
+        && !report.any_incomplete
+    {
+        report.timing_warnings.push(TimingWarning {
+            budget: report.budget,
+            metric: report.budget.to_string(),
+            value: report.median_ratio,
+            limit: report.limit,
+        });
+        report.outcome = Outcome::Passed;
+    }
+    report.verdict = runner::verdict(expect, report.outcome);
+}
+
 /// A comparison this run did not attempt, and why.
 #[derive(Debug, Clone)]
 pub struct Skipped {
@@ -369,6 +413,9 @@ pub struct CompareReport {
     pub records: Vec<ComparisonReport>,
     /// Comparisons this run did not attempt, with the reason.
     pub skipped: Vec<Skipped>,
+    /// Whether the run held timing informational (see [`CompareOptions::timing_informational`]),
+    /// which its table says.
+    pub timing_informational: bool,
 }
 
 impl CompareReport {
@@ -382,7 +429,7 @@ impl CompareReport {
     }
 
     /// The verdict table: one row per comparison, the cause of any `error` verdict, the skipped
-    /// comparisons, and the overall verdict.
+    /// comparisons, one line per timing warning, and the overall verdict.
     #[must_use]
     pub fn table(&self) -> String {
         let mut table = render_rows(&self.rows());
@@ -394,14 +441,29 @@ impl CompareReport {
         for skipped in &self.skipped {
             let _ = writeln!(table, "\nSKIP {}: {}", skipped.name, skipped.reason);
         }
+        for record in &self.records {
+            for warning in &record.timing_warnings {
+                let _ = writeln!(table, "\nWARN {}: {warning}", record.name);
+            }
+        }
         let blocking = self
             .records
             .iter()
             .filter(|record| record.verdict.blocks_run())
             .count();
+        let timing = if self.timing_informational {
+            let warnings: usize = self
+                .records
+                .iter()
+                .map(|record| record.timing_warnings.len())
+                .sum();
+            format!("; timing informational: {warnings} warning(s)")
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             table,
-            "\ncompare {}: {} comparison(s), {blocking} blocking",
+            "\ncompare {}: {} comparison(s), {blocking} blocking{timing}",
             if blocking == 0 { "ok" } else { "FAILED" },
             self.records.len(),
         );
@@ -491,7 +553,11 @@ pub fn run_compare(options: &CompareRunOptions<'_>, comparisons: &[Comparison]) 
         };
         records.push(run_comparison(&comparison, &options.compare));
     }
-    CompareReport { records, skipped }
+    CompareReport {
+        records,
+        skipped,
+        timing_informational: options.compare.timing_informational,
+    }
 }
 
 #[cfg(test)]
@@ -625,5 +691,97 @@ mod tests {
             })
         );
         assert_eq!(probe.profiles, [Profile::Default]);
+    }
+
+    /// A finished comparison of default against reduced motion, one pair, measured at
+    /// `median_ratio` against the limit of 1.25. Nothing has judged it yet.
+    fn finished(median_ratio: f64, any_incomplete: bool) -> ComparisonReport {
+        ComparisonReport {
+            name: "motion-complete".to_owned(),
+            budget: Budget::MotionCompleteRatio,
+            pairs: 1,
+            baseline: vec![1000.0],
+            candidate: vec![1000.0 * median_ratio],
+            baseline_completed: 1,
+            candidate_completed: usize::from(!any_incomplete),
+            any_incomplete,
+            median_ratio,
+            ci: ConfidenceInterval {
+                lower: median_ratio,
+                upper: median_ratio,
+                confidence: 0.95,
+            },
+            limit: 1.25,
+            outcome: Outcome::Errored,
+            verdict: Verdict::Error,
+            duration: Duration::ZERO,
+            error: None,
+            timing_warnings: Vec::new(),
+        }
+    }
+
+    /// What `judge` makes of a comparison measured at `median_ratio`: its verdict and the warnings
+    /// it records.
+    fn judged(
+        median_ratio: f64,
+        any_incomplete: bool,
+        expect: Expect,
+        timing_informational: bool,
+    ) -> (Verdict, Vec<TimingWarning>) {
+        let mut report = finished(median_ratio, any_incomplete);
+        judge(&mut report, expect, timing_informational);
+        (report.verdict, report.timing_warnings)
+    }
+
+    #[test]
+    fn a_ratio_over_its_limit_fails_a_strict_comparison_and_warns_in_an_informational_one() {
+        assert_eq!(
+            judged(2.19, false, Expect::Pass, false),
+            (Verdict::Fail, Vec::new())
+        );
+
+        let (verdict, warnings) = judged(2.19, false, Expect::Pass, true);
+        assert_eq!(verdict, Verdict::Pass);
+        assert_eq!(
+            warnings,
+            [TimingWarning {
+                budget: Budget::MotionCompleteRatio,
+                metric: "motion_complete_ratio".to_owned(),
+                value: 2.19,
+                limit: 1.25,
+            }]
+        );
+    }
+
+    #[test]
+    fn informational_timing_records_nothing_for_a_ratio_within_its_limit() {
+        assert_eq!(
+            judged(1.25, false, Expect::Pass, true),
+            (Verdict::Pass, Vec::new())
+        );
+    }
+
+    #[test]
+    fn informational_timing_does_not_excuse_a_run_that_never_completed() {
+        // A run that hit the bound is a timeout, whatever the capped numbers say.
+        for ratio in [0.5, 2.19] {
+            assert_eq!(
+                judged(ratio, true, Expect::Pass, true),
+                (Verdict::Fail, Vec::new()),
+                "median ratio {ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn informational_timing_keeps_an_expected_failure_strict() {
+        assert_eq!(
+            judged(2.19, false, Expect::Fail, true),
+            (Verdict::Xfail, Vec::new()),
+            "the documented defect still fails, and nothing is excused"
+        );
+        let (verdict, warnings) = judged(1.0, false, Expect::Fail, true);
+        assert_eq!(verdict, Verdict::Xpass, "a fixed defect is still reported");
+        assert!(verdict.blocks_run() && warnings.is_empty());
     }
 }

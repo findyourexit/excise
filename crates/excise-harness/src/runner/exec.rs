@@ -42,11 +42,13 @@ use crate::{
     events::{Event, EventLog, Payload},
     metrics::{Recorder, StoreSampler},
     pty::{Diagnostics, PtySession},
+    report::TimingWarning,
     safety::{FixtureRoot, FixtureSnapshot, Scratch},
     scenario::{Scenario, Step},
 };
 
 use super::{
+    budget::LatencyScale,
     outcome::{FailureCause, RunError, StepFailure, Stop},
     plan::{Prepared, describe_step},
 };
@@ -110,6 +112,15 @@ pub(crate) struct Executor<'a> {
     /// How long `catch_up` reads the terminal after a frame event, before its bounded tail. A field
     /// so that a test can give a Unix terminal the delay `ConPTY` has.
     pub(super) frame_window: Duration,
+    /// The factor the latency budgets are multiplied by in this run. Strict until the caller of
+    /// the run sets it, as the tests set `frame_window`.
+    pub(super) latency_scale: LatencyScale,
+    /// Whether a latency budget that `expect_budget` finds missed is recorded in
+    /// `timing_warnings` and passes, instead of failing the step. Off until the caller of the
+    /// run sets it, like `latency_scale`.
+    pub(super) timing_informational: bool,
+    /// The latency budgets that `expect_budget` found missed and passed, in step order.
+    pub(super) timing_warnings: Vec<TimingWarning>,
     /// Fixture-relative paths of deletions that were confirmed.
     pub(super) intended_deletions: Vec<String>,
     /// Fixture-relative paths that `fs_mutate` steps changed.
@@ -149,6 +160,9 @@ impl<'a> Executor<'a> {
             last_input_at: None,
             input_baseline: None,
             frame_window: FRAME_WINDOW,
+            latency_scale: LatencyScale::STRICT,
+            timing_informational: false,
+            timing_warnings: Vec::new(),
             intended_deletions: Vec::new(),
             intended_mutations: Vec::new(),
             residue_files: None,

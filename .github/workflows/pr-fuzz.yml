@@ -23,6 +23,8 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-08-18 --profile minimal
           cargo +nightly-2026-08-18 install cargo-fuzz --version 0.13.2 --locked
+      - name: Check that every fuzz target compiles
+        run: cargo +nightly-2026-08-18 check --manifest-path fuzz/Cargo.toml --bins --locked
       - name: Run deterministic bounded deletion-plan safety fuzzing
         run: |
           mkdir -p fuzz/corpus/deletion_plan

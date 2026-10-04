@@ -1,6 +1,6 @@
 schema_version = 1
 name = "latency-under-deletion-load-default"
-description = "Navigation keys sent while the 5,011-entry delete-folder victim is still being removed get a frame within twice the strict latency budgets: the cheap, quick-tier representative of latency under load. The strict budgets are checked in full and nightly (latency-under-deletion-load-deterministic)."
+description = "Navigation keys sent while the 5,011-entry delete-folder victim is still being removed get a frame within the latency budgets: the cheap, quick-tier representative of latency under load. It holds the strict budgets, and pull-request CI runs it at twice them with `cargo xtask e2e --quick --latency-scale 2`. The deterministic profile's scenario (latency-under-deletion-load-deterministic) holds them in the full and nightly tiers."
 fixture = "delete-folder"
 sentinels = ["keep-a.bin", "keep-b/keep.txt"]
 profiles = ["default"]
@@ -9,13 +9,6 @@ platforms = ["linux", "macos"]
 [terminal]
 cols = 120
 rows = 40
-
-# Pull-request-tier budgets: twice the strict local and nightly limits.
-[budgets]
-input_to_frame_p99_ms = 100
-max_stall_ms = 500
-first_frame_ms = 500
-quit_ms = 500
 
 [[steps]]
 step = "wait_header"

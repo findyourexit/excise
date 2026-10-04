@@ -25,7 +25,7 @@ use crate::e2e::{BINARY_ENV, build_release_binary};
 const USAGE: &str = "usage: cargo xtask headless [--quick|--full] [--fixture ID]... \
                      [--class scale|identity|hostile|volumes]... \
                      [--profile default|deterministic] [--repeat N] [--timeout SECONDS] \
-                     [--keep-scratch]";
+                     [--timing-informational] [--keep-scratch]";
 
 /// How long one scan or one `du` may take by default. A scan of tens of thousands of entries
 /// takes minutes today.
@@ -40,6 +40,7 @@ struct Selection {
     profile: Profile,
     repeat: u32,
     timeout: Duration,
+    timing_informational: bool,
     keep_scratch: bool,
 }
 
@@ -72,6 +73,7 @@ pub fn headless(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>
         git_sha: super::current_head_sha()?,
         privileged: PrivilegedOptIn::from_env(),
         expectations: Expectations::bundled()?,
+        timing_informational: selection.timing_informational,
     };
 
     let started = Instant::now();
@@ -81,12 +83,18 @@ pub fn headless(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>
             index,
             total,
         } => eprintln!("  [{index}/{total}] {fixture} ..."),
-        Progress::Finished(report) => eprintln!(
-            "  {}: {} in {:.1}s",
-            report.fixture,
-            report.verdict,
-            report.duration.as_secs_f64()
-        ),
+        Progress::Finished(report) => {
+            let warned = match report.timing_warnings.len() {
+                0 => String::new(),
+                count => format!(", {count} timing warning(s)"),
+            };
+            eprintln!(
+                "  {}: {} in {:.1}s{warned}",
+                report.fixture,
+                report.verdict,
+                report.duration.as_secs_f64()
+            );
+        }
     })?;
     println!("{}", report.table());
     println!("wall time: {:.1}s", started.elapsed().as_secs_f64());
@@ -106,6 +114,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
         repeat: DEFAULT_REPEAT,
         timeout: DEFAULT_TIMEOUT,
         keep_scratch: false,
+        timing_informational: false,
     };
     let mut tier: Option<Tier> = None;
     while let Some(argument) = args.next() {
@@ -169,6 +178,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
                 selection.timeout = Duration::from_secs(seconds);
             }
             "--keep-scratch" => selection.keep_scratch = true,
+            "--timing-informational" => selection.timing_informational = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -226,6 +236,17 @@ mod tests {
         assert_eq!(selection.repeat, 0, "zero pairs only checks");
         assert_eq!(selection.timeout, Duration::from_secs(30));
         assert!(selection.keep_scratch);
+    }
+
+    #[test]
+    fn timing_is_gated_unless_the_flag_makes_it_informational() {
+        assert!(!parsed(&["--full"]).expect("valid").timing_informational);
+
+        let selection =
+            parsed(&["--timing-informational", "--full", "--repeat", "3"]).expect("valid");
+        assert!(selection.timing_informational);
+        assert_eq!(selection.tier, Tier::Full, "the flag takes no value");
+        assert_eq!(selection.repeat, 3);
     }
 
     #[test]

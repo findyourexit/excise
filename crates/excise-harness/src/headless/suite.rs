@@ -39,11 +39,14 @@ use crate::{
         spec::{FixtureSpec, Part},
     },
     metrics::CpuTimes,
-    report::{BinaryIdentity, Document, HarnessSummary, SchemaVersion, SummaryKind, Tier, Verdict},
+    report::{
+        BinaryIdentity, Document, HarnessSummary, SchemaVersion, SummaryKind, Tier, TimingWarning,
+        Verdict,
+    },
     run_support::{compact_utc, host_name, point_latest_at, rfc3339, sha256_file},
     runner::work_base,
     safety::{FixtureRoot, SafetyError, ScratchError},
-    scenario::Profile,
+    scenario::{Budget, Profile},
     string_enum::string_enum,
 };
 
@@ -161,6 +164,12 @@ pub struct SuiteOptions {
     pub privileged: Option<PrivilegedOptIn>,
     /// The fixtures that are expected to fail, and why.
     pub expectations: Expectations,
+    /// Whether a ratio over [`RATIO_BUDGET`] is reported as a warning and does not fail the
+    /// fixture: for a hosted machine whose speed the budget was not set on. The oracle diff, the
+    /// memory budget, and a scan or `du` that does not end in time still fail it. A ratio that an
+    /// `[[expect_ratio_fail]]` entry documents keeps its strict verdict (`xfail`, or `xpass` when
+    /// it is within the budget).
+    pub timing_informational: bool,
 }
 
 /// The suite could not be run.
@@ -283,6 +292,9 @@ pub struct FixtureReport {
     pub ratio_gated: bool,
     /// The ratio-budget expectation that applies to this fixture on this platform, if any.
     pub ratio_expectation: Option<RatioExpectedFailure>,
+    /// The ratio check the fixture missed without failing for it, because the suite held timing
+    /// informational: its median ratio over [`RATIO_BUDGET`], at most once.
+    pub timing_warnings: Vec<TimingWarning>,
     /// The highest `peak_memory_bytes` seen across its rounds, where the platform could measure
     /// it.
     pub memory_peak_bytes: Option<u64>,
@@ -328,6 +340,7 @@ impl FixtureReport {
             expectation: None,
             ratio_gated: false,
             ratio_expectation: None,
+            timing_warnings: Vec::new(),
             memory_peak_bytes: None,
             memory_budget_bytes: None,
             memory_verdict: Verdict::Pass,
@@ -414,6 +427,20 @@ impl FixtureReport {
             .peekable();
         totals.peek()?;
         Some(totals.all(|kib| kib == Some(expected)))
+    }
+
+    /// Whether the `du` runs the ratio is measured against are a valid reference: every measured
+    /// round has a `du` that exited with code 0, and no `du` printed a total the oracle
+    /// contradicts. A `du` that failed, was killed, or walked only part of the tree times
+    /// something other than the scan's work, so its ratio says nothing about the scan.
+    #[must_use]
+    pub fn du_reference_is_valid(&self) -> bool {
+        self.measured().all(|round| {
+            round
+                .du
+                .as_ref()
+                .is_some_and(|du| du.ended.code() == Some(0))
+        }) && self.du_matches_oracle() != Some(false)
     }
 
     /// The diff of the first report that was not clean.
@@ -552,6 +579,8 @@ pub fn run_suite(
             )))?,
         },
         git_sha: options.git_sha.clone(),
+        latency_budget_scale: None,
+        timing_informational: options.timing_informational,
         scenarios: fixtures.iter().map(render::result_of).collect(),
     };
     let summary_path = run_dir.join("summary.json");
@@ -712,6 +741,35 @@ fn resolve_budget_check(expected: bool, over_budget: bool) -> Verdict {
     }
 }
 
+/// The verdict of a gated fixture's ratio budget.
+///
+/// A ratio over [`RATIO_BUDGET`] fails the fixture when no `[[expect_ratio_fail]]` entry documents
+/// it on this platform, unless `informational` and the `du` runs it was measured against are a
+/// valid reference ([`FixtureReport::du_reference_is_valid`]): then the miss is recorded in
+/// `report.timing_warnings` and the verdict is `pass`. Against an invalid reference the ratio
+/// keeps its strict verdict, so a failed `du` can never turn into a warning. A ratio that an entry
+/// documents keeps the strict-xfail verdict whether or not the run is informational (`xfail` over
+/// the budget, `xpass` within it), because excusing it would turn a documented defect into an
+/// `xpass`.
+fn judge_ratio(report: &mut FixtureReport, informational: bool) -> Verdict {
+    let expected = report.ratio_expectation.is_some();
+    let median = report.ratio_spread().map(|spread| spread.median);
+    let over_budget = median.is_some_and(|median| median > RATIO_BUDGET);
+    let excusable = informational && !expected && report.du_reference_is_valid();
+    match median {
+        Some(value) if over_budget && excusable => {
+            report.timing_warnings.push(TimingWarning {
+                budget: Budget::HeadlessScanRatio,
+                metric: Budget::HeadlessScanRatio.to_string(),
+                value,
+                limit: RATIO_BUDGET,
+            });
+            Verdict::Pass
+        }
+        _ => resolve_budget_check(expected, over_budget),
+    }
+}
+
 /// How much a verdict counts against a run, highest first: an expected outcome (`Pass`, `Xfail`)
 /// is least notable, a blocking one (`Xpass`, `Fail`, `Error`) more so.
 const fn verdict_severity(verdict: Verdict) -> u8 {
@@ -798,8 +856,7 @@ fn measure(
         .cloned();
     if report.ratio_is_gated() {
         report.ratio_gated = true;
-        let over_budget = report.ratio_over_budget().unwrap_or(false);
-        let ratio_verdict = resolve_budget_check(report.ratio_expectation.is_some(), over_budget);
+        let ratio_verdict = judge_ratio(report, options.timing_informational);
         report.verdict = combine_verdicts(report.verdict, ratio_verdict);
     }
     let peak = report

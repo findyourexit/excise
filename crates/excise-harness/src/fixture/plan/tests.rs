@@ -91,6 +91,8 @@ fn every_spec_plans_exactly_the_entries_its_parameters_predict() {
     // The large specs are validated and counted without being expanded.
     let million = spec("tiny-files-1m");
     assert_eq!(million.planned_entry_count(), 1_010_101);
+    let ten_million = spec("tiny-files-10m");
+    assert_eq!(ten_million.planned_entry_count(), 10_010_101);
     let quarter_million = spec("tiny-files-250k");
     assert_eq!(quarter_million.planned_entry_count(), 249_250);
     assert!(
@@ -102,6 +104,23 @@ fn every_spec_plans_exactly_the_entries_its_parameters_predict() {
     assert!(
         fifty.planned_entry_count() <= 50_000,
         "the 50k spec must respect the disk cap"
+    );
+}
+
+#[test]
+fn a_spec_that_plans_more_entries_than_the_limit_is_refused() {
+    // The weekly tier's spec with 1,010 files in each of its 10,000 leaf directories plans
+    // 10,110,101 entries, which is past the limit that the largest shipped spec fits under.
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-files-10m.toml"),
+    )
+    .expect("the weekly spec ships")
+    .replace("files_per_dir = 1000", "files_per_dir = 1010");
+    let error = FixtureSpec::from_toml_str(&text).expect_err("loading refuses the spec");
+
+    assert!(
+        error.to_string().contains("the limit is") && error.to_string().contains("10110101"),
+        "{error}"
     );
 }
 

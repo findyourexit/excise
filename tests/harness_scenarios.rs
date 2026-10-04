@@ -16,7 +16,7 @@ use std::{
 use excise_harness::{
     fixture::Fixtures,
     report::Verdict,
-    runner::{FailureCause, RunReport, RunRequest, run_scenario, work_base},
+    runner::{FailureCause, LatencyScale, RunReport, RunRequest, run_scenario, work_base},
     scenario::{Profile, Scenario, Step},
 };
 use serde_json::Value;
@@ -114,6 +114,8 @@ fn run(
         repro_command: "cargo test --test harness_scenarios",
         fixture_seed: 0,
         keep_scratch: false,
+        latency_scale: LatencyScale::STRICT,
+        timing_informational: false,
     });
     (report, bundle)
 }

@@ -58,8 +58,8 @@ impl ScenarioRun {
         Verdict::resolve(self.expect, self.passed())
     }
 
-    /// The run as a row of a harness summary. In-process runs record no metrics and write no
-    /// failure bundle.
+    /// The run as a row of a harness summary. In-process runs record no metrics, judge no timing,
+    /// and write no failure bundle.
     pub fn result(&self) -> ScenarioResult {
         ScenarioResult {
             name: self.name.clone(),
@@ -68,6 +68,7 @@ impl ScenarioRun {
             duration_ms: u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
             metrics: BTreeMap::new(),
             failure_bundle: None,
+            timing_warnings: Vec::new(),
         }
     }
 }

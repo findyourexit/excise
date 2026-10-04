@@ -132,6 +132,7 @@ pub(super) fn result_of(report: &FixtureReport) -> ScenarioResult {
             .failure_dir
             .as_ref()
             .map(|directory| directory.display().to_string()),
+        timing_warnings: report.timing_warnings.clone(),
     }
 }
 
@@ -260,9 +261,19 @@ impl SuiteReport {
             .iter()
             .filter(|fixture| fixture.verdict == Verdict::Xfail)
             .count();
+        let timing = if self.summary.timing_informational {
+            let warnings: usize = self
+                .fixtures
+                .iter()
+                .map(|fixture| fixture.timing_warnings.len())
+                .sum();
+            format!("; timing informational: {warnings} warning(s)")
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             table,
-            "\nheadless {}: {} fixture(s), {blocking} blocking, {expected} expected failure(s); summary: {}",
+            "\nheadless {}: {} fixture(s), {blocking} blocking, {expected} expected failure(s){timing}; summary: {}",
             if blocking == 0 { "ok" } else { "FAILED" },
             self.fixtures.len(),
             self.summary_path.display()
@@ -478,8 +489,9 @@ fn write_fixture_block(table: &mut String, fixture: &FixtureReport) {
 }
 
 /// The block for a fixture whose ratio was gated: printed only when the outcome is notable (an
-/// expected failure, an unexpected one, or a now-clean budget whose entry must be removed). A
-/// gated fixture that is within budget and not listed prints nothing here.
+/// expected failure, an unexpected one, a now-clean budget whose entry must be removed, or a miss
+/// that informational timing turned into a warning). A gated fixture that is within budget and
+/// not listed prints nothing here.
 fn write_ratio_block(table: &mut String, fixture: &FixtureReport) {
     if fixture.error.is_some() || !fixture.ratio_gated {
         return;
@@ -504,7 +516,7 @@ fn write_ratio_block(table: &mut String, fixture: &FixtureReport) {
                 fixture.fixture, spread.median
             );
         }
-        (None, true) => {
+        (None, true) if fixture.timing_warnings.is_empty() => {
             let _ = writeln!(
                 table,
                 "\nFAIL {} ratio: {:.1}x over the {RATIO_BUDGET}x budget, and no expectation is \
@@ -513,6 +525,14 @@ fn write_ratio_block(table: &mut String, fixture: &FixtureReport) {
                 fixture.fixture,
                 spread.median,
                 std::env::consts::OS
+            );
+        }
+        (None, true) => {
+            let _ = writeln!(
+                table,
+                "\nWARN {} ratio: {:.1}x over the {RATIO_BUDGET}x budget; timing is informational, \
+                 so this does not fail the run",
+                fixture.fixture, spread.median
             );
         }
         (None, false) => {}

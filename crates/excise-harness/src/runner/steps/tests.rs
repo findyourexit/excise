@@ -14,18 +14,22 @@
 //! that nothing but the input baseline keeps a step from taking the first of the two frames for
 //! the answer and reading the screen before the second.
 //!
+//! The last group checks `expect_budget` against metrics that the test records itself, so that the
+//! limit a step applies is the only thing that can decide the result and no timing is involved.
+//!
 //! The programs are shell scripts, so these tests run on Unix. A script that waits for a resize
 //! sleeps in short steps rather than in one `wait` for a background `sleep`: a shell may run the
 //! trap of a signal that arrives just before its `wait` starts only once that `wait` is over.
 
 use std::{collections::BTreeMap, time::Duration};
 
-use super::super::{exec::Executor, outcome::Stop, plan::prepare};
+use super::super::{budget::LatencyScale, exec::Executor, outcome::Stop, plan::prepare};
 use crate::{
     fixture::{FixtureCache, FixtureSpec, Fixtures},
     pty::{PtySession, SpawnSpec},
+    report::TimingWarning,
     safety::{FixtureRoot, FixtureSnapshot, Scratch, isolated_env},
-    scenario::{Profile, Scenario},
+    scenario::{Budget, Profile, Scenario},
 };
 
 /// The frame window of the tests whose terminal delivers a frame 30 ms after its event: far longer
@@ -111,15 +115,25 @@ fn scenario(steps: &str) -> Scenario {
     scenario
 }
 
-/// How a run of the steps ended, and the metrics it had recorded by then.
+/// How a run of the steps ended, the metrics it had recorded by then, and the timing budgets it
+/// had missed without failing for them.
 struct Run {
     result: Result<(), Stop>,
     metrics: BTreeMap<String, f64>,
+    warnings: Vec<TimingWarning>,
 }
 
 /// Runs `steps` after the script has printed `READY`, in an executor whose frame window is
 /// `frame_window`, and stops the program.
 fn run(script: &str, steps: &str, frame_window: Duration) -> Run {
+    run_with(script, steps, |executor| {
+        executor.frame_window = frame_window;
+    })
+}
+
+/// Runs `steps` after the script has printed `READY`, in an executor that `configure` has set up,
+/// and stops the program.
+fn run_with(script: &str, steps: &str, configure: impl FnOnce(&mut Executor<'_>)) -> Run {
     let work = tempfile::tempdir().expect("a work directory");
     let fixture_copy = Fixtures::new(
         FixtureSpec::bundled_dir(),
@@ -153,11 +167,16 @@ fn run(script: &str, steps: &str, frame_window: Duration) -> Run {
         scratch.store(),
         session,
     );
-    executor.frame_window = frame_window;
+    configure(&mut executor);
     let result = executor.run();
     let metrics = executor.metrics();
+    let warnings = std::mem::take(&mut executor.timing_warnings);
     executor.session.kill();
-    Run { result, metrics }
+    Run {
+        result,
+        metrics,
+        warnings,
+    }
 }
 
 const SETTLE_THEN_EXPECT: &str = r#"
@@ -274,4 +293,187 @@ fn a_resize_and_the_key_after_it_wait_for_their_frames_past_the_programs_own_inp
     );
 
     assert!(run.result.is_ok(), "{:?}", run.result);
+}
+
+/// A program that is ready and then waits: the budget tests need a session to check against, not
+/// a program that does anything.
+const READY_AND_WAIT: &str = r"
+printf READY
+/bin/sleep 30
+";
+
+/// A step that checks the metric `probe_ms`, which a test records, against `budget`.
+fn expect_probe_within(budget: &str) -> String {
+    format!("\n[[steps]]\nstep = \"expect_budget\"\nbudget = \"{budget}\"\nmetric = \"probe_ms\"\n")
+}
+
+/// Runs `steps`, which check `probe_ms`, recorded as `value`, in an executor whose latency scale is
+/// `scale` and whose timing is informational when `informational`.
+fn run_probes(steps: &str, value: f64, scale: f64, informational: bool) -> Run {
+    run_with(READY_AND_WAIT, steps, |executor| {
+        executor.recorder.record_metric("probe_ms", value);
+        executor.latency_scale = LatencyScale::new(scale).expect("a valid scale");
+        executor.timing_informational = informational;
+    })
+}
+
+/// Runs a step that checks `probe_ms`, recorded as `value`, against `budget`, in an executor
+/// whose latency scale is `scale` and whose timing is strict.
+fn run_probe(budget: &str, value: f64, scale: f64) -> Run {
+    run_probes(&expect_probe_within(budget), value, scale, false)
+}
+
+/// The budgets that are memory, count, residue, and CPU contracts, each with a value just over its
+/// limit: a latency scale of 100 would hide it if it applied, and so would a warning.
+fn contract_budgets_just_over() -> [(&'static str, f64); 4] {
+    [
+        ("peak_rss_bytes", 512.0 * 1024.0 * 1024.0 + 1.0),
+        ("idle_output_bytes", 1.0),
+        ("residue_files", 1.0),
+        ("idle_cpu_ms", 51.0),
+    ]
+}
+
+#[test]
+fn a_scaled_latency_budget_passes_what_the_strict_budget_fails() {
+    // 300 ms is over the strict first-frame limit of 250 ms and under twice it.
+    let strict = run_probe("first_frame_ms", 300.0, 1.0);
+    let scaled = run_probe("first_frame_ms", 300.0, 2.0);
+
+    let Err(Stop::Fail(failure)) = &strict.result else {
+        panic!("the strict limit must fail 300 ms: {:?}", strict.result);
+    };
+    assert!(
+        failure.expected.contains("at most 250"),
+        "{}",
+        failure.expected
+    );
+    assert!(scaled.result.is_ok(), "{:?}", scaled.result);
+}
+
+#[test]
+fn a_latency_failure_under_a_scale_names_the_scaled_limit_and_the_scale() {
+    let run = run_probe("first_frame_ms", 600.0, 2.0);
+
+    let Err(Stop::Fail(failure)) = &run.result else {
+        panic!("600 ms is over twice the limit: {:?}", run.result);
+    };
+    assert!(
+        failure.expected.contains("at most 500") && failure.expected.contains("scaled by 2"),
+        "{}",
+        failure.expected
+    );
+}
+
+#[test]
+fn a_scale_never_loosens_a_memory_count_residue_or_cpu_budget() {
+    for (budget, value) in contract_budgets_just_over() {
+        let run = run_probe(budget, value, 100.0);
+
+        assert!(
+            matches!(run.result, Err(Stop::Fail(_))),
+            "{budget} must still fail {value} under a scale of 100: {:?}",
+            run.result
+        );
+    }
+}
+
+/// The warning that a step checking `probe_ms` records when `budget` is missed.
+fn warning(budget: Budget, value: f64, limit: f64) -> TimingWarning {
+    TimingWarning {
+        budget,
+        metric: "probe_ms".to_owned(),
+        value,
+        limit,
+    }
+}
+
+#[test]
+fn informational_timing_passes_a_missed_latency_budget_and_records_it() {
+    // 300 ms is over the strict first-frame limit of 250 ms.
+    let strict = run_probe("first_frame_ms", 300.0, 1.0);
+    let informational = run_probes(&expect_probe_within("first_frame_ms"), 300.0, 1.0, true);
+
+    assert!(
+        matches!(strict.result, Err(Stop::Fail(_))) && strict.warnings.is_empty(),
+        "a strict run fails the miss and records no warning: {:?}",
+        strict.result
+    );
+    assert!(informational.result.is_ok(), "{:?}", informational.result);
+    assert_eq!(
+        informational.warnings,
+        [warning(Budget::FirstFrameMs, 300.0, 250.0)]
+    );
+}
+
+#[test]
+fn informational_timing_records_nothing_for_a_latency_budget_that_is_met() {
+    let run = run_probes(&expect_probe_within("first_frame_ms"), 250.0, 1.0, true);
+
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(run.warnings.is_empty(), "{:?}", run.warnings);
+}
+
+#[test]
+fn informational_timing_holds_a_scaled_run_to_its_scaled_limit() {
+    // 300 ms is over the strict limit and under twice it; 600 ms is over twice it.
+    let within = run_probes(&expect_probe_within("first_frame_ms"), 300.0, 2.0, true);
+    let over = run_probes(&expect_probe_within("first_frame_ms"), 600.0, 2.0, true);
+
+    assert!(within.result.is_ok() && within.warnings.is_empty());
+    assert!(over.result.is_ok(), "{:?}", over.result);
+    assert_eq!(
+        over.warnings,
+        [warning(Budget::FirstFrameMs, 600.0, 500.0)],
+        "the warning names the limit the run was held to"
+    );
+}
+
+#[test]
+fn informational_timing_never_excuses_a_memory_count_residue_or_cpu_budget() {
+    for (budget, value) in contract_budgets_just_over() {
+        let run = run_probes(&expect_probe_within(budget), value, 1.0, true);
+
+        assert!(
+            matches!(run.result, Err(Stop::Fail(_))),
+            "{budget} must still fail {value} when timing is informational: {:?}",
+            run.result
+        );
+        assert!(run.warnings.is_empty(), "{budget}: {:?}", run.warnings);
+    }
+}
+
+#[test]
+fn informational_timing_does_not_excuse_a_metric_that_was_never_recorded() {
+    let steps = "\n[[steps]]\nstep = \"expect_budget\"\nbudget = \"first_frame_ms\"\n\
+                 metric = \"never_recorded\"\n";
+    let run = run_probes(steps, 0.0, 1.0, true);
+
+    assert!(
+        matches!(run.result, Err(Stop::Fail(_))),
+        "a latency budget with no metric to judge fails: {:?}",
+        run.result
+    );
+    assert!(run.warnings.is_empty(), "{:?}", run.warnings);
+}
+
+#[test]
+fn a_step_after_a_warning_still_fails_the_run_and_the_warning_stays_recorded() {
+    // Step 0 waits for READY, step 1 misses a latency budget, and step 2 misses a residue budget.
+    let steps = format!(
+        "{}{}",
+        expect_probe_within("first_frame_ms"),
+        expect_probe_within("residue_files")
+    );
+    let run = run_probes(&steps, 300.0, 1.0, true);
+
+    let Err(Stop::Fail(failure)) = &run.result else {
+        panic!("the residue budget must fail: {:?}", run.result);
+    };
+    assert_eq!(failure.index, 2, "{failure}");
+    assert_eq!(
+        run.warnings,
+        [warning(Budget::FirstFrameMs, 300.0, 250.0)],
+        "what the run measured before it failed is still evidence"
+    );
 }

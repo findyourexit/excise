@@ -12,9 +12,14 @@ use std::{
 };
 
 use excise_harness::{
-    comparison::{CompareOptions, load_comparisons, run_comparison},
+    comparison::{
+        CompareOptions, CompareRunOptions, Comparison, load_comparisons, run_compare,
+        run_comparison,
+    },
     fixture::{FixtureCache, FixtureSpec, Fixtures},
+    report::{Tier, TimingWarning, Verdict},
     runner::work_base,
+    scenario::Budget,
 };
 
 /// A unique directory under the harness work area, removed when dropped.
@@ -103,6 +108,7 @@ fn a_motion_ratio_comparison_runs_end_to_end_with_no_harness_error() {
             fixtures: &fixtures,
             work_dir: &work.0,
             seed: 0,
+            timing_informational: false,
         },
     );
 
@@ -157,6 +163,7 @@ fn a_tui_ratio_comparison_runs_end_to_end_with_no_harness_error() {
             fixtures: &fixtures,
             work_dir: &work.0,
             seed: 0,
+            timing_informational: false,
         },
     );
 
@@ -176,5 +183,87 @@ fn a_tui_ratio_comparison_runs_end_to_end_with_no_harness_error() {
     assert_eq!(
         report.candidate_completed, 1,
         "the candidate run must complete"
+    );
+}
+
+/// A ratio over its limit is a failure in a strict comparison and a warning in one that holds
+/// timing informational. A limit of 0.0001 puts the ratio of two scan times over it on any
+/// machine, so no timing noise decides the verdicts; the runs themselves must still complete.
+#[test]
+fn a_ratio_over_its_limit_fails_a_strict_comparison_and_is_a_warning_in_an_informational_one() {
+    let work = Workspace::new();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_excise"));
+    let fixtures = Fixtures::new(
+        FixtureSpec::bundled_dir(),
+        FixtureCache::at(work.0.join("cache")),
+    );
+    let comparison = Comparison::from_toml_str(
+        "schema_version = 1\nname = \"over-the-limit\"\ndescription = \"smoke test\"\n\
+         fixture = \"wide-1k\"\nbudget = \"tui_complete_ratio\"\nprofile = \"default\"\n\
+         pairs = 1\ntimeout_ms = 20000\nlimit = 0.0001\n",
+    )
+    .expect("a comparison");
+    comparison.validate().expect("a valid comparison");
+    let compare = |timing_informational: bool| {
+        run_compare(
+            &CompareRunOptions {
+                compare: CompareOptions {
+                    binary: &binary,
+                    fixtures: &fixtures,
+                    work_dir: &work.0,
+                    seed: 0,
+                    timing_informational,
+                },
+                tier: Tier::Full,
+                named: true,
+                pairs: None,
+            },
+            std::slice::from_ref(&comparison),
+        )
+    };
+
+    let strict = compare(false);
+    let informational = compare(true);
+
+    for report in [&strict, &informational] {
+        let [record] = report.records.as_slice() else {
+            panic!("one comparison ran: {:?}", report.records);
+        };
+        assert!(
+            record.error.is_none() && !record.any_incomplete,
+            "the runs must complete: {record:#?}"
+        );
+    }
+    let strict_record = &strict.records[0];
+    assert_eq!(strict_record.verdict, Verdict::Fail);
+    assert!(!strict.is_success());
+    assert!(strict_record.timing_warnings.is_empty());
+    assert!(!strict.table().contains("timing informational"));
+
+    let record = &informational.records[0];
+    assert_eq!(record.verdict, Verdict::Pass, "{record:#?}");
+    assert!(informational.is_success(), "{}", informational.table());
+    assert_eq!(
+        record.timing_warnings,
+        [TimingWarning {
+            budget: Budget::TuiCompleteRatio,
+            metric: "tui_complete_ratio".to_owned(),
+            value: record.median_ratio,
+            limit: 0.0001,
+        }]
+    );
+    let table = informational.table();
+    assert!(
+        table.contains(&format!(
+            "WARN over-the-limit: {}",
+            record.timing_warnings[0]
+        )),
+        "{table}"
+    );
+    assert!(
+        table.contains(
+            "compare ok: 1 comparison(s), 0 blocking; timing informational: 1 warning(s)"
+        ),
+        "{table}"
     );
 }

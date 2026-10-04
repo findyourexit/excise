@@ -540,6 +540,38 @@ The hosted `benchmark.yml` retains the `criterion-benchmark-evidence` artifact f
 
 Treat small host-local changes as noise unless repeated statistical evidence on comparable hardware supports them.
 
+## Continuous integration tiers
+
+The validation harness runs on a fixed cadence in four places. `ci.yml` (Native verification) holds the required checks, so the pull-request tier runs inside its three native jobs; the other tiers have workflows of their own. Every workflow uploads the run directories of a failed run, with a retention in days, as an artifact.
+
+| Tier | When | Where | What runs |
+|---|---|---|---|
+| Pull request | Every pull request and every push to `main` (`ci.yml`) | Linux, macOS, and Windows, in each native job after the dependency policy check | `cargo xtask e2e --quick --latency-scale 2`; then, on Linux and macOS, the full-tier scenarios named in the job's `pr_scenarios` matrix entry at the same scale: latency under deletion and scan load, idle, descriptor and scan-store budgets, signals, and the 250,000-entry memory budget (Linux also exports the deletion history after a 65,111-entry deletion; macOS also runs the selection-drift scenario). Fixtures never exceed 250,000 entries. On macOS both commands also take `--timing-informational`: timing is reported there and not gated (below). |
+| Fuzz compile | Every pull request (`pr-fuzz.yml`) | Linux | `cargo +nightly-2026-08-18 check --manifest-path fuzz/Cargo.toml --bins --locked`, so an API change cannot break a fuzz target unnoticed, then one bounded fuzz run |
+| Nightly | Every night and on demand (`nightly.yml`) | Linux | `e2e --nightly` at the strict budgets with `EXCISE_HARNESS_CGROUP=1` (the one-million-entry scenario runs under the memory cap, and a check fails the job if it was skipped), `compare --nightly`, `headless --full` and `headless --fixture tiny-files-1m --repeat 0` under the cap, and the privileged volume steps (`EXCISE_HARNESS_PRIVILEGED=1`: `e2e --scenario scan-store-quota` and `headless --class volumes`) |
+| Nightly | Same | Windows | `e2e --full`, the lifecycle tier |
+| Nightly | Same | macOS | `e2e --nightly --timing-informational`, `compare --nightly --timing-informational`, and `headless --full --timing-informational`: the lifecycle tier and the performance checks, with timing reported and not gated (below) |
+| Weekly | Saturday and on demand (`weekly.yml`) | Linux | `headless --fixture tiny-files-10m --repeat 1 --timeout 7200` under the cap, on an ext4 image that the job builds (1 KiB blocks, 12 million inodes, no journal) because a hosted disk has about five million inodes; it measured about 4.9 times `du`'s time against the budget of 15. A manual run can name `tiny-files-1m` instead to prove the mechanism in minutes, but its ratio can exceed the budget on this image: `du` finishes a million tiny files in about 2 seconds, and 15.3 times was measured. |
+
+**Latency scale.** Hosted runners are busier than the machines the strict budgets are held on, so the pull-request tier multiplies the limits of the four latency budgets (input to frame, stall, first frame, and quit) by 2 with `--latency-scale 2`. Local runs and the nightly tier use the strict limits. No other budget is scaled, and a scenario that documents a known defect keeps the strict limits. A scaled run records `latency_budget_scale` in its `summary.json` and names the factor on the last line of the verdict table. Latency scenarios run on Linux and macOS only: Windows measures latency, in the metrics of every lifecycle scenario, and gates none of it.
+
+**Timing on hosted macOS.** A hosted macOS runner (three virtual CPUs) is slower than the machine the strict budgets were set on. On it, a slow-terminal scenario stalled for 562 to 588 ms against the pull-request limit of 500, four 50,000-entry interface comparisons ran at 1.68 to 2.19 times their headless scan against a limit of 1.25, and two headless scans ran at 20.8 and 15.8 times `du` against a limit of 15, while every correctness check passed. So on hosted macOS timing is measured and not gated. `--timing-informational`, accepted by `cargo xtask e2e`, `compare`, and `headless`, reports a timing verdict that would block (a scenario's four latency budgets after any scale, a comparison's median ratio over its limit, a headless scan's ratio against `du` over its budget) as a warning: the verdict table lists it and counts it on its last line, the scenario or fixture result in `summary.json` carries it in `timing_warnings` (budget, metric, value, and limit), the summary says `timing_informational`, and the exit status ignores it. `compare` writes no summary, so its warnings are in its table only. Everything else still blocks on every system: the quick tier's lifecycle checks, signals, idle output and CPU, descriptor, thread, memory, and scan-store budgets, residue, waits that time out, failed steps, oracle diffs, and a comparison run that never completed; and a scenario, comparison, or fixture that documents an expected failure keeps its strict verdict. Strict timing gates run on the Linux nightly and, before a release, on the reference development machine the budgets were set on, with the same commands and no option.
+
+**Time budget.** A native job must stay within 15 minutes end to end on its hosted runner. The scenarios in `pr_scenarios` are what fits next to the job's other steps; add one only after reading the job's step times (`gh run view <id> --json jobs`).
+
+**Reproducing a failure locally.** Every command above runs on a development machine with the same environment variables, except where a step needs another system (the memory cap needs Linux with `systemd-run`, the weekly image needs root, and Windows scenarios need Windows). Start from the failed step's log, which names the scenario, profile, and fixture, then run it alone:
+
+```console
+cargo xtask e2e --scenario NAME --profile PROFILE --latency-scale 2   # as the pull-request tier ran it; drop the scale to hold the strict budgets
+cargo xtask e2e --quick --latency-scale 2                              # the whole pull-request quick tier
+cargo xtask e2e --quick --latency-scale 2 --timing-informational      # as the macOS pull-request tier ran it
+cargo xtask e2e --nightly                                              # the nightly scenario matrix
+EXCISE_HARNESS_CGROUP=1 cargo xtask headless --full                    # under the memory cap, on Linux
+EXCISE_HARNESS_PRIVILEGED=1 cargo xtask headless --class volumes       # attaches real disk images: only for volume work
+```
+
+The artifact of a failed run holds `target/excise-e2e/` (the summaries and one failure bundle per failed run, each with its `repro.txt`) and, for the headless suite, each run's `summary.json`, `discrepancies.txt`, and `repro.txt`. A failure bundle's `repro.txt` is the command that reruns exactly that scenario; add `--keep-fixture` to keep what it ran against.
+
 ## Pull Requests
 
 See [CONTRIBUTING.md](https://github.com/findyourexit/excise/blob/main/CONTRIBUTING.md) for review, safety, accessibility, authorship, and documentation requirements.
