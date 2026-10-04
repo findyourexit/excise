@@ -11,12 +11,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+#[cfg(any(windows, test))]
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-#[cfg(windows)]
-use crossbeam_channel::Sender;
 
 /// A request to end the run immediately as a confirmed quit: cancel pending plans, stop an
 /// active deletion at its next entry boundary, restore the terminal if one is attached, remove
@@ -39,7 +39,7 @@ pub enum StopRequest {
 pub(crate) struct StopSignals {
     receiver: Receiver<StopRequest>,
     #[cfg(windows)]
-    done: Sender<()>,
+    quit_end: QuitEnd,
 }
 
 impl StopSignals {
@@ -48,19 +48,93 @@ impl StopSignals {
         self.receiver.clone()
     }
 
-    /// Tells a Windows console control handler that is waiting for this run's confirmed quit to
-    /// finish (terminal restored, session storage removed, any report written) that it has: see
-    /// `os::windows::install_console_ctrl_handler`. Idempotent and a no-op on Unix, where nothing
-    /// waits on it and process exit is not on a deadline the way a Windows close, logoff, or
-    /// shutdown event is. Called exactly once, by `cli::run_main`, after every other exit step.
+    /// Tells every Windows console control handler thread, those waiting for this run's confirmed
+    /// quit to finish (terminal restored, session storage removed, any report written) and any
+    /// that starts waiting later, that it has: see `os::windows::install_console_ctrl_handler`. A
+    /// handler does not answer Windows after that, so the exit that follows, with this run's own
+    /// status, is what ends the process (see `await_quit_end`). Idempotent and a no-op on Unix,
+    /// where nothing waits on it and process exit is not on a deadline the way a Windows close,
+    /// logoff, or shutdown event is. Called exactly once, by `cli::run_main`, as soon as the run
+    /// has returned; on Windows the end of the run tells the handlers the same if it never gets
+    /// there.
     #[allow(
         clippy::unused_self,
-        reason = "self is read on Windows (the `done` sender); unused on Unix, where nothing \
-                  waits on it"
+        reason = "self is read on Windows (the quit's end); unused on Unix, where nothing waits \
+                  on it"
     )]
     pub(crate) fn acknowledge_done(&self) {
         #[cfg(windows)]
-        let _ = self.done.send(());
+        self.quit_end.end();
+    }
+}
+
+/// The end of the run, however it ends, tells the handlers what the acknowledgement does: a panic
+/// that unwinds out of `cli::run_main` before it gets there included.
+#[cfg(windows)]
+impl Drop for StopSignals {
+    fn drop(&mut self) {
+        self.quit_end.end();
+    }
+}
+
+/// Whether this run's confirmed quit has ended, as every Windows console control handler thread
+/// sees it: those waiting for it when it ends and those that start waiting later alike. Windows
+/// runs each event's handler on a thread of its own, and events overlap (a break, then a close)
+/// and arrive late (while the run is already exiting), so the end of the quit is a state that all
+/// of them read, never a message that one of them would take from the others. Clones share it.
+#[cfg(any(windows, test))]
+#[derive(Clone, Default)]
+pub(crate) struct QuitEnd(Arc<QuitEndState>);
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct QuitEndState {
+    ended: Mutex<bool>,
+    changed: Condvar,
+}
+
+#[cfg(any(windows, test))]
+impl QuitEnd {
+    /// Records that the quit has ended and wakes every thread waiting for that. A later call
+    /// changes nothing.
+    fn end(&self) {
+        *self.0.ended.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.0.changed.notify_all();
+    }
+
+    /// Waits up to `wait` for the quit to end, and says whether it has: at once, when it already
+    /// had.
+    fn ended_within(&self, wait: Duration) -> bool {
+        let ended = self.0.ended.lock().unwrap_or_else(PoisonError::into_inner);
+        let (ended, _) = self
+            .0
+            .changed
+            .wait_timeout_while(ended, wait, |ended| !*ended)
+            .unwrap_or_else(PoisonError::into_inner);
+        *ended
+    }
+}
+
+/// What the Windows console control handler does once it has handed its request to the run, up to
+/// the point where it may answer Windows. Waits up to `wait` for the quit to end (at once, when
+/// it already has: see [`QuitEnd`]). A quit that has not ended by then is given up on, and this
+/// returns, so that the handler answers as it always has. One that has ended is handed to `hold`,
+/// which must not return while the process lives: from then on the handler does not answer at
+/// all.
+///
+/// Answering a close, logoff, or shutdown event is what lets Windows end the process, at once,
+/// with a status of its own (an `NTSTATUS` such as `STATUS_CONTROL_C_EXIT`). When the quit has
+/// ended, the run is already on its way out with its own status, `130` for a quit, and whichever
+/// of the two ends the process first decides the status that a parent process reads. A handler
+/// that answered as soon as the quit ended made that a race. One that does not answer leaves the
+/// end of the process to the run, and the run's exit takes the handler's thread with it, which
+/// the `HandlerRoutine` documentation allows for ("it is possible that the handler function will
+/// be terminated by another thread in the process"). `hold` is a parameter so that a test can
+/// stand in for the end of the process.
+#[cfg(any(windows, test))]
+pub(crate) fn await_quit_end(quit_end: &QuitEnd, wait: Duration, hold: impl FnOnce()) {
+    if quit_end.ended_within(wait) {
+        hold();
     }
 }
 
@@ -335,22 +409,25 @@ pub(crate) fn install() -> io::Result<StopSignals> {
 
 #[cfg(windows)]
 pub(crate) fn install() -> io::Result<StopSignals> {
-    let (receiver, done) = crate::os::windows::install_console_ctrl_handler()?;
-    Ok(StopSignals { receiver, done })
+    let (receiver, quit_end) = crate::os::windows::install_console_ctrl_handler()?;
+    Ok(StopSignals { receiver, quit_end })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::convert::Infallible;
     use std::path::PathBuf;
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
-    use crossbeam_channel::Sender;
+    use crossbeam_channel::{Receiver, Sender};
 
+    #[cfg(windows)]
+    use super::StopSignals;
     use super::{
-        FORCED_STOP_GRACE, ForcedExitAction, Joined, ShutdownWait, StopRequest, WaitableThread,
-        Wake, forced_exit_action, spawn_waitable,
+        FORCED_STOP_GRACE, ForcedExitAction, Joined, QuitEnd, ShutdownWait, StopRequest,
+        WaitableThread, Wake, await_quit_end, forced_exit_action, spawn_waitable,
     };
 
     #[test]
@@ -559,5 +636,173 @@ mod tests {
             "the grace was used up while the patient wait ran"
         );
         releaser.join().expect("the releasing thread should end");
+    }
+
+    /// A console control handler's thread, running `await_quit_end` as the handler does, with a
+    /// `hold` that says it was entered (`entered`) and then waits for the test to let a stand-in
+    /// for the end of the process fire (`process_ends`). `answered` hears when the handler would
+    /// answer Windows, which only a `hold` that returned lets it do. A handler that answers
+    /// without ever holding is therefore told from one that holds by which of the two it reports
+    /// first, with no stretch of silence to wait out.
+    struct HandlerThread {
+        entered: Receiver<()>,
+        answered: Receiver<()>,
+        process_ends: Sender<()>,
+        thread: JoinHandle<()>,
+    }
+
+    impl HandlerThread {
+        fn start(quit_end: &QuitEnd, wait: Duration) -> Self {
+            let quit_end = quit_end.clone();
+            let (entered_hold, entered) = crossbeam_channel::bounded::<()>(1);
+            let (answer, answered) = crossbeam_channel::bounded::<()>(1);
+            let (process_ends, process_ended) = crossbeam_channel::bounded::<()>(1);
+            let thread = thread::spawn(move || {
+                await_quit_end(&quit_end, wait, || {
+                    let _ = entered_hold.send(());
+                    let _ = process_ended.recv();
+                });
+                let _ = answer.send(());
+            });
+            Self {
+                entered,
+                answered,
+                process_ends,
+                thread,
+            }
+        }
+
+        /// Waits for the handler to take its hold, and checks that it has not answered Windows.
+        fn assert_holds(&self) {
+            crossbeam_channel::select! {
+                recv(self.entered) -> _ => {}
+                recv(self.answered) -> _ => panic!(
+                    "the handler answered Windows without holding: Windows would end the process \
+                     with its own status, racing the run's exit"
+                ),
+                default(Duration::from_secs(10)) => panic!(
+                    "the handler neither held nor answered within ten seconds of the quit's end"
+                ),
+            }
+            assert!(
+                self.answered.try_recv().is_err(),
+                "the handler answered Windows while the process still lived"
+            );
+        }
+
+        /// Lets the stand-in for the process end, and the handler end with it.
+        fn end_process(self) {
+            self.process_ends
+                .send(())
+                .expect("the stand-in for the process should accept its end");
+            self.answered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the handler must be free to end once the process has");
+            self.thread.join().expect("the handler thread should end");
+        }
+    }
+
+    /// Windows ends the process the moment a close handler answers, in a race with the exit the
+    /// run is by then on its way to. So a handler whose quit has ended must not answer while the
+    /// process lives: the exit of the process, with the run's status, ends it.
+    #[test]
+    fn a_console_handler_does_not_answer_after_its_quit_ended_while_the_process_lives() {
+        let quit_end = QuitEnd::default();
+        let handler = HandlerThread::start(&quit_end, Duration::from_secs(60));
+
+        quit_end.end();
+
+        handler.assert_holds();
+        handler.end_process();
+    }
+
+    /// Windows runs the handlers of overlapping events (a break, then a close) on threads of their
+    /// own, and the end of the quit is no message that one of them could take from the others:
+    /// every one that is waiting for it must hold.
+    #[test]
+    fn every_console_handler_waiting_for_the_quit_holds_when_it_ends() {
+        let quit_end = QuitEnd::default();
+        let first = HandlerThread::start(&quit_end, Duration::from_secs(60));
+        let second = HandlerThread::start(&quit_end, Duration::from_secs(60));
+        // Both are in their wait by now, but for a badly stalled thread, which would only make
+        // this test weaker, not fail it: however the threads interleave, both must hold.
+        thread::sleep(Duration::from_millis(100));
+
+        quit_end.end();
+
+        first.assert_holds();
+        second.assert_holds();
+        first.end_process();
+        second.end_process();
+    }
+
+    /// An event that arrives late, while the run is already exiting, finds the end of the quit
+    /// known already, though an earlier handler has heard of it: the late handler holds at once.
+    /// Its bound is a minute and `assert_holds` waits ten seconds, so a handler that had to wait
+    /// out its bound before holding could not pass.
+    #[test]
+    fn a_console_handler_that_starts_after_the_quit_ended_holds_at_once() {
+        let quit_end = QuitEnd::default();
+        let earlier = HandlerThread::start(&quit_end, Duration::from_secs(60));
+        quit_end.end();
+        earlier.assert_holds();
+
+        let late = HandlerThread::start(&quit_end, Duration::from_secs(60));
+
+        late.assert_holds();
+        earlier.end_process();
+        late.end_process();
+    }
+
+    /// A quit that does not end in time is still given up on, as before: the handler then
+    /// answers, and for a close, logoff, or shutdown event Windows ends the process, before its
+    /// own time-out does.
+    #[test]
+    fn a_console_handler_gives_up_on_a_quit_that_does_not_end_in_time() {
+        let quit_end = QuitEnd::default();
+        let held = Cell::new(false);
+        let wait = Duration::from_millis(150);
+        let started = Instant::now();
+
+        await_quit_end(&quit_end, wait, || held.set(true));
+
+        assert!(started.elapsed() >= wait, "the handler gave up early");
+        assert!(
+            !held.get(),
+            "the handler held for a quit that had not ended"
+        );
+    }
+
+    /// The run reaches the handlers through `StopSignals`: when it acknowledges the end of its
+    /// quit, and when it just ends, as a panic unwinding out of `cli::run_main` would end it.
+    #[cfg(windows)]
+    #[test]
+    fn the_run_tells_the_console_handlers_when_it_acknowledges_and_when_it_just_ends() {
+        let run_of = |quit_end: &QuitEnd| StopSignals {
+            receiver: crossbeam_channel::unbounded().1,
+            quit_end: quit_end.clone(),
+        };
+        let acknowledged = QuitEnd::default();
+        let run = run_of(&acknowledged);
+        assert!(
+            !acknowledged.ended_within(Duration::ZERO),
+            "the quit had not ended yet"
+        );
+
+        run.acknowledge_done();
+
+        assert!(
+            acknowledged.ended_within(Duration::ZERO),
+            "the acknowledgement did not tell the handlers"
+        );
+        drop(run);
+        let unwound = QuitEnd::default();
+
+        drop(run_of(&unwound));
+
+        assert!(
+            unwound.ended_within(Duration::ZERO),
+            "the end of the run did not tell the handlers"
+        );
     }
 }

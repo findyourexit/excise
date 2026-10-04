@@ -73,6 +73,8 @@ The deletion history is written in the background, so a long history never delay
 
 A headless run (`--format table` or `--format json`) that receives one of these signals or events quits like an interactive one: it writes a `scan-report` document with `"state": "cancelled"`, covering what the scan had reduced by then, to `--output FILE` or standard output, and exits `130`. A second signal exits `130` at once, without waiting for publication or the report, so it can cut a report off mid-write: discard the output of a run that received two signals instead of reading it as a smaller valid document.
 
+On Windows, a console close, logoff, or shutdown event gives the quit about four seconds to finish. A quit that finishes in that time exits `130`, as above. One that does not is ended by Windows, and a parent process then reads a status of Windows' own instead of `130`. A break has no such limit: Windows does not end the process when Excise stops waiting, so a slow quit still exits `130` when it finishes.
+
 !!! tip "Safe consumer pattern"
 
     - [ ] Check the process exit code.
