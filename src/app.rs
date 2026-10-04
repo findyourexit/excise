@@ -1807,6 +1807,10 @@ where
         self.ui_effects.current_path_is_red = false;
         self.mark_dirty();
     }
+
+    /// The primary scan is over for the reader: the interface leaves loading and shows the
+    /// finished map, if it could be published, with the cursor on the largest entry unless the
+    /// reader has already chosen one (`land_untouched_cursor_on_largest` has the rule).
     pub fn start_ui(&mut self) {
         self.loaded = true;
         self.retarget_completed_scan_transient_modals();
@@ -1823,6 +1827,11 @@ where
         } else {
             self.render_and_update_board();
         }
+        // The page is still the live one only when no finished map came to replace it (the
+        // publication failed): there is nothing to put the cursor on then.
+        if !self.snapshot_page_is_provisional {
+            self.land_untouched_cursor_on_largest();
+        }
         if let Some(suspended) = self.suspended_ui_mode.as_mut() {
             match suspended {
                 UiMode::Loading => *suspended = UiMode::Normal,
@@ -1834,6 +1843,18 @@ where
                 _ => {}
             }
         }
+    }
+
+    /// A scan the reader watched fill in has ended and its map is on screen. While it filled in,
+    /// the cursor stayed on the entry the map selected first, which is whichever entry the scan
+    /// listed first, large or not. Unless the reader has moved or clicked, it goes to the largest
+    /// actionable entry of the folder on screen now, once. A cursor the reader placed stays where
+    /// they put it. Only a scan's end does this, and no refresh: a rebuild that keeps the map the
+    /// reader had on screen never calls it, so a deletion leaves the cursor as `complete_deletion`
+    /// describes.
+    fn land_untouched_cursor_on_largest(&mut self) {
+        self.board.select_largest_unless_locked();
+        self.mark_dirty();
     }
 
     pub(crate) fn record_loading_entry(&mut self, entry_path: PathBuf) {
@@ -3012,6 +3033,7 @@ where
         self.generation_rebuild_invalidated = false;
         self.generation_rebuild_active = false;
         self.generation_rebuild_required = rebuild_invalidated;
+        let mut watched_live_view = false;
         if rebuild_invalidated {
             // A deletion discarded this generation while its worker was still
             // draining. Its terminal event only releases the stale worker. The
@@ -3025,6 +3047,11 @@ where
                 return Ok(());
             }
             self.generation_rebuild_restart_suppressed = false;
+            // A rebuild with no map kept on screen was a scan for the reader to watch: its live
+            // pages carried the cursor as a first scan's do, so its end settles the cursor as a
+            // first scan's does. A rebuild behind the map the reader kept is a refresh of that
+            // map, and the cursor follows its entry through it.
+            watched_live_view = self.snapshot_page_is_provisional;
             self.snapshot_page_cache = None;
             self.snapshot_page_is_provisional = false;
             self.snapshot_page_history.clear();
@@ -3080,6 +3107,9 @@ where
             }
         }
         self.render_and_update_board();
+        if watched_live_view {
+            self.land_untouched_cursor_on_largest();
+        }
         Ok(())
     }
 
@@ -3378,6 +3408,41 @@ mod tests {
             .find(|file| file.name == name)
             .expect("the page on screen should list the entry")
             .node_id
+    }
+
+    /// A file of `len` bytes in `dir`. The cursor tests size entries by length (`app_scanning`),
+    /// so which entry is the largest never depends on how a file system rounds up what it
+    /// allocates.
+    fn file_of(dir: &Path, name: &str, len: usize) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'x'; len]).expect("fixture file should be written");
+        path
+    }
+
+    /// An app that has begun scanning `root` and sizes entries by length, with a map area of
+    /// `width` by `height` cells: under 72 columns the map is a list.
+    fn app_scanning(root: &Path, width: u16, height: u16, mouse_enabled: bool) -> App<TestBackend> {
+        let mut app = App::new(
+            TestBackend::new(width, height),
+            root.to_path_buf(),
+            true,
+            false,
+            crate::model::MIN_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            mouse_enabled,
+        )
+        .expect("app should initialize");
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, width, height));
+        app
+    }
+
+    /// The name of the entry the cursor is on.
+    fn cursor_on(app: &App<TestBackend>) -> Option<String> {
+        app.board
+            .currently_selected()
+            .map(|tile| tile.name.to_string_lossy().into_owned())
     }
 
     /// A lease to enumerate the root in `generation` of the app's own session.
@@ -3788,6 +3853,268 @@ mod tests {
             app.take_finished_publication(),
             Some(FinishedPublication::Primary)
         );
+    }
+
+    /// The scan lists a small entry first and larger ones on later pages. The map selects the
+    /// first entry it is shown and, with the reader never having moved or clicked, keeps the
+    /// cursor there while the scan runs; the scan's end puts it on the largest entry. The test
+    /// decides what each page holds, so nothing depends on the order the file system lists a
+    /// folder in.
+    #[test]
+    fn an_untouched_cursor_holds_through_the_scan_and_lands_on_the_largest_entry_at_completion() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let small = file_of(root.path(), "small", 4 * 1024);
+        let medium = file_of(root.path(), "medium", 16 * 1024);
+        let large = file_of(root.path(), "large", 256 * 1024);
+        let mut app = app_scanning(root.path(), 80, 24, false);
+
+        add_fixture_entry(&mut app, &small);
+        refresh_live_page(&mut app, "the first page should refresh");
+        assert_eq!(cursor_on(&app).as_deref(), Some("small"));
+
+        add_fixture_entry(&mut app, &medium);
+        refresh_live_page(&mut app, "the second page should refresh");
+        assert_eq!(
+            cursor_on(&app).as_deref(),
+            Some("small"),
+            "a larger entry on a later page does not take the cursor while the scan runs"
+        );
+        add_fixture_entry(&mut app, &large);
+        refresh_live_page(&mut app, "the third page should refresh");
+        assert_eq!(listed_names(&app), ["large", "medium", "small"]);
+        assert_eq!(cursor_on(&app).as_deref(), Some("small"));
+
+        app.finalize_scan();
+        app.start_ui();
+
+        assert_eq!(cursor_on(&app).as_deref(), Some("large"));
+
+        // Only the scan's end retargets it: a later layout carries the cursor by name instead.
+        let small_id = node_id_of(&app, "small");
+        assert!(app.board.select_node(small_id));
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 100, 30));
+        assert_eq!(cursor_on(&app).as_deref(), Some("small"));
+    }
+
+    /// A cursor the reader moved is their choice: the scan's end leaves it on its entry, however
+    /// large the entries that arrived since.
+    #[test]
+    fn a_cursor_the_reader_moved_stays_on_its_entry_through_completion() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let small = file_of(root.path(), "small", 4 * 1024);
+        let medium = file_of(root.path(), "medium", 16 * 1024);
+        let large = file_of(root.path(), "large", 256 * 1024);
+        let mut app = app_scanning(root.path(), 80, 24, false);
+        add_fixture_entry(&mut app, &medium);
+        add_fixture_entry(&mut app, &small);
+        refresh_live_page(&mut app, "the first page should refresh");
+        assert_eq!(cursor_on(&app).as_deref(), Some("medium"));
+
+        // Which key reaches the other entry depends on how the map tiled the two, so the keys
+        // are tried in turn.
+        let keys: [fn(&mut App<TestBackend>); 4] = [
+            App::move_selected_left,
+            App::move_selected_right,
+            App::move_selected_up,
+            App::move_selected_down,
+        ];
+        for key in keys {
+            if cursor_on(&app).as_deref() == Some("small") {
+                break;
+            }
+            key(&mut app);
+        }
+        assert_eq!(
+            cursor_on(&app).as_deref(),
+            Some("small"),
+            "a movement key should reach the other entry"
+        );
+
+        add_fixture_entry(&mut app, &large);
+        refresh_live_page(&mut app, "the second page should refresh");
+        app.finalize_scan();
+        app.start_ui();
+
+        assert_eq!(cursor_on(&app).as_deref(), Some("small"));
+    }
+
+    /// A click places the cursor as deliberately as a key does.
+    #[test]
+    fn a_cursor_the_reader_clicked_stays_on_its_entry_through_completion() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let small = file_of(root.path(), "small", 4 * 1024);
+        let medium = file_of(root.path(), "medium", 16 * 1024);
+        let large = file_of(root.path(), "large", 256 * 1024);
+        let mut app = app_scanning(root.path(), 80, 24, true);
+        add_fixture_entry(&mut app, &medium);
+        add_fixture_entry(&mut app, &small);
+        refresh_live_page(&mut app, "the first page should refresh");
+        assert_eq!(cursor_on(&app).as_deref(), Some("medium"));
+
+        let tile = app
+            .board
+            .tiles
+            .iter()
+            .find(|tile| tile.name == "small")
+            .cloned()
+            .expect("the page should tile the small entry");
+        let column = tile.x.saturating_add(1);
+        let row = u16::try_from(tile.top_row()).expect("the map fits in a terminal row");
+        assert!(app.select_at(column, row), "the click lands on the entry");
+        assert_eq!(cursor_on(&app).as_deref(), Some("small"));
+
+        add_fixture_entry(&mut app, &large);
+        refresh_live_page(&mut app, "the second page should refresh");
+        app.finalize_scan();
+        app.start_ui();
+
+        assert_eq!(cursor_on(&app).as_deref(), Some("small"));
+    }
+
+    /// The cursor that goes to the largest entry is the one of the folder the reader is in when
+    /// the scan ends. Opening a folder is not a move or a click, so it leaves the cursor
+    /// automatic, and the folder's own first page listed a small file only.
+    #[test]
+    fn the_cursor_of_a_folder_opened_during_the_scan_lands_on_its_largest_entry_at_completion() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let folder = root.path().join("folder");
+        std::fs::create_dir(&folder).expect("folder fixture should exist");
+        let small_leaf = file_of(&folder, "small-leaf", 4 * 1024);
+        let large_leaf = file_of(&folder, "large-leaf", 256 * 1024);
+        let sibling = file_of(root.path(), "sibling", 128 * 1024);
+        let mut app = app_scanning(root.path(), 120, 32, false);
+        for path in [&folder, &small_leaf, &sibling] {
+            add_fixture_entry(&mut app, path);
+        }
+        refresh_live_page(&mut app, "the root page should refresh");
+        assert_eq!(cursor_on(&app).as_deref(), Some("sibling"));
+        let folder_id = node_id_of(&app, "folder");
+        assert!(app.board.select_node(folder_id));
+
+        app.enter_selected();
+        app.process_scan_store_events();
+        app.board.settle_geometry();
+        assert_eq!(app.current_folder_path(), folder);
+        assert_eq!(cursor_on(&app).as_deref(), Some("small-leaf"));
+
+        add_fixture_entry(&mut app, &large_leaf);
+        refresh_live_page(&mut app, "the folder's page should refresh");
+        assert_eq!(listed_names(&app), ["large-leaf", "small-leaf"]);
+        assert_eq!(
+            cursor_on(&app).as_deref(),
+            Some("small-leaf"),
+            "the opened folder's cursor holds too while the scan runs"
+        );
+
+        app.finalize_scan();
+        app.start_ui();
+
+        assert_eq!(app.current_folder_path(), folder);
+        assert_eq!(cursor_on(&app).as_deref(), Some("large-leaf"));
+    }
+
+    /// A narrow terminal lists the entries instead of tiling them, and the list scrolls to keep
+    /// the cursor in view: the early entry the cursor stayed on has scrolled the list to its
+    /// bottom, and at completion the cursor, and the list with it, go back to the largest entry
+    /// at the top rather than to whichever row the window starts on.
+    #[test]
+    fn in_a_narrow_list_the_cursor_returns_to_the_largest_entry_at_the_top() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = app_scanning(root.path(), 60, 3, false);
+        let small = file_of(root.path(), "small", 4 * 1024);
+        add_fixture_entry(&mut app, &small);
+        refresh_live_page(&mut app, "the first page should refresh");
+        for (name, kib) in [("e", 8), ("d", 16), ("c", 32), ("b", 64), ("a", 128)] {
+            let path = file_of(root.path(), name, kib * 1024);
+            add_fixture_entry(&mut app, &path);
+            refresh_live_page(&mut app, "a later page should refresh");
+        }
+        assert!(app.board.is_list_layout());
+        assert_eq!(cursor_on(&app).as_deref(), Some("small"));
+        assert_eq!(
+            app.board.tiles.first().map(|tile| tile.name.clone()),
+            Some(std::ffi::OsString::from("d")),
+            "the list scrolled to keep the cursor in view"
+        );
+
+        app.finalize_scan();
+        app.start_ui();
+
+        assert_eq!(cursor_on(&app).as_deref(), Some("a"));
+        assert_eq!(app.board.selected_index, Some(0));
+    }
+
+    /// A rebuild behind the map the reader kept is a refresh of it, not a scan they watched fill
+    /// in: the cursor follows its entry through the new map instead of going to the largest.
+    #[test]
+    fn a_rebuild_behind_the_map_the_reader_kept_leaves_the_cursor_on_its_entry() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let small = file_of(root.path(), "small", 4 * 1024);
+        let large = file_of(root.path(), "large", 256 * 1024);
+        let mut app = app_scanning(root.path(), 80, 24, false);
+        add_fixture_entry(&mut app, &large);
+        add_fixture_entry(&mut app, &small);
+        app.finalize_scan();
+        app.start_ui();
+        assert_eq!(cursor_on(&app).as_deref(), Some("large"));
+
+        // The cursor is on the smaller entry without the reader having moved or clicked, as it
+        // is on a folder they have just come out of.
+        let small_id = node_id_of(&app, "small");
+        assert!(app.board.select_node(small_id));
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("the rebuild should start behind the map the reader kept")
+        );
+        add_fixture_entry(&mut app, &large);
+        add_fixture_entry(&mut app, &small);
+        finish_rebuild(&mut app).expect("the replacement map should publish");
+
+        assert_eq!(cursor_on(&app).as_deref(), Some("small"));
+    }
+
+    /// A rebuild with no map to keep on screen, because the scan it replaces never published
+    /// one, is a scan the reader watches fill in, and its end settles the cursor as a first
+    /// scan's does.
+    #[test]
+    fn a_rebuild_the_reader_watched_fill_in_ends_with_the_cursor_on_its_largest_entry() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let small = file_of(root.path(), "small", 4 * 1024);
+        let large = file_of(root.path(), "large", 256 * 1024);
+        let mut app = app_scanning(root.path(), 80, 24, false);
+        add_fixture_entry(&mut app, &small);
+        refresh_live_page(&mut app, "the first scan's page should refresh");
+
+        // A deletion the live map cannot describe ends while the first scan runs: that map is
+        // given up, and the scan's end leads to a rebuild with nothing published to keep.
+        app.invalidate_snapshot_view_for_live_mutation();
+        app.begin_primary_publication();
+        assert_eq!(
+            app.take_finished_publication(),
+            Some(FinishedPublication::Primary)
+        );
+        app.start_ui();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("the rebuild should start")
+        );
+
+        add_fixture_entry(&mut app, &small);
+        refresh_live_page(&mut app, "the rebuild's first page should refresh");
+        assert_eq!(cursor_on(&app).as_deref(), Some("small"));
+        add_fixture_entry(&mut app, &large);
+        refresh_live_page(&mut app, "the rebuild's second page should refresh");
+        assert_eq!(
+            cursor_on(&app).as_deref(),
+            Some("small"),
+            "the rebuild's cursor holds while it runs"
+        );
+
+        finish_rebuild(&mut app).expect("the replacement map should publish");
+
+        assert_eq!(cursor_on(&app).as_deref(), Some("large"));
     }
 
     #[test]

@@ -61,7 +61,8 @@ pub struct Board {
     overflow: Option<MapOverflow>,
     pub selected_index: Option<usize>, // None means nothing is selected
     /// Set once the user moves or places the cursor deliberately (an arrow key
-    /// or a pointer click). Auto-arming (`select_largest`) may retarget the
+    /// or a pointer click). Auto-arming (`select_largest`, and
+    /// `select_largest_unless_locked` when a scan completes) may retarget the
     /// selection only before this becomes true; afterward the selection follows
     /// the same entry by name across every regeneration, or clears if that
     /// entry is genuinely gone.
@@ -967,6 +968,36 @@ impl Board {
     /// see `fill_from_selected`'s `selection_locked` handling.
     pub fn select_largest(&mut self) {
         self.selected_index = self.tiles.iter().position(Tile::is_interactive);
+    }
+
+    /// Moves a selection the user has not chosen onto the largest actionable
+    /// entry of the dataset on screen, which is where the map would have put it
+    /// had it known the whole folder from the start.
+    ///
+    /// While a scan lists a folder the map selects the first entry it is given
+    /// and carries it by name through every refresh (`fill_from_selected`), so
+    /// the cursor can end up on a small entry that merely came first. This is
+    /// the one place that retargets it: a scan's completion calls it once, and
+    /// no refresh does. A selection the user has moved or clicked is their
+    /// choice and stays where it is.
+    pub(crate) fn select_largest_unless_locked(&mut self) {
+        if self.selection_locked {
+            return;
+        }
+        let Some(largest) = self.files.iter().find(|file| file.is_interactive()) else {
+            return;
+        };
+        if self
+            .currently_selected()
+            .is_some_and(|selected| selected.name == largest.name)
+        {
+            return;
+        }
+        let name = largest.name.clone();
+        // A full layout, not just a new index: the layout protects the carried entry from
+        // the overflow fold and a narrow list scrolls to keep it in view, and both must
+        // now follow the entry the cursor moves to.
+        self.fill_from_selected(Some(name.as_os_str()));
     }
 
     /// Selects `node`, revealing it first when a narrow list has paged it away.
@@ -2008,6 +2039,77 @@ mod tests {
         assert!(
             board.currently_selected().is_none(),
             "after the first input, a vanished selection must clear, not silently jump elsewhere"
+        );
+    }
+
+    fn selected_name(board: &Board) -> Option<OsString> {
+        board.currently_selected().map(|tile| tile.name.clone())
+    }
+
+    #[test]
+    fn a_selection_nobody_chose_moves_to_the_largest_entry_when_asked() {
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files(vec![file_named(0, "small", 1.0)]);
+
+        // A larger entry arrives on a later page. The map carries the selection by name, so
+        // the cursor stays on the entry it first picked until something asks it to move.
+        board.change_files(vec![
+            file_named(0, "large", 0.9),
+            file_named(1, "small", 0.1),
+        ]);
+        assert_eq!(selected_name(&board), Some(OsString::from("small")));
+
+        board.select_largest_unless_locked();
+
+        assert_eq!(selected_name(&board), Some(OsString::from("large")));
+    }
+
+    #[test]
+    fn a_clicked_selection_stays_put_when_asked_to_move_to_the_largest_entry() {
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files(vec![
+            file_named(0, "large", 0.7),
+            file_named(1, "small", 0.3),
+        ]);
+        board.advance_geometry(Duration::ZERO, true);
+        let small = board
+            .tiles
+            .iter()
+            .find(|tile| tile.name == "small")
+            .cloned()
+            .expect("the small entry should have a tile");
+        let row = u16::try_from(small.top_row()).expect("the test pane fits in a terminal row");
+        assert!(board.select_at(small.x.saturating_add(1), row));
+        assert_eq!(selected_name(&board), Some(OsString::from("small")));
+
+        board.select_largest_unless_locked();
+
+        assert_eq!(selected_name(&board), Some(OsString::from("small")));
+    }
+
+    #[test]
+    fn the_largest_entry_a_selection_moves_to_is_the_largest_that_can_be_selected() {
+        let mut shared = file_named(0, "Shared allocation", 0.6);
+        shared.file_type = FileType::Synthetic;
+        shared.synthetic_kind = Some(SyntheticKind::Shared);
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files(vec![file_named(0, "last", 1.0)]);
+        board.change_files(vec![
+            shared,
+            file_named(1, "second", 0.3),
+            file_named(2, "last", 0.1),
+        ]);
+        assert_eq!(selected_name(&board), Some(OsString::from("last")));
+
+        board.select_largest_unless_locked();
+
+        assert_eq!(
+            selected_name(&board),
+            Some(OsString::from("second")),
+            "the shared total is the biggest row, but it cannot be selected"
         );
     }
 
