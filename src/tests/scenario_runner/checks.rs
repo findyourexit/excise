@@ -108,6 +108,23 @@ fn displayed(path: &Path) -> String {
     safe_display_path(Path::new(&snapshot_path(path))).text
 }
 
+/// The part of the dialog's path below the fixture root. A path the dialog had to cut short cannot
+/// be checked, so it fails.
+fn below_root<'a>(shown: &'a str, root: &Path) -> Result<&'a str, String> {
+    if shown.ends_with('…') {
+        return Err(format!(
+            "the dialog cuts its path short ({shown:?}), so the target cannot be verified"
+        ));
+    }
+    let root_text = displayed(root);
+    shown
+        .strip_prefix(root_text.as_str())
+        .and_then(|rest| rest.strip_prefix('/'))
+        .ok_or_else(|| {
+            format!("the dialog path {shown:?} is not under the fixture root {root_text:?}")
+        })
+}
+
 /// Checks that the path the dialog shows is an entry called `name` under the fixture root. A path
 /// the dialog had to cut short cannot be checked, so it fails.
 ///
@@ -115,24 +132,27 @@ fn displayed(path: &Path) -> String {
 ///
 /// Returns why the path is not the entry the step expects.
 pub fn check_target(shown: &str, root: &Path, name: &str) -> Result<(), String> {
-    if shown.ends_with('…') {
-        return Err(format!(
-            "the dialog cuts its path short ({shown:?}), so the target cannot be verified"
-        ));
-    }
-    let root_text = displayed(root);
-    let Some(below) = shown
-        .strip_prefix(root_text.as_str())
-        .and_then(|rest| rest.strip_prefix('/'))
-    else {
-        return Err(format!(
-            "the dialog path {shown:?} is not under the fixture root {root_text:?}"
-        ));
-    };
+    let below = below_root(shown, root)?;
     let target = below.rsplit('/').next().unwrap_or(below);
     if target != name {
         return Err(format!(
             "the dialog names {target:?} ({shown:?}), but the step expects {name:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that the path the dialog shows is exactly `path` below the fixture root, where the step
+/// says the entry is (`delete`'s `path`).
+///
+/// # Errors
+///
+/// Returns why the dialog's path is not that one.
+pub fn check_target_path(shown: &str, root: &Path, path: &str) -> Result<(), String> {
+    let below = below_root(shown, root)?;
+    if below != path {
+        return Err(format!(
+            "the dialog deletes {below:?} ({shown:?}), but the step expects {path:?}"
         ));
     }
     Ok(())

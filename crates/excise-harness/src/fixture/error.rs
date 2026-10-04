@@ -40,10 +40,22 @@ pub enum FixtureError {
     /// [`FixtureSpec::removable_by_path`](crate::fixture::FixtureSpec::removable_by_path). Take a
     /// run copy of it instead.
     #[error(
-        "the fixture `{id}` is never cached: it holds a directory that cannot be listed or a path \
-         longer than `PATH_MAX`, which `cargo clean` cannot remove; take a run copy of it instead"
+        "the fixture `{id}` is never cached: it holds a directory that cannot be listed or \
+         changed, or a path longer than `PATH_MAX`, which `cargo clean` cannot remove; take a run \
+         copy of it instead"
     )]
     NotCacheable {
+        /// The id of the fixture.
+        id: String,
+    },
+    /// The fixture does its job only for a user that is not root, and the process is root: see
+    /// [`FixtureSpec::needs_unprivileged_user`](crate::fixture::FixtureSpec::needs_unprivileged_user).
+    #[error(
+        "the fixture `{id}` needs a user that is not root: it holds a directory whose mode forbids \
+         changes, root ignores modes, and so the directory would refuse root nothing; run as \
+         another user"
+    )]
+    NeedsUnprivilegedUser {
         /// The id of the fixture.
         id: String,
     },

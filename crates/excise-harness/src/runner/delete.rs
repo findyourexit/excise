@@ -1,4 +1,4 @@
-//! Verifying the target of a deletion before the confirmation key is sent.
+//! Verifying the target of a deletion before the key that starts it is sent.
 //!
 //! The deletion dialog is the ground truth of what `excise` will delete: it captures its target
 //! when it opens and confirming acts on that target, whatever the selection does afterwards. So
@@ -20,9 +20,19 @@
 //!    refused; no fixture-relative path holds one.
 //! 5. The entry exists on disk and has the requested kind, looked up without following links.
 //! 6. Every sentinel exists, and no sentinel is the target or lies inside it.
+//!
+//! A scenario that sets `disable_delete_confirmation` has no dialog, and Backspace alone starts the
+//! deletion. [`verify_selection`] then checks what it can before Backspace: the selected-item panel
+//! shows an entry of the requested name and kind, the entry the step names exists on disk with
+//! that kind (rules 5 and 6), and no sentinel is it or inside it. Nothing shows where the selected
+//! entry lives, so that is taken from the scenario's `path`, and the panel's name and kind prove
+//! it only when they point at one entry in the whole fixture:
+//!
+//! 7. The entry is the only one of its name and kind in the fixture. With two, the panel cannot
+//!    say which is selected, and Backspace would delete that one, whatever `path` says.
 
 use crate::{
-    pty::ui::{Confirmation, DeleteDialog, DeleteKind},
+    pty::ui::{Confirmation, DeleteDialog, DeleteKind, SelectedItem},
     safety::FixtureRoot,
     scenario::EntryKind,
 };
@@ -76,7 +86,49 @@ pub(crate) fn verify(
     }
 
     let relative = relative_path(&dialog.path, fixture, name)?;
-    match fixture.lstat(&relative) {
+    verify_entry(&relative, kind, fixture, sentinels)?;
+    Ok(Verified { relative })
+}
+
+/// Checks the selection against the request, for a deletion that no dialog confirms. `relative`
+/// is where the scenario says the entry is. `Ok` means it is safe to press Backspace.
+pub(crate) fn verify_selection(
+    selected: &SelectedItem,
+    name: &str,
+    kind: EntryKind,
+    relative: &str,
+    fixture: &FixtureRoot,
+    sentinels: &[String],
+) -> Result<Verified, Refusal> {
+    if selected.name != name {
+        return Err(format!(
+            "the selected-item panel shows `{}`, but the step deletes `{name}`",
+            selected.name
+        ));
+    }
+    if selected.kind != kind.to_string() {
+        return Err(format!(
+            "the selected-item panel shows a {} named `{name}`, but the step deletes a {kind}",
+            selected.kind
+        ));
+    }
+    verify_entry(relative, kind, fixture, sentinels)?;
+    // Rule 7: the panel's name and kind can only mean the entry the step names.
+    fixture.require_only_entry(name, kind, relative)?;
+    Ok(Verified {
+        relative: relative.to_owned(),
+    })
+}
+
+/// Rules 5 and 6: the entry is on disk with the requested kind, every sentinel is there, and none
+/// is the entry or inside it.
+fn verify_entry(
+    relative: &str,
+    kind: EntryKind,
+    fixture: &FixtureRoot,
+    sentinels: &[String],
+) -> Result<(), Refusal> {
+    match fixture.lstat(relative) {
         Ok(Some(metadata)) => {
             let is_folder = metadata.is_dir();
             if is_folder != (kind == EntryKind::Folder) {
@@ -100,13 +152,13 @@ pub(crate) fn verify(
                 ));
             }
         }
-        if sentinel == &relative || sentinel.starts_with(&format!("{relative}/")) {
+        if sentinel == relative || sentinel.starts_with(&format!("{relative}/")) {
             return Err(format!(
                 "the target `{relative}` contains the sentinel `{sentinel}`, which must survive"
             ));
         }
     }
-    Ok(Verified { relative })
+    Ok(())
 }
 
 /// The fixture-relative path the dialog's path line names, if it names an entry called `name`
@@ -487,5 +539,213 @@ mod tests {
             check(&fixture, &dialog, "keep-b", EntryKind::Folder).expect_err("contains a sentinel");
 
         assert!(refusal.contains("keep-b/keep.txt"), "{refusal}");
+    }
+
+    fn selected(name: &str, kind: &str) -> SelectedItem {
+        SelectedItem {
+            name: name.to_owned(),
+            state: "◆ COMPLETE".to_owned(),
+            kind: kind.to_owned(),
+        }
+    }
+
+    fn check_selection(
+        fixture: &Fixture,
+        selected: &SelectedItem,
+        name: &str,
+        kind: EntryKind,
+        relative: &str,
+    ) -> Result<Verified, Refusal> {
+        verify_selection(
+            selected,
+            name,
+            kind,
+            relative,
+            &fixture.root,
+            &fixture.sentinels,
+        )
+    }
+
+    #[test]
+    fn a_selection_that_matches_the_request_and_the_disk_is_cleared_for_backspace() {
+        let fixture = fixture();
+
+        let verified = check_selection(
+            &fixture,
+            &selected("other.bin", "file"),
+            "other.bin",
+            EntryKind::File,
+            "other.bin",
+        )
+        .expect("a match");
+        assert_eq!(verified.relative, "other.bin");
+
+        // The panel never shows where an entry is: the step's path says, and the disk is checked.
+        let nested = check_selection(
+            &fixture,
+            &selected("nested", "folder"),
+            "nested",
+            EntryKind::Folder,
+            "victim/nested",
+        )
+        .expect("a nested match");
+        assert_eq!(nested.relative, "victim/nested");
+    }
+
+    /// The fixture has a `victim` folder at its root and another below `sub`. The panel shows a
+    /// name and a kind, so it cannot say which one is selected, and Backspace deletes that one:
+    /// naming either as the entry cannot be confirmed.
+    #[test]
+    fn a_selection_whose_name_and_kind_fit_two_entries_is_refused_whichever_the_step_names() {
+        let fixture = fixture();
+        let item = selected("victim", "folder");
+
+        for relative in ["victim", "sub/victim"] {
+            let refusal = check_selection(&fixture, &item, "victim", EntryKind::Folder, relative)
+                .expect_err("two entries fit the panel");
+            assert!(
+                refusal.contains("2 folders called `victim` (`sub/victim`, `victim`)"),
+                "{relative}: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_same_named_entry_of_the_other_kind_does_not_make_a_selection_ambiguous() {
+        let fixture = fixture();
+        // A file called `nested` far below the folder called `nested`: the panel says which kind.
+        fs::write(fixture.root.path().join("sub/victim/nested"), b"x").expect("a file");
+
+        let folder = check_selection(
+            &fixture,
+            &selected("nested", "folder"),
+            "nested",
+            EntryKind::Folder,
+            "victim/nested",
+        )
+        .expect("the only folder called nested");
+        assert_eq!(folder.relative, "victim/nested");
+
+        let file = check_selection(
+            &fixture,
+            &selected("nested", "file"),
+            "nested",
+            EntryKind::File,
+            "sub/victim/nested",
+        )
+        .expect("the only file called nested");
+        assert_eq!(file.relative, "sub/victim/nested");
+    }
+
+    #[test]
+    fn a_path_that_is_not_where_the_only_entry_of_that_name_is_is_refused() {
+        let fixture = fixture();
+        fs::create_dir_all(fixture.root.path().join("sub/elsewhere")).expect("a folder");
+        fs::write(fixture.root.path().join("sub/elsewhere/lonely.bin"), b"x").expect("a file");
+        fs::write(fixture.root.path().join("lonely"), b"x").expect("a file");
+
+        let refusal = check_selection(
+            &fixture,
+            &selected("lonely.bin", "file"),
+            "lonely.bin",
+            EntryKind::File,
+            "lonely",
+        )
+        .expect_err("the step's path is another entry");
+
+        assert!(
+            refusal.contains("the only file called `lonely.bin` is `sub/elsewhere/lonely.bin`"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_selection_that_is_another_entry_or_another_kind_is_refused() {
+        let fixture = fixture();
+
+        let other = check_selection(
+            &fixture,
+            &selected("other.bin", "file"),
+            "victim",
+            EntryKind::Folder,
+            "victim",
+        )
+        .expect_err("another entry");
+        assert!(
+            other.contains("shows `other.bin`, but the step deletes `victim`"),
+            "{other}"
+        );
+
+        let kind = check_selection(
+            &fixture,
+            &selected("victim", "file"),
+            "victim",
+            EntryKind::Folder,
+            "victim",
+        )
+        .expect_err("another kind");
+        assert!(
+            kind.contains("shows a file named `victim`, but the step deletes a folder"),
+            "{kind}"
+        );
+    }
+
+    #[test]
+    fn a_selection_is_held_to_the_disk_and_the_sentinels_as_a_dialog_is() {
+        let fixture = fixture();
+
+        // The panel and the step agree on a file, but the entry on disk is a folder.
+        let by_disk = check_selection(
+            &fixture,
+            &selected("victim", "file"),
+            "victim",
+            EntryKind::File,
+            "victim",
+        )
+        .expect_err("wrong kind on disk");
+        assert!(by_disk.contains("is a folder on disk"), "{by_disk}");
+
+        let missing = check_selection(
+            &fixture,
+            &selected("victim", "folder"),
+            "victim",
+            EntryKind::Folder,
+            "gone/victim",
+        )
+        .expect_err("missing");
+        assert!(missing.contains("does not exist"), "{missing}");
+
+        let holds_sentinel = check_selection(
+            &fixture,
+            &selected("keep-b", "folder"),
+            "keep-b",
+            EntryKind::Folder,
+            "keep-b",
+        )
+        .expect_err("holds a sentinel");
+        assert!(
+            holds_sentinel.contains("keep-b/keep.txt"),
+            "{holds_sentinel}"
+        );
+    }
+
+    #[test]
+    fn a_selection_is_refused_while_a_sentinel_is_missing() {
+        let mut fixture = fixture();
+        fixture.sentinels.push("keep-c.bin".to_owned());
+
+        let refusal = check_selection(
+            &fixture,
+            &selected("victim", "folder"),
+            "victim",
+            EntryKind::Folder,
+            "victim",
+        )
+        .expect_err("missing sentinel");
+
+        assert!(
+            refusal.contains("keep-c.bin") && refusal.contains("missing"),
+            "{refusal}"
+        );
     }
 }

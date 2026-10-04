@@ -1,0 +1,66 @@
+schema_version = 1
+name = "delete-tree-narrow-terminal-reduced-confirmation"
+description = "In a 60-column terminal with the confirmation disabled, Backspace deletes the selected folder at once with no dialog: the whole tree goes and the files beside it stay."
+fixture = "nested"
+sentinels = ["keep-a.bin", "keep-b.bin"]
+disable_delete_confirmation = true
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 60
+rows = 50
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# Nothing is selected: the fresh map arms its cursor on `victim`, the largest entry. (At this width
+# the status row cuts the reduced-guard label and the filter prompt that `select` reads, so the
+# scenario does not use either.) With no dialog to read, the step checks that the selected-item
+# panel shows this folder and presses Backspace; it fails if a dialog opens.
+[[steps]]
+step = "delete"
+name = "victim"
+kind = "folder"
+timeout_ms = 60000
+
+[[steps]]
+step = "wait_fs_absent"
+path = "victim"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "keep-b.bin"]
+absent = ["victim", "victim/inner", "victim/inner/part-0.bin", "victim/part-0.bin"]
+
+# What the interface reports afterwards: six entries deleted. This scenario never moves the cursor,
+# so after the map refreshes the cursor lands on its largest entry again on every platform, and the
+# selected-item panel shows the report in its own wording. (The header's status row cannot be used
+# here: at 60 columns it is cut in the middle, and the reduced-guard label before the report takes
+# the part of the row that is kept.) `skipped` would follow the count if any entry had not gone.
+[[steps]]
+step = "wait_text"
+text = "Last deletion: 6 removed"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["skipped", "DELETE FOLDER"]
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "quit"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000

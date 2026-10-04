@@ -198,14 +198,7 @@ fn a_wrong_delete_target_fails_the_step_and_no_confirmation_key_is_ever_sent() {
 
     // The recording shows every byte the runner wrote. The dialog was opened with Backspace, and
     // nothing was sent after it: the filter's Enter came before it, and no `y` was ever sent.
-    let cast = fs::read_to_string(bundle.join("session.cast")).expect("the bundle has a recording");
-    let inputs: Vec<String> = cast
-        .lines()
-        .skip(1)
-        .map(|line| serde_json::from_str::<Value>(line).expect("a cast event"))
-        .filter(|event| event[1] == "i")
-        .map(|event| event[2].as_str().expect("input text").to_owned())
-        .collect();
+    let inputs = recorded_inputs(&bundle);
     assert_eq!(
         inputs.last().map(String::as_str),
         Some("\u{7f}"),
@@ -215,6 +208,172 @@ fn a_wrong_delete_target_fails_the_step_and_no_confirmation_key_is_ever_sent() {
 
     // Nothing was deleted, and nothing else changed either.
     assert!(tree(fixture.root()) == before, "the fixture changed");
+}
+
+/// Every input the runner wrote to the program, from the failure bundle's recording.
+fn recorded_inputs(bundle: &Path) -> Vec<String> {
+    let cast = fs::read_to_string(bundle.join("session.cast")).expect("the bundle has a recording");
+    cast.lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<Value>(line).expect("a cast event"))
+        .filter(|event| event[1] == "i")
+        .map(|event| event[2].as_str().expect("input text").to_owned())
+        .collect()
+}
+
+#[test]
+fn a_wrong_delete_target_with_no_dialog_fails_the_step_before_backspace_is_ever_sent() {
+    let _session = session_guard();
+    let scenario = load(CONTROLS, "delete-reduced-wrong-target");
+    assert!(scenario.disable_delete_confirmation);
+    let work = Workspace::new();
+    let fixture = Fixtures::bundled()
+        .run_copy(&scenario.fixture, &work.0)
+        .expect("the fixture is built");
+    let before = tree(fixture.root());
+    let (report, bundle) = run(&scenario, Profile::Default, fixture.root(), &work);
+
+    // The `delete` step failed because it refused, not because of a timeout or a crash.
+    assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
+    let failure = report.failure.as_ref().expect("a failed step");
+    assert_eq!(failure.cause, FailureCause::DeleteRefused, "{failure}");
+    assert!(
+        matches!(scenario.steps.get(failure.index), Some(Step::Delete(_))),
+        "the failed step is not the delete step: {failure}"
+    );
+    assert!(
+        failure
+            .to_string()
+            .contains("the selected-item panel shows `victim`, but the step deletes `keep-a.bin`"),
+        "{failure}"
+    );
+
+    // Backspace is the one key that starts a deletion with no dialog: it was never written, and
+    // neither was a `y`. The last input is the filter's Enter.
+    let inputs = recorded_inputs(&bundle);
+    assert_eq!(inputs.last().map(String::as_str), Some("\r"), "{inputs:?}");
+    assert!(!inputs.iter().any(|input| input == "\u{7f}"), "{inputs:?}");
+    assert!(!inputs.iter().any(|input| input == "y"), "{inputs:?}");
+    assert!(tree(fixture.root()) == before, "the fixture changed");
+}
+
+/// The delete step's `path` defaults to `name` directly below the root. A dialog that names a file
+/// of that name somewhere else under the fixture root is another entry, and `y` is never sent.
+#[test]
+fn a_delete_step_without_a_path_refuses_an_entry_of_that_name_below_another_folder() {
+    let _session = session_guard();
+    let scenario = load(CONTROLS, "delete-default-path-nested-entry");
+    let work = Workspace::new();
+    let fixture = Fixtures::bundled()
+        .run_copy(&scenario.fixture, &work.0)
+        .expect("the fixture is built");
+    let before = tree(fixture.root());
+    let (report, bundle) = run(&scenario, Profile::Default, fixture.root(), &work);
+
+    assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
+    let failure = report.failure.as_ref().expect("a failed step");
+    assert_eq!(failure.cause, FailureCause::DeleteRefused, "{failure}");
+    assert!(
+        matches!(scenario.steps.get(failure.index), Some(Step::Delete(_))),
+        "the failed step is not the delete step: {failure}"
+    );
+    assert!(
+        failure
+            .to_string()
+            .contains("the dialog deletes `docs/twin.bin`, but the step deletes `twin.bin`"),
+        "{failure}"
+    );
+
+    // The dialog was opened with Backspace, and nothing was sent after it.
+    let inputs = recorded_inputs(&bundle);
+    assert_eq!(
+        inputs.last().map(String::as_str),
+        Some("\u{7f}"),
+        "{inputs:?}"
+    );
+    assert!(!inputs.iter().any(|input| input == "y"), "{inputs:?}");
+    assert!(tree(fixture.root()) == before, "the fixture changed");
+}
+
+/// With no dialog, the panel's name and kind are all that bind Backspace to an entry. Two entries
+/// with the same name and kind leave it unbound, so the step refuses before Backspace.
+#[test]
+fn a_deletion_with_no_dialog_refuses_a_name_and_kind_that_fit_two_entries() {
+    let _session = session_guard();
+    let scenario = load(CONTROLS, "delete-reduced-ambiguous-name");
+    assert!(scenario.disable_delete_confirmation);
+    let work = Workspace::new();
+    let fixture = Fixtures::bundled()
+        .run_copy(&scenario.fixture, &work.0)
+        .expect("the fixture is built");
+    let before = tree(fixture.root());
+    let (report, bundle) = run(&scenario, Profile::Default, fixture.root(), &work);
+
+    assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
+    let failure = report.failure.as_ref().expect("a failed step");
+    assert_eq!(failure.cause, FailureCause::DeleteRefused, "{failure}");
+    assert!(
+        matches!(scenario.steps.get(failure.index), Some(Step::Delete(_))),
+        "the failed step is not the delete step: {failure}"
+    );
+    assert!(
+        failure
+            .to_string()
+            .contains("the fixture has 2 files called `twin.bin` (`docs/twin.bin`, `twin.bin`)"),
+        "{failure}"
+    );
+
+    // Backspace starts a deletion with no dialog: it was never written, and neither was a `y`.
+    let inputs = recorded_inputs(&bundle);
+    assert!(!inputs.iter().any(|input| input == "\u{7f}"), "{inputs:?}");
+    assert!(!inputs.iter().any(|input| input == "y"), "{inputs:?}");
+    assert!(tree(fixture.root()) == before, "the fixture changed");
+}
+
+#[test]
+fn expect_config_reads_the_file_the_program_saved_its_theme_to() {
+    let _session = session_guard();
+    let commit_the_next_theme = "[[steps]]\nstep = \"key\"\nkey = \"t\"\n\n\
+         [[steps]]\nstep = \"wait_text\"\ntext = \"THEME PREVIEW\"\nregion = \"dialog\"\n\n\
+         [[steps]]\nstep = \"key\"\nkey = \"down\"\n\n\
+         [[steps]]\nstep = \"key\"\nkey = \"enter\"\n\n\
+         [[steps]]\nstep = \"settle\"\n\n";
+    let end = "\n[[steps]]\nstep = \"quit\"\n\n\
+         [[steps]]\nstep = \"expect_exit\"\ncode = 0\nterminal_restored = true\nresidue = \"none\"\n";
+    for (equals, saved) in [("excise-light", true), ("excise-dark", false)] {
+        let scenario = inline(
+            "saved-theme",
+            &format!(
+                "{commit_the_next_theme}[[steps]]\nstep = \"expect_config\"\n\
+                 key = \"runtime.theme\"\nequals = \"{equals}\"\n{end}"
+            ),
+        );
+        let work = Workspace::new();
+        let fixture = Fixtures::bundled()
+            .run_copy(&scenario.fixture, &work.0)
+            .expect("the fixture is built");
+
+        let (report, _) = run(&scenario, Profile::Default, fixture.root(), &work);
+
+        if saved {
+            assert_eq!(
+                report.verdict,
+                Verdict::Pass,
+                "failure {:?}, error {:?}",
+                report.failure,
+                report.error
+            );
+        } else {
+            // The file holds the light theme, and the step says so instead of passing.
+            assert_eq!(report.verdict, Verdict::Fail, "{report:?}");
+            let failure = report.failure.as_ref().expect("a failed step");
+            assert_eq!(failure.cause, FailureCause::Mismatch, "{failure}");
+            assert!(
+                failure.to_string().contains("it is \"excise-light\""),
+                "{failure}"
+            );
+        }
+    }
 }
 
 #[test]

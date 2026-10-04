@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use super::{ALL_STEPS, errors_of, parse, step_errors, valid};
 use crate::scenario::{
-    Budget, Comparison, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, EntryKind, EventField, EventKind,
-    Expect, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen, Field, FsMutate, Idle,
-    MAX_TIMEOUT_MS, Marker, Measure, MutateOp, PathViolation, Profile, Quit, Region, Residue,
-    Resize, ScanState, Scenario, Select, Settle, Step, StepError, TypeText, ValidationError,
-    WaitEvent, WaitFs, WaitHeader, WaitText, check_fixture_relative_path,
+    Budget, Comparison, ConfirmKey, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, EntryKind, EventField,
+    EventKind, Expect, ExpectBudget, ExpectConfig, ExpectExit, ExpectFs, ExpectScreen, Field,
+    FsMutate, Idle, MAX_TIMEOUT_MS, Marker, Measure, MutateOp, PathViolation, Profile, Quit,
+    Region, Residue, Resize, ScanState, Scenario, Select, Settle, Step, StepError, TypeText,
+    ValidationError, WaitEvent, WaitFs, WaitHeader, WaitText, check_fixture_relative_path,
 };
 
 fn wait_text(text: Option<&str>, regex: Option<&str>, region: Option<Region>) -> Step {
@@ -64,6 +64,8 @@ fn waiting_steps(timeout_ms: u64) -> Vec<Step> {
         Step::Delete(Delete {
             name: "victim".to_owned(),
             kind: EntryKind::Folder,
+            path: None,
+            confirm_with: ConfirmKey::Y,
             wait_for: DeleteWait::Finished,
             timeout_ms,
         }),
@@ -403,6 +405,8 @@ fn a_delete_step_requires_at_least_one_sentinel() {
     let delete = Step::Delete(Delete {
         name: "victim".to_owned(),
         kind: EntryKind::Folder,
+        path: None,
+        confirm_with: ConfirmKey::Y,
         wait_for: DeleteWait::Finished,
         timeout_ms: DEFAULT_TIMEOUT_MS,
     });
@@ -791,6 +795,8 @@ fn typed_text_and_entry_names_must_not_be_empty() {
     let delete = Step::Delete(Delete {
         name: String::new(),
         kind: EntryKind::File,
+        path: None,
+        confirm_with: ConfirmKey::Y,
         wait_for: DeleteWait::Finished,
         timeout_ms: DEFAULT_TIMEOUT_MS,
     });
@@ -1144,6 +1150,8 @@ fn every_broken_rule_is_reported_in_scenario_order() {
         Step::Delete(Delete {
             name: "victim".to_owned(),
             kind: EntryKind::File,
+            path: None,
+            confirm_with: ConfirmKey::Y,
             wait_for: DeleteWait::Finished,
             timeout_ms: 0,
         }),
@@ -1205,4 +1213,119 @@ fn the_rendered_report_locates_each_broken_rule() {
         .to_string();
 
     assert!(report.contains("steps[1] (wait_text)"), "{report}");
+}
+
+fn delete_at(path: &str) -> Step {
+    Step::Delete(Delete {
+        name: "stuck.txt".to_owned(),
+        kind: EntryKind::File,
+        path: Some(path.to_owned()),
+        confirm_with: ConfirmKey::Y,
+        wait_for: DeleteWait::Finished,
+        timeout_ms: DEFAULT_TIMEOUT_MS,
+    })
+}
+
+#[test]
+fn a_delete_path_must_be_safe_and_end_in_the_entrys_name() {
+    assert_eq!(step_errors(delete_at("stuck.txt")), []);
+    assert_eq!(step_errors(delete_at("hostile/unwritable/stuck.txt")), []);
+
+    // Where the entry is must name the entry, or the step would delete one thing and check another.
+    assert_eq!(
+        step_errors(delete_at("hostile/unwritable")),
+        [StepError::PathNotNamed {
+            name: "stuck.txt".to_owned(),
+            path: "hostile/unwritable".to_owned(),
+        }]
+    );
+    // A path that could leave the fixture is reported as that, and only that.
+    let errors = step_errors(delete_at("../stuck.txt"));
+    assert!(
+        matches!(errors.as_slice(), [StepError::InvalidPath { .. }]),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn a_delete_that_waits_for_its_dialog_to_close_needs_a_dialog() {
+    let started = Step::Delete(Delete {
+        name: "victim".to_owned(),
+        kind: EntryKind::Folder,
+        path: None,
+        confirm_with: ConfirmKey::Y,
+        wait_for: DeleteWait::Started,
+        timeout_ms: DEFAULT_TIMEOUT_MS,
+    });
+    let mut scenario = with_steps(vec![started]);
+    assert_eq!(errors_of(&scenario), []);
+
+    scenario.disable_delete_confirmation = true;
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::Step {
+            index: 0,
+            kind: "delete",
+            error: StepError::StartedWithoutDialog,
+        }]
+    );
+}
+
+#[test]
+fn a_confirm_key_other_than_the_default_needs_a_dialog() {
+    let enter = Step::Delete(Delete {
+        name: "victim".to_owned(),
+        kind: EntryKind::Folder,
+        path: None,
+        confirm_with: ConfirmKey::Enter,
+        wait_for: DeleteWait::Finished,
+        timeout_ms: DEFAULT_TIMEOUT_MS,
+    });
+    let mut scenario = with_steps(vec![enter]);
+    assert_eq!(errors_of(&scenario), []);
+
+    scenario.disable_delete_confirmation = true;
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::Step {
+            index: 0,
+            kind: "delete",
+            error: StepError::ConfirmWithoutDialog,
+        }]
+    );
+}
+
+#[test]
+fn expect_config_needs_a_dotted_key_and_a_string_to_equal() {
+    let expect = |key: &str, equals: &str| {
+        Step::ExpectConfig(ExpectConfig {
+            key: key.to_owned(),
+            equals: equals.to_owned(),
+        })
+    };
+    assert_eq!(step_errors(expect("runtime.theme", "excise-light")), []);
+    assert_eq!(step_errors(expect("version", "1")), []);
+    for key in [
+        "",
+        ".theme",
+        "runtime.",
+        "runtime..theme",
+        "Runtime.theme",
+        "runtime theme",
+        "runtime.the/me",
+    ] {
+        assert_eq!(
+            step_errors(expect(key, "x")),
+            [StepError::InvalidConfigKey {
+                key: key.to_owned()
+            }],
+            "{key:?}"
+        );
+    }
+    assert_eq!(
+        step_errors(expect("runtime.theme", "")),
+        [StepError::EmptyValue {
+            field: Field::new("equals")
+        }]
+    );
 }

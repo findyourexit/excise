@@ -76,8 +76,9 @@ residue = "none"
 
 Parsing rejects unknown fields at every level (top level, every step, and every nested table),
 unknown enum values, and wrongly typed values. There are no aliases; the only defaults are the
-documented ones (terminal size, `expect`, `timeout_ms`, `ctrl`, `alt`, `sentinels`, and
-`budgets`). Names are `snake_case`, except profile names, which are kebab-case.
+documented ones (terminal size, `expect`, `timeout_ms`, `ctrl`, `alt`, `sentinels`,
+`disable_delete_confirmation`, `confirm_with`, and `budgets`). Names are `snake_case`, except
+profile names, which are kebab-case.
 
 `Scenario::from_toml_str` and `Scenario::from_path` only parse. `Scenario::validate` then applies
 the semantic rules below and reports every broken rule, not only the first. **A runner must call
@@ -92,6 +93,7 @@ the semantic rules below and reports every broken rule, not only the first. **A 
 | `description` | yes | What the scenario demonstrates. |
 | `fixture` | yes | The identifier of the fixture specification to generate, in the same shape as `name`. The scenario never names a directory. |
 | `sentinels` | if any step is `delete` | Fixture-relative paths that must survive the scenario. |
+| `disable_delete_confirmation` | no | Starts `excise` in its session-only reduced-confirmation mode, as `--disable-delete-confirmation` does: Backspace starts a deletion at once, with no dialog, and the header shows `! REDUCED DELETE GUARD`. A typed field and not an argument list, because an argument could point the program at a root the harness does not own: the runners add this one flag in front of the fixture root they always pass (the in-process runner sets the same setting). Defaults to `false`. It changes what the `delete` step does: see [Steps](#steps). |
 | `scan_store_on_volume` | no | Points `EXCISE_SCAN_STORE_DIR` at a subdirectory of the fixture's attached volume instead of the scenario's own scratch area. Defaults to `false`. The fixture must declare exactly one `volume` part. See [Volumes](#volumes). |
 | `cgroup_memory_cap` | no | Spawns `excise` under the Linux cgroup memory cap instead of only sampling its memory. Defaults to `false`. Needs `EXCISE_HARNESS_CGROUP=1` and a host that can do it; every runner skips a scenario that sets this without both, with the reason, even when it is named. See [Linux cgroup memory cap](#linux-cgroup-memory-cap). |
 | `profiles` | yes | A non-empty, duplicate-free list of profiles the scenario runs under. |
@@ -263,7 +265,7 @@ state and never wait; put a `wait_*` or `settle` step before them.
 | `key` | `key`, `ctrl`, `alt` | Presses one key. |
 | `type` | `text` | Types literal text, one character at a time. |
 | `select` | `name`, `timeout_ms` | Selects the entry by name through the filter. |
-| `delete` | `name`, `kind` (`file` or `folder`), `wait_for` (`finished` or `started`), `timeout_ms` | Deletes the selected entry through the confirmation dialog. |
+| `delete` | `name`, `kind` (`file` or `folder`), `path`, `confirm_with` (`y` or `enter`), `wait_for` (`finished` or `started`), `timeout_ms` | Deletes the selected entry through the confirmation dialog, or with Backspace alone when the scenario disables the confirmation. |
 | `wait_fs_absent` | `path`, `timeout_ms` | Waits until the fixture-relative path no longer exists. |
 | `wait_fs_present` | `path`, `timeout_ms` | Waits until the fixture-relative path exists. |
 | `fs_mutate` | `op` (`appear`, `change`, `vanish`, `replace`), `path` | Changes the fixture while the program runs. |
@@ -271,6 +273,7 @@ state and never wait; put a `wait_*` or `settle` step before them.
 | `signal` | `signal` (`term`, `hup`, `quit`, `int`, `close`, `break`) | Delivers a signal or console event. `close` needs Windows; `break` is never deliverable (see below). |
 | `expect_screen` | `contains`, `not_contains`, `regex`, `region` | Asserts what the screen shows now. |
 | `expect_fs` | `present`, `absent` | Asserts which fixture-relative paths exist now. |
+| `expect_config` | `key`, `equals` | Asserts a string setting in the configuration file the program saved. |
 | `expect_exit` | `code`, `terminal_restored`, `residue`, `timeout_ms` | Waits for the program to exit and asserts how it ended. |
 | `expect_budget` | `budget`, `metric` | Asserts that a recorded metric is within a budget. |
 | `measure` | `name`, `marker` (`start` or `stop`) | Marks one end of a named measurement. |
@@ -294,16 +297,50 @@ Details that a table cannot carry:
   `not_contains`, and `regex` entries must not be empty.
 - **`key`.** `key` is one printable character (`"y"`, `"/"`, `" "`) or one of `enter`, `esc`,
   `backspace`, `tab`, `up`, `down`, `left`, `right`, `page_up`, `page_down`. Named keys are
-  lowercase. `ctrl` and `alt` default to `false`.
+  lowercase. `ctrl` and `alt` default to `false`. A key sent right behind a lone `esc` can be read
+  with it as Alt plus that key, so put a `settle` after `esc` before any other key (`quit` sends
+  `q`).
 - **`select`.** The runner opens the filter with `/`, types the name, presses Enter, then asserts
   that the selected item is exactly that entry.
 - **`delete`.** The runner acts on the selected entry. It presses Backspace, parses the
   confirmation dialog, asserts that its title and path name that entry, `name` and `kind`, under the
-  fixture root, asserts that every sentinel still exists, and only then presses `y`. Any mismatch
-  fails the step and `y` is never sent. `wait_for` (default `"finished"`) controls when the step
-  returns: `"finished"` waits for the deletion to finish; `"started"` returns as soon as the
-  confirmation has closed the dialog, while the deletion keeps running, so a later step can act
-  while it is still in progress (for example, delivering a `signal`).
+  fixture root, asserts that every sentinel still exists, and only then presses `y`, or Enter with
+  `confirm_with = "enter"` (the dialog offers both: `[Enter/y] start`). Any mismatch fails the step
+  and the confirmation key is never sent. `path` says where the entry is: relative to the fixture
+  root, `/`-separated, and ending in `name` (it defaults to `name` itself, an entry directly below
+  the root); with a dialog, the path the dialog shows must be exactly the fixture root and `path`.
+  `wait_for` (default `"finished"`) controls when the step returns: `"finished"` waits for the
+  deletion to finish; `"started"` returns as soon as the confirmation has closed the dialog, while
+  the deletion keeps running, so a later step can act while it is still in progress (for example,
+  delivering a `signal`).
+
+  **Without a dialog** (`disable_delete_confirmation = true`) Backspace alone starts the deletion,
+  so the step has no dialog to read and no key to hold back. It checks what it can before it presses
+  Backspace. It waits, within its `timeout_ms`, for the selected-item panel to show an entry of this
+  `name` and `kind` (the pseudo-terminal runner reads a panel that can trail the header: a fresh map
+  arms its cursor in the frame that ends the scan, and a terminal may deliver a frame in pieces);
+  a panel that never does fails the step and says what it showed. Then the entry that `path` names
+  must exist on disk with that kind, every sentinel must exist, and no sentinel may be that entry or
+  lie inside it. The panel never shows where an entry lives, so an entry below a folder needs
+  `path`, and `name` and `kind` must belong to one entry in the whole fixture: a panel that shows a
+  file called `twin.bin` could be either of two, and Backspace deletes whichever is selected, so the
+  step refuses and says where the twins are (give each entry a name of its own, or keep the
+  confirmation on, whose dialog shows the path). The step then presses Backspace and fails if any
+  dialog opens: a confirmation dialog means the program did not honour the mode, and no key is sent
+  to confirm it. After that it waits as `"finished"` does. `wait_for = "started"` and
+  `confirm_with = "enter"` have nothing to act on there and are validation errors. A terminal too
+  narrow to draw the selected-item panel cannot run this step.
+  At about 60 columns the status row cuts a label that precedes the filter prompt (the reduced-guard
+  label, or `! ELEVATED` on an elevated Windows session such as the hosted runner), so `select`
+  cannot read the prompt there; a scenario at that width leaves selected the entry that the fresh
+  map selects (the largest) instead of choosing one.
+- **`expect_config`.** `key` is a dotted path into the configuration file the program saved: every
+  name but the last is a table, and the last is a setting whose value is a string, which `equals`
+  must match exactly (`key = "runtime.theme"`, `equals = "excise-light"`). Names are lowercase ASCII
+  letters, digits, `_`, and `-`. The step reads the file as it is now and never waits, so put a
+  `settle` before it. A process run reads the scratch file `EXCISE_CONFIG` names; the in-process
+  runner gives the program a file of its own. A file that is not TOML, a missing table or setting,
+  or a value that is not a string fails the step and says which.
 - **`wait_event`.** `event` is one of `frame`, `scan_complete`, `deletion_finished`, `quit_prompt`,
   or `exit`: the kinds reported by the program's internal test event channel (which also opens with
   a `hello` line that the runner consumes itself). `fields` maps a numeric event field to a test:
@@ -355,6 +392,9 @@ Details that a table cannot carry:
 | `platforms` and `fails_on` name only known platforms, without repeats, and are not present but empty | `UnknownPlatform`, `DuplicatePlatform`, `EmptyPlatformList` |
 | `fails_on` names only platforms `platforms` includes | `FailsOnOutsidePlatforms` |
 | a scenario with a `delete` step declares a sentinel | `DeleteWithoutSentinel` |
+| a `delete` step's `path` ends in the entry's `name` | `PathNotNamed` |
+| in a scenario with `disable_delete_confirmation`, a `delete` step has neither `wait_for = "started"` nor `confirm_with = "enter"`: there is no dialog to close or to confirm | `StartedWithoutDialog`, `ConfirmWithoutDialog` |
+| an `expect_config` key is a dotted path of lowercase names, and it expects a non-empty string | `InvalidConfigKey`, `EmptyValue` |
 | every fixture-relative path is safe (see [Safety rules](#safety-rules)) | `InvalidPath` |
 | every `timeout_ms` is between 1 and 1 800 000 | `TimeoutOutOfRange` |
 | `wait_text` has exactly one non-empty matcher | `MissingMatcher`, `ConflictingMatchers`, `EmptyValue` |
@@ -365,6 +405,50 @@ Details that a table cannot carry:
 | a `wait_event` tests only fields its event carries | `UnknownEventField` |
 | metric and measurement names are identifiers | `InvalidIdentifier` |
 | measurements start once, stop once, and stop after starting | `MeasureRestarted`, `MeasureStopWithoutStart`, `MeasureNeverStopped` |
+
+### The deletion and lifecycle scenarios
+
+Deletion, its confirmation, cancellation, refusal, and what the interface says and allows around
+it are pinned by these scenarios, all `quick`, under `default` and `deterministic`, in both
+runners. Each asserts the facts by name (what is on disk, what the dialog names, what the
+interface reports, how the run ends) and not whole frames.
+
+What the interface reports is read from the header's status row (`Last deletion: 1 deleted · 0
+changed · 0 missing · 0 failed · 0 not run`), which shows it after a deletion whatever is
+selected. The selected-item panel words the same report shorter (`Last deletion: 1 removed`), but
+only while an entry is selected, and what is selected afterwards depends on the platform: macOS
+cannot prove that a file it removed left no other link behind, so it rebuilds the map, which drops
+the filter and puts the cursor back on the largest entry, while Linux and Windows swap in a map
+without the removed entry, which keeps the filter and, once the cursor has moved, selects nothing.
+Four scenarios read the panel's wording instead of the row, for two reasons. The row gives way to a
+more urgent status, and the `refused` fixture has one (`Scan complete · 1 path unreadable`):
+nothing is removed there, so the map is not refreshed and the entry stays selected on every
+platform. And at 60 columns the row is cut in the middle to fit beside the size of the scan store,
+and how much of it is kept depends on the disk and on the labels in front of it (the reduced-guard
+label, and `! ELEVATED` on an elevated Windows session such as the hosted runner), so both
+60-column scenarios read the panel, which they can because they never move the cursor, and the
+cursor lands on the largest entry again on every platform. For the same labels, the two
+reduced-confirmation scenarios that read the row run 160 columns wide, where it is never cut. A
+scenario never asserts the size of the store, which depends on the disk, or a path separator,
+which depends on the platform.
+
+| Scenario | Fixture | What it pins |
+|---|---|---|
+| `delete-file-lifecycle` | `delete-file` | A confirmed deletion removes only that file, the header reports one entry deleted and none failed, the map stays navigable, and quitting restores the terminal. |
+| `delete-folder-lifecycle` | `delete-folder` | The same for a folder of 5,011 entries. |
+| `delete-tree-confirmed-with-enter` | `nested` | Enter confirms, and a folder goes with the folder inside it while the files beside it stay. |
+| `delete-tree-narrow-terminal` | `nested` | The same in a terminal 60 columns wide. Linux and macOS: on Windows the fixture's path (under the runner's temporary directory, every backslash doubled on screen) is longer than a 60-column dialog shows, and the `delete` step refuses a path it cannot read whole. |
+| `delete-file-cancelled` | `delete-file` | The first Backspace of a fresh map opens the confirmation for the largest entry; `n` closes it, and nothing is touched. |
+| `delete-file-terminal-too-small` | `delete-file` | In a terminal 49 columns wide Backspace opens an error dialog that says to resize, and nothing is deleted. |
+| `delete-file-reduced-confirmation`, `delete-tree-reduced-confirmation`, `delete-tree-narrow-terminal-reduced-confirmation` | `delete-file`, `nested` | `disable_delete_confirmation`: the header says the guard is reduced, Backspace deletes at once with no dialog, and the program reports what it removed. |
+| `delete-refused-by-permission`, `delete-refused-reduced-confirmation` | `refused` | A file in a folder that cannot be changed is not removed, the selected-item panel reports `0 removed, 1 skipped`, and the exit code is 3 (a partial result). Linux and macOS. |
+| `exit-prompt-keeps-pending-deletion` | `delete-file` | The exit prompt over a waiting confirmation names the waiting check, and keeping work brings the same confirmation back. |
+| `theme-commit-saves` | `delete-file` | A committed theme is saved to the configuration file (`expect_config`), and quitting then shows only the ordinary prompt. |
+
+`src/tests/cases/ui.rs` holds only layout snapshots and two tests of frames that neither runner can
+see: the frame between a confirmed deletion and its result, and the filter prompt while a deletion
+runs. A scenario that needs a step only the pseudo-terminal runner performs (`wait_event`,
+`signal`, and so on) is skipped in-process, so these use none of them.
 
 ## Runner semantics
 
@@ -627,14 +711,22 @@ longer than its budget on the reference machine (see [Quick-tier time](#quick-ti
   `target/excise-e2e/latest` points at the newest run (a symbolic link, or on Windows a text file).
   Failure bundles sit beside it, one directory per failed run.
 
-The negative control for the `delete` step is not a scenario. It is
-[`tests/controls/delete-wrong-target.toml`](tests/controls/delete-wrong-target.toml): it selects a
-folder and then asks `delete` for a different entry. `cargo xtask e2e` never runs it, because it is
-not in `scenarios/`. `tests/harness_scenarios.rs` in the `excise` crate runs
-`delete-folder-lifecycle` under every profile it names against the crate's own binary as part of
-`cargo test`, along with a few one-off scenarios that exercise the runner itself, and runs the
-control to assert that the `delete` step failed, that the last input was Backspace, that no `y`
-appears among the recording's input events, and that every byte of the fixture is unchanged.
+The negative controls for the `delete` step are not scenarios. They are
+[`tests/controls/delete-wrong-target.toml`](tests/controls/delete-wrong-target.toml) and
+[`tests/controls/delete-reduced-wrong-target.toml`](tests/controls/delete-reduced-wrong-target.toml)
+(the same, in a scenario that disables the confirmation): each selects a folder and then asks
+`delete` for a different entry. Two more ask for an entry the step cannot bind to what it names:
+[`tests/controls/delete-default-path-nested-entry.toml`](tests/controls/delete-default-path-nested-entry.toml)
+selects `docs/twin.bin` and gives no `path`, which means `twin.bin` directly below the root, and
+[`tests/controls/delete-reduced-ambiguous-name.toml`](tests/controls/delete-reduced-ambiguous-name.toml)
+disables the confirmation over a fixture with two files called `twin.bin`, so that the panel cannot
+say which one Backspace would delete. `cargo xtask e2e` never runs them, because they are not in
+`scenarios/`. `tests/harness_scenarios.rs` in the `excise` crate runs `delete-folder-lifecycle`
+under every profile it names against the crate's own binary as part of `cargo test`, along with a
+few one-off scenarios that exercise the runner itself, and runs each control to assert that the
+`delete` step failed, that Backspace was the last input when a dialog is open and was never sent
+when there is none, that no `y` appears among the recording's input events, and that every byte of
+the fixture is unchanged.
 
 ### Quick-tier time
 
@@ -1178,7 +1270,7 @@ a dense file is at most 1 GiB. A *name style* is one of:
 | `deep` | Scale | A chain of nested directories, created relative to open directory handles so that it can pass `PATH_MAX`. `depth` (required, at most 512), `name_len` (required, 5 to 255 bytes), `files_per_level` (0), `file_size` (1). The deepest path has `len(root) + depth × (name_len + 1)` bytes: choose it above 1,024 (macOS) or 4,096 (Linux). |
 | `file` | Any | One top-level file, for sentinels. `size` (1). |
 | `identity` | Identity | Features are off until asked for. Entries live in `links/`, `dangling/`, `symlinks/`, `loops/`, `sparse/`, and `clones/` below the root, and every link target is relative. `hard_link_groups` (0) of `links_per_group` (2, at most 64) names, spread over `link_spread` (2) directories `links/d0`, `links/d1`, and so on, of `link_file_size` (4096); `dangling_symlinks` (0); `valid_symlinks` (false: one link to a file and one to a directory); `symlink_loops` (a list of `self`, `pair`, and `directory`); `sparse_files` (a list of `{ apparent_mib, data_kib = 4 }`, above 16 MiB to stay sparse on APFS); `clones` (0) of one original of `clone_kib` (64) KiB. |
-| `hostile` | Hostile | `features`, at least one and without repeats, of `control_names`, `bidi_names` (U+202E and friends), `escape_names` (ESC sequences), `newline_names`, `invalid_utf8_names`, `long_names` (255 bytes), `unreadable_dirs` (modes 000 and 100, with contents), and `unreadable_files` (modes 000 and 200). Each name feature creates one directory per name, holding a file of the same name. |
+| `hostile` | Hostile | `features`, at least one and without repeats, of `control_names`, `bidi_names` (U+202E and friends), `escape_names` (ESC sequences), `newline_names`, `invalid_utf8_names`, `long_names` (255 bytes), `unreadable_dirs` (modes 000 and 100, with contents), `unreadable_files` (modes 000 and 200), and `unwritable_dirs` (`unwritable/`, a mode 555 directory that holds `stuck.txt`: it can be listed and entered, and nothing in it can be removed). Each name feature creates one directory per name, holding a file of the same name. Like `unreadable_dirs`, `unwritable_dirs` keeps a fixture out of the cache, because a path-based removal cannot remove it; and it needs a user that is not root, because root ignores the mode, so a run copy refuses to generate it for one (`FixtureError::NeedsUnprivilegedUser`). |
 | `volume` | Volumes | A mount point: an empty directory in the master. `size_mib` (required, 8 to 1024), `files` (0) of `file_bytes` (1024) written once a volume is attached (see [Volumes](#volumes)). |
 
 The specs the crate ships. Entries are planned entries; every generated fixture also holds the
@@ -1195,6 +1287,9 @@ marker.
 | `all-classes-small` | 253 | Every class once, in one fixture. |
 | `delete-folder` | 5,014 | A 5,000-entry victim for deletion scenarios. |
 | `delete-file` | 5 | A 48 KiB victim file, a sentinel beside it, and a folder below it with two more files that must survive. The in-process lifecycle scenario deletes the victim. |
+| `nested` | 8 | A folder with a folder inside it, and files beside it: `victim/` holds two files and `inner/`, which holds two more (32 KiB in all, the largest entry, so a fresh map selects it), and `keep-a.bin` and `keep-b.bin` (16 KiB each) are the sentinels. The id is short on purpose: a terminal 60 columns wide cuts a longer path in the deletion dialog. |
+| `refused` | 4 | A file that cannot be deleted: `hostile/unwritable/stuck.txt`, in a mode 555 directory, and `keep-a.bin` beside it as a sentinel. It needs permission modes and a user that is not root (Linux and macOS), and it is never cached: take a run copy. The id is short on purpose: the deletion dialog cuts a long path, and the `delete` step refuses to confirm a path it cannot read whole. |
+| `twins` | 4 | Two files called `twin.bin`, one at the root (the largest entry, so a fresh map selects it) and one in `docs/`, and `keep-a.bin` beside them as a sentinel. The selected-item panel shows a name and a kind and nothing else, so it cannot tell the twins apart: the controls for a `delete` step with no `path`, or with no dialog, use it. |
 | `navigate-folders` | 6 | Two folders and a file beside them, to drill into and back out of. |
 | `mount-boundary` | 13 | An ordinary `outside/` tree and an empty mount point; a privileged run copy attaches a 16 MiB volume with 20 files. |
 | `scan-store-quota` | 35,002 | A flat directory of 35,000 tiny files beside an empty mount point; a privileged run copy attaches an 8 MiB volume there for `scan_store_on_volume` (see [Volumes](#volumes)). |
@@ -1462,7 +1557,10 @@ or mutates therefore never touches the cached master.
 ### Profiles
 
 The profiles are the in-process column of the contract, built from the same options through the
-same configuration layers, without reading the environment or a configuration file:
+same configuration layers, without reading the environment or a configuration file. The runner
+gives the program a configuration file of its own, empty, which a theme commit writes and
+`expect_config` reads, and a scenario's `disable_delete_confirmation` adds the same flag the
+process runners pass:
 
 | Profile | In-process configuration |
 |---|---|
@@ -1482,8 +1580,9 @@ same configuration layers, without reading the environment or a configuration fi
 | `wait_text`, `expect_screen` | Match the screen text, or one region of it: `header` (the top three rows), `dialog`, or `rows`. |
 | `wait_header` | Reads the state badge that ends the title row. `scanning` can only be seen before the first settle. |
 | `select` | Opens the filter, replaces what it holds, types the name, applies it, and waits for the selected-item panel to name exactly that entry. The panel needs a terminal of at least 19 rows. |
-| `delete` | Presses Backspace, parses the dialog, asserts its title and path name exactly this entry and kind under the fixture root (a path the dialog cut short cannot be checked), asserts every sentinel exists, and only then sends `y`. A mismatch fails the step and `y` is never sent. |
+| `delete` | Presses Backspace, parses the dialog, asserts its title and path name exactly this entry and kind under the fixture root (a path the dialog cut short cannot be checked) and, with `path`, exactly that path, asserts every sentinel exists, and only then sends `y`, or Enter with `confirm_with = "enter"`. A mismatch fails the step and the confirmation key is never sent. With `disable_delete_confirmation` it instead checks the selected-item panel (name and kind), the entry on disk at `path`, and the sentinels, sends Backspace alone, and fails if a dialog opens. |
 | `wait_fs_absent`, `wait_fs_present`, `expect_fs` | Resolve paths one component at a time, never through a symbolic link. |
+| `expect_config` | Reads the configuration file the runner gave the program and compares one string setting of it, on a fresh screen: a barrier comes first when input was delivered since the last one. |
 | `fs_mutate` | Applies `appear`, `change`, `vanish`, or `replace` with the [live mutators](#live-mutators), once the program is at rest: unless the last thing delivered was a barrier, one comes first, so even a mutation that opens the scenario lands after the first scan has settled. Nothing tells the program, so what it does about the change is what the steps after this one observe. A refused mutation fails the step with the mutator's reason. |
 | `resize` | Resizes the backend and delivers the resize event. |
 | `quit` | Presses `q`, waits for the plain `Quit Excise?` prompt, and presses `y`. A prompt about pending deletion work fails the step. |

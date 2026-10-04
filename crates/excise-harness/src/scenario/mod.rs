@@ -19,6 +19,7 @@ use thiserror::Error;
 
 use crate::{platform::PLATFORMS, string_enum::string_enum};
 
+mod config;
 mod path;
 mod step;
 mod validate;
@@ -26,12 +27,13 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
+pub use config::config_setting;
 pub use path::{PathViolation, check_fixture_relative_path};
 pub use step::{
-    Comparison, Delete, DeleteWait, EntryKind, EventField, EventKind, ExpectBudget, ExpectExit,
-    ExpectFs, ExpectScreen, FsMutate, Idle, KeyName, KeyNameError, Marker, Measure, MutateOp,
-    PressKey, Quit, Region, Residue, Resize, ScanState, Select, SendSignal, Settle, Signal, Step,
-    TypeText, WaitEvent, WaitFs, WaitHeader, WaitText,
+    Comparison, ConfirmKey, Delete, DeleteWait, EntryKind, EventField, EventKind, ExpectBudget,
+    ExpectConfig, ExpectExit, ExpectFs, ExpectScreen, FsMutate, Idle, KeyName, KeyNameError,
+    Marker, Measure, MutateOp, PressKey, Quit, Region, Residue, Resize, ScanState, Select,
+    SendSignal, Settle, Signal, Step, TypeText, WaitEvent, WaitFs, WaitHeader, WaitText,
 };
 pub use validate::{Field, StepError, ValidationError, ValidationErrors};
 
@@ -199,6 +201,14 @@ pub struct Scenario {
     /// it is named, the same way a fixture with a volume part needs `EXCISE_HARNESS_PRIVILEGED`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cgroup_memory_cap: bool,
+    /// Starts `excise` in its session-only reduced-confirmation mode, as the
+    /// `--disable-delete-confirmation` flag does: a deletion starts when it is asked for, with no
+    /// confirmation dialog, and the header shows `! REDUCED DELETE GUARD`. A typed field, not
+    /// free-form arguments: a scenario cannot point the program at a root of its own, because the
+    /// runners add this one flag themselves, in front of the fixture root they always pass. The
+    /// in-process runner sets the same runtime setting. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_delete_confirmation: bool,
     /// The profiles the scenario runs under.
     pub profiles: Vec<Profile>,
     /// How often the scenario runs. `quick` (the default) runs under every tier and in-process;

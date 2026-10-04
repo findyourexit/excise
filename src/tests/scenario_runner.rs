@@ -85,14 +85,23 @@ pub fn run_scenario_with(
         .tempdir()
         .map_err(|error| RunError::Setup(format!("no scratch directory: {error}")))?;
     let scan_store = scratch.path().join("scan-store");
-    let configuration = profile::configure(profile, scenario.terminal, root, scan_store.clone())
-        .map_err(RunError::Setup)?;
+    // The counterpart of the process runners' `EXCISE_CONFIG`: an empty configuration in the only
+    // supported version, which a theme commit may rewrite. It lies outside the scan-store
+    // directory, so the residue check never sees it.
+    let config = scratch.path().join("config").join("config.toml");
+    fs::create_dir(scratch.path().join("config"))
+        .and_then(|()| fs::write(&config, "version = 1\n"))
+        .map_err(|error| RunError::Setup(format!("no configuration file: {error}")))?;
+    let configuration =
+        profile::configure(profile, scenario, root, scan_store.clone(), config.clone())
+            .map_err(RunError::Setup)?;
     let backend = SharedBackend::new(configuration.cols, configuration.rows);
     let progress = Rc::new(RefCell::new(Progress::default()));
     let input = ScenarioInput::new(
         Rc::clone(&plan),
         backend.clone(),
         root.to_path_buf(),
+        config,
         limits,
         Rc::clone(&progress),
     );

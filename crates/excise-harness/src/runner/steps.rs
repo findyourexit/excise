@@ -1,6 +1,9 @@
 //! The steps of the scenario vocabulary, implemented on the executor.
 
-use std::time::{Duration, Instant};
+use std::{
+    fs,
+    time::{Duration, Instant},
+};
 
 use crate::{
     events::Payload,
@@ -13,15 +16,15 @@ use crate::{
     report::TimingWarning,
     safety::{FixtureSnapshot, send_signal},
     scenario::{
-        DEFAULT_TIMEOUT_MS, Delete, DeleteWait, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen,
-        FsMutate, Idle, Measure, Quit, Residue, Resize, Select, SendSignal, Settle, Signal, Step,
-        WaitEvent, WaitFs, WaitHeader, WaitText,
+        ConfirmKey, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, ExpectBudget, ExpectConfig, ExpectExit,
+        ExpectFs, ExpectScreen, FsMutate, Idle, Measure, Quit, Residue, Resize, Select, SendSignal,
+        Settle, Signal, Step, WaitEvent, WaitFs, WaitHeader, WaitText, config_setting,
     },
 };
 
 use super::{
     budget::{is_latency, limit_for},
-    delete::verify,
+    delete::{verify, verify_selection},
     exec::{Executor, FS_POLL_INTERVAL, Waited},
     outcome::{FailureCause, RunError, Stop},
     plan::{Prepared, describe_region},
@@ -67,6 +70,7 @@ impl Executor<'_> {
             Step::Signal(step) => self.signal(index, *step),
             Step::ExpectScreen(step) => self.expect_screen(index, step),
             Step::ExpectFs(step) => self.expect_fs(index, step),
+            Step::ExpectConfig(step) => self.expect_config(index, step),
             Step::ExpectExit(step) => self.expect_exit(index, step),
             Step::ExpectBudget(step) => self.expect_budget(index, step),
             Step::Measure(step) => {
@@ -310,7 +314,13 @@ impl Executor<'_> {
     /// (default `"finished"`) controls when the step returns: on the first frame after
     /// `deletion_finished`, which shows the result, or (`"started"`) as soon as the dialog has
     /// closed, while the deletion keeps running in the background.
+    ///
+    /// A scenario that sets `disable_delete_confirmation` has no dialog to read: see
+    /// [`Self::delete_without_dialog`].
     fn delete(&mut self, index: usize, step: &Delete) -> Result<(), Stop> {
+        if self.scenario.disable_delete_confirmation {
+            return self.delete_without_dialog(index, step);
+        }
         let deadline = Self::deadline(step.timeout_ms);
         let expected = format!(
             "the deletion dialog to name the {} {:?} under {}",
@@ -351,6 +361,7 @@ impl Executor<'_> {
             }
             DialogView::None => return Err(Self::unprepared(index, "delete")),
         };
+        let relative = step.path.as_deref().unwrap_or(&step.name);
         let verified = verify(
             &dialog,
             &step.name,
@@ -358,6 +369,19 @@ impl Executor<'_> {
             self.fixture,
             &self.scenario.sentinels,
         )
+        .and_then(|verified| {
+            // Where the entry is: the step's `path`, or `name` itself directly below the root.
+            // The dialog proves the entry only down to its name, so a same-named entry in
+            // another folder would pass `verify` alone.
+            if verified.relative == relative {
+                Ok(verified)
+            } else {
+                Err(format!(
+                    "the dialog deletes `{}`, but the step deletes `{relative}`",
+                    verified.relative
+                ))
+            }
+        })
         .map_err(|reason| {
             self.fail(
                 index,
@@ -369,7 +393,11 @@ impl Executor<'_> {
 
         // Every check passed. Only now is the confirmation key sent.
         let events_before = self.events.events().len();
-        let at = self.send_input(b"y")?;
+        let confirm: &[u8] = match step.confirm_with {
+            ConfirmKey::Y => b"y",
+            ConfirmKey::Enter => &ENTER,
+        };
+        let at = self.send_input(confirm)?;
         self.recorder.record_deletion_confirmed(at);
         self.intended_deletions.push(verified.relative);
 
@@ -377,6 +405,123 @@ impl Executor<'_> {
             DeleteWait::Started => self.delete_wait_started(index, step, deadline),
             DeleteWait::Finished => self.delete_wait_finished(index, step, deadline, events_before),
         }
+    }
+
+    /// `disable_delete_confirmation`: Backspace alone starts the deletion, so there is no dialog to
+    /// read and no key to hold back. The step waits for the selected-item panel to name the entry,
+    /// then checks the disk and the sentinels (`verify_selection`); presses Backspace; fails if a
+    /// dialog opens (the program did not honour the mode, and no key is sent to confirm it); and
+    /// then waits like `wait_for = "finished"`.
+    fn delete_without_dialog(&mut self, index: usize, step: &Delete) -> Result<(), Stop> {
+        let deadline = Self::deadline(step.timeout_ms);
+        let relative = step.path.as_deref().unwrap_or(&step.name);
+        let expected = format!(
+            "the selected-item panel to show the {} {:?}, which Backspace alone deletes at {relative:?} under {}",
+            step.kind,
+            step.name,
+            self.fixture.path().display()
+        );
+
+        // The selection is what the panel shows after every key sent so far. The panel can trail
+        // the header: a fresh map arms its cursor in the frame that ends the scan, and the terminal
+        // may deliver that frame in pieces, so a panel that shows nothing, or another entry, is not
+        // an answer yet. The step waits for the panel to name this entry and kind, and refuses only
+        // when it never does within the step's `timeout_ms`.
+        let kind = step.kind.to_string();
+        let shown = self.wait_until(deadline, |exec| {
+            exec.frame_reflecting_inputs()?;
+            match inspector(exec.session.screen()) {
+                Inspector::Item(item) if item.name == step.name && item.kind == kind => Some(item),
+                _ => None,
+            }
+        })?;
+        let selected = match shown {
+            Waited::Ready(selected) => selected,
+            other => {
+                let refusal = match inspector(self.session.screen()) {
+                    Inspector::Item(item) if item.name == step.name && item.kind == kind => None,
+                    Inspector::Item(item) => verify_selection(
+                        &item,
+                        &step.name,
+                        step.kind,
+                        relative,
+                        self.fixture,
+                        &self.scenario.sentinels,
+                    )
+                    .err(),
+                    Inspector::NothingSelected => Some("the panel shows no selection".to_owned()),
+                    Inspector::NotShown => Some("the selected-item panel is not drawn".to_owned()),
+                };
+                if let (Some(reason), true) = (refusal, matches!(other, Waited::TimedOut)) {
+                    return Err(self.fail(index, FailureCause::DeleteRefused, expected, reason));
+                }
+                return Err(self.unmet(
+                    index,
+                    &other.discard(),
+                    "a frame that reflects every key sent, with the panel naming the entry",
+                    step.timeout_ms,
+                    || format!("the screen shows:\n{}", self.session.screen().text()),
+                ));
+            }
+        };
+        let verified = verify_selection(
+            &selected,
+            &step.name,
+            step.kind,
+            relative,
+            self.fixture,
+            &self.scenario.sentinels,
+        )
+        .map_err(|reason| {
+            self.fail(index, FailureCause::DeleteRefused, expected.clone(), reason)
+        })?;
+
+        // Backspace is the whole confirmation: record it as the moment the deletion was asked for.
+        let events_before = self.events.events().len();
+        let at = self.send_input(&BACKSPACE)?;
+        self.recorder.record_deletion_confirmed(at);
+        self.intended_deletions.push(verified.relative);
+
+        let opened = self.wait_until(deadline, |exec| {
+            exec.frame_reflecting_inputs()?;
+            Some(dialog_view(exec.session.screen()))
+        })?;
+        match opened {
+            Waited::Ready(DialogView::None) => {}
+            Waited::Ready(DialogView::Delete(dialog)) => {
+                return Err(self.fail(
+                    index,
+                    FailureCause::DeleteRefused,
+                    expected,
+                    format!(
+                        "a confirmation dialog opened although the scenario disables confirmation, \
+                         so the program did not honour the mode; no key was sent to confirm it:\n{}",
+                        dialog.view.text
+                    ),
+                ));
+            }
+            Waited::Ready(DialogView::Other(other)) => {
+                return Err(self.fail(
+                    index,
+                    FailureCause::DeleteRefused,
+                    expected,
+                    format!(
+                        "the dialog `{}` opened instead of a deletion starting:\n{}",
+                        other.title, other.text
+                    ),
+                ));
+            }
+            other => {
+                return Err(self.unmet(
+                    index,
+                    &other.discard(),
+                    "a frame that reflects Backspace",
+                    step.timeout_ms,
+                    || self.events_summary(),
+                ));
+            }
+        }
+        self.delete_wait_finished(index, step, deadline, events_before)
     }
 
     /// `wait_for = "started"`: returns once a frame shows the dialog has closed. The confirmation
@@ -607,6 +752,37 @@ impl Executor<'_> {
             format!("present {:?} and absent {:?}", step.present, step.absent),
             problems.join("; "),
         ))
+    }
+
+    /// Reads the scratch configuration file, the one `EXCISE_CONFIG` names, and compares one
+    /// setting of it. The step never waits: a `settle` before it makes the program's last key
+    /// reach the file.
+    fn expect_config(&mut self, index: usize, step: &ExpectConfig) -> Result<(), Stop> {
+        self.pump()?;
+        let found = fs::read_to_string(self.scratch.config_file())
+            .map_err(|error| format!("the configuration file cannot be read: {error}"))
+            .and_then(|text| config_setting(&text, &step.key));
+        match found {
+            Ok(value) if value == step.equals => Ok(()),
+            Ok(value) => Err(self.fail(
+                index,
+                FailureCause::Mismatch,
+                format!(
+                    "`{}` in the configuration file to be {:?}",
+                    step.key, step.equals
+                ),
+                format!("it is {value:?}"),
+            )),
+            Err(reason) => Err(self.fail(
+                index,
+                FailureCause::Mismatch,
+                format!(
+                    "`{}` in the configuration file to be {:?}",
+                    step.key, step.equals
+                ),
+                reason,
+            )),
+        }
     }
 
     /// Waits for the exit, reads the rest of the output, and asserts how the program ended.

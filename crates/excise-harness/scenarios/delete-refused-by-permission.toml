@@ -1,0 +1,99 @@
+schema_version = 1
+name = "delete-refused-by-permission"
+description = "A file in a folder that cannot be changed cannot be deleted: the deletion is confirmed and runs, the program reports one failure and no removal, and the file and its folder are still there."
+fixture = "refused"
+sentinels = ["keep-a.bin"]
+profiles = ["default", "deterministic"]
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# Walk down to the file: `hostile/` holds only `unwritable/`, a folder that can be listed and
+# entered (mode 555) but not changed, and `unwritable/` holds `stuck.txt`.
+[[steps]]
+step = "select"
+name = "hostile"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "wait_text"
+text = "hostile"
+region = "header"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "unwritable"
+
+[[steps]]
+step = "key"
+key = "enter"
+
+[[steps]]
+step = "wait_text"
+text = "unwritable"
+region = "header"
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "stuck.txt"
+
+# The dialog must name this file at this path, then `y` confirms it.
+[[steps]]
+step = "delete"
+name = "stuck.txt"
+kind = "file"
+path = "hostile/unwritable/stuck.txt"
+timeout_ms = 30000
+
+# The removal was refused: the program says so, with nothing removed and one entry skipped, and
+# nothing changed on disk. The selected-item panel says so, in its own wording, because nothing was
+# removed: the map is not refreshed, so the entry stays selected on every platform. (The header's
+# status row cannot be used here: the unreadable path that the scan found, `Scan complete · 1 path
+# unreadable`, outranks the report in it.)
+[[steps]]
+step = "wait_text"
+text = "Last deletion: 0 removed, 1 skipped"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["DELETE FILE"]
+
+[[steps]]
+step = "expect_fs"
+present = ["hostile/unwritable/stuck.txt", "hostile/unwritable", "keep-a.bin"]
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "quit"
+
+# A deletion that failed leaves the operation partial, and the exit code says so (3, not 0).
+[[steps]]
+step = "expect_exit"
+code = 3
+terminal_restored = true
+residue = "none"

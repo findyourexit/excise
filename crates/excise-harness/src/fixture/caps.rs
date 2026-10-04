@@ -134,6 +134,14 @@ impl Capabilities {
         self
     }
 
+    /// Returns these capabilities with the answer to whether the process runs as root replaced.
+    /// For tests, which cannot become root.
+    #[must_use]
+    pub fn with_running_as_root(mut self, running_as_root: Option<bool>) -> Self {
+        self.running_as_root = running_as_root;
+        self
+    }
+
     /// Probes the file system that holds `parent`.
     ///
     /// The probe creates one scratch directory inside `parent`, tries each capability for real,

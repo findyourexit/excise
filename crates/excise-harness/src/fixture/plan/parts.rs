@@ -268,7 +268,9 @@ fn catalog(feature: HostileFeature) -> Option<(Vec<Vec<u8>>, Option<Capability>)
             Some(Capability::InvalidUtf8Names),
         )),
         HostileFeature::LongNames => Some((names::maximum_length_names(), None)),
-        HostileFeature::UnreadableDirs | HostileFeature::UnreadableFiles => None,
+        HostileFeature::UnreadableDirs
+        | HostileFeature::UnreadableFiles
+        | HostileFeature::UnwritableDirs => None,
     }
 }
 
@@ -295,6 +297,18 @@ fn hostile(part: &HostilePart, stream: u64, entries: &mut Vec<ManifestEntry>) {
                     sizes.range_inclusive(1, 64),
                 )));
             }
+            continue;
+        }
+        if *feature == HostileFeature::UnwritableDirs {
+            // A directory that can be listed and entered but not changed, so nothing in it can be
+            // removed. The mode is applied once the file is in it.
+            entries.push(restricted(
+                ManifestEntry::directory(directory.clone()).with_mode(0o555),
+            ));
+            entries.push(restricted(ManifestEntry::file(
+                directory.join(b"stuck.txt"),
+                4096,
+            )));
             continue;
         }
         if !unreadable_added {

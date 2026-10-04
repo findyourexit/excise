@@ -86,6 +86,9 @@ pub struct Panel {
 pub struct SelectedItem {
     /// The name line. The panel shortens long names in the middle.
     pub name: String,
+    /// The entry kind the state line ends in: `file`, `folder`, `link`, or `shared item`. Empty
+    /// when the line has none.
+    pub kind: String,
 }
 
 impl Screen {
@@ -180,7 +183,23 @@ impl Screen {
             .into_iter()
             .find(|panel| panel.title == SELECTED_ITEM_TITLE)?;
         let name = panel.lines.first()?;
-        (!name.starts_with(NO_SELECTION)).then(|| SelectedItem { name: name.clone() })
+        if name.starts_with(NO_SELECTION) {
+            return None;
+        }
+        // The state line reads `◆ COMPLETE · file`, with `.` in ASCII mode.
+        let kind = panel
+            .lines
+            .get(1)
+            .and_then(|state| {
+                state
+                    .rsplit_once(" · ")
+                    .or_else(|| state.rsplit_once(" . "))
+            })
+            .map_or_else(String::new, |(_, kind)| kind.to_owned());
+        Some(SelectedItem {
+            name: name.clone(),
+            kind,
+        })
     }
 
     /// The text in the open filter prompt, or `None` when the filter is not open.
@@ -396,7 +415,8 @@ mod tests {
         assert_eq!(
             lines_of(&selected).selected_item(),
             Some(SelectedItem {
-                name: "victim.bin".to_owned()
+                name: "victim.bin".to_owned(),
+                kind: "file".to_owned(),
             })
         );
         let nothing = boxed(

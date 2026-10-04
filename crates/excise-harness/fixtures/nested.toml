@@ -1,0 +1,24 @@
+schema_version = 1
+id = "nested"
+description = "A folder with a folder inside it, to delete, and the files beside it that must survive. `victim/` holds two files and `inner/`, which holds two more, 32 KiB in all, the largest entry, so a fresh map selects it; `keep-a.bin` and `keep-b.bin`, 16 KiB each, are the sentinels. The id is short on purpose: a 60-column terminal cuts a long path in the deletion dialog, and the `delete` step refuses to confirm a path it cannot read whole."
+seed = 20261004
+
+[[parts]]
+kind = "file"
+root = "keep-a.bin"
+size = 16384
+
+[[parts]]
+kind = "file"
+root = "keep-b.bin"
+size = 16384
+
+[[parts]]
+kind = "tree"
+root = "victim"
+depth = 1
+fanout = 1
+files_per_dir = 2
+dir_names = { style = "literal", name = "inner" }
+file_names = { style = "sequential", prefix = "part-", suffix = ".bin" }
+file_size = 8192

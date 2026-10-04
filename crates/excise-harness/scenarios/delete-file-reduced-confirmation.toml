@@ -1,0 +1,78 @@
+schema_version = 1
+name = "delete-file-reduced-confirmation"
+description = "With the confirmation disabled (--disable-delete-confirmation), Backspace deletes the selected file at once with no dialog, the header says the guard is reduced, siblings are left alone, and the program reports what it removed."
+fixture = "delete-file"
+sentinels = ["keep-a.bin", "docs/keep-0.txt"]
+disable_delete_confirmation = true
+profiles = ["default", "deterministic"]
+
+# 160 columns, so that the header's status row is never cut: it holds the reduced-guard label, the
+# deletion report, and the store's size, and on an elevated Windows session (as on the hosted
+# runner) `! ELEVATED` before them, about 131 characters in all. At 120 the program cuts the row in
+# the middle, and the report with it.
+[terminal]
+cols = 160
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# The mode is on and says so. The label is waited for: the header is drawn a row at a time.
+[[steps]]
+step = "wait_text"
+text = "REDUCED DELETE GUARD"
+region = "header"
+
+[[steps]]
+step = "select"
+name = "victim.bin"
+
+# With no dialog to read, the step checks the selected-item panel (this file, a file), the disk,
+# and the sentinels, presses Backspace, and fails if a dialog opens: a program that ignored the
+# mode would show one, and no key would confirm it.
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+timeout_ms = 30000
+
+[[steps]]
+step = "wait_fs_absent"
+path = "victim.bin"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
+absent = ["victim.bin"]
+
+# What the interface reports afterwards: one entry deleted, and none failed, changed, missing, or
+# left unattempted. The header's status row says so whether or not an entry is selected (the
+# selected-item panel's shorter wording needs a selection, which the map does not keep on every
+# platform). And no dialog opened or is left.
+[[steps]]
+step = "wait_text"
+text = "Last deletion: 1 deleted · 0 changed · 0 missing · 0 failed · 0 not run"
+region = "header"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["DELETE FILE"]
+
+# The map rebuilds after a deletion; quitting during the rebuild would cancel it and exit 130.
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"

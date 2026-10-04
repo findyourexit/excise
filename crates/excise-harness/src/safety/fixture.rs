@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     fixture::{OwnershipError, verify_owned},
-    scenario::{PathViolation, check_fixture_relative_path},
+    scenario::{EntryKind, PathViolation, check_fixture_relative_path},
 };
 
 /// Why a directory cannot be used as a fixture root, or why a path cannot be resolved inside one.
@@ -153,6 +153,82 @@ impl FixtureRoot {
     /// The errors of [`FixtureRoot::lstat`].
     pub fn exists(&self, relative: &str) -> Result<bool, SafetyError> {
         self.lstat(relative).map(|metadata| metadata.is_some())
+    }
+
+    /// Every entry called `name` that is a folder (`directory`) or is not one, anywhere under the
+    /// root, as fixture-relative `/`-separated paths in name order.
+    ///
+    /// The walk takes each entry's kind from its directory entry, so a symbolic link is an entry
+    /// that is not a folder and is never entered. A deletion that no dialog confirms uses this to
+    /// tell whether a name and a kind point at one entry only.
+    ///
+    /// # Errors
+    ///
+    /// [`SafetyError::Io`] when a folder cannot be listed.
+    pub fn entries_named(&self, name: &str, directory: bool) -> Result<Vec<String>, SafetyError> {
+        let mut found = Vec::new();
+        let mut pending = vec![(self.path.clone(), String::new())];
+        while let Some((folder, prefix)) = pending.pop() {
+            let io_error = |source| SafetyError::Io {
+                path: folder.clone(),
+                source,
+            };
+            for entry in fs::read_dir(&folder).map_err(io_error)? {
+                let entry = entry.map_err(io_error)?;
+                let is_folder = entry.file_type().map_err(io_error)?.is_dir();
+                let entry_name = entry.file_name();
+                let relative = format!("{prefix}{}", entry_name.to_string_lossy());
+                if entry_name == name && is_folder == directory {
+                    found.push(relative.clone());
+                }
+                if is_folder {
+                    pending.push((entry.path(), format!("{relative}/")));
+                }
+            }
+        }
+        found.sort();
+        Ok(found)
+    }
+
+    /// Checks that `relative` is the only entry called `name` of `kind` anywhere under the root.
+    ///
+    /// The selected-item panel shows a name and a kind and nothing else, so a deletion that no
+    /// dialog confirms is bound to the entry the scenario names only when no other entry could
+    /// be the one selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns why not: the fixture cannot be searched, `relative` is not the entry, or another
+    /// entry has the same name and kind.
+    pub fn require_only_entry(
+        &self,
+        name: &str,
+        kind: EntryKind,
+        relative: &str,
+    ) -> Result<(), String> {
+        let found = self
+            .entries_named(name, kind == EntryKind::Folder)
+            .map_err(|error| {
+                format!("the fixture cannot be searched for other entries called `{name}`: {error}")
+            })?;
+        match found.as_slice() {
+            [only] if only == relative => Ok(()),
+            [only] => Err(format!(
+                "the only {kind} called `{name}` is `{only}`, but the step says it is at \
+                 `{relative}`"
+            )),
+            _ => Err(format!(
+                "the fixture has {} {kind}s called `{name}` ({}), and the selected-item panel \
+                 shows a name and a kind only, so a deletion with no dialog cannot tell which one \
+                 is selected; give each entry a name of its own",
+                found.len(),
+                found
+                    .iter()
+                    .map(|path| format!("`{path}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
     }
 }
 
@@ -338,5 +414,70 @@ mod tests {
         let fixture = FixtureRoot::open(root.path()).expect("a marked root");
 
         assert!(fixture.exists("dangling").expect("lstat"));
+    }
+
+    #[test]
+    fn entries_named_finds_every_entry_of_that_name_and_kind_at_any_depth() {
+        let root = marked_root();
+        fs::create_dir_all(root.path().join("a/b/twin")).expect("directories");
+        fs::create_dir_all(root.path().join("twin")).expect("a folder at the root");
+        fs::write(root.path().join("twin.bin"), b"x").expect("a file");
+        fs::write(root.path().join("a/twin.bin"), b"x").expect("a nested file");
+        fs::write(root.path().join("a/b/twin/twin.bin"), b"x").expect("a deeper file");
+        fs::write(root.path().join("a/twins.bin"), b"x").expect("a name that only starts alike");
+        let fixture = FixtureRoot::open(root.path()).expect("a marked root");
+
+        assert_eq!(
+            fixture.entries_named("twin.bin", false).expect("a walk"),
+            ["a/b/twin/twin.bin", "a/twin.bin", "twin.bin"]
+        );
+        assert_eq!(
+            fixture.entries_named("twin", true).expect("a walk"),
+            ["a/b/twin", "twin"]
+        );
+        assert!(
+            fixture
+                .entries_named("twin", false)
+                .expect("a walk")
+                .is_empty(),
+            "a folder is not a file of that name"
+        );
+        assert!(
+            fixture
+                .entries_named("twin.bin", true)
+                .expect("a walk")
+                .is_empty(),
+            "a file is not a folder of that name"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entries_named_never_enters_a_symbolic_link_and_counts_it_as_no_folder() {
+        let outside = tempfile::tempdir().expect("an outside directory");
+        fs::write(outside.path().join("twin.bin"), b"x").expect("a file outside");
+        let root = marked_root();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("twin")).expect("a link");
+        let fixture = FixtureRoot::open(root.path()).expect("a marked root");
+
+        assert!(
+            fixture
+                .entries_named("twin.bin", false)
+                .expect("a walk")
+                .is_empty(),
+            "what lies behind a link is out of reach"
+        );
+        assert!(
+            fixture
+                .entries_named("twin", true)
+                .expect("a walk")
+                .is_empty(),
+            "a link to a folder is not a folder entry"
+        );
+        assert_eq!(
+            fixture.entries_named("twin", false).expect("a walk"),
+            ["twin"],
+            "the link is an entry that is not a folder"
+        );
     }
 }

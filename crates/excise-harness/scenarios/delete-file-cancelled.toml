@@ -1,0 +1,78 @@
+schema_version = 1
+name = "delete-file-cancelled"
+description = "A fresh map already has something to delete: the first Backspace opens the confirmation for the largest entry, and n cancels it, leaves every file where it was, and returns to the plain map."
+fixture = "delete-file"
+sentinels = ["victim.bin", "keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+# Nothing was selected. The map arms its cursor on the largest entry, `victim.bin`, as soon as the
+# scan completes, so the first Backspace already has a target and opens the confirmation for it.
+[[steps]]
+step = "key"
+key = "backspace"
+
+[[steps]]
+step = "wait_text"
+text = "! DELETE FILE"
+region = "dialog"
+
+# The path line ends in the file's name, after whichever separator the platform uses.
+[[steps]]
+step = "wait_text"
+regex = '[/\\]victim\.bin'
+region = "dialog"
+
+# n declines. The frame that answers it is read to the end before the next key, and the map then
+# answers a key of its own: `/` opens the filter, which a dialog would not allow. So the confirmation
+# is gone and no other dialog replaced it.
+[[steps]]
+step = "key"
+key = "n"
+
+[[steps]]
+step = "settle"
+
+[[steps]]
+step = "key"
+key = "/"
+
+[[steps]]
+step = "wait_text"
+text = "[Enter] apply"
+region = "header"
+
+[[steps]]
+step = "expect_screen"
+contains = ["STORAGE MAP"]
+not_contains = ["! DELETE FILE", "Quit Excise?"]
+
+[[steps]]
+step = "key"
+key = "esc"
+
+# A key sent right behind a lone Esc can be read with it as Alt plus that key, so the frame that
+# answers Esc is read before the next key.
+[[steps]]
+step = "settle"
+
+[[steps]]
+step = "expect_fs"
+present = ["victim.bin", "keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"

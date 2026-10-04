@@ -1,0 +1,71 @@
+schema_version = 1
+name = "delete-tree-confirmed-with-enter"
+description = "Enter confirms the deletion of a folder, and the folder goes with everything in it, nested folders included, while the files beside it stay. The program says what it removed, and quitting restores the terminal."
+fixture = "nested"
+sentinels = ["keep-a.bin", "keep-b.bin"]
+profiles = ["default", "deterministic"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "select"
+name = "victim"
+
+# The dialog offers Enter as well as `y` (the two lifecycle scenarios confirm with `y`). The step
+# confirms only when the dialog names exactly this folder and every sentinel is intact.
+[[steps]]
+step = "delete"
+name = "victim"
+kind = "folder"
+confirm_with = "enter"
+timeout_ms = 60000
+
+# The whole tree goes: the folder, the folder inside it, and a file of each.
+[[steps]]
+step = "wait_fs_absent"
+path = "victim"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "keep-b.bin"]
+absent = ["victim", "victim/inner", "victim/inner/part-0.bin", "victim/part-0.bin"]
+
+# What the interface reports afterwards: six entries deleted, and none failed, changed, missing, or
+# left unattempted. The header's status row says so whether or not an entry is selected; the
+# selected-item panel's shorter wording needs a selection, which the map does not keep on every
+# platform. And no dialog is left.
+[[steps]]
+step = "wait_text"
+text = "Last deletion: 6 deleted · 0 changed · 0 missing · 0 failed · 0 not run"
+region = "header"
+timeout_ms = 30000
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["DELETE FOLDER"]
+
+# A deletion invalidates the map and the program rebuilds it; quitting during the rebuild would
+# cancel it and exit 130.
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 30000
+
+[[steps]]
+step = "quit"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 15000

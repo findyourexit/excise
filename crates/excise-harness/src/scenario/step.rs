@@ -58,6 +58,8 @@ pub enum Step {
     ExpectScreen(ExpectScreen),
     /// Assert which fixture-relative paths exist now.
     ExpectFs(ExpectFs),
+    /// Assert a setting in the configuration file the program saved.
+    ExpectConfig(ExpectConfig),
     /// Wait for the program to exit and assert how it ended.
     ExpectExit(ExpectExit),
     /// Assert that a recorded metric is within a budget.
@@ -74,7 +76,7 @@ pub enum Step {
 
 impl Step {
     /// Every name accepted in the `step` field, in documentation order.
-    pub const KINDS: [&'static str; 20] = [
+    pub const KINDS: [&'static str; 21] = [
         "wait_text",
         "wait_header",
         "wait_event",
@@ -89,6 +91,7 @@ impl Step {
         "signal",
         "expect_screen",
         "expect_fs",
+        "expect_config",
         "expect_exit",
         "expect_budget",
         "measure",
@@ -115,6 +118,7 @@ impl Step {
             Self::Signal(_) => "signal",
             Self::ExpectScreen(_) => "expect_screen",
             Self::ExpectFs(_) => "expect_fs",
+            Self::ExpectConfig(_) => "expect_config",
             Self::ExpectExit(_) => "expect_exit",
             Self::ExpectBudget(_) => "expect_budget",
             Self::Measure(_) => "measure",
@@ -144,6 +148,7 @@ impl Step {
             | Self::Signal(_)
             | Self::ExpectScreen(_)
             | Self::ExpectFs(_)
+            | Self::ExpectConfig(_)
             | Self::ExpectBudget(_)
             | Self::Measure(_)
             | Self::Idle(_) => None,
@@ -334,8 +339,12 @@ string_enum! {
 }
 
 /// Deletes the currently selected entry: presses Backspace, asserts that the dialog names exactly
-/// this entry and kind, asserts the sentinels, and only then confirms. `wait_for` controls when
-/// the step returns relative to the deletion it starts.
+/// this entry and kind, asserts the sentinels, and only then confirms with `confirm_with`.
+/// `wait_for` controls when the step returns relative to the deletion it starts.
+///
+/// A scenario that sets `disable_delete_confirmation` has no dialog: the step then checks the
+/// selected-item panel and the entry on disk instead, presses Backspace alone, and fails if a
+/// dialog opens (see [`Scenario::disable_delete_confirmation`](super::Scenario)).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Delete {
@@ -343,12 +352,36 @@ pub struct Delete {
     pub name: String,
     /// The kind of entry the dialog must show.
     pub kind: EntryKind,
+    /// Where the entry is, relative to the fixture root and `/`-separated; its last component is
+    /// `name`. Absent means `name` itself: an entry directly below the fixture root. With a
+    /// dialog, the path the dialog shows must be exactly the fixture root and this path. Without
+    /// one, this is the only thing that says where the selected entry lives, so a nested entry
+    /// needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The key that confirms the dialog once it names the entry: `"y"` (the default) or
+    /// `"enter"`, the two the dialog offers. A scenario with no dialog
+    /// (`disable_delete_confirmation`) must leave it at the default.
+    #[serde(default)]
+    pub confirm_with: ConfirmKey,
     /// When the step returns relative to the deletion. Defaults to `"finished"`.
     #[serde(default)]
     pub wait_for: DeleteWait,
     /// The bound on the waits inside the step.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+string_enum! {
+    /// The key a `delete` step presses to confirm the dialog.
+    #[derive(Default)]
+    pub enum ConfirmKey {
+        /// The `y` key. The default.
+        #[default]
+        Y => "y",
+        /// Enter. The dialog says `[Enter/y] start`, so both start the deletion.
+        Enter => "enter",
+    }
 }
 
 string_enum! {
@@ -469,6 +502,19 @@ pub struct ExpectFs {
     /// Paths that must not exist.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub absent: Vec<String>,
+}
+
+/// Asserts one setting of the configuration file the program saves: the file `EXCISE_CONFIG`
+/// names in a process run, and the file the in-process runner hands the program. It reads the file
+/// as it is now and never waits, so put a `settle` before it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectConfig {
+    /// The setting, as the dotted path of table names and the setting's own name that locate it
+    /// in the configuration file: `runtime.theme`.
+    pub key: String,
+    /// The string the setting must be: `excise-light`.
+    pub equals: String,
 }
 
 string_enum! {
