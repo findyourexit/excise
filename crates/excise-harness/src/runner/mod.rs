@@ -22,26 +22,31 @@
 //!
 //! * **`settle`** waits for a `frame` event that reflects every input event the runner has sent
 //!   (its `inputs` counter, less the inputs the program counted of its own before the first one,
-//!   covers them, and it was observed after the last was written; see `exec`), then reads the
-//!   terminal output still in flight so that the screen model has caught up with the frame and the
-//!   step after it can read the screen once. On Unix it reads until the output has been quiet for
-//!   3 ms, for at most 20 ms. On Windows it first reads for 100 ms and then does the same, because
-//!   `ConPTY` can hold a frame back for tens of milliseconds after the program has reported it
-//!   (see `exec::CONPTY_FRAME_WINDOW` for the measurements). A key that changes nothing draws no
-//!   frame and so never settles.
+//!   covers them, and it was observed after the last was written; see `exec`), and then until the
+//!   screen shows that frame, so that the step after it can read the screen once. A program that
+//!   marks its frames (`hello.frame_marks`) says when: on Unix the screen shows a frame once its
+//!   mark has been read; on Windows, where `ConPTY` passes the mark on before it paints the frame,
+//!   the step also waits for the paint that follows it (see `live` and its "Frame marks"). A
+//!   program that does not mark its frames gets a read until the output has been quiet for 3 ms,
+//!   for at most 20 ms, and on Windows 100 ms of reading first (see `live::CONPTY_FRAME_WINDOW`
+//!   for the measurements). A key that changes nothing draws no frame and so never settles.
 //! * **`select`** opens the filter with `/`, erases any text the filter opened with, types the
 //!   name, checks the prompt, presses Enter, and waits until the inspector pane shows exactly that
 //!   name.
-//! * **`delete`** presses Backspace, reads the dialog, and presses `y` only when the dialog names
-//!   exactly the requested entry, kind, and path and every sentinel is intact. Otherwise it fails
-//!   without ever sending `y`. It then waits for the `deletion_finished` event and for the first
-//!   frame after it, and reads the output in flight as `settle` does, so the screen shows the
-//!   result. The program rebuilds its map after a deletion and treats a quit during the rebuild as
-//!   a cancellation (exit 130), so a scenario that quits next waits for the header to read
-//!   `COMPLETE`.
+//! * **`delete`** presses Backspace, reads the dialog from a screen that shows the frame that
+//!   counts it, and presses `y` only when the dialog names exactly the requested entry, kind, and
+//!   path and every sentinel is intact. Otherwise it fails without ever sending `y`. It first
+//!   refuses, before any key is sent (a Backspace included), a program that does not mark its
+//!   frames and a terminal that paints on its own timer, which is `ConPTY` on Windows: nothing
+//!   proves that such a screen shows the frame whose mark was read, so no deletion is confirmed
+//!   from it (see `live`'s "Frame marks"), and `cargo xtask e2e` skips the scenarios that delete
+//!   there. It then waits for the `deletion_finished` event and for the first frame after it,
+//!   until the screen shows it, so the screen shows the result. The program rebuilds its map after
+//!   a deletion and treats a quit during the rebuild as a cancellation (exit 130), so a scenario
+//!   that quits next waits for the header to read `COMPLETE`.
 //! * **`quit`** presses `q`, waits for the quit dialog, and confirms with `y`.
-//! * **`resize`** resizes the terminal and waits for the frame that answers it, then reads the
-//!   output in flight as `settle` does.
+//! * **`resize`** resizes the terminal and waits for the frame that answers it, then until the
+//!   screen shows it, as `settle` does.
 //! * **`wait_event`** matches any event read so far, including events before the step began.
 //! * **`expect_exit`** also compares the fixture with its state before the run: only confirmed
 //!   deletions may differ.
@@ -71,9 +76,12 @@ mod bundle;
 mod delete;
 mod e2e;
 mod exec;
+pub(crate) mod live;
 mod outcome;
 mod plan;
 mod run;
+#[cfg(all(test, unix))]
+pub(crate) mod scripted;
 mod steps;
 mod tier_time;
 mod verdict;

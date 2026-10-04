@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use super::{ALL_STEPS, errors_of, parse, step_errors, valid};
+use crate::fixture::MARKER_FILE_NAME;
 use crate::scenario::{
     Budget, Comparison, ConfirmKey, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, EntryKind, EventField,
     EventKind, Expect, ExpectBudget, ExpectConfig, ExpectExit, ExpectFs, ExpectScreen, Field,
@@ -1265,6 +1266,153 @@ fn a_delete_path_must_be_safe_and_end_in_the_entrys_name() {
         matches!(errors.as_slice(), [StepError::InvalidPath { .. }]),
         "{errors:?}"
     );
+}
+
+/// A `delete` step on `name`, at `path` when the step has one.
+fn delete_of(name: &str, path: Option<&str>) -> Step {
+    Step::Delete(Delete {
+        name: name.to_owned(),
+        kind: EntryKind::File,
+        path: path.map(str::to_owned),
+        confirm_with: ConfirmKey::Y,
+        wait_for: DeleteWait::Finished,
+        timeout_ms: DEFAULT_TIMEOUT_MS,
+    })
+}
+
+#[test]
+fn a_delete_step_may_not_delete_the_ownership_marker() {
+    // Without a `path` the entry is `name` itself, directly below the root.
+    assert_eq!(
+        step_errors(delete_of(MARKER_FILE_NAME, None)),
+        [StepError::DeletesTheMarker {
+            field: Field::new("name"),
+            path: MARKER_FILE_NAME.to_owned(),
+        }]
+    );
+    // With a `path`, that is where the entry is.
+    assert_eq!(
+        step_errors(delete_of(MARKER_FILE_NAME, Some(MARKER_FILE_NAME))),
+        [StepError::DeletesTheMarker {
+            field: Field::new("path"),
+            path: MARKER_FILE_NAME.to_owned(),
+        }]
+    );
+    // Anything inside the marker is reached through it, so it is refused as well.
+    let inside = format!("{MARKER_FILE_NAME}/x");
+    assert_eq!(
+        step_errors(delete_of("x", Some(inside.as_str()))),
+        [StepError::DeletesTheMarker {
+            field: Field::new("path"),
+            path: inside.clone(),
+        }]
+    );
+    assert_eq!(
+        step_errors(delete_of(&inside, None)),
+        [StepError::DeletesTheMarker {
+            field: Field::new("name"),
+            path: inside,
+        }]
+    );
+}
+
+#[test]
+fn the_marker_is_refused_whether_or_not_the_path_ends_in_the_name() {
+    assert_eq!(
+        step_errors(delete_of("stuck.txt", Some(MARKER_FILE_NAME))),
+        [
+            StepError::PathNotNamed {
+                name: "stuck.txt".to_owned(),
+                path: MARKER_FILE_NAME.to_owned(),
+            },
+            StepError::DeletesTheMarker {
+                field: Field::new("path"),
+                path: MARKER_FILE_NAME.to_owned(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_path_that_breaks_the_path_rule_is_not_also_reported_as_the_marker() {
+    let escaping = format!("{MARKER_FILE_NAME}/../x");
+
+    let errors = step_errors(delete_of("x", Some(escaping.as_str())));
+
+    assert!(
+        matches!(errors.as_slice(), [StepError::InvalidPath { .. }]),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn entries_that_only_resemble_the_ownership_marker_may_be_deleted() {
+    // The marker is the root's own entry. The same name further down is another entry, and so are
+    // a longer name and a suffixed one at the root.
+    let nested = format!("sub/{MARKER_FILE_NAME}");
+    assert_eq!(
+        step_errors(delete_of(MARKER_FILE_NAME, Some(nested.as_str()))),
+        []
+    );
+    let longer = format!("{MARKER_FILE_NAME}-2");
+    let suffixed = format!("{MARKER_FILE_NAME}.tmp");
+    for lookalike in [longer.as_str(), suffixed.as_str()] {
+        assert_eq!(step_errors(delete_of(lookalike, None)), [], "{lookalike}");
+        assert_eq!(
+            step_errors(delete_of(lookalike, Some(lookalike))),
+            [],
+            "{lookalike} with a path"
+        );
+    }
+}
+
+#[test]
+fn looking_at_the_marker_is_not_deleting_it() {
+    for step in [
+        Step::WaitFsAbsent(WaitFs {
+            path: MARKER_FILE_NAME.to_owned(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        }),
+        Step::WaitFsPresent(WaitFs {
+            path: MARKER_FILE_NAME.to_owned(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        }),
+        Step::ExpectFs(ExpectFs {
+            present: vec![MARKER_FILE_NAME.to_owned()],
+            absent: Vec::new(),
+        }),
+    ] {
+        let kind = step.kind();
+        assert_eq!(step_errors(step), [], "{kind}");
+    }
+}
+
+#[test]
+fn the_refusal_to_delete_the_marker_names_the_step_and_the_marker() {
+    let scenario = with_steps(vec![
+        Step::Settle(Settle {
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        }),
+        delete_of(MARKER_FILE_NAME, None),
+    ]);
+
+    assert_eq!(
+        errors_of(&scenario),
+        [ValidationError::Step {
+            index: 1,
+            kind: "delete",
+            error: StepError::DeletesTheMarker {
+                field: Field::new("name"),
+                path: MARKER_FILE_NAME.to_owned(),
+            },
+        }]
+    );
+    let report = scenario
+        .validate()
+        .expect_err("a step deletes the marker")
+        .to_string();
+    assert!(report.contains("steps[1] (delete)"), "{report}");
+    assert!(report.contains(".excise-harness-owned"), "{report}");
 }
 
 #[test]

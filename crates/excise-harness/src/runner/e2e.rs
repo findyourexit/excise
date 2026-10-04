@@ -10,10 +10,13 @@
 //!
 //! `--quick` runs scenarios tagged `quick` (the default), `--full` adds `full`, and `--nightly`
 //! adds `nightly` too; a scenario named with `--scenario` runs whatever its tier, but a scenario
-//! outside its `platforms` is always skipped, with the reason, even when it is named. The quick
-//! tier also limits the *profiles* that run: the two profiles every lifecycle scenario must pass
-//! under (`default` and `deterministic`); `--full` and `--nightly` run every profile a scenario
-//! declares. A scenario is selected for a profile only if it declares that profile.
+//! outside its `platforms` is always skipped, with the reason, even when it is named, and so is a
+//! scenario with a `delete` step, or one that asks for a deletion with a key of its own (a raw
+//! Backspace), on a platform whose pseudo-terminal cannot tie its screen to a frame
+//! ([`SCREEN_IS_EXACT`]: Windows), where the harness confirms no deletion from the screen.
+//! The quick tier also limits the *profiles* that run: the two profiles every lifecycle scenario
+//! must pass under (`default` and `deterministic`); `--full` and `--nightly` run every profile a
+//! scenario declares. A scenario is selected for a profile only if it declares that profile.
 //!
 //! # Latency scale
 //!
@@ -71,6 +74,8 @@ use crate::{
 
 use super::{
     budget::LatencyScale,
+    live::{SCREEN_IS_EXACT, SCREEN_NOT_EXACT},
+    plan::{describe_step, raw_deletion_request},
     run::{RunReport, RunRequest, resolve_binary, run_scenario},
     tier_time::{QuickBudget, QuickTierTime, REFERENCE_ENV, is_reference_machine},
     work::work_base,
@@ -116,7 +121,8 @@ pub struct E2eOptions {
     /// The scenarios to consider, already loaded.
     pub scenarios: Vec<Scenario>,
     /// Whether `scenarios` was narrowed to scenarios named with `--scenario`: when true, each one
-    /// runs whatever its tier. Platform selection always applies.
+    /// runs whatever its tier. Platform selection always applies, and so does the skip of a
+    /// scenario that deletes where the screen is not exact.
     pub named: bool,
     /// Limits the run to these profiles. Empty means every profile the tier allows.
     pub profiles: Vec<Profile>,
@@ -326,17 +332,26 @@ fn is_whole_quick_tier(options: &E2eOptions) -> bool {
         && options.repeat <= 1
 }
 
-/// Plans which of `options.scenarios` run on `os`, and under which profiles, and which are
-/// skipped, with the reason.
+/// Plans which of `options.scenarios` run on `os`, whose pseudo-terminal's screen is exact when
+/// `screen_is_exact` (see [`SCREEN_IS_EXACT`]), and under which profiles, and which are skipped,
+/// with the reason.
 ///
 /// A scenario outside its `platforms` is always skipped, even when `options.named`. One outside
 /// `options.tier` is skipped too, unless `options.named`: a scenario named with `--scenario` runs
-/// whatever its tier. One whose fixture needs a scratch volume (`fixture::spec::FixtureSpec::has_volumes`)
-/// is skipped too, even when named, unless `EXCISE_HARNESS_PRIVILEGED=1` opts in: a volume is
-/// privileged-adjacent on every OS (see `fixture::volume`).
+/// whatever its tier. One with a `delete` step is skipped, even when named, where the screen is
+/// not exact: the harness confirms no deletion from a screen it cannot tie to a frame, so the step
+/// could only refuse. So is one with a `key` or `type` step that the program can read as a request
+/// for a deletion (a raw Backspace, or the bytes that finish an escape sequence that earlier keys
+/// began: `plan::raw_deletion_request`): a later `y`, Enter, filter text, or quit would meet a
+/// dialog that nothing verified, and the runner refuses to write them on a screen it cannot read
+/// exactly (see "Raw deletion requests" in `runner::live`). One whose
+/// fixture needs a scratch volume (`fixture::spec::FixtureSpec::has_volumes`) is skipped too,
+/// even when named, unless `EXCISE_HARNESS_PRIVILEGED=1` opts in: a volume is privileged-adjacent
+/// on every OS (see `fixture::volume`).
 fn select<'a>(
     options: &'a E2eOptions,
     os: &str,
+    screen_is_exact: bool,
 ) -> (Vec<(&'a Scenario, Profile)>, Vec<SkippedScenario>) {
     let fixtures = Fixtures::bundled();
     let mut plan = Vec::new();
@@ -358,6 +373,30 @@ fn select<'a>(
                 reason: format!(
                     "its tier is `{}`, outside the `{}` tier",
                     scenario.tier, options.tier
+                ),
+            });
+            continue;
+        }
+        if scenario.deletes() && !screen_is_exact {
+            skipped.push(SkippedScenario {
+                name: scenario.name.clone(),
+                reason: format!(
+                    "it has a `delete` step, and {SCREEN_NOT_EXACT}; the scenario runs in-process \
+                     under `cargo test`"
+                ),
+            });
+            continue;
+        }
+        if !screen_is_exact && let Some(index) = raw_deletion_request(scenario) {
+            skipped.push(SkippedScenario {
+                name: scenario.name.clone(),
+                reason: format!(
+                    "step {index} ({}) can be read by the program as a request for a deletion \
+                     outside a `delete` step (a Backspace, or the end of an escape sequence that \
+                     earlier keys began), so a later key that could confirm it would meet a \
+                     dialog that nothing verified, and {SCREEN_NOT_EXACT}; the scenario runs \
+                     in-process under `cargo test`",
+                    describe_step(&scenario.steps[index])
                 ),
             });
             continue;
@@ -489,7 +528,7 @@ fn run_matrix(
     budget: QuickBudget,
     mut progress: impl FnMut(&RunRecord),
 ) -> Result<E2eReport, E2eError> {
-    let (plan, skipped) = select(options, std::env::consts::OS);
+    let (plan, skipped) = select(options, std::env::consts::OS, SCREEN_IS_EXACT);
     if plan.is_empty() {
         let selected = if options.profiles.is_empty() {
             format!("the {} tier", options.tier)
@@ -1028,7 +1067,7 @@ mod tests {
         let mut opts = options(Tier::Quick, Vec::new());
         opts.scenarios = vec![needs_a_volume];
 
-        let (plan, skipped) = select(&opts, "linux");
+        let (plan, skipped) = select(&opts, "linux", true);
 
         assert!(plan.is_empty(), "{plan:?}");
         assert_eq!(skipped.len(), 1, "{skipped:?}");
@@ -1043,7 +1082,7 @@ mod tests {
         // Named with `--scenario`, the same scenario is still skipped: platform and tier
         // selection are bypassed by `named`, but the volume opt-in never is.
         opts.named = true;
-        let (plan, skipped) = select(&opts, "linux");
+        let (plan, skipped) = select(&opts, "linux", true);
         assert!(plan.is_empty(), "{plan:?}");
         assert_eq!(skipped.len(), 1, "{skipped:?}");
     }
@@ -1062,7 +1101,7 @@ mod tests {
         let mut opts = options(Tier::Nightly, Vec::new());
         opts.scenarios = vec![wants_the_cap];
 
-        let (plan, skipped) = select(&opts, "linux");
+        let (plan, skipped) = select(&opts, "linux", true);
 
         assert!(plan.is_empty(), "{plan:?}");
         assert_eq!(skipped.len(), 1, "{skipped:?}");
@@ -1079,7 +1118,7 @@ mod tests {
         // Named with `--scenario`, the same scenario is still skipped: platform and tier
         // selection are bypassed by `named`, but the cgroup opt-in never is.
         opts.named = true;
-        let (plan, skipped) = select(&opts, "linux");
+        let (plan, skipped) = select(&opts, "linux", true);
         assert!(plan.is_empty(), "{plan:?}");
         assert_eq!(skipped.len(), 1, "{skipped:?}");
     }
@@ -1090,7 +1129,7 @@ mod tests {
         let mut opts = options(Tier::Quick, Vec::new());
         opts.scenarios = vec![ordinary];
 
-        let (plan, skipped) = select(&opts, "linux");
+        let (plan, skipped) = select(&opts, "linux", true);
 
         assert_eq!(plan.len(), 1);
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -1103,7 +1142,7 @@ mod tests {
         let mut opts = options(Tier::Quick, Vec::new());
         opts.scenarios = vec![full_tier];
 
-        let (plan, skipped) = select(&opts, "linux");
+        let (plan, skipped) = select(&opts, "linux", true);
         assert!(plan.is_empty(), "{plan:?}");
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert_eq!(skipped[0].name, "s");
@@ -1112,7 +1151,7 @@ mod tests {
 
         // Named with `--scenario`, the same scenario runs whatever its tier.
         opts.named = true;
-        let (plan, skipped) = select(&opts, "linux");
+        let (plan, skipped) = select(&opts, "linux", true);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert_eq!(plan.len(), 1);
     }
@@ -1125,15 +1164,168 @@ mod tests {
         opts.scenarios = vec![only_linux];
         opts.named = true;
 
-        let (plan, skipped) = select(&opts, "macos");
+        let (plan, skipped) = select(&opts, "macos", true);
         assert!(plan.is_empty(), "{plan:?}");
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert_eq!(skipped[0].name, "s");
         assert!(skipped[0].reason.contains("macos"), "{}", skipped[0].reason);
 
-        let (plan, skipped) = select(&opts, "linux");
+        let (plan, skipped) = select(&opts, "linux", true);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert_eq!(plan.len(), 1);
+    }
+
+    /// A scenario with a `delete` step, which names the file `victim` and declares two profiles.
+    fn deleting_scenario() -> Scenario {
+        Scenario::from_toml_str(
+            "schema_version = 1\nname = \"d\"\ndescription = \"d\"\nfixture = \"f\"\n\
+             profiles = [\"default\", \"deterministic\"]\nsentinels = [\"keep.bin\"]\n\
+             [[steps]]\nstep = \"delete\"\nname = \"victim\"\nkind = \"file\"\n",
+        )
+        .expect("a scenario")
+    }
+
+    #[test]
+    fn a_scenario_that_deletes_is_skipped_with_the_reason_where_the_screen_is_not_exact_even_when_named()
+     {
+        let mut opts = options(Tier::Quick, Vec::new());
+        opts.scenarios = vec![deleting_scenario(), scenario(r#"["default"]"#)];
+
+        for named in [false, true] {
+            opts.named = named;
+            let (plan, skipped) = select(&opts, "windows", false);
+
+            // The scenario that has no `delete` step still runs.
+            assert_eq!(plan.len(), 1, "named {named}: {plan:?}");
+            assert_eq!(plan[0].0.name, "s", "named {named}");
+            assert_eq!(skipped.len(), 1, "named {named}: {skipped:?}");
+            assert_eq!(skipped[0].name, "d", "named {named}");
+            let reason = &skipped[0].reason;
+            assert!(
+                reason.contains("`delete` step")
+                    && reason.contains("on its own timer")
+                    && reason.contains("cargo test"),
+                "named {named}: {reason}"
+            );
+        }
+
+        // Where the screen is exact, both run: two profiles of the one, and one of the other.
+        let (plan, skipped) = select(&opts, "linux", true);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(plan.len(), 3, "{plan:?}");
+    }
+
+    /// A scenario with a `key` step that asks for a deletion (Backspace) and a `quit` after it,
+    /// which declares two profiles.
+    fn raw_backspace_scenario() -> Scenario {
+        Scenario::from_toml_str(
+            "schema_version = 1\nname = \"b\"\ndescription = \"d\"\nfixture = \"f\"\n\
+             profiles = [\"default\", \"deterministic\"]\n\
+             [[steps]]\nstep = \"key\"\nkey = \"backspace\"\n[[steps]]\nstep = \"quit\"\n",
+        )
+        .expect("a scenario")
+    }
+
+    #[test]
+    fn a_scenario_that_asks_for_a_deletion_with_a_key_is_skipped_where_the_screen_is_not_exact() {
+        // The `y` of its `quit` could meet a dialog that nothing verified, and the runner writes
+        // no key that could confirm one on a screen it cannot read exactly.
+        let mut opts = options(Tier::Quick, Vec::new());
+        opts.scenarios = vec![raw_backspace_scenario(), scenario(r#"["default"]"#)];
+
+        for named in [false, true] {
+            opts.named = named;
+            let (plan, skipped) = select(&opts, "windows", false);
+
+            // The scenario that has no such key still runs.
+            assert_eq!(plan.len(), 1, "named {named}: {plan:?}");
+            assert_eq!(plan[0].0.name, "s", "named {named}");
+            assert_eq!(skipped.len(), 1, "named {named}: {skipped:?}");
+            assert_eq!(skipped[0].name, "b", "named {named}");
+            let reason = &skipped[0].reason;
+            assert!(
+                reason.contains("step 0 (key backspace)")
+                    && reason.contains("outside a `delete` step")
+                    && reason.contains("on its own timer")
+                    && reason.contains("cargo test"),
+                "named {named}: {reason}"
+            );
+        }
+
+        // Where the screen is exact, both run: two profiles of the one, and one of the other.
+        let (plan, skipped) = select(&opts, "linux", true);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(plan.len(), 3, "{plan:?}");
+    }
+
+    /// A scenario whose `key` and `type` steps compose an escape sequence that none of its
+    /// writes holds a Backspace, `y`, or Enter byte of (`alt+[`, and then the text `121u`: the
+    /// program reads `ESC [ 121 u` as `y`) and a `quit` after them, which declares two profiles.
+    fn composed_sequence_scenario() -> Scenario {
+        Scenario::from_toml_str(
+            "schema_version = 1\nname = \"c\"\ndescription = \"d\"\nfixture = \"f\"\n\
+             profiles = [\"default\", \"deterministic\"]\n\
+             [[steps]]\nstep = \"key\"\nkey = \"[\"\nalt = true\n\
+             [[steps]]\nstep = \"type\"\ntext = \"121u\"\n[[steps]]\nstep = \"quit\"\n",
+        )
+        .expect("a scenario")
+    }
+
+    #[test]
+    fn a_scenario_that_composes_an_escape_sequence_is_skipped_where_the_screen_is_not_exact() {
+        // The step that continues the sequence is the one that can ask, whatever its bytes are, so
+        // the runner skips the scenario where it cannot read the screen exactly, as it skips one
+        // with a raw Backspace.
+        let mut opts = options(Tier::Quick, Vec::new());
+        opts.scenarios = vec![composed_sequence_scenario(), scenario(r#"["default"]"#)];
+
+        for named in [false, true] {
+            opts.named = named;
+            let (plan, skipped) = select(&opts, "windows", false);
+
+            assert_eq!(plan.len(), 1, "named {named}: {plan:?}");
+            assert_eq!(plan[0].0.name, "s", "named {named}");
+            assert_eq!(skipped.len(), 1, "named {named}: {skipped:?}");
+            assert_eq!(skipped[0].name, "c", "named {named}");
+            let reason = &skipped[0].reason;
+            assert!(
+                reason.contains("step 1 (type \"121u\")")
+                    && reason.contains("an escape sequence that earlier keys began")
+                    && reason.contains("on its own timer")
+                    && reason.contains("cargo test"),
+                "named {named}: {reason}"
+            );
+        }
+
+        // Where the screen is exact, both run: two profiles of the one, and one of the other.
+        let (plan, skipped) = select(&opts, "linux", true);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(plan.len(), 3, "{plan:?}");
+    }
+
+    #[test]
+    fn exactly_three_of_the_scenarios_that_ship_ask_for_a_deletion_with_their_own_keys() {
+        // The three that press Backspace themselves. None composes an escape sequence (no scenario
+        // has an `alt` key, and none types a `[` or an `O` behind an `esc`), so reading every write
+        // of a scenario as a possible part of a sequence costs the others nothing where the screen
+        // is not exact.
+        let scenarios = load_scenarios(&Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios"))
+            .expect("the shipped scenarios load");
+        let mut asking: Vec<&str> = scenarios
+            .iter()
+            .filter(|scenario| raw_deletion_request(scenario).is_some())
+            .map(|scenario| scenario.name.as_str())
+            .collect();
+        asking.sort_unstable();
+
+        assert_eq!(
+            asking,
+            [
+                "delete-file-cancelled",
+                "delete-file-terminal-too-small",
+                "exit-prompt-keeps-pending-deletion",
+            ]
+        );
     }
 
     #[test]

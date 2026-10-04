@@ -218,6 +218,11 @@ impl FixtureSnapshot {
         self.entries.contains_key(relative)
     }
 
+    /// Every path in the snapshot, `/`-separated, in path order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
     /// A stable identity of the fixture's shape: the lowercase hexadecimal SHA-256 of every path
     /// with its fingerprint, in path order.
     #[must_use]

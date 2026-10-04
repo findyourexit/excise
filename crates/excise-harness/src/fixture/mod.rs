@@ -76,7 +76,8 @@ pub use generate::{
 };
 pub use integrity::{IntegrityFailure, Verified, Verify, verify_master};
 pub use marker::{
-    Marker, MarkerError, OwnershipError, Role, read_marker, verify_owned, write_marker,
+    Marker, MarkerError, OwnershipError, Role, is_marker_path, read_marker, verify_owned,
+    write_marker,
 };
 pub use names::NameStyle;
 pub use oracle::{Comparison, Discrepancy, Oracle, OracleEntry, OracleError, OracleOptions};

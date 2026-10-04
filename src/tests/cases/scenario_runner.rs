@@ -2,7 +2,9 @@
 
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
 use excise_harness::fixture::{MARKER_FILE_NAME, mutate};
@@ -577,6 +579,176 @@ confirm_with = "{confirm_with}"
             "{confirm_with}: {:?}",
             run.sent_keys
         );
+    }
+}
+
+// --- A root that loses its ownership marker while the run goes on ---------------------------
+
+/// Takes the ownership marker away, as something other than the harness could. The harness's own
+/// mutators refuse to touch it, so a test does it directly.
+fn remove_marker(marker: &Path) {
+    fs::remove_file(marker).expect("the marker should be removable");
+}
+
+/// Puts a directory where the marker was: something is still at that name, but no regular file.
+fn replace_marker_with_a_directory(marker: &Path) {
+    remove_marker(marker);
+    fs::create_dir(marker).expect("a directory should take the marker's place");
+}
+
+/// Leaves the marker alone: the control that shows what the scenarios below do when nothing is
+/// wrong.
+fn keep_marker(_marker: &Path) {}
+
+/// Runs `scenario` on a fresh fixture and has `tamper` change the ownership marker while the run
+/// goes on: after the run started and before the scenario's `delete` step.
+///
+/// The scenario makes `go.bin` appear with `fs_mutate` and then waits for `done.flag`. A thread of
+/// the test sees `go.bin`, calls `tamper` with the marker's path, and only then writes
+/// `done.flag`, so every step after the wait finds the marker as `tamper` left it.
+fn execute_tampering_with_the_marker(
+    scenario: &Scenario,
+    tamper: fn(&Path),
+) -> (Fixture, ScenarioRun) {
+    let fixture = materialize(&scenario.fixture).expect("the fixture should build");
+    let root = fixture.root().to_path_buf();
+    let finished = AtomicBool::new(false);
+    let run = thread::scope(|scope| {
+        scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !root.join("go.bin").exists() {
+                if finished.load(Ordering::Relaxed) || Instant::now() > deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            tamper(&root.join(MARKER_FILE_NAME));
+            fs::write(root.join("done.flag"), b"").expect("the flag should be written");
+        });
+        let outcome = run_scenario(scenario, Profile::Deterministic, &root);
+        finished.store(true, Ordering::Relaxed);
+        outcome.expect("the scenario should run")
+    });
+    (fixture, run)
+}
+
+/// A scenario that makes `go.bin` appear, waits for `done.flag` (see
+/// `execute_tampering_with_the_marker`), selects `victim.bin`, and deletes it, with
+/// `delete_fields` added to the `delete` step, which is the fifth.
+fn delete_after_tampering(header: &str, delete_fields: &str) -> Scenario {
+    scenario(
+        header,
+        &format!(
+            r#"{WAIT_FOR_COMPLETE}
+[[steps]]
+step = "fs_mutate"
+op = "appear"
+path = "go.bin"
+
+[[steps]]
+step = "wait_fs_present"
+path = "done.flag"
+
+[[steps]]
+step = "select"
+name = "victim.bin"
+
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+{delete_fields}"#
+        ),
+    )
+}
+
+/// Checks that a `delete` step whose dialog is up refuses to confirm once `tamper` has changed the
+/// ownership marker, whichever key it confirms with, and that nothing is gone from the fixture.
+fn assert_confirmation_refused_after(tamper: fn(&Path), confirm_with: &str) {
+    let fields = format!("confirm_with = \"{confirm_with}\"\n");
+    let scenario = delete_after_tampering(DELETE_FILE, &fields);
+    let (fixture, run) = execute_tampering_with_the_marker(&scenario, tamper);
+    let failure = failure_of(&run);
+    assert_eq!(failure.step.index, 4, "{confirm_with}: {run}");
+    assert!(
+        failure.step.description.starts_with("delete "),
+        "{confirm_with}: {run}"
+    );
+    assert!(
+        failure.message.contains(MARKER_FILE_NAME)
+            && failure.message.contains("no confirming key was sent"),
+        "{confirm_with}: {run}"
+    );
+    // Backspace opened the dialog, which the failure still shows, and no key followed it.
+    assert!(
+        failure.screen.actual.contains("DELETE"),
+        "{confirm_with}: {run}"
+    );
+    assert_eq!(
+        last_sent(&run, 1),
+        [KeyCode::Backspace],
+        "{confirm_with}: {:?}",
+        run.sent_keys
+    );
+    assert!(
+        !sent_codes(&run).contains(&KeyCode::Char('y')),
+        "`y` must never be sent: {:?}",
+        run.sent_keys
+    );
+    for path in DELETE_FILE_FILES {
+        assert!(
+            fixture.root().join(path).exists(),
+            "`{path}` must be intact after a refused delete"
+        );
+    }
+}
+
+#[test]
+fn a_delete_step_never_confirms_in_a_root_that_lost_its_marker_after_the_run_started() {
+    for confirm_with in ["y", "enter"] {
+        assert_confirmation_refused_after(remove_marker, confirm_with);
+    }
+    assert_confirmation_refused_after(replace_marker_with_a_directory, "y");
+}
+
+#[test]
+fn the_same_scenario_deletes_when_nothing_touches_the_marker() {
+    let scenario = delete_after_tampering(DELETE_FILE, "");
+    let (fixture, run) = execute_tampering_with_the_marker(&scenario, keep_marker);
+    assert!(run.passed(), "{run}");
+    assert!(!fixture.root().join("victim.bin").exists());
+    for path in ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"] {
+        assert!(fixture.root().join(path).exists(), "`{path}` must survive");
+    }
+    assert_eq!(
+        last_sent(&run, 2),
+        [KeyCode::Backspace, KeyCode::Char('y')],
+        "{:?}",
+        run.sent_keys
+    );
+}
+
+#[test]
+fn a_deletion_with_no_dialog_never_presses_backspace_in_a_root_that_lost_its_marker() {
+    let tampers: [fn(&Path); 2] = [remove_marker, replace_marker_with_a_directory];
+    for tamper in tampers {
+        let scenario = delete_after_tampering(&without_dialog(), "");
+        let (fixture, run) = execute_tampering_with_the_marker(&scenario, tamper);
+        let failure = failure_of(&run);
+        assert_eq!(failure.step.index, 4, "{run}");
+        assert!(failure.step.description.starts_with("delete "), "{run}");
+        assert!(failure.message.contains(MARKER_FILE_NAME), "{run}");
+        assert!(
+            !sent_codes(&run).contains(&KeyCode::Backspace),
+            "Backspace must never be pressed: {:?}",
+            run.sent_keys
+        );
+        for path in DELETE_FILE_FILES {
+            assert!(
+                fixture.root().join(path).exists(),
+                "`{path}` must be intact after a refused delete"
+            );
+        }
     }
 }
 

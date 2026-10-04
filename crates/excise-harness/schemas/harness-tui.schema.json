@@ -1,0 +1,676 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/harness/schemas/harness-tui-v1.json",
+  "title": "Excise harness tui command document v1",
+  "description": "What one `cargo xtask tui` command prints: its result, or why it failed. Every command prints exactly one document. Internal test tooling, not a supported product interface.",
+  "type": "object",
+  "required": ["document_kind", "schema_version", "command", "ok"],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "harness-tui" },
+    "schema_version": { "const": 1 },
+    "command": {
+      "description": "The command; null for a command line that names none.",
+      "enum": ["open", "keys", "delete", "screen", "events", "close", "list", null]
+    },
+    "ok": {
+      "description": "Whether the command did what it was asked. A successful document has a result and no error; a failed one has an error and no result.",
+      "type": "boolean"
+    },
+    "session": {
+      "description": "The session the command acted on, when it names one.",
+      "$ref": "#/$defs/session_id"
+    },
+    "result": {
+      "description": "The result of the command; its shape depends on `command`.",
+      "type": "object"
+    },
+    "error": { "$ref": "#/$defs/error" }
+  },
+  "allOf": [
+    {
+      "if": { "required": ["ok"], "properties": { "ok": { "const": true } } },
+      "then": { "required": ["result"], "properties": { "error": false, "command": { "type": "string" } } },
+      "else": { "required": ["error"], "properties": { "result": false } }
+    },
+    {
+      "if": { "required": ["ok", "command"], "properties": { "ok": { "const": true }, "command": { "const": "open" } } },
+      "then": { "required": ["session"], "properties": { "result": { "$ref": "#/$defs/open_result" } } }
+    },
+    {
+      "if": { "required": ["ok", "command"], "properties": { "ok": { "const": true }, "command": { "const": "keys" } } },
+      "then": { "required": ["session"], "properties": { "result": { "$ref": "#/$defs/keys_result" } } }
+    },
+    {
+      "if": { "required": ["ok", "command"], "properties": { "ok": { "const": true }, "command": { "const": "delete" } } },
+      "then": { "required": ["session"], "properties": { "result": { "$ref": "#/$defs/delete_result" } } }
+    },
+    {
+      "if": { "required": ["ok", "command"], "properties": { "ok": { "const": true }, "command": { "const": "screen" } } },
+      "then": { "required": ["session"], "properties": { "result": { "$ref": "#/$defs/screen_result" } } }
+    },
+    {
+      "if": { "required": ["ok", "command"], "properties": { "ok": { "const": true }, "command": { "const": "events" } } },
+      "then": { "required": ["session"], "properties": { "result": { "$ref": "#/$defs/events_result" } } }
+    },
+    {
+      "if": { "required": ["ok", "command"], "properties": { "ok": { "const": true }, "command": { "const": "close" } } },
+      "then": { "required": ["session"], "properties": { "result": { "$ref": "#/$defs/close_result" } } }
+    },
+    {
+      "if": { "required": ["ok", "command"], "properties": { "ok": { "const": true }, "command": { "const": "list" } } },
+      "then": { "properties": { "session": false, "result": { "$ref": "#/$defs/list_result" } } }
+    }
+  ],
+  "$defs": {
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "frame_seq": {
+      "description": "The drawn-frame counter: the first frame the program draws is 1.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nullable_text": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "session_id": {
+      "description": "Eight lowercase hexadecimal digits.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}$"
+    },
+    "timestamp": {
+      "description": "An RFC 3339 date-time.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "profile": {
+      "enum": ["default", "deterministic", "reduced-motion", "monochrome-ascii", "narrow", "mouse-keymaps"]
+    },
+    "nullable_boolean": {
+      "type": ["boolean", "null"]
+    },
+    "size": {
+      "type": "object",
+      "required": ["cols", "rows"],
+      "additionalProperties": false,
+      "properties": {
+        "cols": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "rows": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "cursor": {
+      "description": "A cursor position, zero-based.",
+      "type": "object",
+      "required": ["row", "col"],
+      "additionalProperties": false,
+      "properties": {
+        "row": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "col": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      }
+    },
+    "modes": {
+      "description": "The terminal modes. echo and icanon are null where the platform cannot say.",
+      "type": "object",
+      "required": ["alternate_screen", "cursor_visible", "echo", "icanon"],
+      "additionalProperties": false,
+      "properties": {
+        "alternate_screen": { "type": "boolean" },
+        "cursor_visible": { "type": "boolean" },
+        "echo": { "$ref": "#/$defs/nullable_boolean" },
+        "icanon": { "$ref": "#/$defs/nullable_boolean" }
+      }
+    },
+    "rect": {
+      "description": "The inclusive cell rectangle of a box.",
+      "type": "object",
+      "required": ["left", "top", "right", "bottom"],
+      "additionalProperties": false,
+      "properties": {
+        "left": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "top": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "right": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "bottom": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      }
+    },
+    "box": {
+      "type": "object",
+      "required": ["title", "rect"],
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string" },
+        "rect": { "$ref": "#/$defs/rect" }
+      }
+    },
+    "delete_dialog": {
+      "description": "What a deletion dialog says.",
+      "type": "object",
+      "required": ["kind", "path", "confirmation"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["folder", "file", "item"] },
+        "path": {
+          "description": "The path line, as drawn. It is cut with an ellipsis when it does not fit.",
+          "type": "string"
+        },
+        "confirmation": { "enum": ["single_key", "typed_phrase", "unknown"] }
+      }
+    },
+    "dialog": {
+      "type": "object",
+      "required": ["title", "rect", "text", "delete"],
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string" },
+        "rect": { "$ref": "#/$defs/rect" },
+        "text": { "type": "string" },
+        "delete": {
+          "description": "Present for a deletion dialog; null for any other.",
+          "oneOf": [{ "$ref": "#/$defs/delete_dialog" }, { "type": "null" }]
+        }
+      }
+    },
+    "selected": {
+      "type": "object",
+      "required": ["name", "state", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "state": { "type": "string" },
+        "kind": { "type": "string" }
+      }
+    },
+    "filter": {
+      "type": "object",
+      "required": ["input", "error"],
+      "additionalProperties": false,
+      "properties": {
+        "input": { "type": "string" },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "screen": {
+      "description": "What the screen model shows, never what the raw output bytes say.",
+      "type": "object",
+      "required": ["size", "cursor", "modes", "header_state", "selected", "filter", "dialog", "boxes", "rows"],
+      "additionalProperties": false,
+      "properties": {
+        "size": { "$ref": "#/$defs/size" },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "modes": { "$ref": "#/$defs/modes" },
+        "header_state": {
+          "description": "The scan state in the header badge: SCANNING, COMPLETE, or another state's text. Null before the header is drawn.",
+          "type": ["string", "null"]
+        },
+        "selected": {
+          "description": "The entry the inspector pane describes; null when the pane is not drawn or nothing is selected.",
+          "oneOf": [{ "$ref": "#/$defs/selected" }, { "type": "null" }]
+        },
+        "filter": {
+          "description": "The open filter prompt; null when no filter is being typed.",
+          "oneOf": [{ "$ref": "#/$defs/filter" }, { "type": "null" }]
+        },
+        "dialog": {
+          "description": "The modal dialog; null when none is open.",
+          "oneOf": [{ "$ref": "#/$defs/dialog" }, { "type": "null" }]
+        },
+        "boxes": {
+          "description": "Every titled, closed box, from the top down.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/box" }
+        },
+        "rows": {
+          "description": "The visible text, one entry per row, trailing spaces removed.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "frame": {
+      "type": "object",
+      "required": ["seq", "inputs"],
+      "additionalProperties": false,
+      "properties": {
+        "seq": { "$ref": "#/$defs/frame_seq" },
+        "inputs": { "$ref": "#/$defs/unsigned" }
+      }
+    },
+    "input_counts": {
+      "type": "object",
+      "required": ["sent", "consumed"],
+      "additionalProperties": false,
+      "properties": {
+        "sent": { "$ref": "#/$defs/unsigned" },
+        "consumed": { "$ref": "#/$defs/unsigned" }
+      }
+    },
+    "sent_key": {
+      "type": "object",
+      "required": ["key", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "$ref": "#/$defs/text" },
+        "bytes": {
+          "description": "The bytes written to the terminal, in lowercase hexadecimal.",
+          "type": "string",
+          "pattern": "^([0-9a-f]{2})+$"
+        }
+      }
+    },
+    "event_record": {
+      "description": "One line of the event channel. `kind` says which of the optional fields the record carries.",
+      "type": "object",
+      "required": ["index", "t_us", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "index": { "$ref": "#/$defs/unsigned" },
+        "t_us": { "$ref": "#/$defs/unsigned" },
+        "kind": { "enum": ["hello", "frame", "scan_complete", "quit_prompt", "deletion_finished", "refresh_finished", "exit"] },
+        "version": { "$ref": "#/$defs/text" },
+        "pid": { "$ref": "#/$defs/unsigned" },
+        "frame_marks": {
+          "description": "hello: whether the program marks its frames in the terminal output.",
+          "type": "boolean"
+        },
+        "input_barrier": {
+          "description": "hello: whether the program answers input barrier requests, so that a reader can tell that it has read everything written before a request.",
+          "type": "boolean"
+        },
+        "seq": { "$ref": "#/$defs/frame_seq" },
+        "inputs": { "$ref": "#/$defs/unsigned" },
+        "barriers": {
+          "description": "frame: the input barrier requests the program had read when it drew the frame.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "entries": { "$ref": "#/$defs/unsigned" },
+        "removed": { "$ref": "#/$defs/unsigned" },
+        "failed": { "$ref": "#/$defs/unsigned" },
+        "outcome": { "enum": ["published", "failed"] },
+        "code": { "$ref": "#/$defs/unsigned" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "hello" } } },
+          "then": {
+            "required": ["version", "pid", "frame_marks", "input_barrier"],
+            "properties": { "seq": false, "inputs": false, "barriers": false, "entries": false, "removed": false, "failed": false, "outcome": false, "code": false }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "frame" } } },
+          "then": {
+            "required": ["seq", "inputs", "barriers"],
+            "properties": { "version": false, "pid": false, "frame_marks": false, "input_barrier": false, "entries": false, "removed": false, "failed": false, "outcome": false, "code": false }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "scan_complete" } } },
+          "then": {
+            "required": ["entries"],
+            "properties": { "version": false, "pid": false, "frame_marks": false, "input_barrier": false, "seq": false, "inputs": false, "barriers": false, "removed": false, "failed": false, "outcome": false, "code": false }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "quit_prompt" } } },
+          "then": {
+            "properties": { "version": false, "pid": false, "frame_marks": false, "input_barrier": false, "seq": false, "inputs": false, "barriers": false, "entries": false, "removed": false, "failed": false, "outcome": false, "code": false }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "deletion_finished" } } },
+          "then": {
+            "required": ["removed", "failed"],
+            "properties": { "version": false, "pid": false, "frame_marks": false, "input_barrier": false, "seq": false, "inputs": false, "barriers": false, "entries": false, "outcome": false, "code": false }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "refresh_finished" } } },
+          "then": {
+            "required": ["outcome"],
+            "properties": { "version": false, "pid": false, "frame_marks": false, "input_barrier": false, "seq": false, "inputs": false, "barriers": false, "entries": false, "removed": false, "failed": false, "code": false }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "exit" } } },
+          "then": {
+            "required": ["code"],
+            "properties": { "version": false, "pid": false, "frame_marks": false, "input_barrier": false, "seq": false, "inputs": false, "barriers": false, "entries": false, "removed": false, "failed": false, "outcome": false }
+          }
+        }
+      ]
+    },
+    "events_page": {
+      "type": "object",
+      "required": ["since", "next", "records"],
+      "additionalProperties": false,
+      "properties": {
+        "since": {
+          "description": "The index of the first record the page covers.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "next": {
+          "description": "The index to pass as --since for the records after this page.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "records": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/event_record" }
+        }
+      }
+    },
+    "frame_summary": {
+      "description": "The frame records of a run of the event channel, summarized.",
+      "type": "object",
+      "required": ["count", "first_t_us", "last_t_us", "last"],
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "description": "How many frame records the run holds.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "first_t_us": {
+          "description": "When the first of them was drawn: its t_us.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "last_t_us": {
+          "description": "When the last of them was drawn: the t_us of last.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "last": {
+          "description": "The last frame record, in full.",
+          "allOf": [
+            { "$ref": "#/$defs/event_record" },
+            { "required": ["kind"], "properties": { "kind": { "const": "frame" } } }
+          ]
+        }
+      }
+    },
+    "events_digest": {
+      "description": "The records since the previous command that reported events, with the frames summarized: every record that is not a frame is listed in full and in order. events --since <since> returns every record the digest covers, frames included.",
+      "type": "object",
+      "required": ["since", "next", "frames", "records"],
+      "additionalProperties": false,
+      "properties": {
+        "since": {
+          "description": "The index of the first record the digest covers.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "next": {
+          "description": "The index to pass as --since for the records after the digest.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "frames": {
+          "description": "The frame records the digest covers, summarized; null when there are none.",
+          "oneOf": [{ "$ref": "#/$defs/frame_summary" }, { "type": "null" }]
+        },
+        "records": {
+          "description": "The records that are not frames, in order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/event_record",
+            "not": { "required": ["kind"], "properties": { "kind": { "const": "frame" } } }
+          }
+        }
+      }
+    },
+    "exit": {
+      "type": "object",
+      "required": ["code", "signal", "via", "terminal_restored", "modes"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "description": "The exit code; null if a signal ended the program.",
+          "type": ["integer", "null"]
+        },
+        "signal": {
+          "description": "The signal that ended the program; null if it exited by itself.",
+          "type": ["integer", "null"]
+        },
+        "via": {
+          "description": "quit: the driver quit it the way a user does. exited: it ended by itself. killed: its process group was killed after the bounded wait.",
+          "enum": ["quit", "exited", "killed"]
+        },
+        "terminal_restored": {
+          "description": "The alternate screen left, the cursor visible, and echo and canonical mode on.",
+          "type": "boolean"
+        },
+        "modes": { "$ref": "#/$defs/modes" }
+      },
+      "oneOf": [
+        { "properties": { "code": { "type": "integer" }, "signal": { "type": "null" } } },
+        { "properties": { "code": { "type": "null" }, "signal": { "type": "integer" } } }
+      ]
+    },
+    "fixture_changes": {
+      "type": "object",
+      "required": ["removed", "unexpected"],
+      "additionalProperties": false,
+      "properties": {
+        "removed": {
+          "description": "The entries that were there before any deletion and are gone.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "unexpected": {
+          "description": "Changes that no confirmed deletion explains.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/text" }
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "required": ["removed", "problems"],
+      "additionalProperties": false,
+      "properties": {
+        "removed": { "type": "boolean" },
+        "problems": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/text" }
+        }
+      }
+    },
+    "open_result": {
+      "type": "object",
+      "required": ["fixture", "profile", "size", "root", "session_dir", "pid", "supervisor_pid", "idle_timeout_ms", "recording", "screen", "events"],
+      "additionalProperties": false,
+      "properties": {
+        "fixture": { "$ref": "#/$defs/text" },
+        "profile": { "$ref": "#/$defs/profile" },
+        "size": { "$ref": "#/$defs/size" },
+        "root": {
+          "description": "The disposable copy of the fixture that excise scans.",
+          "$ref": "#/$defs/text"
+        },
+        "session_dir": { "$ref": "#/$defs/text" },
+        "pid": { "$ref": "#/$defs/unsigned" },
+        "supervisor_pid": { "$ref": "#/$defs/unsigned" },
+        "idle_timeout_ms": { "$ref": "#/$defs/unsigned" },
+        "recording": { "$ref": "#/$defs/nullable_text" },
+        "screen": { "$ref": "#/$defs/screen" },
+        "events": { "$ref": "#/$defs/events_digest" }
+      }
+    },
+    "keys_result": {
+      "type": "object",
+      "required": ["sent", "settled", "frame", "inputs", "screen", "events", "exit"],
+      "additionalProperties": false,
+      "properties": {
+        "sent": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sent_key" }
+        },
+        "settled": {
+          "description": "Whether the program drew a frame that counts every input sent. A key that changes nothing draws no frame.",
+          "type": "boolean"
+        },
+        "frame": {
+          "description": "The latest frame the program drew; null before the first.",
+          "oneOf": [{ "$ref": "#/$defs/frame" }, { "type": "null" }]
+        },
+        "inputs": { "$ref": "#/$defs/input_counts" },
+        "screen": { "$ref": "#/$defs/screen" },
+        "events": { "$ref": "#/$defs/events_digest" },
+        "exit": {
+          "description": "How the program ended, if it ended while the keys were sent. The session ends with it.",
+          "oneOf": [{ "$ref": "#/$defs/exit" }, { "type": "null" }]
+        }
+      }
+    },
+    "delete_result": {
+      "type": "object",
+      "required": ["name", "kind", "dialog", "sentinels_checked", "removed", "failed", "fixture", "screen", "events"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "The fixture-relative path that was deleted.",
+          "$ref": "#/$defs/text"
+        },
+        "kind": { "enum": ["file", "folder"] },
+        "dialog": {
+          "description": "The dialog, as it was verified before the confirmation key was sent.",
+          "$ref": "#/$defs/dialog"
+        },
+        "sentinels_checked": { "$ref": "#/$defs/unsigned" },
+        "removed": { "$ref": "#/$defs/unsigned" },
+        "failed": { "$ref": "#/$defs/unsigned" },
+        "fixture": { "$ref": "#/$defs/fixture_changes" },
+        "screen": { "$ref": "#/$defs/screen" },
+        "events": { "$ref": "#/$defs/events_digest" }
+      }
+    },
+    "screen_result": {
+      "type": "object",
+      "required": ["screen"],
+      "additionalProperties": false,
+      "properties": {
+        "screen": { "$ref": "#/$defs/screen" }
+      }
+    },
+    "events_result": {
+      "type": "object",
+      "required": ["events"],
+      "additionalProperties": false,
+      "properties": {
+        "events": { "$ref": "#/$defs/events_page" }
+      }
+    },
+    "close_result": {
+      "type": "object",
+      "required": ["exit", "screen", "events", "recording", "fixture", "residue", "cleanup"],
+      "additionalProperties": false,
+      "properties": {
+        "exit": { "$ref": "#/$defs/exit" },
+        "screen": { "$ref": "#/$defs/screen" },
+        "events": { "$ref": "#/$defs/events_digest" },
+        "recording": { "$ref": "#/$defs/nullable_text" },
+        "fixture": { "$ref": "#/$defs/fixture_changes" },
+        "residue": {
+          "description": "What the program left in its scratch area, relative to it; empty when it left nothing.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/text" }
+        },
+        "cleanup": { "$ref": "#/$defs/cleanup" }
+      }
+    },
+    "session_info": {
+      "type": "object",
+      "required": ["session", "state", "fixture", "profile", "size", "supervisor_pid", "started_at", "idle_timeout_ms", "recording"],
+      "additionalProperties": false,
+      "properties": {
+        "session": { "$ref": "#/$defs/session_id" },
+        "state": { "enum": ["starting", "running"] },
+        "fixture": { "$ref": "#/$defs/text" },
+        "profile": { "$ref": "#/$defs/profile" },
+        "size": { "$ref": "#/$defs/size" },
+        "supervisor_pid": {
+          "description": "The process id of the session's supervisor, once known.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "started_at": { "$ref": "#/$defs/timestamp" },
+        "idle_timeout_ms": { "$ref": "#/$defs/unsigned" },
+        "recording": { "$ref": "#/$defs/nullable_text" }
+      }
+    },
+    "stale_session": {
+      "type": "object",
+      "required": ["session", "reason", "fixture", "recording", "cleaned", "problems"],
+      "additionalProperties": false,
+      "properties": {
+        "session": { "$ref": "#/$defs/session_id" },
+        "reason": { "$ref": "#/$defs/text" },
+        "fixture": { "$ref": "#/$defs/nullable_text" },
+        "recording": {
+          "description": "Where the asciicast was kept; cleaning never removes it.",
+          "$ref": "#/$defs/nullable_text"
+        },
+        "cleaned": {
+          "description": "Whether everything of the session is gone.",
+          "type": "boolean"
+        },
+        "problems": {
+          "description": "What was left, and why: a process or a directory that cannot be proven to be the session's is never signaled or removed, and neither is anything that could not be removed. A session with a problem stays, and list reports it again.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/text" }
+        }
+      }
+    },
+    "list_result": {
+      "type": "object",
+      "required": ["sessions", "stale"],
+      "additionalProperties": false,
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/session_info" }
+        },
+        "stale": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/stale_session" }
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["kind", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "usage",
+            "unsupported_platform",
+            "no_such_session",
+            "session_lost",
+            "refused",
+            "conflict",
+            "not_in_view",
+            "timeout",
+            "program_exited",
+            "fixture_changed",
+            "failed"
+          ]
+        },
+        "message": { "$ref": "#/$defs/text" },
+        "sent": {
+          "description": "The input events the command had sent before it failed.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/sent_key" }
+        },
+        "confirmed": {
+          "description": "For delete: whether the confirmation key may have been sent: it was attempted, and nothing says that it did not arrive (a write that failed does; a recording of the input that failed after the write does not). When it is true the deletion may be running or done even though the command failed.",
+          "type": "boolean"
+        },
+        "screen": { "$ref": "#/$defs/screen" },
+        "exit": { "$ref": "#/$defs/exit" }
+      }
+    }
+  }
+}

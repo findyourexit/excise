@@ -21,6 +21,9 @@ This crate defines the vocabulary the harness shares:
 Runners (in-process, pseudo-terminal, headless) and the `xtask` commands build on this vocabulary
 and on the [fixture generator](#fixtures), which creates and checks the trees they run against.
 
+The [interactive driver](#interactive-driver) (`tui`) drives one live session at a time, for
+exploring the interface before a scenario is written.
+
 ## Scenario files
 
 A scenario is one TOML file. It names a generated fixture, the terminal and profiles to run under,
@@ -138,6 +141,15 @@ scenario declares.
 its `platforms`, every runner skips the scenario, with the reason, even when it is named with
 `--scenario`. For example, `tier = "nightly"` with `platforms = ["linux", "macos"]` runs only in
 the nightly tier, and only on Linux and macOS.
+
+The pseudo-terminal runner also skips a scenario that has a `delete` step, in either mode, and one
+that presses Backspace itself with a `key` or `type` step, or composes an escape sequence from its
+keys (a key that asks for a deletion dialog that no `delete` step verifies; see
+[`key`](#steps)), wherever the terminal's screen cannot be tied to a frame exactly: on Windows,
+where the capability `SCREEN_IS_EXACT` is false (see [`settle`](#pty-runner)). It prints the reason
+(`SKIP name: ...`), also when the scenario is named with `--scenario`, and the scenario's
+`platforms` stay as they are. The in-process runner is not affected: `cargo test` runs the
+scenario there, on Windows too.
 
 Validation rejects `fails_on` without `expect = "fail"`, a name in either list this harness does
 not know, a name in `fails_on` outside `platforms`, a repeated name, and a present-but-empty list
@@ -300,34 +312,95 @@ Details that a table cannot carry:
   `backspace`, `tab`, `up`, `down`, `left`, `right`, `page_up`, `page_down`. Named keys are
   lowercase. `ctrl` and `alt` default to `false`. A key sent right behind a lone `esc` can be read
   with it as Alt plus that key, so put a `settle` after `esc` before any other key (`quit` sends
-  `q`).
+  `q`). `ctrl` with `]` is not a key: its byte, `0x1d`, is the input barrier request that the runner
+  writes itself (see [`settle`](#pty-runner)), so a step that names it is refused before the run,
+  as a combination with no encoding is.
+
+  **A key that asks for a deletion.** Backspace opens a deletion dialog, and a `key` step is not
+  the protocol of `delete`: nothing verifies the dialog it opens, and a later `y`, Enter, filter
+  text, or the `y` of `quit` would confirm whatever a screen that may lag the program shows. The
+  runner reads every byte it writes to the program, in order (a step's own, the protocols', and
+  the barrier requests: `pty::input::InputScan`), and a `key` or `type` step whose bytes the
+  program can read as Backspace (`backspace`, `alt+backspace`, `ctrl+h`, which the Windows console
+  path may read as one) therefore *engages the run*, to its end. Until one does, nothing changes:
+  every key is sent at once, and `quit` presses `y` on the frame event that counts its `q`. In an
+  engaged run every write that can be read as a confirmation (it holds `y`, `Y`, Enter, or a line
+  feed: a `key` or `type` step, the name and the Enter of `select`, the `y` of `quit`) is sent only
+  after the runner has written an input barrier behind everything before it and the screen shows
+  the frame that answers it, and only if that exact screen shows no deletion dialog and what the
+  step needs: the open filter prompt for `select`, and the plain quit prompt (`[y] Quit`, no
+  waiting check listed) for `quit`. Otherwise the step fails with `DeleteRefused` (a mismatch, when
+  it is the prompt that is not there) and the key is not sent. `alt+y` and its like, the escape
+  byte and a confirmation in one write, are refused outright: a program may read them as two
+  inputs, and no barrier can come between them.
+
+  **Keys that compose a key.** The program joins the bytes of an escape sequence across writes:
+  `alt+[` and the text `121u` after it are `ESC [ 121 u`, which it reads as `y` (`13u` and
+  `57414u` are Enter, `97:121;2u` is `y` again, and the Windows console reads sequences of its own
+  that name any key), and no write holds a `y`, Enter, line feed, or Backspace byte. The scan
+  decodes none of this. A sequence that one write begins (`alt+[`, `alt+O`, or an `esc` that the
+  next write's `[` or `O` turns into one) and a later write continues counts as both a request for
+  a deletion and a confirmation, whatever its bytes, and so does every write that continues it
+  until it finishes: the write that continues it engages the run. Behind `ESC [` or `ESC O` it is
+  refused, as no barrier can be written there (the program takes the barrier for a byte of the
+  sequence and never answers it). Behind a lone `esc` it goes out as any write that could confirm
+  does, behind a barrier, which keeps the two apart. A key that begins and finishes a sequence of
+  its own (an arrow, a page key, `alt+up`) is neither. Send each key as one `key` step. A program
+  that does not mark its frames or answer a barrier, and a terminal whose screen is not exact, are
+  refused as `delete` refuses them, and the pseudo-terminal runner skips a scenario that asks for
+  a deletion with a key, or that composes a sequence between its keys, where the screen is not
+  exact (see [Tiers and platforms](#tiers-and-platforms)). No bundled scenario composes a
+  sequence.
 - **`select`.** The runner opens the filter with `/`, types the name, presses Enter, then asserts
-  that the selected item is exactly that entry.
+  that the selected item is exactly that entry. In an engaged run (see `key`) the name and the
+  Enter are sent only behind a barrier, to an exact screen that shows the open filter prompt and no
+  deletion dialog; a character that would continue an escape sequence that a `key` step began and
+  nothing has finished is refused.
 - **`delete`.** The runner acts on the selected entry. It presses Backspace, parses the
   confirmation dialog, asserts that its title and path name that entry, `name` and `kind`, under the
-  fixture root, asserts that every sentinel still exists, and only then presses `y`, or Enter with
-  `confirm_with = "enter"` (the dialog offers both: `[Enter/y] start`). Any mismatch fails the step
-  and the confirmation key is never sent. `path` says where the entry is: relative to the fixture
-  root, `/`-separated, and ending in `name` (it defaults to `name` itself, an entry directly below
-  the root); with a dialog, the path the dialog shows must be exactly the fixture root and `path`.
+  fixture root, asserts that every sentinel still exists, checks the fixture root's ownership marker
+  once more, and only then presses `y`, or Enter with `confirm_with = "enter"` (the dialog offers
+  both: `[Enter/y] start`). Any mismatch fails the step and the confirmation key is never sent. The
+  dialog is read after an input barrier that the runner writes behind the Backspace: `excise`
+  answers it with a frame once it has read the Backspace and every key before it, and the screen,
+  once it shows that frame (the frame marks say when, where the screen is exact: a Unix
+  pseudo-terminal, `SCREEN_IS_EXACT`), shows what those keys did, however the terminal cut their
+  bytes into input events (see [`settle`](#pty-runner)). A program whose `hello` does not say that
+  it marks its frames and answers the barrier is refused before any key is sent. The ownership
+  marker `.excise-harness-owned` is never a target: validation rejects a `delete` step whose `path`
+  (or `name`, when there is no `path`) is the marker or lies inside it. `path` says where the entry
+  is: relative to the fixture root, `/`-separated, and ending in `name` (it defaults to `name`
+  itself, an entry directly below the root); with a dialog, the path the dialog shows must be
+  exactly the fixture root and `path`.
   `wait_for` (default `"finished"`) controls when the step returns: `"finished"` waits for the
   deletion to finish; `"started"` returns as soon as the confirmation has closed the dialog, while
   the deletion keeps running, so a later step can act while it is still in progress (for example,
   delivering a `signal`).
 
+  **Where the screen is not exact** (`SCREEN_IS_EXACT` is false: Windows, see
+  [`settle`](#pty-runner)) the step refuses, in both modes, before any key, not even Backspace. It
+  fails with `DeleteRefused` and says that the terminal repaints the screen on its own timer (the
+  console host of Windows), so the harness cannot tie the screen to a frame and confirms no deletion
+  from it, and that the scenario runs in-process under `cargo test`. The reads that follow the
+  Backspace stay as a second line of defence: nothing can satisfy them there. `cargo xtask e2e`
+  skips every scenario that has a `delete` step there (see [Running scenarios](#running-scenarios)).
+
   **Without a dialog** (`disable_delete_confirmation = true`) Backspace alone starts the deletion,
   so the step has no dialog to read and no key to hold back. It checks what it can before it presses
-  Backspace. It waits, within its `timeout_ms`, for the selected-item panel to show an entry of this
-  `name` and `kind` (the pseudo-terminal runner reads a panel that can trail the header: a fresh map
-  arms its cursor in the frame that ends the scan, and a terminal may deliver a frame in pieces);
+  Backspace. It asks the program for an input barrier, so that the panel it reads shows what every
+  key sent so far did, and then waits, within its `timeout_ms`, for the selected-item panel to show
+  an entry of this `name` and `kind` (the pseudo-terminal runner reads a panel that can trail the
+  header: a fresh map arms its cursor in the frame that ends the scan, and a terminal may deliver a
+  frame in pieces);
   a panel that never does fails the step and says what it showed. Then the entry that `path` names
   must exist on disk with that kind, every sentinel must exist, and no sentinel may be that entry or
   lie inside it. The panel never shows where an entry lives, so an entry below a folder needs
   `path`, and `name` and `kind` must belong to one entry in the whole fixture: a panel that shows a
   file called `twin.bin` could be either of two, and Backspace deletes whichever is selected, so the
   step refuses and says where the twins are (give each entry a name of its own, or keep the
-  confirmation on, whose dialog shows the path). The step then presses Backspace and fails if any
-  dialog opens: a confirmation dialog means the program did not honour the mode, and no key is sent
+  confirmation on, whose dialog shows the path). The step then checks the fixture's ownership marker
+  once more, presses Backspace, asks for a barrier behind it, and fails if any dialog opened: a
+  confirmation dialog means the program did not honour the mode, and no key is sent
   to confirm it. After that it waits as `"finished"` does. `wait_for = "started"` and
   `confirm_with = "enter"` have nothing to act on there and are validation errors. A terminal too
   narrow to draw the selected-item panel cannot run this step.
@@ -384,8 +457,9 @@ Details that a table cannot carry:
   skips any scenario that uses it. The child's live CPU time is not sampled on Windows (see
   [Measurements](#pty-runner)); `idle_cpu_ms` is simply not recorded there, so an `expect_budget`
   step checking it reports the metric as not recorded rather than a value.
-- **`quit`.** The runner presses `q`, waits for the quit prompt, and confirms. It does not assert
-  the exit; follow it with `expect_exit`.
+- **`quit`.** The runner presses `q`, waits for the quit prompt, and confirms. In an engaged run
+  (see `key`) it confirms only behind a barrier, on an exact screen that shows the plain quit
+  prompt and no deletion dialog. It does not assert the exit; follow it with `expect_exit`.
 
 ### Validation rules
 
@@ -405,6 +479,7 @@ Details that a table cannot carry:
 | `fails_on` names only platforms `platforms` includes | `FailsOnOutsidePlatforms` |
 | a scenario with a `delete` step declares a sentinel | `DeleteWithoutSentinel` |
 | a `delete` step's `path` ends in the entry's `name` | `PathNotNamed` |
+| a `delete` step's entry (its `path`, or its `name` directly below the root) is not the ownership marker `.excise-harness-owned` or anything inside it: the marker is what makes the directory a fixture | `DeletesTheMarker` |
 | in a scenario with `disable_delete_confirmation`, a `delete` step has neither `wait_for = "started"` nor `confirm_with = "enter"`: there is no dialog to close or to confirm | `StartedWithoutDialog`, `ConfirmWithoutDialog` |
 | a `wait_refresh` has a `delete` step before it: nothing else owes a refresh | `RefreshWithoutDelete` |
 | an `expect_config` key is a dotted path of lowercase names, and it expects a non-empty string | `InvalidConfigKey`, `EmptyValue` |
@@ -421,10 +496,13 @@ Details that a table cannot carry:
 
 ### The deletion and lifecycle scenarios
 
-Deletion, its confirmation, cancellation, refusal, and what the interface says and allows around
-it are pinned by these scenarios, all `quick`, under `default` and `deterministic`, in both
-runners. Each asserts the facts by name (what is on disk, what the dialog names, what the
-interface reports, how the run ends) and not whole frames.
+Deletion, its confirmation, cancellation, refusal, and what the interface says and allows around it
+are pinned by these scenarios, all `quick`, under `default` and `deterministic`, in both runners,
+except that on Windows the pseudo-terminal runner skips the ones that have a `delete` step or press
+Backspace themselves (see [Tiers and platforms](#tiers-and-platforms)), so only `cargo test` runs
+them there, in-process. Each
+asserts the facts by name (what is on disk, what the dialog names, what the interface reports, how
+the run ends) and not whole frames.
 
 A scenario that deletes something waits with `wait_refresh` before it asserts the outcome and
 before it quits: until the program has replaced the map, the map still lists what was removed, and
@@ -452,6 +530,7 @@ which depends on the platform.
 | Scenario | Fixture | What it pins |
 |---|---|---|
 | `delete-file-lifecycle` | `delete-file` | A confirmed deletion removes only that file, the header reports one entry deleted and none failed, the map stays navigable, and quitting restores the terminal. |
+| `delete-file-slow-terminal` | `delete-file` | The same on a terminal that drains 20,000 bytes a second, so that the screen trails the program by a good part of a second: the `delete` step reads its dialog from a screen that shows the frame the program drew for the Backspace, and still deletes exactly its target. `full` tier; Linux and macOS. |
 | `delete-folder-lifecycle` | `delete-folder` | The same for a folder of 5,011 entries. |
 | `delete-tree-confirmed-with-enter` | `nested` | Enter confirms, and a folder goes with the folder inside it while the files beside it stay. |
 | `delete-tree-narrow-terminal` | `nested` | The same in a terminal 60 columns wide. Linux and macOS: on Windows the fixture's path (under the runner's temporary directory, every backslash doubled on screen) is longer than a 60-column dialog shows, and the `delete` step refuses a path it cannot read whole. |
@@ -521,8 +600,8 @@ a root without the ownership marker `.excise-harness-owned` before any process e
 
 | Module | What it does |
 |---|---|
-| `pty` | The session: `portable-pty` with a `vt100` screen model, key encoding for every scenario key with Ctrl and Alt, `ESC[6n` cursor-position requests answered from the screen model, resize, an asciicast v2 recording with output (`"o"`) and input (`"i"`) events, a token-bucket cap on how fast it drains the child's output (see [Terminal throughput](#pty-runner)), the terminal modes that failure bundles report, and the diagnostics (output timing, the count of answered cursor-position requests, and the bounded head and tail of the raw stream) a timed-out step's failure reports. |
-| `events` | A strict reader for the event channel (`EXCISE_TEST_EVENTS`, protocol v1). It reads complete lines only, rejects an unknown `v`, and requires the first event to be the `hello` of the process the runner started. |
+| `pty` | The session: `portable-pty` with a `vt100` screen model, key encoding for every scenario key with Ctrl and Alt, what the bytes written to the program can be read as (a request for a deletion, the confirmation of one: `input`), `ESC[6n` cursor-position requests answered from the screen model, resize, an asciicast v2 recording with output (`"o"`) and input (`"i"`) events, a token-bucket cap on how fast it drains the child's output (see [Terminal throughput](#pty-runner)), the frame marks it takes out of the output before the screen model sees it (and the latest frame whose mark it has read; on Windows `ConPTY` delivers a mark before the paint of its frame, so the screen cannot be tied to a frame exactly, see [`settle`](#pty-runner)), the terminal modes that failure bundles report, and the diagnostics (output timing, the count of answered cursor-position requests, and the bounded head and tail of the raw stream) a timed-out step's failure reports. |
+| `events` | A strict reader for the event channel (`EXCISE_TEST_EVENTS`, protocol v1). It reads complete lines only, rejects an unknown `v`, and requires the first event to be the `hello` of the process the runner started. The `frame_marks` of the `hello` says whether the program marks its frames; a program from before the marks omits it. |
 | `metrics` | Latency, stalls, output volume, and resource use (below). |
 | `safety` | Ownership markers, environment isolation, scratch areas, process-group kill, fixture snapshots, and residue checks. |
 | `runner` | Step execution, the verdict map, failure bundles, and the matrix. |
@@ -606,25 +685,102 @@ checks that directly.
 **Steps.**
 
 - **`settle`** waits for a `frame` event that reflects every input event the runner has sent, as
-  defined under [Runner semantics](#runner-semantics). It then reads the terminal output still in
-  flight, so that the screen model has caught up with the frame and the step after it can read the
-  screen once. On Unix it reads until the output has been quiet for 3 ms, for at most 20 ms. On
-  Windows it first reads for 100 ms and then does the same, because the event says that the
-  program drew, not that the drawing has arrived: `ConPTY` keeps its own copy of the screen and
-  sends what changed in paints that are typically 16 ms apart, so a frame drawn soon after a paint
+  defined under [Runner semantics](#runner-semantics), and then until the screen can be taken to
+  show that frame, so that the step after it can read the screen once. The event says that the
+  program drew, not that the drawing has arrived: the program writes it when it queues the frame for
+  its terminal writer thread, which can hold the bytes back for as long as the terminal likes. So
+  while the event channel is open `excise` follows every `frame` event with a mark in the terminal
+  output, queued behind the frame's own bytes through the same writer
+  (`ESC ] 9471 ; excise-frame=<seq> BEL`, see `docs/development.md`), and says so in its `hello`
+  (`frame_marks`). The session takes the marks out of the stream before the screen model sees it
+  and records the latest. On a Unix pseudo-terminal, which relays the output in order, the mark
+  follows its frame's bytes, so the screen shows frame `seq` exactly when the session has read its
+  mark, and the step waits for that, bounded by its `timeout_ms`: no quiet window, no guess.
+
+  On Windows `ConPTY` re-renders the output instead of relaying it: it parses what the program
+  writes into a buffer of its own, passes the mark through as soon as it has parsed it, and paints
+  the screen later, on its own timer. So the mark reaches the harness before the paint of its frame,
+  and reading it says that the console host has the frame, not that the screen model shows it.
+  Observed in CI run 37376817720 (the Windows pseudo-terminal tier): the marks do reach the harness,
+  and they arrive before the paint of their frame (in one recording, mark 10 at 0.133 s and the
+  9,756-byte paint that shows frame 10 at 0.142 s).
+
+  Whether the pseudo-terminal can tie its screen to a frame exactly is a capability,
+  `SCREEN_IS_EXACT` in `crates/excise-harness/src/runner/live.rs`: true on Unix, where a frame's
+  mark follows its bytes, so the screen is exact once the mark is read, and false on Windows. There
+  no quiet-time rule can prove a `ConPTY` paint complete: a repaint can be split after a cursor or
+  control prefix, and a paint begun before the mark can be flushed after it, leaving a stale dialog
+  on the screen.
+
+  Where the capability is false, the harness never confirms a deletion from the screen. The `delete`
+  step, in both modes (with the dialog and with `disable_delete_confirmation`), and the interactive
+  driver's `delete` and its confirmation guard refuse before any key, not even Backspace: the step
+  fails with `DeleteRefused` (the driver with the error kind `refused`) and says that the terminal
+  repaints the screen on its own timer (the console host of Windows), so the harness cannot tie the
+  screen to a frame and confirms no deletion from it, and that the scenario runs in-process under
+  `cargo test`. The reads that follow the Backspace in the protocol stay as a second line of
+  defence; nothing can satisfy them there. `cargo xtask e2e` skips every scenario that has a
+  `delete` step, in either mode, or that presses Backspace itself or composes an escape sequence
+  with a `key` or `type` step (see `key` under [Steps](#steps)), where the capability is false,
+  printing the reason (`SKIP name: ...`), also when the scenario is named with `--scenario`, as it
+  does for a scenario outside its `platforms`.
+
+  Reads that decide nothing destructive wait a bounded time on Windows instead: `settle`, `select`,
+  `resize`, `wait_refresh`, the first frame, and the `expect_*` steps after a `settle`. After the
+  mark they wait for the first output that is not a mark (the mark of another frame arriving first
+  does not count), and then for the bounded quiet read, output quiet for 3 ms for at most 20 ms; or
+  for the frame window (`CONPTY_FRAME_WINDOW`, 100 ms) to pass after the mark with nothing painted,
+  which is taken to mean that nothing needed painting. Every part is bounded by the step's
+  `timeout_ms`, so a mark that never comes still makes the step time out. Where the capability is
+  true, as on Unix, the mark alone decides, as above.
+
+  A program that does not mark its frames (a build from before the marks) gets the read that
+  guesses: on Unix until the output has been quiet for 3 ms, for at most 20 ms; on Windows first
+  100 ms of reading and then the same, because `ConPTY` keeps its own copy of the screen and sends
+  what changed in paints that are typically 16 ms apart, so a frame drawn soon after a paint
   reaches the harness late. In the recordings of failed runs on GitHub-hosted Windows runners, 30
   isolated frames arrived 4 to 22 ms after their event (median 12.5 ms), and the gaps between the
   paints of a console that was being redrawn were 15.6 ms at the median, 23 ms at the 99th
   percentile, and 54 ms at most, while the program was starting. The delays are upper bounds,
   because the program's clock and the recording's differ by an offset that only the moments the
-  keys were sent bound. A key that changes nothing draws no frame and never settles.
+  keys were sent bound. Nothing that could confirm a deletion relies on that guess: `delete`
+  refuses such a program. A key that changes nothing draws no frame and never settles.
+- **The input barrier** is how `delete`, and the interactive driver's guard, know that the program
+  has read what they wrote. Counting the inputs sent against the `inputs` of a frame cannot say so:
+  a terminal does not promise that one write is one input event. `ESC DEL` reaches the program as
+  Alt+Backspace when it reads both bytes at once and as Esc and then Backspace when it does not, and
+  an `ESC` read together with the `ESC [ A` of an arrow is Esc, `[`, `A`, so a frame can count the
+  inputs sent while events they became are still unread. While the event channel is open, `excise`
+  reads the byte `0x1d` (`ctrl+]`, which no `key` step can write) as a *barrier request*: it is read
+  in order with the rest of the input, it is not counted in `inputs`, and a frame is drawn for it
+  that carries `barriers`, the number of requests read. The runner writes a request behind the keys
+  it needs read, waits for the first frame whose `barriers` reaches the number of requests written,
+  and then for the screen to show that frame (its mark). The screen then shows what every key before
+  the request did, however the terminal cut their bytes into events, and the key that confirms a
+  deletion is the next thing written. At most one request is outstanding: one that is never
+  answered is waited for before another is written, so that an answer cannot be taken for the
+  answer to a later request. `hello` says `input_barrier` when the program answers; whatever could
+  confirm a deletion refuses a program that does not, before any key. A resize is a signal and not
+  a byte, so the barrier does not order it: the `resize` step waits for the frame that counts it. A
+  scenario that has pressed Backspace itself, or has composed a key from an escape sequence, writes
+  one too, before each key that could confirm what that Backspace opened (see `key` under
+  [Steps](#steps)); no barrier can be written behind an escape sequence that is still open, as the
+  program takes it for a byte of the sequence, so a write that would continue one is refused.
 - **`select`** opens the filter with `/`, erases any text it opened with, types the name, checks
-  the prompt, presses Enter, and waits until the inspector pane shows exactly that name.
-- **`delete`** presses Backspace and reads the dialog. It presses `y` only when the dialog names
-  exactly the requested entry, kind, and path and every sentinel exists. Any mismatch fails the
-  step and no `y` is ever sent. `wait_for = "finished"` (the default) ends the step when the
-  `deletion_finished` event and the first frame after it have been read and the output in flight
-  has been read as after `settle`, so the screen shows the result. `wait_for = "started"` ends it
+  the prompt, presses Enter, and waits until the inspector pane shows exactly that name. In an
+  engaged run (see `key` under [Steps](#steps)) the name's characters and the Enter are sent only
+  behind a barrier, on an exact screen that shows the open prompt and no deletion dialog.
+- **`delete`** presses Backspace and reads the dialog after an input barrier written behind it, from
+  a screen that shows the frame that answers the barrier, as the frame marks say where
+  `SCREEN_IS_EXACT` is true (Unix). Where it is false (Windows) the
+  step refuses before any key, not even Backspace, in both modes: see `settle`. It presses `y` only
+  when the dialog names exactly the requested entry, kind, and path, every sentinel exists, and the
+  fixture still carries its ownership marker. Any mismatch fails the step and no `y` is ever sent,
+  and so does a program that does not mark its frames. The waits after the confirming key read the
+  screen as `settle` does.
+  `wait_for = "finished"` (the default) ends the step when the `deletion_finished` event and the
+  first frame after it have been read and the screen shows that frame, so the screen shows the
+  result. `wait_for = "started"` ends it
   as soon as a frame shows the dialog has closed, without waiting for the deletion itself: the
   deletion keeps running after the step returns, so a step
   that needs its outcome waits for that separately (`wait_fs_absent`, `wait_event`). The map still
@@ -639,11 +795,14 @@ checks that directly.
   state (no rebuild and no publication is owed), so it holds whether the map was rebuilt or swapped
   for one without the entries, and a refresh that ended before the deletion cannot satisfy it,
   which is why no `wait_event` can name it. A deletion that removed nothing owes none, so after one
-  the step waits for nothing but a frame. It ends as `delete` does, on a frame after the event,
-  with the output in flight read as after `settle`.
-- **`quit`** presses `q`, waits for the quit dialog, and confirms with `y`.
-- **`resize`** resizes the terminal and waits for the frame that answers it, then reads the output
-  in flight as `settle` does.
+  the step waits for nothing but a frame. It ends as `delete` does after its confirming key, on a
+  frame after the event, once the screen shows it, as `settle` reads it.
+- **`quit`** presses `q`, waits for the quit dialog, and confirms with `y`. In an engaged run it
+  does not take the frame event that counts the `q`, and a screen, for the answer: it writes a
+  barrier behind the `q` and confirms only if the exact screen that answers shows the plain quit
+  prompt and no deletion dialog.
+- **`resize`** resizes the terminal and waits for the frame that answers it, then until the screen
+  shows it, as `settle` does.
 - **`wait_event`** matches any event read so far, including events before the step began.
 - **`expect_exit`** also compares the fixture with its state before the run: only confirmed
   deletions may differ, and only by removal. A confirmed deletion excuses a removal anywhere at or
@@ -704,7 +863,10 @@ at most 78 columns wide, and the Windows temporary directory is too long for it,
 `EXCISE_E2E_TMPDIR` to a short directory; CI uses the runner's temporary directory. The copy is
 removed when the run ends, and `--keep-fixture` keeps it. The runner checks ownership with the
 generator's `verify_owned`, which refuses a root that is a symbolic link and a marker that is not a
-regular file; `FixtureRoot` adds only the canonical spelling of the path.
+regular file; `FixtureRoot` adds only the canonical spelling of the path, and
+`FixtureRoot::verify_owned` repeats the check, which the runners do right before each key that
+confirms or starts a deletion: a marker that vanished or was replaced after the run began fails the
+step and no key is sent.
 
 ## Running scenarios
 
@@ -722,8 +884,12 @@ longer than its budget on the reference machine (see [Quick-tier time](#quick-ti
   checks (see [Quick-tier time](#quick-tier-time)). `--full`, the default tier, adds `full` and
   every profile a scenario declares. `--nightly` adds `nightly` too.
 - `--scenario` names a scenario and runs it whatever its tier, though a scenario outside its
-  `platforms` is still skipped, with the reason, even when it is named. A scenario outside the
-  selected tier or its `platforms` is otherwise skipped, with the reason, and printed.
+  `platforms` is still skipped, with the reason, even when it is named, and so is a scenario that
+  has a `delete` step, presses Backspace itself, or composes an escape sequence from its keys
+  wherever the terminal's screen cannot be tied to a frame exactly (Windows: `SCREEN_IS_EXACT` is
+  false, see [`settle`](#pty-runner)); `cargo test`
+  runs it in-process there. A scenario outside the selected tier or its `platforms` is otherwise
+  skipped, with the reason (`SKIP name: reason`), and printed.
 - `--profile` narrows the matrix and may repeat, alongside `--scenario`. `--repeat N` runs each
   pair `N` times, which is how identical verdicts are shown.
 - `--latency-scale FACTOR` multiplies the latency budgets' limits (see [Budgets](#budgets)); `1`, the
@@ -751,7 +917,9 @@ under every profile it names against the crate's own binary as part of `cargo te
 few one-off scenarios that exercise the runner itself, and runs each control to assert that the
 `delete` step failed, that Backspace was the last input when a dialog is open and was never sent
 when there is none, that no `y` appears among the recording's input events, and that every byte of
-the fixture is unchanged.
+the fixture is unchanged. On Windows `tests/harness_scenarios.rs` asserts that the `delete` step
+refuses before any key, with the `ConPTY` reason, and that the fixture is unchanged, so a Windows
+run is a positive check of the rule under [`settle`](#pty-runner); on Unix nothing changes.
 
 ### Quick-tier time
 
@@ -1039,6 +1207,16 @@ mutable tree. Metric names are qualified by their case (a fixture id, or `<scena
 for example `wide-1k__wall_time_ms` or `delete-folder-lifecycle-default__scan_complete_ms`, so one
 run can compare several fixtures and scenarios without their metrics colliding.
 
+**A baseline from before the frame marks.** A scenario that has a `delete` step, or presses
+Backspace itself with a `key` or `type` step, or composes an escape sequence from its keys, is
+compared only against a baseline whose `hello`
+says `frame_marks` and `input_barrier` (see [`settle`](#pty-runner) and the input barrier below
+it): the `delete` step refuses any other program before it sends a key, Backspace included
+(`DeleteRefused`), and so does the first key after a Backspace of the scenario's own that could
+confirm what it opened (the `y` of `quit` among them), and `bench-e2e` stops with that error
+instead of a verdict. `--fixture` cases and scenarios that have neither have no such need, so a
+baseline from before them can still be compared on those.
+
 **Pairs and statistics.** After one untimed warm-up pair (baseline, then candidate), `--pairs N`
 (10 by default) measured pairs run the same way, interleaved baseline, candidate, baseline,
 candidate, and so on. For every metric the document holds the per-pair candidate/baseline ratio,
@@ -1182,6 +1360,190 @@ gates nothing, and a reviewer who wants the counts of a head runs `cargo xtask c
 workflow that is followed is found by its name, so a workflow of the same name in a fork can upload
 an artifact of the same name, which is held to the same checks as the real one.
 
+## Interactive driver
+
+`cargo xtask tui` drives one live `excise` session on a fixture, step by step, so that a person or
+an agent can explore the interface and then turn what they saw into a scenario. `excise_harness::tui`
+does the work; `xtask/src/tui.rs` only parses the command line, finds or builds the release binary,
+and prints the one document the command made. It reuses the harness's own parts and forks none of
+them: the fixture generator and its run copies, the isolated environment, `PtySession` with its
+screen model, the scenario key encoding, the asciicast recorder, the event reader, and, shared with
+the scenario runner in `runner::live`, the wait that `settle` performs and the whole protocol of the
+`delete` step.
+
+```console
+cargo xtask tui open --fixture delete-file [--profile NAME] [--size COLSxROWS] [--record] [--idle-timeout DURATION]
+cargo xtask tui keys SESSION KEY... [--timeout DURATION]
+cargo xtask tui delete SESSION --name PATH --kind folder|file [--timeout DURATION]
+cargo xtask tui screen SESSION
+cargo xtask tui events SESSION [--since N]
+cargo xtask tui close SESSION
+cargo xtask tui list
+```
+
+Every command prints exactly one [`harness-tui`](#output-documents) document on stdout and nothing
+else there. A failure is a document too (`ok` is `false` and `error.kind` says why). The status is
+0 on success, 2 for a command line that is not valid, and 1 for any other failure. A duration is
+written `250ms`, `30s`, `15m`, or `2h`.
+
+| Command | What it does |
+|---|---|
+| `open` | Makes a run copy of the fixture spec `--fixture` names (the id of a file in `fixtures/`, never a path; a spec that needs a volume is refused), starts `excise` on it in a pseudo-terminal with the profile's settings and the event channel, waits for the first frame, and prints the session id and the first screen. The scan is usually still running then. The size is 120x40 unless a profile fixes the width; `--record` writes an asciicast; the idle timeout is 15 minutes (1 s to 24 h). |
+| `keys` | Sends keys in order: the scenario key names (`enter`, `esc`, `backspace`, `tab`, the arrows, `page_up`, `page_down`, or one character, with `ctrl+` or `alt+` before it) and `type:TEXT` for text. It waits for a frame that counts every input sent, as `settle` does, and prints the screen and the events since the previous command. `settled: false` means no frame counted them within `--timeout` (2 s): a key that changes nothing draws none. |
+| `delete` | The protocol of the `delete` step for `--name` (a path from the fixture root) and `--kind`: it selects the entry through the filter, presses Backspace, verifies the dialog against exactly that entry, kind, and path and against every sentinel, and only then confirms, then waits for the deletion, and for the rebuilt map as long as the timeout allows (`--timeout` bounds all of it, 60 s by default; the `screen` of the document says whether the map was rebuilt). The filter selects among the entries of the folder the session shows, so an entry elsewhere fails at once with `not_in_view` and nothing is sent: navigate first (`esc` goes up a folder; a folder opens when it is selected with `/`, `type:NAME`, `enter`, and `enter` is pressed again). The sentinels are the entries of the fixture's first two levels (at most 64) that are neither the target nor inside or above it; a fixture with none refuses the deletion. Afterwards the fixture is compared with its state before the first deletion, and a change that no confirmed deletion explains fails the command with `fixture_changed`. A wait that runs out is a failure document whose `confirmed` says whether the confirmation key was sent; the session stays open, and after a confirmation the program is still deleting, so read `screen` or `events`, or `close` it. |
+| `screen` | The screen model now: text, cursor, terminal modes, header badge, the selected entry, the filter prompt, the boxes, and the dialog. |
+| `events` | The event channel's records from `--since` (all of them when it is not given), frames included. |
+| `close` | Quits the program the way a user does (`q`, then the key the quit dialog offers) and kills its process group if it has not ended within a bounded wait. Prints the exit status, whether the terminal modes were restored, the fixture's changes, what the program left in its scratch area, and whether everything was removed. With `--record` the asciicast is kept and its path printed. |
+| `list` | The open sessions. A session whose supervisor died is reported under `stale` and cleaned. |
+
+**Sessions.** One supervisor process per session owns the pseudo-terminal, the screen model, and
+the event reader, so a session outlives the command that opened it. The commands talk to it through
+files in `target/excise-tui/<id>/`, never through a socket or a port, so nothing is reachable from
+another machine: a request is a file in `req/`, and its reply is the file of the same name in
+`rep/`. The directory is private to its owner (mode `0700`; a directory that is not is made so, or
+refused). The supervisor is `xtask` itself, started by `open` as `xtask tui supervise <session
+directory>` in its own process group with no terminal; its standard error is `supervisor.log` in the
+session directory. A session ends on `close`, when the program ends, and after its idle timeout, and
+each time the supervisor removes the run copy, the scratch area, and the session directory (a
+recording is kept). The run copy lives in `xh-tui-<id>/` under the base the scenario runner uses
+(`EXCISE_E2E_TMPDIR`, or `/tmp`), because the deletion dialog is at most 78 columns wide. An `open`
+that fails, or that is not ready after 15 minutes, ends its supervisor and removes everything it
+made. The supervisor serves one command at a time: a command that gets no reply in time withdraws
+its request if the supervisor has not taken it, so that nothing runs after it reported the timeout,
+and says so when the supervisor had taken it. A recording is large (7 MB for a session of 12
+seconds on the smallest fixture, because the program redraws constantly while it animates), so
+record only a session you mean to keep.
+
+**A session that does not clean up.** The command that reads a session's last reply (`close`, a
+`keys` whose key quit the program, a command that found the program gone) waits up to 15 s for the
+supervisor to remove the session directory. If it is still there, the document says so and `list`
+cleans it: `close` in its `cleanup`, and every other reply as a failure that keeps the exit and the
+screen, so a session that did not clean up is never reported as one that did.
+
+**Stale sessions.** The supervisor holds an exclusive lock on `supervisor.lock` for as long as it
+lives, so a free lock means it is gone, with no process id to reuse. `open`, `list`, and every
+command that names a session look for such sessions and clean them. Cleaning kills and removes
+things, so it acts only on what it can prove is the session's: a process id goes to another
+process once its process ends, and anyone can run a tool against the path `open` printed.
+
+- `open` makes a random mark for the session (its *nonce*) and records it in `config.json` before
+  the supervisor exists. The supervisor puts it in the program's environment (`XH_TUI_SESSION`)
+  and in the name of the marker of the workspace, and, once the program shows the mark in its
+  environment, records the program's process id with its start time and executable in
+  `state.json`. A process that is still being started shows its parent's command line and
+  environment, or none, so a reading made earlier would describe the wrong process.
+- The program of a stale session is killed, with its process group when it leads one, only if the
+  system shows the mark in its environment and nothing recorded of the process contradicts that;
+  it is looked at again after its group is known and immediately before the signal. The recorded
+  identity only rules a process out, because a start time in whole seconds and a path are shared by
+  another process that takes the id in the same second: a process with another start time,
+  another executable, or an environment without the mark is left alone. A program the supervisor
+  never got to record is found by the mark among the processes that have the run copy in their
+  arguments. A process whose environment the system does not show is left alone, whatever was
+  recorded of it, and so is the session: it is reported under `stale` with `cleaned: false` and
+  the reason, and `list` reports it again.
+- A workspace is removed only if it holds the marker of the session and its nonce: an empty file
+  whose name holds both, so it is there whole or not at all, whenever its maker ends. The marker is
+  the last thing in the workspace to go, and `config.json` is the last thing in the session
+  directory, so a removal that was interrupted leaves what the next sweep needs to finish it (an
+  empty workspace with no marker, which a supervisor killed between making and marking it leaves,
+  goes after a minute). A directory in `target/excise-tui/` that is named like a session but
+  whose configuration is missing, unreadable, or names another session is left and reported; only
+  the skeleton that a killed `open` leaves is removed (the request and reply directories, empty,
+  either or both, and the temporary file the configuration is written through). Every command
+  refuses a `target/excise-tui` that is a link, and a session never takes an id whose recording is
+  still there, so a kept recording is never written over.
+
+**Events.** `open`, `keys`, `delete`, and `close` do not list every frame since the previous
+command, because a program that animates draws about twenty a second. They summarize the frames
+(`events.frames`: how many, the time of the first and of the last, and the last frame record in
+full) and list every other record in full and in order. `events.since` and `events.next` still
+cover the whole run, and `events --since N` returns every record, frames included.
+
+**Selecting.** The program keeps the text of the filter: `/` opens it with the text of the filter
+before, and `keys` types after that text, so erase it with `backspace` first (the `screen`
+document's `filter.input` shows what is there). A filter that is applied again unchanged selects
+nothing. `delete` takes the entry the session has selected, and otherwise clears the filter and
+selects the entry through it, so neither state makes it fail. A later deletion in a session is
+checked against sentinels that are still there: an entry an earlier deletion removed is no
+sentinel.
+
+**Reading the screen.** `keys` reads the screen once the frame that counts the keys is on it, which
+the program's frame marks say exactly on the Unix pseudo-terminals the driver runs on
+(`SCREEN_IS_EXACT`, see `settle`), and then once the output has been quiet for 25 ms (for at most
+250 ms), because a program goes on drawing after a key. What the screen shows about the keys
+themselves is therefore exact; what the program drew later may not be, so read `screen` again when
+it does not show what the keys should have done. A program that does not mark its frames gets only
+the quiet read, and `keys` then sends it no key that could confirm a deletion.
+
+**Safety.** Confirmations are sent only by `delete`. `keys` refuses `y`, `enter`, and every other
+key that could confirm a deletion dialog while one is shown, and until the screen is known to show
+what the program has read. What could confirm one is read from every byte the session has written,
+in order, across commands (`pty::input::InputScan`: the keys, the barrier requests, and the
+driver's own writes), because the program joins the bytes of an escape sequence across writes:
+`alt+[` and then `type:121u` are `ESC [ 121 u`, which it reads as `y`, with no `y`, Enter, or line
+feed in any key. A key that begins a sequence is sent, as nothing can be confirmed with it yet
+(`alt+[` and `alt+O` do, and an `esc` that the next `[` or `O` turns into one); a key that
+continues one counts as a confirmation whatever its bytes. Behind `ESC [` or `ESC O` it is refused
+with the error kind `refused`, as no input barrier can be written behind it (the program takes the
+request for a byte of the sequence and never answers it), and so is every later key: close the
+session and open another. Behind a lone `esc` it is guarded as any key that could confirm. Before
+such a key it writes an input barrier request behind every key sent so far and waits for the
+program to answer it and for the screen to show the frame that answers it, so the program has read
+them all, however the terminal cut their bytes into input events
+(`alt+backspace` can reach a program as `esc` and then `backspace`), and the screen shows what they
+did. A dialog opens on an input and never by itself, so a screen that shows that frame shows every
+dialog there is, however slowly the terminal delivers it, and nothing is queued behind the request;
+the clock decides nothing. A key that changes nothing draws no frame and needs none, because the
+request makes one. When the answer does not come, and show on the screen, within the timeout, the
+key is refused. On a terminal where the screen is not exact `delete` and this guard refuse before
+any key, with the error kind `refused` (the driver does not run on Windows; the tests check it
+against a terminal that paints on its own timer). For the same reason `keys` refuses such a key in a
+command that sent `backspace` before it: `keys backspace enter` is refused, and so is erasing a
+filter's text and applying it in one command, because nobody has read the dialog Backspace opens. A
+confirmation behind the escape byte (`alt+y`, `alt+enter`) is one input that a program may read as
+two, so the escape could close a prompt that covers a deletion dialog and the key confirm the dialog
+it uncovers with no request possible between them: it is refused always, and `esc` and the key are
+sent as two keys. A program that does not mark its frames or does not answer an input barrier says
+nothing about what it has read, so `keys` sends it no key that could confirm a deletion, and
+`delete` refuses it before any key is sent. `ctrl+]` is not a key (its byte is the request). `delete`
+refuses the ownership marker `.excise-harness-owned`, and anything inside it, as a target, and checks
+the marker once more right before the confirmation key. `delete` waits for a deletion that an earlier
+command confirmed and gave up waiting for, because the program can queue another behind it and the
+`deletion_finished` it waits for has to be its own; a failure's `confirmed` is true when the
+confirmation key was attempted and nothing says that it did not arrive. The run copy carries the
+ownership marker, and every runner refuses a root without it.
+Every wait is bounded. The program's process group is killed when a wait that the session cannot go
+on without runs out (the first frame, the quit, the end of the session); a `keys` or a `delete`
+that runs out reports it and leaves the session open.
+
+**Platforms.** macOS and Linux. On Windows the module builds, and every command fails with a
+document whose `error.kind` is `unsupported_platform` and names the platform: the driver needs Unix
+process groups and file locks.
+
+**Tests.** `xtask/tests/tui.rs` runs the real commands against the `excise` binary `cargo test`
+built: a session from `open` to `close`, a deletion with every sentinel surviving, a folder
+deletion, two deletions in one session after a selection and a cancelled dialog, `delete` on an
+entry outside the open folder, a confirmation key refused in a real deletion dialog and in the
+command that opens it, a quit through `keys`, an idle timeout, a killed supervisor reported stale
+and cleaned, a stale session whose program is found by its mark when its identity was not
+recorded, a stale cleanup that leaves alone the process that took over a recorded id, a
+confirmation behind the escape byte refused while a deletion waits behind the quit prompt, text
+that would finish an escape sequence refused behind a deletion dialog, a state
+directory that is a link that no command follows, the cleanup of a test, which signals no process
+because a state file names its id, a long idle between commands, two sessions side by side, an
+`open` whose program ends at once, and command lines that are not valid, an argument that is not
+text among them. Each test has its own state,
+work directory, and fixture copy, so they are safe in parallel, and each checks that no process,
+session directory, or run copy is left. Every document every test sees is validated against the
+schema and read back by the harness's reader. A test waits for what a key does by reading `screen`
+until it shows it, because the program can draw a frame after the one that counts a key. Two tests
+put the screen behind the program with a pseudo-terminal that drains 20,000 bytes a second, set
+through the variable `EXCISE_HARNESS_TUI_DRAIN_BYTES_PER_SEC`, which the supervisor reads when a
+session starts and which is not an option of any command: one refuses a confirmation after the keys
+that uncover a dialog and after a Backspace more than a second old, and one deletes exactly its
+target.
+
 ## Safety rules
 
 The harness only ever runs `excise` against fixtures it generated itself, and never against a real
@@ -1217,7 +1579,21 @@ path.
    mutation or a check outside it.
 4. **Deletion is guarded.** A scenario with a `delete` step must declare at least one sentinel. The
    `delete` step confirms only after the dialog matches the expected entry and the sentinels exist.
-5. **Fixtures are owned.** The runner refuses any root without the harness ownership marker.
+   The [interactive driver](#interactive-driver) holds itself to the same rule: its `delete` runs
+   the same protocol, and its `keys` never sends a key that could confirm a deletion dialog. A
+   scenario's own `key` that asks for a deletion (Backspace, or bytes that finish an escape
+   sequence that earlier keys began, as `alt+[` and `121u` do) engages its run: from then on a `y`,
+   Enter, filter text, or quit confirmation is sent only on an exact screen that shows no deletion
+   dialog (see `key` under [Steps](#steps)). Where the pseudo-terminal cannot tie its screen to a
+   frame exactly (`SCREEN_IS_EXACT` is false: Windows, see [`settle`](#pty-runner)), the harness
+   confirms no deletion from the screen: the `delete` step, in both modes, and the driver's
+   `delete` and confirmation guard refuse before any key, not even Backspace, and `cargo xtask e2e`
+   skips every scenario that has a `delete` step, presses Backspace itself, or composes a
+   sequence from its keys. Those scenarios run in-process under `cargo test`.
+5. **Fixtures are owned.** The runner refuses any root without the harness ownership marker, no
+   `delete` step may name the marker or anything inside it (validation rejects it, and the
+   interactive driver refuses it), and the runners check the marker again right before each key
+   that confirms or starts a deletion.
 6. **Runs are isolated.** The runner clears the environment and rebuilds it from `TERM`,
    `COLORTERM`, `LANG`, and the profile's own settings. Each scenario gets a scratch `HOME`,
    `EXCISE_CONFIG`, working directory, and `EXCISE_SCAN_STORE_DIR`, so a theme commit, an export,
@@ -1515,6 +1891,7 @@ Machine output is versioned JSON. Every document carries a `document_kind` and a
 | Failure bundle | `harness-failure` | 1 | `cargo xtask e2e` | [`harness-failure.schema.json`](schemas/harness-failure.schema.json) | The evidence for one failed scenario: the failed step, expected and actual screen text, terminal modes, the session's diagnostics (present only when the step timed out; see [Runner semantics](#runner-semantics)), the recording path, resource use, the fixture hash and seed, and a command that reruns it. |
 | A/B evidence | `harness-ab` | 1 | `cargo xtask bench-e2e` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under (the fixtures compared, the host, the toolchain, the power state, the load average, and concurrent `excise` processes). |
 | Counts | `harness-counts` | 1 | `cargo xtask counts` (the history job's record is the same document) | [`harness-counts.schema.json`](schemas/harness-counts.schema.json) | The deterministic counts of one build: the commit and its time, the runner, the toolchain, a pull request's number, base, and head when it is one, and per fixture and profile the fixture's hash and seed and an open map of counts (see [Counts](#counts)). It holds nothing that depends on the run, so a commit counted twice gives the same bytes. |
+| Tui command | `harness-tui` | 1 | `cargo xtask tui` | [`harness-tui.schema.json`](schemas/harness-tui.schema.json) | What one interactive-driver command prints: its result, whose shape depends on `command` (the first screen, the screen and the events after keys, a deletion's verified dialog and sentinels, the screen, the event records, how the session ended, or the open sessions), or why it failed. |
 
 `cargo xtask headless` writes a `harness-summary`, not a separate document kind: a headless run is
 one more kind of scenario result, named `headless-<fixture>`, whose open `metrics` map carries the
@@ -1524,6 +1901,12 @@ document at all: it only prints the verdict table, because a ratio-budget compar
 (the paired samples and the ratio) is exactly a `harness-ab` row running against this crate's own
 binary, and a future slice may fold it into one if that evidence needs to be kept.
 
+Every `cargo xtask tui` command prints one `harness-tui` document, and so does a command that fails
+(`ok: false`, with an `error`). `keys`, `delete`, `close`, and `open` carry their events as a
+digest: the frame records are summarized, and `events` is the one command that lists them. The unit
+tests in `src/report/tests.rs` cover every shape of the document, and `xtask/tests/tui.rs`
+validates the documents the real commands print.
+
 A `metrics` map is deliberately open: the harness does not constrain which names appear, and the
 schemas say so rather than enumerating them (a scenario's own `measure` names, a fixture's class,
 or a future metric all pass through unchanged). Fixed-shape fields (identities, verdicts, the
@@ -1532,9 +1915,10 @@ member or an undeclared field.
 
 Each schema's `$id` is
 `https://github.com/findyourexit/excise/harness/schemas/<document_kind>-v1.json`. The Rust types
-are `HarnessSummary`, `HarnessFailure`, `HarnessAb`, and `HarnessCounts` in `excise_harness::report`. They implement
-`Document`, which carries the kind, the schema id, and the schema text, and renders the canonical
-form: pretty-printed JSON in field order with a final newline.
+are `HarnessSummary`, `HarnessFailure`, `HarnessAb`, `HarnessCounts`, and `HarnessTui` in
+`excise_harness::report`. They implement `Document`, which carries the kind, the schema id, and the
+schema text, and renders the canonical form: pretty-printed JSON in field order with a final
+newline.
 
 The schemas live here, not in `docs/schemas`, because that directory is copied into release
 archives and packages and these formats are not part of the product. The types and the schemas
@@ -1631,7 +2015,9 @@ another runner can perform, a fixture that needs a scratch volume (only a privil
 runner attaches one), or a fixture that plans more than 10,000 entries (the large fixtures are for
 the runners built for them). A scenario file that does not parse, does not validate, is not named
 after its scenario, or names a fixture with no loadable spec fails the suite instead of being
-skipped.
+skipped. On Windows, where the pseudo-terminal runner skips the scenarios that have a `delete` step
+(see [Tiers and platforms](#tiers-and-platforms)), it still runs them: the same steps against the
+real executor, with no terminal (`bundled_in_process_scenarios_pass_under_every_declared_profile`).
 
 ### `settle` and waits
 

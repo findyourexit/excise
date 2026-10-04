@@ -18,8 +18,8 @@
 //!   unless the last thing delivered was a barrier, one comes first, so even a mutation that opens
 //!   the scenario lands after the first scan has settled.
 //! * `select`, `delete`, and `quit` are short sequences of the above with checks in between.
-//!   `delete` sends `y` only after the dialog, the target, and the sentinels have all been
-//!   verified.
+//!   `delete` sends `y` only after the dialog, the target, the sentinels, and the ownership marker
+//!   have all been verified, the marker last.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -29,7 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use excise_harness::fixture::mutate;
+use excise_harness::fixture::{MARKER_FILE_NAME, mutate, verify_owned};
 use excise_harness::report::{FailedStep, ScreenComparison};
 use excise_harness::safety::FixtureRoot;
 use excise_harness::scenario::{
@@ -649,12 +649,12 @@ impl ScenarioInput {
     }
 
     /// Asks to delete the selected entry. It sends `y` only when the dialog names exactly this
-    /// entry and kind under the fixture root and every sentinel exists. Any mismatch fails the step
-    /// and `y` is never sent.
+    /// entry and kind under the fixture root, every sentinel exists, and the fixture root still
+    /// carries its ownership marker. Any mismatch fails the step and `y` is never sent.
     ///
     /// A scenario that disables the confirmation (`disable_delete_confirmation`) has no dialog:
-    /// the step checks the selected-item panel, the disk, and the sentinels, sends Backspace
-    /// alone, and fails if a dialog opens.
+    /// the step checks the selected-item panel, the disk, the sentinels, and the marker, sends
+    /// Backspace alone, and fails if a dialog opens.
     fn delete(&mut self, delete: &Delete) -> Drive {
         let phase = match std::mem::take(&mut self.state) {
             State::Delete(phase) => phase,
@@ -741,15 +741,15 @@ impl ScenarioInput {
         if self.plan.without_dialog {
             format!(
                 "the selected-item panel shows the {} {:?}, which Backspace alone deletes at {:?}, \
-                 and every sentinel exists",
+                 every sentinel exists, and the fixture root still carries its ownership marker",
                 delete.kind,
                 delete.name,
                 delete.path.as_deref().unwrap_or(&delete.name)
             )
         } else {
             format!(
-                "the delete dialog names {:?} ({}) under the fixture root, and every sentinel \
-                 exists",
+                "the delete dialog names {:?} ({}) under the fixture root, every sentinel exists, \
+                 and the fixture root still carries its ownership marker",
                 delete.name, delete.kind
             )
         }
@@ -785,7 +785,9 @@ impl ScenarioInput {
         }
     }
 
-    /// Checks the delete dialog against the step, then the sentinels.
+    /// Checks the delete dialog against the step, then the sentinels, and last that the fixture
+    /// root still carries its ownership marker, so that the confirming key follows the check at
+    /// once.
     fn verify_delete(&self, dialog: &Panel, delete: &Delete) -> Result<(), String> {
         let shown_kind = match dialog.title() {
             "! DELETE FOLDER" => EntryKind::Folder,
@@ -821,13 +823,14 @@ impl ScenarioInput {
                 Err(message) => return Err(message),
             }
         }
-        Ok(())
+        self.verify_ownership("refusing to confirm: no confirming key was sent")
     }
 
     /// For a deletion no dialog confirms: checks the selected-item panel, the entry on disk, and
-    /// the sentinels before Backspace. Nothing on screen shows where the selected entry lives, so
-    /// that is the step's `path` (or its `name`, directly below the root), and the panel's name
-    /// and kind prove it only when no other entry of the fixture has them.
+    /// the sentinels before Backspace, and last that the fixture root still carries its ownership
+    /// marker. Nothing on screen shows where the selected entry lives, so that is the step's
+    /// `path` (or its `name`, directly below the root), and the panel's name and kind prove it
+    /// only when no other entry of the fixture has them.
     fn verify_selection(&self, delete: &Delete) -> Result<(), String> {
         let selected = self.snapshot().selected_item().ok_or_else(|| {
             "the selected-item panel shows no selection, or is not drawn at this terminal size"
@@ -872,7 +875,23 @@ impl ScenarioInput {
         // The panel shows a name and a kind only, so they must point at one entry in the fixture.
         FixtureRoot::open(&self.root)
             .map_err(|error| error.to_string())?
-            .require_only_entry(&delete.name, delete.kind, relative)
+            .require_only_entry(&delete.name, delete.kind, relative)?;
+        self.verify_ownership("refusing to delete: no key was sent")
+    }
+
+    /// Checks that the fixture root still carries its ownership marker, as the last check before
+    /// the key that confirms a deletion or, with no dialog, starts it. A run verifies the marker
+    /// once, when it starts, and the program under test can delete anything it shows, the marker
+    /// included: without this, a deletion that follows one that removed or replaced the marker
+    /// would go ahead in a directory the harness no longer owns. `unsent` says what the refusal
+    /// keeps from being sent.
+    fn verify_ownership(&self, unsent: &str) -> Result<(), String> {
+        verify_owned(&self.root).map_err(|error| {
+            format!(
+                "the fixture root lost its `{MARKER_FILE_NAME}` ownership marker after the run \
+                 started ({error}); {unsent}"
+            )
+        })
     }
 
     /// Asks to quit, waits for the ordinary quit prompt, and confirms it.
@@ -1007,9 +1026,12 @@ fn press_event(press: PressKey) -> Event {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use excise_harness::scenario::Scenario;
 
     use super::*;
+    use crate::tests::fixtures::register_snapshot_root;
     use crate::tests::scenario_runner::fixture::materialize;
     use crate::tests::scenario_runner::plan::plan;
 
@@ -1049,5 +1071,94 @@ path = "extra.bin"
         // Once the barrier is through, the mutation lands and the scenario is over.
         assert!(input.read().is_err());
         assert!(landed());
+    }
+
+    /// The rows of a box `width` cells wide: a top border with its title tab, the `inner` lines,
+    /// and a bottom border, which is how `Screen` reads a dialog.
+    fn boxed(title: &str, inner: &[&str], width: usize) -> Vec<String> {
+        let tab = format!(" {title} ");
+        let fill = "▔".repeat(width - 2 - tab.chars().count());
+        let mut rows = vec![format!("▟{tab}{fill}▜")];
+        rows.extend(
+            inner
+                .iter()
+                .map(|line| format!("▏{line:<w$}▕", w = width - 2)),
+        );
+        rows.push("▔".repeat(width));
+        rows
+    }
+
+    /// The deletion dialog the program draws for `victim.bin` of the `delete-file` fixture.
+    fn victim_dialog() -> Panel {
+        let rows = boxed(
+            "! DELETE FILE",
+            &[
+                "/tmp/excise_tests/delete-file/victim.bin",
+                "[Enter/y] start",
+            ],
+            60,
+        );
+        Screen::from_lines(&rows.iter().map(String::as_str).collect::<Vec<_>>())
+            .dialog()
+            .expect("the box should read as a dialog")
+    }
+
+    #[test]
+    fn the_ownership_marker_is_the_last_check_before_the_confirming_key() {
+        let scenario = Scenario::from_toml_str(
+            r#"
+schema_version = 1
+name = "delete-the-victim"
+description = "A scenario whose delete step is checked without running the program."
+fixture = "delete-file"
+sentinels = ["keep-a.bin"]
+profiles = ["default"]
+
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+"#,
+        )
+        .expect("the scenario should parse");
+        let Step::Delete(delete) = &scenario.steps[0] else {
+            panic!("the scenario's only step deletes");
+        };
+        let fixture = materialize("delete-file").expect("the fixture should build");
+        // The dialog's path reads as the program draws it, under the registered snapshot root.
+        register_snapshot_root(fixture.root(), "delete-file");
+        let input = ScenarioInput::new(
+            Rc::new(plan(&scenario).expect("the scenario should plan")),
+            SharedBackend::new(120, 40),
+            fixture.root().to_path_buf(),
+            PathBuf::new(),
+            Limits::default(),
+            Rc::new(RefCell::new(Progress::default())),
+        );
+        let dialog = victim_dialog();
+        let marker = fixture.root().join(MARKER_FILE_NAME);
+
+        // The dialog names the victim and the sentinel is there, so the marker is all that is
+        // left to check.
+        assert_eq!(input.verify_delete(&dialog, delete), Ok(()));
+
+        fs::remove_file(&marker).expect("the marker should go");
+        let refusal = input
+            .verify_delete(&dialog, delete)
+            .expect_err("a root that lost its marker must not be confirmed");
+        assert!(refusal.contains(MARKER_FILE_NAME), "{refusal}");
+        assert!(
+            refusal.contains("no confirming key was sent"),
+            "the refusal should say that no key was sent: {refusal}"
+        );
+
+        // A directory in its place is no marker either.
+        fs::create_dir(&marker).expect("a directory should take its place");
+        assert!(input.verify_delete(&dialog, delete).is_err());
+
+        // With a marker again, the very same dialog is accepted: only the marker stood in the way.
+        fs::remove_dir(&marker).expect("the directory should go");
+        fs::write(&marker, b"owned").expect("the marker should come back");
+        assert_eq!(input.verify_delete(&dialog, delete), Ok(()));
     }
 }

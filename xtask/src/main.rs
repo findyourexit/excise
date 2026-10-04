@@ -4,6 +4,7 @@ mod counts;
 mod counts_history;
 mod e2e;
 mod headless;
+mod tui;
 
 use clap_complete::Shell;
 use excise::cli_command;
@@ -122,10 +123,13 @@ fn dispatch() -> Result<(), Box<dyn Error>> {
         Some("counts") => counts::counts(args),
         Some("counts-comment") => counts_history::comment(args),
         Some("counts-record") => counts_history::record(args),
+        // The command takes its arguments as they are: one that is not text is a usage error it
+        // reports, where `env::args` would panic on it.
+        Some("tui") => tui::tui(env::args_os().skip(2)),
         Some("demo-features") => render_feature_demos(args),
         Some("create-release-tag") => create_release_tag(args),
         _ => Err(io::Error::other(
-            "usage: cargo xtask <verify|fuzz-toolchain|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|demo-features [NAME...]|e2e [--quick|--full|--nightly] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--latency-scale FACTOR] [--timing-informational] [--keep-fixture]|headless [--quick|--full] [--fixture ID]... [--class CLASS]... [--profile PROFILE] [--repeat N] [--timeout SECONDS] [--timing-informational] [--keep-scratch]|bench-e2e --baseline <ref> [--baseline-binary PATH] [--candidate-binary PATH] [--fixture ID]... [--scenario NAME --profile PROFILE]... [--pairs N] [--seed S] [--timing-threshold FRACTION] [--memory-tolerance FRACTION] [--strict] [--timeout SECONDS]|compare [--quick|--full|--nightly] [--comparison NAME]... [--pairs N] [--seed S] [--timing-informational]|counts [--out FILE] [--repeat N] [--fixture ID]... [--timeout SECONDS] [--pull-request NUMBER --base-sha SHA --head-sha SHA]|counts-comment --artifact FILE --expect-head-sha SHA --out DIR [--history DIR] [--repo DIR]|counts-record --record FILE --remote URL [--branch NAME] [--attempts N]|create-release-tag>",
+            "usage: cargo xtask <verify|fuzz-toolchain|generate|check-generated|check-distribution|check-support-matrix|render-homebrew|dist-local|demo|demo-features [NAME...]|e2e [--quick|--full|--nightly] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--latency-scale FACTOR] [--timing-informational] [--keep-fixture]|headless [--quick|--full] [--fixture ID]... [--class CLASS]... [--profile PROFILE] [--repeat N] [--timeout SECONDS] [--timing-informational] [--keep-scratch]|bench-e2e --baseline <ref> [--baseline-binary PATH] [--candidate-binary PATH] [--fixture ID]... [--scenario NAME --profile PROFILE]... [--pairs N] [--seed S] [--timing-threshold FRACTION] [--memory-tolerance FRACTION] [--strict] [--timeout SECONDS]|compare [--quick|--full|--nightly] [--comparison NAME]... [--pairs N] [--seed S] [--timing-informational]|counts [--out FILE] [--repeat N] [--fixture ID]... [--timeout SECONDS] [--pull-request NUMBER --base-sha SHA --head-sha SHA]|counts-comment --artifact FILE --expect-head-sha SHA --out DIR [--history DIR] [--repo DIR]|counts-record --record FILE --remote URL [--branch NAME] [--attempts N]|tui <open|keys|delete|screen|events|close|list>|create-release-tag>",
         )
         .into()),
     }

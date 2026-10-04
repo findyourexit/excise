@@ -21,6 +21,7 @@ use super::{
     budget::{LatencyScale, limit_for},
     bundle::{self, Bundle, Invocation},
     exec::Executor,
+    live::Drive,
     outcome::{RunError, StepFailure, Stop},
     plan::prepare,
     verdict::{Outcome, verdict},
@@ -217,16 +218,19 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
     match result {
         Ok(()) => {
             report.metrics = executor.metrics();
-            executor.session.kill();
+            executor.live.session.kill();
         }
         Err(Stop::Error(error)) => {
-            executor.session.kill();
+            executor.live.session.kill();
             return Err(error);
         }
         Err(Stop::Fail(failure)) => {
             // Kill the whole process group first, then collect the evidence.
-            executor.session.kill();
-            let _ = executor.session.drain(POST_MORTEM_QUIET, POST_MORTEM_LIMIT);
+            executor.live.session.kill();
+            let _ = executor
+                .live
+                .session
+                .drain(POST_MORTEM_QUIET, POST_MORTEM_LIMIT);
             let _ = executor.pump();
             report.metrics = executor.metrics();
             if let Some(dir) = request.bundle_dir {
@@ -311,9 +315,13 @@ fn write_bundle(
     scratch: &Scratch,
     baseline: &FixtureSnapshot,
 ) -> Result<(), RunError> {
-    executor.session.finish_recording().map_err(RunError::Pty)?;
-    let screen = executor.session.screen();
-    let cpu = executor.session.cpu_time().unwrap_or_default();
+    executor
+        .live
+        .session
+        .finish_recording()
+        .map_err(RunError::Pty)?;
+    let screen = executor.live.session.screen();
+    let cpu = executor.live.session.cpu_time().unwrap_or_default();
     let invocation = Invocation {
         program: spec.program.clone(),
         args: spec
@@ -334,11 +342,16 @@ fn write_bundle(
             screen_text: &screen.text(),
             screen_size: (rows, cols),
             cursor: screen.cursor(),
-            modes: executor.session.modes(),
+            modes: executor.live.session.modes(),
             recording,
             events: &scratch.events(),
             rusage: Rusage {
-                max_rss_bytes: executor.session.sampler().peak_memory_bytes().unwrap_or(0),
+                max_rss_bytes: executor
+                    .live
+                    .session
+                    .sampler()
+                    .peak_memory_bytes()
+                    .unwrap_or(0),
                 user_ms: whole_milliseconds(cpu.user),
                 sys_ms: whole_milliseconds(cpu.system),
             },

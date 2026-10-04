@@ -13,7 +13,10 @@ use super::{
         ExpectScreen, Idle, Marker, Region, Step, WaitEvent, WaitText,
     },
 };
-use crate::platform::PLATFORMS;
+use crate::{
+    fixture::{MARKER_FILE_NAME, is_marker_path},
+    platform::PLATFORMS,
+};
 
 /// The longest slice id.
 const MAX_SLICE_LEN: usize = 8;
@@ -278,6 +281,18 @@ pub enum StepError {
         /// The path that does not end in it.
         path: String,
     },
+    /// A `delete` step would delete the ownership marker, or something inside it.
+    #[error(
+        "`{field}` {path:?} is the ownership marker `{MARKER_FILE_NAME}` of the fixture or lies \
+         inside it, which no step may delete: the marker is what makes the directory a fixture"
+    )]
+    DeletesTheMarker {
+        /// The field that holds the path: `path`, or `name` when the step has no `path` and the
+        /// entry is directly below the root.
+        field: Field,
+        /// The path that is the marker or lies inside it.
+        path: String,
+    },
     /// `wait_for = "started"` in a scenario that has no confirmation dialog to close.
     #[error(
         "`wait_for = \"started\"` needs the confirmation dialog to close, but \
@@ -344,7 +359,8 @@ impl Scenario {
     /// non-empty, duplicate-free `profiles`; a terminal of at least 32x8; at least one step;
     /// `slice` present whenever `expect = "fail"`; finite non-negative budget limits; every
     /// fixture-relative path relative and canonical (see
-    /// [`check_fixture_relative_path`]); at least one sentinel whenever a step deletes; every
+    /// [`check_fixture_relative_path`]); at least one sentinel whenever a step deletes, and no
+    /// `delete` step on the ownership marker or on anything inside it ([`is_marker_path`]); every
     /// `timeout_ms` between 1 and [`MAX_TIMEOUT_MS`]; and the per-step rules documented on
     /// [`StepError`].
     ///
@@ -434,12 +450,7 @@ impl Scenario {
                 });
             }
         }
-        if self.sentinels.is_empty()
-            && self
-                .steps
-                .iter()
-                .any(|step| matches!(step, Step::Delete(_)))
-        {
+        if self.sentinels.is_empty() && self.deletes() {
             errors.push(ValidationError::DeleteWithoutSentinel);
         }
     }
@@ -645,15 +656,35 @@ fn check_expect_fs(step: &ExpectFs, errors: &mut Vec<StepError>) {
 
 fn check_delete(step: &Delete, errors: &mut Vec<StepError>) {
     require_text(Field::new("name"), &step.name, errors);
-    if let Some(path) = &step.path {
-        let before = errors.len();
-        check_path(Field::new("path"), path, errors);
-        if errors.len() == before && path.rsplit('/').next() != Some(step.name.as_str()) {
+    let Some(path) = &step.path else {
+        // Without a `path` the entry is `name` itself, directly below the root.
+        check_not_the_marker(Field::new("name"), &step.name, errors);
+        return;
+    };
+    let before = errors.len();
+    check_path(Field::new("path"), path, errors);
+    // A path that breaks the path rule is reported as that and nothing else: what it ends in, and
+    // what it starts with, are questions about a path that names something.
+    if errors.len() == before {
+        if path.rsplit('/').next() != Some(step.name.as_str()) {
             errors.push(StepError::PathNotNamed {
                 name: step.name.clone(),
                 path: path.clone(),
             });
         }
+        check_not_the_marker(Field::new("path"), path, errors);
+    }
+}
+
+/// Reports a `delete` step whose bound path, which `field` holds, is the ownership marker or lies
+/// inside it. Deleting the marker would leave a root that no runner accepts as a fixture, in the
+/// middle of a run that trusted it.
+fn check_not_the_marker(field: Field, path: &str, errors: &mut Vec<StepError>) {
+    if is_marker_path(path) {
+        errors.push(StepError::DeletesTheMarker {
+            field,
+            path: path.to_owned(),
+        });
     }
 }
 

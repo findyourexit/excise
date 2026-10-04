@@ -14,7 +14,8 @@
 //!   directory, and every component is opened without following links. A link anywhere on the
 //!   path is an error, and the last component is never followed either: `vanish` removes a link,
 //!   it never removes what the link points to.
-//! * **The marker is untouchable.** No operation may name the marker.
+//! * **The marker is untouchable.** No operation may name the marker or a path inside it
+//!   ([`is_marker_path`]).
 //!
 //! # What each operation does
 //!
@@ -37,8 +38,8 @@ use thiserror::Error;
 
 use crate::{
     fixture::{
-        MARKER_FILE_NAME, NodeKind,
-        marker::{OwnershipError, verify_owned},
+        NodeKind,
+        marker::{OwnershipError, is_marker_path, verify_owned},
         path::RelPath,
         rng::{SplitMix64, derive_seed},
         sys::Dir,
@@ -85,7 +86,7 @@ pub enum MutateError {
         /// The rule it breaks.
         violation: PathViolation,
     },
-    /// The path names the ownership marker.
+    /// The path is the ownership marker, or lies inside it ([`is_marker_path`]).
     #[error("`{path}` is the ownership marker, which no mutation may touch")]
     Protected {
         /// The path as given.
@@ -153,12 +154,12 @@ pub fn apply(root: &Path, op: MutateOp, path: &str) -> Result<Mutation, MutateEr
         path: path.to_owned(),
         violation,
     })?;
-    let components: Vec<&str> = path.split('/').collect();
-    if components.first().copied() == Some(MARKER_FILE_NAME) {
+    if is_marker_path(path) {
         return Err(MutateError::Protected {
             path: path.to_owned(),
         });
     }
+    let components: Vec<&str> = path.split('/').collect();
     let (name, parents) = components
         .split_last()
         .ok_or_else(|| MutateError::NotFound {

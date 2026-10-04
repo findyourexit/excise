@@ -85,6 +85,35 @@ pub fn process_group_exists(pgid: u32) -> bool {
     unix_pid(pgid).is_some_and(|pid| process::test_kill_process_group(pid).is_ok())
 }
 
+/// Sends `SIGKILL` to the process `pid` alone, not to its group.
+///
+/// # Errors
+///
+/// Returns an error if `pid` is not a valid id or the call fails for a reason other than the
+/// process being gone.
+#[cfg(unix)]
+pub fn kill_process(pid: u32) -> io::Result<KillOutcome> {
+    use rustix::{io::Errno, process};
+
+    let target = unix_pid(pid)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process id"))?;
+    match process::kill_process(target, process::Signal::KILL) {
+        Ok(()) => Ok(KillOutcome::Killed),
+        Err(Errno::SRCH) => Ok(KillOutcome::AlreadyGone),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The id of the process group that the process `pid` belongs to, or `None` if there is no such
+/// process.
+#[cfg(unix)]
+#[must_use]
+pub fn process_group_of(pid: u32) -> Option<u32> {
+    let target = unix_pid(pid)?;
+    let group = rustix::process::getpgid(Some(target)).ok()?;
+    u32::try_from(rustix::process::Pid::as_raw(Some(group))).ok()
+}
+
 /// Delivers `signal` to the process `pid`.
 ///
 /// # Errors

@@ -1,0 +1,59 @@
+schema_version = 1
+name = "delete-file-slow-terminal"
+description = "On a terminal that takes a good part of a second to deliver a dialog, the delete step still reads the dialog from a screen that shows the frame the program drew for its Backspace, confirms only what it verified, and deletes exactly its target. The pseudo-terminal's drain is capped at 20000 bytes/sec, so the screen trails the program by far more than any quiet window a read could rely on; the step waits for the mark that follows each frame, which excise writes behind the frame's own bytes."
+fixture = "delete-file"
+sentinels = ["keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default"]
+tier = "full"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+drain_bytes_per_sec = 20000
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 90000
+
+[[steps]]
+step = "select"
+name = "victim.bin"
+timeout_ms = 90000
+
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+timeout_ms = 90000
+
+[[steps]]
+step = "wait_fs_absent"
+path = "victim.bin"
+timeout_ms = 90000
+
+# A quit before the map has caught up with the deletion cancels the replacement (exit code 130).
+[[steps]]
+step = "wait_refresh"
+timeout_ms = 90000
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
+absent = ["victim.bin"]
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["DELETE FILE"]
+
+[[steps]]
+step = "quit"
+timeout_ms = 90000
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
+timeout_ms = 90000

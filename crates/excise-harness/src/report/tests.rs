@@ -9,13 +9,21 @@ use super::{
     AbContext, AbFixture, AbKind, AbVerdict, BinaryIdentity, BuildIdentity, ConfidenceInterval,
     CountsCase, CountsContext, CountsFixture, CountsInvalid, CountsKind, CountsRunner, Document,
     FailedStep, FailureKind, FixtureIdentity, HarnessAb, HarnessCounts, HarnessFailure,
-    HarnessSummary, MAX_CASES, MAX_COUNT, MetricComparison, PullRequestOrigin, Rusage,
+    HarnessSummary, HarnessTui, MAX_CASES, MAX_COUNT, MetricComparison, PullRequestOrigin, Rusage,
     SCHEMA_VERSION, Samples, ScenarioResult, SchemaVersion, ScreenComparison, SessionDiagnostics,
     Side, SummaryKind, TerminalModes, Tier, TimingWarning, Verdict,
+    tui::{
+        BoxInfo, Cleanup, CloseResult, ConfirmationKind, Cursor, DeleteDialogInfo,
+        DeleteDialogKind, DeleteResult, DialogInfo, EventRecord, EventRecordKind, EventsPage,
+        EventsResult, ExitInfo, ExitVia, FilterInfo, FixtureChanges, FrameInfo, InputCounts,
+        KeysResult, ListResult, Modes, OpenResult, Rect, RefreshOutcomeKind, ScreenInfo,
+        ScreenResult, SelectedInfo, SentKey, SessionInfo, SessionState, Size, StaleSession,
+        TuiCommand, TuiError, TuiErrorKind, TuiResult,
+    },
 };
 use crate::{
     runner::is_latency,
-    scenario::{Budget, Expect, Profile},
+    scenario::{Budget, EntryKind, Expect, Profile},
 };
 
 const SHA256: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
@@ -415,6 +423,16 @@ fn cover(root: &Value, schema: &Value, at: &str, instance: &Value, coverage: &mu
             );
         }
     }
+    if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
+        // Only the branch the instance takes: a null takes the `null` branch and exercises no
+        // definition.
+        for branch in branches {
+            let is_null = branch.get("type").is_some_and(|kind| kind == "null");
+            if is_null == instance.is_null() {
+                cover(root, branch, &at, instance, coverage);
+            }
+        }
+    }
 }
 
 fn assert_schema_and_types_declare_the_same_fields<D: Document>(sample: &D) {
@@ -478,6 +496,7 @@ fn every_schema_is_draft_2020_12_and_compiles() {
     assert_schema_compiles::<HarnessFailure>();
     assert_schema_compiles::<HarnessAb>();
     assert_schema_compiles::<HarnessCounts>();
+    assert_schema_compiles::<HarnessTui>();
 }
 
 #[test]
@@ -486,6 +505,7 @@ fn every_schema_identity_matches_the_rust_constants() {
     assert_schema_identity::<HarnessFailure>();
     assert_schema_identity::<HarnessAb>();
     assert_schema_identity::<HarnessCounts>();
+    assert_schema_identity::<HarnessTui>();
     assert_eq!(SCHEMA_VERSION, 1);
 }
 
@@ -496,6 +516,7 @@ fn the_rust_marker_fields_serialize_the_document_constants() {
         (to_value(&failure()), HarnessFailure::KIND),
         (to_value(&ab()), HarnessAb::KIND),
         (to_value(&counts()), HarnessCounts::KIND),
+        (to_value(&tui_failure()), HarnessTui::KIND),
     ] {
         assert_eq!(document["document_kind"], kind);
         assert_eq!(document["schema_version"], SCHEMA_VERSION);
@@ -509,6 +530,7 @@ fn every_object_in_every_schema_rejects_undeclared_fields() {
         schema::<HarnessFailure>(),
         schema::<HarnessAb>(),
         schema::<HarnessCounts>(),
+        schema::<HarnessTui>(),
     ] {
         assert_objects_are_closed(&schema, "#");
     }
@@ -594,6 +616,48 @@ fn enumerations_match_between_schemas_and_types() {
             "/$defs/timing_warning/properties/budget/enum"
         ),
         names(&timing_budgets, Budget::as_str)
+    );
+    let tui = schema::<HarnessTui>();
+    let declared_commands: BTreeSet<String> = tui
+        .pointer("/properties/command/enum")
+        .and_then(Value::as_array)
+        .expect("the command is an enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        declared_commands,
+        names(TuiCommand::ALL, TuiCommand::as_str)
+    );
+    assert_eq!(declared(&tui, "/$defs/profile/enum"), profiles);
+    assert_eq!(
+        declared(&tui, "/$defs/error/properties/kind/enum"),
+        names(TuiErrorKind::ALL, TuiErrorKind::as_str)
+    );
+    assert_eq!(
+        declared(&tui, "/$defs/event_record/properties/kind/enum"),
+        names(EventRecordKind::ALL, EventRecordKind::as_str)
+    );
+    assert_eq!(
+        declared(&tui, "/$defs/exit/properties/via/enum"),
+        names(ExitVia::ALL, ExitVia::as_str)
+    );
+    assert_eq!(
+        declared(&tui, "/$defs/session_info/properties/state/enum"),
+        names(SessionState::ALL, SessionState::as_str)
+    );
+    assert_eq!(
+        declared(&tui, "/$defs/delete_dialog/properties/kind/enum"),
+        names(DeleteDialogKind::ALL, DeleteDialogKind::as_str)
+    );
+    assert_eq!(
+        declared(&tui, "/$defs/delete_dialog/properties/confirmation/enum"),
+        names(ConfirmationKind::ALL, ConfirmationKind::as_str)
+    );
+    assert_eq!(
+        declared(&tui, "/$defs/delete_result/properties/kind/enum"),
+        names(EntryKind::ALL, EntryKind::as_str)
     );
 }
 
@@ -1291,6 +1355,512 @@ fn counts_documents_that_are_not_this_kind_and_version_or_have_other_numbers_are
     ] {
         assert!(
             HarnessCounts::from_json_str(&malformed).is_err(),
+            "{malformed}"
+        );
+    }
+}
+
+const TUI_SESSION: &str = "0123abcd";
+
+fn tui_modes(restored: bool) -> Modes {
+    Modes {
+        alternate_screen: !restored,
+        cursor_visible: restored,
+        echo: Some(restored),
+        icanon: None,
+    }
+}
+
+/// A screen with every optional part present.
+fn tui_screen() -> ScreenInfo {
+    ScreenInfo {
+        size: Size {
+            cols: 120,
+            rows: 40,
+        },
+        cursor: Cursor { row: 39, col: 84 },
+        modes: tui_modes(false),
+        header_state: Some("COMPLETE".to_owned()),
+        selected: Some(SelectedInfo {
+            name: "victim.bin".to_owned(),
+            state: "◆ COMPLETE".to_owned(),
+            kind: "file".to_owned(),
+        }),
+        filter: Some(FilterInfo {
+            input: "vict".to_owned(),
+            error: Some("no match".to_owned()),
+        }),
+        dialog: Some(DialogInfo {
+            title: "! DELETE FILE".to_owned(),
+            rect: Rect {
+                left: 21,
+                top: 14,
+                right: 98,
+                bottom: 25,
+            },
+            text: "▟ ! DELETE FILE ▜\n▏ /tmp/x/victim.bin ▕".to_owned(),
+            delete: Some(DeleteDialogInfo {
+                kind: DeleteDialogKind::File,
+                path: "/tmp/x/victim.bin".to_owned(),
+                confirmation: ConfirmationKind::SingleKey,
+            }),
+        }),
+        boxes: vec![BoxInfo {
+            title: "STORAGE MAP".to_owned(),
+            rect: Rect {
+                left: 0,
+                top: 3,
+                right: 119,
+                bottom: 28,
+            },
+        }],
+        rows: vec![" EXCISE  /tmp/x/  ◆ COMPLETE".to_owned(), String::new()],
+    }
+}
+
+fn tui_record(index: u64, kind: EventRecordKind) -> EventRecord {
+    EventRecord {
+        index,
+        t_us: 1_000 * index,
+        kind,
+        version: None,
+        pid: None,
+        frame_marks: None,
+        input_barrier: None,
+        seq: None,
+        inputs: None,
+        barriers: None,
+        entries: None,
+        removed: None,
+        failed: None,
+        outcome: None,
+        code: None,
+    }
+}
+
+/// One record of every kind, so that every field of a record is serialized.
+fn tui_page() -> EventsPage {
+    EventsPage {
+        since: 0,
+        next: 8,
+        records: vec![
+            EventRecord {
+                version: Some("1.3.0".to_owned()),
+                pid: Some(87_432),
+                frame_marks: Some(true),
+                input_barrier: Some(true),
+                ..tui_record(0, EventRecordKind::Hello)
+            },
+            EventRecord {
+                seq: Some(1),
+                inputs: Some(0),
+                barriers: Some(0),
+                ..tui_record(1, EventRecordKind::Frame)
+            },
+            EventRecord {
+                entries: Some(6),
+                ..tui_record(2, EventRecordKind::ScanComplete)
+            },
+            EventRecord {
+                seq: Some(2),
+                inputs: Some(3),
+                barriers: Some(1),
+                ..tui_record(3, EventRecordKind::Frame)
+            },
+            tui_record(4, EventRecordKind::QuitPrompt),
+            EventRecord {
+                removed: Some(1),
+                failed: Some(0),
+                ..tui_record(5, EventRecordKind::DeletionFinished)
+            },
+            EventRecord {
+                outcome: Some(RefreshOutcomeKind::Published),
+                ..tui_record(6, EventRecordKind::RefreshFinished)
+            },
+            EventRecord {
+                code: Some(0),
+                ..tui_record(7, EventRecordKind::Exit)
+            },
+        ],
+    }
+}
+
+fn tui_exit() -> ExitInfo {
+    ExitInfo {
+        code: Some(0),
+        signal: None,
+        via: ExitVia::Quit,
+        terminal_restored: true,
+        modes: tui_modes(true),
+    }
+}
+
+fn tui_key(key: &str, bytes: &str) -> SentKey {
+    SentKey {
+        key: key.to_owned(),
+        bytes: bytes.to_owned(),
+    }
+}
+
+fn tui_session_info(supervisor_pid: Option<u64>, recording: Option<&str>) -> SessionInfo {
+    SessionInfo {
+        session: TUI_SESSION.to_owned(),
+        state: SessionState::Running,
+        fixture: "delete-file".to_owned(),
+        profile: Profile::Narrow,
+        size: Size { cols: 90, rows: 30 },
+        supervisor_pid,
+        started_at: "2026-10-04T09:37:11.248Z".to_owned(),
+        idle_timeout_ms: 900_000,
+        recording: recording.map(str::to_owned),
+    }
+}
+
+fn tui_success(session: Option<&str>, result: TuiResult) -> HarnessTui {
+    HarnessTui::success(session.map(str::to_owned), result)
+}
+
+fn tui_open() -> HarnessTui {
+    tui_success(
+        Some(TUI_SESSION),
+        TuiResult::Open(OpenResult {
+            fixture: "delete-file".to_owned(),
+            profile: Profile::Default,
+            size: Size {
+                cols: 120,
+                rows: 40,
+            },
+            root: "/tmp/xh-tui-0123abcd/delete-file-1-0".to_owned(),
+            session_dir: "target/excise-tui/0123abcd".to_owned(),
+            pid: 87_432,
+            supervisor_pid: 87_431,
+            idle_timeout_ms: 900_000,
+            recording: Some("target/excise-tui/0123abcd.cast".to_owned()),
+            screen: tui_screen(),
+            events: tui_page().digest(),
+        }),
+    )
+}
+
+fn tui_keys() -> HarnessTui {
+    tui_success(
+        Some(TUI_SESSION),
+        TuiResult::Keys(KeysResult {
+            sent: vec![tui_key("/", "2f"), tui_key("enter", "0d")],
+            settled: true,
+            frame: Some(FrameInfo { seq: 2, inputs: 3 }),
+            inputs: InputCounts {
+                sent: 3,
+                consumed: 3,
+            },
+            screen: tui_screen(),
+            events: tui_page().digest(),
+            exit: Some(tui_exit()),
+        }),
+    )
+}
+
+fn tui_delete() -> HarnessTui {
+    tui_success(
+        Some(TUI_SESSION),
+        TuiResult::Delete(DeleteResult {
+            name: "victim.bin".to_owned(),
+            kind: EntryKind::File,
+            dialog: tui_screen().dialog.expect("the sample screen has a dialog"),
+            sentinels_checked: 5,
+            removed: 1,
+            failed: 0,
+            fixture: FixtureChanges {
+                removed: 1,
+                unexpected: vec!["changed: keep-a.bin".to_owned()],
+            },
+            screen: tui_screen(),
+            events: tui_page().digest(),
+        }),
+    )
+}
+
+fn tui_close() -> HarnessTui {
+    tui_success(
+        Some(TUI_SESSION),
+        TuiResult::Close(CloseResult {
+            exit: tui_exit(),
+            screen: tui_screen(),
+            events: tui_page().digest(),
+            recording: Some("target/excise-tui/0123abcd.cast".to_owned()),
+            fixture: FixtureChanges {
+                removed: 1,
+                unexpected: Vec::new(),
+            },
+            residue: vec!["scratch/leftover".to_owned()],
+            cleanup: Cleanup {
+                removed: false,
+                problems: vec!["cannot remove the run copy: busy".to_owned()],
+            },
+        }),
+    )
+}
+
+fn tui_list() -> HarnessTui {
+    tui_success(
+        None,
+        TuiResult::List(ListResult {
+            sessions: vec![
+                tui_session_info(Some(87_431), Some("target/excise-tui/0123abcd.cast")),
+                SessionInfo {
+                    state: SessionState::Starting,
+                    ..tui_session_info(None, None)
+                },
+            ],
+            stale: vec![StaleSession {
+                session: "89abcdef".to_owned(),
+                reason: "its supervisor is gone".to_owned(),
+                fixture: Some("delete-file".to_owned()),
+                recording: Some("target/excise-tui/89abcdef.cast".to_owned()),
+                cleaned: false,
+                problems: vec!["cannot remove the run copy: busy".to_owned()],
+            }],
+        }),
+    )
+}
+
+/// A failure with every optional part present.
+fn tui_failure() -> HarnessTui {
+    HarnessTui::failure(
+        Some(TuiCommand::Delete),
+        Some(TUI_SESSION.to_owned()),
+        TuiError {
+            kind: TuiErrorKind::NotInView,
+            message: "`victim.bin` is not in the folder the session shows".to_owned(),
+            sent: Some(vec![tui_key("y", "79")]),
+            confirmed: Some(false),
+            screen: Some(Box::new(tui_screen())),
+            exit: Some(tui_exit()),
+        },
+    )
+}
+
+/// Every document the commands can print: one successful one for each command, and failures.
+fn tui_documents() -> Vec<HarnessTui> {
+    vec![
+        tui_open(),
+        tui_keys(),
+        tui_delete(),
+        tui_success(
+            Some(TUI_SESSION),
+            TuiResult::Screen(ScreenResult {
+                screen: tui_screen(),
+            }),
+        ),
+        // The command that returns every record, frames included.
+        tui_success(
+            Some(TUI_SESSION),
+            TuiResult::Events(EventsResult { events: tui_page() }),
+        ),
+        tui_close(),
+        tui_list(),
+        tui_failure(),
+        HarnessTui::failure(
+            None,
+            None,
+            TuiError::new(TuiErrorKind::Usage, "name a command"),
+        ),
+    ]
+}
+
+#[test]
+fn every_tui_document_validates_and_round_trips() {
+    for document in tui_documents() {
+        assert_valid(&document);
+        assert_round_trips(&document);
+    }
+}
+
+#[test]
+fn the_tui_schema_and_types_declare_exactly_the_same_fields() {
+    let root = schema::<HarnessTui>();
+    let mut coverage = Coverage::default();
+    for document in tui_documents() {
+        let value = to_value(&document);
+        cover(&root, &root, "", &value, &mut coverage);
+        if let Some(result) = value.get("result") {
+            let command = value["command"]
+                .as_str()
+                .expect("a successful document names its command");
+            let shape = serde_json::json!({ "$ref": format!("#/$defs/{command}_result") });
+            cover(&root, &shape, "", result, &mut coverage);
+        }
+    }
+
+    let never_serialized: Vec<_> = coverage.declared.difference(&coverage.seen).collect();
+    assert!(
+        never_serialized.is_empty(),
+        "harness-tui declares fields the types never serialize: {never_serialized:?}"
+    );
+    let defined: BTreeSet<String> = root["$defs"]
+        .as_object()
+        .expect("the schema has definitions")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        defined, coverage.definitions,
+        "harness-tui defines a shape that no serialized field uses"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table of the ways a document can drift from the schema, a row at a time"
+)]
+fn the_tui_schema_rejects_contract_drift() {
+    let frame =
+        || serde_json::json!({"index": 1, "t_us": 1, "kind": "frame", "seq": 1, "inputs": 0});
+    assert_rejected(
+        &tui_keys(),
+        &[
+            ("an undeclared top-level field", &|d| {
+                d["extra"] = true.into();
+            }),
+            ("an undeclared nested field", &|d| {
+                d["result"]["screen"]["extra"] = 1.into();
+            }),
+            ("a failed document that still has its result", &|d| {
+                d["ok"] = false.into();
+            }),
+            ("a result without its session", &|d| remove(d, "/session")),
+            (
+                "a session that is not eight lowercase hexadecimal digits",
+                &|d| {
+                    set(d, "/session", "ABCD1234".into());
+                },
+            ),
+            ("a result that is another command's", &|d| {
+                set(d, "/command", "screen".into());
+            }),
+            ("an unsupported schema version", &|d| {
+                set(d, "/schema_version", 2.into());
+            }),
+            ("a frame record among the digest's records", &|d| {
+                d["result"]["events"]["records"][0] = frame();
+            }),
+            ("a frame summary of no frames", &|d| {
+                set(d, "/result/events/frames/count", 0.into());
+            }),
+            ("a frame summary whose last record is not a frame", &|d| {
+                set(d, "/result/events/frames/last/kind", "exit".into());
+            }),
+            ("a digest without its frame summary", &|d| {
+                remove(d, "/result/events/frames");
+            }),
+            ("keys that are not hexadecimal bytes", &|d| {
+                set(d, "/result/sent/0/bytes", "ZZ".into());
+            }),
+            ("a successful document that names no command", &|d| {
+                set(d, "/command", Value::Null);
+            }),
+            ("a frame numbered zero", &|d| {
+                set(d, "/result/frame/seq", 0.into());
+            }),
+            ("an exit that has neither a code nor a signal", &|d| {
+                set(d, "/result/exit/code", Value::Null);
+            }),
+            ("an exit that has both a code and a signal", &|d| {
+                set(d, "/result/exit/signal", 9.into());
+            }),
+        ],
+    );
+    let events = tui_documents().remove(4);
+    assert_rejected(
+        &events,
+        &[
+            ("a page that carries a frame summary", &|d| {
+                d["result"]["events"]["frames"] = Value::Null;
+            }),
+            ("a frame record without its counters", &|d| {
+                remove(d, "/result/events/records/1/seq");
+            }),
+            ("a hello record that carries an exit code", &|d| {
+                d["result"]["events"]["records"][0]["code"] = 0.into();
+            }),
+            (
+                "a hello record that does not say whether the frames are marked",
+                &|d| {
+                    remove(d, "/result/events/records/0/frame_marks");
+                },
+            ),
+            ("a hello record whose frame marks are not a boolean", &|d| {
+                set(d, "/result/events/records/0/frame_marks", "yes".into());
+            }),
+            ("a frame record that carries frame marks", &|d| {
+                d["result"]["events"]["records"][1]["frame_marks"] = true.into();
+            }),
+            (
+                "a hello record that does not say whether the program answers the input barrier",
+                &|d| {
+                    remove(d, "/result/events/records/0/input_barrier");
+                },
+            ),
+            (
+                "a hello record whose input barrier is not a boolean",
+                &|d| {
+                    set(d, "/result/events/records/0/input_barrier", 1.into());
+                },
+            ),
+            ("a frame record that carries an input barrier", &|d| {
+                d["result"]["events"]["records"][1]["input_barrier"] = true.into();
+            }),
+            ("a frame record without its barrier count", &|d| {
+                remove(d, "/result/events/records/1/barriers");
+            }),
+            ("a hello record that carries a barrier count", &|d| {
+                d["result"]["events"]["records"][0]["barriers"] = 0.into();
+            }),
+            ("a frame record whose barrier count is negative", &|d| {
+                set(d, "/result/events/records/1/barriers", (-1).into());
+            }),
+            ("a frame record numbered zero", &|d| {
+                set(d, "/result/events/records/1/seq", 0.into());
+            }),
+        ],
+    );
+    assert_rejected(
+        &tui_list(),
+        &[("a list that names a session", &|d| {
+            d["session"] = TUI_SESSION.into();
+        })],
+    );
+    assert_rejected(
+        &tui_failure(),
+        &[
+            ("a failure without its error", &|d| remove(d, "/error")),
+            ("an error kind that is not one", &|d| {
+                set(d, "/error/kind", "mystery".into());
+            }),
+            ("a failure that also has a result", &|d| {
+                d["result"] = serde_json::json!({});
+            }),
+        ],
+    );
+}
+
+#[test]
+fn the_tui_reader_accepts_only_a_result_that_is_its_commands() {
+    let keys = tui_keys().to_json_pretty().expect("a document renders");
+    let failed = tui_failure().to_json_pretty().expect("a document renders");
+
+    assert!(HarnessTui::from_json_str(&keys).is_ok());
+    for malformed in [
+        keys.replace("\"command\": \"keys\"", "\"command\": \"screen\""),
+        keys.replace("\"settled\"", "\"unexpected\": 1,\n    \"settled\""),
+        keys.replace("\"schema_version\": 1", "\"schema_version\": 2"),
+        keys.replace("harness-tui", "harness-ab"),
+        failed.replace("\"ok\": false", "\"ok\": true"),
+        failed.replace("\"not_in_view\"", "\"mystery\""),
+    ] {
+        assert!(
+            HarnessTui::from_json_str(&malformed).is_err(),
             "{malformed}"
         );
     }
