@@ -9,7 +9,7 @@
 //! |---|---|
 //! | `first_frame_ms` | Spawn to the first `frame` event. |
 //! | `scan_complete_ms` | Spawn to the `scan_complete` event. |
-//! | `input_to_frame_p50_ms`, `input_to_frame_p99_ms`, `input_to_frame_max_ms` | Isolated input to the first frame that reflects it. |
+//! | `input_to_frame_p50_ms`, `input_to_frame_p99_ms`, `input_to_frame_max_ms` | Isolated input to the first frame that reflects it. The program's `inputs` counter can include inputs of its own, which the definition of a reflecting frame below takes out. |
 //! | `input_samples` | How many isolated inputs were timed. |
 //! | `max_stall_ms` | The longest gap between frames inside an active window. |
 //! | `quit_ms` | The quit confirmation to the exit of the process. |
@@ -31,7 +31,11 @@
 //!   reflects it. Typing a word fast queues its letters behind each other, and the wait of a
 //!   queued letter measures the burst, not the interface, so only isolated inputs are timed.
 //!   A frame reflects an input when the frame's `inputs` counter is at least the number of inputs
-//!   sent up to and including it and the frame was observed after the input was written.
+//!   sent up to and including it plus the input baseline, and the frame was observed after the
+//!   input was written. The baseline is the inputs the program had counted of its own when the
+//!   first input was written: on Windows `excise` receives `ConPTY`'s first window-size event
+//!   before any key is sent, so without it any frame drawn after a key, whatever drew it, would
+//!   answer the key.
 //! * **Active window.** From the first frame to `scan_complete`, and from each deletion
 //!   confirmation to its `deletion_finished`. Outside a window the program is allowed to be quiet;
 //!   idle output is its own budget.
@@ -111,6 +115,9 @@ pub struct InputRecord {
     pub at: Instant,
     /// The input events written so far, this one included.
     pub cumulative: u64,
+    /// The `inputs` counter at which a frame reflects this input: `cumulative` plus the inputs the
+    /// program had counted of its own when the first input was written.
+    pub counter: u64,
     /// Whether every earlier input already had a frame that reflected it.
     pub isolated: bool,
 }
@@ -148,11 +155,13 @@ impl Recorder {
         self.spawned_at
     }
 
-    /// Records an input event written at `at`; `cumulative` counts it.
-    pub fn record_input(&mut self, at: Instant, cumulative: u64, isolated: bool) {
+    /// Records an input event written at `at`: `cumulative` counts it, and a frame whose `inputs`
+    /// counter reaches `counter` reflects it.
+    pub fn record_input(&mut self, at: Instant, cumulative: u64, counter: u64, isolated: bool) {
         self.inputs.push(InputRecord {
             at,
             cumulative,
+            counter,
             isolated,
         });
     }
@@ -205,7 +214,7 @@ impl Recorder {
                         matches!(
                             event.payload,
                             Payload::Frame { inputs, .. }
-                                if inputs >= input.cumulative && event.observed >= input.at
+                                if inputs >= input.counter && event.observed >= input.at
                         )
                     })
                     .map(|frame| milliseconds(frame.observed.saturating_duration_since(input.at)))
@@ -467,8 +476,8 @@ mod tests {
     fn an_isolated_input_is_timed_to_the_first_frame_that_reflects_it() {
         let start = Instant::now();
         let mut recorder = Recorder::new(start);
-        recorder.record_input(start + Duration::from_millis(100), 1, true);
-        recorder.record_input(start + Duration::from_millis(300), 2, true);
+        recorder.record_input(start + Duration::from_millis(100), 1, 1, true);
+        recorder.record_input(start + Duration::from_millis(300), 2, 2, true);
         let events = [
             frame(start, 90, 1, 0),
             frame(start, 112, 2, 1),
@@ -483,12 +492,32 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_from_before_the_input_never_answers_it() {
-        // The counter says the input was consumed, but the frame was observed before it was written:
-        // the counter must have included an input the harness did not send.
+    fn an_input_is_timed_to_the_frame_that_counts_it_not_to_the_next_one() {
+        // The program counted one input of its own before the first key, so the frame that reflects
+        // the key counts 2. A frame drawn after the key was written that still counts 1, an
+        // animation tick say, is not its answer.
         let start = Instant::now();
         let mut recorder = Recorder::new(start);
-        recorder.record_input(start + Duration::from_millis(100), 1, true);
+        recorder.record_input(start + Duration::from_millis(100), 1, 2, true);
+        let events = [
+            frame(start, 90, 1, 1),
+            frame(start, 120, 2, 1),
+            frame(start, 300, 3, 2),
+        ];
+
+        let latencies = recorder.input_latencies(&events);
+
+        assert_eq!(latencies.len(), 1);
+        assert!((latencies[0] - 200.0).abs() < 1e-6, "{latencies:?}");
+    }
+
+    #[test]
+    fn a_frame_from_before_the_input_never_answers_it() {
+        // The counter has reached the input's before the input was written, so the program counted
+        // an input of its own after the baseline was taken: the frame cannot be the answer.
+        let start = Instant::now();
+        let mut recorder = Recorder::new(start);
+        recorder.record_input(start + Duration::from_millis(100), 1, 1, true);
         let events = [frame(start, 50, 1, 1), frame(start, 130, 2, 1)];
 
         let latencies = recorder.input_latencies(&events);
@@ -501,9 +530,9 @@ mod tests {
     fn queued_inputs_are_not_timed() {
         let start = Instant::now();
         let mut recorder = Recorder::new(start);
-        recorder.record_input(start + Duration::from_millis(100), 1, true);
-        recorder.record_input(start + Duration::from_millis(101), 2, false);
-        recorder.record_input(start + Duration::from_millis(102), 3, false);
+        recorder.record_input(start + Duration::from_millis(100), 1, 1, true);
+        recorder.record_input(start + Duration::from_millis(101), 2, 2, false);
+        recorder.record_input(start + Duration::from_millis(102), 3, 3, false);
         let events = [frame(start, 140, 1, 3)];
 
         let metrics = finish(&recorder, &events, start, 200);
@@ -517,7 +546,7 @@ mod tests {
     fn an_input_that_never_gets_a_frame_has_no_latency() {
         let start = Instant::now();
         let mut recorder = Recorder::new(start);
-        recorder.record_input(start + Duration::from_millis(100), 1, true);
+        recorder.record_input(start + Duration::from_millis(100), 1, 1, true);
 
         let metrics = finish(&recorder, &[frame(start, 50, 1, 0)], start, 200);
 
@@ -690,7 +719,7 @@ mod tests {
     fn every_metric_is_finite() {
         let start = Instant::now();
         let mut recorder = Recorder::new(start);
-        recorder.record_input(start, 1, true);
+        recorder.record_input(start, 1, 1, true);
         recorder.record_deletion_confirmed(start);
         let events = [
             frame(start, 0, 1, 1),

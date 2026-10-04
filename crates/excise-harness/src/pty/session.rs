@@ -22,6 +22,10 @@
 //!
 //! The child is a `ConPTY` process. It is ended with `TerminateProcess`, exits are found by polling,
 //! and the terminal's echo and canonical modes are unavailable. See `safety::process`.
+//!
+//! `ConPTY` also keeps its own copy of the screen and sends what changed on a timer, so output can
+//! reach the reader tens of milliseconds after the program wrote it. A step that waits for a frame
+//! event allows for that (`runner::exec::CONPTY_FRAME_WINDOW`).
 
 use std::{
     ffi::OsString,
@@ -524,7 +528,8 @@ impl PtySession {
     /// This bridges the gap between an event `excise` reports and the bytes of the frame it
     /// describes, which travel by a different route: the event file is readable before the reader
     /// thread has delivered the screen bytes. It is a bounded tail after a semantic condition,
-    /// never a wait for an idle screen.
+    /// never a wait for an idle screen. A terminal that can hold a frame back for longer than this
+    /// tail reads (`ConPTY`) is waited for first: see `runner::exec::CONPTY_FRAME_WINDOW`.
     ///
     /// # Errors
     ///

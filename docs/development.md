@@ -108,7 +108,9 @@ Protocol version 1 objects start with `v` (always `1`) and `kind`, and end with 
 | `deletion_finished` | `removed`, `failed` | A deletion worker reported. The counts come from its report. |
 | `exit` | `code` | An interactive run is about to return its exit code. The terminal, if it was entered, has already been restored, unless it never absorbed the restoration output within a bounded wait. A process that panics or is killed emits none. |
 
-An event marks a state change, not the screen that shows it. Wait for the next `frame` before reading the terminal.
+An event marks a state change, not the screen that shows it. Wait for the next `frame` before reading the terminal, and then keep reading the output for a while: a `frame` is reported once the frame is handed to the thread that writes to the terminal, and the terminal can still hold the bytes back. A Unix pseudo-terminal delivers them within a thread switch. Windows `ConPTY` paints on its own schedule and delivered frames up to 22 ms after their event in the recordings that the harness README (`crates/excise-harness/README.md`) cites under `settle`, so the harness reads for 100 ms there.
+
+`inputs` counts every input event the main loop consumed, including ones the terminal sends by itself, so it can be above zero before any key is sent: in recordings from Windows it was already 1 in the first frames, and on macOS it was 0. A reader that matches a frame to a key takes the `inputs` of the latest frame when it sends its first key as a baseline, and looks for a frame whose `inputs` is at least that baseline plus the keys sent. The validation harness does, and so does `tests/pty_smoke.rs`.
 
 A headless run (`--format json` or `--format table`) opens the channel and writes only its `hello` line.
 

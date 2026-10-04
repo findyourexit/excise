@@ -14,11 +14,23 @@
 //! # Inputs and frames
 //!
 //! The event channel's `frame` event carries `inputs`, the number of terminal input events the
-//! program had consumed when it drew that frame. The executor counts every input event it writes.
-//! A frame *reflects* the inputs sent so far when its counter is at least that count and it was
-//! observed after the last input was written. Waiting for such a frame is what `settle` means, and
-//! it is how a step knows that the screen it is about to read shows the effect of a key and not the
-//! moment before it.
+//! program had consumed when it drew that frame. The executor counts every input event it writes,
+//! but the program may have counted some of its own before the first: `excise` on Windows counts
+//! one before any key is sent. So the executor takes the `inputs` of the latest frame, or 0 before
+//! the first, when it writes the first input, and calls it the input baseline. A frame *reflects*
+//! the inputs sent so far when its counter is at least the baseline plus their number and it was
+//! observed after the last input was written. An input that the program counts of its own only
+//! after the first one was written is not accounted for. Waiting for such a frame is what `settle`
+//! means, and it is how a step knows that the screen it is about to read shows the effect of a key
+//! and not the moment before it.
+//!
+//! # Catching up with a frame
+//!
+//! A `frame` event says that the program drew, not that the drawing has reached the screen model:
+//! the event arrives through a file, the screen through the terminal. A step that ends on a frame
+//! event (`settle`, `delete`, `resize`) therefore keeps reading the terminal for a while before it
+//! returns (`Executor::catch_up`, in the `steps` module), so that the step after it can read the
+//! screen once. How long depends on the terminal: see [`FRAME_WINDOW`].
 
 use std::{
     collections::BTreeMap,
@@ -45,6 +57,28 @@ pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(1);
 pub(super) const FS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// How often the run's scan-store directory is sampled for its peak size.
 pub(super) const STORE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+/// How long `ConPTY` can hold a frame's output back after the program has reported the frame.
+///
+/// `ConPTY` is a renderer, not a pipe: it keeps its own copy of the screen and sends what changed
+/// in paints that are typically 16 ms apart, so a frame that is drawn soon after a paint waits for
+/// the next one. In the recordings of failed runs on GitHub-hosted Windows runners, 30 isolated
+/// frames reached the harness 4 to 22 ms after the program reported them (median 12.5 ms), and the
+/// gaps between 188 paints of a console that was being redrawn had a median of 15.6 ms and a 99th
+/// percentile of 23 ms; the longest, 54 ms, came while the program was starting. These are upper
+/// bounds, because the program's clock and the recording's differ by an offset that only the
+/// moments the keys were sent bound. 100 ms is more than four times the longest delay once the
+/// program was running, and about twice the longest of all.
+pub(super) const CONPTY_FRAME_WINDOW: Duration = Duration::from_millis(100);
+/// How long a step that waited for a frame event keeps reading the terminal before it trusts the
+/// screen: `ConPTY`'s window on Windows, none elsewhere. The program hands a frame to its writer
+/// thread before it reports the frame, and a Unix pseudo-terminal passes bytes on as they are
+/// written, so the frame is at most a thread switch behind its event, which the bounded tail in
+/// `Executor::catch_up` covers.
+pub(super) const FRAME_WINDOW: Duration = if cfg!(windows) {
+    CONPTY_FRAME_WINDOW
+} else {
+    Duration::ZERO
+};
 
 /// How a bounded wait ended.
 #[derive(Debug)]
@@ -69,6 +103,13 @@ pub(crate) struct Executor<'a> {
     /// Terminal input events written so far.
     pub(super) inputs_sent: u64,
     pub(super) last_input_at: Option<Instant>,
+    /// The `inputs` the program had counted when the first input was written: inputs of its own,
+    /// which the executor did not send. `None` until that moment. A frame that reflects the inputs
+    /// sent counts them on top of this baseline.
+    pub(super) input_baseline: Option<u64>,
+    /// How long `catch_up` reads the terminal after a frame event, before its bounded tail. A field
+    /// so that a test can give a Unix terminal the delay `ConPTY` has.
+    pub(super) frame_window: Duration,
     /// Fixture-relative paths of deletions that were confirmed.
     pub(super) intended_deletions: Vec<String>,
     /// Fixture-relative paths that `fs_mutate` steps changed.
@@ -106,6 +147,8 @@ impl<'a> Executor<'a> {
             recorder,
             inputs_sent: 0,
             last_input_at: None,
+            input_baseline: None,
+            frame_window: FRAME_WINDOW,
             intended_deletions: Vec::new(),
             intended_mutations: Vec::new(),
             residue_files: None,
@@ -227,11 +270,28 @@ impl<'a> Executor<'a> {
     /// Writes one terminal input event and records it.
     pub(super) fn send_input(&mut self, bytes: &[u8]) -> Result<Instant, Stop> {
         let isolated = self.frame_reflecting_inputs().is_some();
+        self.take_input_baseline();
         self.inputs_sent += 1;
         let at = self.session.send(bytes)?;
         self.last_input_at = Some(at);
-        self.recorder.record_input(at, self.inputs_sent, isolated);
+        self.recorder
+            .record_input(at, self.inputs_sent, self.reflecting_counter(), isolated);
         Ok(at)
+    }
+
+    /// Fixes the input baseline when the first input is about to be written, and leaves it alone
+    /// afterwards: the `inputs` of the latest frame, or 0 before the first frame. A program may
+    /// count inputs of its own before it is sent any, and a counter that includes them must not be
+    /// taken for one that includes the first key.
+    pub(super) fn take_input_baseline(&mut self) {
+        if self.input_baseline.is_none() {
+            self.input_baseline = Some(self.latest_frame_inputs());
+        }
+    }
+
+    /// The `inputs` counter at which a frame reflects every input sent so far.
+    pub(super) fn reflecting_counter(&self) -> u64 {
+        self.input_baseline.unwrap_or(0) + self.inputs_sent
     }
 
     /// The latest frame, if it reflects every input sent so far.
@@ -245,8 +305,9 @@ impl<'a> Executor<'a> {
         let Payload::Frame { inputs, .. } = frame.payload else {
             return None;
         };
-        (inputs >= self.inputs_sent && self.last_input_at.is_none_or(|sent| frame.observed >= sent))
-            .then_some(frame)
+        (inputs >= self.reflecting_counter()
+            && self.last_input_at.is_none_or(|sent| frame.observed >= sent))
+        .then_some(frame)
     }
 
     /// The `inputs` counter of the latest frame, or 0 before the first one.
@@ -260,6 +321,13 @@ impl<'a> Executor<'a> {
                 _ => None,
             })
             .unwrap_or(0)
+    }
+
+    /// How many of the inputs sent the latest frame counts: its `inputs` counter less the
+    /// program's own inputs (the baseline), or 0 before the first frame.
+    pub(super) fn latest_frame_inputs_sent(&self) -> u64 {
+        self.latest_frame_inputs()
+            .saturating_sub(self.input_baseline.unwrap_or(0))
     }
 
     /// A summary of the events read so far, for failure messages.

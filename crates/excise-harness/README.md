@@ -284,7 +284,9 @@ Details that a table cannot carry:
   `{ eq = n }`, `{ min = n }`, or `{ max = n }` with exactly one key. The fields an event carries
   are `frame`: `seq`, `inputs`; `scan_complete`: `entries`; `deletion_finished`: `removed`,
   `failed`; and `exit`: `code`. Every event also carries `t_us`, the microseconds since the channel
-  opened. Testing a field the event does not carry is a validation error.
+  opened. Testing a field the event does not carry is a validation error. A `frame`'s `inputs` is
+  the program's own count, which can include inputs the runner did not send (see [Runner
+  semantics](#runner-semantics)), so a test on it reads the program's number, not the runner's.
 - **`signal`.** `term`, `hup`, `quit`, and `int` are Unix signals; `close` and `break` are Windows
   console events. `close` closes the pseudo console, which Windows delivers to every attached
   process as `CTRL_CLOSE_EVENT`; this needs no unsafe call, so the runner can deliver it. `break`
@@ -351,6 +353,19 @@ Details that a table cannot carry:
   barrier and waits on semantic signals only: events, header state, and frame counts. Because the
   barrier drains work outside the production scheduling path, scheduling and throughput are judged
   only by the pseudo-terminal and headless runners.
+- **Frames reflect inputs.** The runner counts the input events it writes, and a `frame` event
+  carries `inputs`, the number of input events the program had consumed when it drew that frame.
+  The program may have counted some the runner did not send before the first: on Windows `excise`
+  receives `ConPTY`'s first window-size event before any key is sent, so `inputs` is already 1 in
+  its first frames, where on macOS it is 0. The runner therefore takes the `inputs` of the latest
+  frame, or 0 before the first, when it writes its first input, and calls it the input baseline. A
+  frame reflects the inputs sent so far when its counter is at least the baseline plus their number
+  and it was observed after the last one was written. `settle`, every other step that waits for a
+  frame, and the `input_to_frame_*` metrics use that rule. Without the baseline, on Windows a frame
+  drawn after a key by anything else (an animation tick, say) would count as the key's answer: a
+  `settle` could return before the program had handled the key, and the latency of a key was the
+  time to the next frame. An input that the program counts of its own only after the first one was
+  written is not accounted for.
 - **Bounds.** Every wait is bounded. When a bound elapses the runner kills the process group,
   writes a failure bundle, and leaves nothing behind. A step that times out also reports the
   session's diagnostics in its failure detail and in the bundle's `screen.txt`: how many output
@@ -463,19 +478,28 @@ checks that directly.
 
 **Steps.**
 
-- **`settle`** waits for a `frame` event whose `inputs` counter is at least the number of input
-  events the runner has sent and that was observed after the last one was written. It then reads
-  the terminal output still in flight (at most 20 ms, ending after 3 ms of quiet) so that the
-  screen model has caught up with the frame. A key that changes nothing draws no frame and never
-  settles.
+- **`settle`** waits for a `frame` event that reflects every input event the runner has sent, as
+  defined under [Runner semantics](#runner-semantics). It then reads the terminal output still in
+  flight, so that the screen model has caught up with the frame and the step after it can read the
+  screen once. On Unix it reads until the output has been quiet for 3 ms, for at most 20 ms. On
+  Windows it first reads for 100 ms and then does the same, because the event says that the
+  program drew, not that the drawing has arrived: `ConPTY` keeps its own copy of the screen and
+  sends what changed in paints that are typically 16 ms apart, so a frame drawn soon after a paint
+  reaches the harness late. In the recordings of failed runs on GitHub-hosted Windows runners, 30
+  isolated frames arrived 4 to 22 ms after their event (median 12.5 ms), and the gaps between the
+  paints of a console that was being redrawn were 15.6 ms at the median, 23 ms at the 99th
+  percentile, and 54 ms at most, while the program was starting. The delays are upper bounds,
+  because the program's clock and the recording's differ by an offset that only the moments the
+  keys were sent bound. A key that changes nothing draws no frame and never settles.
 - **`select`** opens the filter with `/`, erases any text it opened with, types the name, checks
   the prompt, presses Enter, and waits until the inspector pane shows exactly that name.
 - **`delete`** presses Backspace and reads the dialog. It presses `y` only when the dialog names
   exactly the requested entry, kind, and path and every sentinel exists. Any mismatch fails the
   step and no `y` is ever sent. `wait_for = "finished"` (the default) ends the step when the
-  `deletion_finished` event and the first frame after it have been read, so the screen shows the
-  result. `wait_for = "started"` ends it as soon as a frame shows the dialog has closed, without
-  waiting for the deletion itself: the deletion keeps running after the step returns, so a step
+  `deletion_finished` event and the first frame after it have been read and the output in flight
+  has been read as after `settle`, so the screen shows the result. `wait_for = "started"` ends it
+  as soon as a frame shows the dialog has closed, without waiting for the deletion itself: the
+  deletion keeps running after the step returns, so a step
   that needs its outcome waits for that separately (`wait_fs_absent`, `wait_event`). The program
   rebuilds its map after a deletion and treats a quit during the rebuild as a cancellation (exit
   code 130): a scenario that goes on to quit after a `"finished"` delete waits for the header to
@@ -483,7 +507,8 @@ checks that directly.
   itself (`wait_fs_absent`, then `wait_event { event = "deletion_finished" }`, then a frame after
   it), since the step returned before any of that happened.
 - **`quit`** presses `q`, waits for the quit dialog, and confirms with `y`.
-- **`resize`** resizes the terminal and waits for the frame that answers it.
+- **`resize`** resizes the terminal and waits for the frame that answers it, then reads the output
+  in flight as `settle` does.
 - **`wait_event`** matches any event read so far, including events before the step began.
 - **`expect_exit`** also compares the fixture with its state before the run: only confirmed
   deletions may differ, and only by removal. A confirmed deletion excuses a removal anywhere at or
@@ -519,7 +544,7 @@ run summary use the same names.
 | Metric | Meaning |
 |---|---|
 | `first_frame_ms`, `scan_complete_ms` | Spawn to the first `frame` event, and to `scan_complete`. `run_e2e` launches the binary once with `--version` before its first run, in an isolated environment with a 10 s limit, so the first measured session does not include the one-time code-signature assessment that macOS applies to a new binary (over 300 ms on its first launch against 5 to 8 ms afterwards). A warm-up that fails or times out stops the matrix with an error. |
-| `input_to_frame_p50_ms`, `input_to_frame_p99_ms`, `input_to_frame_max_ms`, `input_samples` | For each key written while the previous one had been answered: the write to the first frame that reflects it. |
+| `input_to_frame_p50_ms`, `input_to_frame_p99_ms`, `input_to_frame_max_ms`, `input_samples` | For each key written while the previous one had been answered: the write to the first frame that reflects it, as defined under [Runner semantics](#runner-semantics): its `inputs` counter, less the inputs the program counted of its own before the first key, covers the key. |
 | `max_stall_ms` | The longest gap between two frames inside a window in which the program was active (scanning, or working on a deletion or an input). |
 | `quit_ms`, `delete_ms` | The confirmation key to the exit of the process, and to `deletion_finished`. |
 | `output_bytes`, `output_bytes_per_s`, `frames`, `inputs_sent` | Terminal output and its rate, frames drawn, and input events sent. |

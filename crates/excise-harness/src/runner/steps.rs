@@ -30,7 +30,8 @@ use super::{
 const BACKSPACE: [u8; 1] = [0x7f];
 /// The bytes of an Enter key press.
 const ENTER: [u8; 1] = *b"\r";
-/// After a `settle`, output already in flight is read until it has been quiet this long...
+/// After the frame window (`Executor::catch_up`), output that is still arriving is read until it
+/// has been quiet this long...
 const SETTLE_QUIET: std::time::Duration = std::time::Duration::from_millis(3);
 /// ...or this long has passed.
 const SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_millis(20);
@@ -439,10 +440,7 @@ impl Executor<'_> {
                 .then_some(())
         })?;
         match shown {
-            Waited::Ready(()) => {
-                self.session.drain(SETTLE_QUIET, SETTLE_LIMIT)?;
-                self.pump()
-            }
+            Waited::Ready(()) => self.catch_up(),
             other => Err(self.unmet(
                 index,
                 &other,
@@ -502,9 +500,11 @@ impl Executor<'_> {
         }
     }
 
-    /// Resizes the terminal and waits for the frame that answers it. A resize reaches the program
-    /// as an input event, so the frame's counter tells when the program has laid itself out again.
+    /// Resizes the terminal and waits for the frame that answers it, then catches up with its
+    /// output (`catch_up`). A resize reaches the program as an input event, so the frame's counter
+    /// tells when the program has laid itself out again.
     fn resize(&mut self, index: usize, step: Resize) -> Result<(), Stop> {
+        self.take_input_baseline();
         let at = self.session.resize(step.cols, step.rows)?;
         self.inputs_sent += 1;
         self.last_input_at = Some(at);
@@ -515,8 +515,8 @@ impl Executor<'_> {
             Waited::Ready(()) => {
                 // The program counts the events it really received. Two resizes in a row can reach
                 // it as one, so believe the frame over our own count.
-                self.inputs_sent = self.inputs_sent.max(self.latest_frame_inputs());
-                Ok(())
+                self.inputs_sent = self.inputs_sent.max(self.latest_frame_inputs_sent());
+                self.catch_up()
             }
             other => Err(self.unmet(
                 index,
@@ -790,8 +790,22 @@ impl Executor<'_> {
         )
     }
 
-    /// Waits until the program has drawn a frame that reflects every input sent so far, then reads
-    /// the output that is still in flight.
+    /// Reads the output of the frame the last wait saw, until the screen model shows it.
+    ///
+    /// Every step that ends on a frame event (`settle`, `delete`, `resize`) ends here, which is
+    /// what lets the step after it read the screen once. The event says that the program drew; the
+    /// terminal still has to deliver what it drew. The terminal may hold the frame back for the
+    /// whole of `frame_window`, so that long is read first, with the events and the session still
+    /// polled. Then comes the bounded tail: output that is still arriving is read until it has
+    /// been quiet for [`SETTLE_QUIET`], but for no longer than [`SETTLE_LIMIT`].
+    fn catch_up(&mut self) -> Result<(), Stop> {
+        self.wait_quietly(self.frame_window)?;
+        self.session.drain(SETTLE_QUIET, SETTLE_LIMIT)?;
+        self.pump()
+    }
+
+    /// Waits until the program has drawn a frame that reflects every input sent so far, then
+    /// catches up with its output (`catch_up`).
     ///
     /// This is the pseudo-terminal meaning of `settle`. It never waits for the screen to go
     /// quiet: a program that keeps animating settles as soon as its frame counter catches up. A
@@ -801,10 +815,7 @@ impl Executor<'_> {
             exec.frame_reflecting_inputs().map(|_| ())
         })?;
         match waited {
-            Waited::Ready(()) => {
-                self.session.drain(SETTLE_QUIET, SETTLE_LIMIT)?;
-                self.pump()
-            }
+            Waited::Ready(()) => self.catch_up(),
             other => Err(self.unmet(
                 index,
                 &other,
@@ -812,8 +823,11 @@ impl Executor<'_> {
                 step.timeout_ms,
                 || {
                     format!(
-                        "the latest frame counted {} inputs; {}",
+                        "the latest frame counted {} inputs, and a frame that reflects all {} \
+                         sent counts {}; {}",
                         self.latest_frame_inputs(),
+                        self.inputs_sent,
+                        self.reflecting_counter(),
                         self.events_summary()
                     )
                 },
@@ -901,3 +915,6 @@ fn on_off(mode: Option<bool>) -> &'static str {
         None => "unknown",
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests;
