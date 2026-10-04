@@ -53,6 +53,10 @@
 //! * **`idle`** sends nothing, waits `after_ms`, then measures over `window_ms` the terminal
 //!   output bytes and the child's live CPU time (`metrics::live_cpu_ms`, not sampled on Windows),
 //!   recording them as `idle_output_bytes` and `idle_cpu_ms`.
+//! * **`expect_budget`** compares a recorded metric with its budget's limit: the scenario's
+//!   override, else the default. A run's [`LatencyScale`] multiplies the limits of the four
+//!   latency budgets (`input_to_frame_p99_ms`, `max_stall_ms`, `first_frame_ms`, `quit_ms`) and of
+//!   no other budget. A scenario that is expected to fail on the platform keeps the strict limits.
 //! * A step's `timeout_ms` bounds the whole step, not each wait inside it.
 //!
 //! # Profiles
@@ -74,7 +78,7 @@ mod steps;
 mod verdict;
 mod work;
 
-pub use budget::{default_limit, limit_for};
+pub use budget::{InvalidLatencyScale, LatencyScale, default_limit, is_latency, limit_for};
 pub use e2e::{
     E2eError, E2eOptions, E2eReport, RunRecord, SkippedScenario, load_scenarios, run_e2e,
 };

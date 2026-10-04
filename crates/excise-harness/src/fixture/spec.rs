@@ -44,8 +44,9 @@ use crate::{
 /// The only spec `schema_version` this crate reads.
 pub const SPEC_SCHEMA_VERSION: u32 = 1;
 
-/// The most entries one spec may plan. Larger fixtures need a generator that streams its plan.
-pub const MAX_ENTRIES: u64 = 2_000_000;
+/// The most entries one spec may plan. The plan is held in memory, so a fixture much larger than
+/// the weekly tier's `tiny-files-10m` (10,010,101 entries) needs a generator that streams its plan.
+pub const MAX_ENTRIES: u64 = 10_100_000;
 
 /// The largest dense (fully written) file a spec may ask for: 1 GiB.
 pub const MAX_DENSE_FILE_BYTES: u64 = 1 << 30;

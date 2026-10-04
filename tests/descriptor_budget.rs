@@ -81,6 +81,7 @@ fn a_256_descriptor_limit_still_completes_a_large_scan() {
             git_sha: "0".repeat(40),
             privileged: None,
             expectations: Expectations::bundled().expect("the shipped expectations are valid"),
+            timing_informational: false,
         },
         |_| {},
     )

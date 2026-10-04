@@ -10,6 +10,7 @@ use crate::{
         DialogView, FilterPrompt, Inspector, dialog_view, filter_prompt, header_state, inspector,
         offers_plain_quit,
     },
+    report::TimingWarning,
     safety::{FixtureSnapshot, send_signal},
     scenario::{
         DEFAULT_TIMEOUT_MS, Delete, DeleteWait, ExpectBudget, ExpectExit, ExpectFs, ExpectScreen,
@@ -19,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    budget::limit_for,
+    budget::{is_latency, limit_for},
     delete::verify,
     exec::{Executor, FS_POLL_INTERVAL, Waited},
     outcome::{FailureCause, RunError, Stop},
@@ -701,13 +702,26 @@ impl Executor<'_> {
         ))
     }
 
+    /// Holds a recorded metric to its budget's limit. A missed latency budget fails the step,
+    /// unless the run holds timing informational: then the miss is recorded as a warning and the
+    /// step passes. Every other budget, and a metric that was not recorded, fails the step either
+    /// way.
     fn expect_budget(&mut self, index: usize, step: &ExpectBudget) -> Result<(), Stop> {
         self.pump()?;
         let metrics = self.metrics();
-        let Some(limit) = limit_for(self.scenario, step.budget) else {
+        let Some(limit) = limit_for(self.scenario, step.budget, self.latency_scale) else {
             return Err(Self::unprepared(index, "expect_budget"));
         };
-        let expected = format!("`{}` to be at most {limit} ({})", step.metric, step.budget);
+        let basis = if is_latency(step.budget) && !self.latency_scale.is_strict() {
+            format!(
+                "{}, the strict limit scaled by {}",
+                step.budget,
+                self.latency_scale.factor()
+            )
+        } else {
+            step.budget.to_string()
+        };
+        let expected = format!("`{}` to be at most {limit} ({basis})", step.metric);
         let Some(value) = metrics.get(&step.metric) else {
             let recorded: Vec<&str> = metrics.keys().map(String::as_str).collect();
             return Err(self.fail(
@@ -718,15 +732,25 @@ impl Executor<'_> {
             ));
         };
         if *value <= limit {
-            Ok(())
-        } else {
-            Err(self.fail(
-                index,
-                FailureCause::Mismatch,
-                expected,
-                format!("`{}` is {value}", step.metric),
-            ))
+            return Ok(());
         }
+        if self.timing_informational && is_latency(step.budget) {
+            // The run measures timing and does not gate on it: the miss is a warning, and the
+            // scenario goes on to its other steps, whose failures still fail it.
+            self.timing_warnings.push(TimingWarning {
+                budget: step.budget,
+                metric: step.metric.clone(),
+                value: *value,
+                limit,
+            });
+            return Ok(());
+        }
+        Err(self.fail(
+            index,
+            FailureCause::Mismatch,
+            expected,
+            format!("`{}` is {value}", step.metric),
+        ))
     }
 
     fn measure(&mut self, step: &Measure) {

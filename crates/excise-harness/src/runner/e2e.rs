@@ -14,6 +14,23 @@
 //! tier also limits the *profiles* that run: the two profiles every lifecycle scenario must pass
 //! under (`default` and `deterministic`); `--full` and `--nightly` run every profile a scenario
 //! declares. A scenario is selected for a profile only if it declares that profile.
+//!
+//! # Latency scale
+//!
+//! [`E2eOptions::latency_scale`] multiplies the limits of the latency budgets in every run of the
+//! matrix (see [`LatencyScale`]): pull-request CI holds them to twice their strict value. A scaled
+//! matrix says so: the summary carries `latency_budget_scale`, and the verdict table's last line
+//! names the factor. A strict matrix writes neither.
+//!
+//! # Informational timing
+//!
+//! [`E2eOptions::timing_informational`] makes the matrix report a latency budget that a scenario
+//! misses instead of failing on it, for a hosted machine that is slower than the one the budgets
+//! were set on. The miss is a warning: the run's [`RunReport::timing_warnings`] and its result in
+//! the summary hold it, the summary says `timing_informational`, and the verdict table lists it
+//! and counts it on its last line. It is not a blocking verdict. Every other check still fails the
+//! scenario (the other budgets, a wait that times out, a step that fails, residue), and a scenario
+//! that is expected to fail on the platform keeps its strict verdict.
 
 use std::{
     collections::BTreeMap,
@@ -31,7 +48,7 @@ use crate::{
     fixture::{Fixtures, PRIVILEGED_ENV, PrivilegedOptIn, RunCopy},
     report::{
         BinaryIdentity, Document, HarnessSummary, ScenarioResult, SchemaVersion, SummaryKind, Tier,
-        Verdict,
+        TimingWarning, Verdict,
     },
     run_support::{
         compact_utc, format_ms, host_name, median, point_latest_at, render_rows, rfc3339,
@@ -42,6 +59,7 @@ use crate::{
 };
 
 use super::{
+    budget::LatencyScale,
     run::{RunReport, RunRequest, resolve_binary, run_scenario},
     work::work_base,
 };
@@ -95,6 +113,12 @@ pub struct E2eOptions {
     pub work_dir: Option<PathBuf>,
     /// The 40-character commit the binary was built from.
     pub git_sha: String,
+    /// The factor every scenario's latency budgets are multiplied by (see [`LatencyScale`]). A
+    /// scale other than [`LatencyScale::STRICT`] is recorded in the summary.
+    pub latency_scale: LatencyScale,
+    /// Whether a latency budget that a scenario misses is reported as a warning and does not fail
+    /// the run (see [`RunRequest::timing_informational`]). The summary says so.
+    pub timing_informational: bool,
 }
 
 /// The matrix could not be run.
@@ -454,6 +478,9 @@ pub fn run_e2e(
             )))?,
         },
         git_sha: options.git_sha.clone(),
+        latency_budget_scale: (!options.latency_scale.is_strict())
+            .then(|| options.latency_scale.factor()),
+        timing_informational: options.timing_informational,
         scenarios: records.iter().map(result_of).collect(),
     };
     let summary_path = run_dir.join("summary.json");
@@ -517,6 +544,8 @@ fn run_one(
         repro_command: &repro,
         fixture_seed: fixture.plan().spec().seed,
         keep_scratch: options.keep_fixture,
+        latency_scale: options.latency_scale,
+        timing_informational: options.timing_informational,
     });
     let kept_workspace = if options.keep_fixture {
         let _ = fixture.keep();
@@ -600,6 +629,7 @@ fn failed_to_start(
             bundle: None,
             kept_scratch: None,
             fixture_digest: String::new(),
+            timing_warnings: Vec::new(),
         },
         kept_workspace: None,
     }
@@ -617,6 +647,7 @@ fn result_of(record: &RunRecord) -> ScenarioResult {
             .bundle
             .as_ref()
             .map(|bundle| bundle.display().to_string()),
+        timing_warnings: report.timing_warnings.clone(),
     }
 }
 
@@ -624,21 +655,36 @@ fn result_of(record: &RunRecord) -> ScenarioResult {
 // The verdict table.
 
 impl E2eReport {
-    /// The verdict table: one line per scenario and profile, then one block per blocking run, then
-    /// the overall verdict.
+    /// The verdict table: one line per scenario and profile, then one block per blocking run and
+    /// one line per timing warning, then the overall verdict.
     #[must_use]
     pub fn table(&self) -> String {
         let mut table = render_rows(&self.summary_rows());
         self.write_skipped(&mut table);
         self.write_blocking_runs(&mut table);
+        self.write_timing_warnings(&mut table);
         let blocking = self
             .records
             .iter()
             .filter(|record| record.report.verdict.blocks_run())
             .count();
+        let scale = self
+            .summary
+            .latency_budget_scale
+            .map_or_else(String::new, |factor| {
+                format!("; latency budgets at {factor}x their strict limits")
+            });
+        let timing = if self.summary.timing_informational {
+            format!(
+                "; timing informational: {} warning(s)",
+                self.timing_warnings().count()
+            )
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             table,
-            "\ne2e {}: {} run(s), {blocking} blocking; summary: {}",
+            "\ne2e {}: {} run(s), {blocking} blocking{scale}{timing}; summary: {}",
             if blocking == 0 { "ok" } else { "FAILED" },
             self.records.len(),
             self.summary_path.display()
@@ -650,6 +696,29 @@ impl E2eReport {
     fn write_skipped(&self, table: &mut String) {
         for skipped in &self.skipped {
             let _ = writeln!(table, "\nSKIP {}: {}", skipped.name, skipped.reason);
+        }
+    }
+
+    /// Every timing warning of every run, with the run it belongs to.
+    fn timing_warnings(&self) -> impl Iterator<Item = (&RunRecord, &TimingWarning)> {
+        self.records.iter().flat_map(|record| {
+            record
+                .report
+                .timing_warnings
+                .iter()
+                .map(move |warning| (record, warning))
+        })
+    }
+
+    /// One line per timing budget a run missed without failing for it.
+    fn write_timing_warnings(&self, table: &mut String) {
+        for (record, warning) in self.timing_warnings() {
+            let report = &record.report;
+            let _ = writeln!(
+                table,
+                "\nWARN {} [{}] run {}: {warning}",
+                report.scenario, report.profile, record.repetition
+            );
         }
     }
 
@@ -759,6 +828,11 @@ impl E2eReport {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use super::super::outcome::FailureCause;
+    #[cfg(unix)]
+    use crate::scenario::Budget;
+
     fn scenario(profiles: &str) -> Scenario {
         Scenario::from_toml_str(&format!(
             "schema_version = 1\nname = \"s\"\ndescription = \"d\"\nfixture = \"f\"\nprofiles = {profiles}\n[[steps]]\nstep = \"settle\"\n"
@@ -778,6 +852,8 @@ mod tests {
             out_root: PathBuf::from("target/excise-e2e"),
             work_dir: None,
             git_sha: "0".repeat(40),
+            latency_scale: LatencyScale::STRICT,
+            timing_informational: false,
         }
     }
 
@@ -1053,6 +1129,8 @@ mod tests {
             out_root: work.join("out"),
             work_dir: Some(work.to_path_buf()),
             git_sha: "0".repeat(40),
+            latency_scale: LatencyScale::STRICT,
+            timing_informational: false,
         }
     }
 
@@ -1107,6 +1185,347 @@ mod tests {
         validate_against_schema(HarnessFailure::SCHEMA_JSON, &bundle.join("failure.json"));
     }
 
+    /// A stand-in for `excise` that exits at once with status 3, whatever it is asked: every run
+    /// fails, and the matrix still writes its summary.
+    #[cfg(unix)]
+    fn failing_stub(work: &Path) -> PathBuf {
+        stub(
+            work,
+            "excise",
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && exit 0\nexit 3\n",
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scaled_matrix_records_its_scale_and_a_strict_one_records_none() {
+        let work = tempfile::tempdir().expect("a temporary directory");
+        let mut options = lifecycle_options(failing_stub(work.path()), work.path());
+        let strict = run_e2e(&options, |_| {}).expect("a strict matrix runs");
+        options.latency_scale = LatencyScale::new(2.0).expect("a valid scale");
+        options.out_root = work.path().join("scaled");
+        let scaled = run_e2e(&options, |_| {}).expect("a scaled matrix runs");
+
+        assert_eq!(strict.summary.latency_budget_scale, None);
+        assert_eq!(scaled.summary.latency_budget_scale, Some(2.0));
+        for report in [&strict, &scaled] {
+            validate_against_schema(HarnessSummary::SCHEMA_JSON, &report.summary_path);
+        }
+        let text =
+            |report: &E2eReport| fs::read_to_string(&report.summary_path).expect("a summary");
+        assert!(
+            !text(&strict).contains("latency_budget_scale"),
+            "a strict summary has no scale to record: {}",
+            text(&strict)
+        );
+        assert!(
+            text(&scaled).contains("\"latency_budget_scale\": 2.0"),
+            "{}",
+            text(&scaled)
+        );
+        assert!(
+            !strict.table().contains("latency budgets at"),
+            "{}",
+            strict.table()
+        );
+        assert!(
+            scaled
+                .table()
+                .contains("latency budgets at 2x their strict limits"),
+            "{}",
+            scaled.table()
+        );
+    }
+
+    /// A stand-in for `excise` that writes exactly 300 bytes of output and waits: a metric
+    /// (`output_bytes`) that no scheduler can change, for a latency budget to judge. The strict
+    /// first-frame limit is 250 and twice it is 500.
+    #[cfg(unix)]
+    fn three_hundred_bytes(work: &Path) -> PathBuf {
+        stub(
+            work,
+            "excise",
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && exit 0\nprintf '%0299dX' 0\nsleep 30\n",
+        )
+    }
+
+    /// A scenario that waits for the 300 bytes and holds them to the first-frame budget.
+    /// `expectation` is the scenario's `expect` lines, which come before its steps.
+    #[cfg(unix)]
+    fn output_against_the_first_frame_budget(name: &str, expectation: &str) -> Scenario {
+        let scenario = Scenario::from_toml_str(&format!(
+            "schema_version = 1\nname = \"{name}\"\ndescription = \"d\"\n\
+             fixture = \"delete-file\"\nprofiles = [\"deterministic\"]\n{expectation}\
+             [[steps]]\nstep = \"wait_text\"\ntext = \"0X\"\n\
+             [[steps]]\nstep = \"expect_budget\"\nbudget = \"first_frame_ms\"\n\
+             metric = \"output_bytes\"\n"
+        ))
+        .expect("a scenario");
+        scenario.validate().expect("a valid scenario");
+        scenario
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scale_lets_a_scenario_meet_a_latency_limit_but_never_an_expected_failure() {
+        let work = tempfile::tempdir().expect("a temporary directory");
+        let program = three_hundred_bytes(work.path());
+        let verdicts = |scale: LatencyScale, out: &str| -> Vec<(String, Verdict)> {
+            let mut options = lifecycle_options(program.clone(), work.path());
+            options.scenarios = vec![
+                output_against_the_first_frame_budget("meets-a-scaled-limit", ""),
+                output_against_the_first_frame_budget(
+                    "expected-to-fail",
+                    "expect = \"fail\"\nslice = \"SLICE\"\n",
+                ),
+            ];
+            options.latency_scale = scale;
+            options.out_root = work.path().join(out);
+            let report = run_e2e(&options, |_| {}).expect("the matrix runs");
+            report
+                .records
+                .iter()
+                .map(|record| (record.report.scenario.clone(), record.report.verdict))
+                .collect()
+        };
+
+        let strict = verdicts(LatencyScale::STRICT, "strict");
+        let scaled = verdicts(LatencyScale::new(2.0).expect("a valid scale"), "scaled");
+
+        // 300 bytes are over the strict limit of 250 and under twice it. The scenario that
+        // expects to fail must keep failing: under the scale it would pass, and read as fixed.
+        assert_eq!(
+            strict,
+            [
+                ("meets-a-scaled-limit".to_owned(), Verdict::Fail),
+                ("expected-to-fail".to_owned(), Verdict::Xfail)
+            ]
+        );
+        assert_eq!(
+            scaled,
+            [
+                ("meets-a-scaled-limit".to_owned(), Verdict::Pass),
+                ("expected-to-fail".to_owned(), Verdict::Xfail)
+            ]
+        );
+    }
+
+    /// The verdicts of `report`'s runs, in the order they ran, with the name of each scenario.
+    #[cfg(unix)]
+    fn verdicts_of(report: &E2eReport) -> Vec<(String, Verdict)> {
+        report
+            .records
+            .iter()
+            .map(|record| (record.report.scenario.clone(), record.report.verdict))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn informational_timing_reports_a_missed_latency_budget_without_failing_the_run() {
+        let work = tempfile::tempdir().expect("a temporary directory");
+        let program = three_hundred_bytes(work.path());
+        let matrix = |informational: bool, out: &str| -> E2eReport {
+            let mut options = lifecycle_options(program.clone(), work.path());
+            options.scenarios = vec![
+                output_against_the_first_frame_budget("misses-the-limit", ""),
+                output_against_the_first_frame_budget(
+                    "expected-to-fail",
+                    "expect = \"fail\"\nslice = \"SLICE\"\n",
+                ),
+            ];
+            options.timing_informational = informational;
+            options.out_root = work.path().join(out);
+            run_e2e(&options, |_| {}).expect("the matrix runs")
+        };
+
+        let strict = matrix(false, "strict");
+        let informational = matrix(true, "informational");
+        let summary_text =
+            |report: &E2eReport| fs::read_to_string(&report.summary_path).expect("a summary");
+
+        // 300 bytes are over the strict first-frame limit of 250. A strict matrix is as it was:
+        // the miss fails the run, and nothing in the summary or the table mentions timing.
+        assert_eq!(
+            verdicts_of(&strict),
+            [
+                ("misses-the-limit".to_owned(), Verdict::Fail),
+                ("expected-to-fail".to_owned(), Verdict::Xfail)
+            ]
+        );
+        assert!(!strict.is_success());
+        assert!(!strict.summary.timing_informational);
+        assert!(
+            !summary_text(&strict).contains("timing_"),
+            "{}",
+            summary_text(&strict)
+        );
+        assert!(!strict.table().contains("timing informational"));
+        assert!(!strict.table().contains("WARN"), "{}", strict.table());
+
+        // An informational matrix passes the miss and records it. The scenario that expects to
+        // fail keeps failing, strictly: excused, it would pass and read as fixed.
+        assert_eq!(
+            verdicts_of(&informational),
+            [
+                ("misses-the-limit".to_owned(), Verdict::Pass),
+                ("expected-to-fail".to_owned(), Verdict::Xfail)
+            ]
+        );
+        assert!(informational.is_success(), "{}", informational.table());
+        let [missed, documented] = informational.records.as_slice() else {
+            panic!("two runs: {:?}", informational.records);
+        };
+        let [warning] = missed.report.timing_warnings.as_slice() else {
+            panic!("one warning: {:?}", missed.report.timing_warnings);
+        };
+        assert_eq!(warning.budget, Budget::FirstFrameMs);
+        assert_eq!(warning.metric, "output_bytes");
+        assert!(warning.value > 250.0, "{warning:?}");
+        assert!((warning.limit - 250.0).abs() < f64::EPSILON, "{warning:?}");
+        assert!(documented.report.timing_warnings.is_empty());
+
+        let summary = &informational.summary;
+        assert!(summary.timing_informational);
+        assert_eq!(
+            summary.scenarios[0].timing_warnings,
+            std::slice::from_ref(warning)
+        );
+        assert!(summary.scenarios[1].timing_warnings.is_empty());
+        validate_against_schema(HarnessSummary::SCHEMA_JSON, &informational.summary_path);
+        assert!(
+            summary_text(&informational).contains("\"timing_informational\": true"),
+            "{}",
+            summary_text(&informational)
+        );
+        let table = informational.table();
+        assert!(
+            table.contains(&format!(
+                "WARN misses-the-limit [deterministic] run 1: {warning}"
+            )),
+            "{table}"
+        );
+        assert!(
+            table.contains("timing informational: 1 warning(s)"),
+            "{table}"
+        );
+    }
+
+    /// A scenario that misses the first-frame budget (300 bytes against 250) and then reaches
+    /// `last_step`, a step in TOML that is not a timing check.
+    #[cfg(unix)]
+    fn misses_the_budget_then(name: &str, last_step: &str) -> Scenario {
+        let scenario = Scenario::from_toml_str(&format!(
+            "schema_version = 1\nname = \"{name}\"\ndescription = \"d\"\n\
+             fixture = \"delete-file\"\nprofiles = [\"deterministic\"]\n\
+             [[steps]]\nstep = \"wait_text\"\ntext = \"0X\"\n\
+             [[steps]]\nstep = \"expect_budget\"\nbudget = \"first_frame_ms\"\n\
+             metric = \"output_bytes\"\n{last_step}"
+        ))
+        .expect("a scenario");
+        scenario.validate().expect("a valid scenario");
+        scenario
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_that_is_not_timing_still_fails_an_informational_matrix() {
+        let work = tempfile::tempdir().expect("a temporary directory");
+        let mut options = lifecycle_options(three_hundred_bytes(work.path()), work.path());
+        options.scenarios = vec![
+            // 300 bytes of output against a limit of none: a resource budget, never timing.
+            misses_the_budget_then(
+                "then-a-resource-budget",
+                "[[steps]]\nstep = \"expect_budget\"\nbudget = \"idle_output_bytes\"\n\
+                 metric = \"output_bytes\"\n",
+            ),
+            misses_the_budget_then(
+                "then-a-wait-that-times-out",
+                "[[steps]]\nstep = \"wait_text\"\ntext = \"text that is never printed\"\n\
+                 timeout_ms = 300\n",
+            ),
+        ];
+        options.timing_informational = true;
+
+        let report = run_e2e(&options, |_| {}).expect("the matrix runs");
+
+        assert!(!report.is_success(), "{}", report.table());
+        assert_eq!(
+            verdicts_of(&report),
+            [
+                ("then-a-resource-budget".to_owned(), Verdict::Fail),
+                ("then-a-wait-that-times-out".to_owned(), Verdict::Fail)
+            ]
+        );
+        let causes: Vec<FailureCause> = report
+            .records
+            .iter()
+            .map(|record| record.report.failure.as_ref().expect("a failed step").cause)
+            .collect();
+        assert_eq!(causes, [FailureCause::Mismatch, FailureCause::Timeout]);
+        for record in &report.records {
+            assert_eq!(
+                record.report.timing_warnings.len(),
+                1,
+                "the miss before the failure is still recorded: {:?}",
+                record.report.timing_warnings
+            );
+        }
+        validate_against_schema(HarnessSummary::SCHEMA_JSON, &report.summary_path);
+        let table = report.table();
+        assert!(table.contains("FAIL then-a-resource-budget"), "{table}");
+        assert!(table.contains("e2e FAILED"), "{table}");
+        assert!(
+            table.contains("timing informational: 2 warning(s)"),
+            "{table}"
+        );
+    }
+
+    /// A harness error after an informational miss still reports the miss. Here the step after
+    /// the miss fails, and its failure bundle cannot be written because its directory would be
+    /// under a regular file: the run errors, and keeps the warning it measured.
+    #[cfg(unix)]
+    #[test]
+    fn a_harness_error_after_an_informational_miss_keeps_the_warning() {
+        let work = tempfile::tempdir().expect("a temporary directory");
+        let program = three_hundred_bytes(work.path());
+        let scenario = misses_the_budget_then(
+            "then-a-bundle-that-cannot-be-written",
+            "[[steps]]\nstep = \"expect_budget\"\nbudget = \"idle_output_bytes\"\n\
+             metric = \"output_bytes\"\n",
+        );
+        let fixture = Fixtures::bundled()
+            .run_copy(&scenario.fixture, work.path())
+            .expect("a copy of the fixture");
+        let not_a_directory = work.path().join("not-a-directory");
+        fs::write(&not_a_directory, "").expect("a regular file");
+        let bundle_dir = not_a_directory.join("bundle");
+
+        let report = run_scenario(&RunRequest {
+            scenario: &scenario,
+            profile: Profile::Deterministic,
+            binary: &program,
+            fixture_root: fixture.root(),
+            scan_store_dir: None,
+            work_dir: work.path(),
+            bundle_dir: Some(&bundle_dir),
+            repro_command: "cargo xtask e2e",
+            fixture_seed: fixture.plan().spec().seed,
+            keep_scratch: false,
+            latency_scale: LatencyScale::STRICT,
+            timing_informational: true,
+        });
+
+        assert_eq!(report.verdict, Verdict::Error, "{:?}", report.error);
+        let [warning] = report.timing_warnings.as_slice() else {
+            panic!(
+                "the miss before the error is kept: {:?}",
+                report.timing_warnings
+            );
+        };
+        assert_eq!(warning.budget, Budget::FirstFrameMs);
+    }
+
     /// A scenario whose one step waits for text `excise` never prints, bounded by a short
     /// timeout: the shape needed to force a step to time out with the child still running,
     /// rather than exiting first.
@@ -1151,6 +1570,8 @@ mod tests {
             out_root: work.path().join("out"),
             work_dir: Some(work.path().to_path_buf()),
             git_sha: "0".repeat(40),
+            latency_scale: LatencyScale::STRICT,
+            timing_informational: false,
         };
 
         let report = run_e2e(&options, |_| {}).expect("the matrix runs");

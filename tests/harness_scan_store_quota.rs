@@ -16,7 +16,7 @@ use std::path::Path;
 use excise_harness::{
     fixture::{Fixtures, PRIVILEGED_ENV, PrivilegedOptIn},
     report::Verdict,
-    runner::{RunRequest, run_scenario, work_base},
+    runner::{LatencyScale, RunRequest, run_scenario, work_base},
     scenario::Scenario,
 };
 
@@ -63,6 +63,8 @@ fn a_scan_stopped_at_the_quota_leaves_a_quarter_of_the_free_space()
         repro_command: "EXCISE_HARNESS_PRIVILEGED=1 cargo test --locked --test harness_scan_store_quota",
         fixture_seed: fixture.plan().spec().seed,
         keep_scratch: false,
+        latency_scale: LatencyScale::STRICT,
+        timing_informational: false,
     });
     let free_after = free_bytes(&mount)?;
 

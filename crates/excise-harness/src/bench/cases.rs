@@ -24,7 +24,7 @@ use crate::{
         scan::{ScanError, ScanRequest, run_scan},
     },
     report::AbFixture,
-    runner::{RunRequest, run_scenario},
+    runner::{LatencyScale, RunRequest, run_scenario},
     safety::{FixtureRoot, SafetyError},
     scenario::{Profile, Scenario, Step},
 };
@@ -315,6 +315,10 @@ pub fn run_scenario_once(
         repro_command: &repro,
         fixture_seed: fixture.plan().seed(),
         keep_scratch: false,
+        // Timing evidence is measured against the strict budgets, never a loosened one, and a
+        // missed budget fails the case, never a warning.
+        latency_scale: LatencyScale::STRICT,
+        timing_informational: false,
     });
     if let Some(reason) = report.error {
         return Err(CaseError::ScenarioErrored {

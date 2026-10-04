@@ -1,0 +1,100 @@
+name: Weekly harness
+
+# Every week the harness scans its largest fixture, ten million tiny files, without a terminal,
+# under the memory cap, and holds the report to the fixture's oracle and the scan to its budgets.
+# The fixture needs far more inodes than a hosted runner's disks have, so the job builds an ext4
+# image with room for them. A manual run can name a smaller fixture, such as tiny-files-1m, to
+# prove the mechanism in minutes; its scan time against du can exceed the budget on this image,
+# because du finishes a million tiny files in about two seconds (15.3 times measured against the
+# budget of 15, where the ten-million-entry default measures about 4.9). docs/development.md,
+# "Continuous integration tiers", has the details and how to run it locally.
+
+on:
+  schedule:
+    - cron: "43 3 * * 6"
+  workflow_dispatch:
+    inputs:
+      fixture:
+        description: "The fixture to scan: tiny-files-10m (measured at about 4.9 times du's time, against the budget of 15), or tiny-files-1m, which proves the mechanism in minutes but whose ratio can exceed the budget on this image (du scans a million tiny files in about 2 s; 15.3 measured)"
+        type: string
+        default: tiny-files-10m
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  largest-fixture:
+    name: ubuntu-24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      FIXTURE: ${{ inputs.fixture || 'tiny-files-10m' }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check the fixture name
+        shell: bash
+        run: |
+          [[ "$FIXTURE" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || { echo "::error::not a fixture id: $FIXTURE"; exit 1; }
+          test -f "crates/excise-harness/fixtures/$FIXTURE.toml" || { echo "::error::no such fixture: $FIXTURE"; exit 1; }
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+      - name: Build a file system with room for the fixture
+        shell: bash
+        run: |
+          # The hosted disks hold about five million inodes in all, so ten million files need a file
+          # system of their own: an image on the large temporary disk, with 1 KiB blocks so that a
+          # tiny file costs 1 KiB, and no journal. The build, the fixture, and the scan store all go
+          # on it, which is also what keeps the scan store's quota (75% of the free space) roomy.
+          df -h / /mnt
+          df -i / /mnt
+          free -m
+          available_gib="$(df --output=avail -BG /mnt | tail -n 1 | tr -dc '0-9')"
+          image_gib=56
+          if (( available_gib < image_gib + 4 )); then
+            echo "::error::/mnt has $available_gib GiB free; the image needs $image_gib GiB"
+            exit 1
+          fi
+          sudo fallocate -l "${image_gib}G" /mnt/excise-big.img
+          sudo mkfs.ext4 -q -F -b 1024 -N 12000000 -m 0 -O ^has_journal /mnt/excise-big.img
+          sudo mkdir -p /mnt/excise-big
+          sudo mount -o loop,noatime /mnt/excise-big.img /mnt/excise-big
+          sudo chown "$(id -u):$(id -g)" /mnt/excise-big
+          mkdir -p /mnt/excise-big/work
+          df -h /mnt/excise-big
+          df -i /mnt/excise-big
+          {
+            echo "CARGO_TARGET_DIR=/mnt/excise-big/target"
+            echo "EXCISE_E2E_TMPDIR=/mnt/excise-big/work"
+          } >> "$GITHUB_ENV"
+      - name: Scan the fixture without a terminal, under the memory cap
+        env:
+          EXCISE_HARNESS_CGROUP: "1"
+        run: cargo run --locked --package xtask -- headless --fixture "$FIXTURE" --repeat 1 --timeout 7200
+      - name: Record how much room the fixture took
+        if: ${{ !cancelled() }}
+        run: |
+          df -h /mnt/excise-big
+          df -i /mnt/excise-big
+          du -sh /mnt/excise-big/target/excise-fixtures.noindex || true
+      - name: Keep the failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: weekly-linux
+          path: |
+            /mnt/excise-big/target/excise-headless/*/summary.json
+            /mnt/excise-big/target/excise-headless/*/*/discrepancies.txt
+            /mnt/excise-big/target/excise-headless/*/*/repro.txt
+          if-no-files-found: ignore
+          retention-days: 30

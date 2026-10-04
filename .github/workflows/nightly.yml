@@ -1,0 +1,164 @@
+name: Nightly harness
+
+# Every night the validation harness runs its full tiers: on Linux, at the strict budgets, the
+# whole scenario matrix, the comparisons, the headless suite, the one-million-entry scans under
+# the memory cap, and the privileged volume steps; on Windows the lifecycle tier; on macOS the
+# lifecycle tier and the performance checks, with timing reported and not gated, because a hosted
+# macOS runner is slower than the machine the budgets are held on (strict timing runs on Linux and
+# on a reference machine before a release). Pull requests run a bounded tier of it at twice the
+# latency budgets in ci.yml. docs/development.md, "Continuous integration tiers", lists every
+# command and how to run it locally.
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: ubuntu-24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+      - name: Record the runner
+        run: |
+          nproc
+          free -m
+          df -h / /mnt
+          uptime
+      - name: Run every scenario at the strict budgets, with the one-million-entry scan under the memory cap
+        env:
+          EXCISE_HARNESS_CGROUP: "1"
+        run: cargo run --locked --package xtask -- e2e --nightly
+      - name: Check that the memory-cap scenario ran
+        if: ${{ !cancelled() }}
+        run: |
+          # A scenario that needs the cap is skipped, not failed, on a host that cannot provide it.
+          jq -e '[.scenarios[] | select(.name == "memory-budget-interactive-1m-cgroup")] | length > 0' target/excise-e2e/latest/summary.json > /dev/null \
+            || { echo "::error::memory-budget-interactive-1m-cgroup did not run: the memory cap was not enforced"; exit 1; }
+      - name: Check the interface against the headless scan
+        if: ${{ !cancelled() }}
+        run: cargo run --locked --package xtask -- compare --nightly
+      - name: Scan every fixture of up to 250,000 entries without a terminal, under the memory cap
+        if: ${{ !cancelled() }}
+        env:
+          EXCISE_HARNESS_CGROUP: "1"
+        run: cargo run --locked --package xtask -- headless --full
+      - name: Scan the one-million-entry fixture without a terminal, under the memory cap
+        if: ${{ !cancelled() }}
+        env:
+          EXCISE_HARNESS_CGROUP: "1"
+        run: cargo run --locked --package xtask -- headless --fixture tiny-files-1m --repeat 0 --timeout 3600
+      - name: Check the scan-store quota on a small privileged volume
+        if: ${{ !cancelled() }}
+        env:
+          EXCISE_HARNESS_PRIVILEGED: "1"
+        run: cargo run --locked --package xtask -- e2e --scenario scan-store-quota
+      - name: Scan the fixtures with attached volumes without a terminal
+        if: ${{ !cancelled() }}
+        env:
+          EXCISE_HARNESS_PRIVILEGED: "1"
+        run: cargo run --locked --package xtask -- headless --class volumes
+      - name: Keep the failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nightly-linux
+          path: |
+            target/excise-e2e/
+            target/excise-headless/*/summary.json
+            target/excise-headless/*/*/discrepancies.txt
+            target/excise-headless/*/*/repro.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  windows:
+    name: windows-2025
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+      - name: Run the full lifecycle tier
+        shell: bash
+        env:
+          # The deletion dialog is at most 78 columns wide; the Windows temporary directory is too long for scenario fixtures.
+          EXCISE_E2E_TMPDIR: ${{ runner.temp }}
+        run: cargo run --locked --package xtask -- e2e --full
+      - name: Keep the failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nightly-windows
+          path: target/excise-e2e/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  macos:
+    name: macos-14
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+      - name: Record the runner
+        run: |
+          sysctl -n hw.ncpu hw.memsize
+          sw_vers
+          df -h /
+          uptime
+      # `--timing-informational` reports the latency budgets, interface ratios, and `du` ratios that
+      # this runner misses as warnings and does not fail on them; every other check still fails.
+      - name: Run every scenario, reporting timing without failing on it
+        run: cargo run --locked --package xtask -- e2e --nightly --timing-informational
+      - name: Check the interface against the headless scan, reporting timing without failing on it
+        if: ${{ !cancelled() }}
+        run: cargo run --locked --package xtask -- compare --nightly --timing-informational
+      - name: Scan every fixture of up to 250,000 entries without a terminal, reporting the ratio without failing on it
+        if: ${{ !cancelled() }}
+        run: cargo run --locked --package xtask -- headless --full --timing-informational
+      - name: Keep the failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nightly-macos
+          path: |
+            target/excise-e2e/
+            target/excise-headless/*/summary.json
+            target/excise-headless/*/*/discrepancies.txt
+            target/excise-headless/*/*/repro.txt
+          if-no-files-found: ignore
+          retention-days: 14

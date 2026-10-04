@@ -16,22 +16,25 @@ use std::{
 
 use excise_harness::{
     report::Tier,
-    runner::{E2eOptions, load_scenarios, run_e2e},
+    runner::{E2eOptions, LatencyScale, load_scenarios, run_e2e},
     scenario::{Profile, Scenario},
 };
 
 const USAGE: &str = "usage: cargo xtask e2e [--quick|--full|--nightly] [--scenario NAME]... \
-                     [--profile PROFILE]... [--repeat N] [--keep-fixture]";
+                     [--profile PROFILE]... [--repeat N] [--latency-scale FACTOR] \
+                     [--timing-informational] [--keep-fixture]";
 /// Names a binary to test instead of building one. `cargo xtask headless` reads it too.
 pub(crate) const BINARY_ENV: &str = "EXCISE_E2E_BINARY";
 
 /// What the command line asked for.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct Selection {
     tier: Tier,
     scenarios: Vec<String>,
     profiles: Vec<Profile>,
     repeat: u32,
+    latency_scale: LatencyScale,
+    timing_informational: bool,
     keep_fixture: bool,
 }
 
@@ -64,12 +67,18 @@ pub fn e2e(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
         out_root: target.join("excise-e2e"),
         work_dir: None,
         git_sha: super::current_head_sha()?,
+        latency_scale: selection.latency_scale,
+        timing_informational: selection.timing_informational,
     };
 
     let started = Instant::now();
     let report = run_e2e(&options, |record| {
+        let warned = match record.report.timing_warnings.len() {
+            0 => String::new(),
+            count => format!(", {count} timing warning(s)"),
+        };
         eprintln!(
-            "  {} [{}] run {}: {} in {:.2}s",
+            "  {} [{}] run {}: {} in {:.2}s{warned}",
             record.report.scenario,
             record.report.profile,
             record.repetition,
@@ -92,6 +101,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
         scenarios: Vec::new(),
         profiles: Vec::new(),
         repeat: 1,
+        latency_scale: LatencyScale::STRICT,
+        timing_informational: false,
         keep_fixture: false,
     };
     let mut tier: Option<Tier> = None;
@@ -136,6 +147,17 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
                     .filter(|count| *count > 0)
                     .ok_or_else(|| format!("`--repeat` takes a positive integer, not `{text}`"))?;
             }
+            "--latency-scale" => {
+                let text = value(&mut args, "--latency-scale")?;
+                selection.latency_scale = text
+                    .parse()
+                    .ok()
+                    .and_then(|factor| LatencyScale::new(factor).ok())
+                    .ok_or_else(|| {
+                        format!("`--latency-scale` takes a number of at least 1, not `{text}`")
+                    })?;
+            }
+            "--timing-informational" => selection.timing_informational = true,
             "--keep-fixture" => selection.keep_fixture = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -201,6 +223,38 @@ mod tests {
         assert_eq!(selection.tier, Tier::Full);
         assert_eq!(selection.repeat, 1);
         assert!(selection.scenarios.is_empty() && selection.profiles.is_empty());
+        assert!(selection.latency_scale.is_strict());
+    }
+
+    #[test]
+    fn a_latency_scale_is_a_number_of_at_least_one() {
+        for (text, factor) in [("2", 2.0), ("1.5", 1.5), ("1", 1.0), ("10", 10.0)] {
+            let selection = parsed(&["--quick", "--latency-scale", text]).expect("valid");
+            assert!(
+                (selection.latency_scale.factor() - factor).abs() < f64::EPSILON,
+                "{text}"
+            );
+            assert_eq!(selection.tier, Tier::Quick, "a scale keeps the tier");
+        }
+        for text in ["0.5", "0", "-2", "fast", "NaN", "inf", "1e999", ""] {
+            let error = parsed(&["--latency-scale", text]).expect_err(text);
+            assert!(error.contains("--latency-scale"), "{text}: {error}");
+        }
+        assert!(parsed(&["--latency-scale"]).is_err());
+    }
+
+    #[test]
+    fn timing_is_gated_unless_the_flag_makes_it_informational() {
+        assert!(!parsed(&["--quick"]).expect("valid").timing_informational);
+
+        let selection =
+            parsed(&["--timing-informational", "--quick", "--latency-scale", "2"]).expect("valid");
+        assert!(selection.timing_informational);
+        assert_eq!(selection.tier, Tier::Quick, "the flag takes no value");
+        assert!(
+            (selection.latency_scale.factor() - 2.0).abs() < f64::EPSILON,
+            "the flag and the scale compose"
+        );
     }
 
     #[test]

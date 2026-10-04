@@ -12,13 +12,13 @@ use crate::{
     headless::suite::MEMORY_BUDGET_BYTES,
     metrics::milliseconds,
     pty::{PtySession, SpawnSpec},
-    report::{FixtureIdentity, Rusage, Verdict},
+    report::{FixtureIdentity, Rusage, TimingWarning, Verdict},
     safety::{FixtureRoot, FixtureSnapshot, ProfileSettings, Scratch, cgroup, isolated_env},
-    scenario::{Budget, Profile, Scenario},
+    scenario::{Budget, Expect, Profile, Scenario},
 };
 
 use super::{
-    budget::limit_for,
+    budget::{LatencyScale, limit_for},
     bundle::{self, Bundle, Invocation},
     exec::Executor,
     outcome::{RunError, StepFailure, Stop},
@@ -57,6 +57,19 @@ pub struct RunRequest<'a> {
     pub fixture_seed: u64,
     /// Keeps the scratch area on disk instead of deleting it.
     pub keep_scratch: bool,
+    /// The factor the scenario's latency budgets are multiplied by: a run on a loaded or hosted
+    /// machine can hold them to twice their strict value, and a run anywhere else holds them to
+    /// [`LatencyScale::STRICT`]. A scenario that is expected to fail on this platform keeps its
+    /// strict budgets whatever the request says: the defect it documents is measured against
+    /// them, and a looser limit that the defect stays within would read as a fixed defect
+    /// (`xpass`).
+    pub latency_scale: LatencyScale,
+    /// Whether a latency budget that the scenario misses is reported as a warning, in
+    /// [`RunReport::timing_warnings`], and does not fail the run: for a hosted machine whose speed
+    /// the budgets were not set on. A scenario that is expected to fail on this platform keeps its
+    /// strict verdict whatever the request says, for the reason given for `latency_scale`. Every
+    /// other check of the scenario still fails it.
+    pub timing_informational: bool,
 }
 
 /// What a run produced.
@@ -82,6 +95,9 @@ pub struct RunReport {
     pub kept_scratch: Option<PathBuf>,
     /// The digest of the fixture the run started from.
     pub fixture_digest: String,
+    /// The latency budgets the scenario missed without failing for it, because the request held
+    /// timing informational, in step order.
+    pub timing_warnings: Vec<TimingWarning>,
 }
 
 impl RunReport {
@@ -121,6 +137,7 @@ pub fn run_scenario(request: &RunRequest<'_>) -> RunReport {
         bundle: None,
         kept_scratch: None,
         fixture_digest: String::new(),
+        timing_warnings: Vec::new(),
     };
     if let Err(error) = execute(request, &mut report) {
         report.error = Some(error.to_string());
@@ -185,8 +202,18 @@ fn execute(request: &RunRequest<'_>, report: &mut RunReport) -> Result<(), RunEr
     let mut executor = Executor::new(
         scenario, &prepared, &fixture, &scratch, &baseline, store_dir, session,
     );
+    // A scenario that is expected to fail on this platform documents a defect measured against the
+    // strict budgets: a limit it stays within, or a miss that is only a warning, would turn it
+    // into `xpass`, the signal that the defect is fixed.
+    if scenario.expect_on(std::env::consts::OS) == Expect::Pass {
+        executor.latency_scale = request.latency_scale;
+        executor.timing_informational = request.timing_informational;
+    }
 
     let result = executor.run();
+    // A budget missed under informational timing was measured, so the report keeps it on every
+    // path, including a harness error or a failure bundle that cannot be written.
+    report.timing_warnings = std::mem::take(&mut executor.timing_warnings);
     match result {
         Ok(()) => {
             report.metrics = executor.metrics();
@@ -249,7 +276,7 @@ fn apply_cgroup_wrap(
         clippy::cast_sign_loss,
         reason = "a peak_rss_bytes budget is a small positive number of bytes, far below u64::MAX"
     )]
-    let limit_bytes = limit_for(scenario, Budget::PeakRssBytes)
+    let limit_bytes = limit_for(scenario, Budget::PeakRssBytes, LatencyScale::STRICT)
         .map_or(MEMORY_BUDGET_BYTES, |limit| limit.round() as u64);
     let unit = cgroup::unit_name(&format!("{}-{profile}", scenario.name));
     let (program, args, extra_env) = cgroup::wrap(&unit, limit_bytes, &spec.program, &spec.args)

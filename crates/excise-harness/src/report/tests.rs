@@ -9,9 +9,13 @@ use super::{
     AbContext, AbFixture, AbKind, AbVerdict, BinaryIdentity, BuildIdentity, ConfidenceInterval,
     Document, FailedStep, FailureKind, FixtureIdentity, HarnessAb, HarnessFailure, HarnessSummary,
     MetricComparison, Rusage, SCHEMA_VERSION, Samples, ScenarioResult, SchemaVersion,
-    ScreenComparison, SessionDiagnostics, Side, SummaryKind, TerminalModes, Tier, Verdict,
+    ScreenComparison, SessionDiagnostics, Side, SummaryKind, TerminalModes, Tier, TimingWarning,
+    Verdict,
 };
-use crate::scenario::{Expect, Profile};
+use crate::{
+    runner::is_latency,
+    scenario::{Budget, Expect, Profile},
+};
 
 const SHA256: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 const GIT_SHA: &str = "37d1c18a5f0c2b9e4d1a7c3b8e6f2a90d4c5b1e7";
@@ -35,6 +39,8 @@ fn summary() -> HarnessSummary {
             sha256: SHA256.to_owned(),
         },
         git_sha: GIT_SHA.to_owned(),
+        latency_budget_scale: Some(2.0),
+        timing_informational: true,
         scenarios: vec![
             ScenarioResult {
                 name: "delete-folder-lifecycle".to_owned(),
@@ -46,6 +52,20 @@ fn summary() -> HarnessSummary {
                     ("time_to_complete_ms".to_owned(), 3_720.5),
                 ]),
                 failure_bundle: None,
+                timing_warnings: vec![
+                    TimingWarning {
+                        budget: Budget::MaxStallMs,
+                        metric: "max_stall_ms".to_owned(),
+                        value: 588.25,
+                        limit: 500.0,
+                    },
+                    TimingWarning {
+                        budget: Budget::InputToFrameP99Ms,
+                        metric: "input_to_frame_p99_ms".to_owned(),
+                        value: 61.5,
+                        limit: 50.0,
+                    },
+                ],
             },
             ScenarioResult {
                 name: "signal-term-mid-scan".to_owned(),
@@ -57,6 +77,7 @@ fn summary() -> HarnessSummary {
                     "target/excise-e2e/20260930T163000Z-3f9a/signal-term-mid-scan-deterministic"
                         .to_owned(),
                 ),
+                timing_warnings: Vec::new(),
             },
         ],
     }
@@ -65,6 +86,8 @@ fn summary() -> HarnessSummary {
 /// A summary with every optional field absent.
 fn minimal_summary() -> HarnessSummary {
     HarnessSummary {
+        latency_budget_scale: None,
+        timing_informational: false,
         scenarios: Vec::new(),
         ..summary()
     }
@@ -484,6 +507,25 @@ fn enumerations_match_between_schemas_and_types() {
         declared(&ab_schema, "/$defs/metric/properties/verdict/enum"),
         names(AbVerdict::ALL, AbVerdict::as_str)
     );
+    // A warning is only ever for a budget that the speed of the machine decides: the four latency
+    // budgets and the three ratio budgets.
+    let timing_budgets: Vec<Budget> = Budget::ALL
+        .iter()
+        .copied()
+        .filter(|budget| is_latency(*budget))
+        .chain([
+            Budget::HeadlessScanRatio,
+            Budget::TuiCompleteRatio,
+            Budget::MotionCompleteRatio,
+        ])
+        .collect();
+    assert_eq!(
+        declared(
+            &summary_schema,
+            "/$defs/timing_warning/properties/budget/enum"
+        ),
+        names(&timing_budgets, Budget::as_str)
+    );
 }
 
 /// Sets the value at `pointer`, which must already exist.
@@ -578,8 +620,61 @@ fn the_summary_schema_rejects_contract_drift() {
             ("a scenario name that is not an identifier", &|d| {
                 set(d, "/scenarios/0/name", "Delete Folder".into());
             }),
+            (
+                "a latency scale of exactly 1, which a strict run omits",
+                &|d| {
+                    set(d, "/latency_budget_scale", 1.into());
+                },
+            ),
+            ("a latency scale that would tighten the budgets", &|d| {
+                set(d, "/latency_budget_scale", 0.5.into());
+            }),
+            ("a latency scale that is not a number", &|d| {
+                set(d, "/latency_budget_scale", "2x".into());
+            }),
             ("an empty failure bundle path", &|d| {
                 set(d, "/scenarios/1/failure_bundle", "".into());
+            }),
+        ],
+    );
+}
+
+#[test]
+fn the_summary_schema_rejects_drifting_timing_fields() {
+    assert_rejected(
+        &summary(),
+        &[
+            ("a timing flag of false, which a strict run omits", &|d| {
+                set(d, "/timing_informational", false.into());
+            }),
+            ("a timing flag that is not a boolean", &|d| {
+                set(d, "/timing_informational", "yes".into());
+            }),
+            ("an empty list of timing warnings", &|d| {
+                set(d, "/scenarios/0/timing_warnings", serde_json::json!([]));
+            }),
+            ("a timing warning for a budget that always fails", &|d| {
+                set(
+                    d,
+                    "/scenarios/0/timing_warnings/0/budget",
+                    "peak_rss_bytes".into(),
+                );
+            }),
+            ("a timing warning without its limit", &|d| {
+                remove(d, "/scenarios/0/timing_warnings/0/limit");
+            }),
+            ("a timing warning value that is not a number", &|d| {
+                set(d, "/scenarios/0/timing_warnings/0/value", "slow".into());
+            }),
+            ("a timing warning metric that is not an identifier", &|d| {
+                set(
+                    d,
+                    "/scenarios/0/timing_warnings/0/metric",
+                    "Max Stall".into(),
+                );
+            }),
+            ("an undeclared field in a timing warning", &|d| {
+                d["scenarios"][0]["timing_warnings"][0]["extra"] = 1.into();
             }),
         ],
     );

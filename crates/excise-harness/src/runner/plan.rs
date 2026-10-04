@@ -15,7 +15,10 @@ use crate::{
     scenario::{Region, Scenario, Signal, Step, WaitText},
 };
 
-use super::{budget::limit_for, outcome::RunError};
+use super::{
+    budget::{LatencyScale, limit_for},
+    outcome::RunError,
+};
 
 /// A text a step looks for.
 #[derive(Debug, Clone)]
@@ -140,7 +143,7 @@ fn prepare_step(scenario: &Scenario, index: usize, step: &Step) -> Result<Prepar
             Ok(Prepared::Nothing)
         }
         Step::ExpectBudget(expect) => {
-            if limit_for(scenario, expect.budget).is_none() {
+            if limit_for(scenario, expect.budget, LatencyScale::STRICT).is_none() {
                 return Err(invalid(format!(
                     "budget `{}` has no default limit; set one in `[budgets]`",
                     expect.budget

@@ -1,12 +1,12 @@
 //! The `harness-summary` document: the result of one harness run.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
 use super::{Document, SchemaVersion};
 use crate::{
-    scenario::{Expect, Profile},
+    scenario::{Budget, Expect, Profile},
     string_enum::string_enum,
 };
 
@@ -83,6 +83,50 @@ pub struct BinaryIdentity {
     pub sha256: String,
 }
 
+/// A timing budget that a result missed and was not failed for, because the run held timing
+/// informational: the miss is recorded here and changed neither the result's verdict nor the exit
+/// status.
+///
+/// Only the budgets a hosted machine's speed decides are ever reported this way: the four latency
+/// budgets of a scenario, a comparison's ratio, and a headless scan's ratio against `du`. Every
+/// other budget keeps blocking, and so does a result that is expected to fail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimingWarning {
+    /// The budget that was missed.
+    pub budget: Budget,
+    /// The metric that was held to it.
+    pub metric: String,
+    /// What was measured.
+    pub value: f64,
+    /// The limit it was held to, after any latency scale: `value` is above it.
+    pub limit: f64,
+}
+
+/// `value` to three decimals, without trailing zeros: `588`, `2.193`.
+fn trimmed(value: f64) -> String {
+    let text = format!("{value:.3}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+impl fmt::Display for TimingWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (metric, value, limit) = (&self.metric, trimmed(self.value), trimmed(self.limit));
+        if *metric == self.budget.as_str() {
+            write!(
+                formatter,
+                "`{metric}` is {value}, over its limit of {limit}"
+            )
+        } else {
+            write!(
+                formatter,
+                "`{metric}` is {value}, over the `{}` limit of {limit}",
+                self.budget
+            )
+        }
+    }
+}
+
 /// The result of one scenario under one profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +144,11 @@ pub struct ScenarioResult {
     /// The failure bundle directory, when the scenario produced one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_bundle: Option<String>,
+    /// The timing budgets this result missed while the run held timing informational: warnings
+    /// that left the verdict as it was. Absent when there are none, and always absent from a
+    /// strict run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timing_warnings: Vec<TimingWarning>,
 }
 
 /// The result of one harness run.
@@ -128,6 +177,19 @@ pub struct HarnessSummary {
     pub excise_binary: BinaryIdentity,
     /// The 40-character commit the binary was built from.
     pub git_sha: String,
+    /// The factor the latency budgets (`input_to_frame_p99_ms`, `max_stall_ms`, `first_frame_ms`,
+    /// `quit_ms`) of the scenarios that were expected to pass were multiplied by, when it is not
+    /// 1: the budgets this run held its scenarios to were that many times looser than the strict
+    /// ones. Absent in a strict run. No other budget is ever scaled, and a scenario expected to
+    /// fail was judged against the strict budgets either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_budget_scale: Option<f64>,
+    /// Whether the run held timing informational: a timing budget one of its results missed (a
+    /// scenario's four latency budgets, a headless scan's ratio against `du`) is a warning in
+    /// that result's `timing_warnings`, not a failure. Absent in a strict run. Every other budget
+    /// blocked as usual, and a result that was expected to fail was judged strictly either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timing_informational: bool,
     /// One result per scenario and profile.
     pub scenarios: Vec<ScenarioResult>,
 }

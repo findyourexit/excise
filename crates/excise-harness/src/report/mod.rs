@@ -10,8 +10,10 @@
 //! * [`HarnessAb`] (`harness-ab`): paired, interleaved comparison evidence for two builds.
 //!
 //! The types reject unknown fields, so a document with a field this build does not know is an
-//! error rather than silently ignored. Any change to a document's shape needs a new
-//! `schema_version`.
+//! error rather than silently ignored. Removing or retyping a field, or making an optional one
+//! required, needs a new `schema_version`. An optional field that its writer leaves out when it has
+//! nothing to say (`session_diagnostics`, `latency_budget_scale`, `timing_informational`, and a
+//! result's `timing_warnings`) is additive and keeps version 1.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -31,7 +33,9 @@ pub use failure::{
     FailedStep, FailureKind, FixtureIdentity, HarnessFailure, Rusage, ScreenComparison,
     SessionDiagnostics, TerminalModes,
 };
-pub use summary::{BinaryIdentity, HarnessSummary, ScenarioResult, SummaryKind, Tier, Verdict};
+pub use summary::{
+    BinaryIdentity, HarnessSummary, ScenarioResult, SummaryKind, Tier, TimingWarning, Verdict,
+};
 
 /// The `schema_version` of every document in this module.
 pub const SCHEMA_VERSION: u32 = 1;

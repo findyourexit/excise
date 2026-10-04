@@ -54,8 +54,12 @@ A scenario's `tier` is `quick` (the default), `full`, or `nightly`, and says whi
 - `--full` (the default without a flag) runs `quick` and `full` scenarios under every profile each one declares.
 - `--nightly` runs all three tiers under every profile each one declares.
 - `--scenario NAME` runs the named scenario whatever its tier.
+- `--latency-scale FACTOR` multiplies the limits of the four latency budgets (input to frame, stall, first frame, quit) and no other budget. Local runs stay strict; pull-request CI uses 2.
+- `--timing-informational` (on `cargo xtask e2e`, `compare`, and `headless`) reports the timing verdicts that would block (the four latency budgets, a comparison's ratio, a headless scan's ratio against `du`) as warnings that the table and `summary.json` record and the exit status ignores; every other check still blocks, and anything expected to fail keeps its strict verdict. Local runs stay strict; hosted macOS CI uses it.
 
 `cargo xtask e2e --quick` must pass before you report a change as done. A change to scheduling, animation, or scan-store code also needs the relevant `full` scenarios: name them, or run `--full`. `cargo test` runs the `quick` scenarios in-process and never runs `full` or `nightly` ones. `cargo xtask headless --quick` scans the fixtures of at most 10,000 planned entries and `--full` (the default) those of at most 250,000; `--fixture ID` runs one fixture of any size.
+
+CI runs the tiers for you: every pull request runs `e2e --quick --latency-scale 2` plus the full-tier scenarios named in `ci.yml`'s `pr_scenarios` (Linux and macOS; macOS also with `--timing-informational`), each native job within 15 minutes, and compiles every fuzz target; `nightly.yml` runs `e2e --nightly`, `compare --nightly`, and `headless --full` at the strict budgets on Linux (with the memory cap and the privileged volume steps) and with timing informational on macOS, plus Windows' lifecycle tier; `weekly.yml` scans `tiny-files-10m`. Strict timing runs on the Linux nightly and on the reference machine before a release. [docs/development.md](docs/development.md#continuous-integration-tiers) lists the commands and how to reproduce a CI failure.
 
 ## Scenario authoring
 

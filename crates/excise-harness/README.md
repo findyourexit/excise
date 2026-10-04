@@ -170,10 +170,34 @@ must pass everywhere else the scenario runs.
 `expect_budget` compares a recorded metric with a named budget. The scenario can override a
 budget's limit in `[budgets]`; without an override the runner applies the fixed default below,
 which is the strict limit the validation program holds locally and in the nightly tier. The
-runner has no notion of tier: a scenario meant for the quick, pull-request-gated tier that needs a
-looser limit (for example the latency budgets at 2x, matching this project's pull-request CI gate)
-overrides it explicitly, as `latency-under-deletion-load-default.toml` does; a `full` or `nightly`
-scenario checking the same budget ordinarily takes the strict default instead of repeating it.
+scenarios therefore never say which tier they run in.
+
+A run can carry a **latency scale**, `cargo xtask e2e --latency-scale 2`, which multiplies the
+limit of the four latency budgets (`input_to_frame_p99_ms`, `max_stall_ms`, `first_frame_ms`, and
+`quit_ms`), whether the limit is the default or a scenario's override. Pull-request CI runs the
+quick tier and some `full` scenarios at 2, because a hosted runner is busier than the machines the
+strict budgets are held on. A scale is a finite number of at least 1. It never touches any other
+budget: memory, thread and descriptor counts, scan-store bytes, idle output and CPU, residue, and
+the ratios are contracts that a busy machine does not excuse. A scenario that expects to fail on
+the platform it runs on (`expect = "fail"`) keeps the strict budgets whatever the scale is: the
+defect it documents is measured against them, and a looser limit that the defect stays within would
+read as `xpass`, the signal that it is fixed. A scaled run says so: the summary carries
+`latency_budget_scale`, and the verdict table's last line names the factor. A strict run records
+neither.
+
+A run can also hold **timing informational**: `--timing-informational` on `cargo xtask e2e`,
+`compare`, and `headless`, for a hosted machine that is slower than the one the budgets were set
+on. A timing verdict that would block is then a warning and does not fail the run: one of a
+scenario's four latency budgets (after any latency scale), a comparison's median ratio over its
+limit, or a headless scan's ratio against `du` over its budget. The verdict table lists each
+warning (`WARN`) and counts them on its last line; each scenario or fixture result in
+`summary.json` carries its own in `timing_warnings` (`budget`, `metric`, `value`, and `limit`), and
+the summary says `timing_informational`; the exit status ignores them. Nothing else is excused:
+the other budgets, a wait that times out, a failed step, residue, an oracle diff, a comparison
+whose run never completed within its bound, and a scan or `du` that does not end in time fail as
+before. Whatever is expected to fail (`expect = "fail"`, a comparison's `expect`, an
+`[[expect_ratio_fail]]` entry) keeps its strict verdict, because excusing its miss would read as
+`xpass`, the signal that the defect is fixed. A strict run records neither field.
 
 ```toml
 [budgets]
@@ -574,7 +598,7 @@ regular file; `FixtureRoot` adds only the canonical spelling of the path.
 ## Running scenarios
 
 ```console
-cargo xtask e2e [--quick|--full|--nightly] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--keep-fixture]
+cargo xtask e2e [--quick|--full|--nightly] [--scenario NAME]... [--profile PROFILE]... [--repeat N] [--latency-scale FACTOR] [--timing-informational] [--keep-fixture]
 ```
 
 The command builds the `excise` release binary, or uses the one named by `EXCISE_E2E_BINARY`, loads
@@ -589,6 +613,11 @@ verdict table. It exits non-zero on any `fail`, `xpass`, or `error`.
   selected tier or its `platforms` is otherwise skipped, with the reason, and printed.
 - `--profile` narrows the matrix and may repeat, alongside `--scenario`. `--repeat N` runs each
   pair `N` times, which is how identical verdicts are shown.
+- `--latency-scale FACTOR` multiplies the latency budgets' limits (see [Budgets](#budgets)); `1`, the
+  default, keeps them strict.
+- `--timing-informational` reports a missed latency budget as a warning instead of failing the run
+  (see [Budgets](#budgets)); a scenario that is expected to fail keeps its strict verdict. It
+  composes with `--latency-scale`: a warning is a miss of the scaled limit.
 - `--keep-fixture` keeps each run's fixture and scratch area and prints where they are.
 - The summary is `target/excise-e2e/<run-id>/summary.json`, a `harness-summary` document, and
   `target/excise-e2e/latest` points at the newest run (a symbolic link, or on Windows a text file).
@@ -606,7 +635,7 @@ appears among the recording's input events, and that every byte of the fixture i
 ## Comparison files
 
 ```console
-cargo xtask compare [--quick|--full|--nightly] [--comparison NAME]... [--pairs N] [--seed S]
+cargo xtask compare [--quick|--full|--nightly] [--comparison NAME]... [--pairs N] [--seed S] [--timing-informational]
 ```
 
 `motion_complete_ratio` and `tui_complete_ratio` are ratios between two runs, so one scenario's
@@ -689,6 +718,12 @@ completed or because the ratio itself is too high. Strict xfail then applies exa
 a scenario (see [Expected failures](#expected-failures)): `expect = "fail"` with a failing outcome
 is `xfail`; a passing outcome there is `xpass`, which fails the run.
 
+With `--timing-informational` (see [Budgets](#budgets)), a median ratio over the limit is a
+warning, not a failure: the comparison passes, the table lists it (`WARN`) and counts it on its
+last line, and nothing is written to disk, because a comparison writes no summary. A run that
+never completed within its bound is a timeout, not a ratio, and still fails, and a comparison that
+is expected to fail keeps its strict verdict.
+
 ### Running comparisons
 
 `cargo xtask compare` loads every file in `comparisons/`, selects by tier and platform exactly as
@@ -700,7 +735,7 @@ confidence interval, and the limit. It exits non-zero on any `fail` or `xpass`.
 ## Headless runner
 
 ```console
-cargo xtask headless [--quick|--full] [--fixture ID]... [--class scale|identity|hostile|volumes]... [--profile default|deterministic] [--repeat N] [--timeout SECONDS] [--keep-scratch]
+cargo xtask headless [--quick|--full] [--fixture ID]... [--class scale|identity|hostile|volumes]... [--profile default|deterministic] [--repeat N] [--timeout SECONDS] [--timing-informational] [--keep-scratch]
 ```
 
 `excise_harness::headless` scans a fixture without a terminal, holds the report to the fixture's
@@ -751,7 +786,7 @@ are applied.
 
 **Fixtures.** `--quick` selects the fixtures of at most 10,000 planned entries and `--full`, the
 default, those of at most 250,000. `--fixture` names fixtures and runs them whatever their size (the
-1,000,000-entry fixture only ever runs by name), and `--class` selects every fixture that generates
+1,000,000- and 10,000,000-entry fixtures only ever run by name), and `--class` selects every fixture that generates
 a class. A fixture is scanned in its cached master, which the runner only reads, so a large fixture
 is generated once. A fixture that `cargo clean` could not remove is never cached (see
 [Cache and integrity](#cache-and-integrity)) and is scanned in a run copy instead, generated fresh
@@ -774,6 +809,16 @@ reads a count, not a measured time, so which fixtures are gated never depends on
 machine was; an earlier, `du`-time-based threshold let one fixture's ratio verdict flip between
 runs under load. The budget was set from measurements on macOS and Linux once the per-run
 durable writes were gone and the report writer was buffered.
+
+**Informational timing.** With `--timing-informational`, a gated ratio over the 15x budget that no
+`[[expect_ratio_fail]]` entry documents is a warning when it was measured against a valid `du`
+reference (every measured `du` exited with code 0, and none printed a total the oracle
+contradicts): the fixture passes on the ratio, the table lists it (`WARN`) and counts it on its
+last line, its result in `summary.json` carries a `timing_warnings` entry (`headless_scan_ratio`,
+the median, and the budget), and the summary says `timing_informational`. A ratio measured against
+a `du` that failed, was killed, or walked only part of the tree keeps its strict verdict. The
+oracle diff, the memory budget, and a scan that does not end in time still fail the fixture as
+before, and a ratio that an entry documents keeps its strict verdict.
 
 **Expected failures.** `expectations/headless.toml` has three independent tables.
 `[[expect_fail]]` lists the fixtures that fail the oracle diff for a known defect that is not yet
@@ -945,7 +990,7 @@ let root = copy.root(); // what `excise` is pointed at
 ### Spec files
 
 One file per fixture, `fixtures/<id>.toml`. Parsing rejects unknown fields at every level, and
-loading validates the spec (sizes, counts, colliding roots, and at most 2,000,000 planned
+loading validates the spec (sizes, counts, colliding roots, and at most 10,100,000 planned
 entries), so an absurd spec never reaches the generator. `FixtureSpec::load(dir, id)`,
 `load_bundled(id)`, `from_toml_str`, and `from_path` return typed errors.
 
@@ -1015,6 +1060,7 @@ marker.
 | `tiny-files-50k` | 49,050 | 49 directories of 1,000 tiny files. |
 | `tiny-files-250k` | 249,250 | 249 directories of 1,000 tiny files: the full tier's memory-contract fixture, scanned within the 512 MiB peak-memory budget. |
 | `tiny-files-1m` | 1,010,101 | One million tiny files. For nightly and manual tiers only: tests never generate it. |
+| `tiny-files-10m` | 10,010,101 | Ten million tiny files, 1,000 in each of 10,000 leaf directories. For the weekly tier only: tests never generate it. Its plan alone takes about 0.9 GB of memory and 19 seconds to expand (measured, debug build), and on disk it needs ten million inodes and about 10 GB of 1 KiB blocks, which no hosted runner's own file system has (the weekly workflow builds one). |
 
 ### Determinism and the manifest
 
@@ -1203,7 +1249,7 @@ Machine output is versioned JSON. Every document carries a `document_kind` and a
 
 | Document | `document_kind` | `schema_version` | Written by | Schema | What it is |
 |---|---|---|---|---|---|
-| Summary | `harness-summary` | 1 | `cargo xtask e2e` and `cargo xtask headless` (one schema, both commands; see below) | [`harness-summary.schema.json`](schemas/harness-summary.schema.json) | The result of one run: run id, tier, times, host, the binary's path and SHA-256, the git SHA, and a verdict, duration, and an open map of named metrics for each scenario and profile (or, under `headless`, each fixture). |
+| Summary | `harness-summary` | 1 | `cargo xtask e2e` and `cargo xtask headless` (one schema, both commands; see below) | [`harness-summary.schema.json`](schemas/harness-summary.schema.json) | The result of one run: run id, tier, times, host, the binary's path and SHA-256, the git SHA, the latency scale when it is not 1 (`latency_budget_scale`), whether the run held timing informational (`timing_informational`), and a verdict, duration, an open map of named metrics, and the timing budgets missed without failing (`timing_warnings`) for each scenario and profile (or, under `headless`, each fixture). The three fields are optional and absent in a strict run, so they are additive and the version stays 1. |
 | Failure bundle | `harness-failure` | 1 | `cargo xtask e2e` | [`harness-failure.schema.json`](schemas/harness-failure.schema.json) | The evidence for one failed scenario: the failed step, expected and actual screen text, terminal modes, the session's diagnostics (present only when the step timed out; see [Runner semantics](#runner-semantics)), the recording path, resource use, the fixture hash and seed, and a command that reruns it. |
 | A/B evidence | `harness-ab` | 1 | `cargo xtask bench-e2e` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under (the fixtures compared, the host, the toolchain, the power state, the load average, and concurrent `excise` processes). |
 

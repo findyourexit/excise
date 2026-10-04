@@ -22,12 +22,61 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `pr_scenarios` names the full-tier scenarios that the pull-request PTY tier runs after
+          # the quick tier (docs/development.md, "Continuous integration tiers"). The list per
+          # system is what fits the 15-minute budget of a native job on its hosted runner.
+          # `timing_informational` makes the tier report the timing budgets it misses as warnings
+          # instead of failing on them: the hosted macOS runner is slower than the machine the
+          # budgets are held on, so there the lifecycle and correctness checks gate and timing does
+          # not. Strict timing runs on the Linux nightly and on a reference machine before a release.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            timing_informational: false
+            pr_scenarios: >-
+              latency-under-deletion-load-deterministic
+              latency-under-export-after-deletion
+              latency-under-scan-load
+              latency-under-slow-terminal
+              idle-after-complete-default
+              idle-after-complete-deterministic
+              resource-budget-large-store
+              resource-budget-large-fds
+              memory-budget-interactive-250k
+              signal-hup-idle
+              signal-hup-mid-deletion
+              signal-hup-mid-scan
+              signal-quit-idle
+              signal-quit-mid-deletion
+              signal-quit-mid-scan
+              signal-second-forces-exit
+              signal-term-mid-deletion
+              signal-term-mid-scan
           - os: macos-14
             target: aarch64-apple-darwin
+            timing_informational: true
+            pr_scenarios: >-
+              latency-under-deletion-load-deterministic
+              latency-under-scan-load
+              latency-under-slow-terminal
+              idle-after-complete-default
+              idle-after-complete-deterministic
+              resource-budget-large-store
+              resource-budget-large-fds
+              memory-budget-interactive-250k
+              selection-drift
+              signal-hup-idle
+              signal-hup-mid-deletion
+              signal-hup-mid-scan
+              signal-quit-idle
+              signal-quit-mid-deletion
+              signal-quit-mid-scan
+              signal-second-forces-exit
+              signal-term-mid-deletion
+              signal-term-mid-scan
           - os: windows-2025
             target: x86_64-pc-windows-msvc
+            timing_informational: false
+            pr_scenarios: ""
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -39,9 +88,27 @@ jobs:
           rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
           rustup override set 1.98.0
           rustc --version --verbose
+      - name: Resolve the toolchain that builds the dependency policy tool
+        id: deny-toolchain
+        shell: bash
+        run: echo "id=$(rustc +stable --version | tr -c 'A-Za-z0-9.' '-')" >> "$GITHUB_OUTPUT"
+      - name: Restore the dependency policy tool
+        id: deny-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-deny*
+          key: cargo-deny-0.20.2-${{ runner.os }}-${{ runner.arch }}-${{ steps.deny-toolchain.outputs.id }}
       - name: Install dependency policy tool
         shell: bash
-        run: cargo +stable install cargo-deny --version 0.20.2 --locked
+        env:
+          RESTORED: ${{ steps.deny-cache.outputs.cache-hit }}
+        run: |
+          # Use the restored binary only when it reports the pinned version; otherwise build it.
+          if [[ "$RESTORED" == "true" && "$(cargo deny --version)" == "cargo-deny 0.20.2" ]]; then
+            echo "Using the restored cargo-deny 0.20.2."
+          else
+            cargo +stable install cargo-deny --version 0.20.2 --locked
+          fi
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
@@ -75,6 +142,37 @@ jobs:
         run: cargo package --package excise --locked
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
+      - name: Run the pull-request PTY tier at twice the latency budgets
+        shell: bash
+        timeout-minutes: 10
+        env:
+          # The deletion dialog is at most 78 columns wide; the Windows temporary directory is too long for scenario fixtures.
+          EXCISE_E2E_TMPDIR: ${{ runner.os == 'Windows' && runner.temp || '' }}
+          PR_SCENARIOS: ${{ matrix.pr_scenarios }}
+          TIMING_INFORMATIONAL: ${{ matrix.timing_informational }}
+        run: |
+          flags=(--latency-scale 2)
+          if [[ "$TIMING_INFORMATIONAL" == "true" ]]; then
+            # This runner measures timing and reports it; every other check still gates.
+            flags+=(--timing-informational)
+          fi
+          cargo run --locked --package xtask -- e2e --quick "${flags[@]}"
+          if [[ -n "$PR_SCENARIOS" ]]; then
+            read -r -a names <<< "$PR_SCENARIOS"
+            scenarios=()
+            for name in "${names[@]}"; do
+              scenarios+=(--scenario "$name")
+            done
+            cargo run --locked --package xtask -- e2e "${flags[@]}" "${scenarios[@]}"
+          fi
+      - name: Keep the failure evidence of the pull-request PTY tier
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-failure-${{ matrix.target }}
+          path: target/excise-e2e/
+          if-no-files-found: ignore
+          retention-days: 7
 
   nix:
     name: Nix flake package
