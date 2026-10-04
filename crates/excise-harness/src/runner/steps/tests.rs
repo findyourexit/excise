@@ -1,10 +1,12 @@
 //! The steps that end on a frame event, run against scripted programs.
 //!
 //! One group has a terminal that delivers a frame late, the way `ConPTY` does: the program reports
-//! the frame at once, and the bytes of the frame follow 30 ms later. That is more than any delay
-//! `ConPTY` showed once the program was running (see [`CONPTY_FRAME_WINDOW`]), and ten times the
-//! quiet that the bounded tail waits for. These tests give the executor the frame window Windows
-//! uses, which is what a Windows run of the same steps relies on.
+//! the frame at once, and the bytes of the frame follow 30 ms later, ten times the quiet that the
+//! bounded tail waits for. These tests give the executor a frame window far longer than that
+//! delay, so that a loaded machine, which can stall the script's `sleep` for well over the delay,
+//! cannot fail them: what they check is that a step reads the terminal for the whole window, not
+//! how long the window is. Windows' window is chosen from measured `ConPTY` delays (see
+//! [`CONPTY_FRAME_WINDOW`](super::super::exec::CONPTY_FRAME_WINDOW)).
 //!
 //! The other group has a program that counts an input of its own before it is sent any, the way
 //! `excise` does on Windows, and then draws a frame that does not count the key before the frame
@@ -12,21 +14,23 @@
 //! that nothing but the input baseline keeps a step from taking the first of the two frames for
 //! the answer and reading the screen before the second.
 //!
-//! The programs are shell scripts, so these tests run on Unix.
+//! The programs are shell scripts, so these tests run on Unix. A script that waits for a resize
+//! sleeps in short steps rather than in one `wait` for a background `sleep`: a shell may run the
+//! trap of a signal that arrives just before its `wait` starts only once that `wait` is over.
 
 use std::{collections::BTreeMap, time::Duration};
 
-use super::super::{
-    exec::{CONPTY_FRAME_WINDOW, Executor},
-    outcome::Stop,
-    plan::prepare,
-};
+use super::super::{exec::Executor, outcome::Stop, plan::prepare};
 use crate::{
     fixture::{FixtureCache, FixtureSpec, Fixtures},
     pty::{PtySession, SpawnSpec},
     safety::{FixtureRoot, FixtureSnapshot, Scratch, isolated_env},
     scenario::{Profile, Scenario},
 };
+
+/// The frame window of the tests whose terminal delivers a frame 30 ms after its event: far longer
+/// than that, so a stalled script still delivers within it.
+const LATE_FRAME_WINDOW: Duration = Duration::from_secs(2);
 
 /// The frame window of the tests with a program that counts an input of its own: long enough for
 /// bytes written just before their event to arrive, and far below the 100 ms between the frames.
@@ -59,9 +63,11 @@ printf UPDATED
 const RESIZE_DRAWS_LATE: &str = r"
 trap 'report 1; /bin/sleep 0.03; printf UPDATED' WINCH
 printf READY
-/bin/sleep 30 &
-wait $!
-wait
+i=0
+while [ $i -lt 600 ]; do
+  /bin/sleep 0.05
+  i=$((i + 1))
+done
 ";
 
 /// Counts one input of its own before it is sent any. When Enter arrives it reports a frame that
@@ -86,9 +92,11 @@ const COUNTS_ITS_OWN_INPUT_BEFORE_A_RESIZE: &str = r"
 trap 'report 1; /bin/sleep 0.1; printf UPDATED; report 2; read line; printf DONE; report 3' WINCH
 report 1
 printf READY
-/bin/sleep 30 &
-wait $!
-wait
+i=0
+while [ $i -lt 600 ]; do
+  /bin/sleep 0.05
+  i=$((i + 1))
+done
 ";
 
 fn scenario(steps: &str) -> Scenario {
@@ -214,14 +222,14 @@ contains = ["DONE"]
 
 #[test]
 fn settle_reads_a_frame_the_terminal_delivers_after_its_event() {
-    let run = run(ENTER_DRAWS_LATE, SETTLE_THEN_EXPECT, CONPTY_FRAME_WINDOW);
+    let run = run(ENTER_DRAWS_LATE, SETTLE_THEN_EXPECT, LATE_FRAME_WINDOW);
 
     assert!(run.result.is_ok(), "{:?}", run.result);
 }
 
 #[test]
 fn resize_reads_a_frame_the_terminal_delivers_after_its_event() {
-    let run = run(RESIZE_DRAWS_LATE, RESIZE_THEN_EXPECT, CONPTY_FRAME_WINDOW);
+    let run = run(RESIZE_DRAWS_LATE, RESIZE_THEN_EXPECT, LATE_FRAME_WINDOW);
 
     assert!(run.result.is_ok(), "{:?}", run.result);
 }
