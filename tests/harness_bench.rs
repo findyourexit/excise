@@ -59,12 +59,15 @@ fn the_same_binary_on_both_sides_validates_and_blocks_nothing() {
         }],
         pairs: 5,
         seed: 1,
-        // Five pairs of a scan that costs a few tens of milliseconds of CPU cannot resolve a 20%
-        // difference on a shared machine: in a CI build sandbox, this same binary once measured
-        // 1.25x on user CPU with a confident interval. Only a gross difference may block here; the
-        // 20% rule itself is covered by the verdict unit tests.
-        timing_threshold: 1.0,
-        memory_tolerance: 0.05,
+        // Five pairs on a shared machine can judge only a gross difference; the verdict rules
+        // themselves are covered by the verdict unit tests. Timing is not judged at all: five pairs
+        // of a scan that costs a few tens of milliseconds cannot resolve it, and in CI build
+        // sandboxes this same binary has measured 1.25x user CPU and 2.44x wall time against
+        // itself with confident intervals. Peak memory moves by a few percent between identical
+        // runs on a hosted macOS runner (once 5.3% lower on the second side of all five pairs;
+        // 1-2% over twenty pairs, in either direction), so only a move past half of it blocks.
+        timing_threshold: f64::INFINITY,
+        memory_tolerance: 0.5,
         strict: false,
         timeout: Duration::from_secs(120),
         work_dir: work.0.join("scratch"),
