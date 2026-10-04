@@ -25,7 +25,7 @@
 //!
 //! `ConPTY` also keeps its own copy of the screen and sends what changed on a timer, so output can
 //! reach the reader tens of milliseconds after the program wrote it. A step that waits for a frame
-//! event allows for that (`runner::exec::CONPTY_FRAME_WINDOW`).
+//! event allows for that (`runner::live::CONPTY_FRAME_WINDOW`).
 
 use std::{
     ffi::OsString,
@@ -51,8 +51,25 @@ use crate::{
 
 use super::{
     cast::{CastHeader, CastWriter},
+    marks::{MarkScanner, Piece},
     screen::{Screen, ScreenModes},
 };
+
+/// How many marks a session remembers. The waits that ask about a mark ask about a recent one, and
+/// a mark that has left the log is answered by the oldest one kept, which was read after it.
+const MARKS_KEPT: usize = 4096;
+
+/// A mark the session has read, and what came after it.
+#[derive(Debug, Clone, Copy)]
+struct MarkRead {
+    /// The number of the frame the mark follows.
+    seq: u64,
+    /// When the mark was read.
+    at: Instant,
+    /// When the first output that is not a mark was read after the mark: the paint of a console
+    /// host that paints on its own timer. `None` until some has come.
+    first_paint_at: Option<Instant>,
+}
 
 /// How often a running child is sampled for memory, threads, and descriptors.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -263,6 +280,15 @@ pub struct PtySession {
     /// Lifted by [`PtySession::kill`] so a capped reader drains freely once the run ends.
     uncapped: Arc<AtomicBool>,
     screen: Screen,
+    /// Takes the frame marks out of the output before the screen model sees it.
+    marks: MarkScanner,
+    /// The latest frame whose mark the session has read. Zero until the first mark.
+    frame_shown: u64,
+    /// How many of the newest marks in `marks_read` no output that is not a mark has followed yet.
+    unpainted: usize,
+    /// The latest marks read, oldest first, and what came after each (see
+    /// [`PtySession::paint_followed_mark`]). At most [`MARKS_KEPT`].
+    marks_read: std::collections::VecDeque<MarkRead>,
     recording: Option<(PathBuf, CastWriter<io::BufWriter<std::fs::File>>)>,
     started: Instant,
     exit: Option<ExitInfo>,
@@ -372,6 +398,10 @@ impl PtySession {
             reader_done: false,
             uncapped,
             screen: Screen::new(spec.rows, spec.cols),
+            marks: MarkScanner::default(),
+            frame_shown: 0,
+            unpainted: 0,
+            marks_read: std::collections::VecDeque::new(),
             recording,
             started,
             exit: None,
@@ -420,6 +450,41 @@ impl PtySession {
     #[must_use]
     pub const fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// The latest frame whose mark the session has read, or zero when it has read none. On a Unix
+    /// pseudo-terminal the mark follows its frame's bytes, so the screen model has been through
+    /// every byte of that frame and of every frame before it. A console host that paints on its own
+    /// timer (`ConPTY`) delivers the mark before the paint of its frame: there the mark says that
+    /// the host has the frame, and [`PtySession::paint_followed_mark`] says when the screen shows
+    /// it. A program that does not mark its frames never moves it (see the `pty` module); one that
+    /// does moves it once for every frame it draws.
+    #[must_use]
+    pub const fn frame_shown(&self) -> u64 {
+        self.frame_shown
+    }
+
+    /// The first mark of frame `seq` or later that the session has read. Marks come in the order
+    /// of their frames, so that is the frame's own or, if that one has left the log, the oldest
+    /// one kept, which was read after it: what followed that mark followed this one.
+    fn mark_of(&self, seq: u64) -> Option<&MarkRead> {
+        self.marks_read.iter().find(|mark| mark.seq >= seq)
+    }
+
+    /// Whether the screen model can be taken to show frame `seq` on a console host that paints on
+    /// its own timer (`ConPTY`), whose mark arrives before the paint of its frame, for a read that
+    /// decides nothing destructive: the mark of `seq` has been read, and then either output that is
+    /// not a mark has been read after it, which is a paint taken after the host had the frame and
+    /// shows that frame or a later one, or `window` has passed since the mark was read with nothing
+    /// painted, which is taken to mean that nothing needed painting. Another frame's mark is not
+    /// output that paints. `false` while the mark has not been read. That is a guess, and a
+    /// deletion never rests on it: no paint of such a console host can be proved complete, so
+    /// `runner::live` confirms no deletion from its screen. On a Unix pseudo-terminal the mark
+    /// follows its frame's bytes, and [`PtySession::frame_shown`] is all there is to ask.
+    #[must_use]
+    pub fn paint_followed_mark(&self, seq: u64, window: Duration) -> bool {
+        self.mark_of(seq)
+            .is_some_and(|mark| mark.first_paint_at.is_some() || mark.at.elapsed() >= window)
     }
 
     /// The bytes of terminal output read so far.
@@ -529,7 +594,7 @@ impl PtySession {
     /// describes, which travel by a different route: the event file is readable before the reader
     /// thread has delivered the screen bytes. It is a bounded tail after a semantic condition,
     /// never a wait for an idle screen. A terminal that can hold a frame back for longer than this
-    /// tail reads (`ConPTY`) is waited for first: see `runner::exec::CONPTY_FRAME_WINDOW`.
+    /// tail reads (`ConPTY`) is waited for first: see `runner::live::CONPTY_FRAME_WINDOW`.
     ///
     /// # Errors
     ///
@@ -716,6 +781,9 @@ impl PtySession {
         Ok(())
     }
 
+    /// Takes one read of the output in. The recording, the diagnostics, and the byte count see the
+    /// bytes as they came, marks included; the screen model sees them without the marks, and the
+    /// session notes which frame the screen now shows (see [`MarkScanner`]).
     fn absorb(&mut self, chunk: &Chunk) -> Result<(), PtyError> {
         self.output_bytes += chunk.bytes.len() as u64;
         if !chunk.bytes.is_empty() {
@@ -730,7 +798,39 @@ impl PtySession {
                     source,
                 })?;
         }
-        let replies = self.screen.process(&chunk.bytes);
+        let mut replies = Vec::new();
+        let (screen, frame_shown, unpainted, marks_read) = (
+            &mut self.screen,
+            &mut self.frame_shown,
+            &mut self.unpainted,
+            &mut self.marks_read,
+        );
+        self.marks.feed(&chunk.bytes, |piece| match piece {
+            Piece::Bytes(bytes) => {
+                replies.extend_from_slice(&screen.process(bytes));
+                // The marks that no output had followed are followed by this: it is what the
+                // console host painted after them.
+                for mark in marks_read.iter_mut().rev().take(*unpainted) {
+                    mark.first_paint_at = Some(chunk.at);
+                }
+                *unpainted = 0;
+            }
+            // Frames are numbered in the order they are drawn, so a mark can only move the frame
+            // the screen shows forward.
+            Piece::Frame(seq) => {
+                *frame_shown = (*frame_shown).max(seq);
+                if marks_read.len() == MARKS_KEPT {
+                    marks_read.pop_front();
+                    *unpainted = (*unpainted).min(marks_read.len());
+                }
+                marks_read.push_back(MarkRead {
+                    seq,
+                    at: chunk.at,
+                    first_paint_at: None,
+                });
+                *unpainted += 1;
+            }
+        });
         if !replies.is_empty() {
             // A terminal answers a cursor position request; ConPTY, for one, waits for it before it
             // shows anything. A program that has already closed its side of the terminal cannot
@@ -1313,6 +1413,49 @@ mod tests {
                 .any(|(kind, data)| *kind == "o" && data.contains("got:abc")),
             "{kinds:?}"
         );
+    }
+
+    #[test]
+    fn the_marks_a_program_writes_move_the_frame_the_screen_shows_and_stay_in_the_recording() {
+        // The first mark is written in two pieces with a pause between them, which a read can
+        // fall between; the second comes in the same write as the text around it. Where the
+        // reads end must change nothing: the screen model gets the text without the marks, the
+        // session knows the latest frame whose mark it read, and the recording keeps every byte
+        // as the program wrote it.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("session.cast");
+        let mut spec = shell(
+            "printf 'one\\033]9471;excise-fr'; sleep 0.2; \
+             printf 'ame=1\\007two\\033]9471;excise-frame=2\\007three'",
+        );
+        spec.recording = Some(path.clone());
+        let mut session = PtySession::spawn(&spec).expect("spawn");
+        assert_eq!(session.frame_shown(), 0, "no mark has been read");
+
+        run_until(&mut session, PtySession::finished);
+        session.finish_recording().expect("flush");
+
+        assert_eq!(session.frame_shown(), 2);
+        assert!(
+            session.screen().text().contains("onetwothree"),
+            "{}",
+            session.screen().text()
+        );
+        let recorded: String = std::fs::read_to_string(&path)
+            .expect("the recording")
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON"))
+            .filter(|event| event[1] == "o")
+            .map(|event| event[2].as_str().expect("data").to_owned())
+            .collect();
+        for seq in [1, 2] {
+            let mark = format!("\u{1b}]9471;excise-frame={seq}\u{7}");
+            assert!(
+                recorded.contains(&mark),
+                "mark {seq} is not in {recorded:?}"
+            );
+        }
     }
 
     #[test]

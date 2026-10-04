@@ -78,6 +78,23 @@ pub fn header_state(screen: &Screen) -> Option<HeaderState> {
     })
 }
 
+/// The folder path in the header row, as drawn, or `None` before the header is drawn.
+///
+/// The row reads ` EXCISE  <path>  <marker> <STATE>` (see [`header_state`]). The program cuts a
+/// path that does not fit in the middle, with an ellipsis, so the text may not be the whole path.
+#[must_use]
+pub fn header_path(screen: &Screen) -> Option<String> {
+    let row = screen.row_text(0);
+    let rest = row.trim_start().strip_prefix("EXCISE")?;
+    let (path, badge) = rest.rsplit_once("  ")?;
+    let (marker, state) = badge.split_once(' ')?;
+    if marker.chars().count() != 1 || state.trim().is_empty() {
+        return None;
+    }
+    let path = path.trim();
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
 /// The entry described by the inspector pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedItem {
@@ -270,6 +287,47 @@ pub fn offers_plain_quit(view: &BoxView) -> bool {
     view.interior
         .iter()
         .any(|line| line.trim() == QUIT_CONFIRMATION)
+}
+
+/// The key that confirms the quit dialog `view` offers: `y` for `[y] Quit`, `c` for `[c] Cancel
+/// checks and quit` (deletion checks are waiting), and `s` for `[s] Request safe stop and quit` or
+/// `[s] Stop after current item and quit` (a deletion is running). `None` for a dialog that offers
+/// none of them: it is not a quit dialog, or the program is already stopping.
+#[must_use]
+pub fn quit_confirmation_key(view: &BoxView) -> Option<u8> {
+    view.interior.iter().find_map(|line| {
+        let line = line.trim();
+        if !line.to_ascii_lowercase().ends_with("quit") {
+            return None;
+        }
+        match line.as_bytes() {
+            [b'[', key @ (b'y' | b'c' | b's'), b']', b' ', ..] => Some(*key),
+            _ => None,
+        }
+    })
+}
+
+/// Whether the screen shows a deletion dialog, or anything that reads like one.
+///
+/// A key that confirms a deletion must never be sent while this holds. It asks for more than
+/// [`dialog_view`] does, so that a dialog the model cannot place (it is not centred, or is still
+/// being drawn) is not taken for no dialog at all: any box titled `! DELETE …`, and the
+/// confirmation lines of a deletion dialog anywhere on the screen, count.
+#[must_use]
+pub fn deletion_dialog_visible(screen: &Screen) -> bool {
+    if matches!(dialog_view(screen), DialogView::Delete(_)) {
+        return true;
+    }
+    let title = DELETE_TITLE_PREFIX.trim_end();
+    if screen
+        .boxes()
+        .iter()
+        .any(|view| view.title.starts_with(title))
+    {
+        return true;
+    }
+    let text = screen.text();
+    text.contains(SINGLE_KEY_CONFIRMATION) || text.contains(TYPED_CONFIRMATION)
 }
 
 #[cfg(test)]
@@ -608,5 +666,138 @@ mod tests {
         assert!(!offers_plain_quit(&view));
 
         assert_eq!(dialog_view(&drawn(30, 100, &[])), DialogView::None);
+    }
+
+    #[test]
+    fn a_quit_dialog_names_the_key_that_confirms_it() {
+        for (lines, key) in [
+            (
+                &["Quit Excise?", "", "[y] Quit", "[Esc/q/n] Keep working"][..],
+                Some(b'y'),
+            ),
+            (
+                &[
+                    "2 deletion check(s) are waiting.",
+                    "[c] Cancel checks and quit",
+                    "[w/Esc/q/n] Keep working",
+                ][..],
+                Some(b'c'),
+            ),
+            (
+                &[
+                    "Final safety check.",
+                    "[s] Request safe stop and quit",
+                    "[w/Esc/q/n] Keep working",
+                ][..],
+                Some(b's'),
+            ),
+            (
+                &[
+                    "3 of 9 items processed.",
+                    "[s] Stop after current item and quit",
+                ][..],
+                Some(b's'),
+            ),
+            (
+                &[
+                    "Stopping at the next safe boundary.",
+                    "Waiting for final safety check cancellation.",
+                ][..],
+                None,
+            ),
+        ] {
+            let DialogView::Other(view) = dialog_view(&dialog_screen("QUIT", lines)) else {
+                panic!("another dialog");
+            };
+
+            assert_eq!(quit_confirmation_key(&view), key, "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_confirmation_never_names_a_quit_key() {
+        let screen = dialog_screen(
+            "NOTICE",
+            &[
+                "[y] is not offered here",
+                "[Esc] to quit",
+                "[x] Quit",
+                "y Quit",
+            ],
+        );
+        let DialogView::Other(view) = dialog_view(&screen) else {
+            panic!("another dialog");
+        };
+
+        assert_eq!(quit_confirmation_key(&view), None);
+    }
+
+    #[test]
+    fn a_deletion_dialog_is_visible_even_where_the_model_cannot_place_it() {
+        let placed = dialog_screen(
+            "! DELETE FILE",
+            &["/tmp/x/victim.bin", "[Enter/y] start · [Esc/n] cancel"],
+        );
+        assert!(deletion_dialog_visible(&placed));
+
+        // Against the left edge, so that `dialog_view` takes it for a pane and not a dialog.
+        let mut flush = Screen::new(30, 100);
+        place(
+            &mut flush,
+            8,
+            0,
+            &unicode_box("! DELETE FOLDER", 98, &["/tmp/x/victim"]),
+        );
+        assert_eq!(dialog_view(&flush), DialogView::None);
+        assert!(deletion_dialog_visible(&flush));
+
+        // The confirmation line alone, with no box around it.
+        assert!(deletion_dialog_visible(&drawn(
+            10,
+            80,
+            &[(4, 2, "[Enter/y] start · [Esc/n] cancel")]
+        )));
+        assert!(deletion_dialog_visible(&drawn(
+            10,
+            80,
+            &[(4, 2, "Type this exactly: DELETE 7K3M9P")]
+        )));
+    }
+
+    #[test]
+    fn no_deletion_dialog_is_seen_where_there_is_none() {
+        let quit = dialog_screen(
+            "QUIT",
+            &["Quit Excise?", "", "[y] Quit", "[Esc/q/n] Keep working"],
+        );
+        assert!(!deletion_dialog_visible(&quit));
+        assert!(!deletion_dialog_visible(&drawn(30, 100, &[])));
+        assert!(!deletion_dialog_visible(&drawn(
+            5,
+            80,
+            &[(0, 0, " EXCISE  /tmp/x  ◆ COMPLETE"), (3, 0, "photos")]
+        )));
+    }
+
+    #[test]
+    fn the_header_names_the_folder_that_is_open() {
+        for (row, path) in [
+            (" EXCISE  /tmp/x/  ◆ COMPLETE", Some("/tmp/x/")),
+            (" EXCISE  /tmp/x/docs  ◌ SCANNING", Some("/tmp/x/docs")),
+            (
+                " EXCISE  /tmp/x/a b  c  ◆ REBUILDING",
+                Some("/tmp/x/a b  c"),
+            ),
+            (" EXCISE  /tmp/x", None),
+            ("Loading...  ◆ COMPLETE", None),
+            (" EXCISE    ◆ COMPLETE", None),
+        ] {
+            assert_eq!(
+                header_path(&drawn(5, 80, &[(0, 0, row)])).as_deref(),
+                path,
+                "{row:?}"
+            );
+        }
+        assert_eq!(header_path(&drawn(5, 80, &[])), None);
     }
 }

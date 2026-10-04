@@ -15,6 +15,7 @@ use std::{
 
 use excise_harness::{
     fixture::Fixtures,
+    pty::keys::BARRIER,
     report::Verdict,
     runner::{FailureCause, LatencyScale, RunReport, RunRequest, run_scenario, work_base},
     scenario::{Profile, Scenario, Step},
@@ -154,6 +155,60 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, Entry> {
     entries
 }
 
+/// What the pseudo-terminal runner does with a scenario that has a `delete` step where the
+/// terminal cannot be tied to a frame (Windows' console host paints on its own timer): the step
+/// refuses before it sends a key, so no Backspace and no `y` reaches the program from it, and the
+/// fixture is as it was. `cargo xtask e2e` skips such a scenario; running it here is the positive
+/// check of that decision on the platform it is for.
+fn refuses_to_delete_where_the_screen_is_not_exact(scenario: &Scenario, profile: Profile) {
+    let work = Workspace::new();
+    let fixture = Fixtures::bundled()
+        .run_copy(&scenario.fixture, &work.0)
+        .expect("the fixture is built");
+    let before = tree(fixture.root());
+
+    let (report, bundle) = run(scenario, profile, fixture.root(), &work);
+
+    assert_eq!(report.verdict, Verdict::Fail, "{profile}: {report:?}");
+    let failure = report.failure.as_ref().expect("a failed step");
+    assert_eq!(
+        failure.cause,
+        FailureCause::DeleteRefused,
+        "{profile}: {failure}"
+    );
+    assert!(
+        matches!(scenario.steps.get(failure.index), Some(Step::Delete(_))),
+        "{profile}: the failed step is not the delete step: {failure}"
+    );
+    assert!(
+        failure.to_string().contains("on its own timer"),
+        "{profile}: {failure}"
+    );
+    // Nothing was written after the `select` before the step: not the Backspace that opens the
+    // dialog (or deletes, with no dialog), and no `y`. A `select` can write Backspaces of its own,
+    // to erase the text the filter opened with, and the terminal's answers to cursor position
+    // requests, which the recording keeps as inputs, begin with the escape byte; a scenario can
+    // also have no key before the step at all.
+    let inputs = recorded_inputs(&bundle);
+    let last_key = inputs
+        .iter()
+        .rev()
+        .find(|input| !input.starts_with('\u{1b}'));
+    assert_ne!(
+        last_key.map(String::as_str),
+        Some("\u{7f}"),
+        "{profile}: {inputs:?}"
+    );
+    assert!(
+        !inputs.iter().any(|input| input == "y"),
+        "{profile}: {inputs:?}"
+    );
+    assert!(
+        tree(fixture.root()) == before,
+        "{profile}: the fixture changed"
+    );
+}
+
 #[test]
 fn the_delete_folder_lifecycle_passes_under_every_profile_it_names() {
     let _session = session_guard();
@@ -161,6 +216,10 @@ fn the_delete_folder_lifecycle_passes_under_every_profile_it_names() {
     assert!(scenario.profiles.contains(&Profile::Default));
     assert!(scenario.profiles.contains(&Profile::Deterministic));
     for &profile in &scenario.profiles {
+        if cfg!(windows) {
+            refuses_to_delete_where_the_screen_is_not_exact(&scenario, profile);
+            continue;
+        }
         let work = Workspace::new();
         let fixture = Fixtures::bundled()
             .run_copy(&scenario.fixture, &work.0)
@@ -180,6 +239,10 @@ fn the_delete_folder_lifecycle_passes_under_every_profile_it_names() {
 fn a_wrong_delete_target_fails_the_step_and_no_confirmation_key_is_ever_sent() {
     let _session = session_guard();
     let scenario = load(CONTROLS, "delete-wrong-target");
+    if cfg!(windows) {
+        refuses_to_delete_where_the_screen_is_not_exact(&scenario, Profile::Default);
+        return;
+    }
     let work = Workspace::new();
     let fixture = Fixtures::bundled()
         .run_copy(&scenario.fixture, &work.0)
@@ -210,7 +273,11 @@ fn a_wrong_delete_target_fails_the_step_and_no_confirmation_key_is_ever_sent() {
     assert!(tree(fixture.root()) == before, "the fixture changed");
 }
 
-/// Every input the runner wrote to the program, from the failure bundle's recording.
+/// Every key the runner wrote to the program, from the failure bundle's recording.
+///
+/// The input barrier requests that the runner writes behind the keys it needs the program to have
+/// read are not keys: the program does not act on one, and none of them confirms anything. They
+/// are left out, so that "the last key" is the last key.
 fn recorded_inputs(bundle: &Path) -> Vec<String> {
     let cast = fs::read_to_string(bundle.join("session.cast")).expect("the bundle has a recording");
     cast.lines()
@@ -218,6 +285,7 @@ fn recorded_inputs(bundle: &Path) -> Vec<String> {
         .map(|line| serde_json::from_str::<Value>(line).expect("a cast event"))
         .filter(|event| event[1] == "i")
         .map(|event| event[2].as_str().expect("input text").to_owned())
+        .filter(|input| input.as_bytes() != [BARRIER])
         .collect()
 }
 
@@ -225,6 +293,10 @@ fn recorded_inputs(bundle: &Path) -> Vec<String> {
 fn a_wrong_delete_target_with_no_dialog_fails_the_step_before_backspace_is_ever_sent() {
     let _session = session_guard();
     let scenario = load(CONTROLS, "delete-reduced-wrong-target");
+    if cfg!(windows) {
+        refuses_to_delete_where_the_screen_is_not_exact(&scenario, Profile::Default);
+        return;
+    }
     assert!(scenario.disable_delete_confirmation);
     let work = Workspace::new();
     let fixture = Fixtures::bundled()
@@ -263,6 +335,10 @@ fn a_wrong_delete_target_with_no_dialog_fails_the_step_before_backspace_is_ever_
 fn a_delete_step_without_a_path_refuses_an_entry_of_that_name_below_another_folder() {
     let _session = session_guard();
     let scenario = load(CONTROLS, "delete-default-path-nested-entry");
+    if cfg!(windows) {
+        refuses_to_delete_where_the_screen_is_not_exact(&scenario, Profile::Default);
+        return;
+    }
     let work = Workspace::new();
     let fixture = Fixtures::bundled()
         .run_copy(&scenario.fixture, &work.0)
@@ -280,7 +356,7 @@ fn a_delete_step_without_a_path_refuses_an_entry_of_that_name_below_another_fold
     assert!(
         failure
             .to_string()
-            .contains("the dialog deletes `docs/twin.bin`, but the step deletes `twin.bin`"),
+            .contains("the dialog deletes `docs/twin.bin`, but the request is for `twin.bin`"),
         "{failure}"
     );
 
@@ -301,6 +377,10 @@ fn a_delete_step_without_a_path_refuses_an_entry_of_that_name_below_another_fold
 fn a_deletion_with_no_dialog_refuses_a_name_and_kind_that_fit_two_entries() {
     let _session = session_guard();
     let scenario = load(CONTROLS, "delete-reduced-ambiguous-name");
+    if cfg!(windows) {
+        refuses_to_delete_where_the_screen_is_not_exact(&scenario, Profile::Default);
+        return;
+    }
     assert!(scenario.disable_delete_confirmation);
     let work = Workspace::new();
     let fixture = Fixtures::bundled()
@@ -534,6 +614,10 @@ present = ["keep-a.bin", "keep-b/keep.txt"]
 absent = ["victim"]
 "#,
     );
+    if cfg!(windows) {
+        refuses_to_delete_where_the_screen_is_not_exact(&scenario, Profile::Deterministic);
+        return;
+    }
     let work = Workspace::new();
     let fixture = Fixtures::bundled()
         .run_copy(&scenario.fixture, &work.0)

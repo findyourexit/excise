@@ -3,6 +3,8 @@
 //! Every fixture root carries [`MARKER_FILE_NAME`], a regular file (never a symbolic link). The
 //! harness refuses to run `excise`, or to mutate anything, in a root without it, so that a
 //! mistyped path can never point a deletion test at real data. [`verify_owned`] is that check.
+//! [`is_marker_path`] is the one rule for which fixture-relative paths name the marker, which no
+//! mutation and no deletion may touch.
 //!
 //! The generator writes a JSON [`Marker`] as the last thing it does. That makes the marker the
 //! fixture's seal too: a directory that is still being generated has none, and a cache entry is
@@ -209,6 +211,25 @@ pub fn verify_owned(root: &Path) -> Result<(), OwnershipError> {
     }
 }
 
+/// Whether the fixture-relative `relative` is the ownership marker or lies inside it.
+///
+/// True when the first `/`-separated component of `relative` is [`MARKER_FILE_NAME`]: the path is
+/// `.excise-harness-owned` itself or starts with `.excise-harness-owned/`. The comparison is
+/// exact, as in the fixture specs and the mutators, and looks at the first component only:
+/// only the root's own entry of that name is the marker, so `sub/.excise-harness-owned`,
+/// `.excise-harness-owned-2`, and `.excise-harness-owned.tmp` are other entries.
+///
+/// The path is taken as it is written. This does not apply the fixture-relative path rule
+/// ([`check_fixture_relative_path`](crate::scenario::check_fixture_relative_path)); a caller that
+/// needs it checks it separately. [`mutate::apply`](crate::fixture::mutate::apply) refuses every
+/// operation on such a path, and scenario validation rejects a `delete` step that would delete
+/// one: a root that lost its marker is no fixture any more, and every runner refuses a root like
+/// that.
+#[must_use]
+pub fn is_marker_path(relative: &str) -> bool {
+    relative.split('/').next() == Some(MARKER_FILE_NAME)
+}
+
 /// Reads the marker of a harness-generated fixture.
 ///
 /// # Errors
@@ -260,4 +281,74 @@ pub fn write_marker(root: &Path, marker: &Marker) -> io::Result<()> {
         &directory,
         MARKER_FILE_NAME.as_bytes(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{MARKER_FILE_NAME, is_marker_path};
+    use crate::{
+        fixture::mutate::{MutateError, apply},
+        scenario::MutateOp,
+    };
+
+    #[test]
+    fn the_marker_and_everything_inside_it_are_marker_paths() {
+        let inside = format!("{MARKER_FILE_NAME}/inner");
+        let deeper = format!("{MARKER_FILE_NAME}/inner/deeper");
+        for path in [MARKER_FILE_NAME, inside.as_str(), deeper.as_str()] {
+            assert!(is_marker_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn only_the_first_component_can_be_the_marker() {
+        // The same name further down is another entry.
+        let nested = format!("sub/{MARKER_FILE_NAME}");
+        let deeper = format!("a/b/{MARKER_FILE_NAME}/c");
+        for path in [nested.as_str(), deeper.as_str()] {
+            assert!(!is_marker_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_only_resembles_the_marker_is_not_a_marker_path() {
+        let lookalikes = [
+            String::new(),
+            format!("{MARKER_FILE_NAME}-2"),
+            format!("{MARKER_FILE_NAME}.tmp"),
+            format!("x{MARKER_FILE_NAME}"),
+            MARKER_FILE_NAME[1..].to_owned(),
+            MARKER_FILE_NAME[..MARKER_FILE_NAME.len() - 1].to_owned(),
+        ];
+        for lookalike in &lookalikes {
+            assert!(!is_marker_path(lookalike), "{lookalike:?}");
+        }
+    }
+
+    #[test]
+    fn the_mutators_refuse_the_paths_this_rule_names_and_no_others() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        fs::write(root.path().join(MARKER_FILE_NAME), b"owned").expect("the marker");
+        fs::create_dir(root.path().join("sub")).expect("a folder");
+        fs::write(root.path().join("sub").join(MARKER_FILE_NAME), b"x").expect("a lookalike");
+
+        let inside = format!("{MARKER_FILE_NAME}/inner");
+        for path in [MARKER_FILE_NAME, inside.as_str()] {
+            assert!(is_marker_path(path), "{path}");
+            assert!(
+                matches!(
+                    apply(root.path(), MutateOp::Vanish, path),
+                    Err(MutateError::Protected { .. })
+                ),
+                "{path}"
+            );
+        }
+        // The same name in a folder is an ordinary entry, which `vanish` removes like any other.
+        let nested = format!("sub/{MARKER_FILE_NAME}");
+        assert!(!is_marker_path(&nested));
+        apply(root.path(), MutateOp::Vanish, &nested).expect("an ordinary entry goes");
+        assert!(root.path().join(MARKER_FILE_NAME).is_file());
+    }
 }

@@ -1,4 +1,8 @@
 //! The steps of the scenario vocabulary, implemented on the executor.
+//!
+//! The steps that talk to the program through a protocol shared with the interactive driver
+//! (`select`, `delete`, `settle`, `quit`) call the protocol in [`super::live`] and report its
+//! failures as step failures; the rest are specific to a scenario run.
 
 use std::{
     fs,
@@ -10,48 +14,29 @@ use crate::{
     fixture::mutate,
     metrics::live_cpu_ms,
     pty::ui::{
-        DialogView, FilterPrompt, Inspector, dialog_view, filter_prompt, header_state, inspector,
+        DialogView, Inspector, SelectedItem, dialog_view, header_state, inspector,
         offers_plain_quit,
     },
     report::TimingWarning,
     safety::{FixtureSnapshot, send_signal},
     scenario::{
-        ConfirmKey, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, ExpectBudget, ExpectConfig, ExpectExit,
-        ExpectFs, ExpectScreen, FsMutate, Idle, Measure, Quit, Residue, Resize, Select, SendSignal,
-        Settle, Signal, Step, WaitEvent, WaitFs, WaitHeader, WaitRefresh, WaitText, config_setting,
+        DEFAULT_TIMEOUT_MS, Delete, DeleteWait, ExpectBudget, ExpectConfig, ExpectExit, ExpectFs,
+        ExpectScreen, FsMutate, Idle, Measure, Quit, Residue, Resize, Select, SendSignal, Settle,
+        Signal, Step, WaitEvent, WaitFs, WaitHeader, WaitRefresh, WaitText, config_setting,
     },
 };
 
 use super::{
     budget::{is_latency, limit_for},
-    delete::{verify, verify_selection},
-    exec::{Executor, FS_POLL_INTERVAL, Waited},
+    delete::verify_selection,
+    exec::{Executor, FS_POLL_INTERVAL},
+    live::{BACKSPACE, DeletionRequest, Drive, Needs, Waited},
     outcome::{FailureCause, RunError, Stop},
     plan::{Prepared, describe_region},
 };
 
-/// The bytes of a Backspace key press.
-const BACKSPACE: [u8; 1] = [0x7f];
-/// The bytes of an Enter key press.
-const ENTER: [u8; 1] = *b"\r";
-/// After the frame window (`Executor::catch_up`), output that is still arriving is read until it
-/// has been quiet this long...
-const SETTLE_QUIET: std::time::Duration = std::time::Duration::from_millis(3);
-/// ...or this long has passed.
-const SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_millis(20);
 /// How long `expect_exit` reads the rest of the output after the program has exited.
 const EXIT_OUTPUT_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
-
-impl<T> Waited<T> {
-    /// The outcome without its value.
-    pub(super) const fn discard(&self) -> Waited<()> {
-        match self {
-            Self::Ready(_) => Waited::Ready(()),
-            Self::TimedOut => Waited::TimedOut,
-            Self::Exited => Waited::Exited,
-        }
-    }
-}
 
 /// Where the map stands after the deletions a `wait_refresh` waits for.
 enum Refresh {
@@ -111,7 +96,7 @@ impl Executor<'_> {
         let region = step.region;
         let waited = self.wait_until(Self::deadline(step.timeout_ms), |exec| {
             matcher
-                .is_match(&exec.session.screen().region_text(region))
+                .is_match(&exec.live.session.screen().region_text(region))
                 .then_some(())
         })?;
         match waited {
@@ -128,7 +113,7 @@ impl Executor<'_> {
                 || {
                     format!(
                         "the screen shows:\n{}",
-                        self.session.screen().region_text(region)
+                        self.live.session.screen().region_text(region)
                     )
                 },
             )),
@@ -138,7 +123,7 @@ impl Executor<'_> {
     fn wait_header(&mut self, index: usize, step: &WaitHeader) -> Result<(), Stop> {
         let expected_state = step.state;
         let waited = self.wait_until(Self::deadline(step.timeout_ms), |exec| {
-            header_state(exec.session.screen())
+            header_state(exec.live.session.screen())
                 .is_some_and(|state| state.is(expected_state))
                 .then_some(())
         })?;
@@ -152,11 +137,11 @@ impl Executor<'_> {
                 || {
                     format!(
                         "the header badge reads {}; the header shows:\n{}",
-                        header_state(self.session.screen()).map_or_else(
+                        header_state(self.live.session.screen()).map_or_else(
                             || "nothing yet".to_owned(),
                             |state| state.label().to_owned()
                         ),
-                        self.session.screen().rows_text(0, 2)
+                        self.live.session.screen().rows_text(0, 2)
                     )
                 },
             )),
@@ -166,7 +151,8 @@ impl Executor<'_> {
     fn wait_event(&mut self, index: usize, step: &WaitEvent) -> Result<(), Stop> {
         let (kind, fields) = (step.event, &step.fields);
         let waited = self.wait_until(Self::deadline(step.timeout_ms), |exec| {
-            exec.events
+            exec.live
+                .events
                 .events()
                 .iter()
                 .any(|event| event.matches(kind, fields))
@@ -179,151 +165,65 @@ impl Executor<'_> {
                 &other,
                 format!("a `{kind}` event satisfying {fields:?}"),
                 step.timeout_ms,
-                || self.events_summary(),
+                || self.live.events_summary(),
             )),
         }
     }
 
+    /// Presses one key. The bytes are the step's own, written outside every protocol, so they are
+    /// noted before they go out ([`Self::send_raw`]).
     fn key(&mut self, index: usize) -> Result<(), Stop> {
         let prepared = self.prepared;
         let Prepared::Key(bytes) = &prepared[index] else {
             return Err(Self::unprepared(index, "key"));
         };
-        self.send_input(bytes)?;
-        Ok(())
+        self.send_raw(index, bytes)
     }
 
+    /// Types text, one key press per character, each noted and sent as a `key` step's are.
     fn type_text(&mut self, index: usize) -> Result<(), Stop> {
         let prepared = self.prepared;
         let Prepared::Typed(keys) = &prepared[index] else {
             return Err(Self::unprepared(index, "type"));
         };
         for key in keys {
-            self.send_input(key)?;
+            self.send_raw(index, key)?;
         }
         Ok(())
     }
 
-    /// Waits for a frame that reflects every input so far and a filter prompt that `accept`s.
-    fn wait_filter_prompt(
-        &mut self,
-        deadline: Instant,
-        accept: impl Fn(&FilterPrompt) -> bool,
-    ) -> Result<Waited<FilterPrompt>, Stop> {
-        self.wait_until(deadline, |exec| {
-            exec.frame_reflecting_inputs()?;
-            filter_prompt(exec.session.screen()).filter(|prompt| accept(prompt))
-        })
+    /// Writes bytes that a `key` or `type` step holds, outside every protocol.
+    ///
+    /// The program may read them as a request for a deletion, and the dialog that opens is one
+    /// that no protocol verified, so they are noted first: from then on the run is engaged, and
+    /// every write that could confirm a deletion is checked on an exact screen before it is sent
+    /// ([`Drive::send_confirming`], and "Raw deletion requests" in `runner::live`), this one
+    /// included. A run that has never made such a request writes as it always did.
+    fn send_raw(&mut self, index: usize, bytes: &[u8]) -> Result<(), Stop> {
+        self.live.note_raw_write(bytes);
+        self.send_confirming(bytes, Self::deadline(DEFAULT_TIMEOUT_MS), Needs::Nothing)
+            .map(|_| ())
+            .map_err(|error| self.protocol_stop(index, DEFAULT_TIMEOUT_MS, error))
     }
 
     /// Opens the filter, types the name, applies it, and asserts that the inspector shows exactly
-    /// that entry.
-    ///
-    /// The filter opens with the previous filter's text in place, so the step reads the prompt and
-    /// erases what is there. It checks the prompt after each stage instead of assuming the keys
-    /// did what they usually do.
+    /// that entry (`Drive::select_entry`).
     fn select(&mut self, index: usize, step: &Select) -> Result<(), Stop> {
         let prepared = self.prepared;
         let Prepared::Typed(name_keys) = &prepared[index] else {
             return Err(Self::unprepared(index, "select"));
         };
         let deadline = Self::deadline(step.timeout_ms);
-        let name = step.name.as_str();
-        let screen_rows = |exec: &Self| exec.session.screen().rows_text(0, 2);
-
-        self.send_input(b"/")?;
-        let opened = self.wait_filter_prompt(deadline, |_| true)?;
-        let Waited::Ready(prompt) = opened else {
-            return Err(self.unmet(
-                index,
-                &opened.discard(),
-                "the filter prompt to open",
-                step.timeout_ms,
-                || format!("the header shows:\n{}", screen_rows(self)),
-            ));
-        };
-
-        for _ in prompt.input.chars() {
-            self.send_input(&BACKSPACE)?;
-        }
-        if !prompt.input.is_empty() {
-            let erased = self.wait_filter_prompt(deadline, |prompt| prompt.input.is_empty())?;
-            if !matches!(erased, Waited::Ready(_)) {
-                return Err(self.unmet(
-                    index,
-                    &erased.discard(),
-                    "the previous filter to be erased",
-                    step.timeout_ms,
-                    || format!("the header shows:\n{}", screen_rows(self)),
-                ));
-            }
-        }
-
-        for key in name_keys {
-            self.send_input(key)?;
-        }
-        let typed = self.wait_filter_prompt(deadline, |prompt| {
-            prompt.input == name && prompt.error.is_none()
-        })?;
-        if !matches!(typed, Waited::Ready(_)) {
-            return Err(self.unmet(
-                index,
-                &typed.discard(),
-                format!("the filter prompt to read {name:?}"),
-                step.timeout_ms,
-                || {
-                    format!(
-                        "the prompt reads {:?}; the header shows:\n{}",
-                        filter_prompt(self.session.screen()).map(|prompt| prompt.input),
-                        screen_rows(self)
-                    )
-                },
-            ));
-        }
-
-        self.send_input(&ENTER)?;
-        let selected = self.wait_until(deadline, |exec| {
-            exec.frame_reflecting_inputs()?;
-            if filter_prompt(exec.session.screen()).is_some() {
-                return None;
-            }
-            match inspector(exec.session.screen()) {
-                Inspector::Item(item) if item.name == name => Some(item),
-                _ => None,
-            }
-        })?;
-        let Waited::Ready(_) = selected else {
-            let shown = match inspector(self.session.screen()) {
-                Inspector::Item(item) => {
-                    format!("the inspector shows {:?} ({})", item.name, item.kind)
-                }
-                Inspector::NothingSelected => "the inspector shows no selection".to_owned(),
-                Inspector::NotShown => "the inspector is not drawn".to_owned(),
-            };
-            let expected = format!("the inspector to show the selected item {name:?}");
-            // An entry that is selected but is not the requested one is a wrong selection, not
-            // merely a slow screen.
-            if matches!(inspector(self.session.screen()), Inspector::Item(_))
-                && matches!(selected, Waited::TimedOut)
-            {
-                return Err(self.fail(index, FailureCause::Mismatch, expected, shown));
-            }
-            return Err(self.unmet(
-                index,
-                &selected.discard(),
-                expected,
-                step.timeout_ms,
-                || shown,
-            ));
-        };
-        Ok(())
+        self.select_entry(step.name.as_str(), name_keys, deadline)
+            .map_err(|error| self.protocol_stop(index, step.timeout_ms, error))
     }
 
-    /// Presses Backspace, reads the confirmation dialog, and presses `y` only when the dialog
-    /// names exactly the requested entry. See [`super::delete`] for what is checked. `wait_for`
-    /// (default `"finished"`) controls when the step returns: on the first frame after
-    /// `deletion_finished`, which shows the result, or (`"started"`) as soon as the dialog has
-    /// closed, while the deletion keeps running in the background.
+    /// Presses Backspace, reads the confirmation dialog, and presses the `confirm_with` key (`y`
+    /// or Enter) only when the dialog names exactly the requested entry, at the step's `path` or
+    /// as `name` directly below the root (`Drive::confirm_deletion`; see [`super::delete`] for
+    /// what is checked). `wait_for` (default `"finished"`) controls when the step returns: on the
+    /// first frame after `deletion_finished`, which shows the result, or (`"started"`) as soon as
+    /// the dialog has closed, while the deletion keeps running in the background.
     ///
     /// A scenario that sets `disable_delete_confirmation` has no dialog to read: see
     /// [`Self::delete_without_dialog`].
@@ -332,96 +232,52 @@ impl Executor<'_> {
             return self.delete_without_dialog(index, step);
         }
         let deadline = Self::deadline(step.timeout_ms);
-        let expected = format!(
-            "the deletion dialog to name the {} {:?} under {}",
-            step.kind,
-            step.name,
-            self.fixture.path().display()
-        );
-
-        self.send_input(&BACKSPACE)?;
-        let opened = self.wait_until(deadline, |exec| {
-            exec.frame_reflecting_inputs()?;
-            match dialog_view(exec.session.screen()) {
-                DialogView::None => None,
-                view => Some(view),
-            }
-        })?;
-        let Waited::Ready(view) = opened else {
-            return Err(self.unmet(
-                index,
-                &opened.discard(),
-                "a deletion dialog to open",
-                step.timeout_ms,
-                || format!("the screen shows:\n{}", self.session.screen().text()),
-            ));
-        };
-        let dialog = match view {
-            DialogView::Delete(dialog) => dialog,
-            DialogView::Other(other) => {
-                return Err(self.fail(
-                    index,
-                    FailureCause::DeleteRefused,
-                    expected,
-                    format!(
-                        "the dialog `{}` is open instead:\n{}",
-                        other.title, other.text
-                    ),
-                ));
-            }
-            DialogView::None => return Err(Self::unprepared(index, "delete")),
-        };
-        let relative = step.path.as_deref().unwrap_or(&step.name);
-        let verified = verify(
-            &dialog,
-            &step.name,
-            step.kind,
-            self.fixture,
-            &self.scenario.sentinels,
-        )
-        .and_then(|verified| {
+        let (fixture, scenario) = (self.fixture, self.scenario);
+        let request = DeletionRequest {
+            name: &step.name,
+            kind: step.kind,
+            fixture,
+            sentinels: &scenario.sentinels,
             // Where the entry is: the step's `path`, or `name` itself directly below the root.
-            // The dialog proves the entry only down to its name, so a same-named entry in
-            // another folder would pass `verify` alone.
-            if verified.relative == relative {
-                Ok(verified)
-            } else {
-                Err(format!(
-                    "the dialog deletes `{}`, but the step deletes `{relative}`",
-                    verified.relative
-                ))
-            }
-        })
-        .map_err(|reason| {
-            self.fail(
-                index,
-                FailureCause::DeleteRefused,
-                expected.clone(),
-                format!("{reason}\nthe dialog reads:\n{}", dialog.view.text),
-            )
-        })?;
-
-        // Every check passed. Only now is the confirmation key sent.
-        let events_before = self.events.events().len();
-        let confirm: &[u8] = match step.confirm_with {
-            ConfirmKey::Y => b"y",
-            ConfirmKey::Enter => &ENTER,
+            relative: step.path.as_deref().unwrap_or(&step.name),
+            confirm_with: step.confirm_with,
         };
-        let at = self.send_input(confirm)?;
-        self.recorder.record_deletion_confirmed(at);
-        self.intended_deletions.push(verified.relative);
+        let confirmed = self
+            .confirm_deletion(&request, deadline)
+            .map_err(|error| self.protocol_stop(index, step.timeout_ms, error))?;
+        self.recorder.record_deletion_confirmed(confirmed.at);
+        self.intended_deletions.push(confirmed.verified.relative);
 
         match step.wait_for {
-            DeleteWait::Started => self.delete_wait_started(index, step, deadline),
-            DeleteWait::Finished => self.delete_wait_finished(index, step, deadline, events_before),
+            // The confirmation was sent and processed: the dialog closing is the program leaving
+            // `DeleteConfirm` for the planning/execution path it enters in the same turn
+            // (`queue_confirmed_deletion`), so the deletion has started. Nothing here waits for it
+            // to finish; the deletion keeps running after this returns.
+            DeleteWait::Started => self
+                .wait_dialog_closed(deadline)
+                .map_err(|error| self.protocol_stop(index, step.timeout_ms, error)),
+            DeleteWait::Finished => self
+                .wait_deletion_finished(confirmed.events_before, deadline)
+                .map(|_| ())
+                .map_err(|error| self.protocol_stop(index, step.timeout_ms, error)),
         }
     }
 
     /// `disable_delete_confirmation`: Backspace alone starts the deletion, so there is no dialog to
     /// read and no key to hold back. The step waits for the selected-item panel to name the entry,
-    /// then checks the disk and the sentinels (`verify_selection`); presses Backspace; fails if a
-    /// dialog opens (the program did not honour the mode, and no key is sent to confirm it); and
-    /// then waits like `wait_for = "finished"`.
+    /// then checks the disk and the sentinels (`verify_selection`) and the ownership marker of the
+    /// fixture; presses Backspace; fails if a dialog opens (the program did not honour the mode,
+    /// and no key is sent to confirm it); and then waits like `wait_for = "finished"`.
+    ///
+    /// The panel is all that says which entry Backspace deletes, so it is read after a barrier
+    /// ([`Drive::barrier`]): once the program has answered one and the screen shows the frame that
+    /// answers it, the program has read every key sent so far, however the terminal cut them into
+    /// events, and the panel shows what they did (see "The input barrier" in `runner::live`). That
+    /// is only possible where the screen is exact. A terminal that paints on its own timer
+    /// (`ConPTY`, on Windows) cannot tie its screen to a frame, and a program that does not mark
+    /// its frames, or does not answer a barrier, cannot say that the screen shows what it has
+    /// read: each is refused before any key is sent, a Backspace included
+    /// ([`Live::deletion_refusal`]).
     fn delete_without_dialog(&mut self, index: usize, step: &Delete) -> Result<(), Stop> {
         let deadline = Self::deadline(step.timeout_ms);
         let relative = step.path.as_deref().unwrap_or(&step.name);
@@ -432,48 +288,29 @@ impl Executor<'_> {
             self.fixture.path().display()
         );
 
-        // The selection is what the panel shows after every key sent so far. The panel can trail
-        // the header: a fresh map arms its cursor in the frame that ends the scan, and the terminal
-        // may deliver that frame in pieces, so a panel that shows nothing, or another entry, is not
-        // an answer yet. The step waits for the panel to name this entry and kind, and refuses only
-        // when it never does within the step's `timeout_ms`.
-        let kind = step.kind.to_string();
-        let shown = self.wait_until(deadline, |exec| {
-            exec.frame_reflecting_inputs()?;
-            match inspector(exec.session.screen()) {
-                Inspector::Item(item) if item.name == step.name && item.kind == kind => Some(item),
-                _ => None,
-            }
-        })?;
-        let selected = match shown {
-            Waited::Ready(selected) => selected,
-            other => {
-                let refusal = match inspector(self.session.screen()) {
-                    Inspector::Item(item) if item.name == step.name && item.kind == kind => None,
-                    Inspector::Item(item) => verify_selection(
-                        &item,
-                        &step.name,
-                        step.kind,
-                        relative,
-                        self.fixture,
-                        &self.scenario.sentinels,
+        self.pump()?;
+        if let Some(reason) = self.live.deletion_refusal() {
+            return Err(self.fail(index, FailureCause::DeleteRefused, expected, reason));
+        }
+        // The selection is what the panel shows once the program has read every key sent so far.
+        let answered = self.barrier(deadline)?;
+        if !matches!(answered, Waited::Ready(())) {
+            return Err(self.unmet(
+                index,
+                &answered,
+                "the program to answer an input barrier, and the screen to show the frame that \
+                 answers it",
+                step.timeout_ms,
+                || {
+                    format!(
+                        "the screen shows:\n{}\n{}",
+                        self.live.session.screen().text(),
+                        self.live.frames_summary()
                     )
-                    .err(),
-                    Inspector::NothingSelected => Some("the panel shows no selection".to_owned()),
-                    Inspector::NotShown => Some("the selected-item panel is not drawn".to_owned()),
-                };
-                if let (Some(reason), true) = (refusal, matches!(other, Waited::TimedOut)) {
-                    return Err(self.fail(index, FailureCause::DeleteRefused, expected, reason));
-                }
-                return Err(self.unmet(
-                    index,
-                    &other.discard(),
-                    "a frame that reflects every key sent, with the panel naming the entry",
-                    step.timeout_ms,
-                    || format!("the screen shows:\n{}", self.session.screen().text()),
-                ));
-            }
-        };
+                },
+            ));
+        }
+        let selected = self.wait_for_the_panel(index, step, deadline, relative, &expected)?;
         let verified = verify_selection(
             &selected,
             &step.name,
@@ -485,124 +322,133 @@ impl Executor<'_> {
         .map_err(|reason| {
             self.fail(index, FailureCause::DeleteRefused, expected.clone(), reason)
         })?;
+        // The marker is the last thing looked at, right before the key that deletes.
+        self.fixture.verify_owned().map_err(|error| {
+            self.fail(
+                index,
+                FailureCause::DeleteRefused,
+                expected.clone(),
+                format!(
+                    "the fixture root is no longer owned by the harness: {error}; no key was sent"
+                ),
+            )
+        })?;
 
         // Backspace is the whole confirmation: record it as the moment the deletion was asked for.
-        let events_before = self.events.events().len();
+        let events_before = self.live.events.events().len();
         let at = self.send_input(&BACKSPACE)?;
         self.recorder.record_deletion_confirmed(at);
         self.intended_deletions.push(verified.relative);
 
-        let opened = self.wait_until(deadline, |exec| {
-            exec.frame_reflecting_inputs()?;
-            Some(dialog_view(exec.session.screen()))
+        self.refuse_a_dialog_after_backspace(index, step, deadline, expected)?;
+        self.wait_deletion_finished(events_before, deadline)
+            .map(|_| ())
+            .map_err(|error| self.protocol_stop(index, step.timeout_ms, error))
+    }
+
+    /// The part of the dialog-free deletion that waits for the selected-item panel to name the
+    /// entry. The panel can trail the header: a fresh map arms its cursor in the frame that ends
+    /// the scan, and the terminal may deliver that frame in pieces, so a panel that shows nothing,
+    /// or another entry, is not an answer yet. The step waits for the panel to name this entry and
+    /// kind, and refuses only when it never does within the step's `timeout_ms`. Nothing is written
+    /// meanwhile, so no key can change the selection while it is waited for.
+    fn wait_for_the_panel(
+        &mut self,
+        index: usize,
+        step: &Delete,
+        deadline: Instant,
+        relative: &str,
+        expected: &str,
+    ) -> Result<SelectedItem, Stop> {
+        let kind = step.kind.to_string();
+        let shown = self.wait_until(deadline, |exec| {
+            match inspector(exec.live.session.screen()) {
+                Inspector::Item(item) if item.name == step.name && item.kind == kind => Some(item),
+                _ => None,
+            }
         })?;
-        match opened {
-            Waited::Ready(DialogView::None) => {}
-            Waited::Ready(DialogView::Delete(dialog)) => {
-                return Err(self.fail(
-                    index,
-                    FailureCause::DeleteRefused,
-                    expected,
-                    format!(
-                        "a confirmation dialog opened although the scenario disables confirmation, \
-                         so the program did not honour the mode; no key was sent to confirm it:\n{}",
-                        dialog.view.text
-                    ),
-                ));
-            }
-            Waited::Ready(DialogView::Other(other)) => {
-                return Err(self.fail(
-                    index,
-                    FailureCause::DeleteRefused,
-                    expected,
-                    format!(
-                        "the dialog `{}` opened instead of a deletion starting:\n{}",
-                        other.title, other.text
-                    ),
-                ));
-            }
+        let other = match shown {
+            Waited::Ready(selected) => return Ok(selected),
+            other => other,
+        };
+        let refusal = match inspector(self.live.session.screen()) {
+            Inspector::Item(item) if item.name == step.name && item.kind == kind => None,
+            Inspector::Item(item) => verify_selection(
+                &item,
+                &step.name,
+                step.kind,
+                relative,
+                self.fixture,
+                &self.scenario.sentinels,
+            )
+            .err(),
+            Inspector::NothingSelected => Some("the panel shows no selection".to_owned()),
+            Inspector::NotShown => Some("the selected-item panel is not drawn".to_owned()),
+        };
+        if let (Some(reason), true) = (refusal, matches!(other, Waited::TimedOut)) {
+            return Err(self.fail(index, FailureCause::DeleteRefused, expected, reason));
+        }
+        Err(self.unmet(
+            index,
+            &other.discard(),
+            "the panel to name the entry, on a screen that shows the frame that answered the \
+             barrier",
+            step.timeout_ms,
+            || {
+                format!(
+                    "the screen shows:\n{}\n{}",
+                    self.live.session.screen().text(),
+                    self.live.frames_summary()
+                )
+            },
+        ))
+    }
+
+    /// After the Backspace of a deletion that no dialog confirms: waits for the program to answer
+    /// a barrier written behind it and for the screen to show the frame that answers, and fails if
+    /// any dialog opened. A confirmation dialog means the program did not honour the mode, and no
+    /// key is ever sent to confirm it.
+    fn refuse_a_dialog_after_backspace(
+        &mut self,
+        index: usize,
+        step: &Delete,
+        deadline: Instant,
+        expected: String,
+    ) -> Result<(), Stop> {
+        let answered = self.barrier(deadline)?;
+        let opened = match answered {
+            Waited::Ready(()) => dialog_view(self.live.session.screen()),
             other => {
                 return Err(self.unmet(
                     index,
-                    &other.discard(),
-                    "a frame that reflects Backspace",
+                    &other,
+                    "the program to answer an input barrier written behind the Backspace, and the \
+                     screen to show the frame that answers it",
                     step.timeout_ms,
-                    || self.events_summary(),
+                    || self.live.events_summary(),
                 ));
             }
-        }
-        self.delete_wait_finished(index, step, deadline, events_before)
-    }
-
-    /// `wait_for = "started"`: returns once a frame shows the dialog has closed. The confirmation
-    /// was sent and processed: the dialog closing is the program leaving `DeleteConfirm` for the
-    /// planning/execution path it enters in the same turn (`queue_confirmed_deletion`), so the
-    /// deletion has started. Nothing here waits for it to finish; the deletion keeps running
-    /// after this returns.
-    fn delete_wait_started(
-        &mut self,
-        index: usize,
-        step: &Delete,
-        deadline: Instant,
-    ) -> Result<(), Stop> {
-        let closed = self.wait_until(deadline, |exec| {
-            exec.frame_reflecting_inputs()?;
-            matches!(dialog_view(exec.session.screen()), DialogView::None).then_some(())
-        })?;
-        match closed {
-            Waited::Ready(()) => Ok(()),
-            other => Err(self.unmet(
-                index,
-                &other,
-                "the deletion dialog to close after the confirmation",
-                step.timeout_ms,
-                || format!("the screen shows:\n{}", self.session.screen().text()),
-            )),
-        }
-    }
-
-    /// `wait_for = "finished"` (the default): waits for `deletion_finished` and for the frame
-    /// drawn after it, so the screen already shows the result.
-    fn delete_wait_finished(
-        &mut self,
-        index: usize,
-        step: &Delete,
-        deadline: Instant,
-        events_before: usize,
-    ) -> Result<(), Stop> {
-        let finished = self.wait_until(deadline, |exec| {
-            exec.events.events()[events_before..]
-                .iter()
-                .position(|event| matches!(event.payload, Payload::DeletionFinished { .. }))
-                .map(|offset| events_before + offset)
-        })?;
-        let Waited::Ready(finished_at) = finished else {
-            return Err(self.unmet(
-                index,
-                &finished.discard(),
-                "the deletion to finish (a `deletion_finished` event)",
-                step.timeout_ms,
-                || self.events_summary(),
-            ));
         };
-
-        // The program starts rebuilding its map in the same turn that reports the deletion, so a
-        // frame drawn after that report shows the result and everything the deletion set going.
-        // The screen read before it can still show the map as it was.
-        let shown = self.wait_until(deadline, |exec| {
-            exec.events.events()[finished_at + 1..]
-                .iter()
-                .any(|event| matches!(event.payload, Payload::Frame { .. }))
-                .then_some(())
-        })?;
-        match shown {
-            Waited::Ready(()) => self.catch_up(),
-            other => Err(self.unmet(
+        match opened {
+            DialogView::None => Ok(()),
+            DialogView::Delete(dialog) => Err(self.fail(
                 index,
-                &other,
-                "a frame after the deletion finished",
-                step.timeout_ms,
-                || self.events_summary(),
+                FailureCause::DeleteRefused,
+                expected,
+                format!(
+                    "a confirmation dialog opened although the scenario disables confirmation, \
+                     so the program did not honour the mode; no key was sent to confirm it:\n{}",
+                    dialog.view.text
+                ),
+            )),
+            DialogView::Other(other) => Err(self.fail(
+                index,
+                FailureCause::DeleteRefused,
+                expected,
+                format!(
+                    "the dialog `{}` opened instead of a deletion starting:\n{}",
+                    other.title, other.text
+                ),
             )),
         }
     }
@@ -616,7 +462,7 @@ impl Executor<'_> {
     /// `refresh_finished` after the last report that removed something: a refresh that ended
     /// before that deletion is no answer, which is why no `wait_event` can name the event. A
     /// deletion that removed nothing owes none. The step ends as `delete` does, on a frame that
-    /// follows the event it waited for, and the output in flight read after it.
+    /// follows the event it waited for, once the screen shows it.
     fn wait_refresh(&mut self, index: usize, step: WaitRefresh) -> Result<(), Stop> {
         let confirmed = self.intended_deletions.len();
         let deadline = Self::deadline(step.timeout_ms);
@@ -640,24 +486,19 @@ impl Executor<'_> {
                      `refresh_finished` event after the last `deletion_finished` that removed \
                      entries)",
                     step.timeout_ms,
-                    || self.events_summary(),
+                    || self.live.events_summary(),
                 ));
             }
         };
-        let shown = self.wait_until(deadline, |exec| {
-            exec.events.events()[after + 1..]
-                .iter()
-                .any(|event| matches!(event.payload, Payload::Frame { .. }))
-                .then_some(())
-        })?;
+        let shown = self.wait_for_frame_from(after + 1, deadline)?;
         match shown {
-            Waited::Ready(()) => self.catch_up(),
+            Waited::Ready(()) => Ok(()),
             other => Err(self.unmet(
                 index,
                 &other,
-                "a frame after the refresh finished",
+                "a frame after the refresh finished, shown on the screen",
                 step.timeout_ms,
-                || self.events_summary(),
+                || self.live.events_summary(),
             )),
         }
     }
@@ -665,7 +506,7 @@ impl Executor<'_> {
     /// Where the events say the map stands after the `confirmed` deletions the scenario has
     /// confirmed, or `None` while a deletion has not reported or its refresh has not ended.
     fn refresh_after(&self, confirmed: usize) -> Option<Refresh> {
-        let events = self.events.events();
+        let events = self.live.events.events();
         let mut reported = 0;
         let mut last_report = 0;
         let mut last_removing = None;
@@ -749,30 +590,33 @@ impl Executor<'_> {
         }
     }
 
-    /// Resizes the terminal and waits for the frame that answers it, then catches up with its
-    /// output (`catch_up`). A resize reaches the program as an input event, so the frame's counter
-    /// tells when the program has laid itself out again.
+    /// Resizes the terminal and waits for the frame that answers it, then until the screen shows
+    /// it (`Drive::catch_up`). A resize reaches the program as an input event, so the frame's
+    /// counter tells when the program has laid itself out again.
     fn resize(&mut self, index: usize, step: Resize) -> Result<(), Stop> {
-        self.take_input_baseline();
-        let at = self.session.resize(step.cols, step.rows)?;
-        self.inputs_sent += 1;
-        self.last_input_at = Some(at);
-        let waited = self.wait_until(Self::deadline(DEFAULT_TIMEOUT_MS), |exec| {
-            exec.frame_reflecting_inputs().map(|_| ())
-        })?;
-        match waited {
-            Waited::Ready(()) => {
+        self.live.resize(step.cols, step.rows)?;
+        let deadline = Self::deadline(DEFAULT_TIMEOUT_MS);
+        let waited = self.wait_until(deadline, |exec| exec.live.reflecting_frame_seq())?;
+        let shown = match waited {
+            Waited::Ready(seq) => {
                 // The program counts the events it really received. Two resizes in a row can reach
                 // it as one, so believe the frame over our own count.
-                self.inputs_sent = self.inputs_sent.max(self.latest_frame_inputs_sent());
-                self.catch_up()
+                self.live.believe_latest_frame();
+                self.catch_up(seq, deadline)?
             }
+            other => other.discard(),
+        };
+        match shown {
+            Waited::Ready(()) => Ok(()),
             other => Err(self.unmet(
                 index,
                 &other,
-                format!("a frame after the resize to {}x{}", step.cols, step.rows),
+                format!(
+                    "a frame after the resize to {}x{}, shown on the screen",
+                    step.cols, step.rows
+                ),
                 DEFAULT_TIMEOUT_MS,
-                || self.events_summary(),
+                || self.live.events_summary(),
             )),
         }
     }
@@ -782,7 +626,7 @@ impl Executor<'_> {
     /// `safety::send_signal`.
     fn signal(&mut self, index: usize, step: SendSignal) -> Result<(), Stop> {
         self.pump()?;
-        if let Some(exit) = self.session.exit() {
+        if let Some(exit) = self.live.session.exit() {
             return Err(self.fail(
                 index,
                 FailureCause::ProcessExited,
@@ -791,8 +635,8 @@ impl Executor<'_> {
             ));
         }
         match step.signal {
-            Signal::Close => self.session.close_console(),
-            other => send_signal(self.session.pid(), other)?,
+            Signal::Close => self.live.session.close_console(),
+            other => send_signal(self.live.session.pid(), other)?,
         }
         Ok(())
     }
@@ -808,7 +652,7 @@ impl Executor<'_> {
         else {
             return Err(Self::unprepared(index, "expect_screen"));
         };
-        let text = self.session.screen().region_text(step.region);
+        let text = self.live.session.screen().region_text(step.region);
         let mut problems = Vec::new();
         for matcher in contains.iter().chain(patterns) {
             if !matcher.is_match(&text) {
@@ -891,7 +735,7 @@ impl Executor<'_> {
     /// Waits for the exit, reads the rest of the output, and asserts how the program ended.
     fn expect_exit(&mut self, index: usize, step: &ExpectExit) -> Result<(), Stop> {
         let waited = self.wait_until(Self::deadline(step.timeout_ms), |exec| {
-            exec.session.exit().map(|_| ())
+            exec.live.session.exit().map(|_| ())
         })?;
         if matches!(waited, Waited::TimedOut) {
             return Err(self.unmet(
@@ -899,17 +743,18 @@ impl Executor<'_> {
                 &waited,
                 "the program to exit",
                 step.timeout_ms,
-                || format!("it is still running; {}", self.events_summary()),
+                || format!("it is still running; {}", self.live.events_summary()),
             ));
         }
         let deadline = Instant::now() + EXIT_OUTPUT_LIMIT;
-        while !self.session.finished() && Instant::now() < deadline {
+        while !self.live.session.finished() && Instant::now() < deadline {
             self.pump()?;
-            self.session
+            self.live
+                .session
                 .wait_activity(std::time::Duration::from_millis(1))?;
         }
         self.pump()?;
-        let Some(exit) = self.session.exit() else {
+        let Some(exit) = self.live.session.exit() else {
             return Err(Self::unprepared(index, "expect_exit"));
         };
 
@@ -924,8 +769,8 @@ impl Executor<'_> {
         // After a `close` event the console is gone, and nothing the program writes reaches the
         // screen model: the terminal cannot be inspected, so it is not checked (`plan::prepare`
         // refuses `terminal_restored = false` there, which would otherwise pass unexamined).
-        let terminal_checked = !self.session.console_closed();
-        let modes = self.session.modes();
+        let terminal_checked = !self.live.session.console_closed();
+        let modes = self.live.session.modes();
         if terminal_checked && modes.restored() != step.terminal_restored {
             problems.push(format!(
                 "the terminal is {} (alternate screen {}, cursor {}, echo {}, canonical mode {}), \
@@ -1052,35 +897,23 @@ impl Executor<'_> {
             return Err(self.idle_exited(index, step.after_ms));
         }
 
-        let start_bytes = self.session.output_bytes();
-        let start_cpu = live_cpu_ms(self.session.pid());
+        let start_bytes = self.live.session.output_bytes();
+        let start_cpu = live_cpu_ms(self.live.session.pid());
 
         if self.wait_quietly(Duration::from_millis(step.window_ms))? {
             return Err(self.idle_exited(index, step.after_ms + step.window_ms));
         }
 
-        let output_bytes = self.session.output_bytes().saturating_sub(start_bytes);
+        let output_bytes = self.live.session.output_bytes().saturating_sub(start_bytes);
         #[allow(clippy::cast_precision_loss)]
         self.recorder
             .record_metric("idle_output_bytes", output_bytes as f64);
 
-        if let (Some(start), Some(end)) = (start_cpu, live_cpu_ms(self.session.pid())) {
+        if let (Some(start), Some(end)) = (start_cpu, live_cpu_ms(self.live.session.pid())) {
             self.recorder
                 .record_metric("idle_cpu_ms", (end - start).max(0.0));
         }
         Ok(())
-    }
-
-    /// Waits for `duration` to pass while pumping the session. Returns `true` if the program
-    /// ended first. Unlike every other wait, this one has no condition to satisfy: letting time
-    /// pass quietly, with nothing sent, is the point, so reaching the deadline is the step
-    /// succeeding, not timing out.
-    fn wait_quietly(&mut self, duration: Duration) -> Result<bool, Stop> {
-        match self.wait_until(Instant::now() + duration, |_| None::<()>)? {
-            Waited::Exited => Ok(true),
-            Waited::TimedOut => Ok(false),
-            Waited::Ready(()) => unreachable!("the idle wait has no condition to resolve"),
-        }
     }
 
     /// The failure for the program ending before an idle window of `waited_ms` finished.
@@ -1089,49 +922,32 @@ impl Executor<'_> {
             index,
             FailureCause::ProcessExited,
             format!("the program to still be running {waited_ms} ms into the idle step"),
-            format!("it ended first ({})", self.exit_summary()),
+            format!("it ended first ({})", self.live.exit_summary()),
         )
     }
 
-    /// Reads the output of the frame the last wait saw, until the screen model shows it.
-    ///
-    /// Every step that ends on a frame event (`settle`, `delete`, `resize`) ends here, which is
-    /// what lets the step after it read the screen once. The event says that the program drew; the
-    /// terminal still has to deliver what it drew. The terminal may hold the frame back for the
-    /// whole of `frame_window`, so that long is read first, with the events and the session still
-    /// polled. Then comes the bounded tail: output that is still arriving is read until it has
-    /// been quiet for [`SETTLE_QUIET`], but for no longer than [`SETTLE_LIMIT`].
-    fn catch_up(&mut self) -> Result<(), Stop> {
-        self.wait_quietly(self.frame_window)?;
-        self.session.drain(SETTLE_QUIET, SETTLE_LIMIT)?;
-        self.pump()
-    }
-
     /// Waits until the program has drawn a frame that reflects every input sent so far, then
-    /// catches up with its output (`catch_up`).
-    ///
-    /// This is the pseudo-terminal meaning of `settle`. It never waits for the screen to go
-    /// quiet: a program that keeps animating settles as soon as its frame counter catches up. A
-    /// key that changes nothing draws no frame, so a `settle` after one waits in vain.
+    /// until the screen shows it (`Drive::settle_until`).
     fn settle(&mut self, index: usize, step: Settle) -> Result<(), Stop> {
-        let waited = self.wait_until(Self::deadline(step.timeout_ms), |exec| {
-            exec.frame_reflecting_inputs().map(|_| ())
-        })?;
+        let waited = self.settle_until(Self::deadline(step.timeout_ms))?;
         match waited {
-            Waited::Ready(()) => self.catch_up(),
+            Waited::Ready(()) => Ok(()),
             other => Err(self.unmet(
                 index,
                 &other,
-                format!("a frame that reflects all {} inputs sent", self.inputs_sent),
+                format!(
+                    "a frame that reflects all {} inputs sent",
+                    self.live.inputs_sent()
+                ),
                 step.timeout_ms,
                 || {
                     format!(
                         "the latest frame counted {} inputs, and a frame that reflects all {} \
                          sent counts {}; {}",
-                        self.latest_frame_inputs(),
-                        self.inputs_sent,
-                        self.reflecting_counter(),
-                        self.events_summary()
+                        self.live.latest_frame_inputs(),
+                        self.live.inputs_sent(),
+                        self.live.reflecting_counter(),
+                        self.live.events_summary()
                     )
                 },
             )),
@@ -1139,31 +955,28 @@ impl Executor<'_> {
     }
 
     /// Presses `q`, waits for the quit dialog, and confirms it with `y`.
+    ///
+    /// The `y` waits for nothing but the frame event that counts the `q`, which is what keeps a
+    /// quit on a slow terminal from pressing it after the program has begun drawing the next
+    /// frame (`quit_ms`). That holds while no key of the scenario's own has asked for a deletion.
+    /// After one has (`Live::note_raw_write`), a dialog for it can be unread, covered by a prompt,
+    /// or still to be drawn, and the `q` can restore it instead of opening the prompt that the
+    /// frame event and a stale screen say is open. Then the `q` goes out as always, and the `y`
+    /// goes through [`Drive::send_confirming`]: behind a barrier, on the exact screen that
+    /// answers it, and only if that screen shows no deletion dialog and the plain quit prompt.
     fn quit(&mut self, index: usize, step: Quit) -> Result<(), Stop> {
-        let events_before = self.events.events().len();
-        self.send_input(b"q")?;
-        let opened = self.wait_until(Self::deadline(step.timeout_ms), |exec| {
-            exec.frame_reflecting_inputs()?;
-            let prompted = exec.events.events()[events_before..]
-                .iter()
-                .any(|event| matches!(event.payload, Payload::QuitPrompt));
-            if !prompted {
-                return None;
-            }
-            match dialog_view(exec.session.screen()) {
-                DialogView::Other(view) => Some(view),
-                _ => None,
-            }
-        })?;
-        let Waited::Ready(view) = opened else {
-            return Err(self.unmet(
-                index,
-                &opened.discard(),
-                "the quit dialog to open",
-                step.timeout_ms,
-                || format!("the screen shows:\n{}", self.session.screen().text()),
-            ));
-        };
+        let deadline = Self::deadline(step.timeout_ms);
+        if self.live.raw_deletion_requested() {
+            self.send_input(b"q")?;
+            let at = self
+                .send_confirming(b"y", deadline, Needs::PlainQuitPrompt)
+                .map_err(|error| self.protocol_stop(index, step.timeout_ms, error))?;
+            self.recorder.record_quit_confirmed(at);
+            return Ok(());
+        }
+        let view = self
+            .request_quit(deadline)
+            .map_err(|error| self.protocol_stop(index, step.timeout_ms, error))?;
         if !offers_plain_quit(&view) {
             return Err(self.fail(
                 index,
@@ -1192,7 +1005,7 @@ impl Executor<'_> {
                 ));
             }
         }
-        if self.session.exit().is_some() {
+        if self.live.session.exit().is_some() {
             let after = FixtureSnapshot::take(self.fixture.path())?;
             let unexpected = self
                 .baseline

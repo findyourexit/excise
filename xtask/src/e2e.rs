@@ -196,6 +196,9 @@ pub(crate) fn build_release_binary(root: &Path, target: &Path) -> Result<PathBuf
     let status = Command::new(&cargo)
         .current_dir(root)
         .args(["build", "--release", "--locked", "-p", "excise"])
+        // `cargo xtask tui` prints exactly one JSON document on stdout, so nothing a build writes
+        // may reach it; the other commands lose nothing, because a build prints to stderr.
+        .stdout(io::stderr())
         .status()
         .map_err(|error| io::Error::other(format!("cannot start {}: {error}", cargo.display())))?;
     if !status.success() {

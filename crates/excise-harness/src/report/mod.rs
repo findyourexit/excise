@@ -10,6 +10,7 @@
 //! * [`HarnessAb`] (`harness-ab`): paired, interleaved comparison evidence for two builds.
 //! * [`HarnessCounts`] (`harness-counts`): the deterministic counts of one build, the record that
 //!   the count history and a pull request's count comment are made of.
+//! * [`HarnessTui`] (`harness-tui`): what one `cargo xtask tui` command prints.
 //!
 //! The types reject unknown fields, so a document with a field this build does not know is an
 //! error rather than silently ignored. Removing or retyping a field, or making an optional one
@@ -24,6 +25,7 @@ mod ab;
 mod counts;
 mod failure;
 mod summary;
+pub mod tui;
 
 #[cfg(test)]
 mod tests;
@@ -43,6 +45,7 @@ pub use failure::{
 pub use summary::{
     BinaryIdentity, HarnessSummary, ScenarioResult, SummaryKind, Tier, TimingWarning, Verdict,
 };
+pub use tui::{HarnessTui, TuiKind};
 
 /// The `schema_version` of every document in this module.
 pub const SCHEMA_VERSION: u32 = 1;

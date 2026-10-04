@@ -17,5 +17,9 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 excise = { path = ".." }
 excise-harness = { path = "../crates/excise-harness" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [lints]
 workspace = true

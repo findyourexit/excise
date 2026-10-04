@@ -11,7 +11,10 @@ use std::fmt::Write as _;
 use regex::Regex;
 
 use crate::{
-    pty::keys::{encode_key, encode_text},
+    pty::{
+        input::InputScan,
+        keys::{encode_key, encode_text},
+    },
     scenario::{Region, Scenario, Signal, Step, WaitText},
 };
 
@@ -76,6 +79,34 @@ pub(crate) fn prepare(scenario: &Scenario) -> Result<Vec<Prepared>, RunError> {
         .enumerate()
         .map(|(index, step)| prepare_step(scenario, index, step))
         .collect()
+}
+
+/// The index of the first step of `scenario` whose bytes the program can read as a request for a
+/// deletion outside a `delete` step, if there is one: a `key` that encodes to Backspace
+/// (`backspace`, `alt+backspace`, `ctrl+?`, and `ctrl+h`, which the Windows console path may read
+/// as one), or `key` and `type` steps that compose an escape sequence between them (`alt+[` and
+/// the text `127u`, or `esc` and `[127u`), which the program joins across writes and which may
+/// be that Backspace, a confirmation, or any other key ([`InputScan`] says which bytes count).
+///
+/// It is the static counterpart of what the executor notes while it runs
+/// (`Live::note_raw_write`): the same scan over the bytes the steps would write, in step order,
+/// whether or not the run would get that far. It does not see the writes of the protocols (the
+/// `/` of a `select`, the `q` of a `quit`), which can only end an escape sequence that a key
+/// began, so it never engages a run later than the executor does. A run that makes such a request
+/// is engaged: every write that could confirm a deletion needs an exact screen (see "Raw deletion
+/// requests" in `runner::live`). Where the screen is not exact the pseudo-terminal runner skips a
+/// scenario that has one, as it skips one with a `delete` step. A key that has no encoding asks
+/// for nothing here: the run would end in an error before it was written.
+pub(crate) fn raw_deletion_request(scenario: &Scenario) -> Option<usize> {
+    let mut scan = InputScan::default();
+    scenario.steps.iter().position(|step| match step {
+        Step::Key(press) => encode_key(press.key, press.ctrl, press.alt)
+            .is_ok_and(|bytes| scan.note(&bytes).request),
+        Step::Type(typed) => {
+            encode_text(&typed.text).is_ok_and(|keys| keys.iter().any(|key| scan.note(key).request))
+        }
+        _ => false,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -485,5 +516,147 @@ fields = { inputs = { min = 3 } }
                 "wait_event frame inputs Min(3)",
             ]
         );
+    }
+
+    #[test]
+    fn the_keys_a_program_reads_as_backspace_are_raw_deletion_requests() {
+        for key in [
+            "key = \"backspace\"",
+            "key = \"backspace\"\nalt = true",
+            "key = \"h\"\nctrl = true",
+        ] {
+            let scenario = scenario(&format!(
+                "[[steps]]\nstep = \"settle\"\n[[steps]]\nstep = \"key\"\n{key}\n"
+            ));
+
+            assert_eq!(raw_deletion_request(&scenario), Some(1), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_sequence_that_a_key_begins_and_the_text_after_it_finishes_is_a_raw_deletion_request() {
+        // The program joins the bytes of an escape sequence across writes. `alt+[` is `ESC [`, and
+        // the text that follows finishes `ESC [ 127 u` (Backspace), `ESC [ 121 u` (`y`),
+        // `ESC [ 13 u` and `ESC [ 57414 u` (Enter), or `ESC [ 97:121 ; 2 u` (`y` again), with no
+        // Backspace, `y`, or Enter byte in any write: the step whose bytes continue the sequence
+        // is the one that asks, whatever they are.
+        for text in ["127u", "121u", "13u", "57414u", "97:121;2u", "1"] {
+            let scenario = scenario(&format!(
+                "[[steps]]\nstep = \"key\"\nkey = \"[\"\nalt = true\n\
+                 [[steps]]\nstep = \"type\"\ntext = \"{text}\"\n"
+            ));
+
+            assert_eq!(raw_deletion_request(&scenario), Some(1), "alt+[ and {text}");
+        }
+    }
+
+    #[test]
+    fn a_lone_escape_that_the_next_write_turns_into_a_sequence_is_a_raw_deletion_request() {
+        // `esc` and then `[121u` are `ESC` and `[` `1` `2` `1` `u`: a program that reads the
+        // first two bytes together reads `ESC [`, and the rest finishes `ESC [ 121 u`.
+        for (what, steps) in [
+            (
+                "esc, then text",
+                "[[steps]]\nstep = \"key\"\nkey = \"esc\"\n\
+                 [[steps]]\nstep = \"type\"\ntext = \"[121u\"\n",
+            ),
+            (
+                "esc, then `[`",
+                "[[steps]]\nstep = \"key\"\nkey = \"esc\"\n\
+                 [[steps]]\nstep = \"key\"\nkey = \"[\"\n",
+            ),
+            (
+                "alt+O, then a key",
+                "[[steps]]\nstep = \"key\"\nkey = \"O\"\nalt = true\n\
+                 [[steps]]\nstep = \"key\"\nkey = \"x\"\n",
+            ),
+            (
+                "a sequence cut in three",
+                "[[steps]]\nstep = \"key\"\nkey = \"[\"\nalt = true\n\
+                 [[steps]]\nstep = \"type\"\ntext = \"12\"\n\
+                 [[steps]]\nstep = \"type\"\ntext = \"1u\"\n",
+            ),
+        ] {
+            assert_eq!(
+                raw_deletion_request(&scenario(steps)),
+                Some(1),
+                "{what}: the second step continues it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_protocol_step_between_the_writes_does_not_hide_a_sequence_from_the_plan() {
+        // The `/` of a `select` ends the sequence for the program that runs, so the executor does
+        // not engage here. The plan reads only the steps' own writes and so does: where it skips a
+        // scenario that the executor would have run, it errs towards the guard.
+        let scenario = scenario(
+            "[[steps]]\nstep = \"key\"\nkey = \"[\"\nalt = true\n\
+             [[steps]]\nstep = \"select\"\nname = \"victim\"\n\
+             [[steps]]\nstep = \"type\"\ntext = \"121u\"\n",
+        );
+
+        assert_eq!(raw_deletion_request(&scenario), Some(2));
+    }
+
+    #[test]
+    fn keys_that_cannot_be_read_as_backspace_ask_for_no_deletion() {
+        // Nor does a `delete` step: its Backspace is the protocol's, which verifies the dialog. A
+        // key that begins and finishes a sequence of its own (an arrow, a page key) asks for
+        // nothing, and neither does one that begins a sequence which no write continues.
+        let scenario = scenario(
+            r#"
+[[steps]]
+step = "key"
+key = "y"
+[[steps]]
+step = "key"
+key = "enter"
+[[steps]]
+step = "key"
+key = "esc"
+[[steps]]
+step = "key"
+key = "tab"
+[[steps]]
+step = "key"
+key = "up"
+[[steps]]
+step = "key"
+key = "x"
+alt = true
+[[steps]]
+step = "key"
+key = "page_down"
+[[steps]]
+step = "key"
+key = "esc"
+[[steps]]
+step = "key"
+key = "x"
+[[steps]]
+step = "key"
+key = "c"
+ctrl = true
+[[steps]]
+step = "type"
+text = "backspace [127u]"
+[[steps]]
+step = "key"
+key = "["
+alt = true
+[[steps]]
+step = "select"
+name = "victim"
+[[steps]]
+step = "delete"
+name = "victim"
+kind = "file"
+[[steps]]
+step = "quit"
+"#,
+        );
+
+        assert_eq!(raw_deletion_request(&scenario), None);
     }
 }

@@ -315,6 +315,16 @@ impl Scenario {
         }
     }
 
+    /// Whether a step of the scenario is a `delete`: the one step that can confirm a deletion in
+    /// the program, and so the one a platform whose terminal cannot be tied to a frame refuses
+    /// (see `runner::live::SCREEN_IS_EXACT`).
+    #[must_use]
+    pub fn deletes(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, Step::Delete(_)))
+    }
+
     /// Whether `expect = "fail"` applies on `os`, as `std::env::consts::OS` spells it:
     /// `fails_on` verbatim, or every platform in `platforms` when it is absent.
     fn fails_on_platform(&self, os: &str) -> bool {

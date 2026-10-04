@@ -60,7 +60,8 @@ pub struct FixtureRoot {
 impl FixtureRoot {
     /// Accepts `root` only if the fixture generator's `verify_owned` does: a directory that is not
     /// a symbolic link, holding a marker that is a regular file. That check is the one
-    /// implementation every runner and mutator shares; this adds the canonical spelling.
+    /// implementation every runner and mutator shares; this adds the canonical spelling. The
+    /// check is made here, once: [`FixtureRoot::verify_owned`] makes it again.
     ///
     /// # Errors
     ///
@@ -74,6 +75,25 @@ impl FixtureRoot {
             source,
         })?;
         Ok(Self { path })
+    }
+
+    /// Checks again that the root carries the ownership marker: the fixture generator's
+    /// `verify_owned`, run on the canonical root once more.
+    ///
+    /// [`FixtureRoot::open`] verifies ownership once, and a `FixtureRoot` is only a path after
+    /// that. A marker that vanishes, or is replaced by a directory or a link, while the root is in
+    /// use goes unnoticed until something checks again, and the program under test can delete
+    /// anything it shows, the marker included. A runner calls this immediately before a key that
+    /// starts or confirms a deletion, so that a root that is no longer a fixture never goes
+    /// through one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SafetyError::Unowned`] when the root is no longer a harness fixture: it cannot be
+    /// opened as a directory, the marker is missing, or the marker is not a regular file.
+    pub fn verify_owned(&self) -> Result<(), SafetyError> {
+        verify_owned(&self.path)?;
+        Ok(())
     }
 
     /// The canonical root.
@@ -348,6 +368,101 @@ mod tests {
         assert_eq!(
             opened.path(),
             fs::canonicalize(root.path()).expect("canonical path")
+        );
+    }
+
+    #[test]
+    fn a_root_that_still_carries_its_marker_verifies_again() {
+        let root = marked_root();
+        let opened = FixtureRoot::open(root.path()).expect("a marked root");
+
+        opened.verify_owned().expect("the marker is still there");
+    }
+
+    #[test]
+    fn a_marker_that_vanished_after_the_root_was_opened_is_caught() {
+        let root = marked_root();
+        let opened = FixtureRoot::open(root.path()).expect("a marked root");
+        fs::remove_file(root.path().join(MARKER_FILE_NAME)).expect("the marker should go");
+
+        let error = opened
+            .verify_owned()
+            .expect_err("a root that lost its marker must not be owned any more");
+
+        assert!(
+            matches!(error, SafetyError::Unowned(OwnershipError::Missing { .. })),
+            "{error}"
+        );
+        assert!(error.to_string().contains(MARKER_FILE_NAME));
+    }
+
+    #[test]
+    fn a_marker_replaced_by_a_directory_after_the_root_was_opened_is_caught() {
+        let root = marked_root();
+        let opened = FixtureRoot::open(root.path()).expect("a marked root");
+        let marker = root.path().join(MARKER_FILE_NAME);
+        fs::remove_file(&marker).expect("the marker should go");
+        fs::create_dir(&marker).expect("a directory should take its place");
+
+        let error = opened
+            .verify_owned()
+            .expect_err("a directory in the marker's place must not pass");
+
+        assert!(
+            matches!(
+                error,
+                SafetyError::Unowned(OwnershipError::NotRegular {
+                    kind: NodeKind::Directory,
+                    ..
+                })
+            ),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_replaced_by_a_symbolic_link_after_the_root_was_opened_is_caught() {
+        let elsewhere = marked_root();
+        let root = marked_root();
+        let opened = FixtureRoot::open(root.path()).expect("a marked root");
+        let marker = root.path().join(MARKER_FILE_NAME);
+        fs::remove_file(&marker).expect("the marker should go");
+        std::os::unix::fs::symlink(elsewhere.path().join(MARKER_FILE_NAME), &marker)
+            .expect("a marker link");
+
+        let error = opened
+            .verify_owned()
+            .expect_err("a link in the marker's place must not pass");
+
+        assert!(
+            matches!(
+                error,
+                SafetyError::Unowned(OwnershipError::NotRegular {
+                    kind: NodeKind::Symlink,
+                    ..
+                })
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_root_that_vanished_after_it_was_opened_is_caught() {
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let root = parent.path().join("root");
+        fs::create_dir(&root).expect("a root");
+        fs::write(root.join(MARKER_FILE_NAME), b"owned").expect("the marker");
+        let opened = FixtureRoot::open(&root).expect("a marked root");
+        fs::remove_dir_all(&root).expect("the root should go");
+
+        let error = opened
+            .verify_owned()
+            .expect_err("a root that is gone must not be owned any more");
+
+        assert!(
+            matches!(error, SafetyError::Unowned(OwnershipError::Root { .. })),
+            "{error}"
         );
     }
 
