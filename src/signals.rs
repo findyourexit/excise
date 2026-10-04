@@ -6,6 +6,7 @@
 //! Nothing in the in-process test or scenario runners can deliver a real signal or console
 //! event; [`install`] is called only by `cli::run_main`, once per process.
 
+use std::convert::Infallible;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,9 +14,9 @@ use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Receiver;
 #[cfg(windows)]
 use crossbeam_channel::Sender;
-use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 /// A request to end the run immediately as a confirmed quit: cancel pending plans, stop an
 /// active deletion at its next entry boundary, restore the terminal if one is attached, remove
@@ -72,18 +73,67 @@ impl StopSignals {
 /// the shutdown leaves it to the exit of the process.
 pub(crate) const FORCED_STOP_GRACE: Duration = Duration::from_secs(1);
 
-/// The first, and the longest, interval at which a wait for a thread looks again: a thread
-/// cannot be joined with a timeout, so the wait asks whether it ended, sooner at first because
-/// most end at once.
-const FIRST_THREAD_POLL: Duration = Duration::from_millis(1);
-const LAST_THREAD_POLL: Duration = Duration::from_millis(20);
-
 /// What a thread's wait ended with.
 pub(crate) enum Joined<T> {
     /// The thread ended: what it returned, or the panic that ended it.
     Ended(thread::Result<T>),
     /// A forced stop gave up on the thread, which goes on until the process exits.
     Abandoned,
+}
+
+/// A thread that a [`ShutdownWait`] can wait for without ever asking whether it ended: the thread
+/// tells the wait itself, the moment it does.
+///
+/// [`spawn_waitable`] is the only way to make one. It gives the thread a guard that owns the
+/// sending end of a channel nothing is ever sent on (its message type is [`Infallible`]), and the
+/// thread's closure drops that guard last, after everything the thread's body owned, whether it
+/// returns or unwinds. The receiving end disconnects at that moment, which is what the wait
+/// selects on, beside the stop requests and the grace. A thread that panics is therefore seen to
+/// end like any other, and reported as the panic it ended with.
+pub(crate) struct WaitableThread<T> {
+    handle: JoinHandle<T>,
+    /// Disconnects once the thread's closure is done, however it ended.
+    ended: Receiver<Infallible>,
+}
+
+/// Starts a thread called `name` that runs `body`, and tells whoever waits for it through a
+/// [`ShutdownWait`] when it ends.
+///
+/// # Errors
+///
+/// Returns an error when the operating system cannot start the thread.
+pub(crate) fn spawn_waitable<T, F>(name: &str, body: F) -> io::Result<WaitableThread<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (end, ended) = crossbeam_channel::bounded::<Infallible>(0);
+    let handle = thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            // Dropped after `body` and everything it owns, on a return and on an unwind alike.
+            let _end = end;
+            body()
+        })?;
+    Ok(WaitableThread { handle, ended })
+}
+
+impl<T> WaitableThread<T> {
+    /// Waits for the thread to end however long it takes, with no stop request or grace to end
+    /// the wait early.
+    pub(crate) fn join(self) -> thread::Result<T> {
+        self.handle.join()
+    }
+
+    /// Whether the thread ended within `bound`: a test tells a thread that ends from one that
+    /// never does without waiting for it for ever.
+    #[cfg(test)]
+    pub(crate) fn ended_within(&self, bound: Duration) -> bool {
+        matches!(
+            self.ended.recv_timeout(bound),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        )
+    }
 }
 
 /// How a shutdown waits for the threads it stops, and when it stops waiting.
@@ -98,10 +148,24 @@ pub(crate) enum Joined<T> {
 /// entry is moved aside before it is removed, so a process that ended inside one could leave a
 /// target that is neither intact nor gone, and a second signal is not worth that. A deletion stuck
 /// in a call that never returns therefore still holds a forced exit, as it always has.
+///
+/// A wait never asks whether its thread ended, and never sleeps: it blocks on the thread's own end
+/// signal ([`WaitableThread`]), on the stop requests, and on the grace's deadline together. It
+/// returns the moment the thread ends, reacts to a forced stop the moment one arrives, and gives
+/// up only when the grace runs out.
 pub(crate) struct ShutdownWait {
     stops: Option<Receiver<StopRequest>>,
     /// When the wait gives up on the threads still running: set once a forced stop was seen.
     give_up_at: Option<Instant>,
+}
+
+/// Why a wait for a thread's end stopped waiting.
+#[derive(Debug, Eq, PartialEq)]
+enum Wake {
+    /// The thread ended.
+    Ended,
+    /// The grace of a forced stop ran out first.
+    GaveUp,
 }
 
 impl ShutdownWait {
@@ -124,24 +188,11 @@ impl ShutdownWait {
     }
 
     /// Waits for `thread` to end, unless a forced stop ends the wait first.
-    pub(crate) fn join<T>(&mut self, thread: JoinHandle<T>) -> Joined<T> {
-        let mut poll = FIRST_THREAD_POLL;
-        loop {
-            if thread.is_finished() || (self.stops.is_none() && self.give_up_at.is_none()) {
-                return Joined::Ended(thread.join());
-            }
-            let wait = match self.give_up_at {
-                Some(give_up_at) => {
-                    let left = give_up_at.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return Joined::Abandoned;
-                    }
-                    left.min(poll)
-                }
-                None => poll,
-            };
-            self.pause(wait);
-            poll = (poll * 2).min(LAST_THREAD_POLL);
+    pub(crate) fn join<T>(&mut self, thread: WaitableThread<T>) -> Joined<T> {
+        match self.wait_for_end(&thread.ended) {
+            // The thread's closure is done, so this returns as soon as the thread itself has gone.
+            Wake::Ended => Joined::Ended(thread.handle.join()),
+            Wake::GaveUp => Joined::Abandoned,
         }
     }
 
@@ -158,23 +209,30 @@ impl ShutdownWait {
         result
     }
 
-    /// Waits `wait`, or less when a forced stop arrives, which starts the grace.
-    fn pause(&mut self, wait: Duration) {
-        let Some(stops) = &self.stops else {
-            thread::sleep(wait);
-            return;
-        };
-        match stops.recv_timeout(wait) {
-            Ok(StopRequest::Forced) => {
-                self.give_up_at
-                    .get_or_insert_with(|| Instant::now() + FORCED_STOP_GRACE);
-            }
-            // A first request is the quit this shutdown already is.
-            Ok(StopRequest::Graceful) | Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
+    /// Blocks until `ended` disconnects or the grace of a forced stop runs out, and takes the stop
+    /// requests that arrive meanwhile: the first forced one starts the grace. A thread that has
+    /// ended wins over a grace that ran out in the same instant, as it always did.
+    fn wait_for_end(&mut self, ended: &Receiver<Infallible>) -> Wake {
+        let no_stops = crossbeam_channel::never();
+        loop {
+            let stops = self.stops.as_ref().unwrap_or(&no_stops);
+            let deadline = self
+                .give_up_at
+                .map_or_else(crossbeam_channel::never, crossbeam_channel::at);
+            let request = crossbeam_channel::select_biased! {
+                recv(ended) -> _ => return Wake::Ended,
+                recv(deadline) -> _ => return Wake::GaveUp,
+                recv(stops) -> request => request,
+            };
+            match request {
+                Ok(StopRequest::Forced) => {
+                    self.give_up_at
+                        .get_or_insert_with(|| Instant::now() + FORCED_STOP_GRACE);
+                }
+                // A first request is the quit this shutdown already is.
+                Ok(StopRequest::Graceful) => {}
                 // Nothing can arrive any more: wait as a run does that no request reaches.
-                self.stops = None;
-                thread::sleep(wait);
+                Err(_) => self.stops = None,
             }
         }
     }
@@ -283,6 +341,7 @@ pub(crate) fn install() -> io::Result<StopSignals> {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::path::PathBuf;
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
@@ -290,7 +349,8 @@ mod tests {
     use crossbeam_channel::Sender;
 
     use super::{
-        FORCED_STOP_GRACE, ForcedExitAction, Joined, ShutdownWait, StopRequest, forced_exit_action,
+        FORCED_STOP_GRACE, ForcedExitAction, Joined, ShutdownWait, StopRequest, WaitableThread,
+        Wake, forced_exit_action, spawn_waitable,
     };
 
     #[test]
@@ -309,12 +369,109 @@ mod tests {
 
     /// A thread that ends only when its sender is sent to or dropped, to stand for one inside a
     /// call that a hung file system never answers.
-    fn held_thread() -> (JoinHandle<()>, Sender<()>) {
+    fn held_thread() -> (WaitableThread<()>, Sender<()>) {
+        let (release, released) = crossbeam_channel::bounded::<()>(0);
+        let thread = spawn_waitable("excise-test-held", move || {
+            let _ = released.recv();
+        })
+        .expect("the held thread should start");
+        (thread, release)
+    }
+
+    /// As [`held_thread`], for the one wait that takes a plain handle: the deletion executor's.
+    fn held_executor() -> (JoinHandle<()>, Sender<()>) {
         let (release, released) = crossbeam_channel::bounded::<()>(0);
         let thread = thread::spawn(move || {
             let _ = released.recv();
         });
         (thread, release)
+    }
+
+    /// A wait that nothing but the thread's end can wake: its stop requests never come, and with
+    /// no forced stop there is no grace to run out. It must wake on the end signal, whether the
+    /// thread ends before the wait blocks or after.
+    #[test]
+    fn a_wait_wakes_on_the_end_signal_and_nothing_else() {
+        let (stops, receiver) = crossbeam_channel::unbounded::<StopRequest>();
+        let (held, release) = held_thread();
+        let (blocking, waiter_started) = crossbeam_channel::bounded::<()>(0);
+        let (reported, wake) = crossbeam_channel::bounded(1);
+        let waiter = thread::spawn(move || {
+            let mut wait = ShutdownWait::until_forced(Some(receiver), false);
+            blocking.send(()).expect("the test should be listening");
+            let _ = reported.send(wait.wait_for_end(&held.ended));
+        });
+
+        waiter_started.recv().expect("the waiter should start");
+        drop(release);
+
+        assert_eq!(
+            wake.recv_timeout(Duration::from_secs(60))
+                .expect("the wait must wake once the thread ends"),
+            Wake::Ended
+        );
+        waiter.join().expect("the waiting thread should end");
+        drop(stops);
+    }
+
+    /// An end signal that has fired is all a wait needs: there is no thread here to ask whether
+    /// it ended.
+    #[test]
+    fn a_fired_end_signal_ends_a_wait_with_no_thread_to_poll() {
+        let (end, ended) = crossbeam_channel::bounded::<Infallible>(0);
+        drop(end);
+
+        assert_eq!(ShutdownWait::patient().wait_for_end(&ended), Wake::Ended);
+    }
+
+    /// A grace that has run out gives up on a thread that has not ended, without a request being
+    /// read; a thread that has ended is joined all the same, even with the grace out and a request
+    /// still waiting, as it always was.
+    #[test]
+    fn the_end_of_a_thread_outranks_a_grace_that_ran_out_and_a_waiting_request() {
+        let (stops, receiver) = crossbeam_channel::unbounded();
+        stops
+            .send(StopRequest::Forced)
+            .expect("the second request should be accepted");
+        let mut wait = ShutdownWait::until_forced(Some(receiver), true);
+        wait.give_up_at = Some(Instant::now());
+        let (end, ended) = crossbeam_channel::bounded::<Infallible>(0);
+
+        assert_eq!(
+            wait.wait_for_end(&ended),
+            Wake::GaveUp,
+            "the grace had run out on a thread that had not ended"
+        );
+        drop(end);
+        assert_eq!(
+            wait.wait_for_end(&ended),
+            Wake::Ended,
+            "the grace that ran out was preferred to a thread that had ended"
+        );
+    }
+
+    /// A thread that panics ends like any other: the unwind drops the guard, so the wait wakes for
+    /// it, and the join reports the panic it ended with. The wait has no grace to give up on, so a
+    /// guard that did not fire would hang it: the test bounds how long it waits instead.
+    #[test]
+    fn a_thread_that_panics_is_seen_to_end_and_reported_as_a_panic() {
+        let panicking = spawn_waitable::<(), _>("excise-test-panic", || {
+            std::panic::resume_unwind(Box::new("the thread failed"))
+        })
+        .expect("the panicking thread should start");
+        let (joined, outcome) = crossbeam_channel::bounded(1);
+        let waiter = thread::spawn(move || {
+            let _ = joined.send(ShutdownWait::patient().join(panicking));
+        });
+
+        let Joined::Ended(Err(payload)) = outcome
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a thread that panicked must still be seen to end")
+        else {
+            panic!("the wait did not report the thread's panic");
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"the thread failed"));
+        waiter.join().expect("the waiting thread should end");
     }
 
     /// A first request is the quit a shutdown already is, so it leaves the wait for a thread
@@ -381,7 +538,7 @@ mod tests {
         stops
             .send(StopRequest::Forced)
             .expect("the second request should be accepted");
-        let (slow, release_slow) = held_thread();
+        let (slow, release_slow) = held_executor();
         let (next, release_next) = held_thread();
         let releaser = thread::spawn(move || {
             thread::sleep(FORCED_STOP_GRACE + Duration::from_millis(400));

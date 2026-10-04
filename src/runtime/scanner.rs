@@ -37,6 +37,7 @@ use crate::scan_session::ScanSessionId;
 use crate::scan_store::identity_observation::IdentityObservation;
 use crate::scan_store::path_reducer::{Coverage, PathEntryKind, PathObservation, SummaryMetrics};
 use crate::scan_store::session::{ScanInputRunFactory, SealedBatch, scan_store_capacity_message};
+use crate::signals::{WaitableThread, spawn_waitable};
 use crate::temporary_storage::TemporaryStorage;
 /// The owner consumes each bounded batch before checking input again. Keep the
 /// batch small so scanning never makes keyboard feedback wait indefinitely.
@@ -156,7 +157,10 @@ enum ScannerCommand {
 /// Initial scans and invalidation-triggered root rebuilds execute serially on
 /// the same service. A rebuild has its own cancellation flag so it never
 /// interrupts the application's lifetime or an unrelated generation.
-#[derive(Clone)]
+///
+/// The worker holds no clone of this handle, only the state they share, so the handle's sender is
+/// its command channel's only one: dropping the handle disconnects the channel and wakes the
+/// worker at once, whatever it waits on.
 pub(super) struct ScannerHandle {
     commands: Sender<ScannerCommand>,
     scheduler: Arc<Mutex<Option<SchedulerHandle>>>,
@@ -232,18 +236,22 @@ impl ScannerHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
+}
 
-    fn clear_rebuild_cancellation(&self, completed: &Arc<AtomicBool>) {
-        let mut active = self
-            .rebuild_cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if active
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, completed))
-        {
-            *active = None;
-        }
+/// Forgets `completed` as the rebuild cancellation in force, unless a newer rebuild has replaced
+/// it.
+fn clear_rebuild_cancellation(
+    active: &Mutex<Option<Arc<AtomicBool>>>,
+    completed: &Arc<AtomicBool>,
+) {
+    let mut active = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if active
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, completed))
+    {
+        *active = None;
     }
 }
 
@@ -251,47 +259,50 @@ pub(super) fn spawn(
     options: ScannerOptions,
     sender: Sender<WorkerEvent>,
     cancelled: Arc<AtomicBool>,
-) -> Result<(thread::JoinHandle<()>, ScannerHandle), std::io::Error> {
+) -> Result<(WaitableThread<()>, ScannerHandle), std::io::Error> {
     let (commands, command_receiver) = bounded(1);
+    let scheduler = Arc::new(Mutex::new(None));
+    let rebuild_cancellation = Arc::new(Mutex::new(None));
     let scanner = ScannerHandle {
         commands,
-        scheduler: Arc::new(Mutex::new(None)),
-        rebuild_cancellation: Arc::new(Mutex::new(None)),
+        scheduler: Arc::clone(&scheduler),
+        rebuild_cancellation: Arc::clone(&rebuild_cancellation),
     };
-    let service = scanner.clone();
-    let handle = thread::Builder::new()
-        .name("excise-scanner".to_string())
-        .spawn(move || {
+    // The thread captures the state it shares with the handle and never the handle itself: a
+    // clone of the handle would hold a sender of the thread's own command channel for as long as
+    // the thread lives, so dropping the pool's handle could never disconnect it, and the thread
+    // would leave only through the `cancelled` check between two of its timeouts.
+    let handle = spawn_waitable("excise-scanner", move || {
+        run_generation(
+            options,
+            &sender,
+            cancelled.as_ref(),
+            cancelled.as_ref(),
+            &scheduler,
+        );
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let command = match command_receiver.recv_timeout(SCANNER_COMMAND_RETRY) {
+                Ok(command) => command,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+            let ScannerCommand::Rebuild {
+                options,
+                cancelled: rebuild_cancelled,
+            } = command;
             run_generation(
                 options,
                 &sender,
+                rebuild_cancelled.as_ref(),
                 cancelled.as_ref(),
-                cancelled.as_ref(),
-                &service.scheduler,
+                &scheduler,
             );
-            loop {
-                if cancelled.load(Ordering::Acquire) {
-                    return;
-                }
-                let command = match command_receiver.recv_timeout(SCANNER_COMMAND_RETRY) {
-                    Ok(command) => command,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                };
-                let ScannerCommand::Rebuild {
-                    options,
-                    cancelled: rebuild_cancelled,
-                } = command;
-                run_generation(
-                    options,
-                    &sender,
-                    rebuild_cancelled.as_ref(),
-                    cancelled.as_ref(),
-                    &service.scheduler,
-                );
-                service.clear_rebuild_cancellation(&rebuild_cancelled);
-            }
-        })?;
+            clear_rebuild_cancellation(&rebuild_cancellation, &rebuild_cancelled);
+        }
+    })?;
     Ok((handle, scanner))
 }
 
@@ -2799,6 +2810,58 @@ mod tests {
             compared += 1;
         }
         assert_eq!(compared, 5, "every fixture entry is compared");
+    }
+
+    /// The persistent scanner thread holds no sender of its own command channel: once the pool
+    /// drops its handle, the thread, idle after its first scan, sees the channel disconnect and
+    /// ends, though nothing set `cancelled`. A thread that held a clone of the handle would leave
+    /// only through that flag, and this test never sets it.
+    #[test]
+    fn the_scanner_thread_ends_when_the_handle_is_dropped_without_a_cancellation() {
+        let root = tempfile::tempdir().expect("scan root should exist");
+        fs::write(root.path().join("entry"), b"payload").expect("scan fixture should exist");
+        let (sender, events) = crossbeam_channel::unbounded();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (thread, handle) = spawn(
+            ScannerOptions {
+                session: ScanSessionId::from_bytes([7; 16]),
+                generation: ScanGeneration::initial(),
+                coordinator: SessionCoordinator::start(
+                    ScanSessionId::from_bytes([7; 16]),
+                    ScanGeneration::initial(),
+                )
+                .expect("scanner coordinator should start"),
+                root: root.path().to_path_buf(),
+                root_identity: None,
+                threads: 1,
+                cross_filesystems: false,
+                exclusions: Vec::new(),
+                internal_paths: Vec::new(),
+                temporary_storage: TemporaryStorage::scan_store_with_limit_bytes(8 * 1024 * 1024),
+                input_runs: None,
+            },
+            sender,
+            Arc::clone(&cancelled),
+        )
+        .expect("the scanner thread should start");
+        // Once the first scan is over, the thread waits for a command.
+        loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the first scan should finish");
+            if matches!(event, WorkerEvent::ScanFinished { .. }) {
+                break;
+            }
+        }
+
+        drop(handle);
+
+        assert!(
+            thread.ended_within(Duration::from_secs(60)),
+            "the scanner thread did not end when its handle was dropped: it holds a sender of \
+             its own command channel"
+        );
+        assert!(!cancelled.load(Ordering::Acquire));
     }
 }
 

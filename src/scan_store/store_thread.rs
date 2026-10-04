@@ -48,7 +48,6 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TryRecvError, TrySendError, bounded};
@@ -65,7 +64,7 @@ use crate::deletion::{PlannedKind, current_folder_listing};
 use crate::native_path::NativeIdentity;
 use crate::scan_coordinator::{RelativePath, ScanGeneration, WorkLease};
 use crate::scan_session::ScanSessionId;
-use crate::signals::{Joined, ShutdownWait};
+use crate::signals::{Joined, ShutdownWait, WaitableThread, spawn_waitable};
 use crate::temporary_storage::TemporaryStorage;
 
 /// The name of the thread that owns a session's scan store.
@@ -325,16 +324,16 @@ impl StoreEngine {
 struct StoreThread {
     commands: Sender<StoreCommand>,
     results: Receiver<StoreResult>,
-    join: JoinHandle<()>,
+    join: WaitableThread<()>,
 }
 
 impl StoreThread {
     fn spawn(engine: StoreEngine, quota: TemporaryStorage) -> io::Result<Self> {
         let (commands, command_receiver) = bounded(STORE_COMMAND_CAPACITY);
         let (result_sender, results) = bounded(STORE_RESULT_CAPACITY);
-        let join = thread::Builder::new()
-            .name(STORE_THREAD_NAME.to_string())
-            .spawn(move || run(engine, &command_receiver, &result_sender, &quota))?;
+        let join = spawn_waitable(STORE_THREAD_NAME, move || {
+            run(engine, &command_receiver, &result_sender, &quota);
+        })?;
         Ok(Self {
             commands,
             results,
@@ -997,6 +996,7 @@ impl Drop for StoreHandle {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::thread;
     use std::time::Instant;
 
     use super::*;

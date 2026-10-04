@@ -33,7 +33,7 @@ use crate::scan_coordinator::{
 };
 use crate::scan_session::ScanSessionId;
 use crate::scan_store::session::SealedBatch;
-use crate::signals::{Joined, ShutdownWait};
+use crate::signals::{Joined, ShutdownWait, WaitableThread, spawn_waitable};
 use crate::state::deletion_work::{
     DeletionExecutionProgress, DeletionWorkCommand, DeletionWorkId, MAX_DELETION_WORK_ITEMS,
 };
@@ -148,7 +148,7 @@ pub(crate) enum HistoryExportError {
 struct HistoryExport {
     /// Holds the export's one outcome.
     outcome: Receiver<HistoryExportOutcome>,
-    join: thread::JoinHandle<()>,
+    join: WaitableThread<()>,
 }
 
 /// The planner can build one non-mutating identity plan while the executor owns
@@ -166,8 +166,8 @@ pub struct WorkerPool {
     coordinator: SessionCoordinator,
     generation_rebuild_lease: Mutex<Option<WorkLease>>,
     history_export: Mutex<Option<HistoryExport>>,
-    scanner_handle: thread::JoinHandle<()>,
-    planner_handle: thread::JoinHandle<()>,
+    scanner_handle: WaitableThread<()>,
+    planner_handle: WaitableThread<()>,
     executor_handle: thread::JoinHandle<()>,
 }
 
@@ -216,27 +216,25 @@ impl WorkerPool {
             Arc::clone(&cancelled),
         )
         .map_err(|error| AppError::io("could not spawn scanner worker", error))?;
-        let planner = match thread::Builder::new()
-            .name("excise-deletion-planner".to_string())
-            .spawn({
-                let sender = event_sender.clone();
-                let cancelled = Arc::clone(&cancelled);
-                let plan_cancelled = Arc::clone(&deletion_plan_cancelled);
-                let root = scan_root.clone();
-                let root_identity = scan_root_identity.clone();
-                let temporary_storage = temporary_storage.clone();
-                move || {
-                    planning_worker(
-                        &root,
-                        root_identity.as_ref(),
-                        &temporary_storage,
-                        &planner_receiver,
-                        &sender,
-                        &plan_cancelled,
-                        &cancelled,
-                    );
-                }
-            }) {
+        let planner = match spawn_waitable("excise-deletion-planner", {
+            let sender = event_sender.clone();
+            let cancelled = Arc::clone(&cancelled);
+            let plan_cancelled = Arc::clone(&deletion_plan_cancelled);
+            let root = scan_root.clone();
+            let root_identity = scan_root_identity.clone();
+            let temporary_storage = temporary_storage.clone();
+            move || {
+                planning_worker(
+                    &root,
+                    root_identity.as_ref(),
+                    &temporary_storage,
+                    &planner_receiver,
+                    &sender,
+                    &plan_cancelled,
+                    &cancelled,
+                );
+            }
+        }) {
             Ok(handle) => handle,
             Err(error) => {
                 cancelled.store(true, Ordering::Release);
@@ -555,14 +553,12 @@ impl WorkerPool {
         }
         let (sender, outcome) = bounded(1);
         let cancelled = Arc::clone(&self.cancelled);
-        let join = thread::Builder::new()
-            .name("excise-history-export".to_string())
-            .spawn(move || {
-                let result = write(&cancelled);
-                // The queue's only send, so it never waits; a pool that is gone ignores it.
-                let _ = sender.send(HistoryExportOutcome { exported, result });
-            })
-            .map_err(HistoryExportError::Spawn)?;
+        let join = spawn_waitable("excise-history-export", move || {
+            let result = write(&cancelled);
+            // The queue's only send, so it never waits; a pool that is gone ignores it.
+            let _ = sender.send(HistoryExportOutcome { exported, result });
+        })
+        .map_err(HistoryExportError::Spawn)?;
         *slot = Some(HistoryExport { outcome, join });
         Ok(())
     }
