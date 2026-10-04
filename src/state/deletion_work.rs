@@ -1047,6 +1047,19 @@ impl DeletionWork {
     }
 }
 
+#[cfg(feature = "fuzzing")]
+impl DeletionWork {
+    /// The id of the work item that asks to delete `path`, for the fuzz target's probe. The owner
+    /// loop reports a request it has just queued, and the queue made the id then.
+    pub(crate) fn id_for_probe(&self, path: &Path) -> Option<u64> {
+        self.items
+            .iter()
+            .rev()
+            .find(|item| item.path.as_path() == path)
+            .map(|item| item.id.0)
+    }
+}
+
 fn work_rail_item(item: &DeletionWorkItem) -> WorkRailItem<'_> {
     work_rail_item_with_phase_snapshot(item, None)
 }

@@ -920,6 +920,7 @@ fn run_dynamic_checks(cargo: &OsStr) -> Result<(), Box<dyn Error>> {
     run_fuzz_target("filter", 512)?;
     run_fuzz_target("deletion_state", 256)?;
     run_fuzz_target("deletion_plan", 64)?;
+    run_fuzz_target("deletion_lifecycle", 64)?;
     run_fuzz_target("report", 512)?;
     run(
         cargo,

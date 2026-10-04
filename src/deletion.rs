@@ -149,6 +149,18 @@ impl DeletionPlan {
     }
 }
 
+#[cfg(feature = "fuzzing")]
+impl DeletionPlan {
+    /// The entries the planner reviewed, for the fuzz target's model; `None` once the plan keeps
+    /// them in a file.
+    pub(crate) fn reviewed_entries_for_probe(&self) -> Option<Vec<PlannedEntry>> {
+        match &self.entries {
+            PlanEntries::InMemory(entries) => Some(entries.clone()),
+            PlanEntries::Spilled(_) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RecordSpill {
     /// Where the spill is a named file in the user's tree (on Windows), the file is one with the

@@ -96,6 +96,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "deletion_lifecycle"
+path = "fuzz_targets/deletion_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "report"
 path = "fuzz_targets/report.rs"
 test = false

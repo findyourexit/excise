@@ -817,6 +817,8 @@ fn execution_worker(
                 continue;
             }
         };
+        #[cfg(feature = "fuzzing")]
+        crate::deletion_probe::before_execution(work_id.0, &plan);
         let event = match revalidate_plan_cancellable(scan_root, &plan, soft_cancelled) {
             Ok(()) => WorkerEvent::DeletionFinished {
                 work_id,
@@ -832,6 +834,14 @@ fn execution_worker(
             },
             Err(error) => WorkerEvent::DeletionExecutionRejected { work_id, error },
         };
+        #[cfg(feature = "fuzzing")]
+        crate::deletion_probe::after_execution(
+            work_id.0,
+            match &event {
+                WorkerEvent::DeletionFinished { report, .. } => Some(report),
+                _ => None,
+            },
+        );
         clear_active_deletion_progress(active_progress, &progress);
         if !send_event(sender, event, cancelled) {
             return;

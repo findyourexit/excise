@@ -32,6 +32,8 @@ pub mod deletion;
 #[cfg(not(feature = "internal"))]
 #[allow(dead_code)]
 mod deletion;
+#[cfg(feature = "fuzzing")]
+mod deletion_probe;
 mod entry_metadata;
 #[cfg(feature = "internal")]
 pub mod error;
@@ -143,6 +145,7 @@ pub mod fuzz {
             PlannedEntry, PlannedKind, PlannedSnapshot, ReviewedEntry, build_plan_cancellable,
             execute_plan,
         };
+        pub use crate::deletion_probe::{DeletionProbe, ProbeGuard, ReviewedPlan, install_probe};
     }
 
     pub mod error {
