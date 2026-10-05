@@ -603,11 +603,13 @@ cargo xtask e2e [--quick|--full|--nightly] [--scenario NAME]... [--profile PROFI
 
 The command builds the `excise` release binary, or uses the one named by `EXCISE_E2E_BINARY`, loads
 the scenarios in [`scenarios/`](scenarios), runs each selected one under its profiles, and prints a
-verdict table. It exits non-zero on any `fail`, `xpass`, or `error`.
+verdict table. It exits non-zero on any `fail`, `xpass`, or `error`, and on a quick tier that takes
+longer than its budget on the reference machine (see [Quick-tier time](#quick-tier-time)).
 
 - `--quick` runs scenarios tagged `tier = "quick"` (the default) under the `default` and
-  `deterministic` profiles only, and must stay within two minutes. `--full`, the default tier, adds
-  `full` and every profile a scenario declares. `--nightly` adds `nightly` too.
+  `deterministic` profiles only, and must stay within two minutes, which a run of the whole tier
+  checks (see [Quick-tier time](#quick-tier-time)). `--full`, the default tier, adds `full` and
+  every profile a scenario declares. `--nightly` adds `nightly` too.
 - `--scenario` names a scenario and runs it whatever its tier, though a scenario outside its
   `platforms` is still skipped, with the reason, even when it is named. A scenario outside the
   selected tier or its `platforms` is otherwise skipped, with the reason, and printed.
@@ -631,6 +633,33 @@ not in `scenarios/`. `tests/harness_scenarios.rs` in the `excise` crate runs
 `cargo test`, along with a few one-off scenarios that exercise the runner itself, and runs the
 control to assert that the `delete` step failed, that the last input was Backspace, that no `y`
 appears among the recording's input events, and that every byte of the fixture is unchanged.
+
+### Quick-tier time
+
+Agents and developers run the quick tier on every iteration, and it grows one scenario at a time,
+so a run of the whole tier times itself: `cargo xtask e2e --quick` with no `--scenario`, no
+`--profile`, and no `--repeat` (a narrower or longer run is not the tier, and has no time to hold
+to a budget). The clock starts just before the first launch of the binary under test, the warm-up,
+and stops when the last run has ended. The verdict table's last line prints the time against the
+budget of two minutes (`quick tier: 22.6 s of 120 s`), and the summary records it in milliseconds
+as `quick_tier_ms`, a field that every other run leaves out. The runs' own times in the table add up
+to less than the tier's: each run also generates and removes its own copy of its fixture, and the
+warm-up comes first.
+
+The budget is the constant `QUICK_BUDGET` in `src/runner/e2e.rs`, beside the tier's other
+constants. A tier over it:
+
+- **fails the run on the reference machine**, the one whose speed the budget was set on. It says so
+  by setting `EXCISE_HARNESS_REFERENCE=1` (exactly `1`, the convention of `EXCISE_HARNESS_CGROUP`
+  and `EXCISE_HARNESS_PRIVILEGED`); CI runners do not set it. The failure names the budget and the
+  five slowest runs, each with the time the table shows for it, and the table prints it as a
+  `FAIL` line.
+- **warns everywhere else**: the table prints the same message as a `WARN` line and the run
+  passes, because a hosted runner or a loaded machine is slower than the one the budget was set on.
+
+A run that already failed keeps its failure and still reports its time. `--timing-informational`
+does not excuse the budget: the machine decides, not the flag. When a change makes the tier slow,
+the message names the runs to trim: give a heavy scenario `tier = "full"`, or make it cheaper.
 
 ## Comparison files
 
@@ -1249,7 +1278,7 @@ Machine output is versioned JSON. Every document carries a `document_kind` and a
 
 | Document | `document_kind` | `schema_version` | Written by | Schema | What it is |
 |---|---|---|---|---|---|
-| Summary | `harness-summary` | 1 | `cargo xtask e2e` and `cargo xtask headless` (one schema, both commands; see below) | [`harness-summary.schema.json`](schemas/harness-summary.schema.json) | The result of one run: run id, tier, times, host, the binary's path and SHA-256, the git SHA, the latency scale when it is not 1 (`latency_budget_scale`), whether the run held timing informational (`timing_informational`), and a verdict, duration, an open map of named metrics, and the timing budgets missed without failing (`timing_warnings`) for each scenario and profile (or, under `headless`, each fixture). The three fields are optional and absent in a strict run, so they are additive and the version stays 1. |
+| Summary | `harness-summary` | 1 | `cargo xtask e2e` and `cargo xtask headless` (one schema, both commands; see below) | [`harness-summary.schema.json`](schemas/harness-summary.schema.json) | The result of one run: run id, tier, times, host, the binary's path and SHA-256, the git SHA, the latency scale when it is not 1 (`latency_budget_scale`), whether the run held timing informational (`timing_informational`), how long the whole quick tier took when the run was that, in milliseconds (`quick_tier_ms`; see [Quick-tier time](#quick-tier-time)), and a verdict, duration, an open map of named metrics, and the timing budgets missed without failing (`timing_warnings`) for each scenario and profile (or, under `headless`, each fixture). The four fields are optional and left out when they have nothing to say (a strict run has no scale, no flag, and no warnings, and only a run of the whole quick tier has a time), so they are additive and the version stays 1. |
 | Failure bundle | `harness-failure` | 1 | `cargo xtask e2e` | [`harness-failure.schema.json`](schemas/harness-failure.schema.json) | The evidence for one failed scenario: the failed step, expected and actual screen text, terminal modes, the session's diagnostics (present only when the step timed out; see [Runner semantics](#runner-semantics)), the recording path, resource use, the fixture hash and seed, and a command that reruns it. |
 | A/B evidence | `harness-ab` | 1 | `cargo xtask bench-e2e` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under (the fixtures compared, the host, the toolchain, the power state, the load average, and concurrent `excise` processes). |
 

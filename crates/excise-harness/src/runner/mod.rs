@@ -75,6 +75,7 @@ mod outcome;
 mod plan;
 mod run;
 mod steps;
+mod tier_time;
 mod verdict;
 mod work;
 
@@ -85,5 +86,6 @@ pub use e2e::{
 pub use outcome::{FailureCause, RunError, StepFailure};
 pub(crate) use run::resolve_binary;
 pub use run::{RunReport, RunRequest, run_scenario};
+pub use tier_time::{QuickBudget, QuickTierTime};
 pub use verdict::{Outcome, verdict};
 pub use work::work_base;

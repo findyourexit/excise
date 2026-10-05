@@ -581,6 +581,7 @@ pub fn run_suite(
         git_sha: options.git_sha.clone(),
         latency_budget_scale: None,
         timing_informational: options.timing_informational,
+        quick_tier_ms: None,
         scenarios: fixtures.iter().map(render::result_of).collect(),
     };
     let summary_path = run_dir.join("summary.json");

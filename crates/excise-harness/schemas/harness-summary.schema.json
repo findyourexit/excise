@@ -47,6 +47,10 @@
       "description": "Present, and true, when the run held timing informational: a timing budget a result missed (a scenario's four latency budgets, a headless scan's ratio against du) is a warning in that result's timing_warnings, not a failure. Absent in a strict run. Every other budget blocked as usual, and a result that was expected to fail was judged strictly either way.",
       "const": true
     },
+    "quick_tier_ms": {
+      "description": "How long the whole quick tier took, in milliseconds, from just before the first launch of the binary under test to the end of the last run: the time held to the tier's budget. Present only in a run of the whole quick tier (--quick with no --scenario, --profile, or --repeat); absent from every other run, which is not the tier, and from every headless run.",
+      "$ref": "#/$defs/unsigned"
+    },
     "scenarios": {
       "type": "array",
       "items": { "$ref": "#/$defs/scenario_result" }

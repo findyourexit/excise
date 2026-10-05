@@ -190,6 +190,13 @@ pub struct HarnessSummary {
     /// blocked as usual, and a result that was expected to fail was judged strictly either way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timing_informational: bool,
+    /// How long the whole quick tier took, in milliseconds, from just before the first launch to
+    /// the end of the last run: the time `cargo xtask e2e` holds to the tier's budget. Present only
+    /// in a run of the whole quick tier (`--quick` without `--scenario`, `--profile`, or
+    /// `--repeat`), and absent from every other run, which is not the tier, and from every
+    /// `headless` run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quick_tier_ms: Option<u64>,
     /// One result per scenario and profile.
     pub scenarios: Vec<ScenarioResult>,
 }
