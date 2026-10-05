@@ -69,6 +69,7 @@ A scenario is a strict TOML file (unknown fields are errors), `crates/excise-har
 - Lifecycle scenarios declare the `default` and `deterministic` profiles and end with `quit` and `expect_exit` with `residue = "none"`.
 - Wait with `wait_header` before you act, never for the screen to go idle. Every wait takes a `timeout_ms` (10 s by default).
 - Put a `settle` after `key = "esc"`: a key sent right behind a lone Esc can be read with it as Alt plus that key.
+- After a `delete`, put a `wait_refresh` before a `quit` or anything else that ends the run. The map lists the deleted entry until the program replaces it, a quit meanwhile exits 130 instead of 0, and the header reads `COMPLETE` from the map as it was, so `wait_header` cannot say when it is over.
 - A scenario whose verdict depends on timing includes a step only the pseudo-terminal runner performs (`wait_event`, `measure`, `expect_budget`, `signal`), so that the in-process runner, which never judges timing, skips it.
 - To start `excise` in its reduced-confirmation mode, set the typed `disable_delete_confirmation = true`. A scenario never passes arguments of its own, because they could point the program at a root the harness does not own.
 
@@ -81,6 +82,7 @@ The steps:
 - `type`: type literal text.
 - `select`: select an entry by name through the filter, and check the inspector shows exactly it.
 - `delete`: press Backspace, check the dialog and every sentinel, and only then confirm with `y` (or Enter, with `confirm_with`). A mismatch fails the step and confirms nothing. `path` says where the entry is and defaults to `name` directly below the root: the dialog must show exactly that, so an entry below a folder needs its `path`. With `disable_delete_confirmation = true` there is no dialog: the step waits for the selected-item panel to name the entry, checks the entry on disk (at `path`, for an entry below the root) and every sentinel, refuses when another entry of the fixture has the same name and kind (the panel could not say which one Backspace deletes), then presses Backspace alone and fails if a dialog opens.
+- `wait_refresh`: after a `delete`, wait until the map has caught up with it (pseudo-terminal runner: the program's `refresh_finished` event and a frame after it; in-process runner: one barrier). It returns at once after a deletion that removed nothing, and it needs a `delete` before it.
 - `wait_fs_absent`: wait until a fixture-relative path no longer exists.
 - `wait_fs_present`: wait until a fixture-relative path exists.
 - `fs_mutate`: change the fixture while excise runs (`appear`, `change`, `vanish`, `replace`).

@@ -83,9 +83,10 @@ not_contains = ["DELETE FILE"]
 step = "expect_fs"
 present = ["hostile/unwritable/stuck.txt", "hostile/unwritable", "keep-a.bin"]
 
+# Nothing was removed, so no refresh is owed and this returns at once; it stands where the rule
+# puts it, so that nothing ends the run before the map has caught up with a deletion.
 [[steps]]
-step = "wait_header"
-state = "complete"
+step = "wait_refresh"
 timeout_ms = 30000
 
 [[steps]]

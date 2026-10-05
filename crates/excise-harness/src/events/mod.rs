@@ -67,11 +67,25 @@ pub enum Payload {
         /// Entries the deletion failed to remove.
         failed: u64,
     },
+    /// The map on screen caught up with the deletions that removed entries.
+    RefreshFinished {
+        /// How the refresh ended.
+        outcome: RefreshOutcome,
+    },
     /// The interactive run is about to return its exit code.
     Exit {
         /// The exit code.
         code: u64,
     },
+}
+
+/// How the refresh that a deletion owed ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The map without the removed entries was published, and is the one on screen.
+    Published,
+    /// No map could be shown.
+    Failed,
 }
 
 impl Payload {
@@ -84,15 +98,18 @@ impl Payload {
             Self::ScanComplete { .. } => "scan_complete",
             Self::QuitPrompt => "quit_prompt",
             Self::DeletionFinished { .. } => "deletion_finished",
+            Self::RefreshFinished { .. } => "refresh_finished",
             Self::Exit { .. } => "exit",
         }
     }
 
-    /// The scenario-vocabulary kind, or `None` for the `hello` handshake.
+    /// The scenario-vocabulary kind, or `None` for an event that no `wait_event` waits for: the
+    /// `hello` handshake, and the end of a refresh, which only `wait_refresh` reads (a bare wait
+    /// for it would match a refresh that ended before the deletion it should follow).
     #[must_use]
     pub const fn event_kind(&self) -> Option<EventKind> {
         match self {
-            Self::Hello { .. } => None,
+            Self::Hello { .. } | Self::RefreshFinished { .. } => None,
             Self::Frame { .. } => Some(EventKind::Frame),
             Self::ScanComplete { .. } => Some(EventKind::ScanComplete),
             Self::QuitPrompt => Some(EventKind::QuitPrompt),
@@ -204,6 +221,14 @@ pub enum EventError {
         /// The unexpected field.
         field: String,
     },
+    /// A `refresh_finished` line reports an outcome that protocol version 1 does not define.
+    #[error("event line {line} (`refresh_finished`) has the unknown outcome `{outcome}`")]
+    UnknownOutcome {
+        /// The one-based line number.
+        line: usize,
+        /// The outcome as written.
+        outcome: String,
+    },
 }
 
 /// Parses one complete line of the event channel.
@@ -269,6 +294,9 @@ pub fn parse_line(line: usize, bytes: &[u8], observed: Instant) -> Result<Event,
             removed: take_number(&mut fields, line, "removed")?,
             failed: take_number(&mut fields, line, "failed")?,
         },
+        "refresh_finished" => Payload::RefreshFinished {
+            outcome: take_outcome(&mut fields, line)?,
+        },
         "exit" => Payload::Exit {
             code: take_number(&mut fields, line, "code")?,
         },
@@ -316,6 +344,20 @@ fn take_string(
             expected: "a string",
         }),
         None => Err(EventError::MissingField { line, field }),
+    }
+}
+
+fn take_outcome(
+    fields: &mut Map<String, Value>,
+    line: usize,
+) -> Result<RefreshOutcome, EventError> {
+    match take_string(fields, line, "outcome")?.as_str() {
+        "published" => Ok(RefreshOutcome::Published),
+        "failed" => Ok(RefreshOutcome::Failed),
+        other => Err(EventError::UnknownOutcome {
+            line,
+            outcome: other.to_owned(),
+        }),
     }
 }
 
@@ -470,6 +512,47 @@ mod tests {
                 .payload,
             Payload::Exit { code: 130 }
         );
+    }
+
+    #[test]
+    fn a_refresh_event_carries_its_outcome_and_no_wait_event_matches_it() {
+        for (word, outcome) in [
+            ("published", RefreshOutcome::Published),
+            ("failed", RefreshOutcome::Failed),
+        ] {
+            let event = parse(&format!(
+                r#"{{"v":1,"kind":"refresh_finished","outcome":"{word}","t_us":9}}"#
+            ))
+            .expect("refresh_finished");
+
+            assert_eq!(event.payload, Payload::RefreshFinished { outcome });
+            assert_eq!(event.payload.kind_name(), "refresh_finished");
+            // A bare wait for the end of a refresh would match one that ended before the
+            // deletion it should follow, so no `wait_event` can name it.
+            assert_eq!(event.payload.event_kind(), None);
+        }
+    }
+
+    #[test]
+    fn a_refresh_event_with_an_unknown_or_missing_outcome_is_rejected() {
+        assert!(matches!(
+            parse(r#"{"v":1,"kind":"refresh_finished","outcome":"cancelled","t_us":1}"#),
+            Err(EventError::UnknownOutcome { line: 1, outcome }) if outcome == "cancelled"
+        ));
+        assert!(matches!(
+            parse(r#"{"v":1,"kind":"refresh_finished","t_us":1}"#),
+            Err(EventError::MissingField {
+                field: "outcome",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(r#"{"v":1,"kind":"refresh_finished","outcome":1,"t_us":1}"#),
+            Err(EventError::WrongType {
+                field: "outcome",
+                ..
+            })
+        ));
     }
 
     #[test]

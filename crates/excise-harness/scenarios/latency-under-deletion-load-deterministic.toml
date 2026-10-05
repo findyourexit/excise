@@ -54,32 +54,17 @@ key = "down"
 step = "settle"
 timeout_ms = 10000
 
-# The deletion step returned before the deletion itself finished: reach the same point the
-# "finished" wait would have, by hand (wait_fs_absent, then deletion_finished, then a frame after
-# it), before trusting the map or quitting.
+# The deletion step returned before the deletion itself finished. The map lists the victim until
+# the program replaces it, and a quit meanwhile cancels the replacement (exit code 130). The header
+# reads COMPLETE from the map as it was, so it cannot say when that has happened; the program says
+# so itself. This waits for the deletion's report, and then for that.
 [[steps]]
 step = "wait_fs_absent"
 path = "victim"
 timeout_ms = 30000
 
 [[steps]]
-step = "wait_event"
-event = "deletion_finished"
-timeout_ms = 30000
-
-# `wait_event` only waits for the event line itself; force a fresh frame after it before trusting
-# the header, or a stale pre-rebuild COMPLETE frame could let the quit below race the rebuild. A
-# resize forces that frame without counting as a measured input; the width only changes by one
-# column, which cannot break anything this scenario checks afterward.
-[[steps]]
-step = "resize"
-cols = 121
-rows = 40
-
-# A deletion invalidates the map, and the program rebuilds it; this is the frame after the rebuild.
-[[steps]]
-step = "wait_header"
-state = "complete"
+step = "wait_refresh"
 timeout_ms = 30000
 
 [[steps]]

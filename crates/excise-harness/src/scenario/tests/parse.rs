@@ -8,7 +8,7 @@ use crate::scenario::{
     EventKind, Expect, ExpectBudget, ExpectConfig, ExpectExit, ExpectFs, ExpectScreen, FsMutate,
     Idle, KeyName, LoadError, Marker, Measure, MutateOp, PressKey, Profile, Quit, Region, Residue,
     Resize, ScanState, Scenario, Select, SendSignal, Settle, Signal, Step, Terminal, Tier,
-    TypeText, WaitEvent, WaitFs, WaitHeader, WaitText,
+    TypeText, WaitEvent, WaitFs, WaitHeader, WaitRefresh, WaitText,
 };
 
 const HEAD: &str = r#"schema_version = 1
@@ -548,6 +548,24 @@ fn settle_and_quit_parse_with_and_without_a_timeout() {
         step("step = \"quit\"\ntimeout_ms = 5"),
         Step::Quit(Quit { timeout_ms: 5 })
     );
+}
+
+#[test]
+fn wait_refresh_parses_with_and_without_a_timeout_and_takes_no_other_field() {
+    assert_eq!(
+        step("step = \"wait_refresh\""),
+        Step::WaitRefresh(WaitRefresh {
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        })
+    );
+    assert_eq!(
+        step("step = \"wait_refresh\"\ntimeout_ms = 4"),
+        Step::WaitRefresh(WaitRefresh { timeout_ms: 4 })
+    );
+    let rejected = rejection(&format!(
+        "{HEAD}\n[[steps]]\nstep = \"wait_refresh\"\nevent = \"deletion_finished\"\n"
+    ));
+    assert!(rejected.contains("unknown field `event`"), "{rejected}");
 }
 
 #[test]

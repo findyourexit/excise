@@ -221,6 +221,7 @@ pub fn describe(step: &Step) -> String {
         Step::Measure(measure) => format!("measure {} {}", measure.name, measure.marker),
         Step::Idle(idle) => format!("idle after {} ms for {} ms", idle.after_ms, idle.window_ms),
         Step::Settle(_) => "settle".to_owned(),
+        Step::WaitRefresh(_) => "wait_refresh".to_owned(),
         Step::Quit(_) => "quit".to_owned(),
     }
 }

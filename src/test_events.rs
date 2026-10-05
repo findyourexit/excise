@@ -20,8 +20,8 @@
 //!   calling thread and then flushed. Nothing is synced to disk.
 //! - **Failure.** After the first write error the channel disables itself. A reader that
 //!   went away can never crash or block the interface.
-//! - **Privacy.** Events carry counts and timings. They never carry names, paths, or any
-//!   other scan data.
+//! - **Privacy.** Events carry counts, timings, and one fixed word for an outcome. They never
+//!   carry names, paths, or any other scan data.
 //!
 //! # Protocol v1
 //!
@@ -35,6 +35,7 @@
 //! | `scan_complete` | `entries` | The initial scan finished and the map switched to its completed state. `entries` counts the scanned entries. |
 //! | `quit_prompt` | | The quit dialog was built. |
 //! | `deletion_finished` | `removed`, `failed` | A deletion worker reported. The counts come from its report. |
+//! | `refresh_finished` | `outcome` | The map on screen has caught up with the deletions that removed entries: the map without them was published (`published`), or no map could be shown (`failed`), and no rebuild or publication is owed. Always after the `deletion_finished` it answers, and once for deletions whose refreshes overlapped. A deletion that removed nothing owes no refresh and emits none. |
 //! | `exit` | `code` | An interactive run is about to return its exit code. The terminal, if it was entered, has already been restored, unless it never absorbed the restoration output within a bounded wait. A process that panics or is killed emits none. |
 
 use std::fs::{File, OpenOptions};
@@ -118,6 +119,24 @@ pub(crate) fn deletion_finished(removed: u64, failed: u64) {
     }
 }
 
+/// How the refresh that a deletion owed ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RefreshOutcome {
+    /// The map without the removed entries was published, and is the one on screen.
+    Published,
+    /// No map could be shown: the store thread gave up its generation.
+    Failed,
+}
+
+/// Reports that the map on screen has caught up with the deletions that removed entries.
+#[inline]
+pub(crate) fn refresh_finished(outcome: RefreshOutcome) {
+    if let Some(sink) = SINK.get() {
+        sink.emit(&Event::RefreshFinished { outcome });
+    }
+}
+
 /// Reports the exit code an interactive run is about to return.
 #[inline]
 pub(crate) fn exit(code: i32) {
@@ -166,6 +185,7 @@ enum Event {
     ScanComplete { entries: u64 },
     QuitPrompt,
     DeletionFinished { removed: u64, failed: u64 },
+    RefreshFinished { outcome: RefreshOutcome },
     Exit { code: i32 },
 }
 
@@ -370,6 +390,18 @@ mod tests {
                     failed: 1,
                 },
                 r#"{"v":1,"kind":"deletion_finished","removed":5,"failed":1,"t_us":7}"#,
+            ),
+            (
+                Event::RefreshFinished {
+                    outcome: RefreshOutcome::Published,
+                },
+                r#"{"v":1,"kind":"refresh_finished","outcome":"published","t_us":7}"#,
+            ),
+            (
+                Event::RefreshFinished {
+                    outcome: RefreshOutcome::Failed,
+                },
+                r#"{"v":1,"kind":"refresh_finished","outcome":"failed","t_us":7}"#,
             ),
             (
                 Event::Exit { code: 130 },

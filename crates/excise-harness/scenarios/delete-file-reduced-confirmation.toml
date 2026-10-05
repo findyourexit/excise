@@ -43,6 +43,12 @@ step = "wait_fs_absent"
 path = "victim.bin"
 timeout_ms = 30000
 
+# The map lists the file until the program replaces it, and a quit meanwhile cancels the
+# replacement (exit code 130): wait for the map to catch up before anything that ends the run.
+[[steps]]
+step = "wait_refresh"
+timeout_ms = 30000
+
 [[steps]]
 step = "expect_fs"
 present = ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
@@ -61,12 +67,6 @@ timeout_ms = 30000
 [[steps]]
 step = "expect_screen"
 not_contains = ["DELETE FILE"]
-
-# The map rebuilds after a deletion; quitting during the rebuild would cancel it and exit 130.
-[[steps]]
-step = "wait_header"
-state = "complete"
-timeout_ms = 30000
 
 [[steps]]
 step = "quit"

@@ -6,8 +6,9 @@
 //! terminal the loop just drew and the fixture on disk.
 //!
 //! * `key`, `type`, and `resize` deliver events and pass.
-//! * `settle` delivers one barrier, which renders and then drains scan work, deletion work,
-//!   timers, and animation until the loop is quiescent.
+//! * `settle` and `wait_refresh` deliver one barrier, which renders and then drains scan work,
+//!   deletion work, the rebuild or publication that replaces the map after a deletion, timers, and
+//!   animation until the loop is quiescent.
 //! * Every wait is a bounded loop: check, and while the condition does not hold, deliver a barrier
 //!   and check again, until the step's `timeout_ms` or the round limit is reached.
 //! * A check runs on a fresh screen. The screen is fresh when the last thing delivered was a
@@ -300,7 +301,11 @@ impl ScenarioInput {
         match &planned.step {
             Step::Key(press) => self.press(*press),
             Step::Type(typed) => self.type_text(typed),
-            Step::Settle(_) => {
+            // The barrier renders and then drains everything the owner loop has outstanding: scan
+            // work, deletion work, and the rebuild or publication that replaces the map a deletion
+            // left stale. It does not return until all of it has ended, so it is `wait_refresh`
+            // exactly, with none of the races a process has to wait out.
+            Step::Settle(_) | Step::WaitRefresh(_) => {
                 self.complete();
                 Drive::Barrier
             }

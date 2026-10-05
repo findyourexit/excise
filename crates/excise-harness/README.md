@@ -253,9 +253,9 @@ timeout_ms = 60000
 **Timeouts.** Every step that waits takes an optional `timeout_ms`, the bound on that wait. It
 defaults to 10 000 ms and must be between 1 and 1 800 000 (thirty minutes). When a bound elapses
 the step fails and the runner kills the process group. The waiting steps are `wait_text`,
-`wait_header`, `wait_event`, `select`, `delete`, `wait_fs_absent`, `wait_fs_present`,
-`expect_exit`, `settle`, and `quit`. The other `expect_*` steps evaluate once against the current
-state and never wait; put a `wait_*` or `settle` step before them.
+`wait_header`, `wait_event`, `select`, `delete`, `wait_refresh`, `wait_fs_absent`,
+`wait_fs_present`, `expect_exit`, `settle`, and `quit`. The other `expect_*` steps evaluate once
+against the current state and never wait; put a `wait_*` or `settle` step before them.
 
 | Step | Fields | What it does |
 |---|---|---|
@@ -266,6 +266,7 @@ state and never wait; put a `wait_*` or `settle` step before them.
 | `type` | `text` | Types literal text, one character at a time. |
 | `select` | `name`, `timeout_ms` | Selects the entry by name through the filter. |
 | `delete` | `name`, `kind` (`file` or `folder`), `path`, `confirm_with` (`y` or `enter`), `wait_for` (`finished` or `started`), `timeout_ms` | Deletes the selected entry through the confirmation dialog, or with Backspace alone when the scenario disables the confirmation. |
+| `wait_refresh` | `timeout_ms` | Waits until the map on screen has caught up with the deletions confirmed so far. |
 | `wait_fs_absent` | `path`, `timeout_ms` | Waits until the fixture-relative path no longer exists. |
 | `wait_fs_present` | `path`, `timeout_ms` | Waits until the fixture-relative path exists. |
 | `fs_mutate` | `op` (`appear`, `change`, `vanish`, `replace`), `path` | Changes the fixture while the program runs. |
@@ -334,6 +335,16 @@ Details that a table cannot carry:
   label, or `! ELEVATED` on an elevated Windows session such as the hosted runner), so `select`
   cannot read the prompt there; a scenario at that width leaves selected the entry that the fresh
   map selects (the largest) instead of choosing one.
+- **`wait_refresh`.** A deletion that removed entries leaves the map listing them until the program
+  replaces it, either with a rebuild of the whole map (macOS rebuilds after it removes a file,
+  because it cannot show that no other link to it survived) or with a map that leaves them out. A
+  quit meanwhile cancels the replacement and exits 130, not 0, and nothing on the screen says when
+  it is over: the header reads `COMPLETE` from the map as it was. The step waits until the program
+  says so, and then for a frame that shows it (see [PTY runner](#pty-runner) for how, and
+  [In-process runner](#in-process-runner) for the barrier that stands in for it there). A deletion
+  that removed nothing, a refusal, owes no refresh, so the step returns at once after it. Put it
+  after every `delete` that anything which ends the run (`quit`, `expect_exit`, a measurement of
+  the quit) follows; it needs a `delete` step before it.
 - **`expect_config`.** `key` is a dotted path into the configuration file the program saved: every
   name but the last is a table, and the last is a setting whose value is a string, which `equals`
   must match exactly (`key = "runtime.theme"`, `equals = "excise-light"`). Names are lowercase ASCII
@@ -343,7 +354,8 @@ Details that a table cannot carry:
   or a value that is not a string fails the step and says which.
 - **`wait_event`.** `event` is one of `frame`, `scan_complete`, `deletion_finished`, `quit_prompt`,
   or `exit`: the kinds reported by the program's internal test event channel (which also opens with
-  a `hello` line that the runner consumes itself). `fields` maps a numeric event field to a test:
+  a `hello` line and reports `refresh_finished`; the runner consumes both itself, the second for
+  `wait_refresh`). `fields` maps a numeric event field to a test:
   `{ eq = n }`, `{ min = n }`, or `{ max = n }` with exactly one key. The fields an event carries
   are `frame`: `seq`, `inputs`; `scan_complete`: `entries`; `deletion_finished`: `removed`,
   `failed`; and `exit`: `code`. Every event also carries `t_us`, the microseconds since the channel
@@ -394,6 +406,7 @@ Details that a table cannot carry:
 | a scenario with a `delete` step declares a sentinel | `DeleteWithoutSentinel` |
 | a `delete` step's `path` ends in the entry's `name` | `PathNotNamed` |
 | in a scenario with `disable_delete_confirmation`, a `delete` step has neither `wait_for = "started"` nor `confirm_with = "enter"`: there is no dialog to close or to confirm | `StartedWithoutDialog`, `ConfirmWithoutDialog` |
+| a `wait_refresh` has a `delete` step before it: nothing else owes a refresh | `RefreshWithoutDelete` |
 | an `expect_config` key is a dotted path of lowercase names, and it expects a non-empty string | `InvalidConfigKey`, `EmptyValue` |
 | every fixture-relative path is safe (see [Safety rules](#safety-rules)) | `InvalidPath` |
 | every `timeout_ms` is between 1 and 1 800 000 | `TimeoutOutOfRange` |
@@ -412,6 +425,10 @@ Deletion, its confirmation, cancellation, refusal, and what the interface says a
 it are pinned by these scenarios, all `quick`, under `default` and `deterministic`, in both
 runners. Each asserts the facts by name (what is on disk, what the dialog names, what the
 interface reports, how the run ends) and not whole frames.
+
+A scenario that deletes something waits with `wait_refresh` before it asserts the outcome and
+before it quits: until the program has replaced the map, the map still lists what was removed, and
+a quit meanwhile exits 130.
 
 What the interface reports is read from the header's status row (`Last deletion: 1 deleted · 0
 changed · 0 missing · 0 failed · 0 not run`), which shows it after a deletion whatever is
@@ -610,12 +627,20 @@ checks that directly.
   has been read as after `settle`, so the screen shows the result. `wait_for = "started"` ends it
   as soon as a frame shows the dialog has closed, without waiting for the deletion itself: the
   deletion keeps running after the step returns, so a step
-  that needs its outcome waits for that separately (`wait_fs_absent`, `wait_event`). The program
-  rebuilds its map after a deletion and treats a quit during the rebuild as a cancellation (exit
-  code 130): a scenario that goes on to quit after a `"finished"` delete waits for the header to
-  read `COMPLETE` first; one that quits after a `"started"` delete needs to reach the same point
-  itself (`wait_fs_absent`, then `wait_event { event = "deletion_finished" }`, then a frame after
-  it), since the step returned before any of that happened.
+  that needs its outcome waits for that separately (`wait_fs_absent`, `wait_event`). The map still
+  lists what the deletion removed when the step returns, and the program treats a quit before it
+  has replaced that map as a cancellation (exit code 130): a scenario that goes on to quit waits
+  with `wait_refresh` first, after a `"started"` delete as after a `"finished"` one. The header
+  cannot stand in for it, because it reads `COMPLETE` from the map as it was.
+- **`wait_refresh`** needs every deletion the scenario has confirmed to have reported
+  (`deletion_finished`), and then the program's `refresh_finished` event after the last report that
+  removed anything: `published` once the map without the removed entries is the one on screen, or
+  `failed`, which fails the step, when no map could be shown. The program reports it from its own
+  state (no rebuild and no publication is owed), so it holds whether the map was rebuilt or swapped
+  for one without the entries, and a refresh that ended before the deletion cannot satisfy it,
+  which is why no `wait_event` can name it. A deletion that removed nothing owes none, so after one
+  the step waits for nothing but a frame. It ends as `delete` does, on a frame after the event,
+  with the output in flight read as after `settle`.
 - **`quit`** presses `q`, waits for the quit dialog, and confirms with `y`.
 - **`resize`** resizes the terminal and waits for the frame that answers it, then reads the output
   in flight as `settle` does.
@@ -1581,6 +1606,7 @@ process runners pass:
 | `wait_header` | Reads the state badge that ends the title row. `scanning` can only be seen before the first settle. |
 | `select` | Opens the filter, replaces what it holds, types the name, applies it, and waits for the selected-item panel to name exactly that entry. The panel needs a terminal of at least 19 rows. |
 | `delete` | Presses Backspace, parses the dialog, asserts its title and path name exactly this entry and kind under the fixture root (a path the dialog cut short cannot be checked) and, with `path`, exactly that path, asserts every sentinel exists, and only then sends `y`, or Enter with `confirm_with = "enter"`. A mismatch fails the step and the confirmation key is never sent. With `disable_delete_confirmation` it instead checks the selected-item panel (name and kind), the entry on disk at `path`, and the sentinels, sends Backspace alone, and fails if a dialog opens. |
+| `wait_refresh` | Delivers one barrier, as `settle` does: the barrier returns once the owner loop has nothing outstanding, which includes the rebuild or publication that replaces the map after a deletion. |
 | `wait_fs_absent`, `wait_fs_present`, `expect_fs` | Resolve paths one component at a time, never through a symbolic link. |
 | `expect_config` | Reads the configuration file the runner gave the program and compares one string setting of it, on a fresh screen: a barrier comes first when input was delivered since the last one. |
 | `fs_mutate` | Applies `appear`, `change`, `vanish`, or `replace` with the [live mutators](#live-mutators), once the program is at rest: unless the last thing delivered was a barrier, one comes first, so even a mutation that opens the scenario lands after the first scan has settled. Nothing tells the program, so what it does about the change is what the steps after this one observe. A refused mutation fails the step with the mutator's reason. |
@@ -1610,7 +1636,8 @@ skipped.
 ### `settle` and waits
 
 `settle` is the runtime's barrier: it renders, then drains worker events, background deletion
-work, timers, and animation until the owner loop is quiescent. In-process time is virtual, and the
+work, the rebuild or publication that replaces the map after a deletion, timers, and animation
+until the owner loop is quiescent, and so is `wait_refresh`. In-process time is virtual, and the
 barrier drains work outside the production scheduling path, so **this runner never judges
 scheduling, throughput, latency, memory, or any other budget**. The pseudo-terminal and headless
 runners judge those.
@@ -1635,7 +1662,9 @@ A run resolves to a `Verdict` with strict xfail: an `expect = "fail"` scenario t
 2. Name a fixture from [`fixtures/`](fixtures), or add a spec there (see
    [Spec files](#spec-files)).
 3. Use only the steps above. Put a `quit` and an `expect_exit` at the end, so the run ends the way
-   a user would end it; a scenario that stops earlier is stopped by the runner.
+   a user would end it; a scenario that stops earlier is stopped by the runner. After a `delete`,
+   put a `wait_refresh` before the `quit`: a quit while the program is still replacing its map
+   exits 130, not 0.
 4. Run `cargo test -p excise --lib scenario_runner -- --nocapture`. A scenario that this runner
    cannot perform is skipped, never silently dropped: the suite prints `SKIP <name>: <reason>` for
    each one.

@@ -40,12 +40,11 @@ step = "expect_fs"
 present = ["keep-a.bin", "keep-b/keep.txt"]
 absent = ["victim"]
 
-# A deletion invalidates the map, and the program rebuilds it; quitting during the rebuild would
-# cancel it and exit 130. The `delete` step returns on a frame drawn after the deletion, so this
-# wait cannot be satisfied by the screen as it was before.
+# The map lists the folder until the program replaces it, and a quit meanwhile cancels the
+# replacement (exit code 130). The header cannot say when that has happened: it reads COMPLETE
+# from the map as it was. The program says so itself, and this waits for that.
 [[steps]]
-step = "wait_header"
-state = "complete"
+step = "wait_refresh"
 timeout_ms = 30000
 
 # The map stays navigable: a key is answered by a frame that reflects it.

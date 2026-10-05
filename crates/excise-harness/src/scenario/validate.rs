@@ -290,6 +290,12 @@ pub enum StepError {
          `disable_delete_confirmation` leaves no dialog"
     )]
     ConfirmWithoutDialog,
+    /// A `wait_refresh` with no `delete` step before it: nothing owes a refresh.
+    #[error(
+        "`wait_refresh` waits for the map to catch up with a deletion, but no `delete` step \
+         comes before it"
+    )]
+    RefreshWithoutDelete,
     /// An `expect_config` key is not a dotted path of setting names.
     #[error(
         "`key` {key:?} is not a dotted path: use names of lowercase ASCII letters, digits, `_` \
@@ -458,6 +464,18 @@ impl Scenario {
                 error,
             });
         }
+        let mut deleted = false;
+        for (index, step) in self.steps.iter().enumerate() {
+            match step {
+                Step::Delete(_) => deleted = true,
+                Step::WaitRefresh(_) if !deleted => errors.push(ValidationError::Step {
+                    index,
+                    kind: step.kind(),
+                    error: StepError::RefreshWithoutDelete,
+                }),
+                _ => {}
+            }
+        }
         if self.disable_delete_confirmation {
             for (index, step) in self.steps.iter().enumerate() {
                 let Step::Delete(delete) = step else {
@@ -555,6 +573,7 @@ fn check_step(step: &Step) -> Vec<StepError> {
         | Step::Signal(_)
         | Step::ExpectExit(_)
         | Step::Settle(_)
+        | Step::WaitRefresh(_)
         | Step::Quit(_) => {}
     }
     errors

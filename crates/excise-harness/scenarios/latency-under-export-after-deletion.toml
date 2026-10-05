@@ -19,9 +19,9 @@ timeout_ms = 120000
 # The victim is the largest entry, so the map has it selected once the scan is done; the delete step
 # refuses any other target. No filter is typed first: applying one reads a whole page of 65,111
 # entries, and that read is not what this scenario measures.
-# Waits for the deletion to finish; the wait below is for the rebuilt map, so the export is
-# requested on an owner loop with nothing left to do and the only work it can wait for is the
-# export's.
+# Waits for the deletion to finish, and the wait below for the map to catch up with it, so that the
+# export is requested on an owner loop with nothing left to do and the only work it can wait for is
+# the export's. The header cannot say when the map has: it reads COMPLETE from the map as it was.
 [[steps]]
 step = "delete"
 name = "victim"
@@ -29,8 +29,7 @@ kind = "folder"
 timeout_ms = 600000
 
 [[steps]]
-step = "wait_header"
-state = "complete"
+step = "wait_refresh"
 timeout_ms = 120000
 
 [[steps]]
