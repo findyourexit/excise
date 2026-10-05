@@ -1,0 +1,140 @@
+name: Pull-request count comment
+
+# Posts the counts that the `Pull-request counts` workflow took of a pull request as one comment
+# on it: a table of each count against the record of the pull request's base commit (or of its
+# nearest ancestor that has one, which the comment says), with a change of more than 5% flagged.
+# The comment is found again by a hidden marker and updated, never duplicated. It informs; it
+# gates nothing. docs/development.md, "Counts and count history", says how to read it.
+#
+# Trust. A `workflow_run` workflow always runs the copy of this file on the default branch, in the
+# context of this repository, with a token that can comment: that is what lets a comment be posted
+# for a pull request from a fork, whose own workflows cannot write. It is also why this workflow
+# must never check out, build, or run anything of the pull request's. It does not. It checks out
+# the default branch (the tooling that main already has), and the only thing it takes from the pull
+# request is the artifact, which it treats as hostile:
+#
+#  * immediately before it is downloaded, the run's artifacts are listed, and anything but exactly
+#    one `pr-counts` of at most 64 KiB compressed fails the job: the download unpacks all of an
+#    artifact onto the runner, and its size is the pull request author's choice. Nothing slow
+#    runs between that check and the download, so what was checked is what is downloaded
+#    (`.github/scripts/check-count-artifact.sh`);
+#  * the artifact is one file that is read with a size bound, as UTF-8 text, only if it is a plain
+#    file, and held to the harness-counts schema and its rules before anything in it is used
+#    (`xtask counts-comment`); a file that fails any of that fails this job, and nothing is posted;
+#  * text from it appears in the comment only inside code spans, which render it literally, and
+#    numbers and commits are formatted from values that were checked to be numbers and commits;
+#  * no value from it is interpolated into a command: the workflow's own payload and `github`
+#    context supply the commit, the repository, and the branch, the artifact supplies only a pull
+#    request number and a base commit that are digits and hexadecimal digits by then, and the
+#    posting script (`.github/scripts/post-count-comment.sh`) checks all of them again, passes
+#    them as quoted arguments, and sends the body as a file;
+#  * the artifact's pull request is believed only if the API says that pull request is open, still
+#    at the commit that this run's payload names, from the repository and branch that it names,
+#    and still based on the commit that the counts were compared with: so an artifact cannot
+#    comment on another pull request (not even one that has the same head commit), nor against a
+#    base of its own choosing, nor overwrite a newer comment with an older run's;
+#  * where the payload lists the run's pull requests, the artifact's number must be one of them.
+#    GitHub lists them for a run whose pull request is in this repository and leaves the list
+#    empty for one from a fork, so there the number cannot be checked this way; the head and base
+#    bindings above tell the pull requests apart instead, because GitHub allows no two open pull
+#    requests with the same head and base;
+#  * only the bot's own comment that begins with the marker is ever edited.
+#
+# The job's token reaches the steps that need it and no others: the checkout (through its default
+# `token` input; it does not keep it), the artifact check, the download, and the posting script.
+# It is not given to the step that compiles, nor to the step that reads the artifact, which is the
+# only one of ours that parses what the pull request made: that step runs without a token, and
+# reads the history from the checkout, which holds every branch. That is least privilege within
+# one job, not a boundary, because the steps of a job share a machine and a user. A second job
+# that holds only `pull-requests: write` and does nothing but post would be one. There is no
+# `pull_request_target` anywhere.
+#
+# The name of the workflow that this one follows is "Pull-request counts": change it there too.
+
+on:
+  workflow_run:
+    workflows: ["Pull-request counts"]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: count-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  comment:
+    name: Comment
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read # lists and downloads the artifacts that the pull request's run uploaded
+      contents: read # checks out the default branch's tooling, and the history branch with it
+      pull-requests: write # reads the pull request, and creates or updates the one comment on it
+    steps:
+      # The default branch, never the pull request: `ref` is named here so that nothing about the
+      # triggering run (its head commit or branch) can choose what is checked out.
+      - name: Check out the tooling from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      # The checkout has fetched every branch, so the history needs no token: a working copy of
+      # `bench-data` beside the repository. Where the branch does not exist yet there is no
+      # history, and the comment says so.
+      - name: Take the history out of the checkout
+        run: |
+          if git rev-parse -q --verify refs/remotes/origin/bench-data >/dev/null; then
+            git worktree add --detach "$RUNNER_TEMP/history" origin/bench-data
+          fi
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+      - name: Build the harness tooling
+        run: cargo build --locked --release --package xtask
+      # Everything slow is done: the check and the download follow each other, so that the
+      # artifact that is downloaded is the one that was checked.
+      - name: Check the artifact before it is downloaded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: bash .github/scripts/check-count-artifact.sh
+      - name: Download the counts of the pull request
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pr-counts
+          path: ${{ runner.temp }}/pr-counts
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      # No token: this is the step that parses what the pull request made.
+      - name: Render the comment
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          target/release/xtask counts-comment \
+            --artifact "$RUNNER_TEMP/pr-counts/counts.json" \
+            --expect-head-sha "$HEAD_SHA" \
+            --history "$RUNNER_TEMP/history" \
+            --out "$RUNNER_TEMP/comment"
+      - name: Post the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_PULL_REQUESTS: ${{ join(github.event.workflow_run.pull_requests.*.number, ',') }}
+        run: |
+          PR_NUMBER="$(< "$RUNNER_TEMP/comment/pull-request-number")"
+          BASE_SHA="$(< "$RUNNER_TEMP/comment/base-sha")"
+          BODY_FILE="$RUNNER_TEMP/comment/comment.md"
+          export PR_NUMBER BASE_SHA BODY_FILE
+          bash .github/scripts/post-count-comment.sh

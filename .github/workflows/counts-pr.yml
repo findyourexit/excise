@@ -1,0 +1,71 @@
+name: Pull-request counts
+
+# On a pull request that changes the program or what builds it, counts what the merged pull
+# request costs and uploads the counts as an artifact. The `Pull-request count comment` workflow
+# turns the artifact into a comment; this one only measures.
+#
+# Trust. This is an ordinary `pull_request` workflow: it builds and runs the pull request's own
+# code, so for a pull request from a fork it has a read-only token and no secrets, and it can
+# write nothing but its artifact. It never comments, and it never reads the artifact back. That
+# the artifact is whatever the pull request's code made it (a fork can change this very file) is
+# why the other workflow treats it as untrusted input. The name of this workflow is how that one
+# finds it: change it there too.
+#
+# The counts are of the merge commit (`refs/pull/<n>/merge`, what `actions/checkout` builds on a
+# pull request), against the counts recorded for the pull request's base commit.
+# docs/development.md, "Counts and count history", says how to read the comment.
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "crates/excise-harness/Cargo.toml"
+      - "crates/excise-harness/src/**"
+      - "crates/excise-harness/fixtures/**"
+      - "crates/excise-harness/schemas/**"
+      - "xtask/**"
+      - ".github/workflows/counts-pr.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-counts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  counts:
+    name: ubuntu-24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+      - name: Count what the merged pull request costs
+        env:
+          PULL_REQUEST: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          cargo run --locked --release --package xtask -- counts --repeat 2 \
+            --pull-request "$PULL_REQUEST" --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --out "$RUNNER_TEMP/pr-counts/counts.json"
+      - name: Keep the counts for the comment workflow
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-counts
+          path: ${{ runner.temp }}/pr-counts/counts.json
+          if-no-files-found: error
+          retention-days: 7

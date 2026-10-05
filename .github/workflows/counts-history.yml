@@ -1,0 +1,66 @@
+name: Count history
+
+# Every push to main (and a manual run) counts what the build costs on a hosted Linux runner and
+# appends one record to the orphan `bench-data` branch, which is how a pull request's count
+# comment finds what its base commit cost. The counts are deterministic (`cargo xtask counts`
+# fails if any differs between its two runs), so a record is a property of the commit, not of the
+# day it was taken. docs/development.md, "Counts and count history", says how to read the history.
+#
+# Trust. This workflow runs only for a push to main or a dispatch, never for a pull request, so
+# the code it builds and runs is code that is already on a branch this repository trusts. Its one
+# job is the only job of the count workflows that holds `contents: write`, and the token reaches
+# only the step that pushes: the build and the counting run without it, and the checkout does not
+# keep it. Runs never overlap, because of the concurrency group: a run in progress is not
+# cancelled, but GitHub keeps only the newest run that is waiting behind it, so a burst of pushes
+# can leave a commit without a record, which is why a comment falls back to the nearest ancestor
+# that has one. A push that still loses a race is retried a bounded number of times. The only
+# change a run makes to the branch is one new file; nothing else on the branch is ever changed.
+#
+# The records go to `bench-data` only when the run is main's. Any other ref (a dispatch from a
+# branch, or a probe of this workflow) writes to `bench-data-probe` instead, so that trying this
+# out can never add to the real history.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: count-history
+  cancel-in-progress: false
+
+jobs:
+  record:
+    name: ubuntu-24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write # pushes one new record file to the history branch, in the last step only
+    env:
+      DATA_BRANCH: ${{ github.ref == 'refs/heads/main' && 'bench-data' || 'bench-data-probe' }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install minimum supported Rust 1.98.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
+          rustc --version --verbose
+      - name: Build the harness tooling
+        run: cargo build --locked --release --package xtask
+      - name: Count what the build costs
+        run: target/release/xtask counts --repeat 2 --out "$RUNNER_TEMP/counts.json"
+      - name: Append the record to the history branch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          target/release/xtask counts-record \
+            --record "$RUNNER_TEMP/counts.json" \
+            --remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --branch "$DATA_BRANCH"
