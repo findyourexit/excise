@@ -41,12 +41,44 @@ use crate::fixture::{
     integrity::{IntegrityFailure, Verified, Verify, verify_master},
     marker::{Marker, Role, write_marker},
     plan::Plan,
+    resolve::resolve,
     spec::FixtureSpec,
     tree::{TreeGuard, remove_tree},
 };
 
 /// The name of the cache directory below the target directory.
 pub const CACHE_DIR_NAME: &str = "excise-fixtures.noindex";
+
+/// How many hexadecimal digits of the spec hash name an entry, and a fixture that is still being
+/// generated.
+const NAME_DIGITS: usize = 16;
+
+/// The digits of `spec_hash` that name a directory of the cache.
+fn name_digits(spec_hash: &str) -> &str {
+    &spec_hash[..NAME_DIGITS]
+}
+
+/// The name of the entry of the spec whose digits are `digits`: the digits and the generator
+/// version.
+fn entry_name(digits: &str) -> String {
+    format!("{digits}-{GENERATOR_VERSION}")
+}
+
+/// The name a fixture has while it is generated, until it is renamed into place: the digits, then
+/// the number of the process and of the call, so that two never share one.
+fn partial_name(digits: &str, process: u32, call: u64) -> String {
+    format!(".partial-{digits}-{process}-{call}")
+}
+
+/// The length in bytes of the longest name the cache gives a directory directly below its root:
+/// that of an entry, or that of a partial one, which is longer, at the largest process number and
+/// call count there can be, so that it holds for every process and every call.
+fn longest_name_bytes() -> usize {
+    let digits = "0".repeat(NAME_DIGITS);
+    entry_name(&digits)
+        .len()
+        .max(partial_name(&digits, u32::MAX, u64::MAX).len())
+}
 
 /// How to materialize a fixture.
 #[derive(Debug, Clone, Copy, Default)]
@@ -86,11 +118,53 @@ impl FixtureCache {
         &self.root
     }
 
+    /// The length in bytes of the longest absolute path that a fixture root in this cache can
+    /// have: the path of the cache directory, a separator, and the longest name the cache gives a
+    /// directory directly below it, which is that of a fixture while it is generated, in a
+    /// `.partial-` directory, before it is renamed into place. A path-based removal of the
+    /// directory that holds the cache (`cargo clean`, `git worktree remove`) is handed the whole
+    /// path, from the root of the file system, so what the fixture holds has to fit in what this
+    /// leaves of `PATH_MAX`: see
+    /// [`FixtureSpec::removable_by_path`](crate::fixture::FixtureSpec::removable_by_path), which
+    /// takes it.
+    ///
+    /// The path of the cache directory counts as the longest of three: the path as it is
+    /// spelled; every pathname the system works on while it expands a symbolic link in it, which
+    /// is the content of the link and what is left of the path after the link; and the path as it
+    /// resolves, with every link expanded (on Windows the verbatim form, `\\?\C:\...`, which is
+    /// four bytes longer than the drive form). The spelling counts as it is: on Unix the system is
+    /// handed the text of the root, and counts every `.` name and repeated separator in it, which
+    /// [`std::path::absolute`] would drop, so `/dir//cache` is a byte longer than `/dir/cache`
+    /// and `/dir/./cache` two; a relative root is the current directory and the text written
+    /// after it. (On Windows [`std::path::absolute`] is the spelling the system sees: see the
+    /// resolver.) The system counts the expansion of a link against `PATH_MAX`: macOS refuses a
+    /// path when the content of a link and the rest of the path are together longer than that. A
+    /// root reached through a short link to a deep directory, through a link whose content goes
+    /// down a long way and comes back up with `..`, or through a short link to a long path that
+    /// ends in a link back to a short directory, can be short as it is written and short as it
+    /// resolves, and still make the system work on a pathname much longer than either to reach
+    /// what is below it. The names of the root that do not exist yet count as they are written,
+    /// below the longest ancestor that does, so the cache directory need not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the path cannot be resolved: the root is empty, a relative root has no current
+    /// directory to start from, a name on the way cannot be searched, a name that exists is not
+    /// a folder (the root itself included, and a link that leads to a file), a symbolic link on
+    /// the way leads to a name that is not there, or the links loop or are too many. A name that
+    /// does not exist, with no link leading to it, is not an error: the cache makes it. A fixture
+    /// is never cached in a cache whose path cannot be resolved: see
+    /// [`Fixtures::is_cacheable`](crate::fixture::Fixtures::is_cacheable).
+    pub fn longest_entry_path_bytes(&self) -> io::Result<u64> {
+        let resolved = resolve(&self.root)?;
+        let root = resolved.longest.max(resolved.path.as_os_str().len());
+        Ok(u64::try_from(root + 1 + longest_name_bytes()).unwrap_or(u64::MAX))
+    }
+
     /// Where the entry for `plan` lives.
     #[must_use]
     pub fn entry_path(&self, plan: &Plan) -> PathBuf {
-        self.root
-            .join(format!("{}-{GENERATOR_VERSION}", &plan.spec_hash()[..16]))
+        self.root.join(entry_name(name_digits(plan.spec_hash())))
     }
 
     /// Returns the master fixture for `spec`: the cached entry if it verifies, a freshly
@@ -140,11 +214,10 @@ impl FixtureCache {
 
         let partial = {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            self.root.join(format!(
-                ".partial-{}-{}-{}",
-                &plan.spec_hash()[..16],
+            self.root.join(partial_name(
+                name_digits(plan.spec_hash()),
                 std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
+                NEXT.fetch_add(1, Ordering::Relaxed),
             ))
         };
         let guard = TreeGuard::new(&partial);
@@ -241,5 +314,33 @@ impl Materialized {
     #[must_use]
     pub fn generation_time(&self) -> Option<Duration> {
         self.generation.as_ref().map(|report| report.elapsed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `.partial-`, 16 hexadecimal digits, `-`, a process number of at most 10 digits (`u32`), `-`,
+    /// and a call count of at most 20 (`u64`).
+    const LONGEST_NAME: usize = ".partial-".len() + 16 + 1 + 10 + 1 + 20;
+
+    #[test]
+    fn no_name_the_cache_gives_a_directory_is_longer_than_the_longest_it_counts() {
+        let digits = "0123456789abcdef";
+        assert_eq!(LONGEST_NAME, 57);
+        assert_eq!(longest_name_bytes(), LONGEST_NAME);
+
+        // An entry, a partial one now, and a partial one at the largest process number and call
+        // count: the last is the longest, and none is longer than what the cache counts.
+        assert_eq!(entry_name(digits), format!("{digits}-{GENERATOR_VERSION}"));
+        assert!(entry_name(digits).len() < LONGEST_NAME);
+        assert!(partial_name(digits, std::process::id(), 0).len() <= LONGEST_NAME);
+        assert_eq!(
+            partial_name(digits, u32::MAX, u64::MAX).len(),
+            LONGEST_NAME,
+            "{}",
+            partial_name(digits, u32::MAX, u64::MAX)
+        );
     }
 }

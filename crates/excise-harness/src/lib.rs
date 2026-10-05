@@ -8,8 +8,8 @@
 //! * [`scenario`] is the typed model of TOML scenario files, with strict parsing and semantic
 //!   validation.
 //! * [`report`] holds the versioned machine-output documents (`harness-summary`,
-//!   `harness-failure`, `harness-ab`, `harness-counts`, `harness-tui`); their JSON Schemas live in
-//!   `schemas/`.
+//!   `harness-failure`, `harness-ab`, `harness-counts`, `harness-tui`, `harness-shape-profile`);
+//!   their JSON Schemas live in `schemas/`.
 //! * [`fixture`] generates the fixtures scenarios run against, and computes the independent
 //!   oracle of what a generated tree contains.
 //! * [`headless`] runs `excise --format json` against a fixture, checks the scan report against
@@ -23,6 +23,8 @@
 //!   the counts of every commit on `main`, and compares a pull request's counts with them.
 //! * [`tui`] drives one live `excise` session step by step on a fixture, for exploration
 //!   (`cargo xtask tui`).
+//! * [`shape`] measures the shape of a tree as aggregates only and builds a fixture specification
+//!   shaped like it (`excise-shape`, the binary of this crate).
 
 pub mod bench;
 pub mod comparison;
@@ -30,6 +32,7 @@ pub mod counts;
 pub mod events;
 pub mod fixture;
 pub mod headless;
+pub mod histogram;
 pub mod metrics;
 mod platform;
 pub mod pty;
@@ -38,5 +41,6 @@ mod run_support;
 pub mod runner;
 pub mod safety;
 pub mod scenario;
+pub mod shape;
 mod string_enum;
 pub mod tui;

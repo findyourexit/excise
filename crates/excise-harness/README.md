@@ -17,6 +17,8 @@ This crate defines the vocabulary the harness shares:
   [`schemas/`](schemas).
 - [`counts`](src/counts): the deterministic counts of a build, their history on the `bench-data`
   branch, and the pull-request comment of count deltas.
+- [`shape`](src/shape): the shape of a tree as aggregates only, and a fixture specification built
+  from it: the library behind the `excise-shape` binary (see [Shape profiles](#shape-profiles)).
 
 Runners (in-process, pseudo-terminal, headless) and the `xtask` commands build on this vocabulary
 and on the [fixture generator](#fixtures), which creates and checks the trees they run against.
@@ -1051,12 +1053,29 @@ confidence interval, and the limit. It exits non-zero on any `fail` or `xpass`.
 ## Headless runner
 
 ```console
-cargo xtask headless [--quick|--full] [--fixture ID]... [--class scale|identity|hostile|volumes]... [--profile default|deterministic] [--repeat N] [--timeout SECONDS] [--timing-informational] [--keep-scratch]
+cargo xtask headless [--quick|--full] [--fixture ID]... [--fixture-dir DIR] [--class scale|identity|hostile|volumes]... [--profile default|deterministic] [--repeat N] [--timeout SECONDS] [--timing-informational] [--keep-scratch]
 ```
 
 `excise_harness::headless` scans a fixture without a terminal, holds the report to the fixture's
 oracle, and times the scan against `du -sk`. The exactness and throughput claims of the validation
 program rest on it.
+
+**Your own specs.** `--fixture-dir DIR` takes the specs from a directory of your own, `DIR/<id>.toml`,
+instead of the bundled ones, so that a scan can run on a fixture shaped like a tree of yours (see
+[Shape profiles](#shape-profiles)). The ids the run knows are then those of `DIR` alone: a
+`--fixture` that names a bundled id is refused as unknown, with no `--fixture` every spec of `DIR`
+that fits the tier's size limit runs, and a `DIR` that is not a directory is an error. Generated
+masters are cached below the target directory as for any fixture, under a name that holds the
+hash of the spec, so two specs with one id never share a cache entry. No documented defect applies
+to them (`expectations/headless.toml` names bundled fixtures only), so a scan of one must pass.
+
+**A spec is not trusted to be one.** A directory of your own can hold anything, so a spec is
+opened without following a link, must be a regular file, and is read up to 1 MiB
+(`MAX_SPEC_BYTES`: the largest bundled spec is under 1.5 KiB, and one `excise-shape spec` writes
+is a few tens of KiB at most). A link, a FIFO, a folder, a device, or a larger file is refused with
+a message that names it, and none is waited on or read in full. The run reads every spec of `DIR`
+to learn its ids and classes, so one such file stops it before anything is scanned; `bench-e2e`
+reads the specs of the `--fixture` ids it is given the same way.
 
 **A scan.** One run is `excise --format json --output <scratch>/scan-report.json <fixture-root>`,
 under the isolation of the PTY runner: the environment is cleared and rebuilt from `TERM`,
@@ -1178,13 +1197,22 @@ report breaking the schema to assert that the run fails.
 ## Paired A/B benchmark
 
 ```console
-cargo xtask bench-e2e --baseline <ref> [--baseline-binary PATH] [--candidate-binary PATH] [--fixture ID]... [--scenario NAME --profile PROFILE]... [--pairs N] [--seed S] [--timing-threshold FRACTION] [--memory-tolerance FRACTION] [--strict] [--timeout SECONDS]
+cargo xtask bench-e2e --baseline <ref> [--baseline-binary PATH] [--candidate-binary PATH] [--fixture ID]... [--fixture-dir DIR] [--scenario NAME --profile PROFILE]... [--pairs N] [--seed S] [--timing-threshold FRACTION] [--memory-tolerance FRACTION] [--strict] [--timeout SECONDS]
 ```
 
 `excise_harness::bench` builds (or accepts) two `excise` binaries and compares them with paired,
 interleaved A/B runs on the same warm fixture. A single, unpaired timing never transfers across
 sessions (the same binary and tree shape have measured 9.46 s one day and 3.8–3.9 s the next); only
 a paired, interleaved comparison on one machine in one session counts as evidence.
+
+**Your own specs.** `--fixture-dir DIR` takes the ids of `--fixture` from a directory of specs of
+your own, as it does for [`headless`](#headless-runner): `--fixture home-50k --fixture-dir
+target/excise-specs` compares the two builds on a tree shaped like your home. An id that `DIR`
+does not hold is refused, and a `DIR` that is not a directory is an error. A `--scenario` is not
+affected: a scenario names a bundled fixture, so it keeps the bundled specs. Because `ab.json`
+names a fixture by its id alone, a `--fixture` of `DIR` whose id is also the bundled fixture of a
+selected `--scenario` is refused before any case runs, unless the two specs are the same apart
+from their description: rename the spec in `DIR`.
 
 **The two builds.** `--baseline <ref>` builds any git ref (a branch, a tag, or a SHA) in a
 temporary detached worktree with its own `CARGO_TARGET_DIR`, release, `--locked`, then removes the
@@ -1544,6 +1572,358 @@ session starts and which is not an option of any command: one refuses a confirma
 that uncover a dialog and after a Backspace more than a second old, and one deletes exactly its
 target.
 
+## Shape profiles
+
+```console
+excise-shape profile <ROOT> [--output FILE] [--cross-filesystems]
+excise-shape spec <PROFILE> --id ID --entries N [--seed S] [--max-file-bytes BYTES] [--output FILE]
+```
+
+`excise-shape` is the binary of this crate (`src/bin/excise-shape.rs`; the code is
+`excise_harness::shape`). It exists so that benchmarks and scenarios can behave like a tree you
+care about, such as a home directory, without anyone running Excise on it: `profile` measures the
+*shape* of a tree as aggregates only, and `spec` turns a profile into a fixture specification that
+the generator builds at any size. Install it from a checkout with
+`cargo install --path crates/excise-harness --bin excise-shape`, or from the repository with
+`cargo install --locked --git https://github.com/findyourexit/excise excise-harness --bin excise-shape`
+(`publish = false` does not stop an install from Git; a binary target is all it needs).
+`excise-shape help profile` and `excise-shape help spec` print the details below.
+
+**Local only.** A profile of a real tree describes it, in aggregate, and stays private to its
+owner until the owner shares it: keep it out of version control. `target/` is ignored by Git, so
+`target/excise-profiles/` for profiles and `target/excise-specs/` for the specs built from them are
+the places for them. Nothing here is committed or published, and the specs in `fixtures/` are
+built from no real tree. The [performance report form](../../.github/ISSUE_TEMPLATE/performance_report.yml)
+asks for a profile of a slow tree, and nothing else of the tree, for the same reason. What
+`--output` makes, and what the file gets, is under [`profile`](#profile).
+
+**Safety.** This repository's tests, scripts, and agents never run `excise-shape` on a real path
+(`~`, a project, a mounted volume): they profile fixtures the harness generated and scratch trees a
+test made. A profile of a real home is its owner's to make, and an agent may build specs from a
+profile it is given. The walk is safe to run on a real tree, because it only reads (below), and
+this repository's own rule is stricter than that.
+
+### `profile`
+
+`profile` walks `ROOT` and writes a `harness-shape-profile` document ([below](#the-profile-document))
+to standard output, or to `--output FILE`. A summary of counts goes to standard error. It exits 0
+when it wrote the profile, 1 when it could not (the root cannot be opened or listed, or `FILE`
+cannot be made), and 2 for a command line it cannot read. No message of it names `ROOT` or
+anything below it: an error says that the root cannot be opened or listed, and why, and never
+where, and an output that exists is refused without being named, because it can be below `ROOT`.
+
+- **The root.** The path of `ROOT` is resolved like any path you type: a link among its components
+  is followed, as every program follows one. Its last component must be a folder itself, and not
+  a link to one, on Unix and on Windows: on Unix it is opened without following a link, and on
+  Windows it is opened as a reparse point and what was opened is looked at. A separator or a `.`
+  after that last name makes no difference: `link/`, `link//`, and `link/.` are `link`, and are
+  refused when it is a link, because a system resolves a link that a path names with a separator
+  after it whatever the open asks for (POSIX resolves such a path as if a `.` were appended to it),
+  so the walk takes the separators off before it opens the root; on Windows that is a junction
+  written `link\`, or written `\\?\C:\...\link\.` in the verbatim form, where std keeps each `.`
+  as a component of its own, one that ends the path too, and the walk takes those off as well. A
+  path that is only a root, a drive, a share, or `.`, or that ends in `..`, has no last name to
+  take them off, and is opened as it is. Nothing below `ROOT` is followed.
+- **It only reads.** The walk writes nothing, opens no file, and reads no content. It asks for the
+  metadata of each entry (`lstat`) through the handle of the folder that holds it, so how deep a
+  folder is does not matter. `--output` makes its one new file only after the walk has ended, so a
+  profile never counts its own output, wherever `FILE` is, `ROOT` included.
+- **It follows no link below the root.** A symbolic link is an entry of its own, and the walk goes
+  no further than the link: it neither enters it, nor reads where it points, nor asks whether the
+  target exists. A call that follows a link leaves the tree, where it can start an automount or
+  wait on a mount that does not answer, so the only question the walk puts about an entry is
+  `lstat` of the entry itself, and about a folder it has opened, `fstat` of its handle. A profile
+  therefore counts the links and says nothing of where they point: it has no count of links that
+  dangle. A link whose target is a FIFO, a folder that cannot be searched, nothing, or itself is
+  one link, and no error of the walk.
+- **It trusts what it opened, as far as the platform lets it tell.** A folder is inspected when
+  its parent is listed and opened later, and in between it can be replaced. On Unix the walk opens
+  it without following a link, takes its device and inode from the handle it opened, and counts a
+  folder that is not the one it inspected in `unreadable.errors`, with the entries that vanished,
+  without listing it. On Windows it opens each folder as a reparse point and refuses a link or a
+  junction where a folder was, and that is the whole of the check: stable Rust has no file ID to
+  compare, and this crate has no `unsafe` code, so a folder replaced by another ordinary folder in
+  that window is walked, and what it holds is counted. That is the tree changing under the walk,
+  which no walk of a live tree prevents, and nothing outside the tree is reached through a link.
+  The walk holds every folder it is inside open, with the right to list it and every sharing mode
+  but delete: while it runs, none of those folders can be renamed, deleted, or replaced by a
+  junction. A folder it has not opened yet is not held.
+- **It stays on one file system.** A folder on another file system is counted as a folder, counted
+  in `walk.mount_points_skipped`, and not entered, unless you pass `--cross-filesystems`. Where
+  the platform reports no device and inode numbers (Windows), it can find no mount point and no
+  hard link, and the profile says so in `platform.identity`.
+- **It streams, with a few handles.** It keeps no entry of the tree. What the walk holds at one
+  moment is three things and a few counters, and its memory grows with those three and with
+  nothing else of the tree. All of it is in memory: the walk spills nothing to disk, so a tree for
+  which any of them does not fit in what follows cannot be profiled.
+  1. *The names of the folder being listed*, all of them at once, whatever they name: a folder is
+     read to its end before its first entry is counted. Each name is dropped as its entry is
+     counted, so the name of a file or a link does not outlive the listing. This grows with the
+     widest folder, which is what costs: one of a million files with names of 24 bytes took 73 MB
+     at its peak (7 MB of it the process's own; measured on macOS, with a debug build, on a
+     scratch folder of that size), about 66 bytes an entry and more for longer names, while a
+     million entries in folders of a thousand cost a thousand names at a time.
+  2. *The names of the subfolders still to visit, in each folder on the current path* from `ROOT`
+     to the folder being walked. A folder that has been listed keeps those names and no others
+     until it has entered each subfolder: roughly 100 bytes a name (an estimate from the sizes of
+     what holds it, not a measurement). The folders on a path each hold their own, so this grows
+     with the subfolders that wait along a path, and not with the widest folder's alone: in a
+     comb, a chain of folders that each hold many subfolders besides the next one of the chain,
+     the folders waiting along the chain can approach the number of folders in the tree.
+  3. *The identity of every file that has more than one name*, from the first of its names the
+     walk meets until the walk ends: a device and an inode number, how many names the file system
+     says it has, how many the walk met, and the class of its size. That is 40 bytes, and roughly
+     60 with the slack of the tree they are kept in (an estimate from the sizes of the
+     structures, not a measurement). Never a name: the walk keeps the file's identity, and counts
+     its names. This grows with the number of such files, up to every file of the tree.
+
+  Besides these it keeps the name of each folder on the current path, to open a folder it gave up
+  the handle of again by name, and a fixed set of counters and histograms, which are bounded
+  whatever the tree is. On Unix
+  the walk keeps at most 32 folder handles open at once (`HANDLE_BUDGET`; a listing opens one more
+  while it reads), however deep the tree is, down to 4,096 levels, where it stops entering folders.
+  That is well below the 256 descriptors that are a process's soft limit in a macOS shell, so a
+  chain of 300 folders is walked in full there. It keeps the handle of the root, which it opens the
+  others again from, and of the folders it was in last, and a folder with no subfolder left lets go
+  of its own. When it comes back to a folder whose handle it gave up, it opens it again by name from
+  the nearest folder above it that it still holds, without following a link, and checks that every
+  folder it opened on the way is the one it recorded (the same device and inode); one that is not
+  is counted like a folder that changed, and what was left to enter below it is not walked. On
+  Windows it holds every folder it is inside, as above, and has no budget.
+- **It never stops at an entry it cannot read.** A folder it cannot list, an entry that vanishes
+  before the walk reaches it, and an input or output error are counted (`unreadable`), and the
+  walk goes on.
+- **A hard-linked file keeps the class of its size.** The names of a file have one size, so the
+  names of a group lie in one class of `file_sizes`, and the walk records the class (see
+  `hard_links.group_sizes_by_file_size` below): that of the size the first name had when the walk
+  met it. A name met with another size, because the file changed while the walk ran, is a file of
+  another class, which `file_sizes` counts there, and is not a name of the group; so the names of
+  a class's groups are always among the files of that class. A file is remembered by its device
+  and inode and never by a name.
+- **It keeps no name.** A name is measured, in bytes, and dropped. On Windows, where a name is
+  UTF-16 that can hold a surrogate that is half of no pair, the walk reaches the entry by its
+  native name and measures it as WTF-8: the length of its UTF-8 when it is valid, and 3 bytes for
+  each such surrogate. The document has no field that could hold a name, a path, a link target, an
+  owner, or a timestamp, and the types and the schema reject any other.
+
+`--output FILE` makes a new file: `FILE` must not exist, it is never written over, and a link at
+its name is refused. The message for a `FILE` that exists names no path, because `FILE` can be
+below `ROOT`. Folders above `FILE` that already exist are taken as they are *when the file is
+made*, after the walk, links included, as for any path you type: a link among them is followed,
+and so is one that replaced a folder of the path while the walk ran, or in the moment between the
+look at the path and the write, because the path is looked at only when the file is made. What is
+never a link is what this makes: each folder that is missing is made on its own, one at a time and
+never recursively, so that anything that appears at its name first, a link included, is refused,
+and the file is created new, which refuses a link at its name. On Unix the file is readable and
+writable by its owner only (mode 0600), and the folders it makes are 0700. On Windows the file and
+those folders get the permissions of the folder they are made in: an owner-only ACL needs `unsafe`
+code or a Windows security dependency, which this crate has neither of, and a profile is private
+because of what it holds, not because of its permissions. This is `cli::write_new_file`; `spec
+--output` uses it too.
+
+### The profile document
+
+Every histogram is `{ "count", "total", "max", "buckets" }`: how many values it counts, their sum
+and their largest, and a table from the smallest value of a bucket to how many values fell in it.
+What a bucket spans depends on the histogram: a *class* is `0` or a power of two and holds the
+values from it up to the next (`4096` holds 4,096 to 8,191), and a *length* bucket is one name
+length from 1 to 255 bytes, a longer name counted as 255.
+
+| Field | What it holds |
+|---|---|
+| `document_kind`, `schema_version` | `harness-shape-profile` and `1`. |
+| `platform` | `os`, and `identity`: whether the platform reported a device and an inode for every entry. |
+| `walk` | `cross_filesystems`, and `mount_points_skipped`. |
+| `entries` | `total`, `directories`, `files`, `symlinks`, and `others` (sockets, FIFOs, devices) below the root; the root itself is not counted. |
+| `max_depth`, `depths` | The deepest level, and per depth from 1 the `directories`, `files`, `symlinks`, and `others` there, and the `bytes` of the regular files (apparent size, every name counted). |
+| `children_per_directory`, `subdirectories_per_directory`, `files_per_directory` | Histograms in classes of what a folder directly holds, over the folders that could be listed. |
+| `file_sizes` | A histogram in classes of the apparent size of every regular file, every name of a hard-linked file counted. |
+| `name_lengths` | `directories`, `files`, and `symlinks`: histograms of length, in bytes. |
+| `hard_links` | `groups` (files with a link count above 1, each counted once), `names` found, `incomplete_groups` (names outside the walk), `group_sizes`, a histogram in classes, and `group_sizes_by_file_size`: the same groups by the class of the size of their file, a table from the smallest value of a class to a histogram like `group_sizes`. The histograms of the classes add up to `group_sizes`, and the names of a class are at most the files that `file_sizes` counts in it. |
+| `symbolic_links` | `count`: how many symbolic links there are. Nothing of where they point: the walk never asks. |
+| `unreadable` | `directories` that could not be listed because of their permissions, and `errors` of any other kind: an entry that vanished, on Unix a folder that was not the one inspected when the walk opened it (Windows cannot tell, see [`profile`](#profile)), an input or output error, a folder deeper than the walk goes, or a folder that is its own ancestor. |
+
+A profile that disagrees with itself (kinds that do not add up, buckets that do not hold the
+histogram's count, a depth that is missing) is refused by `excise-shape spec`, and the schema
+rejects a document with a member it does not declare. A real home profile is a few tens of
+kilobytes at most, and a 35-entry fixture's is 2.5 KB.
+
+### `spec`
+
+`spec` reads a profile and writes a fixture specification (TOML) with one `shaped` part (see
+[Fixtures](#spec-files)), scaled to `--entries N`: a home of millions of entries at 50,000 for a
+quick run, or at 1,000,000 for a full one. `--id` is the id of the spec, and the file is named
+`ID.toml`. `--seed` (default 1) is the spec's default seed, `--max-file-bytes` (default 16,384, at
+most 1 GiB) cuts the size of a file because the generator writes every byte, and `--output` writes
+the file as `profile` does. The same profile, `N`, and seed always give the same spec, and so the
+same manifest hash.
+
+- **The counts scale exactly.** The directories, files, and symbolic links at each depth are
+  scaled by `N` over the profile's entries, with the method of largest remainders, so the spec
+  plans exactly `N` entries, the part's root directory included, and the fixture holds one more,
+  the marker. A profile scaled far down keeps its depth: every level keeps a folder, so `N` must be
+  at least one more than the levels the spec keeps (the part's root directory is one entry), which
+  are the profile's depth, or 32 if it is deeper because a spec holds no more levels, and at most
+  10,100,000.
+- **The shape does not scale.** What a folder holds, how large a file is, and how long a name is
+  keep their histograms whatever `N` is: scaling a tree down means fewer folders, not smaller ones.
+- **Links scale with their files.** Every symbolic link points at a file of the part, and none
+  dangles: a profile says nothing of where a link pointed, because the walk never asks (a part with
+  no file has nothing to point at, and its links point at nothing). Hard links
+  are scaled class of file size by class, because the names of a group are one file and so lie
+  in one class of the file sizes: the files a class had and the files the spec plans in it give
+  the scale, and the groups the profile had in it are scaled by it, each size of group by its
+  count, rounded like every other count, and the names of the class with them. Four groups of
+  four names are four groups of four names again, and not groups of whatever size their class of
+  sizes allows. The groups of a class are among the files of the class, so a group that the files
+  of a class have no room for (a profile scaled down far) is left out, the largest first, and the
+  spec still builds. A file whose other names lay outside the tree that was profiled has no
+  group to be in, so it is a plain file, and the cut at `--max-file-bytes` puts every class above
+  it in the class of the cut. The generator takes the names of a class's groups from the files of
+  that class, so the histogram of file sizes is kept exactly and the seed decides which files are
+  the names, not where the groups are.
+- **A link points at its file by the shortest relative path:** the file's own name for a link
+  beside it, and otherwise `..` up to the nearest folder the two share and the way down from
+  there. A plan in which a target would still be longer than 1,023 bytes (macOS's limit, the lowest
+  of the three) is refused, by `spec` before it writes a file and by the generator.
+- **Some things are left out.** Sockets, FIFOs, devices, folders that could not be listed, and
+  mount points cannot be generated, and a fixture with one could not be cached or removed like any
+  other.
+
+Keep the spec in a directory of your own and point a runner at it:
+
+```console
+excise-shape profile <ROOT> --output target/excise-profiles/home.json
+excise-shape spec target/excise-profiles/home.json --id home-50k --entries 50000 --output target/excise-specs/home-50k.toml
+cargo xtask headless --fixture-dir target/excise-specs --fixture home-50k
+cargo xtask bench-e2e --baseline main --fixture-dir target/excise-specs --fixture home-50k
+```
+
+### How closely a built tree follows its profile
+
+The round trip test builds a tree, profiles it, builds a spec for several sizes, generates it, and
+profiles that. The generated tree agrees with the profile within these, which are the numbers the
+test holds it to. They were set from the distances the test measures, with room to spare, and not
+from what the generator could be made to pass.
+
+| What | Held to |
+|---|---|
+| Entries | Exactly `N`, and the marker. |
+| The share of folders, files, and links among the entries | Within 0.01. |
+| The share of the entries at each depth | Within 0.005. |
+| The histograms of what a folder holds | A total variation distance of at most 0.15: the zeros and the tail are there, and the classes between them move a little, because a level shares its entries among its folders in proportion to weights drawn from the histogram. |
+| The histogram of file sizes | At most 0.02. |
+| The histograms of name lengths | At most 0.03: a name starts with the digits that tell a folder's entries apart, so it is never shorter than they need. |
+| Links | Every one points at a file of the generated tree: none dangles. |
+| Groups of hard links, class of file size by class | The share of a class's files that are names of linked files within 0.03, with `1 / files` more for the rounding; and each size of group the profile's count scaled with the files of the class, rounded, give or take 1. |
+| A histogram of fewer than 50 values | Not compared. |
+
+### What the tests prove
+
+- The profile of every class of generated fixture is what the oracle counts for the same tree:
+  kinds, depths, what a folder holds, sizes, name lengths, links, and unreadable entries, worked out
+  by plain code that shares nothing with the walk.
+- No name leaks. A profile of a tree whose names are distinctive, hostile ones included, holds
+  none of them, as text or as bytes, and the schema has no member that could hold one.
+- The profile of a generated fixture validates against its schema, which rejects an unknown member.
+- Profile, spec, generate, profile agrees within the table above, and the same profile, size, and
+  seed give the same spec and the same manifest hash.
+- The walk follows no link below the root, enters no loop, and does not cross a mount point
+  unless asked. A walker told that the root is on another device than its folders makes the
+  mount-point decision without a mount; the test with a real volume runs only with
+  `EXCISE_HARNESS_PRIVILEGED=1`.
+- A link is counted and nothing behind it is touched: a link to a FIFO, to a file in a folder that
+  cannot be searched, to nothing, through a file, or to itself is one link and no error, and the
+  profile has no field that says where a link points.
+- A folder replaced after it was inspected, by another folder or by a link, is counted and not
+  listed on Unix; a folder opened again that is not the one recorded is not walked, and a walk that
+  never gave a handle up never notices. On Windows a link or a junction put where a folder was is
+  refused, and another ordinary folder is walked.
+- A chain of 300 folders and combs of 100 levels are walked in full by a walk that is allowed four
+  folder handles, with what the oracle counts and what a walk with no budget finds, and the walker
+  counts its handles: no more than the budget is ever open.
+- No message of `profile` names the root, for a missing root, a file, a folder that cannot be
+  opened, and an output that exists below the root; an output inside the root is made after the
+  walk and is not counted in its profile; and a missing folder that becomes a link before it is
+  made is refused, and nothing is written through it.
+- A shaped part 32 levels deep with folder names of 255 bytes is built, with link targets of 8
+  bytes; a link that would need 8 KiB is refused by the plan.
+- Where the cache is decides whether a fixture is cached, by one rule, to the byte, for every kind
+  of part. The same spec, one whose longest path is 512 bytes, as a `shaped` part and as a `tree`
+  part, is cached under a short cache root and refused under one that leaves it less room
+  (`NotCacheable`, and nothing generated in the cache); the headless suite scans it in a fresh copy
+  on every run, and a `bench-e2e` fixture case shares one run copy. A cache that leaves the spec
+  exactly 1,023 bytes in all (its own path as it resolves, a separator, the longest name the cache
+  gives a directory, 57 bytes, a separator, and the longest path of the spec) caches it, and the
+  deepest path of the tree can be named whole; one byte more refuses it. A `tree` of four folders
+  named with 255 bytes plans 1,028 bytes, which no root leaves room for: it is never cached, the
+  facade says `NotCacheable`, and a run copy is made. Every bundled fixture that a removal could
+  ever take is cacheable below a root that leaves it exactly its longest path and refused one byte
+  below, and the four that it could not (`deep-past-path-max`, `all-classes-small`,
+  `hostile-small`, and `refused`) are refused below every root. The longest path every kind of part
+  can plan, worked out from its fields, is never below the longest path of its plan, whatever the
+  seed, over the bundled specs and specs at the edges of each kind, and is that path exactly for
+  every kind but `shaped` and `identity` (whose longest names can land in other folders than the
+  longest folder name); the marker's temporary name, 25 bytes, is a path of every spec. The root
+  counts as it is spelled (Unix only): `<dir>//cache` is a byte longer than `<dir>/cache` and
+  `<dir>/./cache` two, a relative root is the current directory and the text after it, and a spec
+  that fits to the byte below the normalized spelling is refused below the same length spelled with
+  `//` or `/./`. The cache is measured where it leads, and by every pathname the system works on to
+  get there: below a short link to a deep directory the same spec is refused, whether the cache
+  directory exists yet or not, and below a link to a short directory it is held. A cache below a
+  short link to a long path that ends in a link back to a short directory is short as it is
+  written and as it resolves, and is measured by the content of the link and what is left of the
+  path after it: with a deep folder of 441 bytes it caches the part, and with one of 442 it
+  refuses it. A cache below a link that leads to a name that is not there holds nothing (the link
+  exists, so the cache cannot make it), whether the link is the cache directory or above it, and
+  that is no error that stops a run: a run copy is made instead. So does a cache that is not a
+  folder: a root that is a file, a link to a file, a link whose content goes on after a file with
+  `/`, `/.`, or `/../real`, and a root written `<dir>/file/` or `<dir>/file/.`; through the facade
+  the file is left as it was, nothing is created, and a run copy is made. The resolver is tested
+  apart: a link leads where `fs::canonicalize` leads it (absolute, relative, through `..`, to
+  another link, with separators and dots in its content), the pathname of each link counts as it is
+  written, a link that leads nowhere, a loop, a chain of 41 links (a chain of 8 resolves), and every
+  name that exists and is not a folder are refused, and on macOS the system refuses exactly the
+  pathnames the resolver counts as longer than 1,023 bytes. The tests that make a link run on Unix
+  only (on Windows a link to a directory needs a privilege, and a junction needs `cmd /C mklink
+  /J`, which was not tried with a target 520 bytes long); the length of a root as it resolves, that
+  of an empty root, and that a root that is a file has none, are pinned everywhere.
+- On Windows, in CI's Windows job: a junction put where a folder was is not entered, a folder the
+  walk is inside cannot be renamed, and a file whose name holds a lone surrogate is reached and
+  measured as WTF-8.
+- A directory of specs of your own gives the fixtures `headless` scans, and an id it does not hold
+  is refused. A spec in it that is a symbolic link (whether it leads somewhere or not), a FIFO
+  (without waiting for a writer to open it), or a folder is refused with a message that names it;
+  a file of exactly 1 MiB is read and one byte more is refused unread; and `headless` stops on any
+  of them before it scans anything. The tests load the spec directly and through the `Fixtures`
+  facade that `headless` and `bench-e2e` share.
+- A trailing separator does not turn a link into a folder: `profile` refuses `<link>/`, `<link>//`,
+  and `<link>/.` as it refuses `<link>`, and walks the folder itself written those ways, and a
+  folder reached through a link among the components; on Windows the same with a junction written
+  with a trailing backslash, and written in the verbatim form with a `.` after it
+  (`\\?\<abs>\junction\.`, `\\?\<abs>\junction\.\`, and with the `.` repeated), which std keeps as
+  a component of its own. Both tests are Windows-only, a unit test of what the walk opens for each
+  of those spellings and the junction test, and are first exercised by CI's Windows job.
+- A folder that has been listed keeps the names of its subfolders and no other name, whatever else
+  it held.
+- The profile says in which class of file size each group lay, and it is what the oracle counts:
+  for the same fixture, the groups by the class of the size of their file are the oracle's, and a
+  name met with another size than the first is not a name of its group.
+- Every group of hard links a spec asks for is made, whatever the seed, class by class: the
+  histogram of file sizes is kept (the planned files are in the classes of the histogram, the same
+  number in each, the cut at `max_file_bytes` counted), each class has the groups of its histogram
+  and the names it says, a group's names share a size, and the sizes of a class's groups add up
+  to its names. Groups that a class has no files for are refused, naming the field, and not
+  dropped or cut short; and a layout that no rule of thumb packs, three classes of ten files with
+  groups of 6, 2, 2 and 4, 3, 3 and 3, 3, 2, 2 names, is built exactly, because the spec says in
+  which class each group is, and so is four groups of four names at 17 entries.
+- The groups of two shaped parts are two groups, and the tree has two files with two names each,
+  not one with four.
+- A comparison in which one fixture id would name two trees (a `--fixture-dir` spec and the
+  bundled fixture of a selected scenario) is refused before anything runs.
+- `spec` takes the fewest entries a deep profile needs, 33 for a profile deeper than 32 levels,
+  and its help says so.
+
 ## Safety rules
 
 The harness only ever runs `excise` against fixtures it generated itself, and never against a real
@@ -1603,6 +1983,10 @@ This crate enforces rules 1 and 2 and the sentinel requirement of rule 4: a scen
 name a root, and `Scenario::validate` rejects unsafe paths and unguarded deletions. Rule 3, the
 run-time dialog and sentinel checks of rule 4, and rules 5 and 6 are obligations of the runner and
 the fixture generator.
+
+`excise-shape` is not a runner and has no scenario, so these rules do not apply to it. It has its
+own: this repository's tests, scripts, and agents run it only on fixtures the harness generated
+and on scratch trees a test made, never on a real path (see [Shape profiles](#shape-profiles)).
 
 ## Fixtures
 
@@ -1673,6 +2057,15 @@ a dense file is at most 1 GiB. A *name style* is one of:
 | `identity` | Identity | Features are off until asked for. Entries live in `links/`, `dangling/`, `symlinks/`, `loops/`, `sparse/`, and `clones/` below the root, and every link target is relative. `hard_link_groups` (0) of `links_per_group` (2, at most 64) names, spread over `link_spread` (2) directories `links/d0`, `links/d1`, and so on, of `link_file_size` (4096); `dangling_symlinks` (0); `valid_symlinks` (false: one link to a file and one to a directory); `symlink_loops` (a list of `self`, `pair`, and `directory`); `sparse_files` (a list of `{ apparent_mib, data_kib = 4 }`, above 16 MiB to stay sparse on APFS); `clones` (0) of one original of `clone_kib` (64) KiB. |
 | `hostile` | Hostile | `features`, at least one and without repeats, of `control_names`, `bidi_names` (U+202E and friends), `escape_names` (ESC sequences), `newline_names`, `invalid_utf8_names`, `long_names` (255 bytes), `unreadable_dirs` (modes 000 and 100, with contents), `unreadable_files` (modes 000 and 200), and `unwritable_dirs` (`unwritable/`, a mode 555 directory that holds `stuck.txt`: it can be listed and entered, and nothing in it can be removed). Each name feature creates one directory per name, holding a file of the same name. Like `unreadable_dirs`, `unwritable_dirs` keeps a fixture out of the cache, because a path-based removal cannot remove it; and it needs a user that is not root, because root ignores the mode, so a run copy refuses to generate it for one (`FixtureError::NeedsUnprivilegedUser`). |
 | `volume` | Volumes | A mount point: an empty directory in the master. `size_mib` (required, 8 to 1024), `files` (0) of `file_bytes` (1024) written once a volume is attached (see [Volumes](#volumes)). |
+| `shaped` | Scale, and Identity when it has links | A tree with the shape of another tree, which `excise-shape profile` measured (see [Shape profiles](#shape-profiles)); `excise-shape spec` writes it. `root` (required), `levels` (required, 1 to 32 of them: one table of `directories`, `files`, and `symlinks` (each 0) per depth from 1, none empty, and a level below the first needs a directory above it), `max_file_bytes` (16,384, at most 1 GiB), `dangling_symlinks` (0) of the symbolic links, and the histograms the levels need, each a table of `bucket = count`: `subdirectories_per_directory`, `files_per_directory` (which also spreads the symbolic links), and `file_sizes` in classes (`0` or a power of two), and `directory_name_lengths`, `file_name_lengths`, and `symlink_name_lengths`, one bucket per length from 1 to 255. `hard_links` (none) lists the groups of regular files that are names of one file, one table for each class of file size that has any, in ascending order of class: `class` (the smallest value of the class), `names` (how many names its groups have in all), and `group_sizes`, a table of `bucket = count` in classes from 2 (how many names a group has, and how many groups have that many, so the counts add up to the groups of the class). The names of a group are one file, so they share a size and lie in one class of `file_sizes`: the groups of a class take their names from the files of that class and no other, the histogram of file sizes is kept exactly, and there is nothing to pack. Each group is given an exact number of names within its class, so that they add up to `names`. A class with fewer files than `names` (the cut at `max_file_bytes` counted: every class above it is the class of the cut), a `names` that groups of those sizes cannot have (below what their smallest sizes add up to, or above their largest), a group of fewer than two names, and classes out of order are refused, naming `hard_links`. The groups of two shaped parts are never one group. The entries at each depth are exact, so the part plans `1 +` the sum of its levels, and how a depth's entries are spread over the folders above follows the histograms, with the seed deciding which folder gets which share and which files are the names of a group. A link that resolves points at one file of the part by the shortest relative path, and a plan in which a target would be longer than 1,023 bytes (macOS's limit, the lowest of the three) is refused. |
+
+A symbolic link of a `shaped` part that resolves points at a file that exists wherever hard links
+cannot be made: at a file that is no group's, and when every file has more than one name, at the
+file of a group, which is its first name in canonical order, the one the plan keeps, and never at a
+name that needs a hard link. Every kind of part has a bound on its longest planned path, worked
+out from its fields, and a spec whose longest planned path, below the cache directory, can pass the
+1,023 bytes that `PATH_MAX` allows is never cached there, as a `deep` part never is (see
+[Cache and integrity](#cache-and-integrity)); where the cache is decides it.
 
 The specs the crate ships. Entries are planned entries; every generated fixture also holds the
 marker.
@@ -1738,15 +2131,89 @@ Only the macOS column has been observed. The Windows layer is compiled and type-
 `FixtureCache` keeps generated masters in `<target dir>/excise-fixtures.noindex/<spec hash>-<generator
 version>/`, where the target dir is `CARGO_TARGET_DIR` or the workspace `target` and the spec hash
 is 16 hexadecimal digits. The name changes with the spec, the seed, and the generator version, so a
-stale entry is never mistaken for a current one. Generation happens in a `.partial-…` sibling that
-is renamed into place once the marker, written last, has sealed it. Tests pass a temporary
-directory as the cache root and never touch the shared cache.
+stale entry is never mistaken for a current one. The generator version (`GENERATOR_VERSION`) is
+raised whenever the same spec and seed would plan another tree or manifest. Version 2 numbers the
+hard-link groups of a plan once for the whole plan, which changes the manifest of a spec with more
+than one identity part, and anchors the links of a `shaped` part at a file that exists where hard
+links cannot be made. A new version costs every cached master one regeneration, in a new entry:
+the entries of the old version are never reused, and stay in the cache directory until `cargo
+clean` removes them. The manifest hashes that the tests pin do not include the version (it is in
+the manifest document, the marker, and the name of the entry, and the hash covers the entries
+alone), and the pinned hashes of the bundled specs did not change with it. Generation happens in a
+`.partial-…` sibling that is renamed into place once the marker, written last, has sealed it. Tests
+pass a temporary directory as the cache root and never touch the shared cache.
 
 The shared cache holds only trees that a path-based removal can remove, so that `cargo clean` and
 `git worktree remove` can always remove the target directory. Such a removal fails on a directory
-that cannot be listed (the hostile `unreadable_dirs` feature) and on a path longer than `PATH_MAX`
-(a `deep` part), so `Fixtures::master` refuses a fixture with either
-(`FixtureSpec::removable_by_path`), and a runner takes a run copy of it instead.
+that cannot be listed (the hostile `unreadable_dirs` feature), on one that nothing can be removed
+from (`unwritable_dirs`), and on a path longer than `PATH_MAX`. A `deep` part always has one. Every
+other kind of part can: a `tree` or a `shaped` part has paths as long as its levels and names allow,
+up to 8,447 bytes (32 levels of names of 255 bytes, which a spec of one's own can ask for, and
+`--fixture-dir` lets one reach the cache), and a `file`, `volume`, `identity`, or `hostile` part has
+a root of up to 255 bytes with names below it. The marker is a path as well: it is written at the
+fixture root under a name of 25 bytes (`.excise-harness-owned.tmp`) and renamed to its own, of 21.
+A path-based removal is handed the whole path from the root of the file system, so `PATH_MAX` is
+the limit: 1,024 bytes on macOS, the lowest of the platforms the harness runs on (it is 4,096 on
+Linux), and it counts the terminating NUL, so a path is at most 1,023 bytes
+(`MAX_PORTABLE_PATH_BYTES`). The cache directory above the fixture root takes part of that, and
+where it is the harness does not say: `CARGO_TARGET_DIR` puts it anywhere, through a link too. So
+whether a fixture is cached is decided where the cache is known, by one rule
+(`Fixtures::is_cacheable`, which `Fixtures::master`, the headless suite, and the `bench-e2e`
+fixture cases all go by): the path of the cache directory, a separator, the longest name the cache
+gives a directory directly below it, a separator, and the longest path the spec can plan, of any
+part or of the marker, must fit in 1,023 bytes together (`FixtureCache::longest_entry_path_bytes`
+is the first three, `FixtureSpec::longest_path_bytes` the last, and `FixtureSpec::removable_by_path`
+takes them). The path of the cache directory is measured three ways, and the longest counts: as it
+is spelled; as it resolves, with every symbolic link in it expanded; and as the system works on it
+while it expands each link, which is the content of the link and what is left of the path after it.
+On Unix the spelling counts as it is, because the system is handed the text of the root and counts
+every `.` name and repeated separator in it, which `std::path::absolute` drops: `<dir>//cache` is
+a byte longer than `<dir>/cache`, `<dir>/./cache` two, and a relative root is the current directory
+and the text written after it (a trailing separator counts too, though `join` adds none after it: a
+byte on the safe side). Off Unix `absolute` is kept: on Windows, in Rust 1.98, it returns a
+verbatim path (`\\?\...`) as it is and hands any other to `GetFullPathNameW`, the normalization
+(`.`, `..`, repeated separators) that std applies to a path of 248 UTF-16 units or more, and Win32
+to the rest, before the path is used, so the normalized spelling is the one the system counts there
+(read from the source of the standard library; nothing was measured on Windows). The system counts
+the expansion of a link against `PATH_MAX`: on macOS a path fails with `ENAMETOOLONG` when the
+content of a link and the rest of the path are together longer than 1,023 bytes, and that pathname
+can be longer than the path as it was written and longer than the one it resolves to. A short
+`CARGO_TARGET_DIR` that is a link to a deep directory, or to a long path that ends in a link back
+to a short one, or whose content goes down a long way and comes back up with `..`, is such a case;
+`/tmp` and `/var` there are links that make a path 8 bytes longer as it resolves. The resolver
+(`src/fixture/resolve.rs`) takes the path one name at a time, as the system does, and keeps the
+length of every pathname that makes. The path it gives is that of the longest ancestor of the cache
+directory that exists, with every link expanded, and then the names that do not exist yet as they
+were written, so the cache directory need not exist. Off Unix `fs::canonicalize` gives it (on
+Windows the verbatim form, `\\?\C:\...`, four bytes longer than the drive form), and only it and the
+spelled path are measured. A cache whose path cannot be resolved holds no fixture at all, and a run
+copy is made: it is empty, a name on the way cannot be searched, a name that exists is not a folder,
+the last one included (a root that is a file, a link to one, a link whose content goes on after one
+with `/`, `/.`, or `/..`, and a root written so, which the system refuses with `ENOTDIR` and
+`create_dir_all` cannot use), a link in it leads to a name that is not there (the link exists, so
+the cache cannot make it) or loops, or more than 32 links are on the way (a name that is missing,
+with no link leading to it, is no error). The longest name is that of a fixture while it is
+generated, in a `.partial-…` directory that is renamed into place afterwards: `.partial-`, 16 digits
+of the spec hash, the number of the process (at most 10 digits), and a count of the calls (at most
+20), 57 bytes in all, which is more than the name of the entry (`<16 digits>-<generator version>`).
+Under a target directory of 100 bytes as it resolves, the cache directory is 124 bytes
+(`<target>/excise-fixtures.noindex`), and a spec may plan paths of at most 840 bytes. The longest
+path is an upper bound worked out from the fields of each part alone (`Part::longest_path_bytes`),
+without planning it, because the answer is wanted before a fixture of up to 10 million entries is
+planned, and no plan has a longer path, whatever the seed. It is exact for a `tree` (the root, the
+longest folder name of its style at every level, and the longest file name), a `file` and a `volume`
+(the root: the files written onto a volume are in a run copy, never in the cache), a `deep` part,
+and a `hostile` part (the root, the folder of a feature, and two names of its catalog, or a fixed
+path), and for an `identity` part (the root and the longest path of each feature, in its fixed
+subfolders) unless the longest names of `links/` are spread to folders whose names are shorter than
+the longest (`d10` past `d9`); for a `shaped` part it is the root, then the longest folder names the
+histograms can give the folders of a path, and the longest name of an entry at the bottom, none
+shorter than the hexadecimal digits that tell the entries of a folder apart
+(`ShapedPart::longest_path_bytes`). So a spec that passes is safe to cache there, and one that fails
+may still plan only short paths; and the same spec can be cached under one target directory and
+refused under another that is longer, or that is a link to one. `Fixtures::master` refuses a fixture
+that is not removable by path (`FixtureError::NotCacheable`, and nothing is generated in the cache),
+and a runner takes a run copy of it instead.
 
 The marker `.excise-harness-owned` is a regular file (never a link) at every fixture root. Its JSON
 records the generator version, spec id, spec hash, seed, role (`master` or `run-copy`), manifest
@@ -1892,6 +2359,7 @@ Machine output is versioned JSON. Every document carries a `document_kind` and a
 | A/B evidence | `harness-ab` | 1 | `cargo xtask bench-e2e` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under (the fixtures compared, the host, the toolchain, the power state, the load average, and concurrent `excise` processes). |
 | Counts | `harness-counts` | 1 | `cargo xtask counts` (the history job's record is the same document) | [`harness-counts.schema.json`](schemas/harness-counts.schema.json) | The deterministic counts of one build: the commit and its time, the runner, the toolchain, a pull request's number, base, and head when it is one, and per fixture and profile the fixture's hash and seed and an open map of counts (see [Counts](#counts)). It holds nothing that depends on the run, so a commit counted twice gives the same bytes. |
 | Tui command | `harness-tui` | 1 | `cargo xtask tui` | [`harness-tui.schema.json`](schemas/harness-tui.schema.json) | What one interactive-driver command prints: its result, whose shape depends on `command` (the first screen, the screen and the events after keys, a deletion's verified dialog and sentinels, the screen, the event records, how the session ended, or the open sessions), or why it failed. |
+| Shape profile | `harness-shape-profile` | 1 | `excise-shape profile` | [`harness-shape-profile.schema.json`](schemas/harness-shape-profile.schema.json) | The shape of one tree as aggregates only: counts by kind and by depth, histograms of what a folder holds, of file sizes, and of name lengths, hard links, symbolic links, and unreadable entries; never a name, a path, a link target, an owner, or a timestamp (see [Shape profiles](#shape-profiles)). |
 
 `cargo xtask headless` writes a `harness-summary`, not a separate document kind: a headless run is
 one more kind of scenario result, named `headless-<fixture>`, whose open `metrics` map carries the
@@ -1915,10 +2383,10 @@ member or an undeclared field.
 
 Each schema's `$id` is
 `https://github.com/findyourexit/excise/harness/schemas/<document_kind>-v1.json`. The Rust types
-are `HarnessSummary`, `HarnessFailure`, `HarnessAb`, `HarnessCounts`, and `HarnessTui` in
-`excise_harness::report`. They implement `Document`, which carries the kind, the schema id, and the
-schema text, and renders the canonical form: pretty-printed JSON in field order with a final
-newline.
+are `HarnessSummary`, `HarnessFailure`, `HarnessAb`, `HarnessCounts`, `HarnessTui`, and
+`HarnessShapeProfile` in `excise_harness::report`. They implement `Document`, which carries the
+kind, the schema id, and the schema text, and renders the canonical form: pretty-printed JSON in
+field order with a final newline.
 
 The schemas live here, not in `docs/schemas`, because that directory is copied into release
 archives and packages and these formats are not part of the product. The types and the schemas

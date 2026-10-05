@@ -1,0 +1,115 @@
+name: Performance report
+description: Report a scan, a screen, or a deletion that is slower than it should be, with the shape of the tree and no paths
+title: "perf: "
+labels: ["performance", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities or unsafe deletion paths here. Use the private security-reporting link in the issue chooser.
+
+        This form asks for the **shape** of a slow tree and for counts from one scan of it, never for the tree itself. The shape is a profile written by `excise-shape`, which holds numbers only: how many entries there are at each depth, how many a folder holds, how large files are, how long names are, and the share of links. It holds no file or folder name, no path, no link target, no owner, and no timestamp. The maintainers use it to build a synthetic tree of the same shape and measure that.
+
+        **Never attach or paste a full `excise --format json` report, a table report, a screenshot of a listing, or anything else that has a path in it.** A report lists every path it scanned.
+  - type: input
+    id: version
+    attributes:
+      label: Excise version or commit
+      description: The output of `excise --version`, or the commit of a build from source.
+      placeholder: "v1.3.0 or 0123456789abcdef"
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: filesystem
+    attributes:
+      label: File system and storage
+      description: The file system type and what it sits on, and whether the tree is local or on a network share.
+      placeholder: "APFS on an internal SSD; ext4 on NVMe; NTFS on a spinning disk; SMB share"
+    validations:
+      required: true
+  - type: textarea
+    id: slow
+    attributes:
+      label: What was slow
+      description: The command or screen, whether the scan, opening a folder, the map, an export, or a deletion, and what you expected instead. Leave out real paths.
+      placeholder: |
+        `excise --format json <my home folder>` ran for a long time before it printed anything.
+        I expected about as long as `du -sk` takes on the same folder.
+    validations:
+      required: true
+  - type: input
+    id: duration
+    attributes:
+      label: How long it took
+      description: Wall-clock time from start to finish, and for comparison how long `du -sk` (or your file manager's size) takes on the same folder.
+      placeholder: "Excise 4 min 10 s; du -sk 35 s; warm cache"
+    validations:
+      required: true
+  - type: textarea
+    id: profile
+    attributes:
+      label: Shape profile
+      description: |
+        The profile of the slow tree, from `excise-shape` (aggregates only). Install the tool, profile the folder you scanned, and paste the document here, or drag the file in after renaming it to end in `.txt`. Read it before you post it: it is yours to share, and nothing else of the tree is needed.
+
+        ```console
+        cargo install --locked --git https://github.com/findyourexit/excise excise-harness --bin excise-shape
+        excise-shape profile <the folder you scanned> --output shape-profile.json
+        ```
+
+        `excise-shape help profile` says exactly what is measured. The walk only reads: it follows no link below the folder, reads no file, and stays on the file system of the folder unless you pass `--cross-filesystems`. `--output` makes its one new file only after the walk has ended, and no message of the command names the folder.
+      placeholder: |
+        {
+          "document_kind": "harness-shape-profile",
+          "schema_version": 1,
+          ...
+        }
+    validations:
+      required: true
+  - type: textarea
+    id: counts
+    attributes:
+      label: Counts from one scan
+      description: |
+        The counts of one scan of the same folder, without any path. Run this read-only scan and paste what it prints. The `del` removes the four fields of the summary that can name a path.
+
+        ```console
+        excise --format json <the folder you scanned> | jq '{state, accounting, summary: (.summary | del(.last_unreadable_path, .last_unscanned_path, .last_unscanned_reason, .last_worker_error))}'
+        ```
+
+        Do not paste the report itself, and do not paste anything that has a path in it.
+      placeholder: |
+        {
+          "state": "exact",
+          "accounting": { ... },
+          "summary": { "scanned_entries": 0, ... }
+        }
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant context
+      description: CPU and memory of the machine, whether the disk was busy or the cache cold, configuration such as `--exclude` or `--cross-filesystems`, and anything that changes the time between runs.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: I attached no full report and nothing that has a file or folder name, a path, or a username in it.
+          required: true
+        - label: This report does not disclose an unpatched vulnerability or unsafe deletion path.
+          required: true

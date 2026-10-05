@@ -34,6 +34,8 @@
 //! computed over the entries that were created, differs from the plan hash by exactly those
 //! entries.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -48,12 +50,17 @@ use crate::{
 };
 
 mod parts;
+mod shaped;
 
 #[cfg(test)]
 mod tests;
 
 /// The version of the manifest hash encoding. A change here is a change to every manifest hash.
 const HASH_FORMAT_VERSION: u32 = 1;
+
+/// The most bytes a symbolic link can hold as its target on every platform the harness runs on:
+/// macOS holds 1,023, the lowest of the three. A plan with a longer target is refused.
+pub const MAX_LINK_TARGET_BYTES: usize = 1023;
 
 /// The `schema_version` of the manifest document.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -217,8 +224,9 @@ impl Plan {
         })?;
         let mut entries = Vec::new();
         let mut volumes = Vec::new();
+        let mut groups = GroupIds::default();
         for part in &spec.parts {
-            parts::expand(part, spec.seed, &mut entries, &mut volumes);
+            parts::expand(part, spec.seed, &mut entries, &mut volumes, &mut groups);
         }
         entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         if let Some(pair) = entries.windows(2).find(|pair| pair[0].path == pair[1].path) {
@@ -227,6 +235,29 @@ impl Plan {
                 problems: SpecProblems(vec![SpecProblem {
                     location: "parts".to_owned(),
                     message: format!("the name `{}` is planned twice", pair[0].path),
+                }]),
+            });
+        }
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry
+                .target
+                .as_ref()
+                .is_some_and(|target| target.as_bytes().len() > MAX_LINK_TARGET_BYTES)
+        }) {
+            let length = entry
+                .target
+                .as_ref()
+                .map_or(0, |target| target.as_bytes().len());
+            return Err(SpecError::Invalid {
+                path: None,
+                problems: SpecProblems(vec![SpecProblem {
+                    location: "parts".to_owned(),
+                    message: format!(
+                        "the symbolic link `{}` would need a target of {length} bytes, and a link \
+                         holds at most {MAX_LINK_TARGET_BYTES} on every platform: use shorter names \
+                         or fewer levels",
+                        entry.path
+                    ),
                 }]),
             });
         }
@@ -320,20 +351,36 @@ impl Plan {
     }
 }
 
+/// The temporary numbers of the hard-link groups of a plan, which every part draws from one
+/// counter: the groups of two parts are never given the same number, so [`finish_link_groups`]
+/// never takes them for one group. The final numbers are not these: they are given in canonical
+/// order afterwards.
+#[derive(Debug, Default)]
+struct GroupIds(u32);
+
+impl GroupIds {
+    /// The number of the next group, counted from 1.
+    fn next(&mut self) -> u32 {
+        self.0 = self.0.saturating_add(1);
+        self.0
+    }
+}
+
 /// Numbers the hard-link groups from 1 in canonical order of first appearance, and marks every
 /// member but the first as needing hard links: the first is the file, the rest are links to it.
 fn finish_link_groups(entries: &mut [ManifestEntry]) {
-    let mut renumbered: Vec<(u32, u32)> = Vec::new();
+    // A map and not a list: a shaped part can make groups by the hundred thousand.
+    let mut renumbered: BTreeMap<u32, u32> = BTreeMap::new();
     for entry in entries.iter_mut() {
         let Some(temporary) = entry.link_group else {
             continue;
         };
-        if let Some((_, number)) = renumbered.iter().find(|(old, _)| *old == temporary) {
+        if let Some(number) = renumbered.get(&temporary) {
             entry.link_group = Some(*number);
             entry.requires = Some(Capability::HardLinks);
         } else {
             let number = u32::try_from(renumbered.len() + 1).unwrap_or(u32::MAX);
-            renumbered.push((temporary, number));
+            renumbered.insert(temporary, number);
             entry.link_group = Some(number);
         }
     }

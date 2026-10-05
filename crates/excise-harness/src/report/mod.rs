@@ -11,6 +11,8 @@
 //! * [`HarnessCounts`] (`harness-counts`): the deterministic counts of one build, the record that
 //!   the count history and a pull request's count comment are made of.
 //! * [`HarnessTui`] (`harness-tui`): what one `cargo xtask tui` command prints.
+//! * [`HarnessShapeProfile`] (`harness-shape-profile`): the shape of one tree as aggregates only,
+//!   written by `excise-shape profile`, from which a fixture specification can be built.
 //!
 //! The types reject unknown fields, so a document with a field this build does not know is an
 //! error rather than silently ignored. Removing or retyping a field, or making an optional one
@@ -24,6 +26,7 @@ use thiserror::Error;
 mod ab;
 mod counts;
 mod failure;
+mod shape;
 mod summary;
 pub mod tui;
 
@@ -41,6 +44,11 @@ pub use counts::{
 pub use failure::{
     FailedStep, FailureKind, FixtureIdentity, HarnessFailure, Rusage, ScreenComparison,
     SessionDiagnostics, TerminalModes,
+};
+pub use shape::{
+    ClassHistograms, HarnessShapeProfile, MAX_PROFILE_DEPTH, ShapeDepth, ShapeEntries,
+    ShapeHardLinks, ShapeHistogram, ShapeNameLengths, ShapePlatform, ShapeProblems,
+    ShapeProfileKind, ShapeSymbolicLinks, ShapeUnreadable, ShapeWalk,
 };
 pub use summary::{
     BinaryIdentity, HarnessSummary, ScenarioResult, SummaryKind, Tier, TimingWarning, Verdict,

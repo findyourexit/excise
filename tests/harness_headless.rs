@@ -157,6 +157,224 @@ fn the_suite_caches_only_the_fixtures_that_cargo_clean_can_remove() {
     );
 }
 
+/// A directory of specs of one's own (`cargo xtask headless --fixture-dir`): a spec built from the
+/// profile of a tree is a fixture of the suite like a bundled one, its scan is held to the same
+/// oracle, and the ids the suite knows are the directory's own and no others.
+#[test]
+fn a_directory_of_specs_of_ones_own_gives_the_fixtures_a_suite_scans() {
+    use excise_harness::{
+        fixture::MaterializeOptions,
+        headless::suite::SuiteError,
+        shape::{SpecRequest, WalkOptions, profile, render_spec, spec_from_profile},
+    };
+
+    let _suite = serial();
+    let work = Workspace::new();
+
+    // The shape of a tree the harness generated, and never of a real path.
+    let source = FixtureCache::at(work.0.join("source"))
+        .materialize(
+            &FixtureSpec::load_bundled("node-modules-2k").expect("a bundled spec"),
+            &MaterializeOptions::default(),
+        )
+        .expect("the source tree is generated");
+    let shape = profile(&source.root, WalkOptions::default()).expect("the walk");
+    let spec = spec_from_profile(
+        &shape,
+        &SpecRequest {
+            id: "home-small".to_owned(),
+            entries: 500,
+            seed: 3,
+            max_file_bytes: 1 << 16,
+        },
+    )
+    .expect("a spec is built from the profile");
+    let specs = work.0.join("specs");
+    fs::create_dir_all(&specs).expect("a directory of specs");
+    fs::write(
+        specs.join("home-small.toml"),
+        render_spec(&spec).expect("the spec renders"),
+    )
+    .expect("the spec is written");
+
+    let run = |ids: &[&str]| {
+        run_suite(
+            &SuiteOptions {
+                binary: PathBuf::from(env!("CARGO_BIN_EXE_excise")),
+                fixtures: Fixtures::new(&specs, FixtureCache::at(work.0.join("cache"))),
+                tier: Tier::Quick,
+                fixture_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+                classes: Vec::new(),
+                profile: Profile::Deterministic,
+                repeat: 0,
+                timeout: Duration::from_secs(120),
+                keep: false,
+                out_root: work.0.join("out"),
+                work_dir: Some(work.0.join("scratch")),
+                git_sha: "0".repeat(40),
+                privileged: None,
+                expectations: Expectations::none(),
+                timing_informational: false,
+            },
+            |_| {},
+        )
+    };
+
+    let report = run(&["home-small"]).expect("the suite runs");
+    let [fixture] = report.fixtures.as_slice() else {
+        panic!("one fixture ran, not {}", report.fixtures.len());
+    };
+    assert_eq!(fixture.fixture, "home-small");
+    assert_eq!(
+        fixture.verdict,
+        Verdict::Pass,
+        "{:?} (error: {:?})",
+        fixture.first_failure(),
+        fixture.error
+    );
+    assert!(!fixture.diffs.is_empty(), "the scan was diffed");
+    assert!(fixture.entries > 400, "{} entries", fixture.entries);
+
+    // A bundled id is not an id of this directory, and an id of nobody's is refused the same way.
+    for unknown in ["wide-1k", "nothing-like-it"] {
+        match run(&[unknown]) {
+            Err(SuiteError::UnknownFixture { id, known }) => {
+                assert_eq!(id, unknown);
+                assert_eq!(known, ["home-small"]);
+            }
+            other => panic!("`{unknown}` must be refused as unknown: {other:?}"),
+        }
+    }
+}
+
+/// A spec of one's own whose longest path is 512 bytes: a chain of four folders with names of 100
+/// bytes and a file with a name of 103 below them, in the folder `home`: 4 + 4 * 101 + 1 + 103.
+const CHAIN_SPEC: &str = r#"
+schema_version = 1
+id = "chain"
+description = "A chain of four folders with names of 100 bytes, and a file."
+seed = 3
+
+[[parts]]
+kind = "shaped"
+root = "home"
+max_file_bytes = 100
+
+[[parts.levels]]
+directories = 1
+
+[[parts.levels]]
+directories = 1
+
+[[parts.levels]]
+directories = 1
+
+[[parts.levels]]
+directories = 1
+
+[[parts.levels]]
+files = 1
+
+[parts.subdirectories_per_directory]
+1 = 1
+
+[parts.files_per_directory]
+1 = 1
+
+[parts.file_sizes]
+1 = 1
+
+[parts.directory_name_lengths]
+100 = 1
+
+[parts.file_name_lengths]
+103 = 1
+"#;
+
+/// A path below `base` that is `bytes` bytes long in all, made of names of at most 201 bytes: the
+/// root of a cache as deep as a test needs. Nothing is created.
+fn path_of_len(base: &Path, bytes: usize) -> PathBuf {
+    let mut path = base.to_path_buf();
+    let mut room = bytes
+        .checked_sub(path.as_os_str().len())
+        .filter(|room| *room >= 2)
+        .expect("the base leaves room for a name and its separator");
+    while room > 0 {
+        // A separator and a name that is never empty: when little is left the name takes all of
+        // it but the separator, so that no single byte is left over that nothing could fill.
+        let name = if room > 202 { 200 } else { room - 1 };
+        path.push("a".repeat(name));
+        room -= name + 1;
+    }
+    path
+}
+
+/// Whether the suite reads a cached master or scans a copy depends on where the cache is: its path
+/// is above the fixture and takes part of `PATH_MAX`, and `CARGO_TARGET_DIR` can put it anywhere.
+/// A spec of one's own whose longest path is 512 bytes is cached under a short cache root, and is
+/// scanned in a copy, with nothing cached, under a cache root that leaves its paths no room.
+#[test]
+fn the_suite_scans_a_spec_in_a_copy_when_the_cache_root_leaves_its_paths_no_room() {
+    let _suite = serial();
+    let work = Workspace::new();
+    let specs = work.0.join("specs");
+    fs::create_dir_all(&specs).expect("a directory of specs");
+    fs::write(specs.join("chain.toml"), CHAIN_SPEC).expect("the spec is written");
+
+    let run = |cache: &Path| {
+        let report = run_suite(
+            &SuiteOptions {
+                binary: PathBuf::from(env!("CARGO_BIN_EXE_excise")),
+                fixtures: Fixtures::new(&specs, FixtureCache::at(cache)),
+                tier: Tier::Quick,
+                fixture_ids: vec!["chain".to_owned()],
+                classes: Vec::new(),
+                profile: Profile::Deterministic,
+                repeat: 0,
+                timeout: Duration::from_secs(120),
+                keep: false,
+                out_root: work.0.join("out"),
+                work_dir: Some(work.0.join("scratch")),
+                git_sha: "0".repeat(40),
+                privileged: None,
+                expectations: Expectations::none(),
+                timing_informational: false,
+            },
+            |_| {},
+        )
+        .expect("the suite runs");
+        let [fixture] = report.fixtures.as_slice() else {
+            panic!("one fixture ran, not {}", report.fixtures.len());
+        };
+        assert_eq!(
+            fixture.verdict,
+            Verdict::Pass,
+            "{:?} (error: {:?})",
+            fixture.first_failure(),
+            fixture.error
+        );
+        assert!(!fixture.diffs.is_empty(), "the scan was diffed");
+        fixture.generation
+    };
+
+    // A short cache root: the first run generates the master, and the second reuses it.
+    let short = work.0.join("cache");
+    assert!(run(&short).is_some(), "the first run generates the master");
+    assert!(short.is_dir(), "the master is in the cache");
+    assert!(run(&short).is_none(), "the second run reuses it");
+
+    // A cache root of 500 bytes: with the longest name the cache gives a directory (57) and the
+    // 512 bytes of the spec, its paths would pass the 1,023 that `PATH_MAX` leaves on macOS. The
+    // suite scans a copy, generated fresh each run, and caches nothing.
+    let long = path_of_len(&work.0, 500);
+    assert!(run(&long).is_some(), "a copy is generated");
+    assert!(
+        run(&long).is_some(),
+        "and again, because it is never cached"
+    );
+    assert!(!long.exists(), "nothing was cached below the long root");
+}
+
 /// A binary that writes a report that is not a scan report, as the product's `--output` does.
 #[cfg(unix)]
 #[test]

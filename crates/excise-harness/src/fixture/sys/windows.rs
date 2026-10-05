@@ -35,6 +35,39 @@ pub(crate) struct Dir {
     path: PathBuf,
 }
 
+/// Opens the regular file at `path` for reading, as a person typed the path: a link among its
+/// directories is followed, but its last component must not be a link, and what is opened must be
+/// a regular file. The file is opened as a reparse point (a link or a junction is opened itself
+/// and refused, and never followed), with backup semantics so that a folder can be opened to be
+/// told what it is, and refused too.
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    /// `FILE_FLAG_BACKUP_SEMANTICS`: what opening a folder takes.
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`: open a link or a junction itself, not its target.
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
+        .open(path)?;
+    let file_type = file.metadata()?.file_type();
+    if file_type.is_symlink() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a symbolic link, which is not followed",
+        ))
+    } else if file_type.is_file() {
+        Ok(file)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file (a folder, a FIFO, or a device)",
+        ))
+    }
+}
+
 fn unsupported(what: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
