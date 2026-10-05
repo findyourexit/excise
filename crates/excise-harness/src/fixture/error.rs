@@ -36,13 +36,17 @@ pub enum FixtureError {
         known: Vec<String>,
     },
     /// The fixture is never cached, because a path-based removal such as `cargo clean` could not
-    /// remove it: see
-    /// [`FixtureSpec::removable_by_path`](crate::fixture::FixtureSpec::removable_by_path). Take a
-    /// run copy of it instead.
+    /// remove it where this cache is, or because the path of the cache cannot be resolved: see
+    /// [`Fixtures::is_cacheable`](crate::fixture::Fixtures::is_cacheable). Take a run copy of it
+    /// instead.
     #[error(
         "the fixture `{id}` is never cached: it holds a directory that cannot be listed or \
-         changed, or a path longer than `PATH_MAX`, which `cargo clean` cannot remove; take a run \
-         copy of it instead"
+         changed, or it has, or can have, a path too long for the `PATH_MAX` that a path-based \
+         removal such as `cargo clean` has to stay within, counting the path of the cache \
+         directory above it as it is written, as it resolves, and as the system works on it \
+         while it expands each link in it, or the path of the cache directory cannot be \
+         resolved (a link in it leads nowhere, or a name in it is not a folder); take a run copy \
+         of it instead"
     )]
     NotCacheable {
         /// The id of the fixture.

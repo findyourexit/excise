@@ -175,8 +175,9 @@ pub enum CaseError {
 }
 
 /// A fixture root shared by every measured run of a `--fixture` case: a cached master, read-only,
-/// or (when the fixture cannot be cached, `FixtureSpec::removable_by_path` is false) one run copy
-/// reused for every scan. Dropping it removes the run copy; a master is left in the cache.
+/// or (when the fixture cannot be cached where this cache is, [`Fixtures::is_cacheable`] is false)
+/// one run copy reused for every scan. Dropping it removes the run copy; a master is left in the
+/// cache.
 pub enum SharedFixture {
     /// A cached master, read-only.
     Master(Materialized),
@@ -404,5 +405,40 @@ profiles = ["default"]
 
         let qualified = qualify("delete-folder-lifecycle-default", "peak_rss_bytes");
         assert_eq!(bare_metric_name(&qualified), "peak_rss_bytes");
+    }
+
+    /// A `--fixture` case shares one root: the cached master, unless a path-based removal could
+    /// not take the fixture's paths below the cache, and then one run copy. Where the cache is
+    /// decides it, as for the headless suite.
+    #[test]
+    fn a_fixture_is_one_run_copy_when_the_cache_root_leaves_its_paths_no_room() {
+        use crate::fixture::{
+            FixtureCache,
+            tests::support::{chain_spec, path_of_len},
+        };
+
+        let work = tempfile::tempdir().expect("a work directory");
+        let specs = work.path().join("specs");
+        std::fs::create_dir(&specs).expect("a directory of specs");
+        // A chain whose longest path is 4 + 4 * 101 + 1 + 103 = 512 bytes.
+        std::fs::write(specs.join("chain.toml"), chain_spec("chain", 4, 100, 103)).expect("a spec");
+
+        let short = Fixtures::new(&specs, FixtureCache::at(work.path().join("cache")));
+        let shared = SharedFixture::acquire(&short, "chain", work.path()).expect("acquired");
+        assert!(
+            matches!(shared, SharedFixture::Master(_)),
+            "a short cache root holds it"
+        );
+
+        // 500 bytes, a separator, the longest name the cache gives a directory (57), a separator,
+        // and 512 bytes is past the 1,023 that `PATH_MAX` leaves on macOS.
+        let long_root = path_of_len(work.path(), 500);
+        let long = Fixtures::new(&specs, FixtureCache::at(&long_root));
+        let shared = SharedFixture::acquire(&long, "chain", work.path()).expect("acquired");
+        assert!(
+            matches!(shared, SharedFixture::RunCopy(_)),
+            "a long cache root leaves it no room, and it is one run copy"
+        );
+        assert!(!long_root.exists(), "and nothing was cached in it");
     }
 }

@@ -343,12 +343,27 @@ impl Fixtures {
         FixtureSpec::load(&self.specs_dir, id)
     }
 
+    /// Whether the fixture of `spec` can be kept in this facade's cache: a path-based removal can
+    /// remove it wherever the cache puts it, which depends on the path of the cache directory as
+    /// the system works on it, as it is written, as it resolves, and at each link in it (see
+    /// [`FixtureSpec::removable_by_path`], and [`FixtureCache::longest_entry_path_bytes`] for the
+    /// root it is given). A fixture that cannot is never cached: [`master`](Self::master) refuses
+    /// it, and a runner takes a [`run_copy`](Self::run_copy) of it instead. So is every fixture of
+    /// a cache whose directory cannot be resolved at all, such as one below a link that leads
+    /// nowhere.
+    #[must_use]
+    pub fn is_cacheable(&self, spec: &FixtureSpec) -> bool {
+        self.cache
+            .longest_entry_path_bytes()
+            .is_ok_and(|root_bytes| spec.removable_by_path(root_bytes))
+    }
+
     /// The cached master of the spec `id`, generated if it is not there or does not verify. Treat
     /// it as read-only.
     ///
     /// A fixture that a path-based removal cannot remove is never cached, so that `cargo clean` and
     /// `git worktree remove` can always remove the target directory that holds the cache (see
-    /// [`FixtureSpec::removable_by_path`]). Take a [`run_copy`](Self::run_copy) of it instead.
+    /// [`is_cacheable`](Self::is_cacheable)). Take a [`run_copy`](Self::run_copy) of it instead.
     ///
     /// # Errors
     ///
@@ -356,7 +371,7 @@ impl Fixtures {
     /// be generated.
     pub fn master(&self, id: &str) -> Result<Materialized, FixtureError> {
         let spec = self.spec(id)?;
-        if !spec.removable_by_path() {
+        if !self.is_cacheable(&spec) {
             return Err(FixtureError::NotCacheable { id: spec.id });
         }
         self.cache.materialize(&spec, &self.options)

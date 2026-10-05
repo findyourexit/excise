@@ -21,6 +21,11 @@ use super::{
         TuiCommand, TuiError, TuiErrorKind, TuiResult,
     },
 };
+use super::{
+    HarnessShapeProfile, MAX_PROFILE_DEPTH, ShapeDepth, ShapeEntries, ShapeHardLinks,
+    ShapeHistogram, ShapeNameLengths, ShapePlatform, ShapeProfileKind, ShapeSymbolicLinks,
+    ShapeUnreadable, ShapeWalk,
+};
 use crate::{
     runner::is_latency,
     scenario::{Budget, EntryKind, Expect, Profile},
@@ -433,6 +438,15 @@ fn cover(root: &Value, schema: &Value, at: &str, instance: &Value, coverage: &mu
             }
         }
     }
+    // The definition that names the keys of a map is used by every map that refers to it.
+    if let Some(definition) = schema
+        .get("propertyNames")
+        .and_then(|names| names.get("$ref"))
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("#/$defs/"))
+    {
+        coverage.definitions.insert(definition.to_owned());
+    }
 }
 
 fn assert_schema_and_types_declare_the_same_fields<D: Document>(sample: &D) {
@@ -497,6 +511,7 @@ fn every_schema_is_draft_2020_12_and_compiles() {
     assert_schema_compiles::<HarnessAb>();
     assert_schema_compiles::<HarnessCounts>();
     assert_schema_compiles::<HarnessTui>();
+    assert_schema_compiles::<HarnessShapeProfile>();
 }
 
 #[test]
@@ -506,6 +521,7 @@ fn every_schema_identity_matches_the_rust_constants() {
     assert_schema_identity::<HarnessAb>();
     assert_schema_identity::<HarnessCounts>();
     assert_schema_identity::<HarnessTui>();
+    assert_schema_identity::<HarnessShapeProfile>();
     assert_eq!(SCHEMA_VERSION, 1);
 }
 
@@ -517,6 +533,7 @@ fn the_rust_marker_fields_serialize_the_document_constants() {
         (to_value(&ab()), HarnessAb::KIND),
         (to_value(&counts()), HarnessCounts::KIND),
         (to_value(&tui_failure()), HarnessTui::KIND),
+        (to_value(&shape_profile()), HarnessShapeProfile::KIND),
     ] {
         assert_eq!(document["document_kind"], kind);
         assert_eq!(document["schema_version"], SCHEMA_VERSION);
@@ -531,6 +548,7 @@ fn every_object_in_every_schema_rejects_undeclared_fields() {
         schema::<HarnessAb>(),
         schema::<HarnessCounts>(),
         schema::<HarnessTui>(),
+        schema::<HarnessShapeProfile>(),
     ] {
         assert_objects_are_closed(&schema, "#");
     }
@@ -545,6 +563,8 @@ fn serialized_documents_validate_against_their_schemas() {
     assert_valid(&ab());
     assert_valid(&counts());
     assert_valid(&minimal_counts());
+    assert_valid(&shape_profile());
+    assert_valid(&minimal_shape_profile());
 }
 
 #[test]
@@ -553,6 +573,7 @@ fn schemas_and_types_declare_exactly_the_same_fields() {
     assert_schema_and_types_declare_the_same_fields(&timeout_failure());
     assert_schema_and_types_declare_the_same_fields(&ab());
     assert_schema_and_types_declare_the_same_fields(&counts());
+    assert_schema_and_types_declare_the_same_fields(&shape_profile());
 }
 
 #[test]
@@ -1002,6 +1023,8 @@ fn documents_render_a_canonical_form_that_round_trips() {
     assert_round_trips(&ab());
     assert_round_trips(&counts());
     assert_round_trips(&minimal_counts());
+    assert_round_trips(&shape_profile());
+    assert_round_trips(&minimal_shape_profile());
 }
 
 #[test]
@@ -1864,4 +1887,553 @@ fn the_tui_reader_accepts_only_a_result_that_is_its_commands() {
             "{malformed}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The shape profile.
+
+fn histogram(count: u64, total: u64, max: u64, buckets: &[(u64, u64)]) -> ShapeHistogram {
+    ShapeHistogram {
+        count,
+        total,
+        max,
+        buckets: buckets.iter().copied().collect(),
+    }
+}
+
+/// The profile of a small tree, with a number in every field: the root holds the folders `a` and
+/// `b`, three files, and a link; `a` holds two files and the folder `c`; `c` holds a file. Two of
+/// the files are names of one file.
+fn shape_profile() -> HarnessShapeProfile {
+    HarnessShapeProfile {
+        document_kind: ShapeProfileKind::HarnessShapeProfile,
+        schema_version: SchemaVersion,
+        platform: ShapePlatform {
+            os: "linux".to_owned(),
+            identity: true,
+        },
+        walk: ShapeWalk {
+            cross_filesystems: false,
+            mount_points_skipped: 0,
+        },
+        entries: ShapeEntries {
+            total: 10,
+            directories: 3,
+            files: 6,
+            symlinks: 1,
+            others: 0,
+        },
+        max_depth: 3,
+        depths: vec![
+            ShapeDepth {
+                depth: 1,
+                directories: 2,
+                files: 3,
+                symlinks: 1,
+                others: 0,
+                bytes: 110,
+            },
+            ShapeDepth {
+                depth: 2,
+                directories: 1,
+                files: 2,
+                symlinks: 0,
+                others: 0,
+                bytes: 6_000,
+            },
+            ShapeDepth {
+                depth: 3,
+                directories: 0,
+                files: 1,
+                symlinks: 0,
+                others: 0,
+                bytes: 5_000,
+            },
+        ],
+        children_per_directory: histogram(4, 10, 6, &[(0, 1), (1, 1), (2, 1), (4, 1)]),
+        subdirectories_per_directory: histogram(4, 3, 2, &[(0, 2), (1, 1), (2, 1)]),
+        files_per_directory: histogram(4, 6, 3, &[(0, 1), (1, 1), (2, 2)]),
+        file_sizes: histogram(
+            6,
+            11_110,
+            5_000,
+            &[(0, 1), (8, 1), (64, 1), (512, 1), (4_096, 2)],
+        ),
+        name_lengths: ShapeNameLengths {
+            directories: histogram(3, 13, 5, &[(3, 1), (5, 2)]),
+            files: histogram(6, 48, 12, &[(4, 2), (7, 1), (9, 1), (12, 2)]),
+            symlinks: histogram(1, 6, 6, &[(6, 1)]),
+        },
+        hard_links: ShapeHardLinks {
+            groups: 1,
+            names: 2,
+            incomplete_groups: 0,
+            group_sizes: histogram(1, 2, 2, &[(2, 1)]),
+            // The two names are two of the files in the class of 4,096.
+            group_sizes_by_file_size: [(4_096, histogram(1, 2, 2, &[(2, 1)]))]
+                .into_iter()
+                .collect(),
+        },
+        symbolic_links: ShapeSymbolicLinks { count: 1 },
+        unreadable: ShapeUnreadable {
+            directories: 0,
+            errors: 0,
+        },
+    }
+}
+
+/// The profile of an empty folder: nothing below the root, whose own listing is the one value of
+/// each histogram of what a folder holds.
+fn minimal_shape_profile() -> HarnessShapeProfile {
+    HarnessShapeProfile {
+        entries: ShapeEntries {
+            total: 0,
+            directories: 0,
+            files: 0,
+            symlinks: 0,
+            others: 0,
+        },
+        max_depth: 0,
+        depths: Vec::new(),
+        children_per_directory: histogram(1, 0, 0, &[(0, 1)]),
+        subdirectories_per_directory: histogram(1, 0, 0, &[(0, 1)]),
+        files_per_directory: histogram(1, 0, 0, &[(0, 1)]),
+        file_sizes: ShapeHistogram::default(),
+        name_lengths: ShapeNameLengths::default(),
+        hard_links: ShapeHardLinks::default(),
+        symbolic_links: ShapeSymbolicLinks::default(),
+        ..shape_profile()
+    }
+}
+
+#[test]
+fn the_shape_profile_samples_obey_the_rules_a_schema_cannot_say() {
+    shape_profile().check().expect("a consistent profile");
+    minimal_shape_profile()
+        .check()
+        .expect("a consistent profile");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn the_shape_profile_schema_rejects_contract_drift() {
+    let many_depths = |d: &mut Value| {
+        let level = d["depths"][0].clone();
+        d["depths"] = Value::Array(vec![level; 4097]);
+    };
+    assert_rejected(
+        &shape_profile(),
+        &[
+            ("an undeclared top-level field", &|d| {
+                d["extra"] = true.into();
+            }),
+            ("an undeclared platform field", &|d| {
+                d["platform"]["extra"] = 1.into();
+            }),
+            ("an undeclared walk field", &|d| {
+                d["walk"]["extra"] = 1.into();
+            }),
+            ("an undeclared entries field", &|d| {
+                d["entries"]["extra"] = 1.into();
+            }),
+            ("an undeclared depth field", &|d| {
+                d["depths"][0]["name"] = "documents".into();
+            }),
+            ("an undeclared histogram field", &|d| {
+                d["file_sizes"]["extra"] = 1.into();
+            }),
+            ("an undeclared name length histogram", &|d| {
+                d["name_lengths"]["others"] = serde_json::json!({});
+            }),
+            ("an undeclared hard link field", &|d| {
+                d["hard_links"]["extra"] = 1.into();
+            }),
+            (
+                "an undeclared field in the histogram of a class of groups",
+                &|d| {
+                    d["hard_links"]["group_sizes_by_file_size"]["4096"]["extra"] = 1.into();
+                },
+            ),
+            ("a class of groups that is not a power of two", &|d| {
+                let histogram = d["hard_links"]["group_sizes_by_file_size"]["4096"].clone();
+                d["hard_links"]["group_sizes_by_file_size"]["3"] = histogram;
+            }),
+            ("a class of groups written with a leading zero", &|d| {
+                let histogram = d["hard_links"]["group_sizes_by_file_size"]["4096"].clone();
+                d["hard_links"]["group_sizes_by_file_size"]["04096"] = histogram;
+            }),
+            (
+                "a class of groups that is a count and not a histogram",
+                &|d| {
+                    d["hard_links"]["group_sizes_by_file_size"]["4096"] = 2.into();
+                },
+            ),
+            ("no groups by file size", &|d| {
+                remove(d, "/hard_links/group_sizes_by_file_size");
+            }),
+            ("an undeclared symbolic link field", &|d| {
+                d["symbolic_links"]["target"] = "/etc".into();
+            }),
+            ("an undeclared unreadable field", &|d| {
+                d["unreadable"]["extra"] = 1.into();
+            }),
+            ("another document kind", &|d| {
+                set(d, "/document_kind", "harness-counts".into());
+            }),
+            ("another schema version", &|d| {
+                set(d, "/schema_version", 2.into());
+            }),
+            ("no platform", &|d| remove(d, "/platform")),
+            ("no walk", &|d| remove(d, "/walk")),
+            ("no entries", &|d| remove(d, "/entries")),
+            ("no depths", &|d| remove(d, "/depths")),
+            ("no children histogram", &|d| {
+                remove(d, "/children_per_directory");
+            }),
+            ("no symbolic link name lengths", &|d| {
+                remove(d, "/name_lengths/symlinks");
+            }),
+            ("no unreadable count", &|d| remove(d, "/unreadable")),
+            ("a histogram without buckets", &|d| {
+                remove(d, "/file_sizes/buckets");
+            }),
+            ("a depth deeper than the limit", &|d| {
+                set(d, "/max_depth", (MAX_PROFILE_DEPTH + 1).into());
+            }),
+            ("more levels than the limit", &many_depths),
+            ("a level at depth 0", &|d| {
+                set(d, "/depths/0/depth", 0.into());
+            }),
+            ("a negative count", &|d| {
+                set(d, "/entries/files", (-1).into());
+            }),
+            ("a count that is not whole", &|d| {
+                set(d, "/entries/files", serde_json::json!(6.5));
+            }),
+            ("a count that is text", &|d| {
+                set(d, "/entries/files", "6".into());
+            }),
+            ("a count above what a double holds", &|d| {
+                set(
+                    d,
+                    "/entries/files",
+                    serde_json::json!(9_007_199_254_740_992_u64),
+                );
+            }),
+            ("an operating system in capitals", &|d| {
+                set(d, "/platform/os", "Linux".into());
+            }),
+            ("identity as text", &|d| {
+                set(d, "/platform/identity", "yes".into());
+            }),
+        ],
+    );
+}
+
+#[test]
+fn the_shape_profile_schema_rejects_buckets_that_are_not_what_their_histogram_holds() {
+    let class_buckets = ["children_per_directory", "file_sizes"];
+    for field in class_buckets {
+        let pointer = format!("/{field}/buckets");
+        assert_rejected(
+            &shape_profile(),
+            &[
+                ("a class that is not a power of two", &|d| {
+                    set(d, &pointer, serde_json::json!({ "3": 1 }));
+                }),
+                ("a class written with a leading zero", &|d| {
+                    set(d, &pointer, serde_json::json!({ "04": 1 }));
+                }),
+                ("a class past the largest", &|d| {
+                    set(
+                        d,
+                        &pointer,
+                        serde_json::json!({ "18446744073709551616": 1 }),
+                    );
+                }),
+                ("a name as a class", &|d| {
+                    set(d, &pointer, serde_json::json!({ "documents": 1 }));
+                }),
+                ("an empty bucket", &|d| {
+                    set(d, &pointer, serde_json::json!({ "4": 0 }));
+                }),
+                ("a negative bucket", &|d| {
+                    set(d, &pointer, serde_json::json!({ "4": -1 }));
+                }),
+                ("a bucket that is not whole", &|d| {
+                    set(d, &pointer, serde_json::json!({ "4": 1.5 }));
+                }),
+                ("a bucket above what a double holds", &|d| {
+                    set(
+                        d,
+                        &pointer,
+                        serde_json::json!({ "4": 9_007_199_254_740_992_u64 }),
+                    );
+                }),
+            ],
+        );
+    }
+    for field in ["directories", "files", "symlinks"] {
+        let pointer = format!("/name_lengths/{field}/buckets");
+        assert_rejected(
+            &shape_profile(),
+            &[
+                ("a length of 0", &|d| {
+                    set(d, &pointer, serde_json::json!({ "0": 1 }));
+                }),
+                ("a length past NAME_MAX", &|d| {
+                    set(d, &pointer, serde_json::json!({ "256": 1 }));
+                }),
+                ("a length with a leading zero", &|d| {
+                    set(d, &pointer, serde_json::json!({ "07": 1 }));
+                }),
+                ("a name as a length", &|d| {
+                    set(d, &pointer, serde_json::json!({ "report.pdf": 1 }));
+                }),
+                ("an empty bucket", &|d| {
+                    set(d, &pointer, serde_json::json!({ "7": 0 }));
+                }),
+            ],
+        );
+    }
+    // The longest length and the largest class are accepted: the limits are the schema's own.
+    let validator = validator::<HarnessShapeProfile>(true);
+    let mut document = to_value(&shape_profile());
+    set(
+        &mut document,
+        "/name_lengths/files/buckets",
+        serde_json::json!({ "255": 1, "1": 1 }),
+    );
+    set(
+        &mut document,
+        "/file_sizes/buckets",
+        serde_json::json!({ "9223372036854775808": 1 }),
+    );
+    assert!(validator.is_valid(&document), "the limits are inclusive");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_shape_profile_that_disagrees_with_itself_is_refused() {
+    type Edit = fn(&mut HarnessShapeProfile);
+    let cases: [(&str, Edit, &str); 28] = [
+        (
+            "kinds that do not add up",
+            |p| p.entries.total += 1,
+            "`entries.total` is 11",
+        ),
+        (
+            "a depth that holds other files than the kinds",
+            |p| {
+                p.entries.files += 1;
+                p.entries.total += 1;
+            },
+            "the depths hold 6 files and `entries.files` is 7",
+        ),
+        (
+            "a deepest depth that is not the number of levels",
+            |p| p.max_depth = 2,
+            "`max_depth` is 2 and `depths` has 3 levels",
+        ),
+        (
+            "a level that is out of place",
+            |p| p.depths[1].depth = 5,
+            "says it is depth 5",
+        ),
+        (
+            "a level that holds nothing",
+            |p| {
+                p.depths.push(ShapeDepth {
+                    depth: 4,
+                    directories: 0,
+                    files: 0,
+                    symlinks: 0,
+                    others: 0,
+                    bytes: 0,
+                });
+                p.max_depth = 4;
+            },
+            "depth 4 holds nothing",
+        ),
+        (
+            "a level below a depth with no folder",
+            |p| {
+                p.depths[0].directories = 0;
+                p.entries.directories -= 2;
+                p.entries.total -= 2;
+            },
+            "holds entries below a depth with no folder",
+        ),
+        (
+            "bytes that do not add up",
+            |p| p.file_sizes.total += 1,
+            "the depths hold 11110 bytes and `file_sizes.total` is 11111",
+        ),
+        (
+            "a histogram that counts what its buckets do not hold",
+            |p| p.children_per_directory.count = 5,
+            "`children_per_directory` counts 5 and its buckets hold 4",
+        ),
+        (
+            "a sum its buckets cannot hold",
+            |p| p.file_sizes.total = 1,
+            "`file_sizes` adds up to 1, which its buckets cannot hold",
+        ),
+        (
+            "a largest value outside the last bucket",
+            |p| p.file_sizes.max = 1,
+            "the largest value of `file_sizes` is not in its last bucket",
+        ),
+        (
+            "an empty histogram with a largest value",
+            |p| {
+                p.name_lengths.symlinks = ShapeHistogram {
+                    max: 3,
+                    ..ShapeHistogram::default()
+                };
+            },
+            "`name_lengths.symlinks` is empty and its largest value is not 0",
+        ),
+        (
+            "a class that is not a power of two",
+            |p| p.children_per_directory.buckets.add(3, 1),
+            "`children_per_directory` has no bucket 3",
+        ),
+        (
+            "a name length of 0",
+            |p| p.name_lengths.files.buckets.add(0, 1),
+            "`name_lengths.files` has no bucket 0",
+        ),
+        (
+            "folders listed in two numbers",
+            |p| p.subdirectories_per_directory.count = 3,
+            "`subdirectories_per_directory` counts 3 folders and `children_per_directory` counts 4",
+        ),
+        (
+            "more folders listed than there are",
+            |p| {
+                p.children_per_directory = histogram(10, 10, 6, &[(0, 1), (1, 1), (2, 1), (4, 7)]);
+                p.subdirectories_per_directory = histogram(10, 3, 2, &[(0, 8), (1, 1), (2, 1)]);
+                p.files_per_directory = histogram(10, 6, 3, &[(0, 7), (1, 1), (2, 2)]);
+            },
+            "more folders were listed than the tree has",
+        ),
+        (
+            "files per folder that do not add up to the files",
+            |p| p.files_per_directory.total = 5,
+            "`files_per_directory` adds up to 5 and the tree has 6",
+        ),
+        (
+            "names that do not match the folders",
+            |p| p.name_lengths.directories = histogram(2, 8, 5, &[(3, 1), (5, 1)]),
+            "`name_lengths.directories` counts 2 and the tree has 3",
+        ),
+        (
+            "groups that do not match their sizes",
+            |p| p.hard_links.groups = 2,
+            "`hard_links.groups` is 2 and `group_sizes` counts 1",
+        ),
+        (
+            "names that do not match their sizes",
+            |p| p.hard_links.names = 3,
+            "`hard_links.names` is 3 and `group_sizes` adds up to 2",
+        ),
+        (
+            "more incomplete groups than groups",
+            |p| p.hard_links.incomplete_groups = 2,
+            "more hard-link groups are incomplete than there are groups",
+        ),
+        (
+            "classes of groups that count other groups than the total",
+            |p| {
+                p.hard_links.group_sizes_by_file_size = [(4_096, histogram(2, 4, 2, &[(2, 2)]))]
+                    .into_iter()
+                    .collect();
+            },
+            "`hard_links.groups` is 1 and the classes of `group_sizes_by_file_size` count 2",
+        ),
+        (
+            "a class of groups that holds no group",
+            |p| {
+                p.hard_links
+                    .group_sizes_by_file_size
+                    .insert(0, ShapeHistogram::default());
+            },
+            "`hard_links.group_sizes_by_file_size[0]` holds no group: leave the class out",
+        ),
+        (
+            "a class of groups that is not a power of two",
+            |p| {
+                p.hard_links
+                    .group_sizes_by_file_size
+                    .insert(3, histogram(1, 2, 2, &[(2, 1)]));
+            },
+            "`hard_links.group_sizes_by_file_size` has no class 3",
+        ),
+        (
+            "more linked names in a class than the class has files",
+            |p| {
+                p.hard_links.group_sizes_by_file_size =
+                    [(512, histogram(1, 2, 2, &[(2, 1)]))].into_iter().collect();
+            },
+            "`hard_links.group_sizes_by_file_size[512]` has 2 names and `file_sizes` has 1 files in the class",
+        ),
+        (
+            "a largest group that the classes do not agree on",
+            |p| {
+                p.hard_links.group_sizes_by_file_size = [(4_096, histogram(1, 2, 3, &[(2, 1)]))]
+                    .into_iter()
+                    .collect();
+            },
+            "the largest group of `group_sizes_by_file_size` is 3 names and `group_sizes` says 2",
+        ),
+        (
+            "links counted in two numbers",
+            |p| p.symbolic_links.count = 2,
+            "`symbolic_links.count` is 2 and `entries.symlinks` is 1",
+        ),
+        (
+            "mount points skipped by a walk that crosses",
+            |p| {
+                p.walk.cross_filesystems = true;
+                p.walk.mount_points_skipped = 1;
+            },
+            "a walk that crosses file systems skipped no mount point",
+        ),
+        (
+            "hard links on a platform that cannot find them",
+            |p| p.platform.identity = false,
+            "a platform without identities finds no mount point and no hard link",
+        ),
+    ];
+    for (what, edit, expected) in cases {
+        let mut profile = shape_profile();
+        edit(&mut profile);
+
+        let problems = profile
+            .check()
+            .expect_err(&format!("{what} must be refused"));
+
+        assert!(
+            problems.to_string().contains(expected),
+            "{what}: `{expected}` is not in `{problems}`"
+        );
+    }
+}
+
+#[test]
+fn a_shape_profile_holds_no_string_but_its_kind_and_its_platform() {
+    fn strings(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => out.push(text.clone()),
+            Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
+            Value::Object(members) => members.values().for_each(|member| strings(member, out)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    let mut found = Vec::new();
+    strings(&to_value(&shape_profile()), &mut found);
+    found.sort();
+
+    assert_eq!(found, ["harness-shape-profile", "linux"]);
 }

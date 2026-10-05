@@ -4,6 +4,8 @@
 #[cfg(unix)]
 use std::collections::BTreeSet;
 
+#[cfg(unix)]
+use super::support::deep_names_spec;
 use super::support::{Scratch, master, spec};
 #[cfg(unix)]
 use crate::fixture::{Capability, RelPath};
@@ -470,9 +472,10 @@ fn the_unwritable_class_refuses_every_change_and_still_cleans_up() {
     let oracle = oracle_of(&master.root);
     assert!(oracle.compare(master.plan(), capabilities).is_clean());
     assert_eq!(spec("refused").planned_entry_count(), 4);
+    let root_bytes = u64::try_from(master.root.as_os_str().len()).expect("a length");
     assert!(
-        !spec("refused").removable_by_path(),
-        "a path-based removal cannot remove files from a mode 555 directory"
+        !spec("refused").removable_by_path(root_bytes),
+        "a path-based removal cannot remove files from a mode 555 directory, wherever it is"
     );
 
     let directory = oracle
@@ -549,4 +552,244 @@ fn generation_time_is_recorded() {
         u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
         master.marker.generation_ms
     );
+}
+
+/// A shaped part with every feature: three depths, links that resolve and links that do not, and
+/// files with several names.
+const SHAPED: &str = r#"
+    schema_version = 1
+    id = "shaped-small"
+    description = "A shaped tree."
+    seed = 11
+
+    [[parts]]
+    kind = "shaped"
+    root = "home"
+    max_file_bytes = 5000
+    dangling_symlinks = 3
+
+    [[parts.levels]]
+    directories = 4
+    files = 6
+    symlinks = 1
+
+    [[parts.levels]]
+    directories = 3
+    files = 40
+    symlinks = 6
+
+    [[parts.levels]]
+    files = 60
+    symlinks = 2
+
+    [parts.subdirectories_per_directory]
+    0 = 3
+    1 = 2
+    2 = 1
+
+    [parts.files_per_directory]
+    0 = 2
+    1 = 3
+    8 = 2
+    32 = 1
+
+    [parts.file_sizes]
+    0 = 1
+    1 = 2
+    64 = 4
+    4096 = 2
+
+    [parts.directory_name_lengths]
+    3 = 2
+    12 = 1
+
+    [parts.file_name_lengths]
+    5 = 3
+    20 = 1
+
+    [parts.symlink_name_lengths]
+    8 = 1
+
+    [[parts.hard_links]]
+    class = 1
+    names = 5
+    [parts.hard_links.group_sizes]
+    2 = 2
+
+    [[parts.hard_links]]
+    class = 64
+    names = 6
+    [parts.hard_links.group_sizes]
+    2 = 1
+    4 = 1
+"#;
+
+#[test]
+fn a_shaped_part_generates_the_tree_its_plan_describes_and_the_oracle_confirms() {
+    let scratch = Scratch::new();
+    let spec = crate::fixture::FixtureSpec::from_toml_str(SHAPED).expect("a spec");
+    let master = super::support::master_of(&scratch, &spec);
+
+    let oracle = oracle_of(&master.root);
+    let comparison = oracle.compare(master.plan(), &master.marker.capabilities);
+
+    assert!(
+        comparison.is_clean(),
+        "the tree differs from its plan: {:?}",
+        comparison.discrepancies.iter().take(5).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        master.plan().entries().len() as u64,
+        spec.planned_entry_count()
+    );
+    assert!(
+        master
+            .plan()
+            .entries()
+            .iter()
+            .all(|entry| entry.kind != NodeKind::File || entry.size <= 5000),
+        "no file is larger than the cap"
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            master.marker.skipped.is_empty(),
+            "every capability is there on Unix"
+        );
+        // Four groups of hard links, by the oracle's own count of files with several names.
+        assert_eq!(oracle.hard_links.len(), 4);
+        assert!(oracle.hard_links.iter().all(|group| {
+            group.paths.len() >= 2 && usize::try_from(group.nlink) == Ok(group.paths.len())
+        }));
+        // Three of the nine links dangle, and the six others lead to a file that exists.
+        let mut dangling = 0;
+        for entry in oracle
+            .descendants()
+            .filter(|entry| entry.kind == NodeKind::Symlink)
+        {
+            if std::fs::metadata(entry.path.to_path_buf(&master.root)).is_err() {
+                dangling += 1;
+            }
+        }
+        assert_eq!(dangling, 3);
+    }
+}
+
+/// Two shaped parts, `home` and `work`, with one group of two names each, among files of one size
+/// each. Each part numbers its groups from its own start, so a plan that let the numbers meet
+/// would make one group of four names of two sizes, which the generator would link into one inode
+/// and the manifest would not describe: the plan has two groups, and the tree two files with two
+/// names each.
+#[cfg(unix)]
+#[test]
+fn two_shaped_parts_with_one_group_each_make_two_groups_and_two_inodes() {
+    let part = |root: &str, size: u64| {
+        format!(
+            "[[parts]]\nkind = \"shaped\"\nroot = \"{root}\"\nmax_file_bytes = 100000\n\n\
+             [[parts.levels]]\nfiles = 4\n\n\
+             [parts.files_per_directory]\n4 = 1\n\n\
+             [parts.file_name_lengths]\n8 = 1\n\n\
+             [parts.file_sizes]\n{size} = 4\n\n\
+             [[parts.hard_links]]\nclass = {size}\nnames = 2\n\
+             [parts.hard_links.group_sizes]\n2 = 1\n\n"
+        )
+    };
+    let text = format!(
+        "schema_version = 1\nid = \"two-shaped\"\ndescription = \"Two shaped parts.\"\nseed = 3\n\n{}{}",
+        part("home", 1),
+        part("work", 64)
+    );
+    let scratch = Scratch::new();
+    let spec = crate::fixture::FixtureSpec::from_toml_str(&text).expect("a spec");
+    let master = super::support::master_of(&scratch, &spec);
+
+    let oracle = oracle_of(&master.root);
+    let comparison = oracle.compare(master.plan(), &master.marker.capabilities);
+    assert!(
+        comparison.is_clean(),
+        "the tree differs from its plan: {:?}",
+        comparison.discrepancies.iter().take(5).collect::<Vec<_>>()
+    );
+    let numbers: BTreeSet<u32> = master
+        .plan()
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.link_group)
+        .collect();
+    assert_eq!(numbers.len(), 2, "two groups in the plan");
+    assert_eq!(oracle.hard_links.len(), 2, "two files with several names");
+    assert!(
+        oracle
+            .hard_links
+            .iter()
+            .all(|group| group.paths.len() == 2 && group.nlink == 2),
+        "{:?}",
+        oracle.hard_links
+    );
+    let inodes: BTreeSet<(u64, u64)> = oracle
+        .hard_links
+        .iter()
+        .map(|group| (group.dev, group.ino))
+        .collect();
+    assert_eq!(inodes.len(), 2, "two inodes");
+}
+
+/// The links of a shaped part point at their anchor by the shortest relative path. A link that
+/// climbed to the top of the part and came back down through 31 folders with names of 255 bytes
+/// would hold 8 KiB, which no file system takes as the text of a link: macOS refuses past 1,023
+/// bytes and the common Linux file systems past 4,095.
+#[cfg(unix)]
+#[test]
+fn a_shaped_part_32_levels_deep_with_long_names_is_built_with_short_link_targets() {
+    let scratch = Scratch::new();
+    let spec = crate::fixture::FixtureSpec::from_toml_str(&deep_names_spec()).expect("a spec");
+    let master = super::support::master_of(&scratch, &spec);
+
+    let comparison = oracle_of(&master.root).compare(master.plan(), &master.marker.capabilities);
+    assert!(
+        comparison.is_clean(),
+        "the tree differs from its plan: {:?}",
+        comparison.discrepancies.iter().take(5).collect::<Vec<_>>()
+    );
+    let deepest = master
+        .plan()
+        .entries()
+        .iter()
+        .map(|entry| entry.path.as_bytes().len())
+        .max()
+        .expect("entries");
+    assert!(deepest > 7_900, "the deepest path is {deepest} bytes");
+    let targets: Vec<usize> = master
+        .plan()
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.target.as_ref())
+        .map(|target| target.as_bytes().len())
+        .collect();
+    assert_eq!(targets.len(), 2);
+    assert!(
+        targets.iter().all(|length| *length <= 8),
+        "the targets are {targets:?} bytes long"
+    );
+
+    // One of the two links is asked to dangle and the other points at the file, 8 KiB down: the
+    // oracle, which reads the tree, agrees with the plan about both targets.
+    assert_eq!(
+        master
+            .plan()
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.target.as_ref())
+            .filter(|target| target.as_bytes() == b"missing")
+            .count(),
+        1,
+        "one link dangles"
+    );
+
+    // The walk reaches the bottom through the handle of each folder, which no path could, and
+    // counts the two links without asking where they point.
+    let shape = crate::shape::profile(&master.root, crate::shape::WalkOptions::default())
+        .expect("the walk");
+    assert_eq!(shape.symbolic_links.count, 2);
+    assert_eq!(shape.unreadable.errors, 0);
 }

@@ -38,8 +38,10 @@ pub const MARKER_SCHEMA_VERSION: u32 = 1;
 /// The largest marker [`read_marker`] will read.
 const MAX_MARKER_BYTES: u64 = 1 << 20;
 
-/// The name the marker is written under before it is renamed into place.
-const TEMPORARY_NAME: &str = ".excise-harness-owned.tmp";
+/// The name the marker is written under before it is renamed into place. It is the longest name
+/// the harness puts at the root of a fixture, and a generation that is killed first leaves it
+/// there, so the cache counts it as a path (see `FixtureSpec::longest_path_bytes`).
+pub(crate) const TEMPORARY_NAME: &str = ".excise-harness-owned.tmp";
 
 string_enum! {
     /// The `document_kind` of a marker.

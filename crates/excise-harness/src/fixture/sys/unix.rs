@@ -39,6 +39,32 @@ pub(crate) struct Dir {
     fd: OwnedFd,
 }
 
+/// Opens the regular file at `path` for reading, as a person typed the path: a link among its
+/// directories is followed, but its last component must not be a link, and what is opened must be
+/// a regular file. A FIFO or a device is refused without being waited on (`NONBLOCK`: a FIFO opened
+/// for reading with no writer would otherwise wait for one), and a link, a folder, or anything else
+/// says what it is.
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
+    let fd = match rfs::openat(rfs::CWD, path, OPEN_READ, Mode::empty()) {
+        Ok(fd) => fd,
+        // `NOFOLLOW` on a link, whether it leads somewhere or not.
+        Err(Errno::LOOP) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a symbolic link, which is not followed",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if stat_from_raw(&rfs::fstat(&fd)?).kind != NodeKind::File {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file (a folder, a FIFO, or a device)",
+        ));
+    }
+    Ok(File::from(fd))
+}
+
 impl Dir {
     /// Opens an existing directory. The last component of `path` must not be a symbolic link;
     /// earlier components are resolved normally.

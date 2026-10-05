@@ -18,9 +18,9 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub(crate) use unix::Dir;
+pub(crate) use unix::{Dir, open_regular_file};
 #[cfg(windows)]
-pub(crate) use windows::Dir;
+pub(crate) use windows::{Dir, open_regular_file};
 
 /// What `lstat` reports about one entry. A field is `None` where the platform layer cannot
 /// provide it.

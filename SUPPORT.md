@@ -59,6 +59,10 @@ Use the [issue chooser](https://github.com/findyourexit/excise/issues/new/choose
 
 Do not use a public issue for a vulnerability, path or identity confusion, unintended or over-broad deletion, a race that could invalidate confirmation, or any report that could teach someone to trigger data loss. Stop using the affected build and use the private [security report](https://github.com/findyourexit/excise/security/advisories/new), following [SECURITY.md](SECURITY.md). Do not include sensitive real file system paths in a public report, and do not ask a reporter to rerun a potentially destructive action merely to collect logs.
 
+## Performance Reports
+
+A scan or a screen that is slower than it should be has its own form in the [issue chooser](https://github.com/findyourexit/excise/issues/new/choose), "Performance report". It asks for the Excise version, the operating system and file system, what was slow and how long it took, a shape profile of the slow tree, and the counts of one scan. The profile comes from `excise-shape` (`cargo install --locked --git https://github.com/findyourexit/excise excise-harness --bin excise-shape`, then `excise-shape profile <folder> --output shape-profile.json`). It holds aggregates only: how many entries there are at each depth, how many a folder holds, sizes in classes, name lengths, and the share of links, with no name, path, link target, owner, or timestamp. The counts come from `excise --format json <folder> | jq '{state, accounting, summary: (.summary | del(.last_unreadable_path, .last_unscanned_path, .last_unscanned_reason, .last_worker_error))}'`, which leaves out the four fields that can name a path. Do not attach or paste a full `--format json` report, a table of entries, or anything else that has a path in it.
+
 ## Security & Deletion Safety
 
 For normal first use, follow [Getting Started](docs/getting-started.md) and the [permanent deletion contract](docs/safety/deletion.md). Deletion is permanent. If a run may have deleted the wrong entry, stop immediately. Preserve the command, exit status, and reports, then report it privately instead of attempting another deletion or cleanup command.

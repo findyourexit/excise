@@ -8,6 +8,23 @@ use crate::fixture::{path::is_valid_component, rng::permute};
 /// The longest name any file system this harness targets accepts, in bytes (`NAME_MAX`).
 pub const MAX_NAME_BYTES: usize = 255;
 
+/// The fewest hexadecimal digits that tell `held` entries apart: how many a name needs to be
+/// unique among the entries of a folder that holds that many.
+pub(crate) fn hex_digits_for(held: u64) -> u32 {
+    let mut digits = 1;
+    let mut capacity: u128 = 16;
+    while capacity < u128::from(held) {
+        digits += 1;
+        capacity *= 16;
+    }
+    digits
+}
+
+/// How many decimal digits `value` has: `0` has one.
+pub(crate) fn decimal_digits(value: u64) -> u32 {
+    value.checked_ilog10().map_or(1, |log| log + 1)
+}
+
 /// How the names of the generated directories or files are spelled.
 ///
 /// Both styles give every index a distinct name, so names never collide within a directory.
@@ -87,6 +104,35 @@ impl NameStyle {
                 format!("{prefix}{value:0digits$x}{suffix}").into_bytes()
             }
             Self::Literal { name } => name.as_bytes().to_vec(),
+        }
+    }
+
+    /// The length in bytes of the longest name this style gives to the entries `0..count` of one
+    /// folder, whatever the key, and exactly: a sequential index has the most digits at the
+    /// largest index, a hex name always has its `length` digits, and a literal name is the same
+    /// for the one entry it names. With a `count` of 0 it is the length of the first name, which
+    /// no entry has.
+    pub(crate) fn longest_name_bytes(&self, count: u64) -> u64 {
+        let bytes = |text: &str| u64::try_from(text.len()).unwrap_or(u64::MAX);
+        match self {
+            Self::Sequential {
+                prefix,
+                suffix,
+                width,
+            } => {
+                let digits = u64::from(decimal_digits(count.saturating_sub(1)));
+                bytes(prefix)
+                    .saturating_add(bytes(suffix))
+                    .saturating_add(digits.max(u64::from(*width)))
+            }
+            Self::Hex {
+                prefix,
+                suffix,
+                length,
+            } => bytes(prefix)
+                .saturating_add(bytes(suffix))
+                .saturating_add(u64::from(*length)),
+            Self::Literal { name } => bytes(name),
         }
     }
 
@@ -237,8 +283,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        MAX_NAME_BYTES, NameStyle, bidi_names, control_character_names, escape_sequence_names,
-        invalid_utf8_names, maximum_length_names, newline_names,
+        MAX_NAME_BYTES, NameStyle, bidi_names, control_character_names, decimal_digits,
+        escape_sequence_names, invalid_utf8_names, maximum_length_names, newline_names,
     };
     use crate::fixture::path::is_valid_component;
 
@@ -359,5 +405,77 @@ mod tests {
                 .all(|name| name.len() == MAX_NAME_BYTES),
             "the long names are exactly at the limit"
         );
+    }
+
+    #[test]
+    fn the_longest_name_of_a_style_is_the_longest_name_it_gives() {
+        let padded = |width| NameStyle::Sequential {
+            prefix: "p-".to_owned(),
+            suffix: ".x".to_owned(),
+            width,
+        };
+        let hex = |length| NameStyle::Hex {
+            prefix: "h".to_owned(),
+            suffix: ".bin".to_owned(),
+            length,
+        };
+        let styles = [
+            NameStyle::sequential("", ""),
+            NameStyle::sequential("d", ""),
+            NameStyle::sequential("f", ".dat"),
+            padded(1),
+            padded(4),
+            padded(8),
+            hex(1),
+            hex(3),
+            hex(8),
+        ];
+        // Counts on either side of every power of ten, and 1, which names one entry.
+        for style in &styles {
+            for count in [
+                1_u64, 2, 9, 10, 11, 99, 100, 101, 1_000, 1_001, 10_000, 10_001,
+            ] {
+                if matches!(style, NameStyle::Hex { length: 1, .. }) && count > 16 {
+                    continue;
+                }
+                if matches!(style, NameStyle::Hex { length: 3, .. }) && count > 4_096 {
+                    continue;
+                }
+                let longest = (0..count)
+                    .map(|index| u64::try_from(style.name(index, 7).len()).expect("a length"))
+                    .max()
+                    .expect("a name");
+                assert_eq!(
+                    style.longest_name_bytes(count),
+                    longest,
+                    "{style:?} naming {count} entries"
+                );
+            }
+        }
+
+        let literal = NameStyle::Literal {
+            name: "keep.txt".to_owned(),
+        };
+        assert_eq!(literal.longest_name_bytes(1), 8);
+        let longest = NameStyle::Literal {
+            name: "n".repeat(MAX_NAME_BYTES),
+        };
+        assert_eq!(longest.longest_name_bytes(1), 255);
+    }
+
+    #[test]
+    fn decimal_digits_counts_digits() {
+        for (value, digits) in [
+            (0_u64, 1),
+            (9, 1),
+            (10, 2),
+            (99, 2),
+            (100, 3),
+            (999_999, 6),
+            (1_000_000, 7),
+            (u64::MAX, 20),
+        ] {
+            assert_eq!(decimal_digits(value), digits, "{value}");
+        }
     }
 }

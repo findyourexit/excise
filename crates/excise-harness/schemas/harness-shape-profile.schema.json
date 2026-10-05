@@ -1,0 +1,361 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/harness/schemas/harness-shape-profile-v1.json",
+  "title": "Excise harness shape profile v1",
+  "description": "The shape of one tree, as aggregates only: counts of entries by kind and by depth, what a folder holds and how large a file is in classes of powers of two, the lengths of names in bytes, and the share of hard links and symbolic links. It never holds a name, a path, a link target, an owner, or a timestamp. Internal test tooling, not a supported product interface. Written by excise-shape profile; excise-shape spec builds a fixture specification from one. A profile can come from anywhere, so a reader holds it to this schema, and to the rules in the harness README that a schema cannot say, before it uses a field.",
+  "type": "object",
+  "required": [
+    "document_kind",
+    "schema_version",
+    "platform",
+    "walk",
+    "entries",
+    "max_depth",
+    "depths",
+    "children_per_directory",
+    "subdirectories_per_directory",
+    "files_per_directory",
+    "file_sizes",
+    "name_lengths",
+    "hard_links",
+    "symbolic_links",
+    "unreadable"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "harness-shape-profile" },
+    "schema_version": { "const": 1 },
+    "platform": { "$ref": "#/$defs/platform" },
+    "walk": { "$ref": "#/$defs/walk" },
+    "entries": { "$ref": "#/$defs/entries" },
+    "max_depth": {
+      "description": "The deepest depth that holds an entry, 0 for an empty tree. It equals the length of depths.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4096
+    },
+    "depths": {
+      "description": "The entries and bytes at each depth from 1 to max_depth, in order. Depth 1 is what the root directly holds.",
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/depth" }
+    },
+    "children_per_directory": {
+      "description": "The entries a folder holds, of every kind, for each folder that was listed (the root included).",
+      "$ref": "#/$defs/class_histogram"
+    },
+    "subdirectories_per_directory": {
+      "description": "The folders a folder holds, for each folder that was listed.",
+      "$ref": "#/$defs/class_histogram"
+    },
+    "files_per_directory": {
+      "description": "The regular files a folder holds, for each folder that was listed.",
+      "$ref": "#/$defs/class_histogram"
+    },
+    "file_sizes": {
+      "description": "The apparent size (st_size) of each regular file, every name of a hard-linked file counted. Its total is the bytes of the tree.",
+      "$ref": "#/$defs/class_histogram"
+    },
+    "name_lengths": { "$ref": "#/$defs/name_lengths" },
+    "hard_links": { "$ref": "#/$defs/hard_links" },
+    "symbolic_links": { "$ref": "#/$defs/symbolic_links" },
+    "unreadable": { "$ref": "#/$defs/unreadable" }
+  },
+  "$defs": {
+    "count": {
+      "description": "A non-negative whole number that every JSON consumer reads back exactly (at most 2^53 - 1).",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "positive_count": {
+      "description": "A count of at least 1: a bucket that holds nothing is left out.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "unsigned": {
+      "description": "A non-negative whole number that fits 64 bits. A sum of sizes and a largest size can pass 2^53, which a sparse file makes possible, and a JSON consumer other than a 64-bit reader may then round it.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "platform": {
+      "type": "object",
+      "required": ["os", "identity"],
+      "additionalProperties": false,
+      "properties": {
+        "os": {
+          "description": "The operating system as std::env::consts::OS spells it, for example macos.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]{0,15}$"
+        },
+        "identity": {
+          "description": "Whether the platform reported a device and an inode for every entry. Without them (Windows) the walk finds no mount point and no hard link.",
+          "type": "boolean"
+        }
+      }
+    },
+    "walk": {
+      "type": "object",
+      "required": ["cross_filesystems", "mount_points_skipped"],
+      "additionalProperties": false,
+      "properties": {
+        "cross_filesystems": {
+          "description": "Whether the walk was asked to cross into other file systems. By default it stays on the file system of the root.",
+          "type": "boolean"
+        },
+        "mount_points_skipped": {
+          "description": "The folders on another file system that the walk counted and did not enter. 0 when cross_filesystems is true.",
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "entries": {
+      "description": "The entries below the root, by kind. The root itself is not counted.",
+      "type": "object",
+      "required": ["total", "directories", "files", "symlinks", "others"],
+      "additionalProperties": false,
+      "properties": {
+        "total": {
+          "description": "The four counts below added up.",
+          "$ref": "#/$defs/count"
+        },
+        "directories": {
+          "description": "Folders, mount points and folders that could not be listed included.",
+          "$ref": "#/$defs/count"
+        },
+        "files": {
+          "description": "Regular files, every name of a hard-linked file counted.",
+          "$ref": "#/$defs/count"
+        },
+        "symlinks": {
+          "description": "Symbolic links below the root, which the walk never follows.",
+          "$ref": "#/$defs/count"
+        },
+        "others": {
+          "description": "Everything else: sockets, FIFOs, devices.",
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "depth": {
+      "type": "object",
+      "required": ["depth", "directories", "files", "symlinks", "others", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "description": "The depth, counted from 1 in the order of the list.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "directories": { "$ref": "#/$defs/count" },
+        "files": { "$ref": "#/$defs/count" },
+        "symlinks": { "$ref": "#/$defs/count" },
+        "others": { "$ref": "#/$defs/count" },
+        "bytes": {
+          "description": "The apparent size (st_size) of the regular files at this depth, every name counted.",
+          "$ref": "#/$defs/unsigned"
+        }
+      }
+    },
+    "class_key": {
+      "description": "The smallest value of a class of powers of two, as a string of digits: 0, 1, 2, 4, 8, and so on up to 2^63.",
+      "type": "string",
+      "enum": [
+        "0",
+        "1",
+        "2",
+        "4",
+        "8",
+        "16",
+        "32",
+        "64",
+        "128",
+        "256",
+        "512",
+        "1024",
+        "2048",
+        "4096",
+        "8192",
+        "16384",
+        "32768",
+        "65536",
+        "131072",
+        "262144",
+        "524288",
+        "1048576",
+        "2097152",
+        "4194304",
+        "8388608",
+        "16777216",
+        "33554432",
+        "67108864",
+        "134217728",
+        "268435456",
+        "536870912",
+        "1073741824",
+        "2147483648",
+        "4294967296",
+        "8589934592",
+        "17179869184",
+        "34359738368",
+        "68719476736",
+        "137438953472",
+        "274877906944",
+        "549755813888",
+        "1099511627776",
+        "2199023255552",
+        "4398046511104",
+        "8796093022208",
+        "17592186044416",
+        "35184372088832",
+        "70368744177664",
+        "140737488355328",
+        "281474976710656",
+        "562949953421312",
+        "1125899906842624",
+        "2251799813685248",
+        "4503599627370496",
+        "9007199254740992",
+        "18014398509481984",
+        "36028797018963968",
+        "72057594037927936",
+        "144115188075855872",
+        "288230376151711744",
+        "576460752303423488",
+        "1152921504606846976",
+        "2305843009213693952",
+        "4611686018427387904",
+        "9223372036854775808"
+      ]
+    },
+    "class_histogram": {
+      "description": "A histogram in classes of powers of two. The bucket 0 holds the value 0, the bucket 1 the value 1, the bucket 2 the values 2 and 3, the bucket 4 the values 4 to 7, and so on up to the bucket 2^63, which holds 2^63 and above.",
+      "type": "object",
+      "required": ["count", "total", "max", "buckets"],
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "description": "How many values it counts: the sum of the bucket counts.",
+          "$ref": "#/$defs/count"
+        },
+        "total": {
+          "description": "The values added up, stopping at the largest 64-bit number.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "max": {
+          "description": "The largest value, 0 when there is none.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "buckets": {
+          "description": "The smallest value of each class, as a string of digits, and how many values it holds.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/class_key" },
+          "additionalProperties": { "$ref": "#/$defs/positive_count" }
+        }
+      }
+    },
+    "class_histograms": {
+      "description": "Histograms by class of powers of two: the smallest value of a class, as a string of digits, and the histogram of the values that belong to it. A class that holds no value is left out.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/class_key" },
+      "additionalProperties": { "$ref": "#/$defs/class_histogram" }
+    },
+    "length_histogram": {
+      "description": "A histogram of name lengths in bytes: one bucket for each length from 1 to 255. A longer name is counted as 255.",
+      "type": "object",
+      "required": ["count", "total", "max", "buckets"],
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "description": "How many names it counts: the sum of the bucket counts.",
+          "$ref": "#/$defs/count"
+        },
+        "total": {
+          "description": "The lengths added up.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "max": {
+          "description": "The longest length, 0 when there is none.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "buckets": {
+          "description": "A length as a string of digits, and how many names have it.",
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^([1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])$"
+          },
+          "additionalProperties": { "$ref": "#/$defs/positive_count" }
+        }
+      }
+    },
+    "name_lengths": {
+      "description": "The lengths of names in bytes, by what the name belongs to.",
+      "type": "object",
+      "required": ["directories", "files", "symlinks"],
+      "additionalProperties": false,
+      "properties": {
+        "directories": { "$ref": "#/$defs/length_histogram" },
+        "files": { "$ref": "#/$defs/length_histogram" },
+        "symlinks": { "$ref": "#/$defs/length_histogram" }
+      }
+    },
+    "hard_links": {
+      "description": "The regular files that have more than one name. The names of a file are one file, so they have one size and lie in one class of file_sizes, which counts every name: group_sizes_by_file_size says in which class each group lay.",
+      "type": "object",
+      "required": ["groups", "names", "incomplete_groups", "group_sizes", "group_sizes_by_file_size"],
+      "additionalProperties": false,
+      "properties": {
+        "groups": {
+          "description": "The files whose link count is above 1, each counted once however many names it has.",
+          "$ref": "#/$defs/count"
+        },
+        "names": {
+          "description": "The names of those files that the walk found.",
+          "$ref": "#/$defs/count"
+        },
+        "incomplete_groups": {
+          "description": "Of the groups, those whose link count is above the names found: their other names are outside the walk.",
+          "$ref": "#/$defs/count"
+        },
+        "group_sizes": {
+          "description": "The names found per group, in classes of powers of two. A group of size 1 is a file whose other names are all outside the walk.",
+          "$ref": "#/$defs/class_histogram"
+        },
+        "group_sizes_by_file_size": {
+          "description": "The same groups by the class of the size of their file: for each class of file size that holds a group, the names found per group in classes, as in group_sizes. A group is in the class of the size its first name had when the walk met it, and a name met with another size is not a name of the group. The histograms add up to group_sizes, and the names of a class are at most the files that file_sizes counts in that class.",
+          "$ref": "#/$defs/class_histograms"
+        }
+      }
+    },
+    "symbolic_links": {
+      "description": "The symbolic links: how many there are, and nothing of where they point. A link is an entry of its own and the walk goes no further than the link, so whether its target exists is not asked, and the profile does not say.",
+      "type": "object",
+      "required": ["count"],
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "description": "All of them.",
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "unreadable": {
+      "type": "object",
+      "required": ["directories", "errors"],
+      "additionalProperties": false,
+      "properties": {
+        "directories": {
+          "description": "Folders that could not be opened or listed because of their permissions. Counted as folders and absent from the histograms of what a folder holds.",
+          "$ref": "#/$defs/count"
+        },
+        "errors": {
+          "description": "Entries and folders that failed for another reason: gone before the walk reached them, on Unix a folder that was not the one inspected when the walk opened it (it changed in between; on Windows the walk cannot tell one ordinary folder from another), an input or output error, a folder deeper than 4096 levels, or a folder that is its own ancestor (a bind mount can make one), which is counted and not entered.",
+          "$ref": "#/$defs/count"
+        }
+      }
+    }
+  }
+}

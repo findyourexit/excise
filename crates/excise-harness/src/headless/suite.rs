@@ -5,8 +5,8 @@
 //!
 //! 1. gets the fixture: the cached master, which headless runs only read, or a fresh run copy,
 //!    removed when the fixture is done, for a fixture that is never cached because `cargo clean`
-//!    could not remove it (see
-//!    [`FixtureSpec::removable_by_path`](crate::fixture::FixtureSpec::removable_by_path)) and
+//!    could not remove it, where this suite's cache is (see
+//!    [`Fixtures::is_cacheable`](crate::fixture::Fixtures::is_cacheable)) and
 //!    for a fixture with a volume part whose volume is attached (privileged, behind
 //!    `EXCISE_HARNESS_PRIVILEGED=1`);
 //! 2. walks it for the oracle;
@@ -116,19 +116,35 @@ string_enum! {
 }
 
 impl Class {
-    /// The classes a specification generates.
+    /// The classes a specification generates. A shaped tree is a scale shape, and one that has
+    /// links also has identities for a scan to account for.
     #[must_use]
     pub fn of(spec: &FixtureSpec) -> BTreeSet<Self> {
-        spec.parts
-            .iter()
-            .filter_map(|part| match part {
-                Part::Tree(_) | Part::Deep(_) => Some(Self::Scale),
-                Part::Identity(_) => Some(Self::Identity),
-                Part::Hostile(_) => Some(Self::Hostile),
-                Part::Volume(_) => Some(Self::Volumes),
-                Part::File(_) => None,
-            })
-            .collect()
+        let mut classes = BTreeSet::new();
+        for part in &spec.parts {
+            match part {
+                Part::Tree(_) | Part::Deep(_) => {
+                    classes.insert(Self::Scale);
+                }
+                Part::Shaped(shaped) => {
+                    classes.insert(Self::Scale);
+                    if !shaped.hard_links.is_empty() || shaped.symlink_count() > 0 {
+                        classes.insert(Self::Identity);
+                    }
+                }
+                Part::Identity(_) => {
+                    classes.insert(Self::Identity);
+                }
+                Part::Hostile(_) => {
+                    classes.insert(Self::Hostile);
+                }
+                Part::Volume(_) => {
+                    classes.insert(Self::Volumes);
+                }
+                Part::File(_) => {}
+            }
+        }
+        classes
     }
 }
 
@@ -640,7 +656,7 @@ fn select(options: &SuiteOptions) -> Result<Vec<Planned>, SuiteError> {
             continue;
         }
         let needs_volumes = spec.has_volumes();
-        let cacheable = spec.removable_by_path();
+        let cacheable = options.fixtures.is_cacheable(&spec);
         planned.push(Planned {
             id,
             classes,

@@ -1,9 +1,13 @@
 //! The cache: a hit skips generation, a damaged entry is regenerated, entries are marked, and
 //! publishing is safe.
 
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::{fs, path::Path};
 
 use super::support::{Scratch, master, spec, tiny_spec};
+#[cfg(unix)]
+use super::support::{link_to, long_way_round, path_of_len};
 use crate::fixture::{
     FixtureCache, GENERATOR_VERSION, MARKER_FILE_NAME, MaterializeOptions, Materialized, Oracle,
     OwnershipError, Role, Verify, read_marker, remove_tree, verify_owned,
@@ -480,4 +484,234 @@ fn the_default_cache_lives_in_the_target_directory() {
         "{} is not this workspace",
         workspace_root.display()
     );
+}
+
+/// The longest name the cache gives a directory directly below its root, which is that of a
+/// fixture still being generated: `.partial-` (9 bytes), 16 hexadecimal digits, `-`, a process
+/// number of at most 10 digits, `-`, and a count of at most 20.
+const LONGEST_NAME: u64 = 9 + 16 + 1 + 10 + 1 + 20;
+
+/// What a fixture root in a cache measures at the most: the path of the cache directory, as it
+/// resolves, a separator, and the longest name the cache gives a directory below it. The cache
+/// directory need not exist, and however many of its names are missing, it counts below the
+/// longest ancestor that does; a relative root counts as the absolute path it names.
+#[test]
+fn the_longest_entry_path_of_a_cache_is_its_resolved_root_a_separator_and_the_longest_name() {
+    let scratch = Scratch::new();
+    let base = scratch.resolved_path();
+    for root in [
+        base.clone(),
+        base.join("cache"),
+        base.join("below").join("a").join("cache"),
+    ] {
+        let bytes = u64::try_from(root.as_os_str().len()).expect("a length");
+        assert_eq!(
+            FixtureCache::at(&root)
+                .longest_entry_path_bytes()
+                .expect("the path resolves"),
+            bytes + 1 + LONGEST_NAME,
+            "{}",
+            root.display()
+        );
+    }
+
+    let relative = Path::new("a-cache-root-below-the-current-directory");
+    let named = std::env::current_dir()
+        .expect("a current directory")
+        .join(relative);
+    assert_eq!(
+        FixtureCache::at(relative)
+            .longest_entry_path_bytes()
+            .expect("a relative root resolves"),
+        FixtureCache::at(&named)
+            .longest_entry_path_bytes()
+            .expect("the absolute root resolves"),
+        "a relative root counts as the absolute path it names"
+    );
+}
+
+/// A root below a symbolic link counts as the longer of where it is written and where it leads,
+/// the names that do not exist yet included. Unix only, like the other tests that make a link.
+#[cfg(unix)]
+#[test]
+fn a_root_below_a_link_counts_the_longer_of_where_it_is_written_and_where_it_leads() {
+    let scratch = Scratch::new();
+    let base = scratch.resolved_path();
+    let bytes = |path: &Path| u64::try_from(path.as_os_str().len()).expect("a length");
+    let measured = |root: &Path| {
+        FixtureCache::at(root)
+            .longest_entry_path_bytes()
+            .expect("the path resolves")
+    };
+
+    // A short link to a deep directory leads far: the root counts as the deep directory and what
+    // is below it, whether the names below the link exist or not.
+    let deep = path_of_len(&base, 300);
+    fs::create_dir_all(&deep).expect("a deep directory");
+    let link = base.join("link");
+    link_to(&link, &deep);
+    assert_eq!(
+        measured(&link),
+        bytes(&deep) + 1 + LONGEST_NAME,
+        "the link itself"
+    );
+    for below in [Path::new("cache"), Path::new("not/yet/cache")] {
+        assert_eq!(
+            measured(&link.join(below)),
+            bytes(&deep.join(below)) + 1 + LONGEST_NAME,
+            "below the link: `{}`",
+            below.display()
+        );
+    }
+
+    // A long link to a short directory is longer where it is written than where it leads, and
+    // what is written counts.
+    let near = base.join("near");
+    fs::create_dir(&near).expect("a short directory");
+    let long_link = base.join("l".repeat(200));
+    link_to(&long_link, &near);
+    let written = long_link.join("cache");
+    assert_eq!(measured(&written), bytes(&written) + 1 + LONGEST_NAME);
+}
+
+/// The system works on the content of a link and what is left of the path after it, and that can
+/// be longer than the root as it is written and as it resolves: below a short link to a long path
+/// that ends in a link back to a short directory, the root counts as that pathname. Unix only.
+#[cfg(unix)]
+#[test]
+fn a_root_counts_the_pathname_the_system_works_on_at_a_link_in_it() {
+    let scratch = Scratch::new();
+    let base = scratch.resolved_path();
+    let way = long_way_round(&base, 700);
+    let bytes = |path: &Path| u64::try_from(path.as_os_str().len()).expect("a length");
+    let measured = |root: &Path| {
+        FixtureCache::at(root)
+            .longest_entry_path_bytes()
+            .expect("the path resolves")
+    };
+
+    // Where the way leads, the root is short.
+    let near = way.near.join("cache");
+    assert_eq!(measured(&near), bytes(&near) + 1 + LONGEST_NAME);
+
+    // Below the link that begins the way, it is the 705 bytes of the content of the link and
+    // `/cache`, short as the root is written and as it resolves.
+    let start = way.start.join("cache");
+    assert_eq!(
+        measured(&start),
+        bytes(&way.back.join("cache")) + 1 + LONGEST_NAME
+    );
+    assert!(bytes(&start) + 500 < bytes(&way.back.join("cache")));
+}
+
+/// The path of a root counts as it is spelled, `.` names and repeated separators included: the
+/// system is handed the text of the root and counts all of it against `PATH_MAX`, and
+/// `std::path::absolute`, which drops them, is not what the cache hands it. So `<dir>//cache` is a
+/// byte longer than `<dir>/cache`, `<dir>/./cache` two, and a relative root is the current
+/// directory and the text written after it. Unix only: where `absolute` gives the spelling the
+/// system sees (Windows), that is the normalized one.
+#[cfg(unix)]
+#[test]
+fn a_root_counts_as_it_is_spelled() {
+    let scratch = Scratch::new();
+    let base = scratch.resolved_path();
+    let measured = |root: &str| {
+        FixtureCache::at(root)
+            .longest_entry_path_bytes()
+            .expect("the path resolves")
+    };
+    let dir = base.display().to_string();
+    let plain = measured(&format!("{dir}/cache"));
+    for (root, extra) in [
+        (format!("{dir}//cache"), 1),
+        (format!("{dir}/./cache"), 2),
+        (format!("{dir}/cache/"), 1),
+        (format!("{dir}/cache/."), 2),
+        (format!("{dir}///cache"), 2),
+        (format!("{dir}/./././cache"), 6),
+    ] {
+        assert_eq!(measured(&root), plain + extra, "{root}");
+    }
+
+    // A relative root counts as the current directory and the text after it.
+    let current = std::env::current_dir().expect("a current directory");
+    let plain = measured("a-cache-below-the-current-directory");
+    assert_eq!(
+        plain,
+        measured(&format!(
+            "{}/a-cache-below-the-current-directory",
+            current.display()
+        ))
+    );
+    assert_eq!(measured("./a-cache-below-the-current-directory"), plain + 2);
+    assert_eq!(measured("a-cache-below-the-current-directory//"), plain + 2);
+}
+
+/// A root that cannot be resolved has no length: the empty root; one that exists and is not a
+/// folder, a file, however it is spelled, and a link to one; and (on Unix, where they are not
+/// reported as one that is not there) one below a name that is not a folder, and one that goes
+/// through a link that leads to a name that is not there, whether the link is the root or a
+/// directory above it, absolute or relative.
+#[test]
+fn a_root_that_cannot_be_resolved_has_no_length() {
+    assert!(
+        FixtureCache::at("").longest_entry_path_bytes().is_err(),
+        "the empty root"
+    );
+
+    let scratch = Scratch::new();
+    let file = scratch.join("a-file");
+    fs::write(&file, b"not a folder").expect("a file");
+    assert!(
+        FixtureCache::at(&file).longest_entry_path_bytes().is_err(),
+        "a root that is a file"
+    );
+
+    #[cfg(unix)]
+    {
+        assert!(
+            FixtureCache::at(file.join("cache"))
+                .longest_entry_path_bytes()
+                .is_err(),
+            "below a file"
+        );
+
+        // A name that exists and is not a folder ends the path, whatever follows it: a link to a
+        // file, a separator or a `.` after the file, and a link whose content goes on after it.
+        link_to(&scratch.join("to-file"), &file);
+        link_to(&scratch.join("slash"), Path::new("a-file/"));
+        link_to(&scratch.join("dot"), Path::new("a-file/."));
+        fs::create_dir(scratch.join("a-folder")).expect("a folder");
+        link_to(&scratch.join("up"), Path::new("a-file/../a-folder"));
+        let dir = scratch.path().display().to_string();
+        for root in [
+            scratch.join("to-file"),
+            scratch.join("slash"),
+            scratch.join("dot"),
+            scratch.join("up"),
+            PathBuf::from(format!("{dir}/a-file/")),
+            PathBuf::from(format!("{dir}/a-file/.")),
+        ] {
+            assert!(
+                FixtureCache::at(&root).longest_entry_path_bytes().is_err(),
+                "not a folder: {}",
+                root.display()
+            );
+        }
+
+        // A link that leads to a name that is not there exists, so it is not a name the cache
+        // can make: the root cannot be resolved, as the link itself or below it.
+        link_to(&scratch.join("relative"), Path::new("missing"));
+        link_to(&scratch.join("absolute"), &scratch.join("missing"));
+        for link in ["relative", "absolute"] {
+            let link = scratch.join(link);
+            for root in [link.clone(), link.join("cache")] {
+                assert!(
+                    FixtureCache::at(&root).longest_entry_path_bytes().is_err(),
+                    "a link that leads nowhere: {}",
+                    root.display()
+                );
+            }
+        }
+    }
 }

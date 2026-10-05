@@ -14,7 +14,7 @@ use std::{
 };
 
 use excise_harness::{
-    fixture::{Fixtures, PrivilegedOptIn},
+    fixture::{FixtureCache, Fixtures, PrivilegedOptIn},
     headless::{Class, DEFAULT_REPEAT, Expectations, Progress, SuiteOptions, run_suite},
     report::Tier,
     scenario::Profile,
@@ -23,7 +23,7 @@ use excise_harness::{
 use crate::e2e::{BINARY_ENV, build_release_binary};
 
 const USAGE: &str = "usage: cargo xtask headless [--quick|--full] [--fixture ID]... \
-                     [--class scale|identity|hostile|volumes]... \
+                     [--fixture-dir DIR] [--class scale|identity|hostile|volumes]... \
                      [--profile default|deterministic] [--repeat N] [--timeout SECONDS] \
                      [--timing-informational] [--keep-scratch]";
 
@@ -36,6 +36,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(900);
 struct Selection {
     tier: Tier,
     fixtures: Vec<String>,
+    fixture_dir: Option<PathBuf>,
     classes: Vec<Class>,
     profile: Profile,
     repeat: u32,
@@ -60,7 +61,7 @@ pub fn headless(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>
     };
     let options = SuiteOptions {
         binary,
-        fixtures: Fixtures::bundled(),
+        fixtures: fixtures_in(selection.fixture_dir.as_deref())?,
         tier: selection.tier,
         fixture_ids: selection.fixtures,
         classes: selection.classes,
@@ -72,7 +73,12 @@ pub fn headless(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>
         work_dir: None,
         git_sha: super::current_head_sha()?,
         privileged: PrivilegedOptIn::from_env(),
-        expectations: Expectations::bundled()?,
+        // A spec of a directory of the operator's own has no documented defect: it must pass.
+        expectations: if selection.fixture_dir.is_some() {
+            Expectations::none()
+        } else {
+            Expectations::bundled()?
+        },
         timing_informational: selection.timing_informational,
     };
 
@@ -107,6 +113,7 @@ pub fn headless(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
     let mut selection = Selection {
+        fixture_dir: None,
         tier: Tier::Full,
         fixtures: Vec::new(),
         classes: Vec::new(),
@@ -133,6 +140,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
                 }
             }
             "--fixture" => selection.fixtures.push(value(&mut args, "--fixture")?),
+            "--fixture-dir" => {
+                selection.fixture_dir = Some(PathBuf::from(value(&mut args, "--fixture-dir")?));
+            }
             "--class" => {
                 let text = value(&mut args, "--class")?;
                 let class = Class::ALL
@@ -184,6 +194,31 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
     }
     selection.tier = tier.unwrap_or(Tier::Full);
     Ok(selection)
+}
+
+/// The fixtures a run takes its specs from: the specs of `dir`, a directory of the operator's own
+/// (`--fixture-dir`), or the ones the harness ships. Generated masters are cached below the target
+/// directory either way, under a name that holds the spec's hash, so two specs of one id never
+/// share a cache entry.
+///
+/// What the directory holds is not trusted to be specs. The harness reads each spec when it is
+/// asked for one (`headless` asks for every spec of the directory, `bench-e2e` for those of the
+/// ids it is given): the file is opened without following a link, must be a regular file, and is
+/// read up to `MAX_SPEC_BYTES`, so a link, a FIFO, a folder, or a file above the cap is refused
+/// there with a message, and is never waited on or read in full.
+///
+/// # Errors
+///
+/// Returns an error when `dir` is not a directory.
+pub fn fixtures_in(dir: Option<&Path>) -> io::Result<Fixtures> {
+    match dir {
+        None => Ok(Fixtures::bundled()),
+        Some(dir) if dir.is_dir() => Ok(Fixtures::new(dir, FixtureCache::in_target_dir())),
+        Some(dir) => Err(io::Error::other(format!(
+            "`--fixture-dir {}` is not a directory",
+            dir.display()
+        ))),
+    }
 }
 
 fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -266,5 +301,55 @@ mod tests {
             parsed(&["--quick", "--quick"]).expect("same twice").tier,
             Tier::Quick
         );
+    }
+
+    #[test]
+    fn a_fixture_directory_comes_with_ids_and_must_be_a_directory() {
+        let selection =
+            parsed(&["--fixture-dir", "specs", "--fixture", "home-50k"]).expect("valid");
+        assert_eq!(selection.fixture_dir.as_deref(), Some(Path::new("specs")));
+        assert_eq!(selection.fixtures, ["home-50k"]);
+        assert!(parsed(&[]).expect("valid").fixture_dir.is_none());
+        assert!(
+            parsed(&["--fixture-dir"]).is_err(),
+            "the option needs a directory"
+        );
+        assert!(fixtures_in(None).is_ok());
+        let error = fixtures_in(Some(Path::new("/no/such/directory/of/specs")))
+            .expect_err("a directory that is not there is refused");
+        assert!(error.to_string().contains("is not a directory"), "{error}");
+    }
+
+    /// `headless` and `bench-e2e` both take their fixtures from `fixtures_in`, so a spec of a
+    /// `--fixture-dir` that is a link is refused for both: the harness does not follow it.
+    #[cfg(unix)]
+    #[test]
+    fn a_spec_of_a_fixture_directory_that_is_a_link_is_refused_and_not_followed() {
+        /// A directory of the temporary area that is removed when it drops.
+        struct Scratch(PathBuf);
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let scratch =
+            Scratch(env::temp_dir().join(format!("xtask-fixture-dir-{}", std::process::id())));
+        std::fs::create_dir_all(&scratch.0).expect("a scratch directory");
+        std::fs::write(
+            scratch.0.join("backing.toml"),
+            "schema_version = 1\nid = \"linked\"\ndescription = \"A spec.\"\nseed = 1\n\n\
+             [[parts]]\nkind = \"file\"\nroot = \"f.bin\"\nsize = 8\n",
+        )
+        .expect("a spec");
+        std::os::unix::fs::symlink("backing.toml", scratch.0.join("linked.toml")).expect("a link");
+
+        let fixtures = fixtures_in(Some(&scratch.0)).expect("a directory");
+        let error = fixtures
+            .spec("linked")
+            .expect_err("a link is not a spec of the directory");
+
+        assert!(error.to_string().contains("symbolic link"), "{error}");
     }
 }

@@ -58,15 +58,16 @@ pub mod names;
 pub mod oracle;
 pub mod path;
 pub mod plan;
+mod resolve;
 mod rng;
 pub mod run;
 pub mod spec;
-mod sys;
+pub(crate) mod sys;
 pub mod tree;
 pub mod volume;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use cache::{CACHE_DIR_NAME, FixtureCache, MaterializeOptions, Materialized};
 pub use caps::{Capabilities, Capability, CapabilityStatus};
@@ -91,8 +92,18 @@ pub use volume::{PRIVILEGED_ENV, PrivilegedOptIn, Volume, VolumeError, VolumeSpe
 use crate::string_enum::string_enum;
 
 /// The version of the generator's output. Bump it whenever the same spec and seed would produce
-/// a different tree or manifest, so a cached fixture from an older generator is never reused.
-pub const GENERATOR_VERSION: u32 = 1;
+/// a different tree or manifest, so a cached fixture from an older generator is never reused: it
+/// is in the name of a cache entry (`<spec hash>-<version>`), in the marker, and in the manifest
+/// document, and not in the manifest hash, which covers the entries alone.
+///
+/// * **2.** The hard-link groups of a plan are numbered once for the whole plan, so two identity
+///   parts in one spec no longer share group numbers, which changes the manifest of such a spec;
+///   and a `shaped` part in which every file has more than one name anchors its links at the file
+///   of a group, which changes the targets of its links. A bump costs every cached master one
+///   regeneration, in a new entry; the entries of version 1 are never reused, and stay where they
+///   are until `cargo clean`. The manifest hashes that the tests pin for the bundled specs did not
+///   change with it.
+pub const GENERATOR_VERSION: u32 = 2;
 
 /// The name of the ownership marker at the root of every fixture: a regular file.
 pub const MARKER_FILE_NAME: &str = ".excise-harness-owned";

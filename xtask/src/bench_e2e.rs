@@ -24,10 +24,10 @@ use excise_harness::{
     scenario::{Budget, Profile},
 };
 
-use crate::e2e::build_release_binary;
+use crate::{e2e::build_release_binary, headless::fixtures_in};
 
 const USAGE: &str = "usage: cargo xtask bench-e2e --baseline <ref> [--baseline-binary PATH] \
-                     [--candidate-binary PATH] [--fixture ID]... \
+                     [--candidate-binary PATH] [--fixture ID]... [--fixture-dir DIR] \
                      [--scenario NAME --profile PROFILE]... [--pairs N] [--seed S] \
                      [--timing-threshold FRACTION] [--memory-tolerance FRACTION] [--strict] \
                      [--timeout SECONDS]";
@@ -47,6 +47,7 @@ struct Selection {
     baseline_binary: Option<PathBuf>,
     candidate_binary: Option<PathBuf>,
     fixtures: Vec<String>,
+    fixture_dir: Option<PathBuf>,
     /// `(scenario name, profile)`, in the order `--scenario` was given; the profile is filled in
     /// by the `--profile` that follows it.
     scenarios: Vec<(String, Option<Profile>)>,
@@ -74,14 +75,16 @@ pub fn bench_e2e(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error
         None => build_release_binary(&root, &target)?,
     };
     let candidate_ref = current_candidate_ref(&root)?;
-    let cases = resolve_cases(&selection, &root)?;
+    let scan_fixtures = fixtures_in(selection.fixture_dir.as_deref())?;
+    let cases = resolve_cases(&selection, &root, &scan_fixtures)?;
 
     let options = BenchOptions {
         baseline_binary,
         baseline_ref,
         candidate_binary,
         candidate_ref,
-        fixtures: Fixtures::bundled(),
+        fixtures: scan_fixtures,
+        scenario_fixtures: Fixtures::bundled(),
         cases,
         pairs: selection.pairs.unwrap_or(DEFAULT_PAIRS),
         seed: selection.seed.unwrap_or(DEFAULT_SEED),
@@ -139,11 +142,15 @@ fn resolve_baseline(
     build_baseline_binary(root, target, &reference)
 }
 
-/// The cases named on the command line: every `--fixture` (checked against the known fixture
-/// ids) and every `--scenario`/`--profile` pair (checked against the known scenarios and the
-/// profiles each one declares).
-fn resolve_cases(selection: &Selection, root: &Path) -> Result<Vec<Case>, Box<dyn Error>> {
-    let known_fixtures = Fixtures::bundled().ids()?;
+/// The cases named on the command line: every `--fixture` (checked against the ids of `fixtures`,
+/// the bundled specs or those of `--fixture-dir`) and every `--scenario`/`--profile` pair
+/// (checked against the known scenarios and the profiles each one declares).
+fn resolve_cases(
+    selection: &Selection,
+    root: &Path,
+    fixtures: &Fixtures,
+) -> Result<Vec<Case>, Box<dyn Error>> {
+    let known_fixtures = fixtures.ids()?;
     for id in &selection.fixtures {
         if !known_fixtures.contains(id) {
             return Err(io::Error::other(format!(
@@ -197,6 +204,7 @@ fn resolve_cases(selection: &Selection, root: &Path) -> Result<Vec<Case>, Box<dy
     Ok(cases)
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
     let mut selection = Selection::default();
     while let Some(argument) = args.next() {
@@ -211,6 +219,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Selection, String> {
                     Some(PathBuf::from(value(&mut args, "--candidate-binary")?));
             }
             "--fixture" => selection.fixtures.push(value(&mut args, "--fixture")?),
+            "--fixture-dir" => {
+                selection.fixture_dir = Some(PathBuf::from(value(&mut args, "--fixture-dir")?));
+            }
             "--scenario" => selection
                 .scenarios
                 .push((value(&mut args, "--scenario")?, None)),

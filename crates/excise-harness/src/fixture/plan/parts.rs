@@ -15,22 +15,27 @@ use crate::fixture::{
     },
 };
 
-use super::{ManifestEntry, VolumePlan};
+use super::{GroupIds, ManifestEntry, VolumePlan};
 
-/// Appends the entries of `part` to `entries` (and its volume, if it is one, to `volumes`).
+/// Appends the entries of `part` to `entries` (and its volume, if it is one, to `volumes`). The
+/// hard-link groups of a part are numbered from `groups`, which the whole plan shares.
 pub(super) fn expand(
     part: &Part,
     seed: u64,
     entries: &mut Vec<ManifestEntry>,
     volumes: &mut Vec<VolumePlan>,
+    groups: &mut GroupIds,
 ) {
     let stream = derive_seed(seed, part.root().as_bytes());
     match part {
         Part::Tree(part) => tree(part, stream, entries),
         Part::Deep(part) => deep(part, stream, entries),
         Part::File(part) => file(part, stream, entries),
-        Part::Identity(part) => identity(part, stream, entries),
+        Part::Identity(part) => identity(part, stream, entries, groups),
         Part::Hostile(part) => hostile(part, stream, entries),
+        Part::Shaped(part) => {
+            super::shaped::expand(part, stream, &top_level(&part.root), entries, groups);
+        }
         Part::Volume(part) => volume(part, entries, volumes),
     }
 }
@@ -116,13 +121,18 @@ fn file(part: &FilePart, stream: u64, entries: &mut Vec<ManifestEntry>) {
     ));
 }
 
-fn identity(part: &IdentityPart, stream: u64, entries: &mut Vec<ManifestEntry>) {
+fn identity(
+    part: &IdentityPart,
+    stream: u64,
+    entries: &mut Vec<ManifestEntry>,
+    groups: &mut GroupIds,
+) {
     let mut sizes = SplitMix64::new(stream);
     let root = top_level(&part.root);
     entries.push(ManifestEntry::directory(root.clone()));
 
     if part.hard_link_groups > 0 {
-        hard_links(part, &root, &mut sizes, entries);
+        hard_links(part, &root, &mut sizes, entries, groups);
     }
 
     if part.dangling_symlinks > 0 {
@@ -220,6 +230,7 @@ fn hard_links(
     root: &RelPath,
     sizes: &mut SplitMix64,
     entries: &mut Vec<ManifestEntry>,
+    groups: &mut GroupIds,
 ) {
     let links = root.join(b"links");
     entries.push(ManifestEntry::directory(links.clone()));
@@ -231,6 +242,7 @@ fn hard_links(
         entries.push(ManifestEntry::directory(directory.clone()));
     }
     for group in 0..u64::from(part.hard_link_groups) {
+        let id = groups.next();
         let size = part.link_file_size.draw(sizes);
         for name in 0..u64::from(part.links_per_group) {
             // Consecutive names of a group land in different directories, so the names of one
@@ -240,8 +252,9 @@ fn hard_links(
                 directory.join(format!("g{group}-n{name}.dat").as_bytes()),
                 size,
             );
-            // A temporary group id; the plan renumbers groups in canonical order.
-            entry.link_group = Some(u32::try_from(group + 1).unwrap_or(u32::MAX));
+            // A temporary group id, which no other group of the plan has; the plan renumbers
+            // groups in canonical order.
+            entry.link_group = Some(id);
             entries.push(entry);
         }
     }

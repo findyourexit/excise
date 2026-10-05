@@ -7,12 +7,13 @@ This file is canonical: `CLAUDE.md` and `.github/copilot-instructions.md` only p
 ## Layout
 
 - `src/`, `tests/`, `benches/`: the `excise` binary, its tests, and its benchmarks. `docs/` is the published documentation, with the `docs/safety/` contracts. `generated/` holds the man page and completions: `cargo generate` rewrites them and `cargo check-generated` verifies them.
-- `crates/excise-harness/`: the internal, unpublished validation harness: `scenarios/`, `fixtures/`, `comparisons/`, the runners, and `schemas/` (never `docs/schemas/`, which release archives ship).
+- `crates/excise-harness/`: the internal, unpublished validation harness: `scenarios/`, `fixtures/`, `comparisons/`, the runners, `schemas/` (never `docs/schemas/`, which release archives ship), and `excise-shape` (`src/bin/`), the binary that profiles a tree's shape as aggregates only and builds fixture specs from a profile.
 - `xtask/`: the `cargo xtask` commands: the harness runners (`e2e`, `headless`, `compare`), the interactive session driver (`tui`), repository checks, and release tooling.
 
 ## Safety rules
 
 - Run `excise` only through the harness, against the fixtures it generates. Never run it against a real path (`~`, a project, a mounted volume).
+- Never run `excise-shape` on a real path either. Profile only the fixtures the harness generates and scratch trees you create. A profile of a real tree is its owner's to make: you may build a spec from a profile you are given (`excise-shape spec`) and run it through `--fixture-dir`, and you never commit a profile or a spec of a real tree.
 - Trigger deletions only through a scenario's `delete` step or `cargo xtask tui delete`. Both press `y` (the scenario step presses Enter instead with `confirm_with = "enter"`) only after the dialog names exactly the expected entry, every declared sentinel still exists, and the fixture root still carries its ownership marker. A scenario that sets `disable_delete_confirmation` has no dialog: the step then checks the selected-item panel, the entry on disk, every sentinel, and the marker, and presses Backspace alone. A scenario with a `delete` step must declare sentinels, and no `delete` step may name the ownership marker or anything inside it. `cargo xtask tui keys` never sends a key that could confirm a deletion dialog.
 - Where the pseudo-terminal cannot tie its screen to a frame exactly (`SCREEN_IS_EXACT` in `crates/excise-harness/src/runner/live.rs`: true on Unix, false on Windows, where `ConPTY` paints the screen on its own timer and can leave a stale dialog on it), the harness confirms no deletion from the screen. The scenario `delete` step, in both modes, and `cargo xtask tui delete` refuse before any key, not even Backspace, and `cargo xtask e2e` skips every scenario that has a `delete` step, and every scenario that presses Backspace itself or composes an escape sequence from its keys (see `key` below), also when you name it. On Windows deletions are therefore tested in-process under `cargo test`, and `tests/harness_scenarios.rs` asserts that the `delete` step refuses before any key.
 - Every fixture root carries the ownership marker, a regular file named `.excise-harness-owned`, and every runner refuses a root without it. Never add the marker to a directory the harness did not generate.
@@ -41,6 +42,7 @@ The harness, through the `cargo xtask` alias:
 cargo xtask e2e --quick            # pseudo-terminal scenarios, quick tier
 cargo xtask e2e --scenario NAME    # one scenario, whatever its tier
 cargo xtask headless --quick       # headless scans, checked against the fixture oracle and timed against `du`
+cargo xtask headless --fixture-dir DIR --fixture ID   # scan a spec from a directory of your own, such as one `excise-shape spec` wrote; `bench-e2e` takes the same option; a spec is opened without following a link, must be a regular file, and is read up to 1 MiB
 cargo xtask bench-e2e --baseline main --fixture ID   # paired A/B evidence against another build
 cargo xtask compare --full         # ratio budgets (motion_complete_ratio, tui_complete_ratio) between two runs of one binary
 cargo xtask counts                 # deterministic counts (entries, scan-store bytes, residue files), each fixture counted twice and required to agree; CI comments their deltas on pull requests that change src/
