@@ -78,6 +78,7 @@ pub(crate) fn prepare(scenario: &Scenario) -> Result<Vec<Prepared>, RunError> {
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn prepare_step(scenario: &Scenario, index: usize, step: &Step) -> Result<Prepared, RunError> {
     let invalid = |reason: String| RunError::InvalidStep {
         index,
@@ -176,6 +177,7 @@ fn prepare_step(scenario: &Scenario, index: usize, step: &Step) -> Result<Prepar
         | Step::Measure(_)
         | Step::Idle(_)
         | Step::Settle(_)
+        | Step::WaitRefresh(_)
         | Step::Quit(_)
         | Step::FsMutate(_) => Ok(Prepared::Nothing),
     }
@@ -263,6 +265,7 @@ pub(crate) fn describe_step(step: &Step) -> String {
         Step::Measure(measure) => format!("measure {} {}", measure.marker, measure.name),
         Step::Idle(idle) => format!("idle after {} ms for {} ms", idle.after_ms, idle.window_ms),
         Step::Settle(_) => "settle".to_owned(),
+        Step::WaitRefresh(_) => "wait_refresh".to_owned(),
         Step::Quit(_) => "quit".to_owned(),
     }
 }

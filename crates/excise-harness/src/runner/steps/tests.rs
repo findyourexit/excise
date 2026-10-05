@@ -410,6 +410,156 @@ fn a_deletion_with_no_dialog_refuses_a_panel_that_never_names_the_entry() {
     );
 }
 
+/// What a program writes when its map has caught up with a deletion: `shown` on the screen, the
+/// `refresh_finished` event with `outcome`, and the frame that carries the text, counting `inputs`.
+fn refreshed(shown: &str, outcome: &str, inputs: u32) -> String {
+    format!(
+        "printf '{shown}'\n\
+         printf '{{\"v\":1,\"kind\":\"refresh_finished\",\"outcome\":\"{outcome}\",\"t_us\":3}}\\n' \
+         >> \"$events\"\nreport {inputs}\n"
+    )
+}
+
+/// A program that starts a deletion with no dialog at Backspace and reports at once that it
+/// removed `removed` entries. `before` is what it writes ahead of the key, and `after` what it
+/// writes 300 ms after the report, when its map catches up with the deletion, if it does.
+fn deletes_then(removed: u64, before: &str, after: &str) -> String {
+    format!(
+        "stty raw -echo\nprintf READY\n{victim}report 0\n{before}\
+         dd bs=1 count=1 > /dev/null 2>&1\nreport 1\n\
+         printf '{{\"v\":1,\"kind\":\"deletion_finished\",\"removed\":{removed},\"failed\":0,\
+         \"t_us\":2}}\\n' >> \"$events\"\nreport 1\n\
+         /bin/sleep 0.3\n{after}/bin/sleep 30\n",
+        victim = panel(&["victim.bin", "◆ COMPLETE · file"]),
+    )
+}
+
+/// A scenario with no confirmation dialog that deletes `victim.bin` and then runs `then`.
+fn delete_victim_then(then: &str) -> Scenario {
+    scenario_with(
+        "sentinels = [\"keep-a.bin\"]\ndisable_delete_confirmation = true\n",
+        &format!(
+            "\n[[steps]]\nstep = \"delete\"\nname = \"victim.bin\"\nkind = \"file\"\n\
+             timeout_ms = 10000\n{then}"
+        ),
+    )
+}
+
+const WAIT_REFRESH_THEN_EXPECT_THE_REFRESHED_MAP: &str = r#"
+[[steps]]
+step = "wait_refresh"
+timeout_ms = 10000
+
+[[steps]]
+step = "expect_screen"
+contains = ["REFRESHED"]
+"#;
+
+fn run_short_window(script: &str, scenario: &Scenario) -> Run {
+    run_scenario(script, scenario, |executor| {
+        executor.frame_window = SHORT_FRAME_WINDOW;
+    })
+}
+
+#[test]
+fn wait_refresh_returns_once_the_map_has_caught_up_with_the_deletion() {
+    let scenario = delete_victim_then(WAIT_REFRESH_THEN_EXPECT_THE_REFRESHED_MAP);
+
+    let run = run_short_window(
+        &deletes_then(1, "", &refreshed("REFRESHED", "published", 1)),
+        &scenario,
+    );
+
+    assert!(run.result.is_ok(), "{:?}", run.result);
+}
+
+/// The control for the test above: the `delete` step returns on the frame after the report, 300 ms
+/// before the map catches up, so the screen a step reads then is the map before the refresh.
+#[test]
+fn without_wait_refresh_the_screen_is_still_the_map_before_the_refresh() {
+    let scenario =
+        delete_victim_then("\n[[steps]]\nstep = \"expect_screen\"\ncontains = [\"REFRESHED\"]\n");
+
+    let run = run_short_window(
+        &deletes_then(1, "", &refreshed("REFRESHED", "published", 1)),
+        &scenario,
+    );
+
+    let Err(Stop::Fail(failure)) = &run.result else {
+        panic!("the refresh had not happened yet: {:?}", run.result);
+    };
+    assert_eq!(failure.cause, FailureCause::Mismatch, "{failure}");
+}
+
+/// A refresh that ended before the deletion started is not the one the deletion owes. A step that
+/// took it for the answer would return at once, and a quit after it would land in the rebuild.
+#[test]
+fn a_refresh_that_ended_before_the_deletion_is_no_answer() {
+    let scenario = delete_victim_then(
+        "\n[[steps]]\nstep = \"wait_refresh\"\ntimeout_ms = 10000\n\n\
+         [[steps]]\nstep = \"expect_screen\"\ncontains = [\"LATE\"]\n",
+    );
+
+    let run = run_short_window(
+        &deletes_then(
+            1,
+            &refreshed("EARLY", "published", 0),
+            &refreshed("LATE", "published", 1),
+        ),
+        &scenario,
+    );
+
+    assert!(run.result.is_ok(), "{:?}", run.result);
+}
+
+#[test]
+fn a_deletion_that_removed_nothing_owes_no_refresh_and_wait_refresh_does_not_wait_for_one() {
+    // The program never reports a refresh, and the step's bound is far longer than the test
+    // takes: only returning at once passes.
+    let scenario = delete_victim_then("\n[[steps]]\nstep = \"wait_refresh\"\ntimeout_ms = 5000\n");
+
+    let started = std::time::Instant::now();
+    let run = run_short_window(&deletes_then(0, "", ""), &scenario);
+
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the step waited for a refresh that nothing owed"
+    );
+}
+
+#[test]
+fn a_refresh_that_fails_fails_the_step_instead_of_passing_on_a_map_that_is_gone() {
+    let scenario = delete_victim_then(WAIT_REFRESH_THEN_EXPECT_THE_REFRESHED_MAP);
+
+    let run = run_short_window(
+        &deletes_then(1, "", &refreshed("REFRESHED", "failed", 1)),
+        &scenario,
+    );
+
+    let Err(Stop::Fail(failure)) = &run.result else {
+        panic!("a failed refresh must fail the step: {:?}", run.result);
+    };
+    assert_eq!(failure.cause, FailureCause::Mismatch, "{failure}");
+    assert!(failure.detail.contains("`failed`"), "{failure}");
+}
+
+#[test]
+fn a_refresh_that_never_ends_fails_the_step_at_its_bound() {
+    let scenario = delete_victim_then("\n[[steps]]\nstep = \"wait_refresh\"\ntimeout_ms = 700\n");
+
+    let run = run_short_window(&deletes_then(1, "", ""), &scenario);
+
+    let Err(Stop::Fail(failure)) = &run.result else {
+        panic!(
+            "a refresh that never ends must fail the step: {:?}",
+            run.result
+        );
+    };
+    assert_eq!(failure.cause, FailureCause::Timeout, "{failure}");
+    assert!(failure.expected.contains("`refresh_finished`"), "{failure}");
+}
+
 /// A program that is ready and then waits: the budget tests need a session to check against, not
 /// a program that does anything.
 const READY_AND_WAIT: &str = r"

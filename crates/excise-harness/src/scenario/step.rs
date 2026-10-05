@@ -44,6 +44,8 @@ pub enum Step {
     Select(Select),
     /// Delete the selected entry through the confirmation dialog.
     Delete(Delete),
+    /// Wait until the map has caught up with the deletions confirmed so far.
+    WaitRefresh(WaitRefresh),
     /// Wait until a fixture-relative path no longer exists.
     WaitFsAbsent(WaitFs),
     /// Wait until a fixture-relative path exists.
@@ -76,7 +78,7 @@ pub enum Step {
 
 impl Step {
     /// Every name accepted in the `step` field, in documentation order.
-    pub const KINDS: [&'static str; 21] = [
+    pub const KINDS: [&'static str; 22] = [
         "wait_text",
         "wait_header",
         "wait_event",
@@ -84,6 +86,7 @@ impl Step {
         "type",
         "select",
         "delete",
+        "wait_refresh",
         "wait_fs_absent",
         "wait_fs_present",
         "fs_mutate",
@@ -111,6 +114,7 @@ impl Step {
             Self::Type(_) => "type",
             Self::Select(_) => "select",
             Self::Delete(_) => "delete",
+            Self::WaitRefresh(_) => "wait_refresh",
             Self::WaitFsAbsent(_) => "wait_fs_absent",
             Self::WaitFsPresent(_) => "wait_fs_present",
             Self::FsMutate(_) => "fs_mutate",
@@ -137,6 +141,7 @@ impl Step {
             Self::WaitEvent(step) => Some(step.timeout_ms),
             Self::Select(step) => Some(step.timeout_ms),
             Self::Delete(step) => Some(step.timeout_ms),
+            Self::WaitRefresh(step) => Some(step.timeout_ms),
             Self::WaitFsAbsent(step) | Self::WaitFsPresent(step) => Some(step.timeout_ms),
             Self::ExpectExit(step) => Some(step.timeout_ms),
             Self::Settle(step) => Some(step.timeout_ms),
@@ -598,6 +603,27 @@ pub struct Idle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settle {
+    /// The bound on the wait.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// Waits until the map on screen has caught up with the deletions the scenario has confirmed.
+///
+/// A deletion that removed entries leaves the map listing them until the program replaces it, with
+/// a rebuild of the whole map or with a map without the entries, and the program treats a quit
+/// while it does so as a cancellation, exit code 130. The step returns once the deletions
+/// confirmed so far have finished and the replacement of the last one that removed anything has
+/// landed, and then once a frame shows it. A deletion that removed nothing owes no refresh, so
+/// after one the step returns at once.
+///
+/// The pseudo-terminal runner reads the program's `refresh_finished` event, and only one that
+/// follows the last such deletion. The in-process runner drains its owner loop with the runtime's
+/// barrier, which does not return while a rebuild or a publication is owed. A scenario needs a
+/// `delete` step before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitRefresh {
     /// The bound on the wait.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,

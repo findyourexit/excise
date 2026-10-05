@@ -33,7 +33,8 @@ pub use step::{
     Comparison, ConfirmKey, Delete, DeleteWait, EntryKind, EventField, EventKind, ExpectBudget,
     ExpectConfig, ExpectExit, ExpectFs, ExpectScreen, FsMutate, Idle, KeyName, KeyNameError,
     Marker, Measure, MutateOp, PressKey, Quit, Region, Residue, Resize, ScanState, Select,
-    SendSignal, Settle, Signal, Step, TypeText, WaitEvent, WaitFs, WaitHeader, WaitText,
+    SendSignal, Settle, Signal, Step, TypeText, WaitEvent, WaitFs, WaitHeader, WaitRefresh,
+    WaitText,
 };
 pub use validate::{Field, StepError, ValidationError, ValidationErrors};
 

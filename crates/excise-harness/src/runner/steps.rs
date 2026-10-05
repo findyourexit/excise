@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    events::Payload,
+    events::{Payload, RefreshOutcome},
     fixture::mutate,
     metrics::live_cpu_ms,
     pty::ui::{
@@ -18,7 +18,7 @@ use crate::{
     scenario::{
         ConfirmKey, DEFAULT_TIMEOUT_MS, Delete, DeleteWait, ExpectBudget, ExpectConfig, ExpectExit,
         ExpectFs, ExpectScreen, FsMutate, Idle, Measure, Quit, Residue, Resize, Select, SendSignal,
-        Settle, Signal, Step, WaitEvent, WaitFs, WaitHeader, WaitText, config_setting,
+        Settle, Signal, Step, WaitEvent, WaitFs, WaitHeader, WaitRefresh, WaitText, config_setting,
     },
 };
 
@@ -53,6 +53,15 @@ impl<T> Waited<T> {
     }
 }
 
+/// Where the map stands after the deletions a `wait_refresh` waits for.
+enum Refresh {
+    /// The map is current. The step waits for a frame after the event at `after`: the end of the
+    /// refresh, or, when no deletion removed anything, the last report of one.
+    Settled { after: usize },
+    /// The program could not show a map after the deletion.
+    Failed,
+}
+
 impl Executor<'_> {
     pub(super) fn dispatch(&mut self, index: usize, step: &Step) -> Result<(), Stop> {
         match step {
@@ -63,6 +72,7 @@ impl Executor<'_> {
             Step::Type(_) => self.type_text(index),
             Step::Select(step) => self.select(index, step),
             Step::Delete(step) => self.delete(index, step),
+            Step::WaitRefresh(step) => self.wait_refresh(index, *step),
             Step::WaitFsAbsent(step) => self.wait_fs(index, step, false),
             Step::WaitFsPresent(step) => self.wait_fs(index, step, true),
             Step::FsMutate(step) => self.fs_mutate(index, step),
@@ -595,6 +605,99 @@ impl Executor<'_> {
                 || self.events_summary(),
             )),
         }
+    }
+
+    /// `wait_refresh`: waits until the map on screen has caught up with the deletions confirmed so
+    /// far, and for the frame that shows it.
+    ///
+    /// A deletion that removed entries leaves the map listing them until the program replaces it,
+    /// and a quit meanwhile cancels the replacement (exit code 130). The step needs every
+    /// confirmed deletion to have reported (`deletion_finished`), and then the program's
+    /// `refresh_finished` after the last report that removed something: a refresh that ended
+    /// before that deletion is no answer, which is why no `wait_event` can name the event. A
+    /// deletion that removed nothing owes none. The step ends as `delete` does, on a frame that
+    /// follows the event it waited for, and the output in flight read after it.
+    fn wait_refresh(&mut self, index: usize, step: WaitRefresh) -> Result<(), Stop> {
+        let confirmed = self.intended_deletions.len();
+        let deadline = Self::deadline(step.timeout_ms);
+        let waited = self.wait_until(deadline, |exec| exec.refresh_after(confirmed))?;
+        let after = match waited {
+            Waited::Ready(Refresh::Settled { after }) => after,
+            Waited::Ready(Refresh::Failed) => {
+                return Err(self.fail(
+                    index,
+                    FailureCause::Mismatch,
+                    "the map to catch up with the deletions confirmed so far",
+                    "the program reported `refresh_finished` with the outcome `failed`: no map \
+                     could be shown after the deletion",
+                ));
+            }
+            other => {
+                return Err(self.unmet(
+                    index,
+                    &other.discard(),
+                    "the map to catch up with the deletions confirmed so far (a \
+                     `refresh_finished` event after the last `deletion_finished` that removed \
+                     entries)",
+                    step.timeout_ms,
+                    || self.events_summary(),
+                ));
+            }
+        };
+        let shown = self.wait_until(deadline, |exec| {
+            exec.events.events()[after + 1..]
+                .iter()
+                .any(|event| matches!(event.payload, Payload::Frame { .. }))
+                .then_some(())
+        })?;
+        match shown {
+            Waited::Ready(()) => self.catch_up(),
+            other => Err(self.unmet(
+                index,
+                &other,
+                "a frame after the refresh finished",
+                step.timeout_ms,
+                || self.events_summary(),
+            )),
+        }
+    }
+
+    /// Where the events say the map stands after the `confirmed` deletions the scenario has
+    /// confirmed, or `None` while a deletion has not reported or its refresh has not ended.
+    fn refresh_after(&self, confirmed: usize) -> Option<Refresh> {
+        let events = self.events.events();
+        let mut reported = 0;
+        let mut last_report = 0;
+        let mut last_removing = None;
+        for (at, event) in events.iter().enumerate() {
+            if let Payload::DeletionFinished { removed, .. } = event.payload {
+                reported += 1;
+                last_report = at;
+                if removed > 0 {
+                    last_removing = Some(at);
+                }
+            }
+        }
+        if reported < confirmed {
+            return None;
+        }
+        let Some(removing) = last_removing else {
+            return Some(Refresh::Settled { after: last_report });
+        };
+        events[removing + 1..]
+            .iter()
+            .enumerate()
+            .find_map(|(offset, event)| match event.payload {
+                Payload::RefreshFinished {
+                    outcome: RefreshOutcome::Published,
+                } => Some(Refresh::Settled {
+                    after: removing + 1 + offset,
+                }),
+                Payload::RefreshFinished {
+                    outcome: RefreshOutcome::Failed,
+                } => Some(Refresh::Failed),
+                _ => None,
+            })
     }
 
     /// Applies a live change to the fixture as the step runs. The fixture generator's mutator

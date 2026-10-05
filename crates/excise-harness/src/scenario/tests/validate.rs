@@ -8,7 +8,8 @@ use crate::scenario::{
     EventKind, Expect, ExpectBudget, ExpectConfig, ExpectExit, ExpectFs, ExpectScreen, Field,
     FsMutate, Idle, MAX_TIMEOUT_MS, Marker, Measure, MutateOp, PathViolation, Profile, Quit,
     Region, Residue, Resize, ScanState, Scenario, Select, Settle, Step, StepError, TypeText,
-    ValidationError, WaitEvent, WaitFs, WaitHeader, WaitText, check_fixture_relative_path,
+    ValidationError, WaitEvent, WaitFs, WaitHeader, WaitRefresh, WaitText,
+    check_fixture_relative_path,
 };
 
 fn wait_text(text: Option<&str>, regex: Option<&str>, region: Option<Region>) -> Step {
@@ -69,6 +70,7 @@ fn waiting_steps(timeout_ms: u64) -> Vec<Step> {
             wait_for: DeleteWait::Finished,
             timeout_ms,
         }),
+        Step::WaitRefresh(WaitRefresh { timeout_ms }),
         Step::WaitFsAbsent(WaitFs {
             path: "victim".to_owned(),
             timeout_ms,
@@ -703,6 +705,20 @@ fn step_paths_must_be_fixture_relative() {
     }
 }
 
+/// The rules broken by `step` alone, placed after a `delete` step: a `wait_refresh` is valid only
+/// after one, and every other step is the same wherever it stands.
+fn errors_after_a_delete(step: Step) -> Vec<StepError> {
+    errors_of(&with_steps(vec![delete_at("stuck.txt"), step]))
+        .into_iter()
+        .map(|error| match error {
+            ValidationError::Step {
+                index: 1, error, ..
+            } => error,
+            other => panic!("expected only errors for the step, found: {other}"),
+        })
+        .collect()
+}
+
 #[test]
 fn every_timeout_must_be_between_one_and_the_cap() {
     let waiting = waiting_steps(DEFAULT_TIMEOUT_MS);
@@ -711,7 +727,7 @@ fn every_timeout_must_be_between_one_and_the_cap() {
             let kind = step.kind();
 
             assert_eq!(
-                step_errors(step),
+                errors_after_a_delete(step),
                 [StepError::TimeoutOutOfRange { timeout_ms: bad }],
                 "{kind} with timeout_ms = {bad}"
             );
@@ -721,7 +737,11 @@ fn every_timeout_must_be_between_one_and_the_cap() {
         for step in waiting_steps(good) {
             let kind = step.kind();
 
-            assert_eq!(step_errors(step), [], "{kind} with timeout_ms = {good}");
+            assert_eq!(
+                errors_after_a_delete(step),
+                [],
+                "{kind} with timeout_ms = {good}"
+            );
         }
     }
     let waiting_kinds: Vec<&str> = waiting.iter().map(Step::kind).collect();
@@ -1244,6 +1264,39 @@ fn a_delete_path_must_be_safe_and_end_in_the_entrys_name() {
     assert!(
         matches!(errors.as_slice(), [StepError::InvalidPath { .. }]),
         "{errors:?}"
+    );
+}
+
+#[test]
+fn a_wait_refresh_needs_a_delete_step_before_it() {
+    let wait_refresh = Step::WaitRefresh(WaitRefresh {
+        timeout_ms: DEFAULT_TIMEOUT_MS,
+    });
+    let refused = |error_index| {
+        [ValidationError::Step {
+            index: error_index,
+            kind: "wait_refresh",
+            error: StepError::RefreshWithoutDelete,
+        }]
+    };
+
+    // Nothing owes a refresh before a deletion, so the step would pass without waiting for
+    // anything.
+    assert_eq!(
+        errors_of(&with_steps(vec![wait_refresh.clone()])),
+        refused(0)
+    );
+    assert_eq!(
+        errors_of(&with_steps(vec![
+            wait_refresh.clone(),
+            delete_at("stuck.txt")
+        ])),
+        refused(0),
+        "a deletion after the step is no deletion for it to wait for"
+    );
+    assert_eq!(
+        errors_of(&with_steps(vec![delete_at("stuck.txt"), wait_refresh])),
+        []
     );
 }
 

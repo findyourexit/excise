@@ -1163,6 +1163,9 @@ where
         if did_work {
             self.start_work_that_waited_for_the_store()?;
         }
+        if let Some(outcome) = self.app.take_landed_refresh() {
+            crate::test_events::refresh_finished(outcome);
+        }
         Ok(did_work)
     }
 

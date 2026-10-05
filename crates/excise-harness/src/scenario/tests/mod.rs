@@ -157,6 +157,10 @@ window_ms = 1
 step = "settle"
 
 [[steps]]
+step = "wait_refresh"
+timeout_ms = 20000
+
+[[steps]]
 step = "quit"
 
 [[steps]]

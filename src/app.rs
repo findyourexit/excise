@@ -288,6 +288,9 @@ where
     /// Publications that ended, for the owner loop to finish its own part of: the loop drains them
     /// with [`App::take_finished_publication`].
     finished_publications: VecDeque<FinishedPublication>,
+    /// A deletion removed entries, and the map on screen still lists them: until the rebuild or
+    /// the overlay that replaces it lands, see [`App::take_landed_refresh`].
+    refresh_owed: bool,
     /// When the primary scan's publication has run long enough to show its progress.
     publication_progress_from: Option<Instant>,
     /// An announcement that waits for the reader to finish what they are deciding. A later one
@@ -474,6 +477,7 @@ where
             generation_rebuild_target: None,
             publications: VecDeque::new(),
             finished_publications: VecDeque::new(),
+            refresh_owed: false,
             publication_progress_from: None,
             waiting_announcement: None,
             provisional_page_waiting: None,
@@ -1155,6 +1159,26 @@ where
     /// The next publication that ended, for the owner loop to finish its own part of.
     pub(crate) fn take_finished_publication(&mut self) -> Option<FinishedPublication> {
         self.finished_publications.pop_front()
+    }
+
+    /// How the refresh that deletions owed ended, once it has: the rebuild or the overlay that
+    /// replaces the map listing what they removed has landed, and no other rebuild or publication
+    /// is owed. `None` while one is, and when no deletion removed anything since the last answer,
+    /// so a refresh is reported once, however many deletions it covers.
+    pub(crate) fn take_landed_refresh(&mut self) -> Option<crate::test_events::RefreshOutcome> {
+        if !self.refresh_owed
+            || self.generation_rebuild_required
+            || self.generation_rebuild_active
+            || self.scan_store_busy()
+        {
+            return None;
+        }
+        self.refresh_owed = false;
+        Some(if self.scan_store_available {
+            crate::test_events::RefreshOutcome::Published
+        } else {
+            crate::test_events::RefreshOutcome::Failed
+        })
     }
 
     /// Applies what the store thread has reported since the last call. Returns whether it
@@ -2740,6 +2764,9 @@ where
 
     pub fn complete_deletion(&mut self, report: DeletionReport) -> bool {
         let deleted = report.deleted_entries() > 0;
+        // The map on screen lists what the deletion removed until the rebuild or the overlay that
+        // reconciles it lands (see `Self::take_landed_refresh`).
+        self.refresh_owed |= deleted;
         self.reconcile_generation_after_deletion(&report);
         self.ui_effects.record_deletion_result(&report);
         let report = Arc::new(report);
@@ -5866,6 +5893,71 @@ mod tests {
         assert_eq!(
             app.scan_store.published_generation(),
             Some(ScanGeneration::from_value(1))
+        );
+    }
+
+    /// What the test event channel reports as the end of a refresh: the map on screen has caught
+    /// up with a deletion. A deletion that took entries out owes one, and it lands, once, when the
+    /// map without them is published; one that removed nothing owes none.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_deletion_owes_a_refresh_until_the_map_without_its_target_is_published() {
+        let (_root, mut app, removal) = app_and_target_removal_report();
+        assert_eq!(app.take_landed_refresh(), None, "nothing was removed yet");
+
+        assert!(app.complete_deletion(removal));
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "the map on screen still lists the target"
+        );
+        assert!(app.process_scan_store_events());
+
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "a landed refresh is reported once"
+        );
+        assert!(!app.complete_deletion(report(0)));
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "a deletion that removed nothing owes no refresh"
+        );
+    }
+
+    /// A removal the map cannot be updated for is followed by a rebuild, and the refresh lands
+    /// when that rebuild has ended: not while it runs, and not when the reader cancels it, which
+    /// leaves the stale map and the rebuild owed.
+    #[test]
+    fn a_refresh_that_needs_a_rebuild_lands_when_the_rebuild_publishes_and_not_when_it_is_cancelled()
+     {
+        let (_root, mut app) = app_rebuilding_a_published_map();
+        app.refresh_owed = true;
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "the rebuild is still running"
+        );
+        finish_rebuild(&mut app).expect("the rebuild should settle");
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+
+        let (_root, mut app) = app_rebuilding_a_published_map();
+        app.refresh_owed = true;
+        app.suppress_generation_rebuild_restart();
+        app.cancel_generation_rebuild()
+            .expect("the cancelled rebuild should settle");
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "the stale map stays, and the rebuild is still owed"
         );
     }
 
