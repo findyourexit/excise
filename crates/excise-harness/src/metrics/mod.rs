@@ -417,7 +417,11 @@ mod tests {
         Event {
             t_us: at_ms * 1000,
             observed: start + Duration::from_millis(at_ms),
-            payload: Payload::Frame { seq, inputs },
+            payload: Payload::Frame {
+                seq,
+                inputs,
+                barriers: 0,
+            },
         }
     }
 

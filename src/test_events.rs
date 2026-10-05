@@ -30,13 +30,94 @@
 //!
 //! | `kind` | Fields | Emitted |
 //! |---|---|---|
-//! | `hello` | `version`, `pid` | First line. `version` is the package version. |
-//! | `frame` | `seq`, `inputs` | After every render that drew. `seq` counts drawn frames from 1; `inputs` counts terminal input events the owner loop has consumed so far. |
+//! | `hello` | `version`, `pid`, `frame_marks`, `input_barrier` | First line. `version` is the package version. `frame_marks` is `true`: an interactive run of this binary follows every `frame` event with a frame mark in the terminal output (see "Frame marks"). `input_barrier` is `true`: this binary answers input barrier requests (see "Input barrier"). Binaries from before the marks omit `frame_marks`, and binaries from before the barrier omit `input_barrier`. |
+//! | `frame` | `seq`, `inputs`, `barriers` | After every render that drew, once the frame is queued for the terminal writer thread, which can still hold its bytes back (see "Frame marks"). `seq` counts drawn frames from 1; `inputs` counts terminal input events the owner loop has consumed so far; `barriers` counts the input barrier requests it has consumed so far, which are not inputs (see "Input barrier"). Binaries from before the barrier omit `barriers`. |
 //! | `scan_complete` | `entries` | The initial scan finished and the map switched to its completed state. `entries` counts the scanned entries. |
 //! | `quit_prompt` | | The quit dialog was built. |
 //! | `deletion_finished` | `removed`, `failed` | A deletion worker reported. The counts come from its report. |
 //! | `refresh_finished` | `outcome` | The map on screen has caught up with the deletions that removed entries: the map without them was published (`published`), or no map could be shown (`failed`), and no rebuild or publication is owed. Always after the `deletion_finished` it answers, and once for deletions whose refreshes overlapped. A deletion that removed nothing owes no refresh and emits none. |
 //! | `exit` | `code` | An interactive run is about to return its exit code. The terminal, if it was entered, has already been restored, unless it never absorbed the restoration output within a bounded wait. A process that panics or is killed emits none. |
+//!
+//! # Frame marks
+//!
+//! A `frame` event says that a frame was *queued* for the terminal writer thread, not that its
+//! bytes reached the terminal. That thread writes as slowly as the terminal reads, so the
+//! screen can lag the event by any amount, and a reader that must know which frame the screen
+//! shows cannot take it from the event. While the channel is open, the owner loop therefore
+//! queues a mark behind every frame it draws, through the same writer as the frame:
+//!
+//! ```text
+//! ESC ] 9471 ; excise-frame=<seq> BEL      that is "\x1b]9471;excise-frame=<seq>\x07"
+//! ```
+//!
+//! `<seq>` is the decimal `seq` of the `frame` event the mark follows. The writer never
+//! reorders or drops what it is handed, so the mark reaches the terminal after every byte of
+//! its frame and before every byte of a later frame and of the restoration sequence: a reader
+//! that has read up to a mark has read exactly the frames up to that `seq`.
+//!
+//! - **One mark per event.** `frame` returns the `seq` only when it wrote the event and the
+//!   channel is still open afterwards. A frame whose event was not written, because the channel
+//!   had already disabled itself or this very write failed, gets no mark either.
+//! - **Only with the variable.** Without `EXCISE_TEST_EVENTS`, `frame` returns `None`: nothing
+//!   is written to the terminal and nothing is allocated for it.
+//! - **Only for an interactive run.** An interactive run has a terminal writer. A headless run
+//!   draws no frames and writes no marks, and a run in process (a test or a benchmark) reports
+//!   its `frame` events and has no terminal to mark.
+//! - **`hello.frame_marks`.** It tells a reader that this binary writes marks. A binary from
+//!   before them omits it, and a reader of one must fall back to reading until the output is
+//!   quiet.
+//!
+//! # Input barrier
+//!
+//! A reader that writes keys to the terminal must know when the program has read them and drawn
+//! what they did. It cannot take that from `inputs`: a terminal write is not one decoded input
+//! event. crossterm decodes `ESC DEL` as Alt+Backspace when both bytes arrive in one read and as
+//! Esc and then Backspace when they do not, and `ESC ESC [ A` as Esc, `[`, and `A`, so the number
+//! of writes and `inputs` need not agree, and counting one against the other proves nothing about
+//! what the program has read. The program reads its input in order, and a *barrier request* uses
+//! that:
+//!
+//! ```text
+//! 0x1D      Ctrl+], one byte, written to the program's terminal input
+//! ```
+//!
+//! crossterm's Unix input parser decodes the byte as the key `5` with the Control modifier, and,
+//! when an unread lone `ESC` byte immediately precedes it, as the same key with Alt added: the
+//! parser merges `ESC` and the byte after it into one Alt key. Both are requests. Every other
+//! modifier combination is not one, and neither is an event that is not a key press. That is the
+//! decoding of a terminal whose input crossterm's Unix parser reads; the Windows console builds
+//! its key events from console input records instead, and this was not checked there. The owner
+//! loop handles a request right after it reads it, before anything else is done with the event:
+//!
+//! - **Not an input.** A request is not counted in `inputs`, no key binding sees it, and it does
+//!   not re-arm the selected tile's sheen. An `ESC` that merged into it is neither counted nor
+//!   handled as the Esc key.
+//! - **Counted.** The request counts one in `barriers`.
+//! - **Drawn.** The interface is marked for a redraw and the batch of inputs ends, so the next
+//!   frame is drawn for certain, and not skipped behind a frame that the terminal is still
+//!   draining.
+//! - **Answered.** The `frame` event of that frame carries `barriers`: the number of requests
+//!   consumed before the frame was drawn. Requests count from 1 in the order the program read
+//!   them, and the first `frame` whose `barriers` is at least a request's number answers it.
+//!
+//! The frame is drawn after the request was consumed, and the program reads its input in order,
+//! so the answering frame shows every input that was read before the request: an answered request
+//! proves that everything written before it was read and drawn, whatever the number of input
+//! events the writes made. The frame's mark (see "Frame marks") says when the screen shows it. A
+//! request does not wait for background work that an input started, such as a deletion or a
+//! rescan.
+//!
+//! - **A key boundary.** A request is recognized only after whole keys. A byte inside an
+//!   unfinished escape sequence belongs to that sequence, so a request written there is not
+//!   recognized. A request right behind an `ESC` that is still unread is read with it as one key,
+//!   so a reader that wants the Esc key read as one waits for a frame that counts it before it
+//!   writes a request.
+//! - **Only with the variable.** Without `EXCISE_TEST_EVENTS`, `barrier_request` returns `false`
+//!   at the one `SINK.get()` branch that every emission site has: no counter exists, nothing is
+//!   drawn for the byte, and it reaches the key handler as Ctrl+5, which nothing is bound to.
+//! - **`hello.input_barrier`.** It tells a reader that this binary answers requests. A binary
+//!   from before it omits the field and writes no `barriers`, and a request written to it is never
+//!   answered. Both fields are additive, so the protocol version stays 1.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -45,6 +126,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
+use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEventKind, KeyModifiers};
 use serde::Serialize;
 
 use crate::error::AppError;
@@ -87,12 +169,46 @@ pub(crate) fn input_consumed() {
     }
 }
 
-/// Reports that a render drew a frame.
+/// Counts one input barrier request, and returns `true`, when the channel is open and `event` is
+/// one (see "Input barrier" in the module documentation). The owner loop asks it of every
+/// terminal event it reads, before it counts the event as an input, and handles a `true` as a
+/// request instead of a key. Without the channel it returns `false` after the one `SINK.get()`
+/// branch: nothing is counted, and the event is an ordinary key.
 #[inline]
-pub(crate) fn frame() {
-    if let Some(sink) = SINK.get() {
-        sink.frame();
-    }
+pub(crate) fn barrier_request(event: &TerminalEvent) -> bool {
+    SINK.get().is_some_and(|sink| sink.barrier_request(event))
+}
+
+/// Whether `event` is an input barrier request: the key press Ctrl+5, which is what crossterm
+/// decodes the byte `0x1D` to, or Ctrl+Alt+5, which is what it decodes that byte to right behind
+/// an unread lone `ESC`. Any other modifier combination, any other key, any key event that is not
+/// a press, and any event that is not a key is not a request.
+fn is_barrier_request(event: &TerminalEvent) -> bool {
+    let TerminalEvent::Key(key) = event else {
+        return false;
+    };
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('5')
+        && (key.modifiers == KeyModifiers::CONTROL
+            || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT))
+}
+
+/// Reports that a render drew a frame. Returns the `seq` of the `frame` event it wrote, or
+/// `None` when no event was written: the channel is not open, or it ended with a write error,
+/// this frame's own write included.
+///
+/// The caller marks the frame in the terminal output with [`frame_mark`] when, and only when,
+/// it gets a `seq`, so the marks are exactly the `frame` events (see "Frame marks" in the
+/// module documentation).
+#[inline]
+pub(crate) fn frame() -> Option<u64> {
+    SINK.get().and_then(Sink::frame)
+}
+
+/// The bytes that mark frame `seq` in the terminal output: ESC `]` `9471` `;` `excise-frame=`,
+/// the decimal `seq`, and BEL.
+pub(crate) fn frame_mark(seq: u64) -> Vec<u8> {
+    format!("\x1b]9471;excise-frame={seq}\x07").into_bytes()
 }
 
 /// Reports that the initial scan finished after `entries` scanned entries.
@@ -180,13 +296,31 @@ fn config_error(message: &str) -> AppError {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Event {
-    Hello { version: &'static str, pid: u32 },
-    Frame { seq: u64, inputs: u64 },
-    ScanComplete { entries: u64 },
+    Hello {
+        version: &'static str,
+        pid: u32,
+        frame_marks: bool,
+        input_barrier: bool,
+    },
+    Frame {
+        seq: u64,
+        inputs: u64,
+        barriers: u64,
+    },
+    ScanComplete {
+        entries: u64,
+    },
     QuitPrompt,
-    DeletionFinished { removed: u64, failed: u64 },
-    RefreshFinished { outcome: RefreshOutcome },
-    Exit { code: i32 },
+    DeletionFinished {
+        removed: u64,
+        failed: u64,
+    },
+    RefreshFinished {
+        outcome: RefreshOutcome,
+    },
+    Exit {
+        code: i32,
+    },
 }
 
 /// One serialized line: the version, the event, then its timestamp.
@@ -219,6 +353,8 @@ struct Sink<W> {
     started: Instant,
     /// Terminal input events the owner loop has consumed.
     inputs: AtomicU64,
+    /// Barrier requests the owner loop has consumed. A request is not an input.
+    barriers: AtomicU64,
     state: Mutex<State<W>>,
 }
 
@@ -248,6 +384,7 @@ impl<W: Write> Sink<W> {
         let sink = Self {
             started: Instant::now(),
             inputs: AtomicU64::new(0),
+            barriers: AtomicU64::new(0),
             state: Mutex::new(State {
                 writer: Some(writer),
                 frames: 0,
@@ -257,6 +394,8 @@ impl<W: Write> Sink<W> {
         let hello = Event::Hello {
             version: env!("CARGO_PKG_VERSION"),
             pid: std::process::id(),
+            frame_marks: true,
+            input_barrier: true,
         };
         sink.lock().write(sink.elapsed_micros(), &hello)?;
         Ok(sink)
@@ -274,15 +413,33 @@ impl<W: Write> Sink<W> {
         self.inputs.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn frame(&self) {
+    /// Counts `event` when it is a barrier request, and returns whether it was one.
+    fn barrier_request(&self, event: &TerminalEvent) -> bool {
+        let request = is_barrier_request(event);
+        if request {
+            self.barriers.fetch_add(1, Ordering::Relaxed);
+        }
+        request
+    }
+
+    /// Writes the `frame` event for the frame just queued and returns its `seq`, or `None` once
+    /// the channel has disabled itself, this very write failing included: a frame whose event
+    /// was not written gets no mark, so the marks are exactly the events.
+    fn frame(&self) -> Option<u64> {
         let inputs = self.inputs.load(Ordering::Relaxed);
+        let barriers = self.barriers.load(Ordering::Relaxed);
         let mut state = self.lock();
         state.frames += 1;
-        let event = Event::Frame {
-            seq: state.frames,
-            inputs,
-        };
-        self.emit_locked(&mut state, &event);
+        let seq = state.frames;
+        self.emit_locked(
+            &mut state,
+            &Event::Frame {
+                seq,
+                inputs,
+                barriers,
+            },
+        );
+        state.writer.is_some().then_some(seq)
     }
 
     fn emit(&self, event: &Event) {
@@ -301,6 +458,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
+    use crossterm::event::KeyEvent;
     use serde_json::Value;
 
     use super::*;
@@ -362,6 +520,24 @@ mod tests {
         String::from_utf8(line).expect("a line should be UTF-8")
     }
 
+    /// A key press, as crossterm decodes the bytes a terminal sends.
+    fn key_press(code: KeyCode, modifiers: KeyModifiers) -> TerminalEvent {
+        TerminalEvent::Key(KeyEvent::new(code, modifiers))
+    }
+
+    /// What crossterm decodes the byte `0x1D` to.
+    fn ctrl_5() -> TerminalEvent {
+        key_press(KeyCode::Char('5'), KeyModifiers::CONTROL)
+    }
+
+    /// What crossterm decodes the byte `0x1D` to right behind an unread lone `ESC`.
+    fn ctrl_alt_5() -> TerminalEvent {
+        key_press(
+            KeyCode::Char('5'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        )
+    }
+
     #[test]
     fn every_kind_encodes_to_its_documented_line() {
         let cases = [
@@ -369,12 +545,18 @@ mod tests {
                 Event::Hello {
                     version: "1.2.3",
                     pid: 4242,
+                    frame_marks: true,
+                    input_barrier: true,
                 },
-                r#"{"v":1,"kind":"hello","version":"1.2.3","pid":4242,"t_us":7}"#,
+                r#"{"v":1,"kind":"hello","version":"1.2.3","pid":4242,"frame_marks":true,"input_barrier":true,"t_us":7}"#,
             ),
             (
-                Event::Frame { seq: 3, inputs: 2 },
-                r#"{"v":1,"kind":"frame","seq":3,"inputs":2,"t_us":7}"#,
+                Event::Frame {
+                    seq: 3,
+                    inputs: 2,
+                    barriers: 1,
+                },
+                r#"{"v":1,"kind":"frame","seq":3,"inputs":2,"barriers":1,"t_us":7}"#,
             ),
             (
                 Event::ScanComplete { entries: 12 },
@@ -446,9 +628,12 @@ mod tests {
         assert_eq!(kinds, ["hello", "frame", "frame", "scan_complete", "exit"]);
         assert_eq!(events[0]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(events[0]["pid"], std::process::id());
+        assert_eq!(events[0]["frame_marks"], true);
+        assert_eq!(events[0]["input_barrier"], true);
         assert_eq!(events[1]["seq"], 1);
         assert_eq!(events[2]["seq"], 2);
         assert_eq!(events[1]["inputs"], 2);
+        assert_eq!(events[1]["barriers"], 0);
         assert_eq!(events[3]["entries"], 9);
         assert_eq!(events[4]["code"], 0);
         let times: Vec<u64> = events
@@ -480,6 +665,87 @@ mod tests {
     }
 
     #[test]
+    fn frames_report_the_barrier_requests_consumed_before_them() {
+        let recorder = Recorder::new(usize::MAX);
+        let sink = Sink::start(recorder.clone()).expect("the first line should be written");
+        let plain_5 = key_press(KeyCode::Char('5'), KeyModifiers::NONE);
+        let resize = TerminalEvent::Resize(80, 24);
+        sink.input_consumed();
+        assert!(!sink.barrier_request(&plain_5), "a plain 5 is a key");
+        sink.frame();
+        assert!(sink.barrier_request(&ctrl_5()));
+        sink.frame();
+        assert!(sink.barrier_request(&ctrl_5()));
+        assert!(sink.barrier_request(&ctrl_alt_5()));
+        assert!(!sink.barrier_request(&resize), "a resize is not a request");
+        sink.frame();
+        sink.input_consumed();
+        sink.frame();
+
+        let frames: Vec<Value> = recorder
+            .writes()
+            .iter()
+            .map(|write| parse(write))
+            .filter(|event| event["kind"] == "frame")
+            .collect();
+        let counts = |field: &str| -> Vec<u64> {
+            frames
+                .iter()
+                .map(|frame| frame[field].as_u64().expect("a frame reports its counters"))
+                .collect()
+        };
+        assert_eq!(counts("barriers"), [0, 1, 3, 3]);
+        assert_eq!(counts("inputs"), [1, 1, 1, 2], "a request is not an input");
+    }
+
+    #[test]
+    fn only_ctrl_and_ctrl_alt_make_a_five_a_barrier_request() {
+        let requests = [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ];
+        for bits in 0..=u8::MAX {
+            let modifiers = KeyModifiers::from_bits_truncate(bits);
+            let event = key_press(KeyCode::Char('5'), modifiers);
+            assert_eq!(
+                is_barrier_request(&event),
+                requests.contains(&modifiers),
+                "{modifiers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_other_key_and_no_other_event_is_a_barrier_request() {
+        let ctrl = KeyModifiers::CONTROL;
+        let release = KeyEvent::new_with_kind(KeyCode::Char('5'), ctrl, KeyEventKind::Release);
+        let repeat = KeyEvent::new_with_kind(KeyCode::Char('5'), ctrl, KeyEventKind::Repeat);
+        let others = [
+            key_press(KeyCode::Char('c'), ctrl),
+            key_press(KeyCode::Char('4'), ctrl),
+            key_press(KeyCode::Char('6'), ctrl),
+            key_press(KeyCode::Char(']'), ctrl),
+            key_press(KeyCode::Enter, ctrl),
+            TerminalEvent::Key(release),
+            TerminalEvent::Key(repeat),
+            TerminalEvent::Resize(80, 24),
+            TerminalEvent::FocusGained,
+        ];
+        for event in others {
+            assert!(!is_barrier_request(&event), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn a_request_is_not_recognized_while_the_channel_is_closed() {
+        // Only `init_from_env` opens the process-wide sink, and no unit test sets the variable it
+        // reads, so the sink is closed here, as it is when `EXCISE_TEST_EVENTS` is unset.
+        assert!(SINK.get().is_none());
+        assert!(!barrier_request(&ctrl_5()));
+        assert!(!barrier_request(&ctrl_alt_5()));
+    }
+
+    #[test]
     fn a_write_error_ends_the_channel_without_further_attempts() {
         // The hello line and the first frame succeed; the next write fails.
         let recorder = Recorder::new(2);
@@ -494,6 +760,59 @@ mod tests {
             recorder.attempts.load(Ordering::Relaxed),
             3,
             "the disabled channel must not touch the writer again"
+        );
+    }
+
+    #[test]
+    fn a_frame_returns_the_seq_of_the_event_it_wrote() {
+        let recorder = Recorder::new(usize::MAX);
+        let sink = Sink::start(recorder.clone()).expect("the first line should be written");
+
+        assert_eq!(sink.frame(), Some(1));
+        sink.emit(&Event::ScanComplete { entries: 9 });
+        assert_eq!(sink.frame(), Some(2), "only frames are numbered");
+
+        let written: Vec<u64> = recorder
+            .writes()
+            .iter()
+            .map(|write| parse(write))
+            .filter(|event| event["kind"] == "frame")
+            .map(|event| event["seq"].as_u64().expect("a frame reports its seq"))
+            .collect();
+        assert_eq!(written, [1, 2], "the seq returned is the seq written");
+    }
+
+    #[test]
+    fn a_frame_whose_event_was_not_written_returns_no_seq() {
+        // The hello line and two frames succeed; every later write fails.
+        let recorder = Recorder::new(3);
+        let sink = Sink::start(recorder.clone()).expect("the first line should be written");
+
+        assert_eq!(sink.frame(), Some(1));
+        assert_eq!(sink.frame(), Some(2));
+        assert_eq!(
+            sink.frame(),
+            None,
+            "the write that failed wrote no event, so the frame gets no mark"
+        );
+        assert_eq!(sink.frame(), None, "a channel that ended marks nothing");
+
+        let frame_events = recorder
+            .writes()
+            .iter()
+            .map(|write| parse(write))
+            .filter(|event| event["kind"] == "frame")
+            .count();
+        assert_eq!(frame_events, 2, "one mark for each event that was written");
+    }
+
+    #[test]
+    fn a_frame_mark_is_the_documented_sequence() {
+        assert_eq!(frame_mark(1), b"\x1b]9471;excise-frame=1\x07");
+        assert_eq!(frame_mark(12_345), b"\x1b]9471;excise-frame=12345\x07");
+        assert_eq!(
+            frame_mark(u64::MAX),
+            b"\x1b]9471;excise-frame=18446744073709551615\x07"
         );
     }
 
