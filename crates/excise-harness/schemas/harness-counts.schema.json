@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/harness/schemas/harness-counts-v1.json",
+  "title": "Excise harness counts v1",
+  "description": "The deterministic counts of one build of excise: numbers that, for a given binary and fixture, do not depend on timing or load. Internal test tooling, not a supported product interface. A pull request's counts arrive as an artifact, which is untrusted input, so every reader holds a document to this schema, and to the limits in it, before it uses a field.",
+  "type": "object",
+  "required": ["document_kind", "schema_version", "context", "cases"],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "harness-counts" },
+    "schema_version": { "const": 1 },
+    "context": { "$ref": "#/$defs/context" },
+    "cases": {
+      "description": "One entry per fixture and profile, in the order they were counted. A fixture and profile appear at most once, which this schema cannot say and the readers check.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/case" }
+    }
+  },
+  "$defs": {
+    "count": {
+      "description": "A non-negative whole number that every JSON consumer reads back exactly (at most 2^53 - 1).",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "sha": {
+      "description": "A full, lowercase hexadecimal git commit.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "timestamp": {
+      "description": "An RFC 3339 date-time.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "profile": {
+      "enum": [
+        "default",
+        "deterministic",
+        "reduced-motion",
+        "monochrome-ascii",
+        "narrow",
+        "mouse-keymaps"
+      ]
+    },
+    "printable": {
+      "description": "One line of printable ASCII, at most 120 characters. Free text from an artifact is untrusted, so what a reader may meet in it is bounded by this pattern.",
+      "type": "string",
+      "pattern": "^[ -~]{1,120}$"
+    },
+    "fixture": {
+      "type": "object",
+      "required": ["id", "hash", "seed"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "hash": {
+          "description": "The hash of the fixture manifest. Counts are comparable only between documents whose hash for the case is equal.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{16,128}$"
+        },
+        "seed": { "$ref": "#/$defs/unsigned" }
+      }
+    },
+    "case": {
+      "type": "object",
+      "required": ["fixture", "profile", "metrics"],
+      "additionalProperties": false,
+      "properties": {
+        "fixture": { "$ref": "#/$defs/fixture" },
+        "profile": { "$ref": "#/$defs/profile" },
+        "metrics": {
+          "description": "The counts, by metric name. A deliberately open vocabulary: a build that counts one more thing adds a name and keeps version 1, and a reader shows a name it does not know as a plain count.",
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 32,
+          "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,47}$" },
+          "additionalProperties": { "$ref": "#/$defs/count" }
+        }
+      }
+    },
+    "runner": {
+      "type": "object",
+      "required": ["os", "os_version", "arch"],
+      "additionalProperties": false,
+      "properties": {
+        "os": {
+          "description": "The operating system as std::env::consts::OS spells it, for example linux. It names the directory of the history branch that holds the record.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]{0,15}$"
+        },
+        "os_version": {
+          "description": "The operating system and its version, for example Ubuntu 24.04.3 LTS.",
+          "$ref": "#/$defs/printable"
+        },
+        "arch": {
+          "description": "The CPU architecture as std::env::consts::ARCH spells it, for example x86_64.",
+          "type": "string",
+          "pattern": "^[a-z0-9_]{1,16}$"
+        }
+      }
+    },
+    "pull_request": {
+      "type": "object",
+      "required": ["number", "base_sha", "head_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "base_sha": {
+          "description": "The commit the pull request was based on when the counts were taken. A comment compares with the record of this commit, or of its nearest ancestor that has one.",
+          "$ref": "#/$defs/sha"
+        },
+        "head_sha": {
+          "description": "The tip of the pull request's branch. The counts are of the merge of this tip into the base, which context.git_sha names.",
+          "$ref": "#/$defs/sha"
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "required": ["git_sha", "committed_at", "runner", "toolchain"],
+      "additionalProperties": false,
+      "properties": {
+        "git_sha": {
+          "description": "The commit that was built and counted.",
+          "$ref": "#/$defs/sha"
+        },
+        "committed_at": {
+          "description": "When that commit was committed: a property of the commit, so that two counts of one commit write the same document.",
+          "$ref": "#/$defs/timestamp"
+        },
+        "runner": { "$ref": "#/$defs/runner" },
+        "toolchain": {
+          "description": "The first line of rustc --version for the toolchain that built the binary.",
+          "$ref": "#/$defs/printable"
+        },
+        "pull_request": {
+          "description": "The pull request the counts were taken for. Absent in a record of a commit on main.",
+          "$ref": "#/$defs/pull_request"
+        }
+      }
+    }
+  }
+}

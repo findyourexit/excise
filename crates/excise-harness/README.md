@@ -15,6 +15,8 @@ This crate defines the vocabulary the harness shares:
   semantic validation.
 - [`report`](src/report): the versioned machine-output documents, with JSON Schemas in
   [`schemas/`](schemas).
+- [`counts`](src/counts): the deterministic counts of a build, their history on the `bench-data`
+  branch, and the pull-request comment of count deltas.
 
 Runners (in-process, pseudo-terminal, headless) and the `xtask` commands build on this vocabulary
 and on the [fixture generator](#fixtures), which creates and checks the trees they run against.
@@ -952,6 +954,117 @@ interval, and its verdict.
 cargo xtask bench-e2e --baseline main --fixture wide-1k --pairs 5
 ```
 
+## Counts
+
+```console
+cargo xtask counts [--out FILE] [--repeat N] [--fixture ID]... [--timeout SECONDS] [--pull-request NUMBER --base-sha SHA --head-sha SHA]
+cargo xtask counts-record --record FILE --remote URL [--branch NAME] [--attempts N]
+cargo xtask counts-comment --artifact FILE --expect-head-sha SHA --out DIR [--history DIR] [--repo DIR]
+```
+
+`excise_harness::counts` counts what a build of `excise` costs without timing anything: numbers
+that, for a given binary and fixture, do not depend on timing or load. Timing is only evidence
+from the paired [A/B benchmark](#paired-ab-benchmark); these are the costs two commits compare on
+exactly, so a difference is always real.
+
+**What is counted.** `wide-1k`, `node-modules-2k`, `identity-small`, and `tiny-files-50k`, in that
+order (`--fixture` names others, at most 16), each under the `deterministic` profile, so that no
+count depends on how many processors the machine has. Each is scanned headless and then, on Linux
+and macOS, run in a pseudo-terminal until its scan completes, which checks that scan and counts
+what it leaves behind.
+
+| Count | Taken from | Why it does not depend on timing |
+|---|---|---|
+| `entries` | The headless report's `summary.scanned_entries`. | A function of the tree and the accounting; it moves only when one of them does, so a change is flagged as unexpected. |
+| `scan_store_bytes` | The headless report's `summary.scan_store_bytes`: the quota's bytes in use once the scan is published. | The published store is a function of the scanned records and the program reports it, so no sampler races a writer. Identical under one scan thread and several, on a machine at a load average of 40, and at two fixture paths of different length. |
+| `residue_files` | The scratch areas of both runs after a normal exit. | Zero unless the program leaks. |
+
+**The interactive scan has to be the one that was counted.** `scan_complete` also follows a scan
+that recoverable failures left inexact, and it carries only an entry count. So the run fails unless
+the entries it reports are those of the headless scan of the same fixture (which was required to
+end exact) and the header badge reads `COMPLETE` once the frame that shows how the scan ended has
+been drawn. The whole session, quitting included, ends by `--timeout` counted from the start that
+the session recorded before it launched the program, not by an allowance of its own, and an event
+or an exit that the harness first sees after that moment is not accepted.
+
+**Determinism is checked, not assumed.** Every fixture is counted `--repeat` times (twice by
+default). The run fails, naming the fixture, the count, and every value it took, if any count
+differs between the runs or one run lacks it. Left out on purpose: the peaks of descriptors,
+threads, and scan-store bytes *during* a scan, which the scenario runner samples every 50 ms and
+which gave 19, 22, and 24 descriptors, 8 or 10 threads, and two store peaks (1,556,638 and
+1,410,393 bytes) for one scan on one machine; the size of the JSON report, because every entry
+repeats the root path (965,680 and 1,008,860 bytes for one fixture at two paths 19 characters
+apart); and wall time, CPU, latency, and memory peaks, which are for A/B.
+
+**Left out: the descriptors and threads of the idle program.** An earlier version also took the
+descriptors and threads (`idle_fds`, `idle_threads`) that the program holds once its scan is
+complete. Nothing outside the program says that it has finished what follows its scan, and no
+window of silence proves it: a worker that is blocked, or not scheduled, for longer than the
+window yields a value that is too early, and two runs agree on it, which is the one thing the check
+above cannot see. They can return when the program says so itself: an `idle` event on the test
+event channel, written after the work that follows its scan is done, would be the barrier.
+
+**The document** is `harness-counts` (see [Output documents](#output-documents)): the commit and
+its commit time, the runner (`os`, `os_version`, `arch`), the toolchain, a pull request's number,
+base commit, and head commit when it is one, and per case the fixture's id, manifest hash, and
+seed, the profile, and an open map of counts. It holds no time of the run, so counting one commit
+twice writes the same bytes. It is written by `cargo xtask counts` to
+`target/excise-counts/counts.json` (`--out` names another file).
+
+**History.** `counts-record` appends a record to the orphan `bench-data` branch:
+`records/<os>/<first two hex digits of the commit>/<commit>.json`, one file per commit. A file per
+commit, rather than a JSON Lines file per operating system, because a comment finds a base
+commit's record by name without reading an ever-growing file, two writers never edit one file (a
+push that loses a race is retried on the new tip, never merged), every record is exactly one
+document held to the same schema as an artifact, and a record is never edited: a commit that has
+one is left alone. The first commit of the branch adds a README and nothing after it changes
+anything but by adding one record. A push that is rejected is retried, up to `--attempts` (five)
+times in all.
+
+**Comparison.** `counts-comment` compares a pull request's document with the record of its base
+commit, or of the nearest ancestor on the first-parent chain that has one (the base commit itself
+and up to 200 commits before it; the comment says which and how far). Records are per operating
+system, and a comparison only ever uses one taken on the same system: the same fixture does not
+count the same everywhere (`identity-small` counted 23 entries and 14,783 scan-store bytes on a
+hosted Linux runner and 27 and 16,441 on macOS). A cost that moves by more than 5% of its base value
+is flagged (the arithmetic is on whole numbers, so exactly 5% is not flagged); any change in a
+fixture's `entries` is flagged as unexpected; a fixture whose hash differs is not compared. A
+record that exists and cannot be used is passed over and named on stderr. The comment is at most
+60,000 bytes (GitHub refuses 65,536): the rows and notes that do not fit are left out, and it says
+how many.
+
+**Untrusted input.** A pull request's counts are an artifact that its own workflow run uploaded,
+and a fork controls that workflow. Before the artifact is downloaded, and as the last step before
+it, `.github/scripts/check-count-artifact.sh` lists the run's artifacts and refuses anything but
+exactly one, named `pr-counts`, of at most 64 KiB compressed (the download unpacks all of an
+artifact, and its size is the author's choice). `counts::artifact::read_untrusted` is the only way
+one is read: a regular file, never a link, of at most 64 KiB, that is UTF-8 and JSON and passes the
+schema and the rules the schema cannot say (a fixture appears once per profile; no count exceeds
+2^53 - 1). It is read by a step that has no token in its environment, and the history it compares
+with is a working copy of `origin/bench-data` that the workflow's checkout already holds
+(`--history`), so the one step that parses what the pull request made could not use one. Every
+error it returns is one line of printable ASCII, so text from a document can neither forge a
+workflow command nor fill a log. The comment shows text from a document only inside code spans (a
+`<` becomes `?`, a backtick `'`, a pipe is escaped), so it cannot link, mention, embed, or add a
+second marker; numbers and commits are formatted from checked values. The posting script
+(`.github/scripts/post-count-comment.sh`) is given the pull request number and the base commit that
+the document names, and checks them, with the repository, the head commit, the head repository,
+and the head branch, again. It believes the number only if the API says that pull request is open,
+still at the commit the triggering run was for, from the repository and branch that run was for,
+and still based on the commit that the counts were compared with: an artifact cannot name a base
+of its own choosing, and a run for a base that the pull request no longer has cannot comment. Where
+the run's payload lists its pull requests, the number must be one of them; the
+payload does so for a pull request in this repository and leaves the list empty for one from a
+fork, which the head and base checks then tell apart from any other (GitHub allows no two open pull
+requests with the same head and base). It edits only the bot's own comment that begins with the
+marker.
+
+**What a comment cannot vouch for.** The counts of a pull request are measured by the pull
+request's own code, so a fork can write any numbers that pass the schema; the comment informs and
+gates nothing, and a reviewer who wants the counts of a head runs `cargo xtask counts` on it. The
+workflow that is followed is found by its name, so a workflow of the same name in a fork can upload
+an artifact of the same name, which is held to the same checks as the real one.
+
 ## Safety rules
 
 The harness only ever runs `excise` against fixtures it generated itself, and never against a real
@@ -1281,6 +1394,7 @@ Machine output is versioned JSON. Every document carries a `document_kind` and a
 | Summary | `harness-summary` | 1 | `cargo xtask e2e` and `cargo xtask headless` (one schema, both commands; see below) | [`harness-summary.schema.json`](schemas/harness-summary.schema.json) | The result of one run: run id, tier, times, host, the binary's path and SHA-256, the git SHA, the latency scale when it is not 1 (`latency_budget_scale`), whether the run held timing informational (`timing_informational`), how long the whole quick tier took when the run was that, in milliseconds (`quick_tier_ms`; see [Quick-tier time](#quick-tier-time)), and a verdict, duration, an open map of named metrics, and the timing budgets missed without failing (`timing_warnings`) for each scenario and profile (or, under `headless`, each fixture). The four fields are optional and left out when they have nothing to say (a strict run has no scale, no flag, and no warnings, and only a run of the whole quick tier has a time), so they are additive and the version stays 1. |
 | Failure bundle | `harness-failure` | 1 | `cargo xtask e2e` | [`harness-failure.schema.json`](schemas/harness-failure.schema.json) | The evidence for one failed scenario: the failed step, expected and actual screen text, terminal modes, the session's diagnostics (present only when the step timed out; see [Runner semantics](#runner-semantics)), the recording path, resource use, the fixture hash and seed, and a command that reruns it. |
 | A/B evidence | `harness-ab` | 1 | `cargo xtask bench-e2e` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under (the fixtures compared, the host, the toolchain, the power state, the load average, and concurrent `excise` processes). |
+| Counts | `harness-counts` | 1 | `cargo xtask counts` (the history job's record is the same document) | [`harness-counts.schema.json`](schemas/harness-counts.schema.json) | The deterministic counts of one build: the commit and its time, the runner, the toolchain, a pull request's number, base, and head when it is one, and per fixture and profile the fixture's hash and seed and an open map of counts (see [Counts](#counts)). It holds nothing that depends on the run, so a commit counted twice gives the same bytes. |
 
 `cargo xtask headless` writes a `harness-summary`, not a separate document kind: a headless run is
 one more kind of scenario result, named `headless-<fixture>`, whose open `metrics` map carries the
@@ -1298,7 +1412,7 @@ member or an undeclared field.
 
 Each schema's `$id` is
 `https://github.com/findyourexit/excise/harness/schemas/<document_kind>-v1.json`. The Rust types
-are `HarnessSummary`, `HarnessFailure`, and `HarnessAb` in `excise_harness::report`. They implement
+are `HarnessSummary`, `HarnessFailure`, `HarnessAb`, and `HarnessCounts` in `excise_harness::report`. They implement
 `Document`, which carries the kind, the schema id, and the schema text, and renders the canonical
 form: pretty-printed JSON in field order with a final newline.
 

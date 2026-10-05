@@ -42,6 +42,7 @@ cargo xtask e2e --scenario NAME    # one scenario, whatever its tier
 cargo xtask headless --quick       # headless scans, checked against the fixture oracle and timed against `du`
 cargo xtask bench-e2e --baseline main --fixture ID   # paired A/B evidence against another build
 cargo xtask compare --full         # ratio budgets (motion_complete_ratio, tui_complete_ratio) between two runs of one binary
+cargo xtask counts                 # deterministic counts (entries, scan-store bytes, residue files), each fixture counted twice and required to agree; CI comments their deltas on pull requests that change src/
 ```
 
 `e2e` builds the release binary first, or uses the one named by `EXCISE_E2E_BINARY`. `cargo verify` is the complete local suite and needs more tools than the gate; see [docs/development.md](docs/development.md).

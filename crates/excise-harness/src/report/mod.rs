@@ -8,6 +8,8 @@
 //! * [`HarnessSummary`] (`harness-summary`): the result of one run.
 //! * [`HarnessFailure`] (`harness-failure`): the evidence bundle for one failed scenario.
 //! * [`HarnessAb`] (`harness-ab`): paired, interleaved comparison evidence for two builds.
+//! * [`HarnessCounts`] (`harness-counts`): the deterministic counts of one build, the record that
+//!   the count history and a pull request's count comment are made of.
 //!
 //! The types reject unknown fields, so a document with a field this build does not know is an
 //! error rather than silently ignored. Removing or retyping a field, or making an optional one
@@ -19,6 +21,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 mod ab;
+mod counts;
 mod failure;
 mod summary;
 
@@ -28,6 +31,10 @@ mod tests;
 pub use ab::{
     AbContext, AbFixture, AbKind, AbVerdict, BuildIdentity, ConfidenceInterval, HarnessAb,
     MetricComparison, Samples, Side,
+};
+pub use counts::{
+    CountsCase, CountsContext, CountsFixture, CountsInvalid, CountsKind, CountsRunner,
+    HarnessCounts, MAX_CASES, MAX_COUNT, PullRequestOrigin,
 };
 pub use failure::{
     FailedStep, FailureKind, FixtureIdentity, HarnessFailure, Rusage, ScreenComparison,

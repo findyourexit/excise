@@ -7,10 +7,11 @@ use serde_json::Value;
 
 use super::{
     AbContext, AbFixture, AbKind, AbVerdict, BinaryIdentity, BuildIdentity, ConfidenceInterval,
-    Document, FailedStep, FailureKind, FixtureIdentity, HarnessAb, HarnessFailure, HarnessSummary,
-    MetricComparison, Rusage, SCHEMA_VERSION, Samples, ScenarioResult, SchemaVersion,
-    ScreenComparison, SessionDiagnostics, Side, SummaryKind, TerminalModes, Tier, TimingWarning,
-    Verdict,
+    CountsCase, CountsContext, CountsFixture, CountsInvalid, CountsKind, CountsRunner, Document,
+    FailedStep, FailureKind, FixtureIdentity, HarnessAb, HarnessCounts, HarnessFailure,
+    HarnessSummary, MAX_CASES, MAX_COUNT, MetricComparison, PullRequestOrigin, Rusage,
+    SCHEMA_VERSION, Samples, ScenarioResult, SchemaVersion, ScreenComparison, SessionDiagnostics,
+    Side, SummaryKind, TerminalModes, Tier, TimingWarning, Verdict,
 };
 use crate::{
     runner::is_latency,
@@ -205,6 +206,61 @@ fn ab() -> HarnessAb {
             }],
         },
     }
+}
+
+/// A counts document of a pull request, with every optional field present.
+fn counts() -> HarnessCounts {
+    HarnessCounts {
+        document_kind: CountsKind::HarnessCounts,
+        schema_version: SchemaVersion,
+        context: CountsContext {
+            git_sha: GIT_SHA.to_owned(),
+            committed_at: "2026-10-05T10:35:18+11:00".to_owned(),
+            runner: CountsRunner {
+                os: "linux".to_owned(),
+                os_version: "Ubuntu 24.04.3 LTS".to_owned(),
+                arch: "x86_64".to_owned(),
+            },
+            toolchain: "rustc 1.98.0 (88d9e12ae 2026-08-18)".to_owned(),
+            pull_request: Some(PullRequestOrigin {
+                number: 123,
+                base_sha: "c0ffee0123456789c0ffee0123456789c0ffee01".to_owned(),
+                head_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            }),
+        },
+        cases: vec![
+            CountsCase {
+                fixture: CountsFixture {
+                    id: "wide-1k".to_owned(),
+                    hash: FIXTURE_HASH.to_owned(),
+                    seed: 7,
+                },
+                profile: Profile::Deterministic,
+                metrics: BTreeMap::from([
+                    ("entries".to_owned(), 1_002),
+                    ("residue_files".to_owned(), 0),
+                    ("scan_store_bytes".to_owned(), 353_597),
+                ]),
+            },
+            CountsCase {
+                fixture: CountsFixture {
+                    id: "tiny-files-50k".to_owned(),
+                    hash: FIXTURE_HASH.replace('3', "4"),
+                    seed: 50_000,
+                },
+                profile: Profile::Default,
+                metrics: BTreeMap::from([("entries".to_owned(), 49_051)]),
+            },
+        ],
+    }
+}
+
+/// A counts document of a commit on `main`: no pull request, one case.
+fn minimal_counts() -> HarnessCounts {
+    let mut document = counts();
+    document.context.pull_request = None;
+    document.cases.truncate(1);
+    document
 }
 
 fn schema<D: Document>() -> Value {
@@ -421,6 +477,7 @@ fn every_schema_is_draft_2020_12_and_compiles() {
     assert_schema_compiles::<HarnessSummary>();
     assert_schema_compiles::<HarnessFailure>();
     assert_schema_compiles::<HarnessAb>();
+    assert_schema_compiles::<HarnessCounts>();
 }
 
 #[test]
@@ -428,6 +485,7 @@ fn every_schema_identity_matches_the_rust_constants() {
     assert_schema_identity::<HarnessSummary>();
     assert_schema_identity::<HarnessFailure>();
     assert_schema_identity::<HarnessAb>();
+    assert_schema_identity::<HarnessCounts>();
     assert_eq!(SCHEMA_VERSION, 1);
 }
 
@@ -437,6 +495,7 @@ fn the_rust_marker_fields_serialize_the_document_constants() {
         (to_value(&summary()), HarnessSummary::KIND),
         (to_value(&failure()), HarnessFailure::KIND),
         (to_value(&ab()), HarnessAb::KIND),
+        (to_value(&counts()), HarnessCounts::KIND),
     ] {
         assert_eq!(document["document_kind"], kind);
         assert_eq!(document["schema_version"], SCHEMA_VERSION);
@@ -449,6 +508,7 @@ fn every_object_in_every_schema_rejects_undeclared_fields() {
         schema::<HarnessSummary>(),
         schema::<HarnessFailure>(),
         schema::<HarnessAb>(),
+        schema::<HarnessCounts>(),
     ] {
         assert_objects_are_closed(&schema, "#");
     }
@@ -461,6 +521,8 @@ fn serialized_documents_validate_against_their_schemas() {
     assert_valid(&failure());
     assert_valid(&timeout_failure());
     assert_valid(&ab());
+    assert_valid(&counts());
+    assert_valid(&minimal_counts());
 }
 
 #[test]
@@ -468,6 +530,7 @@ fn schemas_and_types_declare_exactly_the_same_fields() {
     assert_schema_and_types_declare_the_same_fields(&summary());
     assert_schema_and_types_declare_the_same_fields(&timeout_failure());
     assert_schema_and_types_declare_the_same_fields(&ab());
+    assert_schema_and_types_declare_the_same_fields(&counts());
 }
 
 #[test]
@@ -491,6 +554,10 @@ fn enumerations_match_between_schemas_and_types() {
     assert_eq!(declared(&summary_schema, "/$defs/profile/enum"), profiles);
     assert_eq!(
         declared(&schema::<HarnessFailure>(), "/$defs/profile/enum"),
+        profiles
+    );
+    assert_eq!(
+        declared(&schema::<HarnessCounts>(), "/$defs/profile/enum"),
         profiles
     );
     assert_eq!(
@@ -869,6 +936,8 @@ fn documents_render_a_canonical_form_that_round_trips() {
     assert_round_trips(&failure());
     assert_round_trips(&timeout_failure());
     assert_round_trips(&ab());
+    assert_round_trips(&counts());
+    assert_round_trips(&minimal_counts());
 }
 
 #[test]
@@ -931,4 +1000,298 @@ fn only_pass_and_xfail_keep_a_run_green() {
         .collect();
 
     assert_eq!(green, [Verdict::Pass, Verdict::Xfail]);
+}
+
+#[test]
+fn the_counts_schema_rejects_contract_drift() {
+    let many_cases = |d: &mut Value| {
+        let case = d["cases"][0].clone();
+        d["cases"] = Value::Array(vec![case; 17]);
+    };
+    assert_rejected(
+        &counts(),
+        &[
+            ("an undeclared top-level field", &|d| {
+                d["extra"] = true.into();
+            }),
+            ("an undeclared context field", &|d| {
+                d["context"]["extra"] = 1.into();
+            }),
+            ("an undeclared runner field", &|d| {
+                d["context"]["runner"]["extra"] = 1.into();
+            }),
+            ("an undeclared pull request field", &|d| {
+                d["context"]["pull_request"]["extra"] = 1.into();
+            }),
+            ("an undeclared case field", &|d| {
+                d["cases"][0]["extra"] = 1.into();
+            }),
+            ("an undeclared fixture field", &|d| {
+                d["cases"][0]["fixture"]["extra"] = 1.into();
+            }),
+            ("another document kind", &|d| {
+                set(d, "/document_kind", "harness-summary".into());
+            }),
+            ("another schema version", &|d| {
+                set(d, "/schema_version", 2.into());
+            }),
+            ("no context", &|d| remove(d, "/context")),
+            ("no cases", &|d| remove(d, "/cases")),
+            ("an empty list of cases", &|d| {
+                set(d, "/cases", serde_json::json!([]));
+            }),
+            ("more than sixteen cases", &many_cases),
+        ],
+    );
+}
+
+#[test]
+fn the_counts_schema_rejects_a_context_that_misdescribes_the_run() {
+    assert_rejected(
+        &counts(),
+        &[
+            ("a commit that is too short", &|d| {
+                set(d, "/context/git_sha", "37d1c18".into());
+            }),
+            ("a commit in capitals", &|d| {
+                set(d, "/context/git_sha", GIT_SHA.to_uppercase().into());
+            }),
+            ("a commit that is not hexadecimal", &|d| {
+                set(d, "/context/git_sha", "z".repeat(40).into());
+            }),
+            ("a commit time without a zone", &|d| {
+                set(d, "/context/committed_at", "2026-10-05T10:35:18".into());
+            }),
+            ("an operating system in capitals", &|d| {
+                set(d, "/context/runner/os", "Linux".into());
+            }),
+            ("an operating system that could leave its directory", &|d| {
+                set(d, "/context/runner/os", "../x".into());
+            }),
+            ("an operating system name that is too long", &|d| {
+                set(d, "/context/runner/os", "a".repeat(17).into());
+            }),
+            ("an architecture with a hyphen", &|d| {
+                set(d, "/context/runner/arch", "x86-64".into());
+            }),
+            ("an operating system version with a line break", &|d| {
+                set(d, "/context/runner/os_version", "Ubuntu\n24.04".into());
+            }),
+            ("an operating system version that is not ASCII", &|d| {
+                set(d, "/context/runner/os_version", "Ubuntu \u{e9}".into());
+            }),
+            (
+                "an operating system version with a control character",
+                &|d| {
+                    set(d, "/context/runner/os_version", "Ubuntu\t24".into());
+                },
+            ),
+            ("an operating system version that is too long", &|d| {
+                set(d, "/context/runner/os_version", "u".repeat(121).into());
+            }),
+            ("an empty toolchain", &|d| {
+                set(d, "/context/toolchain", "".into());
+            }),
+            ("a toolchain with a line break", &|d| {
+                set(
+                    d,
+                    "/context/toolchain",
+                    "rustc 1.98.0\nbinary: rustc".into(),
+                );
+            }),
+        ],
+    );
+}
+
+#[test]
+fn the_counts_schema_rejects_a_pull_request_origin_that_names_no_commit() {
+    assert_rejected(
+        &counts(),
+        &[
+            ("a pull request number of zero", &|d| {
+                set(d, "/context/pull_request/number", 0.into());
+            }),
+            ("a negative pull request number", &|d| {
+                set(d, "/context/pull_request/number", (-1).into());
+            }),
+            ("a pull request number a double cannot hold", &|d| {
+                set(d, "/context/pull_request/number", (MAX_COUNT + 1).into());
+            }),
+            ("a short base commit", &|d| {
+                set(d, "/context/pull_request/base_sha", "c0ffee".into());
+            }),
+            ("a head commit that is not hexadecimal", &|d| {
+                set(d, "/context/pull_request/head_sha", "z".repeat(40).into());
+            }),
+            ("no head commit", &|d| {
+                remove(d, "/context/pull_request/head_sha");
+            }),
+        ],
+    );
+}
+
+#[test]
+fn the_counts_schema_rejects_cases_and_counts_that_cannot_be_compared() {
+    let many_counts = |d: &mut Value| {
+        let metrics: serde_json::Map<String, Value> = (0..33)
+            .map(|index| (format!("m{index:02}"), Value::from(index)))
+            .collect();
+        set(d, "/cases/0/metrics", Value::Object(metrics));
+    };
+    assert_rejected(
+        &counts(),
+        &[
+            ("a fixture id in capitals", &|d| {
+                set(d, "/cases/0/fixture/id", "Wide-1k".into());
+            }),
+            ("a fixture id with a space", &|d| {
+                set(d, "/cases/0/fixture/id", "wide 1k".into());
+            }),
+            ("a fixture id that is too long", &|d| {
+                set(d, "/cases/0/fixture/id", "w".repeat(65).into());
+            }),
+            ("a fixture hash that is not hexadecimal", &|d| {
+                set(d, "/cases/0/fixture/hash", "not-hex".into());
+            }),
+            ("a negative seed", &|d| {
+                set(d, "/cases/0/fixture/seed", (-1).into());
+            }),
+            ("an unknown profile", &|d| {
+                set(d, "/cases/0/profile", "fancy".into());
+            }),
+            ("a case with no counts", &|d| {
+                set(d, "/cases/0/metrics", serde_json::json!({}));
+            }),
+            ("more than thirty-two counts in a case", &many_counts),
+            ("a count named in capitals", &|d| {
+                set(d, "/cases/0/metrics", serde_json::json!({ "Entries": 1 }));
+            }),
+            ("a count named with a hyphen", &|d| {
+                set(d, "/cases/0/metrics", serde_json::json!({ "idle-fds": 1 }));
+            }),
+            ("a count named from a digit", &|d| {
+                set(d, "/cases/0/metrics", serde_json::json!({ "1st": 1 }));
+            }),
+            ("a count name that is too long", &|d| {
+                let mut metrics = serde_json::Map::new();
+                metrics.insert("m".repeat(49), 1.into());
+                set(d, "/cases/0/metrics", Value::Object(metrics));
+            }),
+            ("a negative count", &|d| {
+                set(d, "/cases/0/metrics/entries", (-1).into());
+            }),
+            ("a fractional count", &|d| {
+                set(d, "/cases/0/metrics/entries", 1.5.into());
+            }),
+            ("a count that is a string", &|d| {
+                set(d, "/cases/0/metrics/entries", "1002".into());
+            }),
+            ("a count that is null", &|d| {
+                set(d, "/cases/0/metrics/entries", Value::Null);
+            }),
+            ("a count a double cannot hold", &|d| {
+                set(d, "/cases/0/metrics/entries", (MAX_COUNT + 1).into());
+            }),
+        ],
+    );
+}
+
+#[test]
+fn the_limits_the_writer_checks_are_the_limits_of_the_schema() {
+    let schema = schema::<HarnessCounts>();
+
+    assert_eq!(
+        schema.pointer("/properties/cases/maxItems"),
+        Some(&Value::from(MAX_CASES)),
+        "the most cases a document holds"
+    );
+    assert_eq!(
+        schema.pointer("/$defs/count/maximum"),
+        Some(&Value::from(MAX_COUNT)),
+        "the largest count a document carries"
+    );
+}
+
+#[test]
+fn a_count_at_the_largest_value_a_double_holds_is_accepted() {
+    let mut document = counts();
+    document.cases[0]
+        .metrics
+        .insert("scan_store_bytes".to_owned(), MAX_COUNT);
+
+    assert_valid(&document);
+    assert_eq!(document.check(), Ok(()));
+}
+
+#[test]
+fn a_counts_document_that_breaks_a_rule_the_schema_cannot_say_is_refused() {
+    let mut twice = counts();
+    twice.cases[1] = twice.cases[0].clone();
+    let mut huge = counts();
+    huge.cases[0]
+        .metrics
+        .insert("scan_store_bytes".to_owned(), MAX_COUNT + 1);
+
+    assert_eq!(counts().check(), Ok(()));
+    assert_eq!(
+        twice.check(),
+        Err(CountsInvalid::DuplicateCase {
+            fixture: "wide-1k".to_owned(),
+            profile: Profile::Deterministic,
+        })
+    );
+    assert_eq!(
+        huge.check(),
+        Err(CountsInvalid::CountTooLarge {
+            fixture: "wide-1k".to_owned(),
+            metric: "scan_store_bytes".to_owned(),
+            value: MAX_COUNT + 1,
+        })
+    );
+}
+
+#[test]
+fn one_fixture_may_be_counted_under_two_profiles() {
+    let mut document = counts();
+    document.cases[1].fixture = document.cases[0].fixture.clone();
+
+    assert_eq!(
+        document.check(),
+        Ok(()),
+        "the case is a fixture and a profile"
+    );
+    assert_eq!(
+        document
+            .case("wide-1k", Profile::Default)
+            .map(|case| case.profile),
+        Some(Profile::Default)
+    );
+    assert!(document.case("wide-1k", Profile::Narrow).is_none());
+    assert!(document.case("absent", Profile::Default).is_none());
+}
+
+#[test]
+fn counts_documents_that_are_not_this_kind_and_version_or_have_other_numbers_are_rejected() {
+    let text = counts().to_json_pretty().expect("counts should render");
+
+    assert!(HarnessSummary::from_json_str(&text).is_err());
+    assert!(HarnessCounts::from_json_str(&text.replace("harness-counts", "harness-ab")).is_err());
+    let future = text.replace("\"schema_version\": 1", "\"schema_version\": 2");
+    let error = HarnessCounts::from_json_str(&future).expect_err("version 2 is unsupported");
+    assert!(
+        error.to_string().contains("unsupported schema_version 2"),
+        "{error}"
+    );
+    for malformed in [
+        text.replace("\"entries\": 1002", "\"entries\": 1002.5"),
+        text.replace("\"entries\": 1002", "\"entries\": -1002"),
+        text.replace("\"entries\": 1002", "\"entries\": \"1002\""),
+        text.replace("\"seed\": 7", "\"seed\": 7.0"),
+        text.replace("\"os\": \"linux\"", "\"os\": \"linux\", \"unexpected\": 1"),
+    ] {
+        assert!(
+            HarnessCounts::from_json_str(&malformed).is_err(),
+            "{malformed}"
+        );
+    }
 }
