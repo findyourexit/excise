@@ -471,6 +471,19 @@ where
         #[cfg(feature = "internal")]
         let _input = self.probe_phase(OwnerPhase::Input);
         let input = self.input.read()?;
+        // An input barrier request (see "Input barrier" in `crate::test_events`; it has nothing to
+        // do with `InputEvent::Barrier`, which the in-process runner uses) is not an input: it is
+        // not counted in `inputs`, no key binding sees it, and it does not re-arm the sheen. It
+        // marks the interface dirty, so the frame that answers it is drawn for certain, and it
+        // ends the batch, so that frame is drawn right away by `render_reflecting_input`, which
+        // never coalesces behind a frame the terminal is still draining. Everything read before
+        // the request has been processed by then, and the frame shows all of it.
+        if let InputEvent::Terminal(event) = &input
+            && crate::test_events::barrier_request(event)
+        {
+            self.app.mark_dirty();
+            return Ok(true);
+        }
         if matches!(input, InputEvent::Terminal(_)) {
             crate::test_events::input_consumed();
             // Input re-arms the selected tile's sheen for one more cycle (F3).
@@ -1501,6 +1514,9 @@ where
         self.render_with_backlog_gate(false)
     }
 
+    /// The body of `render` and `render_reflecting_input`. A frame that drew is reported here and
+    /// nowhere else (`report_frame`), so its `frame` test event and its mark in the terminal
+    /// output come from one call and neither can lack the other.
     fn render_with_backlog_gate(&mut self, respect_backlog_gate: bool) -> Result<bool, AppError> {
         if let Some(sink) = &self.frame_sink
             && let Some(error) = sink.take_failure()
@@ -1514,7 +1530,7 @@ where
                 .frame_sink
                 .as_ref()
                 .is_some_and(|sink| !sink.previous_frame_drained());
-        let result = if gated {
+        let mut result = if gated {
             Ok(false)
         } else {
             self.app.render_if_dirty(
@@ -1527,8 +1543,10 @@ where
                 self.settings.reduced_motion,
             )
         };
-        if matches!(&result, Ok(true)) {
-            crate::test_events::frame();
+        if matches!(&result, Ok(true))
+            && let Err(error) = self.report_frame()
+        {
+            result = Err(error);
         }
         #[cfg(feature = "internal")]
         if !matches!(&result, Ok(true))
@@ -1539,6 +1557,25 @@ where
 
         self.flush_deletion_plan_cancellation()?;
         result
+    }
+
+    /// Reports the frame `render_if_dirty` just drew to the test event channel and, when that
+    /// wrote its `frame` event and a terminal writer exists, marks it in the terminal output.
+    /// The mark is queued behind the frame's own bytes, which the same writer already holds, so
+    /// it reaches the terminal after every one of them and before anything later.
+    ///
+    /// Without `EXCISE_TEST_EVENTS` this does nothing. An in-process run has no terminal writer
+    /// (`frame_sink` is `None`) and gets the event only. A mark that cannot be queued fails the
+    /// draw like any other terminal write.
+    fn report_frame(&self) -> Result<(), AppError> {
+        let Some(seq) = crate::test_events::frame() else {
+            return Ok(());
+        };
+        if let Some(sink) = &self.frame_sink {
+            sink.enqueue(crate::test_events::frame_mark(seq))
+                .map_err(|error| AppError::terminal("draw", error))?;
+        }
+        Ok(())
     }
 
     fn schedule(&mut self, now: Duration, action: TimedAction, delay: Duration) {

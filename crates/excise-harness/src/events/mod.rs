@@ -6,8 +6,11 @@
 //! [`Event`] is one parsed line.
 //!
 //! Parsing is strict. A line must be a JSON object with `v` equal to 1, a known `kind`, a numeric
-//! `t_us`, and exactly the fields its kind carries. Anything else is an [`EventError`]: a harness
-//! that reads a channel it does not understand would otherwise report nonsense.
+//! `t_us`, and exactly the fields its kind carries, but for three: the `frame_marks` and the
+//! `input_barrier` of a `hello`, and the `barriers` of a `frame`, may be absent, because a program
+//! from before the frame marks and the input barrier does not write them. Anything else is an
+//! [`EventError`]: a harness that reads a channel it does not understand would otherwise report
+//! nonsense.
 
 use std::{
     collections::BTreeMap,
@@ -39,12 +42,22 @@ pub struct Event {
 /// What an event reports, with the fields of its kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Payload {
-    /// The first line: the package version and the process id.
+    /// The first line: the package version, the process id, and whether the program marks its
+    /// frames in the terminal output.
     Hello {
         /// The `excise` package version.
         version: String,
         /// The process id of `excise`.
         pid: u64,
+        /// Whether the program follows every `frame` event with a mark in the terminal output
+        /// (see [`crate::pty`]), so that a reader can tell when the screen shows the frame. A
+        /// program from before the marks does not say, and does not mark.
+        frame_marks: bool,
+        /// Whether the program answers an input barrier request (see
+        /// [`crate::pty::keys::BARRIER`]) with a frame that carries the number of requests it has
+        /// read, so that a reader can tell that the program has read everything written before a
+        /// request. A program from before the barrier does not say, and does not answer.
+        input_barrier: bool,
     },
     /// A render drew a frame.
     Frame {
@@ -52,6 +65,10 @@ pub enum Payload {
         seq: u64,
         /// The terminal input events the owner loop had consumed when the frame was drawn.
         inputs: u64,
+        /// The input barrier requests the owner loop had consumed when the frame was drawn: the
+        /// frame answers every request up to this number. 0 from a program that does not answer
+        /// requests, which does not write the field.
+        barriers: u64,
     },
     /// The initial scan finished.
     ScanComplete {
@@ -281,10 +298,13 @@ pub fn parse_line(line: usize, bytes: &[u8], observed: Instant) -> Result<Event,
         "hello" => Payload::Hello {
             version: take_string(&mut fields, line, "version")?,
             pid: take_number(&mut fields, line, "pid")?,
+            frame_marks: take_optional_bool(&mut fields, line, "frame_marks")?.unwrap_or(false),
+            input_barrier: take_optional_bool(&mut fields, line, "input_barrier")?.unwrap_or(false),
         },
         "frame" => Payload::Frame {
             seq: take_number(&mut fields, line, "seq")?,
             inputs: take_number(&mut fields, line, "inputs")?,
+            barriers: take_optional_number(&mut fields, line, "barriers")?.unwrap_or(0),
         },
         "scan_complete" => Payload::ScanComplete {
             entries: take_number(&mut fields, line, "entries")?,
@@ -344,6 +364,37 @@ fn take_string(
             expected: "a string",
         }),
         None => Err(EventError::MissingField { line, field }),
+    }
+}
+
+fn take_optional_bool(
+    fields: &mut Map<String, Value>,
+    line: usize,
+    field: &'static str,
+) -> Result<Option<bool>, EventError> {
+    match fields.remove(field) {
+        Some(Value::Bool(value)) => Ok(Some(value)),
+        Some(_) => Err(EventError::WrongType {
+            line,
+            field,
+            expected: "a boolean",
+        }),
+        None => Ok(None),
+    }
+}
+
+fn take_optional_number(
+    fields: &mut Map<String, Value>,
+    line: usize,
+    field: &'static str,
+) -> Result<Option<u64>, EventError> {
+    match fields.remove(field) {
+        Some(value) => value.as_u64().map(Some).ok_or(EventError::WrongType {
+            line,
+            field,
+            expected: "an unsigned integer",
+        }),
+        None => Ok(None),
     }
 }
 
@@ -476,14 +527,23 @@ mod tests {
             hello.payload,
             Payload::Hello {
                 version: "1.3.0".to_owned(),
-                pid: 4242
+                pid: 4242,
+                frame_marks: false,
+                input_barrier: false,
             }
         );
         assert_eq!(hello.t_us, 6);
 
-        let frame =
-            parse(r#"{"v":1,"kind":"frame","seq":3,"inputs":2,"t_us":900}"#).expect("frame");
-        assert_eq!(frame.payload, Payload::Frame { seq: 3, inputs: 2 });
+        let frame = parse(r#"{"v":1,"kind":"frame","seq":3,"inputs":2,"barriers":1,"t_us":900}"#)
+            .expect("frame");
+        assert_eq!(
+            frame.payload,
+            Payload::Frame {
+                seq: 3,
+                inputs: 2,
+                barriers: 1
+            }
+        );
 
         assert_eq!(
             parse(r#"{"v":1,"kind":"scan_complete","entries":14,"t_us":1}"#)
@@ -512,6 +572,127 @@ mod tests {
                 .payload,
             Payload::Exit { code: 130 }
         );
+    }
+
+    #[test]
+    fn a_hello_says_whether_the_program_marks_its_frames() {
+        let hello = |fields: &str| {
+            parse(&format!(
+                r#"{{"v":1,"kind":"hello","version":"1.3.0","pid":7,{fields}"t_us":0}}"#
+            ))
+        };
+        let marks = |hello: Result<Event, EventError>| match hello.expect("hello").payload {
+            Payload::Hello { frame_marks, .. } => frame_marks,
+            other => panic!("not a hello: {other:?}"),
+        };
+
+        assert!(marks(hello(r#""frame_marks":true,"#)));
+        assert!(!marks(hello(r#""frame_marks":false,"#)));
+        // A program from before the marks says nothing, and does not mark.
+        assert!(!marks(hello("")));
+        for wrong in [
+            r#""frame_marks":"yes","#,
+            r#""frame_marks":1,"#,
+            r#""frame_marks":null,"#,
+        ] {
+            assert!(
+                matches!(
+                    hello(wrong),
+                    Err(EventError::WrongType {
+                        field: "frame_marks",
+                        ..
+                    })
+                ),
+                "{wrong}"
+            );
+        }
+        // The field belongs to `hello` alone.
+        assert!(matches!(
+            parse(r#"{"v":1,"kind":"frame","seq":1,"inputs":0,"frame_marks":true,"t_us":0}"#),
+            Err(EventError::UnknownField { field, .. }) if field == "frame_marks"
+        ));
+    }
+
+    #[test]
+    fn a_hello_says_whether_the_program_answers_the_input_barrier() {
+        let hello = |fields: &str| {
+            parse(&format!(
+                r#"{{"v":1,"kind":"hello","version":"1.3.0","pid":7,{fields}"t_us":0}}"#
+            ))
+        };
+        let answers = |hello: Result<Event, EventError>| match hello.expect("hello").payload {
+            Payload::Hello { input_barrier, .. } => input_barrier,
+            other => panic!("not a hello: {other:?}"),
+        };
+
+        assert!(answers(hello(
+            r#""frame_marks":true,"input_barrier":true,"#
+        )));
+        assert!(!answers(hello(r#""input_barrier":false,"#)));
+        // A program from before the barrier says nothing, and does not answer.
+        assert!(!answers(hello(r#""frame_marks":true,"#)));
+        for wrong in [
+            r#""input_barrier":"yes","#,
+            r#""input_barrier":1,"#,
+            r#""input_barrier":null,"#,
+        ] {
+            assert!(
+                matches!(
+                    hello(wrong),
+                    Err(EventError::WrongType {
+                        field: "input_barrier",
+                        ..
+                    })
+                ),
+                "{wrong}"
+            );
+        }
+        // The field belongs to `hello` alone.
+        assert!(matches!(
+            parse(r#"{"v":1,"kind":"frame","seq":1,"inputs":0,"input_barrier":true,"t_us":0}"#),
+            Err(EventError::UnknownField { field, .. }) if field == "input_barrier"
+        ));
+    }
+
+    #[test]
+    fn a_frame_says_how_many_barrier_requests_it_answers() {
+        let barriers = |fields: &str| match parse(&format!(
+            r#"{{"v":1,"kind":"frame","seq":2,"inputs":5,{fields}"t_us":0}}"#
+        ))
+        .expect("frame")
+        .payload
+        {
+            Payload::Frame { barriers, .. } => barriers,
+            other => panic!("not a frame: {other:?}"),
+        };
+
+        assert_eq!(barriers(r#""barriers":3,"#), 3);
+        // A program from before the barrier does not write the field: it answers nothing.
+        assert_eq!(barriers(""), 0);
+        for wrong in [
+            r#""barriers":"1","#,
+            r#""barriers":-1,"#,
+            r#""barriers":1.5,"#,
+            r#""barriers":null,"#,
+        ] {
+            assert!(
+                matches!(
+                    parse(&format!(
+                        r#"{{"v":1,"kind":"frame","seq":2,"inputs":5,{wrong}"t_us":0}}"#
+                    )),
+                    Err(EventError::WrongType {
+                        field: "barriers",
+                        ..
+                    })
+                ),
+                "{wrong}"
+            );
+        }
+        // The field belongs to `frame` alone.
+        assert!(matches!(
+            parse(r#"{"v":1,"kind":"scan_complete","entries":1,"barriers":1,"t_us":0}"#),
+            Err(EventError::UnknownField { field, .. }) if field == "barriers"
+        ));
     }
 
     #[test]

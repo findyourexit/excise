@@ -7,7 +7,8 @@
 //! |---|---|
 //! | a character | its UTF-8 bytes |
 //! | `ctrl` and a letter | the letter's control code (`ctrl+c` is `0x03`) |
-//! | `ctrl` and `@`, space, `[`, `\`, `]`, `^`, `_`, `?` | `0x00`, `0x00`, `0x1b`, `0x1c`, `0x1d`, `0x1e`, `0x1f`, `0x7f` |
+//! | `ctrl` and `@`, space, `[`, `\`, `^`, `_`, `?` | `0x00`, `0x00`, `0x1b`, `0x1c`, `0x1e`, `0x1f`, `0x7f` |
+//! | `ctrl` and `]` | none: `0x1d` is the input barrier request ([`BARRIER`]), which only the harness writes, so the key is an error |
 //! | `alt` and a key | `ESC` followed by the bytes of the key |
 //! | `enter` | carriage return (`0x0d`) |
 //! | `esc` | `0x1b` |
@@ -29,6 +30,17 @@ use crate::scenario::KeyName;
 
 const ESCAPE: u8 = 0x1b;
 
+/// The input barrier request: `0x1d`, the control code of `ctrl+]`.
+///
+/// While the test event channel is open, `excise` reads it as a request that is not a key: it
+/// draws a frame whose `barriers` counts the requests it has read. A request that a frame answers
+/// was read after everything written before it, and the frame shows what all of that did. A
+/// terminal writes no such byte for a key a person presses. Only the harness writes it, and only
+/// as a request that it counts: a `key` that wrote it would be a request that nothing counted,
+/// and a later request could take that one's answer for its own. So `ctrl+]`, with or without
+/// `alt`, has no encoding here ([`KeyError::Reserved`]).
+pub const BARRIER: u8 = 0x1d;
+
 /// A key or text that has no terminal encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum KeyError {
@@ -39,6 +51,15 @@ pub enum KeyError {
         key: String,
         /// The modifiers, for example `ctrl`.
         modifiers: &'static str,
+    },
+    /// The key is reserved for the harness.
+    #[error(
+        "`{key}` is the input barrier request that the harness writes to the program, so no key \
+         step can write it"
+    )]
+    Reserved {
+        /// The key as written in a scenario.
+        key: String,
     },
     /// Typed text contains a control character.
     #[error(
@@ -61,6 +82,11 @@ pub fn encode_key(key: KeyName, ctrl: bool, alt: bool) -> Result<Vec<u8>, KeyErr
         key: key.to_string(),
         modifiers: "ctrl",
     };
+    if ctrl && key == KeyName::Char(']') {
+        return Err(KeyError::Reserved {
+            key: if alt { "alt+ctrl+]" } else { "ctrl+]" }.to_owned(),
+        });
+    }
     let mut bytes = Vec::with_capacity(8);
     match key {
         KeyName::Char(character) if ctrl => {
@@ -185,10 +211,26 @@ mod tests {
         assert_eq!(encode(" ", true, false), [0x00]);
         assert_eq!(encode("[", true, false), [0x1b]);
         assert_eq!(encode("\\", true, false), [0x1c]);
-        assert_eq!(encode("]", true, false), [0x1d]);
         assert_eq!(encode("^", true, false), [0x1e]);
         assert_eq!(encode("_", true, false), [0x1f]);
         assert_eq!(encode("?", true, false), [0x7f]);
+    }
+
+    #[test]
+    fn the_input_barrier_request_is_not_a_key() {
+        for alt in [false, true] {
+            let error = encode_key(key("]"), true, alt).expect_err("reserved for the harness");
+            assert!(
+                matches!(&error, KeyError::Reserved { key } if key.ends_with("ctrl+]")),
+                "{error}"
+            );
+        }
+        // Only that one key is reserved: `]` itself and the neighbouring control codes are not.
+        assert_eq!(encode("]", false, false), b"]");
+        assert_eq!(encode("\\", true, false), [0x1c]);
+        assert_eq!(encode("^", true, false), [0x1e]);
+        assert_eq!(BARRIER, 0x1d);
+        assert_eq!(control_code(']'), Some(BARRIER));
     }
 
     #[test]
