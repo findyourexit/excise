@@ -3,7 +3,8 @@ name = "motion-complete-node-modules-2k"
 description = "Default-motion time-to-COMPLETE against reduced-motion time-to-COMPLETE (F2's repro shape), on the 2.4k-entry node_modules-shaped fixture."
 fixture = "node-modules-2k"
 budget = "motion_complete_ratio"
-pairs = 5
+# Ten pairs: one pair of a run this short ranged from 0.2x to 9x on a hosted Linux runner, so the median of five could cross the budget by chance.
+pairs = 10
 timeout_ms = 60000
 tier = "full"
 platforms = ["macos", "linux"]

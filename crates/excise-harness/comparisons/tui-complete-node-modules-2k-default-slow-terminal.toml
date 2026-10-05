@@ -4,7 +4,8 @@ description = "Interactive time-to-COMPLETE under default motion against a headl
 fixture = "node-modules-2k"
 budget = "tui_complete_ratio"
 profile = "default"
-pairs = 5
+# Ten pairs: one pair of a run this short ranged from 0.2x to 9x on a hosted Linux runner, so the median of five could cross the budget by chance.
+pairs = 10
 timeout_ms = 90000
 drain_bytes_per_sec = 150000
 tier = "full"
