@@ -12,8 +12,8 @@
 //! The types reject unknown fields, so a document with a field this build does not know is an
 //! error rather than silently ignored. Removing or retyping a field, or making an optional one
 //! required, needs a new `schema_version`. An optional field that its writer leaves out when it has
-//! nothing to say (`session_diagnostics`, `latency_budget_scale`, `timing_informational`, and a
-//! result's `timing_warnings`) is additive and keeps version 1.
+//! nothing to say (`session_diagnostics`, `latency_budget_scale`, `timing_informational`,
+//! `quick_tier_ms`, and a result's `timing_warnings`) is additive and keeps version 1.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;

@@ -41,6 +41,7 @@ fn summary() -> HarnessSummary {
         git_sha: GIT_SHA.to_owned(),
         latency_budget_scale: Some(2.0),
         timing_informational: true,
+        quick_tier_ms: Some(98_765),
         scenarios: vec![
             ScenarioResult {
                 name: "delete-folder-lifecycle".to_owned(),
@@ -88,6 +89,7 @@ fn minimal_summary() -> HarnessSummary {
     HarnessSummary {
         latency_budget_scale: None,
         timing_informational: false,
+        quick_tier_ms: None,
         scenarios: Vec::new(),
         ..summary()
     }
@@ -675,6 +677,15 @@ fn the_summary_schema_rejects_drifting_timing_fields() {
             }),
             ("an undeclared field in a timing warning", &|d| {
                 d["scenarios"][0]["timing_warnings"][0]["extra"] = 1.into();
+            }),
+            ("a negative quick-tier time", &|d| {
+                set(d, "/quick_tier_ms", (-1).into());
+            }),
+            ("a quick-tier time that is not a whole number", &|d| {
+                set(d, "/quick_tier_ms", 98_765.5.into());
+            }),
+            ("a quick-tier time that is not a number", &|d| {
+                set(d, "/quick_tier_ms", "two minutes".into());
             }),
         ],
     );

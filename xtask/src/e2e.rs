@@ -88,10 +88,9 @@ pub fn e2e(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     })?;
     println!("{}", report.table());
     println!("wall time: {:.1}s", started.elapsed().as_secs_f64());
-    if report.is_success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("the e2e run has blocking verdicts").into())
+    match report.failure() {
+        None => Ok(()),
+        Some(reason) => Err(io::Error::other(reason).into()),
     }
 }
 

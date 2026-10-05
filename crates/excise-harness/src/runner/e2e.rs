@@ -31,6 +31,17 @@
 //! and counts it on its last line. It is not a blocking verdict. Every other check still fails the
 //! scenario (the other budgets, a wait that times out, a step that fails, residue), and a scenario
 //! that is expected to fail on the platform keeps its strict verdict.
+//!
+//! # Quick-tier time
+//!
+//! A run of the whole quick tier (`quick`, with no scenario named, no profile chosen, and no
+//! repetition) times itself, from just before the warm-up launch to the end of its last run, and
+//! is held to [`QUICK_BUDGET`]. The summary records the time (`quick_tier_ms`), the verdict
+//! table's last line prints it against the budget, and [`E2eReport::quick_tier`] holds it. A tier
+//! over its budget fails the run on the reference machine, where `EXCISE_HARNESS_REFERENCE=1`, and
+//! is a warning in the table elsewhere; the message names the five slowest runs, and a run that
+//! failed for another reason keeps that failure. [`run_e2e`] reads the environment; the tests reach
+//! the budget and the machine through the parameters of `run_matrix` instead, without waiting.
 
 use std::{
     collections::BTreeMap,
@@ -61,6 +72,7 @@ use crate::{
 use super::{
     budget::LatencyScale,
     run::{RunReport, RunRequest, resolve_binary, run_scenario},
+    tier_time::{QuickBudget, QuickTierTime, REFERENCE_ENV, is_reference_machine},
     work::work_base,
 };
 
@@ -69,6 +81,11 @@ const WARM_UP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The profiles of the quick tier.
 const QUICK_PROFILES: [Profile; 2] = [Profile::Default, Profile::Deterministic];
+
+/// How long the whole quick tier may take: two minutes, so that running it on every iteration
+/// stays cheap. A tier over it fails the run on the reference machine and warns elsewhere (see
+/// [`QuickTierTime`]).
+const QUICK_BUDGET: Duration = Duration::from_secs(120);
 
 /// Whether a scenario tagged `scenario_tier` runs when the matrix is asked for `tier`.
 const fn tier_includes(tier: Tier, scenario_tier: ScenarioTier) -> bool {
@@ -212,16 +229,37 @@ pub struct E2eReport {
     pub records: Vec<RunRecord>,
     /// Scenarios this matrix did not attempt, with the reason.
     pub skipped: Vec<SkippedScenario>,
+    /// How long the whole quick tier took, held to its budget. `None` unless this run was the
+    /// whole quick tier: `--scenario`, `--profile`, and `--repeat` make it something else.
+    pub quick_tier: Option<QuickTierTime>,
 }
 
 impl E2eReport {
-    /// Whether no run has a blocking verdict: a `fail`, `xpass`, or `error` fails the run.
+    /// Whether the run passed: no run has a blocking verdict, and the quick tier did not fail for
+    /// its time (see [`E2eReport::failure`]).
     #[must_use]
     pub fn is_success(&self) -> bool {
-        !self
+        self.failure().is_none()
+    }
+
+    /// Why the run failed, in one line, or `None` when it passed.
+    ///
+    /// A `fail`, `xpass`, or `error` fails the run, and a run that already failed keeps that
+    /// failure whatever its time was: the verdict table still reports the time. Otherwise the run
+    /// fails when the whole quick tier took longer than its budget on the reference machine, and
+    /// the reason names the budget and the five slowest runs.
+    #[must_use]
+    pub fn failure(&self) -> Option<String> {
+        if self
             .records
             .iter()
             .any(|record| record.report.verdict.blocks_run())
+        {
+            return Some("the e2e run has blocking verdicts".to_owned());
+        }
+        self.quick_tier
+            .filter(QuickTierTime::fails_run)?
+            .overrun(&self.records)
     }
 }
 
@@ -276,6 +314,16 @@ fn selected_profiles(options: &E2eOptions, scenario: &Scenario) -> Vec<Profile> 
         .filter(|profile| options.tier != Tier::Quick || QUICK_PROFILES.contains(profile))
         .filter(|profile| options.profiles.is_empty() || options.profiles.contains(profile))
         .collect()
+}
+
+/// Whether `options` ask for the whole quick tier, once: `quick`, with no scenario named, no
+/// profile chosen, and no repetition. Anything else is a part of the tier, or more than it, so its
+/// time is not the tier's and is not held to its budget.
+fn is_whole_quick_tier(options: &E2eOptions) -> bool {
+    options.tier == Tier::Quick
+        && !options.named
+        && options.profiles.is_empty()
+        && options.repeat <= 1
 }
 
 /// Plans which of `options.scenarios` run on `os`, and under which profiles, and which are
@@ -414,6 +462,10 @@ fn warm_up(binary: &Path, work_dir: &Path, timeout: Duration) -> Result<(), E2eE
 /// The binary is launched once with `--version` before the first run (see [`warm_up`]), so that no
 /// measured session pays the one-time cost of a new binary's first launch.
 ///
+/// A run of the whole quick tier is timed from just before that launch to the end of its last run,
+/// and held to [`QUICK_BUDGET`]: over it, the run fails on the reference machine
+/// (`EXCISE_HARNESS_REFERENCE=1`) and only warns elsewhere. See [`E2eReport::failure`].
+///
 /// # Errors
 ///
 /// Returns an error if nothing was selected, if the warm-up launch fails, or if the output
@@ -421,6 +473,20 @@ fn warm_up(binary: &Path, work_dir: &Path, timeout: Duration) -> Result<(), E2eE
 /// blocking verdict in the report.
 pub fn run_e2e(
     options: &E2eOptions,
+    progress: impl FnMut(&RunRecord),
+) -> Result<E2eReport, E2eError> {
+    let budget = QuickBudget {
+        limit: QUICK_BUDGET,
+        enforced: is_reference_machine(),
+    };
+    run_matrix(options, budget, progress)
+}
+
+/// [`run_e2e`] with the quick tier's budget given, so that a test can hold a run to any budget
+/// without waiting for it: [`warm_up`] takes its timeout the same way.
+fn run_matrix(
+    options: &E2eOptions,
+    budget: QuickBudget,
     mut progress: impl FnMut(&RunRecord),
 ) -> Result<E2eReport, E2eError> {
     let (plan, skipped) = select(options, std::env::consts::OS);
@@ -443,6 +509,7 @@ pub fn run_e2e(
         "cannot create the work directory `{}`",
         work_dir.display()
     )))?;
+    let began = Instant::now();
     warm_up(&options.binary, &work_dir, WARM_UP_TIMEOUT)?;
 
     let started_at = SystemTime::now();
@@ -459,6 +526,9 @@ pub fn run_e2e(
             records.push(record);
         }
     }
+
+    let elapsed = began.elapsed();
+    let quick_tier = is_whole_quick_tier(options).then_some(QuickTierTime { elapsed, budget });
 
     let summary = HarnessSummary {
         document_kind: SummaryKind::default(),
@@ -481,6 +551,7 @@ pub fn run_e2e(
         latency_budget_scale: (!options.latency_scale.is_strict())
             .then(|| options.latency_scale.factor()),
         timing_informational: options.timing_informational,
+        quick_tier_ms: quick_tier.as_ref().map(QuickTierTime::millis),
         scenarios: records.iter().map(result_of).collect(),
     };
     let summary_path = run_dir.join("summary.json");
@@ -496,6 +567,7 @@ pub fn run_e2e(
         run_dir,
         records,
         skipped,
+        quick_tier,
     })
 }
 
@@ -655,14 +727,16 @@ fn result_of(record: &RunRecord) -> ScenarioResult {
 // The verdict table.
 
 impl E2eReport {
-    /// The verdict table: one line per scenario and profile, then one block per blocking run and
-    /// one line per timing warning, then the overall verdict.
+    /// The verdict table: one line per scenario and profile, then one block per blocking run, one
+    /// line per timing warning, and a block for a quick tier over its budget, then the overall
+    /// verdict, whose line also carries the quick tier's time against its budget.
     #[must_use]
     pub fn table(&self) -> String {
         let mut table = render_rows(&self.summary_rows());
         self.write_skipped(&mut table);
         self.write_blocking_runs(&mut table);
         self.write_timing_warnings(&mut table);
+        self.write_tier_overrun(&mut table);
         let blocking = self
             .records
             .iter()
@@ -682,10 +756,13 @@ impl E2eReport {
         } else {
             String::new()
         };
+        let tier_time = self
+            .quick_tier
+            .map_or_else(String::new, |time| format!("; {}", time.against_budget()));
         let _ = writeln!(
             table,
-            "\ne2e {}: {} run(s), {blocking} blocking{scale}{timing}; summary: {}",
-            if blocking == 0 { "ok" } else { "FAILED" },
+            "\ne2e {}: {} run(s), {blocking} blocking{scale}{timing}{tier_time}; summary: {}",
+            if self.is_success() { "ok" } else { "FAILED" },
             self.records.len(),
             self.summary_path.display()
         );
@@ -718,6 +795,26 @@ impl E2eReport {
                 table,
                 "\nWARN {} [{}] run {}: {warning}",
                 report.scenario, report.profile, record.repetition
+            );
+        }
+    }
+
+    /// A block for a quick tier that took longer than its budget: a failure where that fails the
+    /// run, a warning with the reason it does not elsewhere.
+    fn write_tier_overrun(&self, table: &mut String) {
+        let Some(time) = self.quick_tier else {
+            return;
+        };
+        let Some(overrun) = time.overrun(&self.records) else {
+            return;
+        };
+        if time.fails_run() {
+            let _ = writeln!(table, "\nFAIL {overrun}");
+        } else {
+            let _ = writeln!(
+                table,
+                "\nWARN {overrun}\n  not a failure here: only the reference machine \
+                 ({REFERENCE_ENV}=1) fails on it"
             );
         }
     }
@@ -1524,6 +1621,238 @@ mod tests {
             );
         };
         assert_eq!(warning.budget, Budget::FirstFrameMs);
+    }
+
+    /// A scenario that waits for the 300 bytes `three_hundred_bytes` prints and asks nothing else
+    /// of the program, under both quick-tier profiles. Against that stand-in it passes in a
+    /// moment; against `failing_stub`, which exits at once, it fails.
+    #[cfg(unix)]
+    fn waits_for_the_output() -> Scenario {
+        let scenario = Scenario::from_toml_str(
+            "schema_version = 1\nname = \"waits-for-the-output\"\ndescription = \"d\"\n\
+             fixture = \"delete-file\"\nprofiles = [\"default\", \"deterministic\"]\n\
+             [[steps]]\nstep = \"wait_text\"\ntext = \"0X\"\n",
+        )
+        .expect("a scenario");
+        scenario.validate().expect("a valid scenario");
+        scenario
+    }
+
+    /// Options for the whole quick tier against `binary`: one scenario under both of the tier's
+    /// profiles, with nothing named, nothing chosen, and no repetition.
+    #[cfg(unix)]
+    fn the_whole_quick_tier(binary: PathBuf, work: &Path) -> E2eOptions {
+        E2eOptions {
+            scenarios: vec![waits_for_the_output()],
+            profiles: Vec::new(),
+            ..lifecycle_options(binary, work)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_quick_tier_over_its_budget_fails_the_reference_machine_and_only_warns_elsewhere() {
+        let work = tempfile::tempdir().expect("a temporary directory");
+        let program = three_hundred_bytes(work.path());
+        let matrix = |limit: Duration, enforced: bool, out: &str| -> E2eReport {
+            let mut options = the_whole_quick_tier(program.clone(), work.path());
+            options.out_root = work.path().join(out);
+            run_matrix(&options, QuickBudget { limit, enforced }, |_| {}).expect("the matrix runs")
+        };
+        let passing = |report: &E2eReport| {
+            report
+                .records
+                .iter()
+                .all(|record| record.report.verdict == Verdict::Pass)
+        };
+
+        // A budget of no time is always over: every run passed, and the time is all that is wrong.
+        let reference = matrix(Duration::ZERO, true, "reference");
+        assert!(passing(&reference), "{}", reference.table());
+        assert!(!reference.is_success());
+        let reason = reference
+            .failure()
+            .expect("a tier over its budget fails the reference machine");
+        assert!(
+            reason.starts_with("the quick tier took ")
+                && reason.contains(" s, over its 0 s budget; slowest runs: ")
+                && reason.contains("waits-for-the-output [default] (")
+                && reason.contains("waits-for-the-output [deterministic] ("),
+            "the failure names the budget and the runs: {reason}"
+        );
+        let table = reference.table();
+        assert!(table.contains(&format!("\nFAIL {reason}\n")), "{table}");
+        assert!(
+            table.contains("e2e FAILED: 2 run(s), 0 blocking; quick tier: ")
+                && table.contains(" s, over its 0 s budget; summary: "),
+            "{table}"
+        );
+
+        // The same run elsewhere passes, and the table warns.
+        let elsewhere = matrix(Duration::ZERO, false, "elsewhere");
+        assert!(
+            passing(&elsewhere) && elsewhere.is_success(),
+            "{}",
+            elsewhere.table()
+        );
+        assert_eq!(elsewhere.failure(), None);
+        let table = elsewhere.table();
+        assert!(table.contains("\nWARN the quick tier took "), "{table}");
+        assert!(
+            table.contains("e2e ok: 2 run(s), 0 blocking; quick tier: ") && !table.contains("FAIL"),
+            "{table}"
+        );
+
+        // Within its budget a tier says nothing but its time, on either machine.
+        for (enforced, out) in [(true, "within-reference"), (false, "within-elsewhere")] {
+            let within = matrix(Duration::from_secs(3600), enforced, out);
+            assert!(
+                passing(&within) && within.is_success(),
+                "{}",
+                within.table()
+            );
+            assert_eq!(within.failure(), None);
+            let table = within.table();
+            assert!(
+                !table.contains("WARN") && !table.contains("FAIL"),
+                "{table}"
+            );
+            assert!(
+                table.contains("e2e ok: 2 run(s), 0 blocking; quick tier: ")
+                    && table.contains(" s of 3600 s; summary: "),
+                "{table}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_already_failed_keeps_its_failure_and_still_reports_its_time() {
+        let work = tempfile::tempdir().expect("a temporary directory");
+        let options = the_whole_quick_tier(failing_stub(work.path()), work.path());
+
+        for (limit, over, out) in [
+            (Duration::from_secs(3600), false, "within"),
+            (Duration::ZERO, true, "over"),
+        ] {
+            let mut options = options.clone();
+            options.out_root = work.path().join(out);
+            let report = run_matrix(
+                &options,
+                QuickBudget {
+                    limit,
+                    enforced: true,
+                },
+                |_| {},
+            )
+            .expect("the matrix runs");
+
+            assert_eq!(
+                verdicts_of(&report),
+                [
+                    ("waits-for-the-output".to_owned(), Verdict::Fail),
+                    ("waits-for-the-output".to_owned(), Verdict::Fail)
+                ]
+            );
+            assert_eq!(
+                report.failure().as_deref(),
+                Some("the e2e run has blocking verdicts"),
+                "the failed runs are the failure, over the budget or not"
+            );
+            let time = report.quick_tier.expect("a failed run is still timed");
+            assert_eq!(report.summary.quick_tier_ms, Some(time.millis()));
+            validate_against_schema(HarnessSummary::SCHEMA_JSON, &report.summary_path);
+            let table = report.table();
+            assert!(
+                table.contains("e2e FAILED: 2 run(s), 2 blocking; quick tier: "),
+                "{table}"
+            );
+            assert_eq!(
+                table.contains(" s, over its 0 s budget; summary: "),
+                over,
+                "{table}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_summary_records_the_time_of_the_whole_quick_tier_and_of_no_other_run() {
+        let work = tempfile::tempdir().expect("a temporary directory");
+        let whole = the_whole_quick_tier(three_hundred_bytes(work.path()), work.path());
+        let run = |out: &str, change: &dyn Fn(&mut E2eOptions)| -> E2eReport {
+            let mut options = whole.clone();
+            options.out_root = work.path().join(out);
+            change(&mut options);
+            run_e2e(&options, |_| {}).expect("the matrix runs")
+        };
+        let text =
+            |report: &E2eReport| fs::read_to_string(&report.summary_path).expect("a summary");
+
+        let tier = run("tier", &|_| {});
+        let time = tier.quick_tier.expect("the whole quick tier is timed");
+        let runs: Duration = tier
+            .records
+            .iter()
+            .map(|record| record.report.duration)
+            .sum();
+        assert_eq!(
+            time.budget.limit,
+            Duration::from_secs(120),
+            "the quick tier is held to two minutes"
+        );
+        assert!(
+            time.elapsed >= runs,
+            "the time covers every run: {time:?} against {runs:?}"
+        );
+        assert_eq!(tier.summary.quick_tier_ms, Some(time.millis()));
+        assert!(
+            text(&tier).contains(&format!("\"quick_tier_ms\": {}", time.millis())),
+            "{}",
+            text(&tier)
+        );
+        assert!(
+            tier.table().contains(" s of 120 s; summary: "),
+            "{}",
+            tier.table()
+        );
+
+        // A run that is not the tier has no time to hold to its budget: a scenario named with
+        // `--scenario`, a profile chosen, a repetition, or another tier.
+        let others = [
+            ("named", run("named", &|options| options.named = true)),
+            (
+                "narrowed",
+                run("narrowed", &|options| {
+                    options.profiles = vec![Profile::Default];
+                }),
+            ),
+            ("repeated", run("repeated", &|options| options.repeat = 2)),
+            ("full", run("full", &|options| options.tier = Tier::Full)),
+        ];
+        for (what, report) in &others {
+            assert_eq!(report.quick_tier, None, "{what}");
+            assert_eq!(report.summary.quick_tier_ms, None, "{what}");
+            assert!(
+                !text(report).contains("quick_tier_ms"),
+                "{what}: {}",
+                text(report)
+            );
+            assert!(
+                !report.table().contains("quick tier"),
+                "{what}: {}",
+                report.table()
+            );
+        }
+
+        // The real writer's documents validate, and read back as the report says.
+        for report in std::iter::once(&tier).chain(others.iter().map(|(_, report)| report)) {
+            validate_against_schema(HarnessSummary::SCHEMA_JSON, &report.summary_path);
+            assert_eq!(
+                HarnessSummary::from_json_str(&text(report)).expect("the summary reads back"),
+                report.summary
+            );
+        }
     }
 
     /// A scenario whose one step waits for text `excise` never prints, bounded by a short

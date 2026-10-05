@@ -50,7 +50,7 @@ cargo xtask compare --full         # ratio budgets (motion_complete_ratio, tui_c
 
 A scenario's `tier` is `quick` (the default), `full`, or `nightly`, and says which `cargo xtask e2e` run includes it:
 
-- `--quick` runs `quick` scenarios under the `default` and `deterministic` profiles only, and must stay within 2 minutes.
+- `--quick` runs `quick` scenarios under the `default` and `deterministic` profiles only, and must stay within 2 minutes. A run of the whole tier (no `--scenario`, `--profile`, or `--repeat`) times itself and prints its time against that budget on the verdict table's last line. Over it, the run names the five slowest runs and warns, or, on the reference machine, which sets `EXCISE_HARNESS_REFERENCE=1` (leave that variable as you find it), fails: give a heavy scenario `tier = "full"`, or make it cheaper.
 - `--full` (the default without a flag) runs `quick` and `full` scenarios under every profile each one declares.
 - `--nightly` runs all three tiers under every profile each one declares.
 - `--scenario NAME` runs the named scenario whatever its tier.
