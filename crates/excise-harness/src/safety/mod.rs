@@ -25,6 +25,8 @@ pub use fixture::{FixtureRoot, SafetyError};
 pub use isolation::{NARROW_COLS, ProfileSettings, isolated_env};
 pub use process::{KillOutcome, SignalError, send_signal};
 #[cfg(unix)]
-pub use process::{kill_process, kill_process_group, process_group_exists, process_group_of};
+pub use process::{
+    has_exited_unreaped, kill_process, kill_process_group, process_group_exists, process_group_of,
+};
 pub use scratch::{Scratch, ScratchError};
 pub use snapshot::{FixtureDiff, FixtureSnapshot, SnapshotError};

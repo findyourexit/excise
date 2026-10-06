@@ -26,6 +26,10 @@ and on the [fixture generator](#fixtures), which creates and checks the trees th
 The [interactive driver](#interactive-driver) (`tui`) drives one live session at a time, for
 exploring the interface before a scenario is written.
 
+The [version sweep](#version-sweep) (`sweep`) runs every published version through the checks a
+published release can take, and tabulates which of the defects fixed in the release under
+development each one shows.
+
 ## Scenario files
 
 A scenario is one TOML file. It names a generated fixture, the terminal and profiles to run under,
@@ -1089,11 +1093,14 @@ set and this host can do it, every scan also runs under the Linux cgroup memory 
 [Linux cgroup memory cap](#linux-cgroup-memory-cap).
 
 **The report** is read only after it validates against the published
-`docs/schemas/scan-report.schema.json` and the `native-path` schema it references. The file is
-checked one entry at a time, so a large report never has to fit in memory twice. A report that
-breaks the schema is `invalid-report`, a scan that ends without one is `no-report`, a scan that
-does not end in time is `timeout`, and a scan that prints to standard output, although its report
-goes to a file, is `unexpected-output`.
+`docs/schemas/scan-report.schema.json` and the `native-path` schema it references (a report that
+declares `schema_version` 1, the report of Excise 1.0.0 through 1.2.4, is held to
+`legacy/scan-report-v1.schema.json` instead, which the [version sweep](#version-sweep) needs to
+read the published releases, and any other version is refused). The file is checked one entry at a
+time, so a large report never has to fit in memory twice. A report that breaks the schema is
+`invalid-report`, a scan that ends without one is `no-report`, a scan that does not end in time is
+`timeout`, and a scan that prints to standard output, although its report goes to a file, is
+`unexpected-output`.
 
 **The diff** joins every report entry to the oracle by its native path and holds the report to the
 accounting contract (`docs/safety/accounting.md`, `docs/reports.md`). What an entry must say is
@@ -1216,11 +1223,28 @@ from their description: rename the spec in `DIR`.
 
 **The two builds.** `--baseline <ref>` builds any git ref (a branch, a tag, or a SHA) in a
 temporary detached worktree with its own `CARGO_TARGET_DIR`, release, `--locked`, then removes the
-worktree. The built binary is cached by its resolved commit SHA under the target directory, so a
-later run against the same commit does not rebuild. The candidate is always the current checkout's
-release build. `--baseline-binary` and `--candidate-binary` each skip building that side and use
-the given path instead (for tests, and for comparing prebuilt binaries); the document's
-`baseline`/`candidate` `git_ref` records which was used.
+worktree with `git worktree remove --force` and checks with `git worktree list` that git no longer
+lists it (`git worktree prune` is never run; see **Removing the worktree** under
+[Version sweep](#version-sweep)). The built binary is cached by its resolved commit SHA under the
+target directory (`excise-bench-e2e-baselines/<sha>/`), so a later run against the same commit does
+not rebuild.
+The build is the shared ref builder, `xtask/src/refs.rs`, which `cargo xtask sweep` uses too, under
+its `Inherited` toolchain policy: `bench-e2e` runs `$CARGO` (`cargo` when that is unset) in the
+environment it was started in, so `RUSTUP_TOOLCHAIN` still decides and the baseline is compiled by
+the same compiler as the candidate, whatever toolchain file the baseline's own commit holds (the
+sweep pins each ref to its own toolchain instead; see [Version sweep](#version-sweep)). The build is
+bounded as the sweep's are: after 60 minutes it is killed with everything it started. Its output
+goes to `excise-bench-e2e-baselines/baseline-build.log` below the target directory (each build
+truncates it) and not to the terminal: the build runs in a process group of its own, which is not
+the terminal's foreground group, and a write to the terminal would stop it where the terminal sets
+`tostop`. Before a build, and not when the baseline is cached, `bench-e2e` prints on standard error
+`building the baseline <ref>; its output is in <path>`, and a build that fails carries the last 30
+lines of the log in its error. The ref is resolved once, to its commit, and that commit is what is
+announced and what is built, so a branch that moves in between changes neither. The candidate is
+always the current checkout's release build.
+`--baseline-binary` and `--candidate-binary` each skip building that side and use the given path
+instead (for tests, and for comparing prebuilt binaries); the document's `baseline`/`candidate`
+`git_ref` records which was used.
 
 **What is compared.** Every `--fixture ID` (repeatable) is a headless scan
 (`excise --format json`, through the same supervised process runner the headless runner uses),
@@ -1276,6 +1300,499 @@ interval, and its verdict.
 ```console
 cargo xtask bench-e2e --baseline main --fixture wide-1k --pairs 5
 ```
+
+## Version sweep
+
+```console
+cargo xtask sweep [--refs REF...] [--quick|--full] [--fixture ID]... [--rounds N] [--seed S] [--timeout SECONDS]
+```
+
+`excise_harness::sweep` runs every published version of `excise` through the checks a published
+release can take, and tabulates which of the defects fixed in the release under development each
+one shows: one row per defect, one column per version, and in each cell `affected`,
+`not-affected`, or `not-measurable`, with the reason, the measured value, and where the evidence
+is. A changelog entry that names the versions a defect affects is a claim about every published
+release, and this is the measurement of it. `xtask/src/sweep.rs` parses the command line, builds
+each ref, prints the grid, and turns what went wrong into an exit status; `xtask/src/refs.rs`
+builds a ref, and `bench-e2e` uses it too. The sweep is a manual tier: CI runs it only when a
+maintainer dispatches `weekly.yml` with `job` set to `version-sweep`, and never on a pull request
+(see [Version sweep](../../docs/development.md#version-sweep) in `docs/development.md` for how to
+run it and what CI runs).
+
+**What it builds.** With no `--refs`, every published release tag, exactly `v1.N.N` (a
+pre-release such as `v1.4.0-rc.1` and every other tag is ignored), oldest first, and then `HEAD`.
+`--refs` names refs (a tag, a branch, or a commit) up to the next flag, and may be given again.
+The last ref is the candidate: every ratio is taken to it, so name the oldest first. A ref is a
+commit, built from a checkout of it, so uncommitted changes are in no build, the candidate's
+included; and it is the commit the ref resolved to when the sweep planned its builds, so a branch
+or `HEAD` that moves while the sweep runs changes nothing it builds. A repository with no `v1.N.N`
+tag fails with the advice to `git fetch --tags`. The sweep never reads `EXCISE_E2E_BINARY`: it
+builds every ref itself.
+
+**How a ref is built.** Every ref is resolved to its commit (an annotated tag peels to the commit
+it points at) and planned before the first build starts, so a ref that does not resolve, or a
+toolchain that is not installed (below), fails the sweep at once with every such problem listed.
+The commit that was planned is what is built: it is checked out, detached, into a worktree
+directly below `target/excise-sweep-worktrees/` and built there with
+`cargo build --release --locked -p excise`, with `CARGO_TARGET_DIR` set to
+`target/excise-sweep-builds/<sha>/`; the binary is `<sha>/release/excise` below it. The binary is
+cached by commit SHA, so a second run builds nothing for a commit it has built (the detail says
+`built (cached)`, and the run has no log for it); a cached binary is trusted only when
+`<sha>/toolchain.txt` names the channel the ref pins now, so one whose build never finished is
+built again. A build that fails is a result and not the end of the sweep: the version's column says
+`the build failed`, with the last 30 lines of cargo's output in the reason and all of it in
+`builds/<label>.log` (see **Output**), and the other versions go on.
+
+**Removing the worktree.** The worktree is removed when the build ends, whether it succeeded,
+failed, ran out of time, or panicked, with `git worktree remove --force`. The sweep never runs
+`git worktree prune`: it forgets every worktree of the repository whose directory is missing (an
+unmounted disk's, a moved directory's), with its index, its detached `HEAD`, and its reflog, not
+only this one. When git refuses (a locked worktree, a directory it cannot empty) or leaves
+something behind, the builder deletes the worktree's own directory and then the one administrative
+entry git keeps for it, `<git-common-dir>/worktrees/<name>`, and nothing else. It checks the entry
+before it deletes anything: it must be a real directory, not a link, directly inside
+`<git-common-dir>/worktrees/`, and its `gitdir` file must name this worktree's `.git`. A check that
+fails deletes nothing, the directory included, so that a person sees both, and the error says why.
+The removal counts only when the directory, the entry, and the worktree's line in
+`git worktree list --porcelain` are all gone. A worktree that cannot be removed is an error that
+names `git worktree remove --force DIR` and warns that prune would also forget every other
+worktree whose directory is missing.
+
+**Bounds.** Nothing is waited for without one. A `cargo build` has a deadline of 60 minutes, and
+every `git` and `rustup` command the builder runs has one of 5 minutes. A command that is still
+running at its deadline is killed with everything it started: `SIGKILL` goes to its process group
+on Unix, and on Windows, which has no group to signal, to the command alone. A build that ran out
+of time fails as one that failed does: its worktree is removed, and its column says
+`the build failed`, with `timed out after 60 minutes and was killed` and the end of its log. A
+build that exits by itself, whether it succeeded or failed, has whatever it left running in its
+process group killed too (`SIGKILL`, on Unix), so that nothing a build started outlives it, and
+nothing is left to hold its worktree when that is removed. The group is signalled before the build
+is reaped, while the build is still a zombie whose id no other process can be given, so the signal
+reaches the group's own members or nothing. The `git` and `rustup` commands get no
+such kill. `git` can start a detached `git gc --auto`, which puts itself in a session of its own,
+so that a kill of the group would not reach it anyway, and it runs the user's hooks, whose
+background work is the user's own configuration of their repository: killing it would break their
+maintenance. The short `rustup` probes start nothing that outlives them. Every command reads from
+the null device, and on Unix runs in a process group of its own so that the group can be killed
+whole. On Unix, then, Ctrl-C (or any signal sent to the sweep's process group) reaches the sweep
+and not a build that is running: an interrupted sweep leaves its build running, with no deadline,
+until it ends, and one that is stuck has to be stopped by hand (see below). A run that is killed
+(Ctrl-C, a timeout, `SIGKILL`) also cannot remove the worktree it was building in.
+To see the build, run `ps -axo pid,pgid,command | grep '[c]argo build'` (macOS and Linux): it is
+`cargo build --release --locked -p excise` (under `rustup run <channel>` when the ref pins a
+toolchain), its working directory is a worktree below `target/excise-sweep-worktrees/`, and its
+lines share one `pgid`. A `cargo build` of your own matches too. To stop the sweep's, send its whole
+group SIGTERM with `kill -TERM -- -PGID`, `PGID` being that column. Then remove the worktree, whose
+directory is `<sha>-<pid>-<n>` below `target/excise-sweep-worktrees/` (`git worktree list` shows
+it), with `git worktree remove --force target/excise-sweep-worktrees/<dir>`, which removes the
+directory and git's entry for it together. Do not run `git worktree prune` for it.
+
+**Each ref's own toolchain.** The sweep judges a release by the compiler the release was built and
+tested with, so each ref is built with the toolchain its own commit pins
+(`ToolchainPolicy::RefPinned`). The channel is read from the commit, not from the working tree: the
+`channel` of its `rust-toolchain.toml`, or the one the legacy `rust-toolchain` names. The build runs
+as `rustup run <channel> cargo build ...`, with `RUSTUP_TOOLCHAIN`, `CARGO`, `RUSTC`, and
+`RUSTDOC` removed from its environment (the candidate's too), so that nothing the caller runs
+under can override a pin, and with `RUSTUP_AUTO_INSTALL=0`: the sweep never installs a toolchain.
+A pin that is not installed is an error that names the command that installs it, for example
+`rustup toolchain install 1.88.0` (v1.0.0 and v1.0.1 pin 1.88.0; every later tag and `HEAD` pin
+1.98.0). A ref that pins nothing is built by `cargo` from `PATH`, and its channel is the word
+`default`. The `rustc --version` of each build is recorded in the document
+(`versions[].toolchain`), in `table.txt`, and in `<sha>/toolchain.txt`. The shell that runs the
+sweep must not export `RUSTUP_TOOLCHAIN`: the sweep removes it from every build it makes, but the
+`cargo` that builds and runs `xtask` itself honors it, and would run the sweep with another
+toolchain than the checkout pins. `bench-e2e` uses the opposite policy, `Inherited`, for its
+baseline (see [Paired A/B benchmark](#paired-ab-benchmark)).
+
+**The checks.** Each runs one build only through the harness: on a generated fixture that carries
+the ownership marker, in the isolated environment of the other runners (the environment rebuilt
+from `TERM`, `COLORTERM`, and `LANG`, and a scratch `HOME`, configuration, working directory,
+temporary directory, and scan-store directory), in a pseudo-terminal of its own process group
+where it needs one, with every wait bounded, and it ends the program before it returns. A check
+reads only what a person at the terminal or a script could see: the screen, the exit status, the
+terminal modes, the bytes written to the terminal, the program's CPU time and open descriptors, the
+scratch area, and the report. None uses the test event channel (the sweep never sets
+`EXCISE_TEST_EVENTS`), frame marks, or the input barrier, which a published release does not have;
+the candidate is run the same way, so that every column is measured with the same instruments. A
+check that cannot run on a build says why (`not-run`: the header never reads `COMPLETE`) and is not
+a finding, and nor is a variant of a check that cannot be carried out (the filter prompt does not
+open): the check records which and why, and the cell that rests on it says so. A check the harness
+could not carry out (a spawn, a fixture, or an isolation failure) is `errored`, and the command
+fails (see **Exit status**).
+
+| Check | Fixture and profile | What it does | What it reads | Rows |
+|---|---|---|---|---|
+| `--help` | every build | Asks for `--help` (20 s bound). | The flags it lists: `--format` and `--output` (without both the build has no headless scan, and no headless check or timing runs on it) and `--scan-store-dir` (earlier builds keep their scan data in the temporary directory, which the isolation points into the scratch area, so the residue checks look there). Recorded in `versions[].traits`, with the report version the build wrote. | all |
+| `headless-oracle` | `node-modules-2k`, `hostile-small`, `deep-past-path-max`; the full tier adds `identity-small`, `all-classes-small`, `wide-1k`; `default` | One scan, `excise --format json --output <report> <root>`, as the [headless runner](#headless-runner) does it. | The report, read by its own version (below) and diffed against the fixture's oracle; the exit status; the scratch area; the free space of the volume the scratch areas are on. | F10, F11, F7 |
+| `signal-term`, `signal-hup`, `signal-quit` (not on macOS; see **Signals**) | `navigate-folders`, `deterministic` | Waits for `COMPLETE` and for the output to go quiet, delivers the signal, and waits up to 15 s for the exit. | The exit status (a confirmed quit exits 130), the terminal modes (restored), the scratch area (nothing left behind). | F6 |
+| `signal-close` (Windows, in place of the signals above) | same | The same, with the console close event. | The same, except the terminal, which a closed console cannot show. | F24, F6 |
+| `kill-restart` | `navigate-folders`, `deterministic` | Kills the program with `SIGKILL` once it is idle, starts another in the same scratch area, and waits for its scan to complete. | What the scratch area held after the kill, and which of that is still there after the second scan. | F4 |
+| `idle` | `navigate-folders`, `default` | Sends nothing after `COMPLETE`, and looks for 5 s starting 3.2 s after it. | The bytes written to the terminal and the CPU time the program used in that window. | F3 |
+| `filter` | `delete-folder`, `deterministic` | Run one reads the selected-item pane at `COMPLETE` with no key pressed, moves to `victim` with the arrows, opens it with Enter, types `/`, `part00`, and Enter, and watches for 1.5 s. Run two types the same at the root. If run one's scan does not reach `COMPLETE` the check did not run. A variant that cannot be carried out (the folder does not open, the filter prompt does not open, or run two's scan does not reach `COMPLETE`) is recorded as `did not run: <why>`, in the check's notes (`` filter `part00` at the root: ... ``) and in its evidence, which also holds the screen each variant ended on, and it is not counted as the program surviving. | The entry the pane names, against the largest entry of the fixture's oracle (see **F23b** for what a match shows); whether the program ended after the Enter, in each variant, and with what exit status. | F23b, F22 |
+| `selection-drift` (full tier) | `selection-drift`, `deterministic` | Two attempts per version: waits until the pane shows `big-file.bin` while the scan runs, presses Down, and reads the pane again after `COMPLETE` and the settling. | Whether the pane then names another entry than before. An attempt whose scan never reaches `COMPLETE` after the Down (it outlasts the bound, or the program ends) reads nothing after it and is counted apart, and a pane that names no entry is not a different entry. The record has `attempts`, `precondition_met` (the pane showed `big-file.bin` before `COMPLETE`), `reached_complete` (the scan then reached `COMPLETE` and was read), and `drifted`; its note and the last line of its evidence file give the same counts in one sentence. | F5 |
+| `descriptors` (full tier) | `wide-1k`, then `tiny-files-50k`; `deterministic` | Scans each to `COMPLETE`. | The most descriptors the program held at the samples taken while it ran. | F13 |
+
+**Signals.** The F6 checks send the signals the platform allows, and the F6 cell is decided from
+the ones that were sent (`signals_for`, in `sweep/signals.rs`): SIGTERM and SIGHUP on macOS;
+SIGTERM, SIGHUP, and SIGQUIT on Linux and the other Unix systems; the console close on Windows.
+SIGQUIT is not sent on macOS. A release that has no handler for it is ended by the default action,
+which macOS treats as a crash, and its crash reporter writes a report into the person's own
+`~/Library/Logs/DiagnosticReports`, whatever the limit on core files is. That folder is not the
+sweep's, and the sweep must not clean it, so it sends nothing that would fill it. The macOS cell
+says so in each of its states (`affected`, `not-affected`, and `not-measurable`), at the end of its
+reason, unless the build failed and the cell says only that: `` SIGQUIT is not sent on macOS: its
+default action makes macOS write a crash report into the person's own
+`~/Library/Logs/DiagnosticReports` ``. The run says it on stderr once, when it starts the interface
+checks. A signal that is not sent is never required. One that is sent and whose check did not run
+keeps the cell `not-measurable` and is named (`SIGHUP: <why>`), and one unclean signal makes the
+cell `affected`. On Unix the sweep sets its soft limit on the size of a core file to 0 before it
+runs its first check, and every program it runs inherits it, so that on Linux a SIGQUIT leaves no
+core file. A machine that pipes core dumps to a handler (a `kernel.core_pattern` that begins with
+`|`) does not enforce that limit (`core(5)`), and what such a handler keeps is its own.
+
+**How a report is read.** `ScanDocument::read` reads the `schema_version` a report declares and
+holds the report to that version's schema: version 1 (Excise 1.0.0 through 1.2.4) to
+`legacy/scan-report-v1.schema.json`, a byte-for-byte copy of the schema those ten releases
+published, and version 3 (1.3.0 and later) to `docs/schemas/scan-report.schema.json`. A build is
+held to the contract it published, not to the current one; any other version is refused. A
+version-1 report has no scan store: its summary gives the memory limit of its in-memory model
+(`model_bytes`, `model_limit_bytes`), which the typed values read into the scan-store fields.
+
+**Which fixtures.** The quick tier (`--quick`) is the checks above on the small fixtures. The full
+tier (`--full`, the default) adds the oracle scans of `identity-small`, `all-classes-small`, and
+`wide-1k`, and the two checks that need a large tree: `selection-drift` (20,053 entries) and
+`descriptors` (49,050 entries on the large tree), which bound their waits at 600 s, or at
+`--timeout` when that is longer. `--fixture ID` (repeatable) replaces the fixtures of the oracle
+scans and the timings; the interface checks keep theirs. A row that reads a fixture
+the run left out says so and is `not-measurable`: F1, F2, F16, and F18 read `node-modules-2k`, F10
+reads `hostile-small`, and F11 reads `deep-past-path-max`.
+
+**No deletion, ever.** A published release can be told to delete what it shows, so the sweep never
+tells one to. A deletion dialog opens on one key, Backspace, and a program that has none open has
+nothing to confirm. The keys a check sends are a closed vocabulary (`/`, Enter, the four arrows, and
+the characters of a name: letters, digits, `_`, `.`, and `-`), and every write is read through
+`pty::input::InputScan` first, which says whether the program could read the bytes so far as a
+request for a deletion (Backspace, Ctrl+H, or an escape sequence that a later write would finish):
+a write that could is refused before it is sent. With no request ever sent, no dialog exists for
+the Enter that opens a folder or applies a filter to meet. A check never confirms a quit either: it
+ends a program with a signal or `SIGKILL`. This is the guarantee the scenario runner gives a build
+without frame marks, and the sweep goes further: it has no `delete` step and never asks. As a
+second line, every fixture a build runs on is compared with what it was before, and a difference
+stops the whole sweep at once, without writing the table, because a build ran that deletes or
+rewrites what it was only to read. The headless scans share each fixture between all the versions,
+so every fixture they scan is held to the plan it was generated from before the first scan runs and
+again after each version's scans, which keeps a difference from being put down to a version that
+predates it; the message names the fixture and what differs, and the version that had just scanned
+it, when one had. A cached master is checked in full (its marker, its top-level names, and every
+entry), and a run copy (a fixture that cannot be cached) by the oracle's comparison of a walk of it
+with the plan, and its marker. Each interface check compares its fixture with a snapshot taken
+before the check, and the paired timings compare the timing fixture with a snapshot taken before
+the first run and another after the last.
+A comparison sees which entries there are and each one's kind, size, and link target (the check
+against the plan also each one's permission bits). It does not read the contents of a file, and it
+cannot see below a folder it cannot list, which `hostile-small` makes on purpose, so nothing below
+one of those is held to anything. So the deletion rows (F9, F14, F19, and F21) are `not-measurable`
+for every version, the candidate's included, with the reason `no confirmation is sent to a build
+without frame marks`: what a deletion shows needs a confirmed deletion, which only a scenario's
+`delete` step sends, to a build that marks its frames.
+
+**The paired timing.** A single timing never transfers across sessions (the same binary and tree
+shape have measured 9.46 s one day and 3.8 s the next), so a version is compared with the candidate
+only through rounds that ran every version one after another, in one session, on the same warm
+fixture (the cached master, which the scans only read). A round runs the versions in turn,
+starting from a different version every round, so that no version always follows the same one and a
+drift of the machine over a round falls on every version in turn. The order of every round is
+recorded (`measurements[].order`). In its turn a version runs every run of its phase back to back,
+so that what two runs measure of one version is measured in the same round. There are two phases,
+each with an untimed warm-up round of its own and then the `--rounds` measured rounds (5 by
+default):
+
+1. Against a terminal that reads as fast as the program writes. In its turn a version scans the
+   fixture headless and then, back to back, runs the interface under `default` to `COMPLETE`. The
+   scan feeds three series: its wall time (`headless_wall_ms`), the time its report took to write
+   (`report_write_ms`), and the wall time less that (`headless_scan_ms`). `du -sk` is timed once
+   per round, beside the scans. F18 asks how much later the interface reaches `COMPLETE` than the
+   headless scan of the same version, and the scan is `headless_scan_ms`, without the writing of
+   its report (see **The report write**). Both timings are taken in one turn and held to each
+   other round by round, and not to timings taken in another phase, when the machine may have been
+   busy with something else.
+2. Against a terminal that reads 150,000 bytes a second. In its turn a version runs the interface
+   under `default` and then under `reduced-motion`, so that default motion is held to reduced
+   motion of the same version in the same round (F2).
+
+| Metric | What it is | On | Rows |
+|---|---|---|---|
+| `headless_wall_ms` | The wall time of `excise --format json --output <report> <root>`: the whole command, the writing of the report included. A scan finished when it ended within `--timeout` with exit code 0, 2, or 3. Also reported against `du -sk`. | `node-modules-2k` | F1 |
+| `report_write_ms` | How long the report took to write: from the first change in the length of the `--output` file to its last, polled every 0.5 ms and once more after the process has exited (see **The report write**); one value for each scan. A scan that finished and whose report was seen to change in length fewer than twice gives none, and never 0 ms. | same | F16 |
+| `headless_scan_ms` | The wall time of a scan less its `report_write_ms`, from the same run: the scan, with what the process does before and after it. A run gives it only as **The report write** says, and otherwise has no sample of it. | same | F18, as the time the interface is held to |
+| `tui_complete_ms` | From the spawn to the header reading `COMPLETE`, in a pseudo-terminal. A run finished when the header read `COMPLETE` within `--timeout`; a program that ended first did not finish. Under `default` against a terminal that reads as fast as the program writes, and under `default` and `reduced-motion` against one that reads 150,000 bytes a second. | same | F18 (`default`, fast terminal, over the same version's `headless_scan_ms` of the same round), F2 (both profiles, slow terminal) |
+
+**The report write.** A release writes its report after its scan, and the write can be most of the
+wall time of a headless run. In a smoke run (3 rounds on `node-modules-2k`, one session, so an
+illustration and not a figure to compare) the wall time and the part of it spent writing the report
+were 1362 ms and 1261 ms for v1.0.0, 4925 ms and 1275 ms for v1.3.0, and 154 ms and 7 ms for `HEAD`.
+A release with a slow write (F1, F16) therefore takes longer to finish headless than to scan, and
+an interface held to that wall time is held to a time that is partly the report: v1.3.0's
+interface took 0.8 times its wall time, which favours exactly the releases with the slow write. So
+F18 is held to `headless_scan_ms` and never to the wall time.
+
+The write is measured from outside, once for each scan (so for each version in each round). A
+thread polls the size of the `--output` file every 0.5 ms while the process runs, and once more
+after it has exited, and notes when the size changed. It asks whether the process has exited before
+it reads the size, so that a report that grows between one read and the exit is read as it ended up
+and its last change is not left out. `report_write_ms` is the time from the first change to the
+last, accurate to about a millisecond, and `headless_scan_ms` is the wall time of the same run less
+it. That reads the write because every published release creates the output file only after its
+scan, so the first byte of the report is the end of the scan and the growth of the file is the
+write, in v1.0.0 too: in `src/cli.rs`, `scan_headless` is called before `write_scan_report`, which
+calls `File::create` (the lines are 78 and 144 in v1.0.0 to v1.2.1, 79 and 145 in v1.2.2 to
+v1.2.4, and 82 and 148 in v1.3.0), and the candidate's `scan_headless_with_stop_signals` likewise
+comes before its `write_scan_report`. A release that streamed its report while it scanned would
+break that, and its write would be as long as its scan. The measurement has limits: the half
+millisecond of the poll, and a little more for a last growth that is read only after the process
+has exited, which is timed at that read; what the process does after its last byte (exit,
+clean-up), which stays in the scan time; and a report whose size was seen to change fewer than
+twice, which says nothing about how long it took and is not a write of 0 ms. A report that is
+written whole between two reads is seen to change once, and so is one that is whole at the read
+after the exit: the scan had ended, and how long the write took is not known.
+
+A run gives a scan time without its report only when the scan finished (it ended within `--timeout`
+with exit code 0, 2, or 3), the file was seen to change at least twice, and at least 1 ms of the
+wall time is left once the write is taken off. Otherwise the run has no sample of
+`headless_scan_ms`: that round of it is a round without a sample, never a reading of 0 ms.
+`report_write_ms` is a sample only for a scan that finished and whose file was seen to change at
+least twice. A scan that did not finish is censored (see below): its `report_write_ms` is how long
+the report had taken to write by then, flagged as not finished, and its scan time is known, as the
+least it took (the length of the run), only when no byte of the report had been seen, because the
+scan was then still going. A run that was killed or failed after the report began to appear, in
+one change or in several, says nothing about how long its scan took. A round without a scan time
+gives no pair for F18, so a version with too few rounds in which the write could be told apart from
+the scan is `not-measurable` for F18, and its cell says in how many of how many rounds it could
+not.
+
+**Rounds are logical.** Every timing is kept in the slot of the round it was taken in, with whether
+it finished, for each metric of the run. A round in which a version did not run (it was given up
+on, below, or its runs could not be carried out) is a slot with no sample: it is neither a sample
+nor a pair, and it never moves a later round against another. So is a round in which a run has no
+usable reading of a series (a report seen to change in length fewer than twice gives no
+`report_write_ms` and no `headless_scan_ms`): it is no reading of 0 ms, and no error either. A ratio
+is made of the rounds in which both of its sides have a sample.
+
+**A run that does not finish is censored.** A run that does not finish within `--timeout` (120 s by
+default) is kept at how long it ran (the bound, when it ran out of time; the time to the exit, when
+the program ended first) and flagged as not completed. That is the least it took, and no more is
+known. A round in which both sides finished gives a ratio. The median of a version's ratios to the
+candidate, and its deterministic bootstrap 95% confidence interval (`bench::bootstrap`, the
+statistics `bench-e2e` uses, seeded from `--seed`, `0` by default), rest on those rounds alone, and
+`pairs` counts them. The other rounds say what they can and no more:
+
+* If only the numerator's run did not finish, the round gives a *lower bound* on its ratio (the
+  least it took over the denominator's time). That can show a version slower and never not slower.
+* If only the denominator's run did not finish, it gives an *upper bound*. That can show a version
+  not slower and never slower.
+* If neither finished, the round says nothing. It is counted (`both_censored`) and never made a
+  ratio, so two runs that both ran to the bound are not a ratio of 1.0.
+
+**Giving up.** A run that cannot finish costs the whole bound each time. After two measured runs in
+a row (`GIVE_UP_AFTER`) of one kind of run of a version (its headless scan, or one of its interface
+runs) in which a run did not finish, that kind is not run again for the version, and the rounds it
+misses are recorded as skipped. The warm-up round runs but does not count towards it, so a version
+that is given up on has two runs that ran out of time on record. A skipped round is neither a
+sample nor a pair, and a version given up on in its interface runs keeps its headless samples, and
+the other way round. A run that could not be carried out at all (a spawn or isolation failure) also
+ends its kind of run for that version, but is no skipped round: its check is `errored`, and the
+cells that need it say why.
+
+**What the rounds decide.** The policy is `bench-e2e`'s, applied to the rounds in which both sides
+finished, with what the other rounds can say added:
+
+* A version is `affected` when the median of at least three such rounds (`MIN_ROUNDS`) is more than
+  20% above one (the `timing_ab_regression` budget), its interval lies above one, and no round in
+  which the candidate's run did not finish could lower it; or when at least two rounds
+  (`MIN_CENSORED`) in which its own run did not finish and the candidate's did have a lower bound
+  over the same 20%. One such round is a slow moment, and two are not.
+* It is `not-affected` when the median of at least three such rounds is at most one, and no round
+  in which its own run did not finish could raise it; or when at least two rounds in which the
+  candidate's run did not finish and its own did have an upper bound of at most one, and no round
+  in which its own run did not finish.
+* Rounds that say slower beside rounds that say not slower settle nothing.
+* Anything else is `not-measurable`: fewer than three rounds that finished on both sides with
+  nothing else to settle it, a ratio between the two thresholds, a median that rounds in which a
+  run did not finish could overturn, or runs that ran out of time on both sides.
+
+A single run is never compared.
+
+**The table.** `sweep/defects.rs` lists the rows: the product defects fixed in the release, each
+tied by the words it opens with to its entry in `CHANGELOG.md` newer than v1.3.0 (a test holds
+every row to a line that is there, and no two rows to the same one). The ids are the numbers of the
+validation program's findings, so there is no row for F17 (withdrawn), F20 (accepted and not
+fixed), F25 (introduced after v1.3.0 by unreleased work), F26 (deferred past the release), or F23a
+and F27 to F30 (the harness, not the product).
+
+| Row | Defect | Decided by | `affected` when |
+|---|---|---|---|
+| F1 | Per-run durable writes dominate scanning | `headless_wall_ms` (the whole command); the value also gives the ratio to `du -sk` | slower than the candidate (see **The paired timing**) |
+| F2 | Scan ingestion stalls when the terminal reads slower than excise writes | `tui_complete_ms` at 150,000 bytes a second, `default` and `reduced-motion` | slower than the candidate in either mode (the value also gives default over reduced motion, over the rounds in which both finished) |
+| F3 | Idle animation loop | `idle` | any byte of output, or more than 50 ms of CPU, in the window |
+| F4 | Leftover scan-store directories | `kill-restart` | something the kill left is still there after the second scan |
+| F5 | Selection drift after COMPLETE | `selection-drift` (full tier) | reproduced: after `COMPLETE` the pane names another entry than before in at least one attempt; never `not-affected` |
+| F6 | Signals skip all cleanup | `signal-*` | a signal that is not a confirmed quit: not exit 130, the terminal not restored, or something left behind (SIGTERM and SIGHUP on macOS; SIGQUIT too on the other Unix systems; the console close on Windows) |
+| F7 | The macOS scan-store quota is about 256x too large | `headless-oracle` | the scan-store limit the report states is larger than the free space of the volume (a version-1 report has no scan store: `not-affected`) |
+| F8 | Windows owner loop stalls after every key release | not measurable | |
+| F9 | A deletion can leave an empty file under a deleted file's name, and the folder survives | not measurable | |
+| F10 | Unreadable folders, and every folder above them, reported complete with exact bounds | `headless-oracle` on `hostile-small` | an `entry-state` discrepancy |
+| F11 | Nothing deeper than PATH_MAX is scanned | `headless-oracle` on `deep-past-path-max` | a `missing` discrepancy |
+| F12 | A full scratch volume reported as a generic failure | not measurable | |
+| F13 | Open descriptors grow with the tree | `descriptors` (full tier) | the large tree held more than 24 descriptors beyond the small one |
+| F14 | The deletion-history export blocks the interface for seconds after a large deletion | not measurable | |
+| F15 | On Windows a scan can end on "scan results unavailable" instead of COMPLETE | not measurable | |
+| F16 | The headless report is written unbuffered | `report_write_ms` (a scan whose report was seen to change in length fewer than twice gives no sample) | slower than the candidate (see **The paired timing**) |
+| F18 | The interface reaches COMPLETE 1.2-2.4x later than headless | `tui_complete_ms` over the same version's `headless_scan_ms` of the same round: its headless scan without the writing of its report (see **The report write**) | over the 1.25 budget (`tui_complete_ratio`), by the rules of **The paired timing** with 1.25 in place of 1.2 and of 1; `not-affected` at or under it. A round in which the write could not be told apart from the scan gives no pair, so a version with too few such rounds is `not-measurable`, and the cell says in how many of how many rounds it could not |
+| F19 | A folder with a path longer than PATH_MAX cannot be deleted | not measurable | |
+| F21 | On macOS deletion planning panics on a device node with major 128 or more, or a negative size | not measurable | |
+| F22 | A filter whose matches lie more than one level below the current folder crashes the program | `filter` | the program ended after the filter, at the root or inside `victim`, whatever the other variant did, also when it did not run; `not-affected` only when both variants ran and the program survived both |
+| F23b | The untouched cursor does not land on the largest entry at COMPLETE | `filter` (the pane before any key) | the pane names another entry, or none, on any platform. A pane on the largest entry is `not-affected` on Windows only, and `not-measurable` on macOS and Linux (see **F23b**) |
+| F24 | On Windows closing the console can end with an NTSTATUS instead of exit code 130 | `signal-close`, on Windows | the exit code is not 130 |
+
+**F23b.** The check reads the selected-item pane at `COMPLETE` with no key pressed, on
+`delete-folder`, and holds the entry it names to the largest entry of the fixture's oracle
+(`victim`). A pane on another entry, or on none, is positive evidence of the defect on any
+platform: `affected`. A pane on the largest entry is `not-affected` on Windows only. The defect is a
+cursor that stays on a small entry the scan listed on its first page while much larger ones
+appeared (the changelog: "The map kept the entry it selected on the scan's first page selected by
+name for as long as that entry was listed, so a small file found early kept the cursor after much
+larger entries appeared"), so it needs a small entry to be listed before the largest one, and the
+order in which a file system lists a folder is its own. The program found the defect on Windows,
+which lists a folder in name order, so `keep-a.bin` comes before `victim`. The file systems of
+macOS and Linux list in an order of their own, and the check reads only the pane at `COMPLETE`: it
+does not see the listing order. Whether the check exercises the mechanism there depends on that
+order, so a clean reading is a claim about the platform it was read on and does not show the defect
+absent. The cell is then `not-measurable`, names the platform (`... does not show the defect absent
+on macos: ...`), and says that a cursor stuck on a small entry would be `affected` on any platform.
+
+**Cells.** `affected` and `not-affected` come only from a check that ran, and a `not-measurable`
+cell always gives its reason (`HarnessSweep::check` refuses one that does not). The candidate is
+the reference: its cell in a timing row (F1, F2, F16) is `not-affected` by definition. In every
+other row it is held to the same rule as the rest, and a row whose candidate cell is `affected`
+carries a note that the candidate shows the defect too, so the run does not show it fixed. A cell
+gives the rule that decided it (`reason`), what was measured (`value`: for a timing, for example
+`14x the candidate (95% CI 12.0-15.0, 5 rounds)`, the rounds being those in which both sides
+finished, followed by what the others show), and where the evidence is (`evidence`). When a timing
+cell rests on runs that did not finish, its reason quotes them: how many runs a version made, how
+many did not finish within the bound, in how many of those rounds the candidate's run did, and how
+many rounds were skipped (`2 of its 2 measured runs did not finish within the bound, 2 of them in
+rounds where the candidate's run did (the candidate finished 5 of its 5 runs); 3 rounds skipped`). A
+cell is a claim about the platform the sweep ran on: where a clean reading shows a defect absent on
+one platform only, the cell says so and is `not-measurable` elsewhere (see **F23b**).
+
+| A cell is `not-measurable` with the reason | Rows | What would measure it |
+|---|---|---|
+| `the build failed: ...` | every row that needs the binary, on a version whose build failed or whose binary does not answer `--help` | A build that works; the log is `builds/<label>.log`. A build that does not finish within 60 minutes fails with `timed out after 60 minutes and was killed`. |
+| `no confirmation is sent to a build without frame marks` | F9, F14, F19, F21, on every version | A confirmed deletion, which only a scenario's `delete` step sends, to a build that marks its frames: `cargo xtask e2e` runs those against the current build. |
+| `needs a scratch volume that fills during the scan, ...` | F12 | A privileged attached volume: `EXCISE_HARNESS_PRIVILEGED=1`, which AGENTS.md allows only for a task about volumes. The cell names `EXCISE_HARNESS_PRIVILEGED=1 cargo xtask e2e --scenario scan-store-quota`, the closest check there is; it runs the current build. |
+| `Windows only (...); this sweep ran on <os>. ...` | F8 (the key-release events of the Windows console) and F15 (another program holding a scan-store file) on every platform; F24 off Windows | A run on Windows, which measures F24 (`signal-close`); F8 and F15 need what a sweep does not do, and the cell sends the row to a Windows run. |
+| `the reproduction needs the 20,053-entry selection-drift fixture, which only the full tier runs: use cargo xtask sweep --full`, and the same for the 49,050-entry `tiny-files-50k` | F5, F13, in the quick tier | `--full`. |
+| `not reproduced in N attempts (the precondition held in P; the scan reached COMPLETE after it in C and did not in I, where nothing was read after COMPLETE) ...` | F5 | Nothing: the defect was observed once and does not reproduce on demand, so a run that does not reproduce it does not show a version unaffected, and an attempt that never reached `COMPLETE` shows neither the drift nor its absence. A run that reproduces it is `affected`. |
+| `inconclusive: ... more rounds would settle it` | F1, F2, F16, F18 | More rounds (`--rounds`): at least three rounds finished on both sides, but the ratio is not more than 20% above one with an interval above one, and not at or below one (F18: over the budget, but its interval reaches it). |
+| `N rounds finished on both sides, which is too few to settle it: ...` | F1, F2, F16, F18 | More rounds, or runs that finish: a ratio needs at least three rounds in which both sides finished, and rounds in which a run did not finish settle a cell only when at least two show it. The reason adds the rounds in which neither side finished, which say nothing. |
+| `the candidate's run did not finish in N rounds in which its run did, and those rounds are left out of the median, which they could lower`, `its run did not finish in N rounds in which the candidate's run did, which says it is slower there and keeps the other rounds from showing it is not`, `the rounds disagree: ...` | F1, F2, F16, F18 | Runs that finish: the median leaves out the rounds in which a run did not finish, and those could move it the other way, or some rounds say slower and others say not slower. |
+| `... was not timed in this run`, `the interface was not timed to COMPLETE without a slow terminal in this run`, `its runs could not be carried out: ...`, `no round of it produced a timing`, `no round has a candidate timing to compare with`, `no round gave a headless scan time to hold the interface to: ...`, `no round has both a headless scan time and an interface time` | F1, F2, F16, F18 | `node-modules-2k` among the `--fixture` fixtures, or runs that succeed (an `errored` check says why they did not); for F16 and F18, scans whose report is seen to grow (see **The report write**). |
+| `fixture ... was not run in this sweep`, `the build's --help lists no --format and --output, so it has no headless scan`, `the scan of ... wrote no report: ...`, `the report of ... could not be read: ...` | F10, F11 | The fixture among the `--fixture` fixtures; a build that takes the flags; a scan that finishes within `--timeout`. |
+| `no headless report was read, so there is no scan-store limit to read`, `the platform cannot say how much space is free on the scratch volume` | F7 | A readable report; a platform that can say (the sweep reads the free space of a volume on Unix only). |
+| a check that did not run: `the header did not read COMPLETE within ...`, `the program ended before COMPLETE`, `the program ended while it was left alone`, `the program ended during the idle window`, `the large tree did not reach COMPLETE within the bound`, `the selected-item pane was not found on the screen`, `the fixture's largest entry could not be worked out`, `the signals that ran were clean, but not every one ran: SIGHUP: <why>` (on macOS every F6 reason ends with the sentence that SIGQUIT is not sent) | F3, F4, F5, F6, F13, F22, F23b | A longer `--timeout`, or a build that gets as far as the check. |
+| `neither filter ran: at the root: <why>; inside victim: <why>`, `only one of the two filters ran: the filter <place> did not run (<why>), so the program surviving the other does not show the version unaffected` | F22 | A build that gets as far as both variants of the filter (the notes of the `filter` check say which did not run, and why). A program that ended after the filter in either variant is `affected` whatever the other did. |
+| `the report write could not be told apart from the scan in N of the M rounds the scan was timed in (the report was seen to change in size fewer than twice, or its write left no time for a scan), so those rounds give no scan time without the report` | F18 (added to the reason of a `not-measurable` cell, and to the value of the others) | Scans whose report is seen to change in size at least twice, with a write that leaves at least 1 ms for the scan; for a scan that did not finish, a longer `--timeout`. |
+| `the selected-item pane shows `victim`, the largest entry, at COMPLETE, which does not show the defect absent on <os>: ...` | F23b, on macOS and Linux | A run on Windows, which lists a folder in name order (`keep-a.bin` before `victim`). The check does not see the listing order elsewhere. |
+
+**Output.** A run writes `target/excise-sweep/<run-id>/` (`target` is `CARGO_TARGET_DIR` when that
+is set), where the run id is the UTC start time and the process id (`20261006T091500Z-31337`), and
+`target/excise-sweep/latest` points at the newest run (a symbolic link on Unix, a text file holding
+the run id elsewhere). The directory is made before the first build, so that the build logs live in
+it. Scratch areas are made below `EXCISE_E2E_TMPDIR` (`/tmp` on Unix when it is not set), as for
+the other runners, and are removed as each check ends. The fixtures are the cached masters in the
+fixture cache below the target directory, which the checks only read. The run directory holds:
+
+```text
+sweep.json                   the harness-sweep document
+table.txt                    the grid, then the detail behind every cell
+builds/<label>.log           cargo's output of each ref built in this run
+evidence/<label>/<name>.txt  one file per check; <name> is <check>[-<fixture>][-<profile>]
+```
+
+An evidence file holds the observation in full and the last screen the check saw (for an oracle
+scan, the first discrepancies of the diff; for the filter check, a line and the final screen of each
+variant, those that did not run included).
+
+`<label>` names a version's files, and the ref as it was typed never does. It is the ref with every
+character outside `A-Za-z0-9._-` replaced by `_` (a non-ASCII one too, and a leading `.` or `-`),
+cut to 64 characters, then `-` and the first 12 characters of the commit: `v1.3.0` at a commit that
+begins `0123456789ab` is `v1.3.0-0123456789ab`, and one of its evidence files is
+`evidence/v1.3.0-0123456789ab/headless-oracle-hostile-small-default.txt`. A label is never empty,
+never begins with `.` or `-`, and holds no separator, so no ref (`feature/x`, `a/../b`,
+`v1.4.0^{/fix}`) can make a subdirectory, leave the run directory, or hide a file. `xtask` and the
+harness make it with one function, `excise_harness::sweep::label`, so the log and the evidence of a
+version share it. Two versions whose labels are the same, with letters compared without case
+(`release/1.0` and `release_1.0` at one commit, or `Main` and `main`), would keep their files under
+one name and are refused before any fixture is prepared: the command exits 1 with no table, after
+the builds, which stay cached. Name one of them by its commit.
+
+`table.txt` lists the builds (commit, toolchain, built or cached or failed) and then, for every
+defect, its changelog entry, how it is measured, and every cell with its `value`, `why`, and
+`evidence`. The command prints the grid on stdout (`AFF` affected, `ok` not affected, `n/m` not
+measurable, then the title of every defect and a legend), then the lines `table:` and `document:`
+with the two paths; its progress and its problems go to stderr.
+
+**What it leaves behind.** By the time the command returns, whether it finished, failed, or stopped
+on a changed fixture, the scratch areas and fixture copies it made (below `EXCISE_E2E_TMPDIR`, or
+`/tmp` on Unix) are removed, on every platform, and so is the worktree of every build: the
+directory that held them, `target/excise-sweep-worktrees/`, is left empty. What stays is what it is
+for: the run directory, the cached builds (`target/excise-sweep-builds/`), and the cached fixtures
+(`target/excise-fixtures.noindex/`). A sweep that is killed (Ctrl-C, `SIGKILL`, power loss) runs no
+cleanup. It leaves the scratch areas (`xh-scratch-*`) and fixture copies
+(`<fixture>-<process id>-<number>`) it was using, at most one build worktree, and a build that was
+running, which goes on until it ends (see **Bounds**). The signals it sends (see **Signals**) leave
+nothing on macOS, where none of them makes the system write a crash report, and no core file on
+Linux, except on a machine that pipes core dumps to a handler, whose files are its own. A build that
+crashes by itself can still make the operating system write a crash report: on macOS into the
+person's own `~/Library/Logs/DiagnosticReports`, which the sweep neither prevents nor deletes. It
+deletes nothing in the person's home folder.
+
+**Exit status.** The command exits 0 when every build was made and every check could be carried
+out. It exits 1 when a build failed or a check was `errored`, and still writes and prints the
+table, because a version without a binary is a column of `not-measurable` cells; each problem is
+named on stderr (`problem: ...`). It exits 1 without a table when the command line is not valid
+(the usage line follows the message), when a ref does not resolve or a pinned toolchain is
+missing (before the first build), when a fixture cannot be made or does not exist, when a fixture
+is not what its plan says or a build or a check changed one (see **No deletion, ever**), when two
+versions would keep their files under one name (see **Output**), and when the output cannot be
+written. A check that did not run (`not-run`) is not a problem: it leaves `not-measurable` cells
+that give its reason.
+
+**The document.** `sweep.json` is a `harness-sweep` document (see
+[Output documents](#output-documents)). `versions` are the columns: the ref, its commit, the
+toolchain, the SHA-256 of the binary, how the build went, and what its `--help` lists.
+`measurements` are the paired timings, one for each metric (`headless_wall_ms`, `report_write_ms`,
+`headless_scan_ms`, and `tui_complete_ms`), fixture, profile, and terminal speed: the `rounds` that
+were planned, the versions that ran in each round in the order they ran (`order`), `du`'s time in
+each round (`du_samples`, for the scan's wall time only: one entry for each round, `null` for a
+round it could not be timed in, and absent when it could not be timed in any), and a `series` for
+each version that ran. A series has the `rounds` its samples were taken in (counted from 0, after
+the warm-up; a round in which the run had no usable reading is not among them), the `samples` in
+milliseconds, whether each `completed` within the bound, how many rounds were `skipped`, the
+`median` of the samples that completed, and its `ratios`, by what each is taken against:
+`candidate`, `du` (a scan over `du -sk`), `headless-scan` (an interface run over the headless scan
+of the same version without its report write, in the same round), and `reduced-motion` (default
+over reduced motion, against the slow terminal, for the same version in the same round). A ratio
+has `pairs`, the rounds in which both sides finished, and, when there are any, their `median` and
+its `bootstrap_ci`; `lower_bounds` and `upper_bounds`, one for each round in which only the
+numerator's or only the denominator's run did not finish; and `both_censored`, how many rounds
+neither side finished in. `checks` are the observations of every other check on every version
+(`ran`, `not-run`, or `errored`, with its metrics, notes, and evidence file), `rows` is the table,
+and `context` is the conditions the run had: the host, the load average at the start and the end,
+the other `excise` processes found running (the run warns about them, as `bench-e2e` does, so close
+them first), the commit of the checkout, the rounds, the seed, the rate of the slow terminal, the
+timeout, and the fixtures. A cell's `evidence` lists paths below the run directory and JSON
+pointers into the document (`#/checks/12`, `#/measurements/0`).
 
 ## Counts
 
@@ -1960,7 +2477,9 @@ path.
 4. **Deletion is guarded.** A scenario with a `delete` step must declare at least one sentinel. The
    `delete` step confirms only after the dialog matches the expected entry and the sentinels exist.
    The [interactive driver](#interactive-driver) holds itself to the same rule: its `delete` runs
-   the same protocol, and its `keys` never sends a key that could confirm a deletion dialog. A
+   the same protocol, and its `keys` never sends a key that could confirm a deletion dialog. The
+   [version sweep](#version-sweep) runs published builds, which predate these guards, and goes
+   further: it has no `delete` step and sends no key that could ask for a deletion. A
    scenario's own `key` that asks for a deletion (Backspace, or bytes that finish an escape
    sequence that earlier keys began, as `alt+[` and `121u` do) engages its run: from then on a `y`,
    Enter, filter text, or quit confirmation is sent only on an exact screen that shows no deletion
@@ -2358,6 +2877,7 @@ Machine output is versioned JSON. Every document carries a `document_kind` and a
 | Failure bundle | `harness-failure` | 1 | `cargo xtask e2e` | [`harness-failure.schema.json`](schemas/harness-failure.schema.json) | The evidence for one failed scenario: the failed step, expected and actual screen text, terminal modes, the session's diagnostics (present only when the step timed out; see [Runner semantics](#runner-semantics)), the recording path, resource use, the fixture hash and seed, and a command that reruns it. |
 | A/B evidence | `harness-ab` | 1 | `cargo xtask bench-e2e` | [`harness-ab.schema.json`](schemas/harness-ab.schema.json) | Paired, interleaved comparison of two builds: identities, trials, run order, per-metric samples, median ratio, bootstrap confidence interval and verdict, and the conditions it ran under (the fixtures compared, the host, the toolchain, the power state, the load average, and concurrent `excise` processes). |
 | Counts | `harness-counts` | 1 | `cargo xtask counts` (the history job's record is the same document) | [`harness-counts.schema.json`](schemas/harness-counts.schema.json) | The deterministic counts of one build: the commit and its time, the runner, the toolchain, a pull request's number, base, and head when it is one, and per fixture and profile the fixture's hash and seed and an open map of counts (see [Counts](#counts)). It holds nothing that depends on the run, so a commit counted twice gives the same bytes. |
+| Version sweep | `harness-sweep` | 1 | `cargo xtask sweep` | [`harness-sweep.schema.json`](schemas/harness-sweep.schema.json) | What the sweep found of every published version and the candidate: the versions (ref, commit, toolchain, binary digest, how the build went, what its `--help` lists), the paired and interleaved timings (every sample with the round it was taken in and whether it finished, how many rounds a version was skipped in, each version's median, and its ratios, with bootstrap intervals over the rounds in which both sides finished and the bounds the other rounds give), the observation of every other check with its evidence file, the conditions it ran under, and the table: one row per defect, one cell per version (`affected`, `not-affected`, or `not-measurable`, with the reason, the measured value, and the evidence). See [Version sweep](#version-sweep). |
 | Tui command | `harness-tui` | 1 | `cargo xtask tui` | [`harness-tui.schema.json`](schemas/harness-tui.schema.json) | What one interactive-driver command prints: its result, whose shape depends on `command` (the first screen, the screen and the events after keys, a deletion's verified dialog and sentinels, the screen, the event records, how the session ended, or the open sessions), or why it failed. |
 | Shape profile | `harness-shape-profile` | 1 | `excise-shape profile` | [`harness-shape-profile.schema.json`](schemas/harness-shape-profile.schema.json) | The shape of one tree as aggregates only: counts by kind and by depth, histograms of what a folder holds, of file sizes, and of name lengths, hard links, symbolic links, and unreadable entries; never a name, a path, a link target, an owner, or a timestamp (see [Shape profiles](#shape-profiles)). |
 
@@ -2375,6 +2895,17 @@ digest: the frame records are summarized, and `events` is the one command that l
 tests in `src/report/tests.rs` cover every shape of the document, and `xtask/tests/tui.rs`
 validates the documents the real commands print.
 
+`cargo xtask sweep` writes one `harness-sweep` document, `target/excise-sweep/<run-id>/sweep.json`,
+and its table is the document's `rows`. The schema cannot say that the candidate is the last of the
+versions, that a ref names one version, that every row has one cell per version in their order, that
+every series and check names a version, that a series' samples, completion flags, and rounds line
+up, that its rounds increase and stay below the rounds the measurement ran, that its samples and
+skipped rounds are no more than those rounds, that a ratio has a median and an interval exactly when
+some round had a ratio and counts no more rounds than the measurement ran, that the `du` samples of
+a measurement are one for each round, or that a `not-measurable` cell, a check that did not run, and
+a failed build each say why; `HarnessSweep::check` holds a document to them, and the sweep checks
+its own document with it before it writes it.
+
 A `metrics` map is deliberately open: the harness does not constrain which names appear, and the
 schemas say so rather than enumerating them (a scenario's own `measure` names, a fixture's class,
 or a future metric all pass through unchanged). Fixed-shape fields (identities, verdicts, the
@@ -2383,10 +2914,10 @@ member or an undeclared field.
 
 Each schema's `$id` is
 `https://github.com/findyourexit/excise/harness/schemas/<document_kind>-v1.json`. The Rust types
-are `HarnessSummary`, `HarnessFailure`, `HarnessAb`, `HarnessCounts`, `HarnessTui`, and
-`HarnessShapeProfile` in `excise_harness::report`. They implement `Document`, which carries the
-kind, the schema id, and the schema text, and renders the canonical form: pretty-printed JSON in
-field order with a final newline.
+are `HarnessSummary`, `HarnessFailure`, `HarnessAb`, `HarnessCounts`, `HarnessSweep`,
+`HarnessTui`, and `HarnessShapeProfile` in `excise_harness::report`. They implement `Document`,
+which carries the kind, the schema id, and the schema text, and renders the canonical form:
+pretty-printed JSON in field order with a final newline.
 
 The schemas live here, not in `docs/schemas`, because that directory is copied into release
 archives and packages and these formats are not part of the product. The types and the schemas

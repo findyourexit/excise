@@ -2,18 +2,17 @@
 //!
 //! This is a thin wrapper, like `e2e` and `headless`: the comparison engine, the bootstrap
 //! statistics, the verdict policy, and the context all live in `excise_harness::bench`; this file
-//! parses the command line, builds or locates the baseline and candidate binaries (including the
-//! baseline's temporary detached worktree), prints the verdict table, and turns the result into
-//! an exit status.
+//! parses the command line, builds or locates the baseline and candidate binaries (the baseline
+//! through `refs::build_planned`, in a temporary detached worktree, with the toolchain of this
+//! environment and with its output in a log file), prints the verdict table, and turns the result
+//! into an exit status.
 
 use std::{
     env,
     error::Error,
-    ffi::OsString,
-    fs, io,
+    io,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -24,7 +23,11 @@ use excise_harness::{
     scenario::{Budget, Profile},
 };
 
-use crate::{e2e::build_release_binary, headless::fixtures_in};
+use crate::{
+    e2e::build_release_binary,
+    headless::fixtures_in,
+    refs::{BuildSpec, RefLayout, ToolchainPolicy, build_planned, is_cached, plan_ref},
+};
 
 const USAGE: &str = "usage: cargo xtask bench-e2e --baseline <ref> [--baseline-binary PATH] \
                      [--candidate-binary PATH] [--fixture ID]... [--fixture-dir DIR] \
@@ -39,6 +42,15 @@ const DEFAULT_SEED: u64 = 0;
 /// `--timeout` when it is not given: generous enough for a 1,000,000-entry fixture (F1 measured
 /// about 556 s wall on the per-run-flush baseline).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(900);
+/// Where the baselines are cached, directly below the target directory: `<sha>/` below it is the
+/// target directory of the build of one commit, and its `release/excise` is the baseline binary.
+const BASELINES_DIR: &str = "excise-bench-e2e-baselines";
+/// Where the temporary worktrees of the baseline builds are made, directly below the target
+/// directory.
+const WORKTREES_DIR: &str = "excise-bench-e2e-worktrees";
+/// The file the output of a baseline build goes to, directly in the baselines directory and in no
+/// `<sha>` directory below it. Every build truncates it.
+const BASELINE_LOG: &str = "baseline-build.log";
 
 /// What the command line asked for.
 #[derive(Debug, Default)]
@@ -120,9 +132,45 @@ pub fn bench_e2e(args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error
     }
 }
 
-/// The baseline binary and its `git_ref` label: built from `--baseline <ref>` in a temporary
-/// worktree, or `--baseline-binary` taken as-is (labeled with `--baseline` if that was also
-/// given, else a `binary:<path>` placeholder).
+/// Where a baseline is built, and where its build writes what it prints: the layout of the shared
+/// ref builder below the target directory, and the log of the build.
+struct BaselineBuild {
+    layout: RefLayout,
+    log: PathBuf,
+}
+
+impl BaselineBuild {
+    /// The baseline build below `target`: the cache is `target/excise-bench-e2e-baselines/`, the
+    /// temporary worktrees are made in `target/excise-bench-e2e-worktrees/`, and the log is
+    /// `baseline-build.log` directly in the cache directory.
+    fn below(target: &Path) -> Self {
+        let layout = RefLayout::below(target, BASELINES_DIR, WORKTREES_DIR);
+        let log = layout.builds.join(BASELINE_LOG);
+        Self { layout, log }
+    }
+
+    /// The spec of the baseline build of the repository at `root`: with the toolchain of this
+    /// environment, so that the baseline is compiled by the compiler of the candidate, and with
+    /// the output of the build in the log and never on the terminal. The build runs in a process
+    /// group of its own, which is not the terminal's foreground group, and a write to the
+    /// terminal would stop it where the terminal sets `tostop`.
+    fn spec<'a>(&'a self, root: &'a Path) -> BuildSpec<'a> {
+        BuildSpec {
+            root,
+            layout: &self.layout,
+            policy: ToolchainPolicy::Inherited,
+            log: Some(&self.log),
+        }
+    }
+}
+
+/// The baseline binary and its `git_ref` label: `--baseline <ref>`, resolved once by
+/// `refs::plan_ref` and then built, at the commit it resolved to, by `refs::build_planned` in a
+/// temporary detached worktree, with the toolchain of this environment so that the baseline is
+/// compiled by the same compiler as the candidate, with its output in
+/// `target/excise-bench-e2e-baselines/baseline-build.log`, and cached by commit SHA under
+/// `target/excise-bench-e2e-baselines/`; or `--baseline-binary` taken as-is (labeled with
+/// `--baseline` if that was also given, else a `binary:<path>` placeholder).
 fn resolve_baseline(
     selection: &Selection,
     root: &Path,
@@ -139,7 +187,22 @@ fn resolve_baseline(
         .baseline_ref
         .clone()
         .expect("parse requires --baseline when --baseline-binary is absent");
-    build_baseline_binary(root, target, &reference)
+    let baseline = BaselineBuild::below(target);
+    let spec = baseline.spec(root);
+    // The ref is resolved once, here, and the plan is what is announced and what is built: asking
+    // for the ref again could resolve a branch that has moved since, so that a build nobody was
+    // told of starts, or an announced one does not run. The build's output goes to the log, so
+    // the person who waits for it is told where it is, and only when a build runs: a baseline
+    // that is cached builds nothing.
+    let plan = plan_ref(&spec, &reference)?;
+    if !is_cached(&spec, &plan)? {
+        eprintln!(
+            "building the baseline {reference}; its output is in {}",
+            baseline.log.display()
+        );
+    }
+    let built = build_planned(&spec, &plan)?;
+    Ok((built.binary, built.sha))
 }
 
 /// The cases named on the command line: every `--fixture` (checked against the ids of `fixtures`,
@@ -334,130 +397,6 @@ fn current_candidate_ref(root: &Path) -> Result<String, Box<dyn Error>> {
     })
 }
 
-/// Builds `reference` in a temporary detached worktree with its own `CARGO_TARGET_DIR`, release,
-/// `--locked`, then removes the worktree. The built binary is cached by commit SHA under the
-/// target directory, so a re-run with the same resolved commit does not rebuild.
-///
-/// Returns the binary's path and the resolved 40-character commit SHA.
-fn build_baseline_binary(
-    root: &Path,
-    target: &Path,
-    reference: &str,
-) -> Result<(PathBuf, String), Box<dyn Error>> {
-    let sha = resolve_commit(root, reference)?;
-    let cache_dir = target.join("excise-bench-e2e-baselines").join(&sha);
-    let binary_path = cache_dir
-        .join("release")
-        .join(format!("excise{}", env::consts::EXE_SUFFIX));
-    if binary_path.is_file() {
-        return Ok((binary_path, sha));
-    }
-
-    let worktree_parent = target.join("excise-bench-e2e-worktrees");
-    fs::create_dir_all(&worktree_parent).map_err(|error| {
-        io::Error::other(format!(
-            "cannot create `{}`: {error}",
-            worktree_parent.display()
-        ))
-    })?;
-    let worktree_dir = unique_worktree_dir(&worktree_parent, &sha);
-
-    let add_status = Command::new("git")
-        .current_dir(root)
-        .args(["worktree", "add", "--detach"])
-        .arg(&worktree_dir)
-        .arg(&sha)
-        .status()
-        .map_err(|error| io::Error::other(format!("could not run `git worktree add`: {error}")))?;
-    if !add_status.success() {
-        return Err(io::Error::other(format!(
-            "`git worktree add --detach {} {sha}` failed ({add_status})",
-            worktree_dir.display()
-        ))
-        .into());
-    }
-
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let build_result = Command::new(&cargo)
-        .current_dir(&worktree_dir)
-        .env("CARGO_TARGET_DIR", &cache_dir)
-        .args(["build", "--release", "--locked", "-p", "excise"])
-        .status();
-
-    // The worktree is removed whether the build succeeded or not, so a failed baseline build
-    // never leaves one behind.
-    let remove_status = Command::new("git")
-        .current_dir(root)
-        .args(["worktree", "remove", "--force"])
-        .arg(&worktree_dir)
-        .status();
-
-    let build_status = build_result.map_err(|error| {
-        io::Error::other(format!("could not start {}: {error}", cargo.display()))
-    })?;
-    match remove_status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            return Err(io::Error::other(format!(
-                "`git worktree remove --force {}` failed ({status})",
-                worktree_dir.display()
-            ))
-            .into());
-        }
-        Err(error) => {
-            return Err(
-                io::Error::other(format!("could not run `git worktree remove`: {error}")).into(),
-            );
-        }
-    }
-    if !build_status.success() {
-        return Err(io::Error::other(format!(
-            "building the baseline release binary ({sha}) failed ({build_status})"
-        ))
-        .into());
-    }
-    Ok((binary_path, sha))
-}
-
-/// Resolves `reference` (a branch, tag, or SHA) to its 40-character commit SHA, peeling an
-/// annotated tag to the commit it points at.
-fn resolve_commit(root: &Path, reference: &str) -> Result<String, Box<dyn Error>> {
-    let output = Command::new("git")
-        .current_dir(root)
-        .args(["rev-parse", &format!("{reference}^{{commit}}")])
-        .output()
-        .map_err(|error| io::Error::other(format!("could not run `git rev-parse`: {error}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let detail = if stderr.is_empty() {
-            format!("exit status {}", output.status)
-        } else {
-            stderr
-        };
-        return Err(io::Error::other(format!(
-            "cannot resolve `{reference}` to a commit: {detail}"
-        ))
-        .into());
-    }
-    let sha = String::from_utf8(output.stdout)
-        .map_err(|error| {
-            io::Error::other(format!("`git rev-parse` returned invalid UTF-8: {error}"))
-        })?
-        .trim()
-        .to_owned();
-    Ok(sha)
-}
-
-/// A unique, not-yet-existing path below `parent` for one baseline worktree.
-fn unique_worktree_dir(parent: &Path, sha: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    parent.join(format!(
-        "{sha}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +509,50 @@ mod tests {
         assert_eq!(selection.memory_tolerance, Some(0.1));
         assert!(selection.strict);
         assert_eq!(selection.timeout, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn the_baseline_build_logs_directly_in_the_baselines_directory_whatever_the_target() {
+        for target in [
+            "target",
+            "/work/target",
+            "../shared/target",
+            "a b/target",
+            ".",
+        ] {
+            let baseline = BaselineBuild::below(Path::new(target));
+            let spec = baseline.spec(Path::new("/repo"));
+
+            // The output of the build goes to a log, never to the terminal. The log is a file
+            // directly in the cache directory: in no `<sha>` directory below it, which a build
+            // uses as its target directory.
+            let log = spec.log.expect("the baseline build has a log");
+            assert_eq!(
+                log.parent(),
+                Some(baseline.layout.builds.as_path()),
+                "{target}"
+            );
+            assert_eq!(
+                log.file_name().and_then(|name| name.to_str()),
+                Some("baseline-build.log"),
+                "{target}"
+            );
+            // The documented paths are kept: the cache and the worktrees are where they were.
+            assert_eq!(
+                baseline.layout.builds,
+                Path::new(target).join("excise-bench-e2e-baselines"),
+                "{target}"
+            );
+            assert_eq!(
+                baseline.layout.worktrees,
+                Path::new(target).join("excise-bench-e2e-worktrees"),
+                "{target}"
+            );
+            // The same builder as before: the toolchain of this environment, in the repository
+            // that was asked for.
+            assert_eq!(spec.policy, ToolchainPolicy::Inherited);
+            assert_eq!(spec.root, Path::new("/repo"));
+            assert_eq!(spec.layout, &baseline.layout);
+        }
     }
 }

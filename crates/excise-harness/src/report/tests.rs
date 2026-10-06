@@ -6,12 +6,15 @@ use jsonschema::Validator;
 use serde_json::Value;
 
 use super::{
-    AbContext, AbFixture, AbKind, AbVerdict, BinaryIdentity, BuildIdentity, ConfidenceInterval,
-    CountsCase, CountsContext, CountsFixture, CountsInvalid, CountsKind, CountsRunner, Document,
-    FailedStep, FailureKind, FixtureIdentity, HarnessAb, HarnessCounts, HarnessFailure,
-    HarnessSummary, HarnessTui, MAX_CASES, MAX_COUNT, MetricComparison, PullRequestOrigin, Rusage,
-    SCHEMA_VERSION, Samples, ScenarioResult, SchemaVersion, ScreenComparison, SessionDiagnostics,
-    Side, SummaryKind, TerminalModes, Tier, TimingWarning, Verdict,
+    AbContext, AbFixture, AbKind, AbVerdict, BinaryIdentity, BuildIdentity, BuildStatus, CellState,
+    CheckStatus, ConfidenceInterval, CountsCase, CountsContext, CountsFixture, CountsInvalid,
+    CountsKind, CountsRunner, Document, FailedStep, FailureKind, FixtureIdentity, HarnessAb,
+    HarnessCounts, HarnessFailure, HarnessSummary, HarnessSweep, HarnessTui, MAX_CASES, MAX_COUNT,
+    MetricComparison, PullRequestOrigin, Rusage, SCHEMA_VERSION, Samples, ScenarioResult,
+    SchemaVersion, ScreenComparison, SessionDiagnostics, Side, SummaryKind, SweepBuild, SweepCell,
+    SweepCheck, SweepContext, SweepInvalid, SweepKind, SweepMeasurement, SweepRatio, SweepRow,
+    SweepSeries, SweepTier, SweepToolchain, SweepTraits, SweepVersion, TerminalModes, Tier,
+    TimingWarning, Verdict,
     tui::{
         BoxInfo, Cleanup, CloseResult, ConfirmationKind, Cursor, DeleteDialogInfo,
         DeleteDialogKind, DeleteResult, DialogInfo, EventRecord, EventRecordKind, EventsPage,
@@ -276,6 +279,415 @@ fn minimal_counts() -> HarnessCounts {
     document
 }
 
+/// A sweep with every optional field present: an old version, one whose build failed, and the
+/// candidate; a headless timing and an interface timing; a check of each status; and two rows
+/// between them holding a cell of each state.
+fn sweep() -> HarnessSweep {
+    HarnessSweep {
+        document_kind: SweepKind::HarnessSweep,
+        schema_version: SchemaVersion,
+        run_id: "20261006T091500Z-5c1e".to_owned(),
+        tier: SweepTier::Full,
+        started_at: "2026-10-06T09:15:00Z".to_owned(),
+        finished_at: "2026-10-06T20:47:41.250+11:00".to_owned(),
+        candidate: "HEAD".to_owned(),
+        context: sweep_context(),
+        versions: sweep_versions(),
+        measurements: vec![headless_measurement(), tui_measurement()],
+        checks: sweep_checks(),
+        rows: sweep_rows(),
+    }
+}
+
+fn sweep_context() -> SweepContext {
+    SweepContext {
+        host: "macbook".to_owned(),
+        cpu: "Apple M1 Pro".to_owned(),
+        os: "macOS 26.0".to_owned(),
+        arch: "aarch64".to_owned(),
+        logical_cpus: 10,
+        power: "ac".to_owned(),
+        load_average_start: 1.2,
+        load_average_end: 1.5,
+        concurrent_excise_processes: 0,
+        checkout_sha: GIT_SHA.to_owned(),
+        rounds: 3,
+        seed: 24_301,
+        drain_bytes_per_sec: 150_000,
+        timeout_ms: 30_000,
+        du: Some("/usr/bin/du".to_owned()),
+        fixtures: vec![
+            AbFixture {
+                id: "node-modules-2k".to_owned(),
+                hash: FIXTURE_HASH.to_owned(),
+                seed: 7,
+            },
+            AbFixture {
+                id: "tiny-files-50k".to_owned(),
+                hash: FIXTURE_HASH.replace('3', "4"),
+                seed: 50_000,
+            },
+        ],
+    }
+}
+
+/// An old version that built under an older toolchain, a version whose build failed (so that it has
+/// no binary and nothing was learned of one), and the candidate.
+fn sweep_versions() -> Vec<SweepVersion> {
+    vec![
+        SweepVersion {
+            reference: "v1.0.0".to_owned(),
+            sha: "c0ffee0123456789c0ffee0123456789c0ffee01".to_owned(),
+            toolchain: Some(SweepToolchain {
+                channel: "1.88.0".to_owned(),
+                rustc: "rustc 1.88.0 (6b00bc388 2025-06-23)".to_owned(),
+            }),
+            binary_sha256: Some(SHA256.replace('9', "a")),
+            build: SweepBuild {
+                status: BuildStatus::Built,
+                cached: true,
+                reason: None,
+                log: None,
+            },
+            traits: Some(SweepTraits {
+                report_version: Some(1),
+                scan_store_dir: false,
+            }),
+        },
+        SweepVersion {
+            reference: "v1.1.0".to_owned(),
+            sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            toolchain: None,
+            binary_sha256: None,
+            build: SweepBuild {
+                status: BuildStatus::Failed,
+                cached: false,
+                reason: Some("cargo build exited with status 101".to_owned()),
+                log: Some("builds/v1.1.0.log".to_owned()),
+            },
+            traits: None,
+        },
+        SweepVersion {
+            reference: "HEAD".to_owned(),
+            sha: GIT_SHA.to_owned(),
+            toolchain: Some(SweepToolchain {
+                channel: "1.98.0".to_owned(),
+                rustc: "rustc 1.98.0 (88d9e12ae 2026-08-18)".to_owned(),
+            }),
+            binary_sha256: Some(SHA256.to_owned()),
+            build: SweepBuild {
+                status: BuildStatus::Built,
+                cached: false,
+                reason: None,
+                log: None,
+            },
+            traits: Some(SweepTraits {
+                report_version: Some(1),
+                scan_store_dir: true,
+            }),
+        },
+    ]
+}
+
+/// A ratio over three rounds in which both sides finished, with a 95% interval, and no round in
+/// which a run did not finish.
+fn sweep_ratio(median: f64, lower: f64, upper: f64) -> SweepRatio {
+    SweepRatio {
+        median: Some(median),
+        bootstrap_ci: Some(ConfidenceInterval {
+            lower,
+            upper,
+            confidence: 0.95,
+        }),
+        pairs: 3,
+        lower_bounds: Vec::new(),
+        upper_bounds: Vec::new(),
+        both_censored: 0,
+    }
+}
+
+/// The order of three rounds that ran `v1.0.0` and `HEAD` in turn, the second round reversed.
+fn sweep_rounds() -> Vec<Vec<String>> {
+    vec![
+        vec!["v1.0.0".to_owned(), "HEAD".to_owned()],
+        vec!["HEAD".to_owned(), "v1.0.0".to_owned()],
+        vec!["v1.0.0".to_owned(), "HEAD".to_owned()],
+    ]
+}
+
+/// A scan timed against `du`, whose samples are present except for the round it could not be
+/// timed in, which the `du` ratios leave out instead of shifting the rounds after it.
+fn headless_measurement() -> SweepMeasurement {
+    SweepMeasurement {
+        metric: "headless_wall_ms".to_owned(),
+        fixture: "node-modules-2k".to_owned(),
+        profile: None,
+        drain_bytes_per_sec: None,
+        rounds: 3,
+        order: sweep_rounds(),
+        du_samples: vec![Some(40.0), None, Some(50.0)],
+        series: vec![
+            SweepSeries {
+                reference: "v1.0.0".to_owned(),
+                rounds: vec![0, 1, 2],
+                samples: vec![120.0, 100.0, 110.0],
+                completed: vec![true, true, true],
+                skipped: 0,
+                median: Some(110.0),
+                ratios: BTreeMap::from([
+                    ("candidate".to_owned(), sweep_ratio(1.22, 1.0, 1.5)),
+                    (
+                        "du".to_owned(),
+                        SweepRatio {
+                            pairs: 2,
+                            ..sweep_ratio(2.6, 2.2, 3.0)
+                        },
+                    ),
+                ]),
+            },
+            SweepSeries {
+                reference: "HEAD".to_owned(),
+                rounds: vec![0, 1, 2],
+                samples: vec![80.0, 100.0, 90.0],
+                completed: vec![true, true, true],
+                skipped: 0,
+                median: Some(90.0),
+                ratios: BTreeMap::from([
+                    ("candidate".to_owned(), sweep_ratio(1.0, 1.0, 1.0)),
+                    (
+                        "du".to_owned(),
+                        SweepRatio {
+                            pairs: 2,
+                            ..sweep_ratio(1.9, 1.8, 2.0)
+                        },
+                    ),
+                ]),
+            },
+        ],
+    }
+}
+
+/// An interface run against a slow terminal under a profile, in which `v1.0.0` ran out of time in
+/// its second round and was then given up on, so that it has no sample for the third.
+fn tui_measurement() -> SweepMeasurement {
+    SweepMeasurement {
+        metric: "tui_complete_ms".to_owned(),
+        fixture: "node-modules-2k".to_owned(),
+        profile: Some(Profile::Default),
+        drain_bytes_per_sec: Some(150_000),
+        rounds: 3,
+        order: vec![
+            vec!["v1.0.0".to_owned(), "HEAD".to_owned()],
+            vec!["HEAD".to_owned(), "v1.0.0".to_owned()],
+            vec!["HEAD".to_owned()],
+        ],
+        du_samples: Vec::new(),
+        series: vec![
+            SweepSeries {
+                reference: "v1.0.0".to_owned(),
+                rounds: vec![0, 1],
+                samples: vec![1_800.0, 30_000.0],
+                completed: vec![true, false],
+                skipped: 1,
+                median: Some(1_800.0),
+                ratios: BTreeMap::from([
+                    (
+                        "candidate".to_owned(),
+                        SweepRatio {
+                            pairs: 1,
+                            lower_bounds: vec![30.0],
+                            ..sweep_ratio(2.0, 2.0, 2.0)
+                        },
+                    ),
+                    (
+                        "reduced-motion".to_owned(),
+                        SweepRatio {
+                            pairs: 1,
+                            lower_bounds: vec![54.5],
+                            ..sweep_ratio(3.0, 3.0, 3.0)
+                        },
+                    ),
+                ]),
+            },
+            SweepSeries {
+                reference: "HEAD".to_owned(),
+                rounds: vec![0, 1, 2],
+                samples: vec![900.0, 1_000.0, 950.0],
+                completed: vec![true, true, true],
+                skipped: 0,
+                median: Some(950.0),
+                ratios: BTreeMap::from([
+                    ("candidate".to_owned(), sweep_ratio(1.0, 1.0, 1.0)),
+                    (
+                        "reduced-motion".to_owned(),
+                        sweep_ratio(1.118, 1.111, 1.125),
+                    ),
+                ]),
+            },
+        ],
+    }
+}
+
+/// A check of each status: two that ran, one that could not run on a version with no binary, and
+/// one that the harness could not carry out.
+fn sweep_checks() -> Vec<SweepCheck> {
+    vec![
+        SweepCheck {
+            reference: "v1.0.0".to_owned(),
+            check: "signal-term".to_owned(),
+            fixture: Some("tiny-files-50k".to_owned()),
+            profile: Some(Profile::Deterministic),
+            status: CheckStatus::Ran,
+            reason: None,
+            metrics: BTreeMap::from([
+                ("exit_code".to_owned(), 143.0),
+                ("residue_files".to_owned(), 3.0),
+            ]),
+            notes: vec![
+                "ended on SIGTERM with no report".to_owned(),
+                "left the scan store in the temporary directory".to_owned(),
+            ],
+            evidence: Some("evidence/v1.0.0/signal-term.json".to_owned()),
+        },
+        SweepCheck {
+            reference: "v1.1.0".to_owned(),
+            check: "headless-oracle".to_owned(),
+            fixture: None,
+            profile: None,
+            status: CheckStatus::NotRun,
+            reason: Some("the build failed, so there is no binary".to_owned()),
+            metrics: BTreeMap::new(),
+            notes: Vec::new(),
+            evidence: None,
+        },
+        SweepCheck {
+            reference: "HEAD".to_owned(),
+            check: "signal-term".to_owned(),
+            fixture: Some("tiny-files-50k".to_owned()),
+            profile: Some(Profile::Deterministic),
+            status: CheckStatus::Ran,
+            reason: None,
+            metrics: BTreeMap::from([
+                ("exit_code".to_owned(), 143.0),
+                ("residue_files".to_owned(), 0.0),
+            ]),
+            notes: vec!["ended on SIGTERM after a partial report".to_owned()],
+            evidence: Some("evidence/HEAD/signal-term.json".to_owned()),
+        },
+        SweepCheck {
+            reference: "HEAD".to_owned(),
+            check: "descriptors".to_owned(),
+            fixture: Some("tiny-files-50k".to_owned()),
+            profile: Some(Profile::Default),
+            status: CheckStatus::Errored,
+            reason: Some("lsof is not installed".to_owned()),
+            metrics: BTreeMap::new(),
+            notes: Vec::new(),
+            evidence: Some("evidence/HEAD/descriptors.txt".to_owned()),
+        },
+    ]
+}
+
+/// A row decided by the timings and one decided by a check, each with a cell of every state.
+fn sweep_rows() -> Vec<SweepRow> {
+    vec![
+        SweepRow {
+            defect: "F1".to_owned(),
+            title: "Scanning a large folder is slow".to_owned(),
+            changelog: "Scanning a large folder is now much faster".to_owned(),
+            measured_by: "headless_wall_ms".to_owned(),
+            cells: vec![
+                SweepCell {
+                    reference: "v1.0.0".to_owned(),
+                    state: CellState::Affected,
+                    reason: Some("the median is above 1.2x the candidate".to_owned()),
+                    value: Some("median 1.22x the candidate (95% CI 1.0-1.5)".to_owned()),
+                    evidence: vec!["#/measurements/0".to_owned()],
+                },
+                SweepCell {
+                    reference: "v1.1.0".to_owned(),
+                    state: CellState::NotMeasurable,
+                    reason: Some("the build failed, so there is no binary".to_owned()),
+                    value: None,
+                    evidence: vec!["builds/v1.1.0.log".to_owned()],
+                },
+                SweepCell {
+                    reference: "HEAD".to_owned(),
+                    state: CellState::NotAffected,
+                    reason: Some("the candidate is the reference".to_owned()),
+                    value: Some("median 1.0x the candidate".to_owned()),
+                    evidence: vec!["#/measurements/0".to_owned()],
+                },
+            ],
+            note: Some("the candidate is not-affected by construction".to_owned()),
+        },
+        SweepRow {
+            defect: "F10".to_owned(),
+            title: "SIGTERM leaves the scan store behind".to_owned(),
+            changelog: "Closing the terminal, or sending SIGTERM".to_owned(),
+            measured_by: "signal-term".to_owned(),
+            cells: vec![
+                SweepCell {
+                    reference: "v1.0.0".to_owned(),
+                    state: CellState::Affected,
+                    reason: None,
+                    value: None,
+                    evidence: vec!["#/checks/0".to_owned()],
+                },
+                SweepCell {
+                    reference: "v1.1.0".to_owned(),
+                    state: CellState::NotMeasurable,
+                    reason: Some("the build failed, so there is no binary".to_owned()),
+                    value: None,
+                    evidence: vec!["#/checks/1".to_owned()],
+                },
+                SweepCell {
+                    reference: "HEAD".to_owned(),
+                    state: CellState::NotAffected,
+                    reason: None,
+                    value: None,
+                    evidence: vec!["#/checks/2".to_owned()],
+                },
+            ],
+            note: None,
+        },
+    ]
+}
+
+/// A sweep with every optional field absent: one version that has no toolchain, digest, or traits,
+/// and a row with one cell and no note, from a quick run that timed and checked nothing.
+fn minimal_sweep() -> HarnessSweep {
+    let mut document = sweep();
+    document.tier = SweepTier::Quick;
+    document.context.du = None;
+    document.context.fixtures.clear();
+    document.versions = vec![SweepVersion {
+        reference: "HEAD".to_owned(),
+        sha: GIT_SHA.to_owned(),
+        toolchain: None,
+        binary_sha256: None,
+        build: SweepBuild {
+            status: BuildStatus::Built,
+            cached: false,
+            reason: None,
+            log: None,
+        },
+        traits: None,
+    }];
+    document.measurements.clear();
+    document.checks.clear();
+    document.rows.truncate(1);
+    document.rows[0].note = None;
+    document.rows[0].cells = vec![SweepCell {
+        reference: "HEAD".to_owned(),
+        state: CellState::NotAffected,
+        reason: None,
+        value: None,
+        evidence: Vec::new(),
+    }];
+    document
+}
+
 fn schema<D: Document>() -> Value {
     serde_json::from_str(D::SCHEMA_JSON).expect("the schema should be valid JSON")
 }
@@ -510,6 +922,7 @@ fn every_schema_is_draft_2020_12_and_compiles() {
     assert_schema_compiles::<HarnessFailure>();
     assert_schema_compiles::<HarnessAb>();
     assert_schema_compiles::<HarnessCounts>();
+    assert_schema_compiles::<HarnessSweep>();
     assert_schema_compiles::<HarnessTui>();
     assert_schema_compiles::<HarnessShapeProfile>();
 }
@@ -520,6 +933,7 @@ fn every_schema_identity_matches_the_rust_constants() {
     assert_schema_identity::<HarnessFailure>();
     assert_schema_identity::<HarnessAb>();
     assert_schema_identity::<HarnessCounts>();
+    assert_schema_identity::<HarnessSweep>();
     assert_schema_identity::<HarnessTui>();
     assert_schema_identity::<HarnessShapeProfile>();
     assert_eq!(SCHEMA_VERSION, 1);
@@ -532,6 +946,7 @@ fn the_rust_marker_fields_serialize_the_document_constants() {
         (to_value(&failure()), HarnessFailure::KIND),
         (to_value(&ab()), HarnessAb::KIND),
         (to_value(&counts()), HarnessCounts::KIND),
+        (to_value(&sweep()), HarnessSweep::KIND),
         (to_value(&tui_failure()), HarnessTui::KIND),
         (to_value(&shape_profile()), HarnessShapeProfile::KIND),
     ] {
@@ -547,6 +962,7 @@ fn every_object_in_every_schema_rejects_undeclared_fields() {
         schema::<HarnessFailure>(),
         schema::<HarnessAb>(),
         schema::<HarnessCounts>(),
+        schema::<HarnessSweep>(),
         schema::<HarnessTui>(),
         schema::<HarnessShapeProfile>(),
     ] {
@@ -565,6 +981,8 @@ fn serialized_documents_validate_against_their_schemas() {
     assert_valid(&minimal_counts());
     assert_valid(&shape_profile());
     assert_valid(&minimal_shape_profile());
+    assert_valid(&sweep());
+    assert_valid(&minimal_sweep());
 }
 
 #[test]
@@ -574,9 +992,14 @@ fn schemas_and_types_declare_exactly_the_same_fields() {
     assert_schema_and_types_declare_the_same_fields(&ab());
     assert_schema_and_types_declare_the_same_fields(&counts());
     assert_schema_and_types_declare_the_same_fields(&shape_profile());
+    assert_schema_and_types_declare_the_same_fields(&sweep());
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table of every closed vocabulary that a schema declares, a line at a time"
+)]
 fn enumerations_match_between_schemas_and_types() {
     fn names<T: Copy>(all: &[T], name: impl Fn(T) -> &'static str) -> BTreeSet<String> {
         all.iter().map(|&value| name(value).to_owned()).collect()
@@ -593,6 +1016,7 @@ fn enumerations_match_between_schemas_and_types() {
     let profiles = names(Profile::ALL, Profile::as_str);
     let summary_schema = schema::<HarnessSummary>();
     let ab_schema = schema::<HarnessAb>();
+    let sweep_schema = schema::<HarnessSweep>();
 
     assert_eq!(declared(&summary_schema, "/$defs/profile/enum"), profiles);
     assert_eq!(
@@ -603,6 +1027,7 @@ fn enumerations_match_between_schemas_and_types() {
         declared(&schema::<HarnessCounts>(), "/$defs/profile/enum"),
         profiles
     );
+    assert_eq!(declared(&sweep_schema, "/$defs/profile/enum"), profiles);
     assert_eq!(
         declared(&summary_schema, "/properties/tier/enum"),
         names(Tier::ALL, Tier::as_str)
@@ -618,6 +1043,22 @@ fn enumerations_match_between_schemas_and_types() {
     assert_eq!(
         declared(&ab_schema, "/$defs/metric/properties/verdict/enum"),
         names(AbVerdict::ALL, AbVerdict::as_str)
+    );
+    assert_eq!(
+        declared(&sweep_schema, "/properties/tier/enum"),
+        names(SweepTier::ALL, SweepTier::as_str)
+    );
+    assert_eq!(
+        declared(&sweep_schema, "/$defs/build/properties/status/enum"),
+        names(BuildStatus::ALL, BuildStatus::as_str)
+    );
+    assert_eq!(
+        declared(&sweep_schema, "/$defs/check/properties/status/enum"),
+        names(CheckStatus::ALL, CheckStatus::as_str)
+    );
+    assert_eq!(
+        declared(&sweep_schema, "/$defs/cell/properties/state/enum"),
+        names(CellState::ALL, CellState::as_str)
     );
     // A warning is only ever for a budget that the speed of the machine decides: the four latency
     // budgets and the three ratio budgets.
@@ -697,6 +1138,16 @@ fn remove(document: &mut Value, pointer: &str) {
         .and_then(Value::as_object_mut)
         .unwrap_or_else(|| panic!("{parent} should be an object"))
         .remove(name);
+}
+
+/// Adds the object member at `pointer`, whose parent must be an object.
+fn add(document: &mut Value, pointer: &str, value: Value) {
+    let (parent, name) = pointer.rsplit_once('/').expect("a member pointer");
+    document
+        .pointer_mut(parent)
+        .and_then(Value::as_object_mut)
+        .unwrap_or_else(|| panic!("{parent} should be an object"))
+        .insert(name.to_owned(), value);
 }
 
 /// One way to break a document, with a description for the failure message.
@@ -1025,6 +1476,8 @@ fn documents_render_a_canonical_form_that_round_trips() {
     assert_round_trips(&minimal_counts());
     assert_round_trips(&shape_profile());
     assert_round_trips(&minimal_shape_profile());
+    assert_round_trips(&sweep());
+    assert_round_trips(&minimal_sweep());
 }
 
 #[test]
@@ -1033,6 +1486,7 @@ fn documents_that_are_not_this_kind_and_version_are_rejected() {
 
     assert!(HarnessFailure::from_json_str(&text).is_err());
     assert!(HarnessAb::from_json_str(&text).is_err());
+    assert!(HarnessSweep::from_json_str(&text).is_err());
     assert!(HarnessSummary::from_json_str(&text.replace("harness-summary", "harness-ab")).is_err());
     let future = text.replace("\"schema_version\": 1", "\"schema_version\": 2");
     let error = HarnessSummary::from_json_str(&future).expect_err("version 2 is unsupported");
@@ -1061,9 +1515,12 @@ fn a_document_that_json_cannot_carry_is_refused_rather_than_written_as_null() {
         .insert("ratio".to_owned(), f64::NAN);
     let mut infinite = ab();
     infinite.metrics[0].samples.candidate[0] = f64::INFINITY;
+    let mut unbounded = sweep();
+    unbounded.measurements[0].series[0].samples[0] = f64::INFINITY;
 
     assert!(not_a_number.to_json_pretty().is_err());
     assert!(infinite.to_json_pretty().is_err());
+    assert!(unbounded.to_json_pretty().is_err());
 }
 
 #[test]
@@ -1381,6 +1838,830 @@ fn counts_documents_that_are_not_this_kind_and_version_or_have_other_numbers_are
             "{malformed}"
         );
     }
+}
+
+/// The pointer to one object of every shape a sweep document holds.
+const SWEEP_OBJECTS: [&str; 14] = [
+    "",
+    "/context",
+    "/context/fixtures/0",
+    "/versions/0",
+    "/versions/0/toolchain",
+    "/versions/0/build",
+    "/versions/0/traits",
+    "/measurements/0",
+    "/measurements/0/series/0",
+    "/measurements/0/series/0/ratios/candidate",
+    "/measurements/0/series/0/ratios/candidate/bootstrap_ci",
+    "/checks/0",
+    "/rows/0",
+    "/rows/0/cells/0",
+];
+
+/// The pointer to every kind of text a sweep document holds, each of which has to say something.
+const SWEEP_TEXTS: [&str; 32] = [
+    "/run_id",
+    "/candidate",
+    "/context/host",
+    "/context/cpu",
+    "/context/os",
+    "/context/arch",
+    "/context/power",
+    "/context/du",
+    "/versions/0/ref",
+    "/versions/0/toolchain/channel",
+    "/versions/0/toolchain/rustc",
+    "/versions/1/build/reason",
+    "/versions/1/build/log",
+    "/measurements/0/metric",
+    "/measurements/0/fixture",
+    "/measurements/0/order/0/0",
+    "/measurements/0/series/0/ref",
+    "/checks/0/ref",
+    "/checks/0/check",
+    "/checks/0/fixture",
+    "/checks/0/notes/0",
+    "/checks/0/evidence",
+    "/checks/1/reason",
+    "/rows/0/defect",
+    "/rows/0/title",
+    "/rows/0/changelog",
+    "/rows/0/measured_by",
+    "/rows/0/note",
+    "/rows/0/cells/0/ref",
+    "/rows/0/cells/0/reason",
+    "/rows/0/cells/0/value",
+    "/rows/0/cells/0/evidence/0",
+];
+
+#[test]
+fn the_sweep_schema_rejects_contract_drift() {
+    for pointer in SWEEP_OBJECTS {
+        let description = format!("an undeclared member of {pointer:?}");
+        let extra = |d: &mut Value| add(d, &format!("{pointer}/extra"), true.into());
+        assert_rejected(&sweep(), &[(description.as_str(), &extra)]);
+    }
+    assert_rejected(
+        &sweep(),
+        &[
+            ("another document kind", &|d| {
+                set(d, "/document_kind", "harness-ab".into());
+            }),
+            ("another schema version", &|d| {
+                set(d, "/schema_version", 2.into());
+            }),
+            ("no rows", &|d| remove(d, "/rows")),
+            ("an empty list of rows", &|d| {
+                set(d, "/rows", serde_json::json!([]));
+            }),
+            ("an empty list of versions", &|d| {
+                set(d, "/versions", serde_json::json!([]));
+            }),
+            ("an order that is not a list", &|d| {
+                set(d, "/measurements/0/order", "v1.0.0 then HEAD".into());
+            }),
+            ("an order of refs rather than rounds", &|d| {
+                set(
+                    d,
+                    "/measurements/0/order",
+                    serde_json::json!(["v1.0.0", "HEAD"]),
+                );
+            }),
+            ("a negative round count", &|d| {
+                set(d, "/measurements/0/rounds", (-1).into());
+            }),
+            ("an unknown tier", &|d| set(d, "/tier", "nightly".into())),
+            ("an unknown build status", &|d| {
+                set(d, "/versions/0/build/status", "cached".into());
+            }),
+            ("an unknown check status", &|d| {
+                set(d, "/checks/0/status", "skipped".into());
+            }),
+            ("an unknown cell state", &|d| {
+                set(d, "/rows/0/cells/0/state", "unaffected".into());
+            }),
+            ("an unknown profile", &|d| {
+                set(d, "/measurements/1/profile", "fancy".into());
+            }),
+            ("an empty ref", &|d| set(d, "/versions/0/ref", "".into())),
+            ("a short commit", &|d| {
+                set(d, "/versions/0/sha", "37d1c18".into());
+            }),
+            ("a time without a zone", &|d| {
+                set(d, "/started_at", "2026-10-06T09:15:00".into());
+            }),
+            ("a failed build with no reason", &|d| {
+                remove(d, "/versions/1/build/reason");
+            }),
+            ("a check that ran and gives a reason", &|d| {
+                add(d, "/checks/0/reason", "odd".into());
+            }),
+            ("a cell that is not measurable and gives no reason", &|d| {
+                remove(d, "/rows/0/cells/1/reason");
+            }),
+        ],
+    );
+}
+
+#[test]
+fn the_sweep_schema_requires_every_member_the_types_always_write() {
+    assert_rejected(
+        &sweep(),
+        &[
+            ("no run id", &|d| remove(d, "/run_id")),
+            ("no tier", &|d| remove(d, "/tier")),
+            ("no start time", &|d| remove(d, "/started_at")),
+            ("no finish time", &|d| remove(d, "/finished_at")),
+            ("no candidate", &|d| remove(d, "/candidate")),
+            ("no context", &|d| remove(d, "/context")),
+            ("no versions", &|d| remove(d, "/versions")),
+            ("no measurements", &|d| remove(d, "/measurements")),
+            ("no checks", &|d| remove(d, "/checks")),
+            ("a missing context field", &|d| remove(d, "/context/seed")),
+            ("a missing checkout commit", &|d| {
+                remove(d, "/context/checkout_sha");
+            }),
+            ("a fixture with no hash", &|d| {
+                remove(d, "/context/fixtures/0/hash");
+            }),
+            ("a version with no commit", &|d| {
+                remove(d, "/versions/0/sha");
+            }),
+            ("a version with no build", &|d| {
+                remove(d, "/versions/0/build");
+            }),
+            ("a toolchain with no rustc line", &|d| {
+                remove(d, "/versions/0/toolchain/rustc");
+            }),
+            ("a build with no cache flag", &|d| {
+                remove(d, "/versions/0/build/cached");
+            }),
+            ("traits with no scan store flag", &|d| {
+                remove(d, "/versions/0/traits/scan_store_dir");
+            }),
+            ("a timing with no series", &|d| {
+                remove(d, "/measurements/0/series");
+            }),
+            ("a timing with no order", &|d| {
+                remove(d, "/measurements/0/order");
+            }),
+            ("a series with no completion flags", &|d| {
+                remove(d, "/measurements/0/series/0/completed");
+            }),
+            ("a series with no ratios", &|d| {
+                remove(d, "/measurements/0/series/0/ratios");
+            }),
+            ("a ratio with no pair count", &|d| {
+                remove(d, "/measurements/0/series/0/ratios/du/pairs");
+            }),
+            ("a series with no rounds", &|d| {
+                remove(d, "/measurements/0/series/0/rounds");
+            }),
+            ("a series with no skipped count", &|d| {
+                remove(d, "/measurements/0/series/0/skipped");
+            }),
+            ("a ratio with no lower bounds", &|d| {
+                remove(d, "/measurements/0/series/0/ratios/du/lower_bounds");
+            }),
+            ("a ratio with no upper bounds", &|d| {
+                remove(d, "/measurements/0/series/0/ratios/du/upper_bounds");
+            }),
+            (
+                "a ratio with no count of rounds neither side finished",
+                &|d| {
+                    remove(d, "/measurements/0/series/0/ratios/du/both_censored");
+                },
+            ),
+            ("an interval with no upper bound", &|d| {
+                remove(d, "/measurements/0/series/0/ratios/du/bootstrap_ci/upper");
+            }),
+            ("a check with no metrics", &|d| {
+                remove(d, "/checks/0/metrics");
+            }),
+            ("a check with no notes", &|d| remove(d, "/checks/0/notes")),
+            ("a cell with no state", &|d| {
+                remove(d, "/rows/0/cells/0/state");
+            }),
+            ("a cell with no evidence", &|d| {
+                remove(d, "/rows/0/cells/0/evidence");
+            }),
+            ("a row with no cells", &|d| remove(d, "/rows/0/cells")),
+            ("a row with no measure", &|d| {
+                remove(d, "/rows/0/measured_by");
+            }),
+        ],
+    );
+}
+
+#[test]
+fn every_text_a_sweep_holds_must_say_something() {
+    for pointer in SWEEP_TEXTS {
+        let description = format!("an empty text at {pointer}");
+        let empty = |d: &mut Value| set(d, pointer, "".into());
+        assert_rejected(&sweep(), &[(description.as_str(), &empty)]);
+    }
+}
+
+#[test]
+fn the_sweep_schema_rejects_identities_and_times_that_name_nothing_exact() {
+    assert_rejected(
+        &sweep(),
+        &[
+            ("a commit that is too short", &|d| {
+                set(d, "/versions/0/sha", "37d1c18".into());
+            }),
+            ("a commit in capitals", &|d| {
+                set(d, "/versions/2/sha", GIT_SHA.to_uppercase().into());
+            }),
+            ("a commit that is not hexadecimal", &|d| {
+                set(d, "/versions/0/sha", "z".repeat(40).into());
+            }),
+            ("a checkout commit that is too short", &|d| {
+                set(d, "/context/checkout_sha", "37d1c18".into());
+            }),
+            ("a checkout commit in capitals", &|d| {
+                set(d, "/context/checkout_sha", GIT_SHA.to_uppercase().into());
+            }),
+            ("a digest that is too short", &|d| {
+                set(d, "/versions/0/binary_sha256", "abc".into());
+            }),
+            ("a digest in capitals", &|d| {
+                set(d, "/versions/2/binary_sha256", SHA256.to_uppercase().into());
+            }),
+            ("a start time without a zone", &|d| {
+                set(d, "/started_at", "2026-10-06T09:15:00".into());
+            }),
+            ("a finish time with a space", &|d| {
+                set(d, "/finished_at", "2026-10-06 09:47:41Z".into());
+            }),
+            ("a finish time that is not a time", &|d| {
+                set(d, "/finished_at", "yesterday".into());
+            }),
+            ("a finish time that is not a date", &|d| {
+                set(d, "/finished_at", "2026-13-45T25:61:61Z".into());
+            }),
+            ("a fixture hash that is not hexadecimal", &|d| {
+                set(d, "/context/fixtures/0/hash", "not-hex".into());
+            }),
+            ("a fixture id in capitals", &|d| {
+                set(d, "/context/fixtures/0/id", "Node-Modules-2k".into());
+            }),
+            ("a fixture id that is too long", &|d| {
+                set(d, "/context/fixtures/0/id", "n".repeat(65).into());
+            }),
+            ("an unknown profile in a timing", &|d| {
+                set(d, "/measurements/1/profile", "fancy".into());
+            }),
+            ("an unknown profile in a check", &|d| {
+                set(d, "/checks/0/profile", "fancy".into());
+            }),
+        ],
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table of the numbers a run cannot produce, one row each"
+)]
+fn the_sweep_schema_rejects_numbers_a_run_cannot_produce() {
+    assert_rejected(
+        &sweep(),
+        &[
+            ("a negative round count", &|d| {
+                set(d, "/measurements/0/rounds", (-1).into());
+            }),
+            ("a round count that is not whole", &|d| {
+                set(d, "/measurements/0/rounds", 2.5.into());
+            }),
+            ("a round count beyond 32 bits", &|d| {
+                set(d, "/measurements/0/rounds", 4_294_967_296_u64.into());
+            }),
+            ("a negative round count in the context", &|d| {
+                set(d, "/context/rounds", (-1).into());
+            }),
+            ("a negative pair count", &|d| {
+                set(d, "/measurements/0/series/0/ratios/du/pairs", (-1).into());
+            }),
+            ("a negative skipped count", &|d| {
+                set(d, "/measurements/1/series/0/skipped", (-1).into());
+            }),
+            ("a skipped count that is not whole", &|d| {
+                set(d, "/measurements/1/series/0/skipped", 1.5.into());
+            }),
+            ("a negative round number", &|d| {
+                set(d, "/measurements/0/series/0/rounds/0", (-1).into());
+            }),
+            ("a round number beyond 32 bits", &|d| {
+                set(
+                    d,
+                    "/measurements/0/series/0/rounds/0",
+                    4_294_967_296_u64.into(),
+                );
+            }),
+            ("a negative lower bound", &|d| {
+                set(
+                    d,
+                    "/measurements/1/series/0/ratios/candidate/lower_bounds/0",
+                    (-1.0).into(),
+                );
+            }),
+            ("a negative upper bound", &|d| {
+                set(
+                    d,
+                    "/measurements/1/series/0/ratios/candidate/upper_bounds",
+                    serde_json::json!([-0.5]),
+                );
+            }),
+            ("a negative count of rounds neither side finished", &|d| {
+                set(
+                    d,
+                    "/measurements/1/series/0/ratios/candidate/both_censored",
+                    (-1).into(),
+                );
+            }),
+            ("a negative timeout", &|d| {
+                set(d, "/context/timeout_ms", (-1).into());
+            }),
+            ("a negative drain rate", &|d| {
+                set(d, "/measurements/1/drain_bytes_per_sec", (-1).into());
+            }),
+            ("a drain rate that is not whole", &|d| {
+                set(d, "/context/drain_bytes_per_sec", 1.5.into());
+            }),
+            ("a negative seed", &|d| set(d, "/context/seed", (-1).into())),
+            ("zero logical cpus", &|d| {
+                set(d, "/context/logical_cpus", 0.into());
+            }),
+            ("a negative load average", &|d| {
+                set(d, "/context/load_average_end", (-0.1).into());
+            }),
+            ("a negative process count", &|d| {
+                set(d, "/context/concurrent_excise_processes", (-1).into());
+            }),
+            ("a negative sample", &|d| {
+                set(d, "/measurements/0/series/0/samples/0", (-1.0).into());
+            }),
+            ("a sample that is not a number", &|d| {
+                set(d, "/measurements/0/series/0/samples/0", "fast".into());
+            }),
+            ("a negative du sample", &|d| {
+                set(d, "/measurements/0/du_samples/0", (-1.0).into());
+            }),
+            ("a negative median of samples", &|d| {
+                set(d, "/measurements/0/series/0/median", (-1.0).into());
+            }),
+            ("a negative median ratio", &|d| {
+                set(
+                    d,
+                    "/measurements/0/series/0/ratios/du/median",
+                    (-0.5).into(),
+                );
+            }),
+            ("a certain interval", &|d| {
+                set(
+                    d,
+                    "/measurements/0/series/0/ratios/du/bootstrap_ci/confidence",
+                    1.0.into(),
+                );
+            }),
+            ("an interval of no confidence", &|d| {
+                set(
+                    d,
+                    "/measurements/0/series/0/ratios/du/bootstrap_ci/confidence",
+                    0.into(),
+                );
+            }),
+            ("a completion flag that is not a boolean", &|d| {
+                set(d, "/measurements/0/series/0/completed/0", "yes".into());
+            }),
+            ("a report version beyond 32 bits", &|d| {
+                set(
+                    d,
+                    "/versions/0/traits/report_version",
+                    4_294_967_296_u64.into(),
+                );
+            }),
+            ("a scan store flag that is not a boolean", &|d| {
+                set(d, "/versions/0/traits/scan_store_dir", "no".into());
+            }),
+            ("a cached flag that is not a boolean", &|d| {
+                set(d, "/versions/0/build/cached", 1.into());
+            }),
+            ("no du samples at all", &|d| {
+                set(d, "/measurements/0/du_samples", serde_json::json!([]));
+            }),
+            ("a du sample that is text", &|d| {
+                set(d, "/measurements/0/du_samples/0", "fast".into());
+            }),
+        ],
+    );
+}
+
+#[test]
+fn the_sweep_schema_rejects_maps_and_lists_of_the_wrong_shape() {
+    assert_rejected(
+        &sweep(),
+        &[
+            ("a metric named with nothing", &|d| {
+                set(d, "/checks/0/metrics", serde_json::json!({ "": 1.0 }));
+            }),
+            ("a metric that is not a number", &|d| {
+                set(d, "/checks/0/metrics/exit_code", "143".into());
+            }),
+            ("a metric that is null", &|d| {
+                set(d, "/checks/0/metrics/exit_code", Value::Null);
+            }),
+            ("a ratio named with nothing", &|d| {
+                let ratio = d["measurements"][0]["series"][0]["ratios"]["du"].clone();
+                d["measurements"][0]["series"][0]["ratios"][""] = ratio;
+            }),
+            ("a ratio that is a number", &|d| {
+                set(d, "/measurements/0/series/0/ratios/du", 2.5.into());
+            }),
+            ("evidence that is one path", &|d| {
+                set(d, "/rows/0/cells/0/evidence", "#/measurements/0".into());
+            }),
+            ("notes that are one line", &|d| {
+                set(d, "/checks/0/notes", "ended on SIGTERM".into());
+            }),
+            ("samples that are one number", &|d| {
+                set(d, "/measurements/0/series/0/samples", 120.0.into());
+            }),
+            ("completion flags that are one flag", &|d| {
+                set(d, "/measurements/0/series/0/completed", true.into());
+            }),
+            ("lower bounds that are one number", &|d| {
+                set(
+                    d,
+                    "/measurements/1/series/0/ratios/candidate/lower_bounds",
+                    30.0.into(),
+                );
+            }),
+            ("rounds that are one number", &|d| {
+                set(d, "/measurements/0/series/0/rounds", 0.into());
+            }),
+            ("du samples that are one number", &|d| {
+                set(d, "/measurements/0/du_samples", 40.0.into());
+            }),
+            ("series that are one object", &|d| {
+                set(d, "/measurements/0/series", serde_json::json!({}));
+            }),
+            ("an order whose rounds hold numbers", &|d| {
+                set(d, "/measurements/0/order", serde_json::json!([[1, 2]]));
+            }),
+        ],
+    );
+}
+
+#[test]
+fn the_sweep_schema_rejects_a_reason_that_does_not_fit_its_status() {
+    assert_rejected(
+        &sweep(),
+        &[
+            ("a failed build that gives no reason", &|d| {
+                remove(d, "/versions/1/build/reason");
+            }),
+            ("a build that did not fail and gives a reason", &|d| {
+                add(d, "/versions/0/build/reason", "odd".into());
+            }),
+            (
+                "a cached build that did not fail and gives a reason",
+                &|d| {
+                    add(d, "/versions/2/build/reason", "odd".into());
+                },
+            ),
+            ("a check that ran and gives a reason", &|d| {
+                add(d, "/checks/0/reason", "odd".into());
+            }),
+            ("a check that did not run and gives no reason", &|d| {
+                remove(d, "/checks/1/reason");
+            }),
+            ("a check that errored and gives no reason", &|d| {
+                remove(d, "/checks/3/reason");
+            }),
+            ("a cell that is not measurable and gives no reason", &|d| {
+                remove(d, "/rows/0/cells/1/reason");
+            }),
+            (
+                "a second cell that is not measurable and gives no reason",
+                &|d| {
+                    remove(d, "/rows/1/cells/1/reason");
+                },
+            ),
+        ],
+    );
+}
+
+/// What `check` says of the rich sweep once `edit` has broken it, and whether the schema still
+/// accepts the document.
+fn broken_sweep(edit: impl FnOnce(&mut HarnessSweep)) -> (Result<(), SweepInvalid>, bool) {
+    let mut document = sweep();
+    edit(&mut document);
+
+    (
+        document.check(),
+        validator::<HarnessSweep>(true).is_valid(&to_value(&document)),
+    )
+}
+
+/// Asserts that `edit` breaks a rule that only `check` can say: the schema accepts the document.
+fn assert_refused_by_check_alone(edit: impl FnOnce(&mut HarnessSweep), rule: SweepInvalid) {
+    assert_eq!(broken_sweep(edit), (Err(rule), true));
+}
+
+/// Asserts that `edit` breaks a rule that the schema says as well, which `check` repeats for a
+/// reader that holds the document to it alone.
+fn assert_refused_by_both(edit: impl FnOnce(&mut HarnessSweep), rule: SweepInvalid) {
+    assert_eq!(broken_sweep(edit), (Err(rule), false));
+}
+
+#[test]
+fn sweep_documents_that_break_a_rule_the_schema_cannot_say_are_refused() {
+    assert_eq!(sweep().check(), Ok(()));
+    assert_eq!(minimal_sweep().check(), Ok(()));
+
+    assert_refused_by_check_alone(
+        |d| d.candidate = "v1.0.0".to_owned(),
+        SweepInvalid::CandidateNotLast("v1.0.0".to_owned()),
+    );
+    assert_refused_by_check_alone(
+        |d| d.versions[1].reference = "v1.0.0".to_owned(),
+        SweepInvalid::DuplicateVersion("v1.0.0".to_owned()),
+    );
+    assert_refused_by_check_alone(
+        |d| {
+            d.rows[0].cells.pop();
+        },
+        SweepInvalid::CellsDoNotMatchVersions {
+            defect: "F1".to_owned(),
+        },
+    );
+    assert_refused_by_check_alone(
+        |d| d.measurements[0].series[0].reference = "v9.9.9".to_owned(),
+        SweepInvalid::UnknownVersion {
+            what: "a series of `headless_wall_ms`".to_owned(),
+            reference: "v9.9.9".to_owned(),
+        },
+    );
+    assert_refused_by_check_alone(
+        |d| {
+            d.measurements[0].series[0].completed.pop();
+        },
+        SweepInvalid::SeriesLengths {
+            metric: "headless_wall_ms".to_owned(),
+            reference: "v1.0.0".to_owned(),
+            samples: 3,
+            flags: 2,
+            rounds: 3,
+        },
+    );
+    assert_refused_by_both(
+        |d| d.rows[0].cells[1].reason = None,
+        SweepInvalid::NoReason {
+            defect: "F1".to_owned(),
+            reference: "v1.1.0".to_owned(),
+        },
+    );
+    assert_refused_by_both(
+        |d| d.checks[0].reason = Some("odd".to_owned()),
+        SweepInvalid::CheckReason {
+            check: "signal-term".to_owned(),
+            reference: "v1.0.0".to_owned(),
+            status: CheckStatus::Ran,
+        },
+    );
+    assert_refused_by_both(
+        |d| d.versions[1].build.reason = None,
+        SweepInvalid::BuildReason("v1.1.0".to_owned()),
+    );
+}
+
+#[test]
+fn sweep_documents_that_break_a_rule_in_another_place_are_refused_too() {
+    assert_refused_by_check_alone(
+        |d| d.candidate = "v9.9.9".to_owned(),
+        SweepInvalid::CandidateNotLast("v9.9.9".to_owned()),
+    );
+    assert_refused_by_check_alone(
+        |d| d.versions.reverse(),
+        SweepInvalid::CandidateNotLast("HEAD".to_owned()),
+    );
+    assert_refused_by_check_alone(
+        |d| d.versions[0].reference = "HEAD".to_owned(),
+        SweepInvalid::DuplicateVersion("HEAD".to_owned()),
+    );
+    assert_refused_by_check_alone(
+        |d| d.rows[1].cells.swap(0, 2),
+        SweepInvalid::CellsDoNotMatchVersions {
+            defect: "F10".to_owned(),
+        },
+    );
+    assert_refused_by_check_alone(
+        |d| d.rows[0].cells[2].reference = "v9.9.9".to_owned(),
+        SweepInvalid::CellsDoNotMatchVersions {
+            defect: "F1".to_owned(),
+        },
+    );
+    assert_refused_by_both(
+        |d| d.rows[1].cells[1].reason = None,
+        SweepInvalid::NoReason {
+            defect: "F10".to_owned(),
+            reference: "v1.1.0".to_owned(),
+        },
+    );
+    assert_refused_by_check_alone(
+        |d| d.checks[0].reference = "v9.9.9".to_owned(),
+        SweepInvalid::UnknownVersion {
+            what: "the `signal-term` check".to_owned(),
+            reference: "v9.9.9".to_owned(),
+        },
+    );
+    assert_refused_by_check_alone(
+        |d| d.measurements[1].series[1].samples.push(1_000.0),
+        SweepInvalid::SeriesLengths {
+            metric: "tui_complete_ms".to_owned(),
+            reference: "HEAD".to_owned(),
+            samples: 4,
+            flags: 3,
+            rounds: 3,
+        },
+    );
+    assert_refused_by_both(
+        |d| d.checks[1].reason = None,
+        SweepInvalid::CheckReason {
+            check: "headless-oracle".to_owned(),
+            reference: "v1.1.0".to_owned(),
+            status: CheckStatus::NotRun,
+        },
+    );
+    assert_refused_by_both(
+        |d| d.checks[3].reason = None,
+        SweepInvalid::CheckReason {
+            check: "descriptors".to_owned(),
+            reference: "HEAD".to_owned(),
+            status: CheckStatus::Errored,
+        },
+    );
+    assert_refused_by_both(
+        |d| d.versions[0].build.reason = Some("odd".to_owned()),
+        SweepInvalid::BuildReason("v1.0.0".to_owned()),
+    );
+}
+
+#[test]
+fn sweep_documents_whose_rounds_do_not_add_up_are_refused() {
+    fn du_ratio(document: &mut HarnessSweep) -> &mut SweepRatio {
+        document.measurements[0].series[0]
+            .ratios
+            .get_mut("du")
+            .expect("the first series has a ratio to du")
+    }
+    let ratio_counts = || SweepInvalid::RatioCounts {
+        metric: "headless_wall_ms".to_owned(),
+        reference: "v1.0.0".to_owned(),
+        name: "du".to_owned(),
+    };
+
+    // The `headless_wall_ms` measurement ran three rounds. `v1.0.0` has a sample, a flag, and a
+    // round for each of them.
+    assert_refused_by_check_alone(
+        |d| {
+            d.measurements[0].series[0].rounds.pop();
+        },
+        SweepInvalid::SeriesLengths {
+            metric: "headless_wall_ms".to_owned(),
+            reference: "v1.0.0".to_owned(),
+            samples: 3,
+            flags: 3,
+            rounds: 2,
+        },
+    );
+    for (what, rounds) in [
+        ("out of order", vec![0, 2, 1]),
+        ("repeated", vec![0, 1, 1]),
+        ("past the last round", vec![0, 1, 3]),
+    ] {
+        let (checked, schema_accepts) =
+            broken_sweep(|d| d.measurements[0].series[0].rounds = rounds);
+        assert_eq!(
+            checked,
+            Err(SweepInvalid::SeriesRounds {
+                metric: "headless_wall_ms".to_owned(),
+                reference: "v1.0.0".to_owned(),
+                rounds: 3,
+            }),
+            "{what}"
+        );
+        assert!(schema_accepts, "{what}: only `check` can say it");
+    }
+
+    // In the `tui_complete_ms` measurement `v1.0.0` has two samples and one skipped round.
+    assert_refused_by_check_alone(
+        |d| d.measurements[1].series[0].skipped = 2,
+        SweepInvalid::SeriesOverrun {
+            metric: "tui_complete_ms".to_owned(),
+            reference: "v1.0.0".to_owned(),
+            samples: 2,
+            skipped: 2,
+            rounds: 3,
+        },
+    );
+
+    // The ratio of `v1.0.0` to `du` has two pairs, and a round of `du` is missing.
+    assert_refused_by_check_alone(|d| du_ratio(d).median = None, ratio_counts());
+    assert_refused_by_check_alone(|d| du_ratio(d).bootstrap_ci = None, ratio_counts());
+    assert_refused_by_check_alone(|d| du_ratio(d).pairs = 0, ratio_counts());
+    assert_refused_by_check_alone(
+        |d| du_ratio(d).lower_bounds = vec![30.0, 31.0],
+        ratio_counts(),
+    );
+    assert_refused_by_check_alone(|d| du_ratio(d).both_censored = 2, ratio_counts());
+
+    assert_refused_by_check_alone(
+        |d| {
+            d.measurements[0].du_samples.pop();
+        },
+        SweepInvalid::DuSamples {
+            metric: "headless_wall_ms".to_owned(),
+            samples: 2,
+            rounds: 3,
+        },
+    );
+}
+
+#[test]
+fn a_ratio_in_which_no_round_finished_on_both_sides_has_no_median_and_is_valid() {
+    let mut document = sweep();
+    document.measurements[1].series[0].ratios.insert(
+        "candidate".to_owned(),
+        SweepRatio {
+            median: None,
+            bootstrap_ci: None,
+            pairs: 0,
+            lower_bounds: vec![30.0, 31.0],
+            upper_bounds: Vec::new(),
+            both_censored: 1,
+        },
+    );
+
+    assert_eq!(document.check(), Ok(()));
+    assert_valid(&document);
+    assert_round_trips(&document);
+    let value = to_value(&document);
+    let ratio = &value["measurements"][1]["series"][0]["ratios"]["candidate"];
+    assert!(
+        ratio.get("median").is_none() && ratio.get("bootstrap_ci").is_none(),
+        "{ratio}"
+    );
+    assert_eq!(ratio["pairs"], 0);
+}
+
+#[test]
+fn sweep_documents_that_are_not_this_kind_and_version_or_have_other_numbers_are_rejected() {
+    let text = sweep().to_json_pretty().expect("a sweep should render");
+
+    assert!(HarnessSummary::from_json_str(&text).is_err());
+    assert!(HarnessCounts::from_json_str(&text).is_err());
+    assert!(HarnessSweep::from_json_str(&text.replace("harness-sweep", "harness-ab")).is_err());
+    let future = text.replace("\"schema_version\": 1", "\"schema_version\": 2");
+    let error = HarnessSweep::from_json_str(&future).expect_err("version 2 is unsupported");
+    assert!(
+        error.to_string().contains("unsupported schema_version 2"),
+        "{error}"
+    );
+    for malformed in [
+        text.replace("\"rounds\": 3", "\"rounds\": 3.5"),
+        text.replace("\"pairs\": 2", "\"pairs\": -2"),
+        text.replace("\"seed\": 7", "\"seed\": 7.0"),
+        text.replace("\"cached\": true", "\"cached\": 1"),
+        text.replace("\"tier\": \"full\"", "\"tier\": \"hourly\""),
+        text.replace("\"status\": \"built\"", "\"status\": \"cached\""),
+        text.replace("\"state\": \"affected\"", "\"state\": \"unaffected\""),
+        text.replace("\"cached\": true", "\"cached\": true, \"unexpected\": 1"),
+    ] {
+        assert!(
+            HarnessSweep::from_json_str(&malformed).is_err(),
+            "{malformed}"
+        );
+    }
+}
+
+#[test]
+fn a_sweep_finds_its_rows_and_cells_by_defect_and_version() {
+    let document = sweep();
+
+    assert_eq!(
+        document.row("F10").map(|row| row.title.as_str()),
+        Some("SIGTERM leaves the scan store behind")
+    );
+    assert_eq!(
+        document.cell("F1", "v1.1.0").map(|cell| cell.state),
+        Some(CellState::NotMeasurable)
+    );
+    assert!(document.row("F99").is_none());
+    assert!(document.cell("F1", "v9.9.9").is_none());
+    assert!(document.cell("F99", "HEAD").is_none());
 }
 
 const TUI_SESSION: &str = "0123abcd";
