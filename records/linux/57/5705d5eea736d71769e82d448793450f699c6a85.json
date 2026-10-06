@@ -1,0 +1,68 @@
+{
+  "document_kind": "harness-counts",
+  "schema_version": 1,
+  "context": {
+    "git_sha": "5705d5eea736d71769e82d448793450f699c6a85",
+    "committed_at": "2026-10-06T20:37:40+11:00",
+    "runner": {
+      "os": "linux",
+      "os_version": "Ubuntu 24.04",
+      "arch": "x86_64"
+    },
+    "toolchain": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+  },
+  "cases": [
+    {
+      "fixture": {
+        "id": "wide-1k",
+        "hash": "0ea50119d4b25818ac466a656f7676eec012eaaa9466ee016878af6905cca0a1",
+        "seed": 7
+      },
+      "profile": "deterministic",
+      "metrics": {
+        "entries": 1002,
+        "residue_files": 0,
+        "scan_store_bytes": 353597
+      }
+    },
+    {
+      "fixture": {
+        "id": "node-modules-2k",
+        "hash": "3215c2c1f155bd1a4f6c250b219ad0aba9df4bb1071c402dc773d2184460d698",
+        "seed": 1
+      },
+      "profile": "deterministic",
+      "metrics": {
+        "entries": 2390,
+        "residue_files": 0,
+        "scan_store_bytes": 995041
+      }
+    },
+    {
+      "fixture": {
+        "id": "identity-small",
+        "hash": "3a1aea95aba94c96174eef18790366dde1a5e178c25638272b9909c9a97d4285",
+        "seed": 11
+      },
+      "profile": "deterministic",
+      "metrics": {
+        "entries": 23,
+        "residue_files": 0,
+        "scan_store_bytes": 14783
+      }
+    },
+    {
+      "fixture": {
+        "id": "tiny-files-50k",
+        "hash": "713d8f43e626cf9a1739decd90f8eeee2ccfd932f6e1a8c6f55137590285e716",
+        "seed": 50000
+      },
+      "profile": "deterministic",
+      "metrics": {
+        "entries": 49051,
+        "residue_files": 0,
+        "scan_store_bytes": 17435521
+      }
+    }
+  ]
+}
