@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/schemas/scan-report-v1.json",
+  "title": "Excise scan-report v1",
+  "type": "object",
+  "required": [
+    "document_kind",
+    "schema_version",
+    "root",
+    "display_root",
+    "state",
+    "accounting",
+    "summary",
+    "entries"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "scan-report" },
+    "schema_version": { "const": 1 },
+    "root": { "$ref": "https://github.com/findyourexit/excise/schemas/native-path-v1.json" },
+    "display_root": { "type": "string" },
+    "state": { "$ref": "#/$defs/scan_state" },
+    "accounting": { "$ref": "#/$defs/accounting" },
+    "summary": { "$ref": "#/$defs/run_summary" },
+    "entries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "bounds": {
+      "type": "object",
+      "required": ["lower", "upper"],
+      "additionalProperties": false,
+      "properties": {
+        "lower": { "$ref": "#/$defs/unsigned" },
+        "upper": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      }
+    },
+    "file_id": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["inode"],
+          "additionalProperties": false,
+          "properties": {
+            "inode": {
+              "type": "object",
+              "required": ["device", "inode"],
+              "additionalProperties": false,
+              "properties": {
+                "device": { "$ref": "#/$defs/unsigned" },
+                "inode": { "$ref": "#/$defs/unsigned" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["lowres"],
+          "additionalProperties": false,
+          "properties": {
+            "lowres": {
+              "type": "object",
+              "required": ["volume", "index"],
+              "additionalProperties": false,
+              "properties": {
+                "volume": { "$ref": "#/$defs/unsigned" },
+                "index": { "$ref": "#/$defs/unsigned" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["highres"],
+          "additionalProperties": false,
+          "properties": {
+            "highres": {
+              "type": "object",
+              "required": ["volume", "file"],
+              "additionalProperties": false,
+              "properties": {
+                "volume": { "$ref": "#/$defs/unsigned" },
+                "file": { "$ref": "#/$defs/unsigned" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "native_identity": {
+      "type": "object",
+      "required": ["file_id", "link_count", "reparse_point"],
+      "additionalProperties": false,
+      "properties": {
+        "file_id": { "$ref": "#/$defs/file_id" },
+        "link_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "reparse_point": { "type": "boolean" }
+      }
+    },
+    "scan_state": {
+      "enum": ["exact", "uncertain", "cancelled"]
+    },
+    "node_state": {
+      "enum": ["scanning", "complete", "aggregated", "uncertain"]
+    },
+    "node_kind": {
+      "oneOf": [
+        { "enum": ["root", "directory", "file", "link"] },
+        {
+          "type": "object",
+          "required": ["synthetic"],
+          "additionalProperties": false,
+          "properties": {
+            "synthetic": { "enum": ["other", "shared", "aggregate"] }
+          }
+        }
+      ]
+    },
+    "accounting": {
+      "type": "object",
+      "required": [
+        "headline",
+        "hard_links_deduplicated",
+        "shared_extents_deduplicated",
+        "directory_metadata_included"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "headline": { "const": "identity-unique-allocated-bytes" },
+        "hard_links_deduplicated": { "const": true },
+        "shared_extents_deduplicated": { "const": false },
+        "directory_metadata_included": { "const": false }
+      }
+    },
+    "run_summary": {
+      "type": "object",
+      "required": [
+        "scanned_entries",
+        "identified_entries",
+        "unreadable_entries",
+        "unscanned_entries",
+        "excluded_entries",
+        "filesystem_boundaries",
+        "link_entries",
+        "deleted_entries",
+        "deletion_changed_entries",
+        "deletion_missing_entries",
+        "deletion_failed_entries",
+        "deletion_unattempted_entries",
+        "model_bytes",
+        "model_limit_bytes",
+        "identity_spilled",
+        "last_unreadable_path",
+        "last_unscanned_path",
+        "last_unscanned_reason",
+        "last_worker_error"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "scanned_entries": { "$ref": "#/$defs/unsigned" },
+        "identified_entries": { "$ref": "#/$defs/unsigned" },
+        "unreadable_entries": { "$ref": "#/$defs/unsigned" },
+        "unscanned_entries": { "$ref": "#/$defs/unsigned" },
+        "excluded_entries": { "$ref": "#/$defs/unsigned" },
+        "filesystem_boundaries": { "$ref": "#/$defs/unsigned" },
+        "link_entries": { "$ref": "#/$defs/unsigned" },
+        "deleted_entries": { "$ref": "#/$defs/unsigned" },
+        "deletion_changed_entries": { "$ref": "#/$defs/unsigned" },
+        "deletion_missing_entries": { "$ref": "#/$defs/unsigned" },
+        "deletion_failed_entries": { "$ref": "#/$defs/unsigned" },
+        "deletion_unattempted_entries": { "$ref": "#/$defs/unsigned" },
+        "model_bytes": { "$ref": "#/$defs/unsigned" },
+        "model_limit_bytes": { "$ref": "#/$defs/unsigned" },
+        "identity_spilled": { "type": "boolean" },
+        "last_unreadable_path": { "type": ["string", "null"] },
+        "last_unscanned_path": { "type": ["string", "null"] },
+        "last_unscanned_reason": { "type": ["string", "null"] },
+        "last_worker_error": { "type": ["string", "null"] }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "required": [
+        "path",
+        "display_path",
+        "kind",
+        "state",
+        "identity",
+        "allocated_bytes",
+        "reclaimable_bytes",
+        "apparent_bytes",
+        "descendants",
+        "unscanned_reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "$ref": "https://github.com/findyourexit/excise/schemas/native-path-v1.json" },
+        "display_path": { "type": "string" },
+        "kind": { "$ref": "#/$defs/node_kind" },
+        "state": { "$ref": "#/$defs/node_state" },
+        "identity": {
+          "oneOf": [
+            { "$ref": "#/$defs/native_identity" },
+            { "type": "null" }
+          ]
+        },
+        "allocated_bytes": { "$ref": "#/$defs/bounds" },
+        "reclaimable_bytes": { "$ref": "#/$defs/bounds" },
+        "apparent_bytes": { "$ref": "#/$defs/unsigned" },
+        "descendants": { "$ref": "#/$defs/unsigned" },
+        "unscanned_reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

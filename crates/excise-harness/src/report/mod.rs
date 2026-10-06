@@ -10,6 +10,8 @@
 //! * [`HarnessAb`] (`harness-ab`): paired, interleaved comparison evidence for two builds.
 //! * [`HarnessCounts`] (`harness-counts`): the deterministic counts of one build, the record that
 //!   the count history and a pull request's count comment are made of.
+//! * [`HarnessSweep`] (`harness-sweep`): what `cargo xtask sweep` found of every published version,
+//!   and the version-by-defect table built from it.
 //! * [`HarnessTui`] (`harness-tui`): what one `cargo xtask tui` command prints.
 //! * [`HarnessShapeProfile`] (`harness-shape-profile`): the shape of one tree as aggregates only,
 //!   written by `excise-shape profile`, from which a fixture specification can be built.
@@ -28,6 +30,7 @@ mod counts;
 mod failure;
 mod shape;
 mod summary;
+mod sweep;
 pub mod tui;
 
 #[cfg(test)]
@@ -52,6 +55,11 @@ pub use shape::{
 };
 pub use summary::{
     BinaryIdentity, HarnessSummary, ScenarioResult, SummaryKind, Tier, TimingWarning, Verdict,
+};
+pub use sweep::{
+    BuildStatus, CellState, CheckStatus, HarnessSweep, SweepBuild, SweepCell, SweepCheck,
+    SweepContext, SweepInvalid, SweepKind, SweepMeasurement, SweepRatio, SweepRow, SweepSeries,
+    SweepTier, SweepToolchain, SweepTraits, SweepVersion,
 };
 pub use tui::{HarnessTui, TuiKind};
 

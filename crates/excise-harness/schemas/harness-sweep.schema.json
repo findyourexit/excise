@@ -1,0 +1,540 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/harness/schemas/harness-sweep-v1.json",
+  "title": "Excise harness version sweep v1",
+  "description": "What `cargo xtask sweep` found when it ran the checks a published release can take against every published version and the candidate: how each version built, the paired and interleaved timings, the observation of every other check, and the version-by-defect table made from them. Internal test tooling, not a supported product interface. The rules this schema cannot say belong to the readers (`HarnessSweep::check`): the candidate is the last of the versions, a ref names one version, every row has one cell per version in the order of `versions`, every series and every check names a version, a series has one completion flag and one round for each sample, its rounds increase and stay below the rounds of its measurement, and its samples and skipped rounds are no more than those rounds, a ratio has a median and an interval exactly when some round had a ratio and counts no more rounds than the measurement ran, and the `du` samples of a measurement are one for each round.",
+  "type": "object",
+  "required": [
+    "document_kind",
+    "schema_version",
+    "run_id",
+    "tier",
+    "started_at",
+    "finished_at",
+    "candidate",
+    "context",
+    "versions",
+    "measurements",
+    "checks",
+    "rows"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "harness-sweep" },
+    "schema_version": { "const": 1 },
+    "run_id": {
+      "description": "Also the name of the run's output directory below target/excise-sweep.",
+      "$ref": "#/$defs/text"
+    },
+    "tier": {
+      "description": "How much of the sweep ran: quick covers the small fixtures only, full everything the sweep can measure.",
+      "enum": ["quick", "full"]
+    },
+    "started_at": { "$ref": "#/$defs/timestamp" },
+    "finished_at": { "$ref": "#/$defs/timestamp" },
+    "candidate": {
+      "description": "The ref of the version every ratio is taken against: the last of `versions`, which this schema cannot say.",
+      "$ref": "#/$defs/text"
+    },
+    "context": { "$ref": "#/$defs/context" },
+    "versions": {
+      "description": "The columns of the table, oldest first and the candidate last. A ref appears once, which this schema cannot say and the readers check.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/version" }
+    },
+    "measurements": {
+      "description": "The paired, interleaved timings, one per fixture, metric, and profile.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/measurement" }
+    },
+    "checks": {
+      "description": "The observations of every other check, one per check and version.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/check" }
+    },
+    "rows": {
+      "description": "The table: one row per defect fixed in the release.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/row" }
+    }
+  },
+  "$defs": {
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "milliseconds": {
+      "description": "A duration in milliseconds: a finite number that is never negative.",
+      "type": "number",
+      "minimum": 0
+    },
+    "nullable_milliseconds": {
+      "description": "A duration in milliseconds, or null for a round in which it could not be timed.",
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "sha": {
+      "description": "A full, lowercase hexadecimal git commit.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "timestamp": {
+      "description": "An RFC 3339 date-time.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "profile": {
+      "enum": ["default", "deterministic", "reduced-motion", "monochrome-ascii", "narrow", "mouse-keymaps"]
+    },
+    "toolchain": {
+      "description": "The toolchain a version was built with.",
+      "type": "object",
+      "required": ["channel", "rustc"],
+      "additionalProperties": false,
+      "properties": {
+        "channel": {
+          "description": "The channel the version's own rust-toolchain.toml names, for example 1.88.0.",
+          "$ref": "#/$defs/text"
+        },
+        "rustc": {
+          "description": "The first line of rustc --version as that toolchain printed it.",
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "build": {
+      "description": "How a version's build went. A build that failed says why, and no other build gives a reason.",
+      "type": "object",
+      "required": ["status", "cached"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Whether there is a binary: built when it was built or found in the cache of a build of the same commit, failed when the build failed (every cell of the version says so, and the sweep went on).",
+          "enum": ["built", "failed"]
+        },
+        "cached": {
+          "description": "Whether the binary came from the cache of an earlier build of the same commit and toolchain.",
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "Why the build failed, with the end of the build's output. Present exactly when status is failed.",
+          "$ref": "#/$defs/text"
+        },
+        "log": {
+          "description": "The build's complete output, as a path below the run's directory, when it was kept.",
+          "$ref": "#/$defs/text"
+        }
+      },
+      "if": { "required": ["status"], "properties": { "status": { "const": "failed" } } },
+      "then": { "required": ["reason"] },
+      "else": { "properties": { "reason": false } }
+    },
+    "traits": {
+      "description": "What the sweep learned of a build by asking it, which is what the checks adapt to: the sweep never assumes that an old build takes today's flags or writes today's report.",
+      "type": "object",
+      "required": ["scan_store_dir"],
+      "additionalProperties": false,
+      "properties": {
+        "report_version": {
+          "description": "The schema_version of the scan-report documents the build writes, read from one it wrote to a headless scan. Absent when it wrote none.",
+          "$ref": "#/$defs/count"
+        },
+        "scan_store_dir": {
+          "description": "Whether the build's --help lists --scan-store-dir, so that it keeps its scan data in the directory the harness names. A build that does not keeps it in the temporary directory, which is where the checks then look for leftovers.",
+          "type": "boolean"
+        }
+      }
+    },
+    "version": {
+      "description": "One column of the table: a git ref and its build.",
+      "type": "object",
+      "required": ["ref", "sha", "build"],
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "description": "The ref as it was given, for example v1.3.0 or HEAD.",
+          "$ref": "#/$defs/text"
+        },
+        "sha": {
+          "description": "The commit the ref resolved to.",
+          "$ref": "#/$defs/sha"
+        },
+        "toolchain": {
+          "description": "The toolchain the build used. Absent when the build did not get as far as running one.",
+          "$ref": "#/$defs/toolchain"
+        },
+        "binary_sha256": {
+          "description": "The SHA-256 of the binary. Absent when there is none.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "build": { "$ref": "#/$defs/build" },
+        "traits": {
+          "description": "What the build is known to do. Absent when it was not asked, because there is no binary.",
+          "$ref": "#/$defs/traits"
+        }
+      }
+    },
+    "bootstrap_ci": {
+      "description": "A deterministic bootstrap confidence interval for the median per-round ratio.",
+      "type": "object",
+      "required": ["lower", "upper", "confidence"],
+      "additionalProperties": false,
+      "properties": {
+        "lower": { "type": "number" },
+        "upper": { "type": "number" },
+        "confidence": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1
+        }
+      }
+    },
+    "ratio": {
+      "description": "A ratio of two paired timings: the median of the per-round ratios of the rounds in which both sides finished, a bootstrap confidence interval for it, and what the other rounds say. A run that did not finish within the bound is recorded at how long it ran (the bound, when it ran out of time), which is only the least it took: a round in which only the numerator did not finish gives a lower bound on its ratio, one in which only the denominator did not finish gives an upper bound, and one in which neither finished says nothing. The median and the interval rest on the rounds in which both sides finished and on nothing else, and a round in which a side has no sample at all is none of these. The rules this schema cannot say belong to the readers (`HarnessSweep::check`): `median` and `bootstrap_ci` are present exactly when `pairs` is more than 0, and `pairs`, the bounds, and `both_censored` count no more rounds than the measurement ran.",
+      "type": "object",
+      "required": ["pairs", "lower_bounds", "upper_bounds", "both_censored"],
+      "additionalProperties": false,
+      "properties": {
+        "median": {
+          "description": "The median of the per-round numerator/denominator ratios of the rounds in which both sides finished. Absent when there are none.",
+          "type": "number",
+          "minimum": 0
+        },
+        "bootstrap_ci": {
+          "description": "A deterministic bootstrap interval for the median. Present exactly when the median is, which this schema cannot say and the readers check.",
+          "$ref": "#/$defs/bootstrap_ci"
+        },
+        "pairs": {
+          "description": "How many rounds had a ratio: both sides finished, and the denominator was not zero.",
+          "$ref": "#/$defs/count"
+        },
+        "lower_bounds": {
+          "description": "For each round in which only the numerator did not finish, in round order: the least its ratio can have been, the numerator's bound over the denominator's time.",
+          "type": "array",
+          "items": { "type": "number", "minimum": 0 }
+        },
+        "upper_bounds": {
+          "description": "For each round in which only the denominator did not finish, in round order: the most its ratio can have been, the numerator's time over the denominator's bound.",
+          "type": "array",
+          "items": { "type": "number", "minimum": 0 }
+        },
+        "both_censored": {
+          "description": "How many rounds neither side finished in: they say nothing about the ratio.",
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "series": {
+      "description": "One version's timings of one metric. The rules this schema cannot say belong to the readers (`HarnessSweep::check`): `rounds`, `samples`, and `completed` have one entry for each sample, the rounds increase and stay below the rounds of the measurement, and the samples and the skipped rounds are no more than its rounds.",
+      "type": "object",
+      "required": ["ref", "rounds", "samples", "completed", "skipped", "ratios"],
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "description": "The version.",
+          "$ref": "#/$defs/text"
+        },
+        "rounds": {
+          "description": "The round (counting from 0, after the warm-up round that is not recorded) each sample was measured in, increasing, index-aligned with `samples`. A round the version did not run in has no sample.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/count" }
+        },
+        "samples": {
+          "description": "The measurement of each of those rounds in milliseconds. A run that did not reach the end within the bound is recorded at how long it ran (the bound, when it ran out of time), which is only the least it took, and `completed` says so.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/milliseconds" }
+        },
+        "completed": {
+          "description": "Whether each run reached the end within the bound, index-aligned with `samples`, which this schema cannot say and the readers check.",
+          "type": "array",
+          "items": { "type": "boolean" }
+        },
+        "skipped": {
+          "description": "How many rounds the version was not run in, because its runs had run out of time several times in a row. A skipped round is neither a sample nor a pair.",
+          "$ref": "#/$defs/count"
+        },
+        "median": {
+          "description": "The median of the samples whose run completed, absent when none did.",
+          "$ref": "#/$defs/milliseconds"
+        },
+        "ratios": {
+          "description": "The ratios the metric defines, by the name of what they are taken against: `candidate` (this version over the candidate, round by round), `du` (a scan over `du -sk`), `headless-scan` (an interface run over the headless scan of the same version in the same round, without the writing of its report), and `reduced-motion` (default motion over reduced motion, for the same version in the same round). A deliberately open vocabulary: a name this schema does not list is still a ratio.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/text" },
+          "additionalProperties": { "$ref": "#/$defs/ratio" }
+        }
+      }
+    },
+    "measurement": {
+      "description": "Paired, interleaved timings of one metric on one fixture: rounds that ran every version in turn, one after another in one session on the same warm fixture.",
+      "type": "object",
+      "required": ["metric", "fixture", "rounds", "order", "series"],
+      "additionalProperties": false,
+      "properties": {
+        "metric": {
+          "description": "The metric: headless_wall_ms (a scan with --format json --output), headless_scan_ms (the same scan's wall time less the time its report took to write, from the same run), report_write_ms (how long the report file took to grow, from its first byte to the last change in its length), or tui_complete_ms (spawn to the header reading COMPLETE). A deliberately open vocabulary: a sweep that times one more thing adds a name and keeps version 1.",
+          "$ref": "#/$defs/text"
+        },
+        "fixture": {
+          "description": "The fixture's id.",
+          "$ref": "#/$defs/text"
+        },
+        "profile": {
+          "description": "The profile an interface metric ran under.",
+          "$ref": "#/$defs/profile"
+        },
+        "drain_bytes_per_sec": {
+          "description": "The cap on how fast the terminal's output was read, in bytes per second, for an interface metric that ran against a slow terminal. Absent when it read as fast as it came.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "rounds": {
+          "description": "How many measured rounds were planned, after the warm-up round that is not recorded. A version may have fewer samples: see `skipped` of its series.",
+          "$ref": "#/$defs/count"
+        },
+        "order": {
+          "description": "The refs that ran in each round, in the order they ran, so that the interleaving can be audited. A version that was skipped in a round, or whose runs could not be carried out, is not in it.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/text" }
+          }
+        },
+        "du_samples": {
+          "description": "The milliseconds `du -sk` took in each round, null for a round in which it could not be timed, for the metric that is timed against it. Absent when there are none, and otherwise one for every round, which this schema cannot say and the readers check.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/nullable_milliseconds" }
+        },
+        "series": {
+          "description": "One series per version that ran, in the order of `versions`.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/series" }
+        }
+      }
+    },
+    "check": {
+      "description": "The observation of one check on one version. A check that ran gives no reason, and one that did not run says why.",
+      "type": "object",
+      "required": ["ref", "check", "status", "metrics", "notes"],
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "description": "The version.",
+          "$ref": "#/$defs/text"
+        },
+        "check": {
+          "description": "The check: headless-oracle, signal-term, signal-hup, signal-quit, signal-close, kill-restart, idle, filter, descriptors, or selection-drift. A deliberately open vocabulary.",
+          "$ref": "#/$defs/text"
+        },
+        "fixture": {
+          "description": "The fixture it ran on.",
+          "$ref": "#/$defs/text"
+        },
+        "profile": {
+          "description": "The profile it ran under, for an interface check.",
+          "$ref": "#/$defs/profile"
+        },
+        "status": {
+          "description": "What came of it: ran (the observation is valid), not-run (it could not run on this version, tier, or platform), or errored (the harness could not carry it out, so the observation says nothing about the version).",
+          "enum": ["ran", "not-run", "errored"]
+        },
+        "reason": {
+          "description": "Why it did not run, or why the harness could not carry it out. Present exactly when status is not ran.",
+          "$ref": "#/$defs/text"
+        },
+        "metrics": {
+          "description": "What it measured, by name: exit codes, byte counts, milliseconds. A deliberately open vocabulary. Every value is a finite number.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/text" },
+          "additionalProperties": { "type": "number" }
+        },
+        "notes": {
+          "description": "What it observed that is not a number, one fact per line: how the program ended, what was left behind.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/text" }
+        },
+        "evidence": {
+          "description": "The evidence file the run kept, as a path below the run's directory.",
+          "$ref": "#/$defs/text"
+        }
+      },
+      "if": { "required": ["status"], "properties": { "status": { "const": "ran" } } },
+      "then": { "properties": { "reason": false } },
+      "else": { "required": ["reason"] }
+    },
+    "cell": {
+      "description": "One cell of the table: one defect on one version. A cell that is not measurable says why.",
+      "type": "object",
+      "required": ["ref", "state", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "description": "The version.",
+          "$ref": "#/$defs/text"
+        },
+        "state": {
+          "description": "What the sweep found: affected (the version shows the defect), not-affected (the check ran and the version does not show it), or not-measurable (no check the sweep can run decides it for this version).",
+          "enum": ["affected", "not-affected", "not-measurable"]
+        },
+        "reason": {
+          "description": "Why: required when the cell is not-measurable, and the rule that decided it otherwise.",
+          "$ref": "#/$defs/text"
+        },
+        "value": {
+          "description": "The measured value, as text: `median 14.2x the candidate (95% CI 13.1-15.0)`.",
+          "$ref": "#/$defs/text"
+        },
+        "evidence": {
+          "description": "Where the evidence is: paths below the run's directory, and JSON pointers into this document (`#/measurements/0`, `#/checks/12`).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/text" }
+        }
+      },
+      "if": { "required": ["state"], "properties": { "state": { "const": "not-measurable" } } },
+      "then": { "required": ["reason"] }
+    },
+    "row": {
+      "description": "One row of the table: a defect fixed in the release.",
+      "type": "object",
+      "required": ["defect", "title", "changelog", "measured_by", "cells"],
+      "additionalProperties": false,
+      "properties": {
+        "defect": {
+          "description": "The finding: F1, F10, F23b.",
+          "$ref": "#/$defs/text"
+        },
+        "title": {
+          "description": "What the defect is, in a line.",
+          "$ref": "#/$defs/text"
+        },
+        "changelog": {
+          "description": "The opening words of the CHANGELOG.md [Unreleased] entry that records the fix.",
+          "$ref": "#/$defs/text"
+        },
+        "measured_by": {
+          "description": "How the row is measured.",
+          "$ref": "#/$defs/text"
+        },
+        "cells": {
+          "description": "One cell per version, in the order of `versions`, which this schema cannot say and the readers check.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/cell" }
+        },
+        "note": {
+          "description": "A caveat about the whole row, for example that the candidate shows the defect too.",
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "fixture_context": {
+      "type": "object",
+      "required": ["id", "hash", "seed"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16,128}$"
+        },
+        "seed": { "$ref": "#/$defs/unsigned" }
+      }
+    },
+    "context": {
+      "description": "The conditions the sweep ran under, recorded because timings do not transfer.",
+      "type": "object",
+      "required": [
+        "host",
+        "cpu",
+        "os",
+        "arch",
+        "logical_cpus",
+        "power",
+        "load_average_start",
+        "load_average_end",
+        "concurrent_excise_processes",
+        "checkout_sha",
+        "rounds",
+        "seed",
+        "drain_bytes_per_sec",
+        "timeout_ms",
+        "fixtures"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "host": { "$ref": "#/$defs/text" },
+        "cpu": { "$ref": "#/$defs/text" },
+        "os": { "$ref": "#/$defs/text" },
+        "arch": { "$ref": "#/$defs/text" },
+        "logical_cpus": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "power": {
+          "description": "For example ac, battery, or unknown.",
+          "$ref": "#/$defs/text"
+        },
+        "load_average_start": {
+          "description": "The 1-minute load average when the sweep started.",
+          "type": "number",
+          "minimum": 0
+        },
+        "load_average_end": {
+          "description": "The 1-minute load average when the sweep finished.",
+          "type": "number",
+          "minimum": 0
+        },
+        "concurrent_excise_processes": {
+          "description": "How many other excise processes were running when the sweep started.",
+          "$ref": "#/$defs/count"
+        },
+        "checkout_sha": {
+          "description": "The commit of the checkout that ran the sweep.",
+          "$ref": "#/$defs/sha"
+        },
+        "rounds": {
+          "description": "How many measured rounds each paired timing ran.",
+          "$ref": "#/$defs/count"
+        },
+        "seed": {
+          "description": "The seed of the bootstrap.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "drain_bytes_per_sec": {
+          "description": "The cap, in bytes per second, of the slow terminal the interface timings ran against.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "timeout_ms": {
+          "description": "How long one run of a timed check could take before it counted as not completed.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "du": {
+          "description": "The du the scans were timed against, when there was one.",
+          "$ref": "#/$defs/text"
+        },
+        "fixtures": {
+          "description": "The fixtures the sweep ran on, one entry each.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/fixture_context" }
+        }
+      }
+    }
+  }
+}

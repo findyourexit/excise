@@ -8,27 +8,60 @@ name: Weekly harness
 # because du finishes a million tiny files in about two seconds (15.3 times measured against the
 # budget of 15, where the ten-million-entry default measures about 4.9). docs/development.md,
 # "Continuous integration tiers", has the details and how to run it locally.
+#
+# A manual run can start the version sweep instead of the scan: set the input job to
+# version-sweep. It runs `cargo xtask sweep` on Linux and on macOS. The sweep builds every
+# published v1.* tag and the commit the run was started on, each with the toolchain its own
+# rust-toolchain.toml pins, runs the checks a published release can take against each build, and
+# writes the table of which fixed defects each version shows, with the evidence behind every cell.
+# Each runner keeps that output as the artifact version-sweep-ubuntu-24.04 or
+# version-sweep-macos-14 and shows the table in its job summary; the two are separate
+# measurements, never compared with each other. The schedule never starts the sweep, and the
+# inputs refs and tier apply only to it. docs/development.md, "Continuous integration tiers",
+# describes the job and its inputs, and "Version sweep" how to run the sweep on your own machine
+# and read its table.
 
 on:
   schedule:
     - cron: "43 3 * * 6"
   workflow_dispatch:
     inputs:
+      job:
+        description: "The job to run: largest-fixture, the weekly scan of the largest fixture, or version-sweep, which builds every published v1.* tag and the candidate and writes the version-by-defect table"
+        type: choice
+        options:
+          - largest-fixture
+          - version-sweep
+        default: largest-fixture
       fixture:
-        description: "The fixture to scan: tiny-files-10m (measured at about 4.9 times du's time, against the budget of 15), or tiny-files-1m, which proves the mechanism in minutes but whose ratio can exceed the budget on this image (du scans a million tiny files in about 2 s; 15.3 measured)"
+        description: "For largest-fixture, the fixture to scan: tiny-files-10m (measured at about 4.9 times du's time, against the budget of 15), or tiny-files-1m, which proves the mechanism in minutes but whose ratio can exceed the budget on this image (du scans a million tiny files in about 2 s; 15.3 measured)"
         type: string
         default: tiny-files-10m
+      refs:
+        description: "For version-sweep, the git refs to build, separated by spaces: the last is the candidate, and HEAD is the commit this run was started on. Empty means every v1.* tag, then HEAD"
+        type: string
+        default: ""
+      tier:
+        description: "For version-sweep, the tier: full, or quick, the smoke tier, which skips the checks that need the larger fixtures"
+        type: choice
+        options:
+          - full
+          - quick
+        default: full
 
 permissions:
   contents: read
 
 concurrency:
-  group: weekly-${{ github.ref }}
+  # The job is part of the group, so that a manual version sweep and the scan, scheduled or
+  # manual, never cancel each other on the same ref.
+  group: weekly-${{ github.ref }}-${{ inputs.job || 'largest-fixture' }}
   cancel-in-progress: true
 
 jobs:
   largest-fixture:
     name: ubuntu-24.04
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.job == '' || inputs.job == 'largest-fixture'))
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     env:
@@ -97,4 +130,105 @@ jobs:
             /mnt/excise-big/target/excise-headless/*/*/discrepancies.txt
             /mnt/excise-big/target/excise-headless/*/*/repro.txt
           if-no-files-found: ignore
+          retention-days: 30
+
+  version-sweep:
+    if: github.event_name == 'workflow_dispatch' && inputs.job == 'version-sweep'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    env:
+      # The inputs reach the shell only as these variables, never as part of a script, and the
+      # step "Check the inputs" runs before any step that uses them.
+      REFS: ${{ inputs.refs }}
+      TIER: ${{ inputs.tier }}
+    steps:
+      - name: Check out source with every tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The sweep builds every published v1.* tag from this checkout, so it needs every tag and
+          # the history behind them.
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Check the inputs
+        shell: bash
+        run: |
+          # Both inputs end up on the sweep's command line. The tier is one of two words. A ref is a
+          # word of letters, digits, and . _ / @ ^ ~ - that does not start with a dash, so that it
+          # cannot read as an option; the words are separated by spaces.
+          case "$TIER" in
+            full | quick) ;;
+            *)
+              echo "::error::tier must be full or quick"
+              exit 1
+              ;;
+          esac
+          allowed='^[A-Za-z0-9._/@^~ -]*$'
+          if [[ ! "$REFS" =~ $allowed ]]; then
+            echo "::error::refs may hold only letters, digits, the characters . _ / @ ^ ~ - and spaces"
+            exit 1
+          fi
+          read -r -a refs <<< "$REFS"
+          for ref in "${refs[@]}"; do
+            if [[ "$ref" == -* ]]; then
+              echo "::error::a ref cannot start with a dash"
+              exit 1
+            fi
+          done
+      - name: Install the toolchains the releases pin
+        shell: bash
+        run: |
+          # The sweep builds each ref with the toolchain that ref pins in its rust-toolchain.toml,
+          # and installs none itself: v1.0.0 and v1.0.1 pin 1.88.0, every later tag and HEAD pin
+          # 1.98.0. A ref that pins another one stops the sweep before its first build, and the
+          # error names the rustup command that installs it. Nothing here sets RUSTUP_TOOLCHAIN or
+          # a rustup override: the pins choose the toolchains, and 1.98.0 is only the default, so
+          # that the job does not depend on the one the runner image ships.
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+          rustup toolchain list
+          rustc --version --verbose
+      - name: Sweep the published versions and the candidate
+        shell: bash
+        run: |
+          # REFS passed the check above, so splitting it at the spaces gives refs and nothing else.
+          read -r -a refs <<< "$REFS"
+          args=()
+          if (( ${#refs[@]} > 0 )); then
+            args=(--refs "${refs[@]}")
+          fi
+          cargo run --locked --package xtask -- sweep "${args[@]}" "--$TIER"
+      - name: Show the table in the job summary
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          table=target/excise-sweep/latest/table.txt
+          if [[ -f "$table" ]]; then
+            {
+              echo "### Version sweep on $RUNNER_OS"
+              echo
+              echo '```text'
+              cat "$table"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::the sweep wrote no table"
+          fi
+      - name: Keep the table, the document, and the evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: version-sweep-${{ matrix.os }}
+          # `latest` is a link to the run's directory: left in, it would upload every file twice.
+          path: |
+            target/excise-sweep/
+            !target/excise-sweep/latest
+          if-no-files-found: error
           retention-days: 30
