@@ -546,6 +546,7 @@ mod tests {
             name: name.to_owned(),
             state: "◆ COMPLETE".to_owned(),
             kind: kind.to_owned(),
+            pane: name.to_owned(),
         }
     }
 

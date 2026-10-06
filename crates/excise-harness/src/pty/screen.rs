@@ -139,6 +139,18 @@ impl Screen {
         }
     }
 
+    /// A copy of what the screen shows now: its cells, its cursor, and its modes. The copy is a
+    /// screen of its own, so what is fed to this one afterwards does not reach it. It answers no
+    /// cursor position request and its count of answers starts at zero, because it is only
+    /// looked at.
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        let (rows, cols) = self.size();
+        let mut parser = vt100::Parser::new_with_callbacks(rows, cols, 0, Responder::default());
+        *parser.screen_mut() = self.parser.screen().clone();
+        Self { parser }
+    }
+
     /// Feeds terminal output to the emulator and returns the bytes it must answer with.
     ///
     /// The answers are the cursor position reports that the output asked for, each computed from
@@ -698,5 +710,32 @@ pub(crate) mod tests {
         assert_eq!(pane.rect.left, 0);
         assert_eq!(pane.interior[0].trim(), "victim");
         assert_eq!(screen.box_titled("QUIT"), None);
+    }
+
+    #[test]
+    fn a_snapshot_keeps_what_the_screen_showed_when_it_was_taken() {
+        let mut screen = Screen::new(5, 40);
+        screen.process(b"\x1b[2J\x1b[1;1Hfirst frame\x1b[?25l");
+        let snapshot = screen.snapshot();
+
+        screen.process(b"\x1b[1;1HFIRST");
+
+        assert_eq!(snapshot.row_text(0), "first frame");
+        assert_eq!(screen.row_text(0), "FIRST frame");
+        assert_eq!(snapshot.size(), (5, 40));
+        assert!(!snapshot.modes().cursor_visible, "the modes are copied too");
+        assert_eq!(snapshot.cursor(), (0, 11));
+    }
+
+    #[test]
+    fn a_snapshot_answers_nothing_and_does_not_disturb_the_screen_it_was_taken_from() {
+        let mut screen = Screen::new(5, 40);
+        let mut snapshot = screen.snapshot();
+
+        assert_eq!(screen.process(b"\x1b[6n"), b"\x1b[1;1R");
+        assert_eq!(screen.cursor_reports_answered(), 1);
+        assert_eq!(snapshot.cursor_reports_answered(), 0);
+        let _ = snapshot.process(b"changed");
+        assert_eq!(screen.row_text(0), "");
     }
 }

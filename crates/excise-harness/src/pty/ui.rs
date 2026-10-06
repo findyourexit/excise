@@ -21,6 +21,8 @@ const SINGLE_KEY_CONFIRMATION: &str = "[Enter/y] start";
 const TYPED_CONFIRMATION: &str = "Type this exactly: ";
 /// The quit dialog's confirmation line.
 const QUIT_CONFIRMATION: &str = "[y] Quit";
+/// The badge of a map that is being rebuilt after a deletion: work is still going on.
+const REBUILDING: &str = "REBUILDING";
 
 /// The scan state in the header row's badge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +54,23 @@ impl HeaderState {
             (Self::Scanning, ScanState::Scanning) | (Self::Complete, ScanState::Complete)
         )
     }
+
+    /// Whether the badge says that the scan of what is shown has ended: `COMPLETE`, or the label
+    /// of an uncertain result (`NEEDS REVIEW`, `READ ERROR`, `OTHER DEVICE`, `LINK SKIPPED`,
+    /// `EXCLUDED`, `CHANGED`, `SPACE ESTIMATE`), or another state that is not work in progress
+    /// (`STALE MAP`). `SCANNING` and `REBUILDING` say that work is still going on.
+    ///
+    /// A scan with a folder it could not read ends `NEEDS REVIEW` or another label of an
+    /// uncertain result, never `COMPLETE`: a runner that waits for the word `COMPLETE` alone
+    /// waits for something that such a scan never reaches.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        match self {
+            Self::Scanning => false,
+            Self::Complete => true,
+            Self::Other(label) => label != REBUILDING,
+        }
+    }
 }
 
 /// The scan state shown in the header band, or `None` before the header is drawn.
@@ -81,7 +100,8 @@ pub fn header_state(screen: &Screen) -> Option<HeaderState> {
 /// The folder path in the header row, as drawn, or `None` before the header is drawn.
 ///
 /// The row reads ` EXCISE  <path>  <marker> <STATE>` (see [`header_state`]). The program cuts a
-/// path that does not fit in the middle, with an ellipsis, so the text may not be the whole path.
+/// path that does not fit in the middle, putting `[...]` (or `[..]`) where it cuts, so the text
+/// may not be the whole path, and two different paths can read the same.
 #[must_use]
 pub fn header_path(screen: &Screen) -> Option<String> {
     let row = screen.row_text(0);
@@ -104,6 +124,13 @@ pub struct SelectedItem {
     pub state: String,
     /// The entry kind: `folder`, `file`, `link`, or `shared item`.
     pub kind: String,
+    /// Everything the pane shows of the entry, one trimmed line after another with the empty
+    /// lines left out: the name, the state and kind, the sizes and the count of items, and
+    /// where the pane has it the item check (the identity the file system gives the entry). A
+    /// name is cut to fit the pane, so two entries can show one name, and the whole pane tells
+    /// them apart far better: it is what a reader that must know whether the entry changed keeps
+    /// an entry by, and never the name alone.
+    pub pane: String,
 }
 
 /// What the inspector pane shows.
@@ -119,6 +146,10 @@ pub enum Inspector {
 
 /// Reads the inspector pane. The selected item is the one the pane shows, not the one a key press
 /// meant to select.
+///
+/// The pane that invites the user to choose an item, and the pane of an item whose name begins
+/// with the same words, are told apart by the line below the first: an item has a state line
+/// (`◆ COMPLETE · folder`), and the invitation, which goes on in words, has none.
 #[must_use]
 pub fn inspector(screen: &Screen) -> Inspector {
     let Some(pane) = screen.box_titled(INSPECTOR_TITLE) else {
@@ -126,19 +157,30 @@ pub fn inspector(screen: &Screen) -> Inspector {
     };
     let mut lines = pane.interior.iter().map(|line| line.trim());
     let name = lines.next().unwrap_or_default();
-    if name.is_empty() || name.starts_with(NOTHING_SELECTED) {
+    let state_line = lines.next().unwrap_or_default();
+    let described = split_state_line(state_line);
+    if name.is_empty() || (name.starts_with(NOTHING_SELECTED) && described.is_none()) {
         return Inspector::NothingSelected;
     }
-    let state_line = lines.next().unwrap_or_default();
-    let (state, kind) = state_line
-        .rsplit_once(" · ")
-        .or_else(|| state_line.rsplit_once(" . "))
-        .unwrap_or((state_line, ""));
+    let (state, kind) = described.unwrap_or((state_line, ""));
     Inspector::Item(SelectedItem {
         name: name.to_owned(),
         state: state.to_owned(),
         kind: kind.to_owned(),
+        pane: pane
+            .interior
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
     })
+}
+
+/// A state line split into its state and its kind: `◆ COMPLETE · folder` is `◆ COMPLETE` and
+/// `folder` (` . ` is the separator in ASCII mode). `None` for a line that has no separator.
+fn split_state_line(line: &str) -> Option<(&str, &str)> {
+    line.rsplit_once(" · ").or_else(|| line.rsplit_once(" . "))
 }
 
 /// The filter prompt in the header band.
@@ -380,6 +422,32 @@ mod tests {
         assert_eq!(header_state(&screen), Some(HeaderState::Complete));
     }
 
+    /// Every label `excise` can put on a finished or unfinished map (`view_state` in
+    /// `src/ui/display.rs`): the scan has ended for all but the two that say work is going on.
+    #[test]
+    fn every_label_of_an_uncertain_result_says_the_scan_ended_and_two_say_it_did_not() {
+        for (row, finished) in [
+            (" EXCISE  /tmp/x/  ◆ COMPLETE", true),
+            (" EXCISE  /tmp/x/  ? NEEDS REVIEW", true),
+            (" EXCISE  /tmp/x/  ? READ ERROR", true),
+            (" EXCISE  /tmp/x/  ? OTHER DEVICE", true),
+            (" EXCISE  /tmp/x/  ? LINK SKIPPED", true),
+            (" EXCISE  /tmp/x/  ? EXCLUDED", true),
+            (" EXCISE  /tmp/x/  ? CHANGED", true),
+            (" EXCISE  /tmp/x/  ? SPACE ESTIMATE", true),
+            (" EXCISE  /tmp/x/  ! STALE MAP", true),
+            (" EXCISE  /tmp/x/  ◌ SCANNING", false),
+            (" EXCISE  /tmp/x/  ~ SCANNING", false),
+            (" EXCISE  /tmp/x/  ◌ REBUILDING", false),
+        ] {
+            let screen = drawn(5, 80, &[(0, 0, row)]);
+
+            let state = header_state(&screen).expect("a header");
+
+            assert_eq!(state.is_finished(), finished, "{row}");
+        }
+    }
+
     #[test]
     fn there_is_no_header_state_before_the_header_is_drawn() {
         assert_eq!(header_state(&drawn(5, 80, &[])), None);
@@ -427,6 +495,7 @@ mod tests {
                 name: "victim".to_owned(),
                 state: "◆ COMPLETE".to_owned(),
                 kind: "folder".to_owned(),
+                pane: "victim\n◆ COMPLETE · folder".to_owned(),
             })
         );
     }
@@ -466,6 +535,19 @@ mod tests {
         assert!(
             matches!(inspector(&screen), Inspector::Item(item) if item.name == "SELECTED ITEM")
         );
+    }
+
+    #[test]
+    fn a_selection_named_like_the_invitation_is_still_a_name() {
+        let screen = inspector_screen(&["Choose an item", "◆ COMPLETE · folder"]);
+
+        assert!(matches!(
+            inspector(&screen),
+            Inspector::Item(item) if item.name == "Choose an item" && item.kind == "folder"
+        ));
+        // The invitation, wrapped over two lines, is still the invitation.
+        let wrapped = inspector_screen(&["Choose an item to see its", "space and scan status."]);
+        assert_eq!(inspector(&wrapped), Inspector::NothingSelected);
     }
 
     #[test]

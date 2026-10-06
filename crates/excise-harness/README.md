@@ -617,15 +617,27 @@ a root without the ownership marker `.excise-harness-owned` before any process e
 working directory, `EXCISE_SCAN_STORE_DIR`, and the temporary directory point into a fresh scratch
 area, and `EXCISE_TEST_EVENTS` names a new file inside it. A scenario's `scan_store_on_volume`
 overrides `EXCISE_SCAN_STORE_DIR` to a directory on an attached volume instead (see
-[Volumes](#volumes)); nothing else about isolation changes. The scratch area is deleted after the
-run unless `--keep-fixture` is given.
+[Volumes](#volumes)); nothing else about isolation changes. The scratch area is private to its
+owner on Unix (its root and directories have mode `0700` and its configuration file `0600`,
+whatever the umask is), and is deleted after the run unless `--keep-fixture` is given.
 
 **Process group.** On Unix the child leads its own session, so its process group id is its pid.
 A timeout, a failed step, or dropping the session kills the whole group with `SIGKILL`, and the
-session waits until nothing is left. On Windows there is no group to signal: the child is ended
-with the library's process termination, which does not reach descendants (`excise` starts none). A
-job object would, but creating one needs `unsafe`, which this workspace allows only in
-`src/os/windows.rs`.
+session waits until nothing is left. So does the end of the child: its exit is seen without
+reaping it (`waitid` with `WNOWAIT`), while its pid still names its group, and the group is killed
+then, once, before the child is reaped, so a child that ends and leaves a descendant that ignores
+the hang-up (a `nohup` job) does not leave it running. On Windows there is no group to signal: the
+child is ended with the library's process termination, which does not reach descendants (`excise`
+starts none). A job object would, but creating one needs `unsafe`, which this workspace allows
+only in `src/os/windows.rs`.
+
+**Reading the terminal.** The reader thread forwards what the terminal gives and ends with the
+end of the output: a read that returns nothing, or that fails because the program's side of the
+terminal is closed (`EIO` on Unix, a broken pipe on Windows). Any other failed read is not an end:
+it reaches the session, and the caller's next `pump` or `wait_activity` returns it (`PtyError::Read`)
+as a harness error, once. One `pump` takes in at most 1 MiB of output and leaves the rest for the
+next call, so that a program that writes without pause cannot keep a caller from looking at its
+deadlines, which it does between calls.
 
 **Terminal throughput.** A scenario's `[terminal]` table, or a comparison's own field, can set
 `drain_bytes_per_sec`: it caps how fast the reader thread takes bytes from the pseudo-terminal,
@@ -2441,6 +2453,246 @@ from what the generator could be made to pass.
 - `spec` takes the fewest entries a deep profile needs, 33 for a profile deeper than 32 levels,
   and its help says so.
 
+## Read-only soak
+
+`cargo xtask soak ROOT [--rounds N] [--timeout DURATION] [--record]` runs `excise` on a real tree,
+headless and in a terminal, in a way that cannot delete, and records metrics and quirks that gate
+nothing. The maintainer used to validate a change with `cargo run --release ~/`: a demanding real
+tree, but manual, unrepeatable, and able to delete real data. The soak keeps the signal and removes
+the danger.
+
+It is **human-only**. `xtask/src/soak.rs` refuses unless standard input and standard output are
+terminals and the person types the root's canonical path at its prompt, and until then it starts no
+`git`, no build of `excise`, and no scan. That holds from the moment `xtask` runs, and no earlier:
+`cargo xtask` is an alias of `cargo run --locked --package xtask --` (`.cargo/config.toml`), so
+cargo has built and started `xtask` before it can read a terminal, as it has for every `cargo
+xtask` command, and the prompt says so. Agents never run it (`AGENTS.md`).
+
+It runs on macOS and Linux and refuses everywhere else: it has to end everything it starts, with an
+interrupt handler and by killing a program's whole process group, and Windows has neither. The
+library builds and its tests run on Windows too (where the screen is not exact, `ConPTY` paints on
+its own timer, so latency comes from frame events and no decision rests on the screen). The
+library entry, `excise_harness::soak::run_soak`, takes the root directly, and the tests use it, on
+fixtures and scratch trees only. The code is [`src/soak`](src/soak); `xtask/src/soak.rs` asks and
+prints, and `xtask/src/soak_build.rs` builds the binary.
+
+### Why it cannot delete
+
+Three things, each covered by a test, and the second does not depend on the first.
+
+1. **The type of the root.** A soak's root is a `SoakRoot` (`soak/root.rs`): canonical, a
+   directory, not a link. Every step and protocol that deletes or mutates a fixture (the `delete`
+   and `fs_mutate` steps, `DeletionRequest`, the interactive driver) takes a `FixtureRoot`, which a
+   `SoakRoot` is not and converts into none, so the compiler refuses to hand it a real tree; three
+   `compile_fail` doctests in `soak/root.rs` say so. The type does not seal the path
+   (`fixture::remove_tree` takes a plain `&Path`), so a test (`soak/tests.rs`) reads the source of
+   every file below `src/soak` and of the two files of the command, test modules left out, and
+   fails for a forbidden name (`FixtureRoot`, `remove_tree`, `fs::rename`, `fs::write`, ...), for
+   every way to write Backspace or Ctrl+H outside the allowlist, for a write to the program that
+   does not pass the choke point, and for a `crate::` path that is not on a list. The few names
+   that some line must hold (starting the one binary under test, opening the soak's own new
+   files) are allowed only on those lines, exactly as often as they are pinned.
+2. **The keys.** Only Backspace asks `excise` for a deletion, in every key preset, and
+   configuration cannot rebind it. The soak does not rest on that: every key it writes goes through
+   `Driver::send_input` (`soak/session.rs`), which sends only `Key::ALLOWED` (`soak/keys.rs`): the
+   four arrows, `h j k l`, `enter`, `esc`, `q`, and the `y` that answers the quit prompt. It
+   matches a whole write, so `h` and a Backspace together are not a key, and it refuses everything
+   else, Backspace (`0x7f`), Ctrl+H (`0x08`), and the input barrier (`0x1d`) by name, before it
+   writes. It sends nothing that could begin an escape sequence and leave it open (the program
+   joins sequences across writes: `ESC [ 121 u` is `y`). Behind the table the driver asks the
+   harness's own `InputScan`, and it refuses `Enter` and `y` while the screen shows text that
+   reads as a deletion dialog. Nothing the soak does can open one, so that text is a name in the
+   tree: it is noted as a quirk (`dialog_text`), the folder is not opened, the program is killed
+   instead of quit, and the soak does not fail. (The refusal stays broad on purpose: a screen read
+   that missed a real dialog would be the dangerous mistake, and one that sees a dialog that is
+   not there costs a measurement.) The protocols of `runner::live` that the soak shares send their
+   keys through the same function, and the one that writes around it, the input barrier, is
+   overridden to refuse. Two writes are not keys and do not pass it: the terminal layer's answer to
+   a cursor position request (`ESC [ row ; col R`, pinned by a test), and the line feed and
+   end-of-file that closing a session writes after its program was killed.
+3. **The isolation.** The program runs in the environment of every harness run
+   (`safety::isolated_env`): a scratch `HOME`, configuration, working directory, temporary
+   directory, and scan store, all outside the root. Its only argument is the root: never
+   `--disable-delete-confirmation`, never a mouse or custom key setting, and the profiles are
+   `default` and `deterministic`.
+
+### What it runs, and what it writes
+
+It runs the release build of this checkout and nothing else (`cargo build --release --locked
+--offline -p excise`; `EXCISE_E2E_BINARY` is not read, because one left in a shell would run
+another program on a real tree). The binary that runs is a private copy of the one executable that
+cargo reports for that build, made in the scratch directory with mode `0700`, in a directory that
+is made `0700` too, so that it is private from the moment it exists; `summary.json`
+carries its SHA-256. The build's copy and the soak's own are both identified by what they were
+when whole (device, inode, owner, mode, and change time, read from the open file once its last
+write was made), and the identity is checked again where it matters: the build hands the soak its
+copy's identity with its path, and the soak opens that path without following a link and runs
+nothing unless the open file is that file, unchanged, before it copies it and after; its own copy
+is looked at again before each scan and session. A file that was replaced, or written in place
+(which moves the change time and nothing else), is not run.
+
+- **The root.** Nothing is written in it, except in the places the prompt names when the root
+  contains them. The checkout's target directory: cargo replaces its own build files there, and the
+  soak adds `excise-soak/` and the link `latest`. Cargo's home directory (`CARGO_HOME`, else
+  `$HOME/.cargo`): cargo updates its own files there, its usage database (`.global-cache`), its lock
+  files (`.package-cache` and `.package-cache-mutate`), and the source of a crate it had downloaded
+  and not yet unpacked; the build is offline, so it downloads nothing. `cargo xtask soak ~` from a
+  checkout under the home directory has both. A root that lies *inside* the target directory or
+  cargo's home is refused. The code that the build runs (build scripts, procedural macros, a
+  configured linker, `RUSTC`, `RUSTFLAGS`, `[env]`) is the person's own, runs with their rights,
+  and is not confined; the prompt says so.
+- **The scratch directory** (`EXCISE_E2E_TMPDIR`, else `/tmp`) holds the copy of the binary and
+  every scratch area, outside the root. It must be private to the person: it and every directory
+  above it is on a file system that enforces ownership, is owned by the person or by root, and is
+  not writable by its group or by everybody, unless its sticky bit is set (OpenSSH's `StrictModes`
+  rule; `/tmp` passes). The command refuses one that is not before it asks for the path, and
+  `run_soak` checks again, because another user who can rename entries in it could put another
+  program where the copy was. On macOS a volume mounted with "Ignore ownership" (the default for an
+  external disk) is refused (`MNT_IGNORE_OWNERSHIP`, read with `statfs`): `stat` shows the caller
+  as the owner of every entry there and every user is treated as the owner, so no mode makes a
+  directory private; the way out is another directory, or `sudo diskutil enableOwnership` on the
+  volume. Linux has no such flag, and for its local file systems the kernel's permission check uses
+  the owner and the mode that `stat` reports, so the check asks nothing more there; it does not
+  recognize a file system that decides for itself (FUSE with `allow_other` and without
+  `default_permissions`, network and virtual-machine shares). The check reads owners and mode
+  bits, not access control lists. The target and output directories get a note at the prompt and
+  no refusal. Each scratch area in it is private by construction as well, whatever the umask is:
+  its root and the directories in it are made with mode `0700` and its configuration file with
+  `0600` (`Scratch::create`, which every runner uses), so that another user cannot read the report
+  of a whole tree that is written there, or put a link or a file where the program will open one.
+- **The output directory**, `target/excise-soak/<run-id>/` below the resolved target directory,
+  which must not be a link; `latest` is replaced only when a run made it. Its files are private to
+  their owner (see [Output](#output)).
+- **A scan's report** goes to the scratch area, where only `state`, `accounting`, and `summary`
+  are read from it, and is deleted with the area. It is large on a real tree, so the soak needs
+  room there, and its size is watched while the scan runs and looked at once more when the scan
+  has ended: above 16 GiB (or a quarter of the free space, if that is less) the scan's process
+  group is killed, or a report that passed it between two looks is not read, and the quirk
+  `report_too_large` is noted either way, since a tree of very deep folders makes a report grow
+  with the square of its depth. The thread that looks is the soak's own and is not waited for: a
+  scratch directory that has stopped answering (a network mount that hung) cannot hold the run
+  past its bound with it. When its last look does not come back within 2 seconds the size of the
+  report is not known, the report is not read, and the quirk `report_unreadable` says so.
+
+### What a run does
+
+A round is one headless scan and one session in a pseudo-terminal under each of the `default` and
+`deterministic` profiles; `--rounds N` runs N of them in turn.
+
+- **Headless** (`soak/headless.rs`): `excise --format json --output <scratch>/scan-report.json
+  <root>`, supervised by `headless::process` (its own process group, wall time, CPU time, peak
+  memory). Of the report only `state`, `accounting`, and `summary` are kept (`soak/facts.rs`); the
+  four `last_*` text fields can be paths, so only whether each held anything is recorded.
+- **Session** (`soak/session.rs`): the first frame; then an `Esc` at a time while the scan runs,
+  each timed to the frame that counts it; the end of the scan under any badge (`COMPLETE`, or the
+  label of an uncertain result, which a real home directory nearly always gets and which is a
+  quirk); the largest folder opened with `Enter` and left with `Esc` (when the largest entry is a
+  file, the cursor is first walked to a folder with the arrow keys, at most 48 keys); and the
+  shared confirmed quit. A frame is read from the screen as its mark left it, and an entry is told
+  by its whole pane. The metrics are the time to the first frame and to the end of the scan, the
+  latency of the probes, the longest gap between frames, frames and output bytes, peak memory, and
+  the times of the drill, the way up, and the quit.
+- **Bounds.** The whole run (`--timeout`, 30 minutes by default) counts from the instant the person
+  confirmed, the build included, and every phase has a bound of its own. A phase that passes its
+  bound ends its program with the program's whole process group, and the run goes on. Ctrl+C,
+  `Ctrl+\`, Ctrl+Z, a termination request, or a hang-up stops the run where it waits and keeps what
+  finished; nothing is started once the soak has seen it (a program that it was already starting
+  when the key was pressed is ended at its next look), and the run ends as an interrupted one.
+  Ctrl+Z stops the run and not the command: a command that it stopped would stop its clock and its
+  watch on the report while a scan, in a process group of its own, went on. `cargo xtask soak`
+  runs the soak by `exec` (on Unix `cargo run` replaces itself with the binary), so Ctrl+Z reaches
+  only the soak, which ends the run as Ctrl+C does and returns. A launcher that stays in front of
+  it (`make`, `just`, `sh -c`, a script) is stopped by the terminal as usual; `fg` resumes it, and
+  it ends with the command.
+
+  A second Ctrl+C or a second `Ctrl+\`, the two that a person sends by pressing a key again, ends
+  the command at once, as it would without a handler, but only once the exit is armed: the person
+  has asked to stop and no program is held. The soak holds a program (the lookup of the commit,
+  the build, a scan, or a session) from before it starts it until it has been ended with its
+  process group and waited for, or given up on after 5 seconds (below), and lets it go before it
+  reads a report, looks at what the program left, finishes a recording, or removes a scratch area.
+  The last program let go of arms the exit at once, and a thread of the command's own arms it
+  within 25 ms when none is held, so a soak blocked in the file system between two programs still
+  ends at the second press. Until the exit is armed a second press is the same request. The build,
+  the scans, and the sessions run in process groups that the signal of a terminal does not reach,
+  so a command that ended before would leave one running with nothing to bound it. When it ends
+  the command it cleans nothing up: the scratch areas (`xh-*` in the scratch directory) stay.
+  While a program is held, a scratch mount that stops answering can keep the soak from acting on
+  any press: a session reads its events there, a scan hears of an interrupt only through the
+  thread that watches its report there, and a program being started can block there. A scan still
+  ends at its bound; a session waits for the mount. To end the soak sooner, send `kill -KILL` to it
+  from another terminal, then to the scans and sessions it started, which run from its copy of the
+  binary (`pkill -KILL -f xh-soak-bin`). A process in uninterruptible I/O on a hung file system
+  ends only when the file system answers. A hang-up, a termination request, and Ctrl+Z
+  never end the command: one hang-up of a terminal delivers SIGHUP twice, milliseconds apart (the
+  shell resends it to its jobs, then the kernel sends it to the old foreground group), and tools
+  send SIGTERM in pairs, so a second one is not a second request, and ending the command there
+  would orphan a headless scan, which runs in a process group of its own, with no bound and no cap
+  on its report. No wait after a kill is unbounded: a process that SIGKILL does not end is stuck
+  where a signal does not reach it (a hung mount), so after 5 seconds the soak says that it could
+  not be ended, as a harness error, leaves it unreaped, and signals it no more; a process whose
+  exit was published within those 5 seconds is not reported stuck, however late the supervisor
+  looks.
+- **Exit status.** 0 once the rounds have run, whatever the metrics say; non-zero for a refused
+  start, a harness error, or an interrupted run.
+
+### Output
+
+`target/excise-soak/<run-id>/` holds `quirks.txt` and `summary.json`, and with `--record` a
+`<round>-tui-<profile>.cast` for each session; then `latest` is pointed at the run.
+
+- `summary.json` is a `harness-soak` document
+  ([`schemas/harness-soak.schema.json`](schemas/harness-soak.schema.json), `report/soak.rs`,
+  version 1): metrics and counts only, with no path, no name from the tree, no host name, and no
+  free text, so that it can be shared. Every string in it is an enumerated word, a constant, or has
+  a pattern, and so is every key of a session's `metrics`; a test fails for a path or a name
+  written into any string of a sample. It is written last, whole or not at all, so it says how the
+  run ended, and a run directory without it is one that did not end.
+- `quirks.txt` is local only. It holds anything unexpected, with its circumstances: an error
+  dialog, text that reads as a deletion dialog, an uncertain scan and the last folder it could not
+  read, a non-zero exit, a time-out, a stall, a report that grew too large. Its text comes from the
+  screen and the scan report, so it names things in the tree.
+- A recording is kept only with `--record`, and its screens show real names too.
+
+### What it does not defend against
+
+The soak is run by the person who owns the machine, on a tree that person chose, and it is not a
+sandbox. Its checks look at a place when they look, and it writes with ordinary calls by path: it
+does not hold a directory open between a look and a write. So it does not defend against another
+process that changes the file system under it while it runs: one that renames the output, scratch,
+or target directory and puts a link where it was after the soak has looked, one that makes or
+replaces `latest` between the look at it and the replacing, or one that rewrites the file that
+cargo reported in place between cargo's exit and the copy. Nor does it look at access control
+lists, recognize a file system that decides for itself about who may change what (the macOS
+volume that ignores ownership is the one it knows), or confine the code that the build runs. An
+attack that needs one of these is made by a process that already has the person's own rights,
+except where other users can change a directory, which is why the scratch directory must be
+private. What the soak promises is what it says where it says it: the root is not written but in
+the places the prompt names, no key that deletes is sent, and everything it starts is ended with
+its process group.
+
+### Tests
+
+`cargo test -p excise-harness --lib -- soak safety report run_support headless::process pty` (the
+allowlist and the driver; sessions against scripts that stand in for `excise`; the source tripwire;
+whole runs against scripts: a program that hangs is killed with its process group and the log says
+so, a binary or a copy that is replaced or written in place, an interrupt, a bound, a report that
+grows past its cap; the private-directory check, with a stand-in for a volume that ignores
+ownership, and on macOS, with `EXCISE_HARNESS_PRIVILEGED=1`, a real image attached without owners
+(`fixture::volume`); the supervisor that gives up on a process that the kill does not end; the
+schema), `cargo test --test harness_soak` (generated fixtures with distinctive names, soaked
+with the real binary: it finishes, validates, leaves the tree byte for byte as it was, and puts no
+name or path in `summary.json`; it works in `/tmp`, or `EXCISE_E2E_TMPDIR`, else in cargo's test
+directory, else in the system's, whichever the soak accepts as a scratch directory, and says
+`skipped:` where none is, as in a Nix build sandbox, where `/tmp` belongs to `nobody`, and fails
+there instead when `CI` is set), and `cargo test -p xtask` (the build supervisor, which lets its
+program go as soon as it is ended; the handlers, run in a process of their own whose main thread
+calls nothing: a second Ctrl+C or Ctrl+\ ends the command once the exit is armed, which a thread
+of its own does when no program is held, and not while one is, and two hang-ups, terminations, or
+stops do not; and `xtask/tests/soak.rs`, which runs the built `xtask` binary: it refuses without a
+terminal, at a mistyped path, and at a scratch directory that others can change, before it builds
+or starts anything, and Ctrl+Z ends a build as the other signals do).
+
 ## Safety rules
 
 The harness only ever runs `excise` against fixtures it generated itself, and never against a real
@@ -2845,6 +3097,12 @@ the opt-in.
 EXCISE_HARNESS_PRIVILEGED=1 cargo test -p excise-harness --locked --lib volume
 ```
 
+On macOS the same command also runs the test behind the read-only soak's scratch-directory check
+([Read-only soak](#read-only-soak)): an image attached with `hdiutil attach -owners off` is a volume
+that ignores ownership, which the check refuses whatever the mode of its directories, and one
+attached with `-owners on` is not refused for that. `mount`, which decodes the flags of the same
+`statfs`, says which of the two a volume is, and the test compares the check with it.
+
 **`cargo xtask e2e` and `scan_store_on_volume`.** The PTY runner (`run_e2e`/`run_scenario`)
 always starts `excise` with `EXCISE_SCAN_STORE_DIR` inside its own per-run scratch area (see
 [Isolation](#isolation)), on the same file system as everything else the scenario touches. A
@@ -2880,6 +3138,7 @@ Machine output is versioned JSON. Every document carries a `document_kind` and a
 | Version sweep | `harness-sweep` | 1 | `cargo xtask sweep` | [`harness-sweep.schema.json`](schemas/harness-sweep.schema.json) | What the sweep found of every published version and the candidate: the versions (ref, commit, toolchain, binary digest, how the build went, what its `--help` lists), the paired and interleaved timings (every sample with the round it was taken in and whether it finished, how many rounds a version was skipped in, each version's median, and its ratios, with bootstrap intervals over the rounds in which both sides finished and the bounds the other rounds give), the observation of every other check with its evidence file, the conditions it ran under, and the table: one row per defect, one cell per version (`affected`, `not-affected`, or `not-measurable`, with the reason, the measured value, and the evidence). See [Version sweep](#version-sweep). |
 | Tui command | `harness-tui` | 1 | `cargo xtask tui` | [`harness-tui.schema.json`](schemas/harness-tui.schema.json) | What one interactive-driver command prints: its result, whose shape depends on `command` (the first screen, the screen and the events after keys, a deletion's verified dialog and sentinels, the screen, the event records, how the session ended, or the open sessions), or why it failed. |
 | Shape profile | `harness-shape-profile` | 1 | `excise-shape profile` | [`harness-shape-profile.schema.json`](schemas/harness-shape-profile.schema.json) | The shape of one tree as aggregates only: counts by kind and by depth, histograms of what a folder holds, of file sizes, and of name lengths, hard links, symbolic links, and unreadable entries; never a name, a path, a link target, an owner, or a timestamp (see [Shape profiles](#shape-profiles)). |
+| Soak | `harness-soak` | 1 | `cargo xtask soak` | [`harness-soak.schema.json`](schemas/harness-soak.schema.json) | What one read-only soak of a real tree measured: the commit and the SHA-256 of the binary, how the run ended, for each round the headless scan's wall time, CPU time, and peak memory with the `state`, `accounting`, and `summary` counts of its report, and for each session in a pseudo-terminal how it ended, whether the terminal was restored, what the program left behind, and a map of named metrics whose names the schema lists, with the quirks counted by kind. Metrics and counts only: no path, no name from the tree, no host name, and no free text, so that it can be shared (see [Read-only soak](#read-only-soak)). |
 
 `cargo xtask headless` writes a `harness-summary`, not a separate document kind: a headless run is
 one more kind of scenario result, named `headless-<fixture>`, whose open `metrics` map carries the
@@ -2908,14 +3167,17 @@ its own document with it before it writes it.
 
 A `metrics` map is deliberately open: the harness does not constrain which names appear, and the
 schemas say so rather than enumerating them (a scenario's own `measure` names, a fixture's class,
-or a future metric all pass through unchanged). Fixed-shape fields (identities, verdicts, the
-profile and tier enums, the session diagnostics object) are fully enumerated and reject an unknown
-member or an undeclared field.
+or a future metric all pass through unchanged). The one exception is the soak's, which is made to
+be shared: the names of a session's `metrics` are listed in `harness-soak.schema.json`
+(`$defs/metric_name`), so that a name from the tree cannot be a key. Fixed-shape fields
+(identities, verdicts, the profile and tier enums, the session diagnostics object) are fully
+enumerated and reject an unknown member or an undeclared field.
 
 Each schema's `$id` is
 `https://github.com/findyourexit/excise/harness/schemas/<document_kind>-v1.json`. The Rust types
 are `HarnessSummary`, `HarnessFailure`, `HarnessAb`, `HarnessCounts`, `HarnessSweep`,
-`HarnessTui`, and `HarnessShapeProfile` in `excise_harness::report`. They implement `Document`,
+`HarnessTui`, `HarnessShapeProfile`, and `HarnessSoak` in `excise_harness::report`.
+They implement `Document`,
 which carries the kind, the schema id, and the schema text, and renders the canonical form:
 pretty-printed JSON in field order with a final newline.
 

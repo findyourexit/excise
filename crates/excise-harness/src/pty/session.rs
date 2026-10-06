@@ -12,7 +12,11 @@
 //! also the leader of its own process group. [`PtySession::kill`] signals that group with
 //! `SIGKILL`, so nothing the child forked survives, and the same happens when the session is
 //! dropped: a session never leaks a process. The child is reaped only after its exit is seen
-//! without reaping (`waitid` with `WNOWAIT`), so its final resource figures can still be read.
+//! without reaping (`waitid` with `WNOWAIT`), so its final resource figures can still be read,
+//! and so that what it started and left running can be killed while its process id still names
+//! its group: a leader that has ended is a zombie until it is reaped, and nothing else can have
+//! the id. The kill is made at that moment, once, so a child that ends and leaves a descendant
+//! behind does not leave it running.
 //!
 //! The library's writer sends a newline and an end-of-file character to the child when it is
 //! dropped. That input could confirm a dialog, so the session drops the writer only once the child
@@ -34,7 +38,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -71,6 +75,21 @@ struct MarkRead {
     first_paint_at: Option<Instant>,
 }
 
+/// What a session keeps of the screen as the latest mark left it ([`PtySession::marked_screen`]).
+enum Marked {
+    /// The session was not asked to keep it: the screen model is all there is.
+    NotKept,
+    /// It was asked, and there is no screen of a mark to keep yet: no mark has been read, or the
+    /// terminal was resized since the copy was made.
+    NoMarkYet,
+    /// The latest mark is the last thing read. The screen model is exactly the screen it left,
+    /// and the next output is the start of the redraw after it.
+    AtTheMark,
+    /// Output has been read after the latest mark. This is the screen as the mark left it, copied
+    /// when that output first came.
+    Kept(Box<Screen>),
+}
+
 /// How often a running child is sampled for memory, threads, and descriptors.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 /// How long [`PtySession::kill`] waits for a killed child to die before it gives up.
@@ -79,6 +98,22 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The size of one read from the terminal.
 const READ_CHUNK: usize = 64 * 1024;
+/// How many bytes of output one call of [`PtySession::pump`] takes in at most. A program that
+/// writes faster than the session reads would keep a call going for as long as it writes, and the
+/// caller, whose deadlines are only looked at between calls, would never get its turn. What is
+/// left waits for the next call.
+const PUMP_LIMIT: usize = 1024 * 1024;
+/// How many bytes of output wait to be pumped, at most, not counting the read that the reader
+/// thread has in hand (one [`READ_CHUNK`]). The thread stops reading when this much waits, so a
+/// program that writes faster than the session pumps is held back in its own writes, as it is by
+/// a terminal that nobody reads. Without the bound what waits would grow as long as the program
+/// writes, and a caller that is not pumping, or is pumping one [`PUMP_LIMIT`] at a time, could not
+/// stop it. It is a number of bytes, and not of reads, because how much one read returns is the
+/// system's to decide. [`PtySession::kill`] lifts it: a program that is being killed must be read
+/// freely, because it does not die while a write of its own is held back.
+const QUEUE_BYTES: usize = 4 * 1024 * 1024;
+/// How often a reader thread that waits for room in the queue looks again.
+const BACKLOG_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// How many bytes of raw output a timeout's diagnostics keep from the start and from the end of
 /// the stream.
 const DIAGNOSTIC_BYTES: usize = 200;
@@ -121,6 +156,10 @@ pub enum PtyError {
     /// The terminal input was closed.
     #[error("the terminal input is closed")]
     InputClosed,
+    /// The terminal's output could not be read. Not the end of the output: that is a read that
+    /// returns nothing, or fails because the program's side of the terminal is closed.
+    #[error("cannot read from the terminal: {0}")]
+    Read(io::Error),
     /// The terminal could not be resized.
     #[error("cannot resize the terminal: {0}")]
     Resize(String),
@@ -274,7 +313,9 @@ pub struct PtySession {
     master: Option<Box<dyn MasterPty + Send>>,
     /// Dropped only after the child is dead; see the module documentation.
     writer: Option<Box<dyn Write + Send>>,
-    chunks: Receiver<Chunk>,
+    chunks: Receiver<io::Result<Chunk>>,
+    /// How much output waits in `chunks`, and whether anybody is going to take it in.
+    backlog: Arc<Backlog>,
     reader: Option<JoinHandle<()>>,
     reader_done: bool,
     /// Lifted by [`PtySession::kill`] so a capped reader drains freely once the run ends.
@@ -289,6 +330,9 @@ pub struct PtySession {
     /// The latest marks read, oldest first, and what came after each (see
     /// [`PtySession::paint_followed_mark`]). At most [`MARKS_KEPT`].
     marks_read: std::collections::VecDeque<MarkRead>,
+    /// What the session keeps of the screen as the latest mark left it
+    /// ([`PtySession::marked_screen`]).
+    marked: Marked,
     recording: Option<(PathBuf, CastWriter<io::BufWriter<std::fs::File>>)>,
     started: Instant,
     exit: Option<ExitInfo>,
@@ -348,11 +392,13 @@ impl PtySession {
         // nothing running.
         let (sender, chunks) = mpsc::channel();
         let uncapped = Arc::new(AtomicBool::new(false));
+        let backlog = Arc::new(Backlog::default());
         let reader = spawn_reader(
             reader,
             sender,
             spec.drain_bytes_per_sec,
             Arc::clone(&uncapped),
+            Arc::clone(&backlog),
         )?;
         let started = Instant::now();
         let recording = spec
@@ -394,6 +440,7 @@ impl PtySession {
             master: Some(pair.master),
             writer: Some(writer),
             chunks,
+            backlog,
             reader: Some(reader),
             reader_done: false,
             uncapped,
@@ -402,6 +449,7 @@ impl PtySession {
             frame_shown: 0,
             unpainted: 0,
             marks_read: std::collections::VecDeque::new(),
+            marked: Marked::NotKept,
             recording,
             started,
             exit: None,
@@ -462,6 +510,36 @@ impl PtySession {
     #[must_use]
     pub const fn frame_shown(&self) -> u64 {
         self.frame_shown
+    }
+
+    /// Makes the session keep the screen as the latest mark left it
+    /// ([`PtySession::marked_screen`]). It is not the default: a copy of the screen is made each
+    /// time output is read after a mark, and a runner that never asks for the screen of a frame
+    /// does not pay for it. Called before any output is read.
+    pub fn keep_the_screen_of_each_mark(&mut self) {
+        if matches!(self.marked, Marked::NotKept) {
+            self.marked = Marked::NoMarkYet;
+        }
+    }
+
+    /// The screen as the latest mark left it, for a read that is about one frame and not about a
+    /// redraw in progress.
+    ///
+    /// The screen model is fed as the output arrives, so after a read it can hold the start of the
+    /// redraw of the frame after the latest mark (a read ends where it ends, in the middle of a
+    /// frame as often as not): a header whose badge is half drawn, a pane that shows the old
+    /// entry above the new one's size. On a Unix pseudo-terminal the mark follows its frame's
+    /// bytes, so the screen as the mark left it is the screen of [`PtySession::frame_shown`]
+    /// exactly. That is this: a copy made when output was first read after the mark, and the
+    /// screen model itself for as long as nothing has been read after it. Before the first
+    /// mark, for a program that marks no frames, and when the session was not asked to keep it
+    /// ([`PtySession::keep_the_screen_of_each_mark`]), it is the screen model.
+    #[must_use]
+    pub fn marked_screen(&self) -> &Screen {
+        match &self.marked {
+            Marked::Kept(screen) => screen,
+            Marked::NotKept | Marked::NoMarkYet | Marked::AtTheMark => &self.screen,
+        }
     }
 
     /// The first mark of frame `seq` or later that the session has read. Marks come in the order
@@ -543,15 +621,26 @@ impl PtySession {
     }
 
     /// Reads whatever output is waiting, answers cursor position requests, samples the child, and
-    /// notes whether it has exited. Never blocks.
+    /// notes whether it has exited. Never blocks, and takes in at most [`PUMP_LIMIT`] bytes of
+    /// output: a call that finds more leaves the rest for the next one.
     ///
     /// # Errors
     ///
-    /// Returns an error if the recording or the terminal input fails.
+    /// Returns an error if the recording or the terminal input fails, or if the terminal could
+    /// not be read (once: the output that came before the failure has been taken in).
     pub fn pump(&mut self) -> Result<(), PtyError> {
-        loop {
+        let mut taken = 0;
+        while taken < PUMP_LIMIT {
             match self.chunks.try_recv() {
-                Ok(chunk) => self.absorb(&chunk)?,
+                Ok(Ok(chunk)) => {
+                    taken += chunk.bytes.len();
+                    self.backlog.leave(chunk.bytes.len());
+                    self.absorb(&chunk)?;
+                }
+                Ok(Err(error)) => {
+                    self.reader_done = true;
+                    return Err(PtyError::Read(error));
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.reader_done = true;
@@ -572,14 +661,22 @@ impl PtySession {
     ///
     /// # Errors
     ///
-    /// Returns an error if the recording or the terminal input fails.
+    /// Returns an error if the recording or the terminal input fails, or if the terminal could
+    /// not be read.
     pub fn wait_activity(&mut self, timeout: Duration) -> Result<(), PtyError> {
         if self.reader_done {
             thread::sleep(timeout);
             return Ok(());
         }
         match self.chunks.recv_timeout(timeout) {
-            Ok(chunk) => self.absorb(&chunk),
+            Ok(Ok(chunk)) => {
+                self.backlog.leave(chunk.bytes.len());
+                self.absorb(&chunk)
+            }
+            Ok(Err(error)) => {
+                self.reader_done = true;
+                Err(PtyError::Read(error))
+            }
             Err(RecvTimeoutError::Timeout) => Ok(()),
             Err(RecvTimeoutError::Disconnected) => {
                 self.reader_done = true;
@@ -655,6 +752,10 @@ impl PtySession {
             })
             .map_err(|error| PtyError::Resize(format!("{error:#}")))?;
         self.screen.resize(rows, cols);
+        // The copy is the size the screen was; what follows is read at the new one.
+        if matches!(self.marked, Marked::Kept(_)) {
+            self.marked = Marked::NoMarkYet;
+        }
         if let Some((path, cast)) = &mut self.recording {
             cast.resize(at, cols, rows)
                 .map_err(|source| PtyError::Recording {
@@ -737,16 +838,19 @@ impl PtySession {
     /// Ends the child and everything it started, and reaps it. Does nothing once the child has
     /// been reaped.
     ///
-    /// Gives up waiting for the child to die after five seconds. Also lifts any drain cap
+    /// Gives up waiting for the child to die after five seconds, and says so: the result is
+    /// whether the child has been reaped. `false` is a child that the kill did not reach in that
+    /// time, one stuck where a signal does not take effect (a call that the file system under it
+    /// does not answer), and it is still running. Also lifts any drain cap
     /// (`SpawnSpec::drain_bytes_per_sec`) immediately, so output already queued in the
     /// pseudo-terminal drains at full speed before the kill signal arrives.
-    pub fn kill(&mut self) {
+    pub fn kill(&mut self) -> bool {
         // Lifted first: a process that still has output queued when its terminal closes keeps
         // writing until it is read, so the reader must drain freely before the signal arrives, or
         // the reap could stall behind a write the reader is pacing.
         self.uncapped.store(true, Ordering::Relaxed);
         if self.reaped {
-            return;
+            return true;
         }
         #[cfg(unix)]
         {
@@ -763,6 +867,7 @@ impl PtySession {
                 thread::sleep(Duration::from_millis(2));
             }
         }
+        self.reaped
     }
 
     /// Flushes the recording. Called before the recording is copied anywhere.
@@ -805,8 +910,14 @@ impl PtySession {
             &mut self.unpainted,
             &mut self.marks_read,
         );
+        let marked = &mut self.marked;
         self.marks.feed(&chunk.bytes, |piece| match piece {
             Piece::Bytes(bytes) => {
+                // The first output after a mark begins the next frame's redraw, and the screen
+                // model holds that from here on: what the mark left is kept before it is fed.
+                if matches!(marked, Marked::AtTheMark) {
+                    *marked = Marked::Kept(Box::new(screen.snapshot()));
+                }
                 replies.extend_from_slice(&screen.process(bytes));
                 // The marks that no output had followed are followed by this: it is what the
                 // console host painted after them.
@@ -819,6 +930,10 @@ impl PtySession {
             // the screen shows forward.
             Piece::Frame(seq) => {
                 *frame_shown = (*frame_shown).max(seq);
+                // Every byte of the frame is in the screen model, and nothing after it is.
+                if !matches!(marked, Marked::NotKept) {
+                    *marked = Marked::AtTheMark;
+                }
                 if marks_read.len() == MARKS_KEPT {
                     marks_read.pop_front();
                     *unpainted = (*unpainted).min(marks_read.len());
@@ -885,6 +1000,12 @@ impl PtySession {
                 if self.cgroup_wrapped {
                     self.cgroup_peak_bytes = crate::safety::cgroup::read_memory_peak(self.pid);
                 }
+                // The leader is a zombie until it is reaped below, so its id still names its
+                // process group and cannot name another one. Whatever it started and left running
+                // ends with it: a session never leaks a process, whether the child is ended by
+                // `kill` or ends by itself. (There is no group to signal where there is no
+                // `waitid`: see `safety::process`.)
+                let _ = crate::safety::kill_process_group(self.pid);
             }
             let _ = self.child.wait();
             self.reaped = true;
@@ -915,6 +1036,10 @@ impl Drop for PtySession {
         self.kill();
         // The child is dead, so the end-of-file the writer sends on drop reaches nobody.
         drop(self.writer.take());
+        // A reader that waits for room in the queue ends when the queue is closed, so it is
+        // closed before the thread is waited for: a program that was held back by a full queue
+        // does not make this wait for the whole of the join bound.
+        self.backlog.close();
         if let Some(handle) = self.reader.take() {
             let deadline = Instant::now() + READER_JOIN_TIMEOUT;
             while !handle.is_finished() && Instant::now() < deadline {
@@ -925,6 +1050,57 @@ impl Drop for PtySession {
             }
         }
         let _ = self.finish_recording();
+    }
+}
+
+/// The output that has been read from the terminal and not taken in yet: how much of it there is,
+/// and whether anybody is going to take it in. The reader thread adds what it reads and waits while
+/// [`QUEUE_BYTES`] wait; the session takes chunks in and says so.
+#[derive(Debug, Default)]
+struct Backlog {
+    waiting: AtomicUsize,
+    closed: AtomicBool,
+}
+
+impl Backlog {
+    /// Waits until fewer than [`QUEUE_BYTES`] wait to be taken in, the bound is lifted
+    /// (`uncapped`, which [`PtySession::kill`] sets), or the queue is closed. Returns whether the
+    /// thread may read on: `false` once nobody is going to take the output in.
+    ///
+    /// The bound is lifted by the kill for the reason the pace of a capped reader is: a process
+    /// that is blocked in a write to the terminal does not die until the write goes through, so a
+    /// reader that held the output back would stall the reap that the kill waits for. What a
+    /// program that is being killed can still write is finite.
+    fn wait_for_room(&self, uncapped: &AtomicBool) -> bool {
+        while self.waiting.load(Ordering::Acquire) >= QUEUE_BYTES
+            && !uncapped.load(Ordering::Relaxed)
+        {
+            if self.closed.load(Ordering::Acquire) {
+                return false;
+            }
+            thread::sleep(BACKLOG_POLL_INTERVAL);
+        }
+        !self.closed.load(Ordering::Acquire)
+    }
+
+    /// A read of `bytes` bytes is queued.
+    fn join(&self, bytes: usize) {
+        self.waiting.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    /// A chunk of `bytes` bytes was taken in. A chunk that was not counted in (one that a test
+    /// put in the queue itself) leaves the count at zero and no lower.
+    fn leave(&self, bytes: usize) {
+        let _ = self
+            .waiting
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                Some(waiting.saturating_sub(bytes))
+            });
+    }
+
+    /// Nobody is going to take the output in.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
     }
 }
 
@@ -982,9 +1158,10 @@ impl DrainCap {
 /// output at full speed.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
-    sender: mpsc::Sender<Chunk>,
+    sender: mpsc::Sender<io::Result<Chunk>>,
     drain_bytes_per_sec: Option<u64>,
     uncapped: Arc<AtomicBool>,
+    backlog: Arc<Backlog>,
 ) -> Result<JoinHandle<()>, PtyError> {
     thread::Builder::new()
         .name("harness-pty-reader".to_owned())
@@ -992,6 +1169,11 @@ fn spawn_reader(
             let mut buffer = vec![0_u8; READ_CHUNK];
             let mut cap = drain_bytes_per_sec.map(|rate| DrainCap::new(rate, Instant::now()));
             loop {
+                // The output that waits is bounded: no more is read from the terminal while the
+                // session has a backlog, which holds the program back in its own writes.
+                if !backlog.wait_for_room(&uncapped) {
+                    break;
+                }
                 let want = match &mut cap {
                     Some(cap) if !uncapped.load(Ordering::Relaxed) => {
                         let mut allowed = cap.take(READ_CHUNK, Instant::now());
@@ -1014,20 +1196,29 @@ fn spawn_reader(
                             at: Instant::now(),
                             bytes: buffer[..read].to_vec(),
                         };
-                        if sender.send(chunk).is_err() {
+                        backlog.join(read);
+                        if sender.send(Ok(chunk)).is_err() {
                             break;
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
+                    // The end of the output: the program's side of the terminal is closed.
+                    Err(error) if program_side_closed(&error) => break,
+                    // Any other failure is not the end of the output, and a reader that ended
+                    // without saying so would let the session believe it had read everything.
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
                 }
             }
         })
         .map_err(|error| PtyError::Open(format!("cannot start the reader thread: {error}")))
 }
 
-/// Whether a write to the terminal failed because the program's side of it is closed, so nothing
-/// is left to read what was written: `EIO` on Unix, a broken pipe on Windows.
+/// Whether a read or a write of the terminal failed because the program's side of it is closed, so
+/// that there is nothing left to read, or nothing left to read what was written: `EIO` on Unix, a
+/// broken pipe on Windows.
 fn program_side_closed(error: &io::Error) -> bool {
     #[cfg(unix)]
     if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) {
@@ -1582,6 +1773,317 @@ mod tests {
         assert!(
             session.exit().is_some(),
             "the child is still reaped normally"
+        );
+    }
+
+    /// A reader that gives what it holds and then fails with `error`.
+    struct Failing {
+        held: Vec<u8>,
+        error: Option<io::Error>,
+    }
+
+    impl Read for Failing {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.held.is_empty() {
+                let count = self.held.len().min(buffer.len());
+                buffer[..count].copy_from_slice(&self.held[..count]);
+                self.held.drain(..count);
+                return Ok(count);
+            }
+            Err(self
+                .error
+                .take()
+                .unwrap_or_else(|| io::Error::other("the terminal failed again")))
+        }
+    }
+
+    #[test]
+    fn a_failed_read_of_the_terminal_is_reported_and_is_not_the_end_of_the_output() {
+        let (sender, chunks) = mpsc::channel();
+        let reader = spawn_reader(
+            Box::new(Failing {
+                held: b"output".to_vec(),
+                error: Some(io::Error::other("a failing terminal")),
+            }),
+            sender,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Backlog::default()),
+        )
+        .expect("a reader");
+
+        let first = chunks
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the output")
+            .map(|chunk| chunk.bytes)
+            .expect("a read");
+        let failure = chunks
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the failure");
+
+        assert_eq!(first, b"output");
+        assert!(
+            matches!(&failure, Err(error) if error.to_string().contains("a failing terminal")),
+            "the failure is delivered to the session"
+        );
+        reader.join().expect("the reader ended");
+        assert!(matches!(chunks.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn a_terminal_whose_program_side_is_closed_ends_the_output_without_an_error() {
+        for error in [
+            io::Error::from(io::ErrorKind::BrokenPipe),
+            io::Error::from_raw_os_error(rustix::io::Errno::IO.raw_os_error()),
+        ] {
+            let (sender, chunks) = mpsc::channel();
+            let reader = spawn_reader(
+                Box::new(Failing {
+                    held: Vec::new(),
+                    error: Some(error),
+                }),
+                sender,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Backlog::default()),
+            )
+            .expect("a reader");
+
+            reader.join().expect("the reader ended");
+
+            assert!(
+                matches!(chunks.try_recv(), Err(TryRecvError::Disconnected)),
+                "the end of the output is not a failure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_error_reaches_the_caller_once_and_then_the_session_is_done_reading() {
+        let mut session = PtySession::spawn(&shell("sleep 30")).expect("spawn");
+        let (sender, chunks) = mpsc::channel();
+        session.chunks = chunks;
+        sender
+            .send(Err(io::Error::other("a failing terminal")))
+            .expect("sent");
+        drop(sender);
+
+        let first = session.pump();
+
+        assert!(
+            matches!(&first, Err(PtyError::Read(error)) if error.to_string().contains("failing")),
+            "{first:?}"
+        );
+        assert!(session.pump().is_ok(), "the failure is reported once");
+        session.kill();
+    }
+
+    #[test]
+    fn one_pump_takes_in_a_bounded_amount_of_output_and_the_rest_waits_for_the_next() {
+        // The child writes three times what one call takes in, and ends. The reader thread
+        // queues what the child writes, whether or not anyone pumps (it is less than the queue
+        // holds), so when the child has written it all the queue holds more than a call takes.
+        const TOTAL: usize = 3 * PUMP_LIMIT;
+        const _: () = assert!(TOTAL < QUEUE_BYTES);
+        let dir = tempfile::Builder::new()
+            .prefix("xt-pump-")
+            .tempdir()
+            .expect("a directory");
+        let written = dir.path().join("written");
+        let script = format!(
+            "head -c {TOTAL} /dev/zero | tr '\\0' x; : > '{}'",
+            written.display()
+        );
+        let mut session = PtySession::spawn(&shell(&script)).expect("spawn");
+        assert!(
+            eventually(|| written.exists()),
+            "the child never finished writing"
+        );
+
+        session.pump().expect("pump");
+
+        let first = session.output_bytes();
+        assert!(first > 0, "the call took in nothing");
+        assert!(
+            first <= (PUMP_LIMIT + READ_CHUNK) as u64,
+            "one call took in {first} bytes of {TOTAL}"
+        );
+        run_until(&mut session, PtySession::finished);
+        assert!(
+            session.output_bytes() >= TOTAL as u64,
+            "what one call left was taken in by the next: {} of {TOTAL}",
+            session.output_bytes()
+        );
+    }
+
+    #[test]
+    fn a_program_that_writes_more_than_the_queue_holds_is_held_back_until_the_session_reads() {
+        // The child writes twice what the queue holds. Nothing pumps, so the reader thread stops
+        // reading when the queue is full, the terminal fills, and the child waits in its own
+        // write: it cannot get to the file it makes when it has written everything. Without the
+        // bound the thread would queue all of it, and the child would end at once.
+        const TOTAL: usize = 2 * QUEUE_BYTES;
+        let dir = tempfile::Builder::new()
+            .prefix("xt-held-")
+            .tempdir()
+            .expect("a directory");
+        let written = dir.path().join("written");
+        let script = format!(
+            "head -c {TOTAL} /dev/zero | tr '\\0' x; : > '{}'",
+            written.display()
+        );
+        let mut session = PtySession::spawn(&shell(&script)).expect("spawn");
+
+        assert!(
+            eventually(|| session.backlog.waiting.load(Ordering::Acquire) >= QUEUE_BYTES),
+            "the queue never filled"
+        );
+        thread::sleep(Duration::from_millis(500));
+        let waiting = session.backlog.waiting.load(Ordering::Acquire);
+        assert!(
+            waiting <= QUEUE_BYTES + READ_CHUNK,
+            "{waiting} bytes waited to be read, more than the bound of {QUEUE_BYTES}"
+        );
+        assert!(
+            !written.exists(),
+            "the child wrote {TOTAL} bytes that nobody had read"
+        );
+        run_until(&mut session, PtySession::finished);
+        assert!(written.exists(), "the child never finished writing");
+        assert!(
+            session.output_bytes() >= TOTAL as u64,
+            "what was held back was read once the session pumped: {} of {TOTAL}",
+            session.output_bytes()
+        );
+    }
+
+    #[test]
+    fn dropping_a_session_whose_reader_waits_for_room_does_not_wait_for_the_reader() {
+        // The queue is full and nobody reads: the reader thread is in its wait for room, and the
+        // child is in its write. Dropping the session ends the child and closes the queue, and
+        // the thread ends at once instead of at the end of the bound on the join.
+        const TOTAL: usize = 2 * QUEUE_BYTES;
+        let session = PtySession::spawn(&shell(&format!(
+            "head -c {TOTAL} /dev/zero | tr '\\0' x; sleep 30"
+        )))
+        .expect("spawn");
+        assert!(
+            eventually(|| session.backlog.waiting.load(Ordering::Acquire) >= QUEUE_BYTES),
+            "the queue never filled"
+        );
+        thread::sleep(Duration::from_millis(200));
+
+        let started = Instant::now();
+        drop(session);
+
+        assert!(
+            started.elapsed() < READER_JOIN_TIMEOUT,
+            "the drop waited {:?} for a reader that was only waiting for room",
+            started.elapsed()
+        );
+    }
+
+    /// A chunk of terminal output, as the reader thread would have read it.
+    fn chunk(bytes: &[u8]) -> Chunk {
+        Chunk {
+            at: Instant::now(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_screen_of_a_mark_is_kept_while_the_start_of_the_next_frame_is_read() {
+        // One read ends in the middle of the redraw after a mark, which is where a read ends as
+        // often as not. The screen model then holds half of the next frame, and the screen as the
+        // mark left it is the copy made when that output came.
+        let mut session = PtySession::spawn(&shell("sleep 30")).expect("spawn");
+        session.keep_the_screen_of_each_mark();
+
+        session
+            .absorb(&chunk(
+                b"\x1b[2J\x1b[1;1Hframe one\x1b]9471;excise-frame=1\x07\x1b[2J\x1b[1;1Hframe t",
+            ))
+            .expect("a read");
+
+        assert_eq!(session.frame_shown(), 1);
+        assert_eq!(session.screen().row_text(0), "frame t", "half of frame two");
+        assert_eq!(session.marked_screen().row_text(0), "frame one");
+
+        // The rest of frame two comes, and its mark: the screen model is that frame's again.
+        session
+            .absorb(&chunk(b"wo\x1b]9471;excise-frame=2\x07"))
+            .expect("a read");
+
+        assert_eq!(session.frame_shown(), 2);
+        assert_eq!(session.screen().row_text(0), "frame two");
+        assert_eq!(session.marked_screen().row_text(0), "frame two");
+
+        // A later read, with the start of frame three in it, leaves the mark's screen as it was.
+        session
+            .absorb(&chunk(b"\x1b[2J\x1b[1;1Hframe th"))
+            .expect("a read");
+
+        assert_eq!(session.screen().row_text(0), "frame th");
+        assert_eq!(session.marked_screen().row_text(0), "frame two");
+        session.kill();
+    }
+
+    #[test]
+    fn a_session_that_was_not_asked_keeps_no_copy_and_its_marked_screen_is_the_screen_model() {
+        let mut session = PtySession::spawn(&shell("sleep 30")).expect("spawn");
+
+        session
+            .absorb(&chunk(
+                b"\x1b[2J\x1b[1;1Hframe one\x1b]9471;excise-frame=1\x07\x1b[2J\x1b[1;1Hframe t",
+            ))
+            .expect("a read");
+
+        assert_eq!(session.marked_screen().row_text(0), "frame t");
+        session.kill();
+    }
+
+    #[test]
+    fn before_the_first_mark_the_marked_screen_is_the_screen_model() {
+        let mut session = PtySession::spawn(&shell("sleep 30")).expect("spawn");
+        session.keep_the_screen_of_each_mark();
+
+        session
+            .absorb(&chunk(b"\x1b[2J\x1b[1;1Hstarting"))
+            .expect("a read");
+
+        assert_eq!(session.frame_shown(), 0);
+        assert_eq!(session.marked_screen().row_text(0), "starting");
+        session.kill();
+    }
+
+    #[test]
+    fn what_a_child_started_does_not_outlive_it() {
+        // The child starts a sleeper that ignores the hang-up the terminal sends to its group when
+        // its leader ends, and the child ends at once. Nothing but the session ends the sleeper.
+        let mut session =
+            PtySession::spawn(&shell("trap '' HUP; sleep 60 & echo background:$!; exit 0"))
+                .expect("spawn");
+
+        run_until(&mut session, PtySession::finished);
+
+        assert!(
+            session.finished(),
+            "the output did not end: {}",
+            session.screen().text()
+        );
+        let text = session.screen().text();
+        let sleeper: u32 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("background:"))
+            .and_then(|pid| pid.trim().parse().ok())
+            .expect("the process id of the sleeper");
+        assert!(
+            eventually(|| gone(sleeper)),
+            "the sleeper outlived the child that started it"
+        );
+        assert!(
+            eventually(|| !process_group_exists(session.pid())),
+            "the process group must be empty once the child has ended"
         );
     }
 }
