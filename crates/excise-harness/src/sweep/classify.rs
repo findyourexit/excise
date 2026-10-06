@@ -3076,6 +3076,7 @@ mod tests {
                 name: name.to_owned(),
                 state: "COMPLETE".to_owned(),
                 kind: "folder".to_owned(),
+                pane: format!("{name}\n◆ COMPLETE · folder"),
             })
         };
         let observation = |selected: Inspector, root: Option<i32>, folder: Option<i32>| {
@@ -3417,6 +3418,7 @@ mod tests {
                     name: name.to_owned(),
                     state: "COMPLETE".to_owned(),
                     kind: "folder".to_owned(),
+                    pane: format!("{name}\n◆ COMPLETE · folder"),
                 }),
                 largest: Some("victim".to_owned()),
                 at_root: survived("at the root"),

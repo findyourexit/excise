@@ -1,0 +1,371 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/findyourexit/excise/harness/schemas/harness-soak-v1.json",
+  "title": "Excise harness soak v1",
+  "description": "What one read-only soak of a tree measured: headless scans and sessions in a pseudo-terminal, as metrics and counts. It carries no path and no name from the tree, no host name, and no free text: every string is an identifier, an enumerated word, a timestamp, or a digest, and the patterns and enumerations below keep it that way (the names of the metrics are enumerated too, so that no name from the tree can be one), so the document can be shared. What a person needs in order to look into a quirk stays in quirks.txt, on the machine that made it. Internal test tooling, not a supported product interface.",
+  "type": "object",
+  "required": [
+    "document_kind",
+    "schema_version",
+    "run_id",
+    "started_at",
+    "finished_at",
+    "os",
+    "arch",
+    "git_sha",
+    "excise_sha256",
+    "outcome",
+    "rounds",
+    "limits",
+    "headless",
+    "tui",
+    "quirks"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "document_kind": { "const": "harness-soak" },
+    "schema_version": { "const": 1 },
+    "run_id": {
+      "description": "Also the name of the run's output directory.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "started_at": { "$ref": "#/$defs/timestamp" },
+    "finished_at": { "$ref": "#/$defs/timestamp" },
+    "os": { "$ref": "#/$defs/token" },
+    "arch": { "$ref": "#/$defs/token" },
+    "git_sha": {
+      "description": "The commit of the checkout the harness ran from.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "excise_sha256": {
+      "description": "The SHA-256 of the excise binary that was soaked. Its path is not recorded.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "outcome": {
+      "description": "finished: every round ran. interrupted: the person interrupted the run, or the bound on the whole run passed, and the rest never ran. failed: the harness could not go on. The sessions that ran before are recorded either way.",
+      "enum": ["finished", "interrupted", "failed"]
+    },
+    "rounds": { "$ref": "#/$defs/rounds" },
+    "limits": { "$ref": "#/$defs/limits" },
+    "headless": {
+      "description": "One entry per headless scan, in the order they ran.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/headless" }
+    },
+    "tui": {
+      "description": "One entry per session in a pseudo-terminal, in the order they ran.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/tui" }
+    },
+    "quirks": {
+      "description": "The quirks the soak noted, counted by kind; a kind that had none is absent. The text of a quirk, which can name things in the tree, is only in quirks.txt.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/quirk_count" }
+    }
+  },
+  "$defs": {
+    "unsigned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "token": {
+      "description": "A lowercase word such as macos or x86_64.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$"
+    },
+    "timestamp": {
+      "description": "An RFC 3339 date-time.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "profile": {
+      "enum": ["default", "deterministic", "reduced-motion", "monochrome-ascii", "narrow", "mouse-keymaps"]
+    },
+    "scan_state": {
+      "description": "The state of a whole scan report.",
+      "enum": ["exact", "uncertain", "summary-only", "cancelled"]
+    },
+    "rounds": {
+      "type": "object",
+      "required": ["requested", "completed"],
+      "additionalProperties": false,
+      "properties": {
+        "requested": { "$ref": "#/$defs/unsigned" },
+        "completed": {
+          "description": "The rounds that ran to their end. A round that was interrupted is not counted.",
+          "$ref": "#/$defs/unsigned"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "required": ["run_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "run_ms": {
+          "description": "The bound on the whole run, in milliseconds.",
+          "$ref": "#/$defs/unsigned"
+        }
+      }
+    },
+    "accounting": {
+      "description": "The accounting a scan report states.",
+      "type": "object",
+      "required": [
+        "headline",
+        "hard_links_deduplicated",
+        "shared_extents_deduplicated",
+        "directory_metadata_included"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "headline": {
+          "description": "What the headline number counts. The published scan-report schema allows this one value; a report that says another is a quirk and its facts are not kept.",
+          "const": "identity-unique-allocated-bytes"
+        },
+        "hard_links_deduplicated": { "type": "boolean" },
+        "shared_extents_deduplicated": { "type": "boolean" },
+        "directory_metadata_included": { "type": "boolean" }
+      }
+    },
+    "scan_summary": {
+      "description": "What a scan report's summary counts. The four last_* text fields of the report can be paths, so only whether each held anything is kept.",
+      "type": "object",
+      "required": [
+        "scanned_entries",
+        "identified_entries",
+        "unreadable_entries",
+        "unscanned_entries",
+        "excluded_entries",
+        "filesystem_boundaries",
+        "link_entries",
+        "deleted_entries",
+        "deletion_changed_entries",
+        "deletion_missing_entries",
+        "deletion_failed_entries",
+        "deletion_unattempted_entries",
+        "scan_store_bytes",
+        "scan_store_limit_bytes",
+        "last_unreadable_path_present",
+        "last_unscanned_path_present",
+        "last_unscanned_reason_present",
+        "last_worker_error_present"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "scanned_entries": { "$ref": "#/$defs/unsigned" },
+        "identified_entries": { "$ref": "#/$defs/unsigned" },
+        "unreadable_entries": { "$ref": "#/$defs/unsigned" },
+        "unscanned_entries": { "$ref": "#/$defs/unsigned" },
+        "excluded_entries": { "$ref": "#/$defs/unsigned" },
+        "filesystem_boundaries": { "$ref": "#/$defs/unsigned" },
+        "link_entries": { "$ref": "#/$defs/unsigned" },
+        "deleted_entries": {
+          "description": "A soak deletes nothing, so this is 0 in every report it reads.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "deletion_changed_entries": { "$ref": "#/$defs/unsigned" },
+        "deletion_missing_entries": { "$ref": "#/$defs/unsigned" },
+        "deletion_failed_entries": { "$ref": "#/$defs/unsigned" },
+        "deletion_unattempted_entries": { "$ref": "#/$defs/unsigned" },
+        "scan_store_bytes": { "$ref": "#/$defs/unsigned" },
+        "scan_store_limit_bytes": { "$ref": "#/$defs/unsigned" },
+        "last_unreadable_path_present": { "type": "boolean" },
+        "last_unscanned_path_present": { "type": "boolean" },
+        "last_unscanned_reason_present": { "type": "boolean" },
+        "last_worker_error_present": { "type": "boolean" }
+      }
+    },
+    "report_facts": {
+      "description": "What a headless scan's report said: its state, its accounting, and its counts.",
+      "type": "object",
+      "required": ["state", "accounting", "summary"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "$ref": "#/$defs/scan_state" },
+        "accounting": { "$ref": "#/$defs/accounting" },
+        "summary": { "$ref": "#/$defs/scan_summary" }
+      }
+    },
+    "headless": {
+      "description": "One headless scan: excise --format json on the root, bounded and measured.",
+      "type": "object",
+      "required": ["round", "profile", "timed_out", "wall_ms", "residue_files"],
+      "additionalProperties": false,
+      "properties": {
+        "round": {
+          "description": "From 1.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "profile": { "$ref": "#/$defs/profile" },
+        "exit_code": {
+          "description": "Present when the process exited by itself.",
+          "type": "integer"
+        },
+        "signal": {
+          "description": "Present when a signal ended the process. The bound's kill is 9.",
+          "type": "integer"
+        },
+        "timed_out": {
+          "description": "Whether the bound passed and the process group was killed.",
+          "type": "boolean"
+        },
+        "wall_ms": {
+          "description": "From just before the spawn to the exit.",
+          "type": "number",
+          "minimum": 0
+        },
+        "user_ms": {
+          "description": "CPU time in user mode, where the platform says.",
+          "type": "number",
+          "minimum": 0
+        },
+        "sys_ms": {
+          "description": "CPU time in the kernel, where the platform says.",
+          "type": "number",
+          "minimum": 0
+        },
+        "peak_rss_bytes": {
+          "description": "Peak memory, where the platform says: the peak physical footprint on macOS, the peak resident set size on Linux.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "residue_files": {
+          "description": "Entries the scan left in its scratch area besides its report.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "report": {
+          "description": "What the report said. Absent when the scan wrote none that could be read.",
+          "$ref": "#/$defs/report_facts"
+        }
+      }
+    },
+    "exit": {
+      "description": "How a session's program ended.",
+      "type": "object",
+      "required": ["via"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "description": "Present when the program exited by itself.",
+          "type": "integer"
+        },
+        "signal": {
+          "description": "Present when a signal ended the program.",
+          "type": "integer"
+        },
+        "via": {
+          "description": "quit: the soak quit it the way a user does. exited: it ended by itself. killed: its process group was killed.",
+          "enum": ["quit", "exited", "killed"]
+        }
+      }
+    },
+    "phase": {
+      "description": "A phase of a session.",
+      "enum": ["first_frame", "scan", "complete", "drill", "up", "quit", "exit"]
+    },
+    "metric_name": {
+      "description": "The name of a measurement that a session of the soak can record: those of the recorder that the harness's runners share (first_frame_ms, scan_complete_ms, input_samples, input_to_frame_p50_ms, input_to_frame_p99_ms, input_to_frame_max_ms, inputs_sent, max_stall_ms, quit_ms, output_bytes, output_bytes_per_s, frames, peak_rss_bytes, threads, fds, scan_store_peak_bytes, scan_store_bytes_per_entry, user_ms, sys_ms) and the ones the soak's own session driver adds (complete_ms, scan_complete_entries, duration_ms, drill_ms, up_ms). The list is closed on purpose: a metric name is a key of the document, and a key that only has the look of an identifier could be a name from the tree (private, payroll-2026, photos), so no pattern is enough. A soak deletes nothing, so the timing of a deletion is not here. A name is added to this list, and to the test that compares it with the code that records, when a session records a new measurement.",
+      "type": "string",
+      "enum": [
+        "first_frame_ms",
+        "scan_complete_ms",
+        "scan_complete_entries",
+        "complete_ms",
+        "duration_ms",
+        "drill_ms",
+        "up_ms",
+        "quit_ms",
+        "input_samples",
+        "input_to_frame_p50_ms",
+        "input_to_frame_p99_ms",
+        "input_to_frame_max_ms",
+        "inputs_sent",
+        "max_stall_ms",
+        "frames",
+        "output_bytes",
+        "output_bytes_per_s",
+        "peak_rss_bytes",
+        "threads",
+        "fds",
+        "scan_store_peak_bytes",
+        "scan_store_bytes_per_entry",
+        "user_ms",
+        "sys_ms"
+      ]
+    },
+    "tui": {
+      "description": "One session in a pseudo-terminal: the scan, the keys, the largest folder, the quit.",
+      "type": "object",
+      "required": ["round", "profile", "exit", "terminal_restored", "residue_files", "drilled", "metrics"],
+      "additionalProperties": false,
+      "properties": {
+        "round": {
+          "description": "From 1.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "profile": { "$ref": "#/$defs/profile" },
+        "exit": { "$ref": "#/$defs/exit" },
+        "timed_out_phase": {
+          "description": "The phase whose bound passed, when one did. The session then ended with the program's process group killed.",
+          "$ref": "#/$defs/phase"
+        },
+        "terminal_restored": {
+          "description": "Whether the terminal was as a shell expects it once the program had ended.",
+          "type": "boolean"
+        },
+        "residue_files": {
+          "description": "Entries the program left in its scratch area.",
+          "$ref": "#/$defs/unsigned"
+        },
+        "drilled": {
+          "description": "Whether the soak opened a folder and came back up: the largest entry when that is a folder, and otherwise the first folder the arrow keys reached from it.",
+          "type": "boolean"
+        },
+        "metrics": {
+          "description": "Named measurements of the session. Every value is a finite number, and every name is one of those that metric_name lists: the set of keys is closed, so that no name from the tree can be one. A session that did not get as far as a measurement has no such name, so a consumer must not assume that a name is present.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/metric_name" },
+          "additionalProperties": { "type": "number" }
+        }
+      }
+    },
+    "quirk_count": {
+      "description": "How many quirks of one kind the soak noted.",
+      "type": "object",
+      "required": ["kind", "count"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "error_dialog",
+            "dialog_text",
+            "uncertain_scan",
+            "report_unreadable",
+            "report_too_large",
+            "non_zero_exit",
+            "timeout",
+            "stall",
+            "no_frame_for_key",
+            "exited_early",
+            "quit_refused",
+            "drill_skipped",
+            "terminal_not_restored",
+            "residue",
+            "protocol",
+            "harness_error"
+          ]
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

@@ -15,6 +15,8 @@
 //! * [`HarnessTui`] (`harness-tui`): what one `cargo xtask tui` command prints.
 //! * [`HarnessShapeProfile`] (`harness-shape-profile`): the shape of one tree as aggregates only,
 //!   written by `excise-shape profile`, from which a fixture specification can be built.
+//! * [`HarnessSoak`] (`harness-soak`): what one read-only `cargo xtask soak` measured, with no path
+//!   and no name from the tree.
 //!
 //! The types reject unknown fields, so a document with a field this build does not know is an
 //! error rather than silently ignored. Removing or retyping a field, or making an optional one
@@ -29,6 +31,7 @@ mod ab;
 mod counts;
 mod failure;
 mod shape;
+mod soak;
 mod summary;
 mod sweep;
 pub mod tui;
@@ -52,6 +55,11 @@ pub use shape::{
     ClassHistograms, HarnessShapeProfile, MAX_PROFILE_DEPTH, ShapeDepth, ShapeEntries,
     ShapeHardLinks, ShapeHistogram, ShapeNameLengths, ShapePlatform, ShapeProblems,
     ShapeProfileKind, ShapeSymbolicLinks, ShapeUnreadable, ShapeWalk,
+};
+pub use soak::{
+    AccountingHeadline, HarnessSoak, QuirkKind, SoakAccounting, SoakExit, SoakHeadless, SoakKind,
+    SoakLimits, SoakOutcome, SoakPhase, SoakQuirkCount, SoakReportFacts, SoakRounds,
+    SoakScanSummary, SoakTui,
 };
 pub use summary::{
     BinaryIdentity, HarnessSummary, ScenarioResult, SummaryKind, Tier, TimingWarning, Verdict,

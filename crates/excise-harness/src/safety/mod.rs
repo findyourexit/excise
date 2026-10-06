@@ -14,6 +14,9 @@
 //! * [`FixtureSnapshot`] fingerprints a fixture so that a run can prove it changed nothing but its
 //!   intended deletions and mutations.
 //! * [`cgroup`] is the opt-in Linux cgroup v2 memory cap for both process runners.
+//! * [`check_private_directory`] refuses a directory that another user can change, which the
+//!   read-only soak asks of the place it runs a copy of the binary from, and [`available_bytes`]
+//!   says how much room a file system has.
 
 pub mod cgroup;
 mod fixture;
@@ -21,6 +24,8 @@ mod isolation;
 pub mod process;
 mod scratch;
 mod snapshot;
+mod space;
+mod trust;
 pub use fixture::{FixtureRoot, SafetyError};
 pub use isolation::{NARROW_COLS, ProfileSettings, isolated_env};
 pub use process::{KillOutcome, SignalError, send_signal};
@@ -30,3 +35,5 @@ pub use process::{
 };
 pub use scratch::{Scratch, ScratchError};
 pub use snapshot::{FixtureDiff, FixtureSnapshot, SnapshotError};
+pub use space::available_bytes;
+pub use trust::{FileIdentity, NotTheFile, Untrusted, UntrustedDirectory, check_private_directory};

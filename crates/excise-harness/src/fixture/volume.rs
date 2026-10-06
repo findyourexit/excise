@@ -1036,6 +1036,8 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    #[cfg(target_os = "macos")]
+    use super::{Cmd, SETUP_TIMEOUT, TEARDOWN_TIMEOUT, ensure_absent, path_arg, run};
     use super::{
         MAX_LABEL_LEN, MAX_SIZE_MIB, MIN_SIZE_MIB, PrivilegedOptIn, Volume, VolumeError,
         VolumeSpec, image_path_for, linux, macos, opt_in_from_value, windows,
@@ -1383,6 +1385,131 @@ mod tests {
             "hdiutil must not report the failed mount point as attached"
         );
 
+        Ok(())
+    }
+
+    /// A real image that `hdiutil` attached at a mount point with owners honored or ignored as
+    /// asked, which [`Volume::attach`] does not offer: it takes what the system does by default
+    /// for a disk image. Detached (forced if need be) and removed when dropped.
+    #[cfg(target_os = "macos")]
+    struct ImageWithOwners {
+        mount_point: PathBuf,
+        image: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl ImageWithOwners {
+        fn attach(
+            owners: &str,
+            spec: &VolumeSpec,
+            work_dir: &Path,
+            mount_point: &Path,
+        ) -> Result<Self, VolumeError> {
+            let image = image_path_for(spec, work_dir);
+            ensure_absent(&image)?;
+            run(&macos::create_cmd(spec, &image))?;
+            let attach = Cmd::new(
+                "hdiutil",
+                vec![
+                    OsString::from("attach"),
+                    OsString::from("-nobrowse"),
+                    OsString::from("-noverify"),
+                    OsString::from("-noautoopen"),
+                    OsString::from("-owners"),
+                    OsString::from(owners),
+                    OsString::from("-mountpoint"),
+                    path_arg(mount_point),
+                    path_arg(&image),
+                ],
+                SETUP_TIMEOUT,
+            );
+            if let Err(error) = run(&attach) {
+                let _ = fs::remove_file(&image);
+                return Err(error);
+            }
+            Ok(Self {
+                mount_point: mount_point.to_path_buf(),
+                image,
+            })
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ImageWithOwners {
+        fn drop(&mut self) {
+            let _ = macos::detach(&self.mount_point, None);
+            let _ = fs::remove_file(&self.image);
+        }
+    }
+
+    /// The one test of what the read-only soak asks of its scratch directory that a stand-in cannot
+    /// show: a real volume mounted without owners ("Ignore ownership", `MNT_IGNORE_OWNERSHIP`) is
+    /// refused as a scratch directory, whatever mode its directories have, and one mounted with
+    /// owners is not refused for that. `mount(8)`, which decodes the flags of the same `statfs`
+    /// itself, is the oracle for which of the two a volume is. Gated on
+    /// [`PrivilegedOptIn::from_env`], like the lifecycle test above.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_privileged_a_volume_mounted_without_owners_is_refused_as_a_scratch_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::safety::{Untrusted, check_private_directory};
+
+        if PrivilegedOptIn::from_env().is_none() {
+            eprintln!("skipped: EXCISE_HARNESS_PRIVILEGED=1 not set");
+            return Ok(());
+        }
+        let work_dir = tempfile::tempdir()?;
+
+        let mut seen_without_owners = false;
+        for (owners, label) in [("off", "OWNSOFF"), ("on", "OWNSON")] {
+            let mount_point = tempfile::tempdir()?;
+            let spec = VolumeSpec::new(8, label)?;
+            let volume =
+                ImageWithOwners::attach(owners, &spec, work_dir.path(), mount_point.path())?;
+            let canonical = fs::canonicalize(mount_point.path())?;
+
+            let mounted = run(&Cmd::new("mount", Vec::new(), TEARDOWN_TIMEOUT))?;
+            let line = mounted
+                .lines()
+                .find(|line| line.contains(&format!(" on {} (", canonical.display())))
+                .ok_or("the volume is not in the list that mount prints")?
+                .to_owned();
+            let without_owners = line.contains("noowners");
+            eprintln!("hdiutil attach -owners {owners}: {line}");
+            assert!(
+                owners != "off" || without_owners,
+                "a volume attached with -owners off must say noowners: {line}"
+            );
+            seen_without_owners |= without_owners;
+
+            // A directory below the root of the volume, made by its owner: whatever the volume
+            // says about ownership, the mode of this one is closed to the group and everybody.
+            let below = mount_point.path().join("scratch");
+            fs::create_dir(&below)?;
+            for asked in [&canonical, &below] {
+                let verdict = check_private_directory(asked);
+                match verdict {
+                    Err(refusal) if without_owners => assert_eq!(
+                        refusal.why,
+                        Untrusted::IgnoresOwnership,
+                        "{}: {refusal}",
+                        asked.display()
+                    ),
+                    Ok(()) if without_owners => panic!(
+                        "{} is on a volume that ignores ownership, and it was accepted: {line}",
+                        asked.display()
+                    ),
+                    Err(refusal) => assert_ne!(
+                        refusal.why,
+                        Untrusted::IgnoresOwnership,
+                        "a volume that honors owners was refused for ignoring them: {refusal}: {line}"
+                    ),
+                    Ok(()) => {}
+                }
+            }
+            drop(volume);
+        }
+        assert!(seen_without_owners, "no volume without owners was seen");
         Ok(())
     }
 }

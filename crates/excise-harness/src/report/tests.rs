@@ -3,18 +3,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use jsonschema::Validator;
+use regex::Regex;
 use serde_json::Value;
 
 use super::{
-    AbContext, AbFixture, AbKind, AbVerdict, BinaryIdentity, BuildIdentity, BuildStatus, CellState,
-    CheckStatus, ConfidenceInterval, CountsCase, CountsContext, CountsFixture, CountsInvalid,
-    CountsKind, CountsRunner, Document, FailedStep, FailureKind, FixtureIdentity, HarnessAb,
-    HarnessCounts, HarnessFailure, HarnessSummary, HarnessSweep, HarnessTui, MAX_CASES, MAX_COUNT,
-    MetricComparison, PullRequestOrigin, Rusage, SCHEMA_VERSION, Samples, ScenarioResult,
-    SchemaVersion, ScreenComparison, SessionDiagnostics, Side, SummaryKind, SweepBuild, SweepCell,
-    SweepCheck, SweepContext, SweepInvalid, SweepKind, SweepMeasurement, SweepRatio, SweepRow,
-    SweepSeries, SweepTier, SweepToolchain, SweepTraits, SweepVersion, TerminalModes, Tier,
-    TimingWarning, Verdict,
+    AbContext, AbFixture, AbKind, AbVerdict, AccountingHeadline, BinaryIdentity, BuildIdentity,
+    BuildStatus, CellState, CheckStatus, ConfidenceInterval, CountsCase, CountsContext,
+    CountsFixture, CountsInvalid, CountsKind, CountsRunner, Document, FailedStep, FailureKind,
+    FixtureIdentity, HarnessAb, HarnessCounts, HarnessFailure, HarnessSoak, HarnessSummary,
+    HarnessSweep, HarnessTui, MAX_CASES, MAX_COUNT, MetricComparison, PullRequestOrigin, QuirkKind,
+    Rusage, SCHEMA_VERSION, Samples, ScenarioResult, SchemaVersion, ScreenComparison,
+    SessionDiagnostics, Side, SoakAccounting, SoakExit, SoakHeadless, SoakKind, SoakLimits,
+    SoakOutcome, SoakPhase, SoakQuirkCount, SoakReportFacts, SoakRounds, SoakScanSummary, SoakTui,
+    SummaryKind, SweepBuild, SweepCell, SweepCheck, SweepContext, SweepInvalid, SweepKind,
+    SweepMeasurement, SweepRatio, SweepRow, SweepSeries, SweepTier, SweepToolchain, SweepTraits,
+    SweepVersion, TerminalModes, Tier, TimingWarning, Verdict,
     tui::{
         BoxInfo, Cleanup, CloseResult, ConfirmationKind, Cursor, DeleteDialogInfo,
         DeleteDialogKind, DeleteResult, DialogInfo, EventRecord, EventRecordKind, EventsPage,
@@ -30,6 +33,7 @@ use super::{
     ShapeUnreadable, ShapeWalk,
 };
 use crate::{
+    headless::document::ScanState,
     runner::is_latency,
     scenario::{Budget, EntryKind, Expect, Profile},
 };
@@ -688,6 +692,151 @@ fn minimal_sweep() -> HarnessSweep {
     document
 }
 
+/// What the report of a headless scan said, with every flag set that can be.
+fn soak_facts() -> SoakReportFacts {
+    SoakReportFacts {
+        state: ScanState::Uncertain,
+        accounting: SoakAccounting {
+            headline: AccountingHeadline::IdentityUniqueAllocatedBytes,
+            hard_links_deduplicated: true,
+            shared_extents_deduplicated: false,
+            directory_metadata_included: false,
+        },
+        summary: SoakScanSummary {
+            scanned_entries: 1_204_331,
+            identified_entries: 1_204_100,
+            unreadable_entries: 3,
+            unscanned_entries: 2,
+            excluded_entries: 0,
+            filesystem_boundaries: 1,
+            link_entries: 5_212,
+            deleted_entries: 0,
+            deletion_changed_entries: 0,
+            deletion_missing_entries: 0,
+            deletion_failed_entries: 0,
+            deletion_unattempted_entries: 0,
+            scan_store_bytes: 402_653_184,
+            scan_store_limit_bytes: 3_221_225_472,
+            last_unreadable_path_present: true,
+            last_unscanned_path_present: true,
+            last_unscanned_reason_present: true,
+            last_worker_error_present: false,
+        },
+    }
+}
+
+/// A soak with every optional field present, across its entries.
+fn soak() -> HarnessSoak {
+    let facts = soak_facts();
+    HarnessSoak {
+        document_kind: SoakKind::HarnessSoak,
+        schema_version: SchemaVersion,
+        run_id: "20261006T120000Z-4242".to_owned(),
+        started_at: "2026-10-06T12:00:00.000Z".to_owned(),
+        finished_at: "2026-10-06T12:07:31.250+11:00".to_owned(),
+        os: "macos".to_owned(),
+        arch: "aarch64".to_owned(),
+        git_sha: GIT_SHA.to_owned(),
+        excise_sha256: SHA256.to_owned(),
+        outcome: SoakOutcome::Finished,
+        rounds: SoakRounds {
+            requested: 2,
+            completed: 2,
+        },
+        limits: SoakLimits { run_ms: 1_800_000 },
+        headless: vec![
+            SoakHeadless {
+                round: 1,
+                profile: Profile::Default,
+                exit_code: Some(2),
+                signal: None,
+                timed_out: false,
+                wall_ms: 61_250.5,
+                user_ms: Some(180_000.25),
+                sys_ms: Some(42_500.0),
+                peak_rss_bytes: Some(301_989_888),
+                residue_files: 0,
+                report: Some(facts),
+            },
+            SoakHeadless {
+                round: 2,
+                profile: Profile::Default,
+                exit_code: None,
+                signal: Some(9),
+                timed_out: true,
+                wall_ms: 900_000.0,
+                user_ms: None,
+                sys_ms: None,
+                peak_rss_bytes: None,
+                residue_files: 1,
+                report: None,
+            },
+        ],
+        tui: vec![
+            SoakTui {
+                round: 1,
+                profile: Profile::Default,
+                exit: SoakExit {
+                    code: Some(0),
+                    signal: None,
+                    via: ExitVia::Quit,
+                },
+                timed_out_phase: None,
+                terminal_restored: true,
+                residue_files: 0,
+                drilled: true,
+                metrics: BTreeMap::from([
+                    ("first_frame_ms".to_owned(), 41.5),
+                    ("scan_complete_ms".to_owned(), 70_100.0),
+                    ("complete_ms".to_owned(), 74_300.0),
+                    ("input_samples".to_owned(), 60.0),
+                    ("input_to_frame_p99_ms".to_owned(), 38.0),
+                    ("max_stall_ms".to_owned(), 212.0),
+                    ("peak_rss_bytes".to_owned(), 335_544_320.0),
+                    ("drill_ms".to_owned(), 480.0),
+                    ("up_ms".to_owned(), 120.0),
+                    ("quit_ms".to_owned(), 90.0),
+                ]),
+            },
+            SoakTui {
+                round: 1,
+                profile: Profile::Deterministic,
+                exit: SoakExit {
+                    code: None,
+                    signal: Some(9),
+                    via: ExitVia::Killed,
+                },
+                timed_out_phase: Some(SoakPhase::Complete),
+                terminal_restored: false,
+                residue_files: 3,
+                drilled: false,
+                metrics: BTreeMap::from([("first_frame_ms".to_owned(), 44.0)]),
+            },
+        ],
+        quirks: vec![
+            SoakQuirkCount {
+                kind: QuirkKind::UncertainScan,
+                count: 2,
+            },
+            SoakQuirkCount {
+                kind: QuirkKind::Timeout,
+                count: 1,
+            },
+        ],
+    }
+}
+
+/// A soak that was interrupted before anything ran: no scans, no sessions, no quirks.
+fn minimal_soak() -> HarnessSoak {
+    let mut document = soak();
+    document.outcome = SoakOutcome::Interrupted;
+    document.rounds.completed = 0;
+    document.headless.clear();
+    document.tui.clear();
+    document.quirks.clear();
+    document
+}
+
 fn schema<D: Document>() -> Value {
     serde_json::from_str(D::SCHEMA_JSON).expect("the schema should be valid JSON")
 }
@@ -925,6 +1074,7 @@ fn every_schema_is_draft_2020_12_and_compiles() {
     assert_schema_compiles::<HarnessSweep>();
     assert_schema_compiles::<HarnessTui>();
     assert_schema_compiles::<HarnessShapeProfile>();
+    assert_schema_compiles::<HarnessSoak>();
 }
 
 #[test]
@@ -936,6 +1086,7 @@ fn every_schema_identity_matches_the_rust_constants() {
     assert_schema_identity::<HarnessSweep>();
     assert_schema_identity::<HarnessTui>();
     assert_schema_identity::<HarnessShapeProfile>();
+    assert_schema_identity::<HarnessSoak>();
     assert_eq!(SCHEMA_VERSION, 1);
 }
 
@@ -949,6 +1100,7 @@ fn the_rust_marker_fields_serialize_the_document_constants() {
         (to_value(&sweep()), HarnessSweep::KIND),
         (to_value(&tui_failure()), HarnessTui::KIND),
         (to_value(&shape_profile()), HarnessShapeProfile::KIND),
+        (to_value(&soak()), HarnessSoak::KIND),
     ] {
         assert_eq!(document["document_kind"], kind);
         assert_eq!(document["schema_version"], SCHEMA_VERSION);
@@ -965,6 +1117,7 @@ fn every_object_in_every_schema_rejects_undeclared_fields() {
         schema::<HarnessSweep>(),
         schema::<HarnessTui>(),
         schema::<HarnessShapeProfile>(),
+        schema::<HarnessSoak>(),
     ] {
         assert_objects_are_closed(&schema, "#");
     }
@@ -983,6 +1136,8 @@ fn serialized_documents_validate_against_their_schemas() {
     assert_valid(&minimal_shape_profile());
     assert_valid(&sweep());
     assert_valid(&minimal_sweep());
+    assert_valid(&soak());
+    assert_valid(&minimal_soak());
 }
 
 #[test]
@@ -993,6 +1148,7 @@ fn schemas_and_types_declare_exactly_the_same_fields() {
     assert_schema_and_types_declare_the_same_fields(&counts());
     assert_schema_and_types_declare_the_same_fields(&shape_profile());
     assert_schema_and_types_declare_the_same_fields(&sweep());
+    assert_schema_and_types_declare_the_same_fields(&soak());
 }
 
 #[test]
@@ -1478,6 +1634,8 @@ fn documents_render_a_canonical_form_that_round_trips() {
     assert_round_trips(&minimal_shape_profile());
     assert_round_trips(&sweep());
     assert_round_trips(&minimal_sweep());
+    assert_round_trips(&soak());
+    assert_round_trips(&minimal_soak());
 }
 
 #[test]
@@ -3717,4 +3875,322 @@ fn a_shape_profile_holds_no_string_but_its_kind_and_its_platform() {
     found.sort();
 
     assert_eq!(found, ["harness-shape-profile", "linux"]);
+}
+
+#[test]
+fn the_soak_schema_enumerations_match_the_types() {
+    fn names<T: Copy>(all: &[T], name: impl Fn(T) -> &'static str) -> BTreeSet<String> {
+        all.iter().map(|&value| name(value).to_owned()).collect()
+    }
+    fn declared(schema: &Value, pointer: &str) -> BTreeSet<String> {
+        schema
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("{pointer} should be an enum"))
+            .iter()
+            .map(|value| value.as_str().expect("enum names are strings").to_owned())
+            .collect()
+    }
+    let schema = schema::<HarnessSoak>();
+
+    assert_eq!(
+        declared(&schema, "/properties/outcome/enum"),
+        names(SoakOutcome::ALL, SoakOutcome::as_str)
+    );
+    assert_eq!(
+        declared(&schema, "/$defs/profile/enum"),
+        names(Profile::ALL, Profile::as_str)
+    );
+    assert_eq!(
+        declared(&schema, "/$defs/scan_state/enum"),
+        names(ScanState::ALL, ScanState::as_str)
+    );
+    assert_eq!(
+        declared(&schema, "/$defs/exit/properties/via/enum"),
+        names(ExitVia::ALL, ExitVia::as_str)
+    );
+    assert_eq!(
+        declared(&schema, "/$defs/phase/enum"),
+        names(SoakPhase::ALL, SoakPhase::as_str)
+    );
+    assert_eq!(
+        declared(&schema, "/$defs/quirk_count/properties/kind/enum"),
+        names(QuirkKind::ALL, QuirkKind::as_str)
+    );
+    assert_eq!(
+        schema["$defs"]["accounting"]["properties"]["headline"]["const"],
+        AccountingHeadline::IdentityUniqueAllocatedBytes.as_str()
+    );
+}
+
+#[test]
+fn the_soak_schema_rejects_contract_drift() {
+    assert_rejected(
+        &soak(),
+        &[
+            ("an undeclared top-level field", &|d| {
+                d["extra"] = true.into();
+            }),
+            ("an undeclared field of a scan", &|d| {
+                d["headless"][0]["extra"] = 1.into();
+            }),
+            ("an undeclared field of a session", &|d| {
+                d["tui"][0]["extra"] = 1.into();
+            }),
+            ("another document kind", &|d| {
+                set(d, "/document_kind", "harness-summary".into());
+            }),
+            ("another schema version", &|d| {
+                set(d, "/schema_version", 2.into());
+            }),
+            ("a missing outcome", &|d| remove(d, "/outcome")),
+            ("an unknown outcome", &|d| {
+                set(d, "/outcome", "paused".into());
+            }),
+            ("a missing digest of the binary", &|d| {
+                remove(d, "/excise_sha256");
+            }),
+            ("a binary path in place of its digest", &|d| {
+                set(
+                    d,
+                    "/excise_sha256",
+                    "/Users/someone/excise/target/release/excise".into(),
+                );
+            }),
+            ("a commit that is not 40 hexadecimal digits", &|d| {
+                set(d, "/git_sha", "main".into());
+            }),
+            ("an unknown kind of quirk", &|d| {
+                set(d, "/quirks/0/kind", "mystery".into());
+            }),
+            ("a quirk kind that had no quirk", &|d| {
+                set(d, "/quirks/0/count", 0.into());
+            }),
+            ("a round that is not from 1", &|d| {
+                set(d, "/headless/0/round", 0.into());
+            }),
+            ("a negative wall time", &|d| {
+                set(d, "/headless/0/wall_ms", (-1).into());
+            }),
+            ("a state that is not a scan state", &|d| {
+                set(d, "/headless/0/report/state", "mostly".into());
+            }),
+            ("another accounting headline", &|d| {
+                set(
+                    d,
+                    "/headless/0/report/accounting/headline",
+                    "apparent-bytes".into(),
+                );
+            }),
+            ("a path in the counts of a report", &|d| {
+                d["headless"][0]["report"]["summary"]["last_unreadable_path"] =
+                    "/Users/someone/Private".into();
+            }),
+            ("an unknown phase", &|d| {
+                set(d, "/tui/1/timed_out_phase", "dance".into());
+            }),
+            ("an unknown way for a program to end", &|d| {
+                set(d, "/tui/0/exit/via", "vanished".into());
+            }),
+            ("a metric that is not a number", &|d| {
+                set(d, "/tui/0/metrics/first_frame_ms", "fast".into());
+            }),
+            ("a metric whose name is a path", &|d| {
+                d["tui"][0]["metrics"]["/Users/someone/Private/photos"] = 1.into();
+            }),
+            ("a metric whose name is a file name", &|d| {
+                d["tui"][0]["metrics"]["Holiday Photos.jpg"] = 1.into();
+            }),
+            ("a metric named like a folder", &|d| {
+                d["tui"][0]["metrics"]["private"] = 1.into();
+            }),
+            ("a metric named like a folder with a year", &|d| {
+                d["tui"][0]["metrics"]["payroll-2026"] = 1.into();
+            }),
+            ("a metric named like a plain word", &|d| {
+                d["tui"][0]["metrics"]["photos"] = 1.into();
+            }),
+            ("a metric named like one that is not quite one", &|d| {
+                d["tui"][0]["metrics"]["first_frame"] = 1.into();
+            }),
+            (
+                "the timing of a deletion, which a soak never records",
+                &|d| {
+                    d["tui"][0]["metrics"]["delete_ms"] = 1.into();
+                },
+            ),
+        ],
+    );
+}
+
+/// The source of a file of this crate without its test module and without its comment lines, so
+/// that what is looked for in it is code.
+fn code_of_source(source: &str) -> String {
+    source
+        .split("\n#[cfg(test)]\n")
+        .next()
+        .unwrap_or(source)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The names that the calls matched by `call` (what comes before their arguments) are made with in
+/// `source`, when the name is written out as the first argument. A call that is made another way
+/// fails the test: a name that is built could be anything.
+fn names_in_calls(source: &str, call: &str) -> BTreeSet<String> {
+    let any = Regex::new(&format!(r"{call}\s*\(")).expect("a pattern");
+    let named = Regex::new(&format!(r#"{call}\s*\(\s*"([a-z0-9_]+)""#)).expect("a pattern");
+    assert_eq!(
+        any.find_iter(source).count(),
+        named.find_iter(source).count(),
+        "a call of `{call}` is not made with a name written out: its name could be anything"
+    );
+    named
+        .captures_iter(source)
+        .map(|captures| captures[1].to_owned())
+        .collect()
+}
+
+/// Every metric name that a session of the soak can record, read from the source of the code that
+/// records them: `Recorder::finish` (every name it inserts) and the calls of the soak's session
+/// driver (`record_metric`, and the measures it starts and stops). Reading the source is what makes
+/// the list complete: a name that is added to that code is found here, whoever adds it, and the
+/// schema is then made to list it.
+fn recorded_metric_names() -> BTreeSet<String> {
+    let recorder = code_of_source(include_str!("../metrics/mod.rs"));
+    let session = code_of_source(include_str!("../soak/session.rs"));
+
+    let mut names = names_in_calls(&recorder, r"\bmetrics\s*\.\s*insert");
+    for call in [r"\brecord_metric", r"\bstart_measure", r"\bstop_measure"] {
+        names.extend(names_in_calls(&session, call));
+    }
+    assert!(
+        names.len() >= 24,
+        "the code that records was not read: {names:?}"
+    );
+    names
+}
+
+#[test]
+fn the_soak_schema_lists_every_metric_a_session_can_record_and_no_other() {
+    let mut recorded = recorded_metric_names();
+    // A soak confirms no deletion, so a session never records the timing of one, although the
+    // recorder that every runner shares can.
+    let session = code_of_source(include_str!("../soak/session.rs"));
+    assert!(
+        !session.contains("record_deletion_confirmed"),
+        "a soak confirms no deletion"
+    );
+    assert!(
+        recorded.remove("delete_ms"),
+        "the recorder times a deletion"
+    );
+
+    let schema = schema::<HarnessSoak>();
+    let listed: BTreeSet<String> = schema
+        .pointer("/$defs/metric_name/enum")
+        .and_then(Value::as_array)
+        .expect("the metric names are an enumeration")
+        .iter()
+        .map(|name| name.as_str().expect("a name is a string").to_owned())
+        .collect();
+
+    assert_eq!(listed, recorded);
+    assert_eq!(
+        schema["$defs"]["tui"]["properties"]["metrics"]["propertyNames"],
+        serde_json::json!({ "$ref": "#/$defs/metric_name" }),
+        "the keys of a session's metrics are those names, and no pattern"
+    );
+}
+
+#[test]
+fn a_session_that_records_every_metric_of_the_soak_validates() {
+    let mut document = soak();
+    document.tui[0].metrics = recorded_metric_names()
+        .into_iter()
+        .filter(|name| name != "delete_ms")
+        .map(|name| (name, 1.0))
+        .collect();
+
+    assert_valid(&document);
+}
+
+#[test]
+fn the_soak_schema_has_no_free_text() {
+    // Every string the document can hold is an enumerated word, a constant, or has a pattern, so
+    // that a path or a name from the tree cannot be written into it and still validate. A string
+    // with none of the three would be free text, and this fails for it.
+    fn walk(schema: &Value, at: &str) {
+        let is_string = schema.get("type").is_some_and(|kind| {
+            kind == "string"
+                || kind
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "string"))
+        });
+        if is_string {
+            assert!(
+                ["enum", "const", "pattern"]
+                    .iter()
+                    .any(|keyword| schema.get(keyword).is_some()),
+                "{at} is a string with no enum, const, or pattern: free text"
+            );
+        }
+        for key in ["properties", "$defs"] {
+            for (name, child) in schema
+                .get(key)
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+            {
+                walk(child, &format!("{at}/{key}/{name}"));
+            }
+        }
+        for key in ["items", "additionalProperties", "propertyNames"] {
+            if let Some(child) = schema.get(key).filter(|child| child.is_object()) {
+                walk(child, &format!("{at}/{key}"));
+            }
+        }
+    }
+
+    walk(&schema::<HarnessSoak>(), "#");
+}
+
+#[test]
+fn no_string_of_a_soak_document_accepts_a_path_or_a_name() {
+    // Every string the sample holds is replaced, one at a time, by a path and then by a file name,
+    // and the schema must reject each: the document cannot carry what names the tree.
+    fn strings(value: &Value, at: &str, found: &mut Vec<String>) {
+        match value {
+            Value::String(_) => found.push(at.to_owned()),
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    strings(item, &format!("{at}/{index}"), found);
+                }
+            }
+            Value::Object(members) => {
+                for (name, member) in members {
+                    strings(member, &format!("{at}/{name}"), found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let document = to_value(&soak());
+    let validator = validator::<HarnessSoak>(true);
+    let mut pointers = Vec::new();
+    strings(&document, "", &mut pointers);
+
+    assert!(pointers.len() >= 10, "{pointers:?}");
+    for pointer in pointers {
+        for intruder in ["/Users/someone/Private/photos", "Holiday Photos.jpg"] {
+            let mut changed = document.clone();
+            set(&mut changed, &pointer, intruder.into());
+            assert!(
+                !validator.is_valid(&changed),
+                "{pointer} accepts {intruder:?}: the document could carry a name"
+            );
+        }
+    }
 }

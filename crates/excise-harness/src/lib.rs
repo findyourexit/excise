@@ -27,6 +27,11 @@
 //!   shaped like it (`excise-shape`, the binary of this crate).
 //! * [`sweep`] runs every published version through the checks a published release can take and
 //!   builds the version-by-defect table (`cargo xtask sweep`).
+//! * [`soak`] runs `excise` read-only on a real tree a person names, headless and in a
+//!   pseudo-terminal, and records metrics and quirks (`cargo xtask soak`, human-triggered): its root
+//!   is a type that no step taking a `FixtureRoot` accepts, a test that reads its source keeps its
+//!   code away from the helpers that take a path, and every key it sends passes an allowlist that
+//!   has no Backspace.
 
 pub mod bench;
 pub mod comparison;
@@ -44,6 +49,7 @@ pub mod runner;
 pub mod safety;
 pub mod scenario;
 pub mod shape;
+pub mod soak;
 mod string_enum;
 pub mod sweep;
 pub mod tui;

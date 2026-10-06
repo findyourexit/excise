@@ -18,6 +18,9 @@ tar = "0.4.46"
 excise = { path = ".." }
 excise-harness = { path = "../crates/excise-harness" }
 
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3.18"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 
