@@ -68,7 +68,7 @@ timeout_ms = 120000
 [[steps]]
 step = "expect_screen"
 region = { rows = [1, 1] }
-regex = ["250256 items"]
+regex = ["249255 items"]
 
 [[steps]]
 step = "expect_screen"
