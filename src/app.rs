@@ -291,6 +291,12 @@ where
     /// A deletion removed entries, and the map on screen still lists them: until the rebuild or
     /// the overlay that replaces it lands, see [`App::take_landed_refresh`].
     refresh_owed: bool,
+    /// A deletion finished before the first map was published. The scan went on through it, so
+    /// the map it ends with mixes what the file system held before the deletion and after it:
+    /// once that map is shown, the map is rebuilt behind it, see
+    /// [`App::settle_removals_before_first_map`]. The refresh the deletion owes does not land
+    /// before then, see [`App::take_landed_refresh`].
+    removed_before_first_map: bool,
     /// When the primary scan's publication has run long enough to show its progress.
     publication_progress_from: Option<Instant>,
     /// An announcement that waits for the reader to finish what they are deciding. A later one
@@ -478,6 +484,7 @@ where
             publications: VecDeque::new(),
             finished_publications: VecDeque::new(),
             refresh_owed: false,
+            removed_before_first_map: false,
             publication_progress_from: None,
             waiting_announcement: None,
             provisional_page_waiting: None,
@@ -1170,6 +1177,7 @@ where
             || self.generation_rebuild_required
             || self.generation_rebuild_active
             || self.scan_store_busy()
+            || self.removed_before_first_map
         {
             return None;
         }
@@ -1221,6 +1229,8 @@ where
             self.publication_progress_from = Some(Instant::now() + PUBLICATION_PROGRESS_DELAY);
             return;
         }
+        // No first map is coming, so none needs a deletion rebuilt behind it.
+        self.settle_removals_before_first_map();
         let message = self.scan_results_unavailable_message();
         self.show_scan_results_unavailable(message);
         self.finished_publications
@@ -1293,6 +1303,7 @@ where
             let message = self.scan_results_unavailable_message();
             self.show_scan_results_unavailable(message);
         }
+        self.settle_removals_before_first_map();
         self.finished_publications
             .push_back(FinishedPublication::Primary);
         self.resume_pending_navigation();
@@ -1697,19 +1708,48 @@ where
         }
     }
 
+    /// Whether the first map is still to come, so that a deletion finishing now has no map to be
+    /// reconciled with: the scan that builds it has not published, and no rebuild stands in for
+    /// it.
+    fn first_map_is_owed(&self) -> bool {
+        self.scan_store_available
+            && !self.loaded
+            && self.scan_store.published().is_none()
+            && !self.generation_rebuild_required
+            && !self.generation_rebuild_active
+    }
+
+    /// The first map was published, or will not be. A deletion that finished before it owes the
+    /// map a rebuild, which starts behind the map the reader now has: the scan went on through
+    /// the deletion, so that map mixes what the file system held before it and after it.
+    fn settle_removals_before_first_map(&mut self) {
+        if std::mem::take(&mut self.removed_before_first_map) && self.scan_store_available {
+            self.invalidate_snapshot_view_for_live_mutation();
+        }
+    }
+
     /// Applies a completed mutation to the canonical generation boundary.
     ///
-    /// A complete removal of its exact target can safely publish an overlay that drops that
-    /// prefix: the store thread builds it from the map the reader has installed, with the folder
-    /// that held the target recorded as the file system has it now, and the map swaps it in when
-    /// it arrives ([`Self::complete_overlay_publication`]); until then the reader keeps the map
-    /// they have. Any partial outcome invalidates the immutable snapshot instead of presenting a
-    /// fabricated mixture of pre- and post-deletion facts, and so does a removal the map cannot
-    /// describe exactly: one that may have left other links to a file it removed (the map has
-    /// its files by path, and does not say where those are), and one the store thread's overlay
-    /// then fails to describe. The map is scanned again.
+    /// A deletion that finishes before the first map is published leaves the scan alone: the
+    /// reader keeps the live view and the work the scan has done, and the map it ends with is
+    /// rebuilt behind itself ([`Self::settle_removals_before_first_map`]). No map exists yet for
+    /// an overlay to derive from, and the scan went on through the deletion.
+    ///
+    /// After that, a complete removal of its exact target can safely publish an overlay that
+    /// drops that prefix: the store thread builds it from the map the reader has installed, with
+    /// the folder that held the target recorded as the file system has it now, and the map swaps
+    /// it in when it arrives ([`Self::complete_overlay_publication`]); until then the reader
+    /// keeps the map they have. Any partial outcome invalidates the immutable snapshot instead
+    /// of presenting a fabricated mixture of pre- and post-deletion facts, and so does a removal
+    /// the map cannot describe exactly: one that may have left other links to a file it removed
+    /// (the map has its files by path, and does not say where those are), and one the store
+    /// thread's overlay then fails to describe. The map is scanned again.
     fn reconcile_generation_after_deletion(&mut self, report: &DeletionReport) {
         if report.deleted_entries() == 0 {
+            return;
+        }
+        if self.first_map_is_owed() {
+            self.removed_before_first_map = true;
             return;
         }
         if !self.scan_store_available
@@ -1726,10 +1766,10 @@ where
             self.invalidate_snapshot_view_for_live_mutation();
             return;
         };
-        // An overlay derives from the installed map, and only from it: while the primary scan has
-        // not published one, or another publication is still owed (the installed map is then
-        // about to be replaced, and an overlay of it would replace its successor with a map
-        // older than that one), the deletion invalidates the map, as it always has.
+        // An overlay derives from the installed map, and only from it: while no map is installed
+        // (a rebuild stands in for the first one), or another publication is still owed (the
+        // installed map is then about to be replaced, and an overlay of it would replace its
+        // successor with a map older than that one), the deletion invalidates the map.
         if self.scan_store.published().is_none() || !self.publications.is_empty() {
             self.invalidate_snapshot_view_for_live_mutation();
             return;
@@ -3835,6 +3875,128 @@ mod tests {
             app.request_deletion().is_some(),
             "the published map allows deletion again"
         );
+    }
+
+    /// An app whose first scan is still running, with the live view of its folder on screen, and
+    /// the report of deleting `target` from disk completely, the way the executor does.
+    #[cfg(any(unix, windows))]
+    fn app_scanning_with_a_target_removal_report()
+    -> (tempfile::TempDir, App<TestBackend>, DeletionReport) {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let target_path = root.path().join("target");
+        let survivor_path = root.path().join("survivor");
+        std::fs::write(&target_path, b"target").expect("target fixture should exist");
+        std::fs::write(&survivor_path, b"survivor").expect("survivor fixture should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 160, 48));
+        add_fixture_entry(&mut app, &target_path);
+        add_fixture_entry(&mut app, &survivor_path);
+        refresh_live_page(&mut app, "the live view should refresh");
+        let target_id = node_id_of(&app, "target");
+        assert!(app.board.select_node(target_id));
+        let target = app
+            .request_deletion()
+            .expect("a concrete live entry is deletable while the scan runs");
+        let plan = crate::deletion::build_plan(root.path(), target, false)
+            .expect("target plan should build");
+        let report = crate::deletion::execute_plan(
+            root.path(),
+            plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(report.target_was_removed());
+        (root, app, report)
+    }
+
+    /// A deletion that finishes while the first scan runs leaves the scan alone: the reader keeps
+    /// the map as it fills in, and the scan keeps what it found and goes on finding. The map the
+    /// scan ends with mixes what the file system held before the deletion and after it, so it is
+    /// rebuilt behind itself once it is shown. The reader is never left with an empty map to
+    /// navigate while the scan runs.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_deletion_during_the_first_scan_leaves_the_live_map_and_the_scan_alone() {
+        let (root, mut app, removal) = app_scanning_with_a_target_removal_report();
+
+        assert!(app.complete_deletion(removal));
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "the first map is still to come, and the refresh waits for it"
+        );
+
+        // What the scan finds next reaches the live map, beside what it found before.
+        let late_path = root.path().join("late");
+        std::fs::write(&late_path, b"late").expect("late fixture should exist");
+        add_fixture_entry(&mut app, &late_path);
+        refresh_live_page(&mut app, "the live view should refresh after the deletion");
+        let names = listed_names(&app);
+        for kept in ["survivor", "late"] {
+            assert!(
+                names.contains(&std::ffi::OsString::from(kept)),
+                "the live map must still list {kept}: {names:?}"
+            );
+        }
+        assert!(
+            !app.generation_rebuild_required && !app.deletion_is_unavailable(),
+            "nothing is rebuilt, and nothing is locked, while the first scan runs"
+        );
+
+        // The first map arrives, and the rebuild it owes starts behind it.
+        app.finalize_scan();
+        let names = listed_names(&app);
+        for kept in ["survivor", "late"] {
+            assert!(
+                names.contains(&std::ffi::OsString::from(kept)),
+                "the first map must list {kept}: {names:?}"
+            );
+        }
+        assert!(
+            app.generation_rebuild_required,
+            "the map the scan ended with mixes before and after the deletion"
+        );
+        assert_eq!(app.take_landed_refresh(), None, "the rebuild is owed");
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("the rebuild should start behind the first map")
+        );
+        finish_rebuild(&mut app).expect("the rebuild should settle");
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+    }
+
+    /// A deletion that finishes while the first map is being published is rebuilt behind it as
+    /// well: the scan went on through it, and the map was not published yet.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_deletion_that_finishes_as_the_first_map_is_published_is_rebuilt_behind_it() {
+        let (_root, mut app, removal) = app_scanning_with_a_target_removal_report();
+
+        app.begin_primary_publication();
+        assert!(app.complete_deletion(removal));
+        app.process_scan_store_events();
+        while app.take_finished_publication().is_some() {}
+
+        assert!(app.scan_store.published().is_some());
+        assert!(
+            app.generation_rebuild_required,
+            "the map that was being published did not know of the deletion"
+        );
+        assert!(listed_names(&app).contains(&std::ffi::OsString::from("survivor")));
     }
 
     #[test]

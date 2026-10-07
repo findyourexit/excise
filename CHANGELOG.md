@@ -6,6 +6,10 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+### Fixed
+
+* Deleting an entry while the first scan is still running no longer replaces the map with an empty `SCANNING FOLDER` field until a rescan ends. The scan carries on and the map stays navigable; once the scan ends, the map is rebuilt behind it to account for the deletion.
+
 ## [1.4.0] - 2026-10-07
 
 ### Added
