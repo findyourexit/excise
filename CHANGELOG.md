@@ -6,6 +6,10 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+### Changed
+
+* On macOS, deleting a file or symbolic link now updates the map in place, as it does on Linux and Windows, instead of rescanning the whole tree. A rescan still follows when a removed file has other hard links, or when the system cannot say whether a link survived.
+
 ### Fixed
 
 * Deleting an entry while the first scan is still running no longer replaces the map with an empty `SCANNING FOLDER` field until a rescan ends. The scan carries on and the map stays navigable; once the scan ends, the map is rebuilt behind it to account for the deletion.

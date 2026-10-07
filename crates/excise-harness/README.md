@@ -415,8 +415,8 @@ Details that a table cannot carry:
   cannot read the prompt there; a scenario at that width leaves selected the entry that the fresh
   map selects (the largest) instead of choosing one.
 - **`wait_refresh`.** A deletion that removed entries leaves the map listing them until the program
-  replaces it, either with a rebuild of the whole map (macOS rebuilds after it removes a file,
-  because it cannot show that no other link to it survived) or with a map that leaves them out. A
+  replaces it, either with a rebuild of the whole map (after a file that may have had another
+  link: one whose last link the program did not see go) or with a map that leaves them out. A
   quit meanwhile cancels the replacement and exits 130, not 0, and nothing on the screen says when
   it is over: the header reads `COMPLETE` from the map as it was. The step waits until the program
   says so, and then for a frame that shows it (see [PTY runner](#pty-runner) for how, and

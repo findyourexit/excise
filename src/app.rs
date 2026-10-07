@@ -5905,24 +5905,26 @@ mod tests {
     }
 
     /// What a test removes when it is about the map that follows a removal that left no link
-    /// behind: a file where the executor can show that (Linux, and Windows through the handle
-    /// that removes it), and on macOS, which opens nothing it removes and counts every file or
-    /// link it removes as possibly linked, an empty folder.
+    /// behind: a file, where the executor can show that of one (`deletion::proves_no_link_survived`
+    /// says where), and an empty folder, which has no other links to speak of, where it cannot.
     #[cfg(any(unix, windows))]
     fn make_a_removable_target(path: &Path) {
-        if cfg!(target_vendor = "apple") {
-            std::fs::create_dir(path).expect("target fixture should exist");
-        } else {
-            std::fs::write(path, b"target").expect("target fixture should exist");
+        #[cfg(unix)]
+        {
+            if !crate::deletion::proves_no_link_survived() {
+                std::fs::create_dir(path).expect("target fixture should exist");
+                return;
+            }
         }
+        std::fs::write(path, b"target").expect("target fixture should exist");
     }
 
     /// An app whose published map lists `target` and `survivor`, and the report of deleting
     /// `target` from disk completely. The target is a file where the executor can show that its
-    /// removal left no link behind (Linux, and Windows through the handle that removes it); on
-    /// macOS, which opens nothing it removes and so counts every file or link it removes as
-    /// possibly linked, it is an empty folder, which has no other links to speak of. Either way
-    /// the report is one the owner may answer with a map updated in place.
+    /// removal left no link behind (Linux; Windows, through the handle that removes it; macOS,
+    /// on a file system that resolves an object by its identity), and otherwise an empty folder,
+    /// which has no other links to speak of. Either way the report is one the owner may answer
+    /// with a map updated in place.
     #[cfg(any(unix, windows))]
     fn app_and_target_removal_report() -> (tempfile::TempDir, App<TestBackend>, DeletionReport) {
         app_and_target_removal_report_beside(false)
@@ -5997,8 +5999,9 @@ mod tests {
         // behind. Whether the executor can prove that of a file is a fact about the platform: on
         // Linux it does, and the report says so; on Windows it depends on what the file system
         // says through the handle that removed the file, and is tested where the executor reads
-        // it (`deletion`); macOS proves it of no file (the target there is a folder, which has
-        // no other links to speak of).
+        // it (`deletion`); on macOS it depends on whether the file system resolves an object by
+        // its identity, and where it does not the target is a folder, which has no other links
+        // to speak of.
         #[cfg(unix)]
         assert!(
             !report.deleted_files_may_have_other_links(),
@@ -6512,33 +6515,6 @@ mod tests {
         assert!(
             app.generation_rebuild_required,
             "the file had a second link when it was removed, so the map cannot be updated in place"
-        );
-        assert_eq!(
-            app.scan_store.published_generation(),
-            Some(ScanGeneration::initial())
-        );
-    }
-
-    /// macOS opens nothing it removes, so it cannot show that a file with one link left no link
-    /// behind, and every file or link it removes counts as possibly linked: the map is scanned
-    /// again after a deletion of a file, as it was before the map could be updated in place at
-    /// all. (A folder with no file in it is still described in place:
-    /// `a_deletion_whose_report_spilled_is_still_described_in_place`.)
-    #[cfg(target_vendor = "apple")]
-    #[test]
-    fn a_deletion_of_a_file_sends_the_map_back_to_a_scan_on_macos() {
-        let (root, mut app) = app_listing_a_folder_holding_a_file(|_| {});
-        let report = delete_the_target_in_the_folder(root.path(), &app, || {});
-        assert!(
-            report.deleted_files_may_have_other_links(),
-            "the file had one link, and the executor opened nothing to show that none survived"
-        );
-
-        finish_the_deletion(&mut app, report);
-
-        assert!(
-            app.generation_rebuild_required,
-            "a removed file counts as possibly linked, so the map is scanned again"
         );
         assert_eq!(
             app.scan_store.published_generation(),
