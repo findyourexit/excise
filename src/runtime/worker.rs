@@ -78,6 +78,15 @@ pub(super) enum WorkerEvent {
         path: Option<PathBuf>,
         message: String,
     },
+    /// A path the scan was reading (a directory it could not open or list, or an entry it could
+    /// not stat) that was gone, or whose parent is not a directory (`NotFound`, `NotADirectory`): the failure `ScanFailed` carries, told apart by the
+    /// kind of the error and never by its text. What a deletion removes while the scan runs fails
+    /// this way, and only the owner knows whether one did, so it decides what the failure counts
+    /// for.
+    ScanPathGone {
+        path: PathBuf,
+        message: String,
+    },
     ScanFinished {
         cancelled: bool,
     },
@@ -894,6 +903,10 @@ fn sanitize_worker_event(event: WorkerEvent) -> WorkerEvent {
             path,
             message: safe_worker_text(&message),
         },
+        WorkerEvent::ScanPathGone { path, message } => WorkerEvent::ScanPathGone {
+            path,
+            message: safe_worker_text(&message),
+        },
         WorkerEvent::ScanUnscanned {
             lease,
             path,
@@ -1095,6 +1108,7 @@ mod tests {
                 WorkerEvent::ScanBatch { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::ScanFailed { .. }
+                | WorkerEvent::ScanPathGone { .. }
                 | WorkerEvent::ScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. } => {}
@@ -1139,7 +1153,10 @@ mod tests {
             {
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
-                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scan failed: {message}")
+                }
                 WorkerEvent::ScanBatch { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
@@ -1184,7 +1201,10 @@ mod tests {
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
-                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scan failed: {message}")
+                }
                 WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
@@ -1223,7 +1243,10 @@ mod tests {
                     WorkerEvent::ScanFinished { cancelled: true } => {
                         panic!("scan pass was cancelled")
                     }
-                    WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                    WorkerEvent::ScanFailed { message, .. }
+                    | WorkerEvent::ScanPathGone { message, .. } => {
+                        panic!("scan failed: {message}")
+                    }
                     WorkerEvent::ScanUnscanned { .. }
                     | WorkerEvent::DeletionPlanned { .. }
                     | WorkerEvent::DeletionExecutionRejected { .. }
@@ -1258,7 +1281,10 @@ mod tests {
                 WorkerEvent::ScanFinished { cancelled: true } => {
                     panic!("initial scan was cancelled")
                 }
-                WorkerEvent::ScanFailed { message, .. } => panic!("initial scan failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("initial scan failed: {message}")
+                }
                 WorkerEvent::ScanBatch { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
@@ -1281,7 +1307,10 @@ mod tests {
                 WorkerEvent::ScanFinished { cancelled: false } => {
                     panic!("rebuild should observe its cancellation")
                 }
-                WorkerEvent::ScanFailed { message, .. } => panic!("rebuild failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("rebuild failed: {message}")
+                }
                 WorkerEvent::ScanBatch { .. }
                 | WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
@@ -1310,7 +1339,10 @@ mod tests {
                 WorkerEvent::ScanFinished { cancelled: true } => {
                     panic!("next rebuild was unexpectedly cancelled")
                 }
-                WorkerEvent::ScanFailed { message, .. } => panic!("next rebuild failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("next rebuild failed: {message}")
+                }
                 WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
@@ -1354,7 +1386,10 @@ mod tests {
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
-                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scan failed: {message}")
+                }
                 WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
@@ -1391,7 +1426,10 @@ mod tests {
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
-                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scan failed: {message}")
+                }
                 WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
@@ -1441,7 +1479,10 @@ mod tests {
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
-                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scan failed: {message}")
+                }
                 WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
@@ -1485,7 +1526,10 @@ mod tests {
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
-                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scan failed: {message}")
+                }
                 WorkerEvent::ScanUnscanned { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
@@ -1532,7 +1576,10 @@ mod tests {
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
-                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scan failed: {message}")
+                }
                 WorkerEvent::ScanUnscanned { path, .. } => {
                     assert_ne!(path, ours, "the session's own file is not even reported");
                 }
@@ -1577,7 +1624,10 @@ mod tests {
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
                 WorkerEvent::ScanFinished { cancelled: true } => panic!("scan was cancelled"),
-                WorkerEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scan failed: {message}")
+                }
                 WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
                 | WorkerEvent::DeletionFinished { .. } => {}
@@ -1621,7 +1671,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("scanner should produce completion")
             {
-                WorkerEvent::ScanFailed { message, .. } => {
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
                     failed = message.contains("replaced") || message.contains("changed");
                 }
                 WorkerEvent::ScanFinished { cancelled: false } => break,
@@ -1684,7 +1735,8 @@ mod tests {
                         .iter()
                         .any(|entry| entry.path == outside.join("replacement"));
                 }
-                WorkerEvent::ScanFailed { message, .. } => {
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
                     saw_root_change |= message.contains("during traversal");
                 }
                 WorkerEvent::ScanUnscanned {
@@ -1741,6 +1793,30 @@ mod tests {
         assert!(message.contains("\\n"));
         assert!(message.contains("\\u{202e}"));
         assert!(message.contains("\\x1b"));
+        assert!(!message.chars().any(char::is_control));
+        assert!(!message.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn a_vanished_directorys_message_is_escaped_like_any_scan_failure() {
+        let (sender, events) = bounded(1);
+        let cancelled = AtomicBool::new(false);
+        assert!(send_event(
+            &sender,
+            WorkerEvent::ScanPathGone {
+                path: PathBuf::from("/scan/hostile"),
+                message: "no such file\n\u{202e}name\u{1b}[31m".to_string(),
+            },
+            &cancelled,
+        ));
+        let WorkerEvent::ScanPathGone { path, message } = events
+            .recv()
+            .expect("sanitized worker error should be delivered")
+        else {
+            panic!("expected a vanished directory event");
+        };
+        assert_eq!(path, PathBuf::from("/scan/hostile"));
+        assert!(message.starts_with(DECEPTIVE_DISPLAY_MARKER));
         assert!(!message.chars().any(char::is_control));
         assert!(!message.contains('\u{202e}'));
     }

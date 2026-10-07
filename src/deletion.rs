@@ -38,6 +38,10 @@ use crate::native_path::{
 use crate::os::windows::{physical_size_from_handle, remove_open_handle};
 #[cfg(windows)]
 use crate::private_files::PrivateFile;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use crate::private_files::PrivateFile as TransientName;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use crate::private_files::PrivateFiles;
 use crate::state::FileToDelete;
 use crate::temporary_storage::{TemporaryStorage, TemporaryStorageReservation};
 
@@ -132,6 +136,11 @@ pub struct DeletionPlan {
     root_snapshot: PlannedSnapshot,
     pub challenge: ConfirmationChallenge,
     pub apparent_bytes: u128,
+    /// The session's registry of the files Excise keeps in the user's tree: the executor registers
+    /// the transient names it makes there while an entry is isolated (`TransientNames`). Windows
+    /// removes an entry through an open handle and makes no such name.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    private_files: PrivateFiles,
     /// What the plan, and the report that follows it, hold in memory: the entries it keeps
     /// resident, and nothing once it has spilled, because every entry is then in a file. It never
     /// exceeds the budget the plan was built with, so the place the deletion history keeps for
@@ -1744,6 +1753,8 @@ pub(crate) fn build_plan_cancellable_with_root_identity_and_temporary_storage(
         root_snapshot,
         challenge,
         apparent_bytes,
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        private_files: temporary_storage.private_files().clone(),
         estimated_bytes,
     };
     revalidate_plan_cancellable(scan_root, &plan, cancelled)?;
@@ -2081,6 +2092,7 @@ where
         };
         let outcome = execute_unix_entry(
             &root,
+            &TransientNames::new(scan_root, &entry.relative_path, &plan.private_files),
             &mut entry,
             soft_cancelled,
             &mut try_claim_mutation,
@@ -2137,6 +2149,7 @@ where
 )]
 fn execute_unix_entry<C, M, F, G, I>(
     root: &File,
+    names: &TransientNames<'_>,
     entry: &mut PlannedEntry,
     soft_cancelled: &AtomicBool,
     try_claim_mutation: &mut C,
@@ -2168,7 +2181,9 @@ where
     if !try_claim_mutation() {
         return DeletionEntryOutcome::Unattempted;
     }
-    let (detached_name, placeholder) = match create_placeholder(&parent) {
+    // The registration of the detached name lasts until this entry's outcome is known, whichever
+    // way it ends (it is released by its drop), and the name is gone for good by then.
+    let (detached_name, placeholder, _registered) = match create_placeholder(&parent, names) {
         Ok(value) => value,
         Err(error) => return DeletionEntryOutcome::Failed(error.to_string()),
     };
@@ -2219,8 +2234,13 @@ where
             kind: io::ErrorKind::NotFound,
             ..
         }) => {
-            return match finalize_placeholder(&parent, &original_name, &detached_name, &placeholder)
-            {
+            return match finalize_placeholder(
+                &parent,
+                names,
+                &original_name,
+                &detached_name,
+                &placeholder,
+            ) {
                 Ok(()) => DeletionEntryOutcome::Missing,
                 Err(error) => DeletionEntryOutcome::Failed(format!(
                     "isolated entry disappeared; namespace cleanup failed: {error}"
@@ -2257,8 +2277,13 @@ where
             kind: io::ErrorKind::NotFound,
             ..
         }) => {
-            return match finalize_placeholder(&parent, &original_name, &detached_name, &placeholder)
-            {
+            return match finalize_placeholder(
+                &parent,
+                names,
+                &original_name,
+                &detached_name,
+                &placeholder,
+            ) {
                 Ok(()) => DeletionEntryOutcome::Missing,
                 Err(error) => DeletionEntryOutcome::Failed(format!(
                     "isolated entry disappeared; namespace cleanup failed: {error}"
@@ -2324,7 +2349,8 @@ where
                     entry.snapshot.identity.link_count = None;
                 }
             }
-            match finalize_placeholder(&parent, &original_name, &detached_name, &placeholder) {
+            match finalize_placeholder(&parent, names, &original_name, &detached_name, &placeholder)
+            {
                 Ok(()) => DeletionEntryOutcome::Deleted,
                 Err(error) => DeletionEntryOutcome::Failed(format!(
                     "target deleted; namespace cleanup failed: {error}"
@@ -2332,7 +2358,8 @@ where
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match finalize_placeholder(&parent, &original_name, &detached_name, &placeholder) {
+            match finalize_placeholder(&parent, names, &original_name, &detached_name, &placeholder)
+            {
                 Ok(()) => DeletionEntryOutcome::Missing,
                 Err(error) => DeletionEntryOutcome::Failed(format!(
                     "target disappeared; namespace cleanup failed: {error}"
@@ -2739,6 +2766,34 @@ fn past_path_max(scan_root: &Path, relative: &Path) -> bool {
         >= PATH_MAX
 }
 
+/// Where the executor makes the transient names of one entry, and the registry that keeps every
+/// reader of the tree away from them: a name the executor makes in the folder that holds the entry
+/// is registered by its exact path (the scan root, the entry's folder, and the name), which is the
+/// path the scanner builds for the same name. The scanner and the overlay's listing skip a
+/// registered path without reading it, so neither records the placeholder or the isolated target
+/// as an entry of the user's while the name is registered. The registration ends when the entry's
+/// outcome is known; a scanner that took a name from a listing before then, and reaches it after,
+/// finds it gone.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+struct TransientNames<'a> {
+    folder: PathBuf,
+    files: &'a PrivateFiles,
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+impl<'a> TransientNames<'a> {
+    fn new(scan_root: &Path, entry: &Path, files: &'a PrivateFiles) -> Self {
+        Self {
+            folder: scan_root.join(entry.parent().unwrap_or_else(|| Path::new(""))),
+            files,
+        }
+    }
+
+    fn register(&self, name: &OsStr) -> TransientName {
+        self.files.register(self.folder.join(name))
+    }
+}
+
 /// How many unpredictable names a placeholder operation tries before giving up.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 const PLACEHOLDER_NAME_ATTEMPTS: usize = 128;
@@ -2767,16 +2822,22 @@ fn placeholder_name() -> io::Result<OsString> {
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-fn create_placeholder(parent: &File) -> io::Result<(OsString, PlannedSnapshot)> {
+fn create_placeholder(
+    parent: &File,
+    names: &TransientNames<'_>,
+) -> io::Result<(OsString, PlannedSnapshot, TransientName)> {
     for _ in 0..PLACEHOLDER_NAME_ATTEMPTS {
         let name = placeholder_name()?;
+        // Registered before the name exists, and by its exact path: a scan that lists the folder
+        // sees either no such name or one that is registered.
+        let registered = names.register(&name);
         let mut options = cap_fs::OpenOptions::new();
         options.write(true).create_new(true);
         match cap_fs::open(parent, Path::new(&name), &options) {
             Ok(file) => {
                 let metadata = file.metadata()?;
                 return snapshot_from_std_metadata(&metadata, PlannedKind::File)
-                    .map(|snapshot| (name, snapshot));
+                    .map(|snapshot| (name, snapshot, registered));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -2863,6 +2924,7 @@ fn restore_detached(
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn finalize_placeholder(
     parent: &File,
+    names: &TransientNames<'_>,
     original: &OsStr,
     detached: &OsStr,
     placeholder: &PlannedSnapshot,
@@ -2876,6 +2938,9 @@ fn finalize_placeholder(
         ));
     }
     let mut private = detached.to_os_string();
+    // The detached name is registered by the caller; a fresh one is registered here, before the
+    // placeholder is moved to it, and released once the placeholder is gone from it.
+    let mut registered_private: Option<TransientName> = None;
     for _ in 0..PLACEHOLDER_NAME_ATTEMPTS {
         match rustix::fs::renameat_with(
             parent,
@@ -2885,7 +2950,10 @@ fn finalize_placeholder(
             rustix::fs::RenameFlags::NOREPLACE,
         ) {
             Ok(()) => return remove_verified_placeholder(parent, &private, placeholder),
-            Err(rustix::io::Errno::EXIST) => private = placeholder_name()?,
+            Err(rustix::io::Errno::EXIST) => {
+                private = placeholder_name()?;
+                registered_private.replace(names.register(&private));
+            }
             Err(error) => return Err(io::Error::from(error)),
         }
     }
@@ -3037,11 +3105,21 @@ pub(crate) fn current_folder_listing(
     mut visit: impl FnMut(&OsStr, PlannedKind, &NativeIdentity) -> bool,
 ) -> Result<EntrySnapshot, DeletionPlanError> {
     let root = open_root(scan_root, scan_root_identity)?;
-    let (before, handle) = inspect_relative(&root, relative)?;
-    let Some(handle) = handle.filter(|_| before.kind == PlannedKind::Directory) else {
-        return Err(DeletionPlanError::Changed);
+    let opened;
+    // The scan root is listed through its own handle, which `open_root` has checked.
+    let (before, handle) = if relative.as_os_str().is_empty() {
+        let before = snapshot_from_open_file(&root, PlannedKind::Directory)
+            .map_err(|error| plan_io(relative, error))?;
+        (before, &root)
+    } else {
+        let (before, handle) = inspect_relative(&root, relative)?;
+        let Some(handle) = handle.filter(|_| before.kind == PlannedKind::Directory) else {
+            return Err(DeletionPlanError::Changed);
+        };
+        opened = handle;
+        (before, &opened)
     };
-    let entries = cap_fs::read_base_dir(&handle).map_err(|error| plan_io(relative, error))?;
+    let entries = cap_fs::read_base_dir(handle).map_err(|error| plan_io(relative, error))?;
     for entry in entries {
         let entry = entry.map_err(|error| plan_io(relative, error))?;
         let name = entry.file_name();
@@ -3049,12 +3127,12 @@ pub(crate) fn current_folder_listing(
             continue;
         }
         validate_component(&name)?;
-        let (kind, identity) = list_entry(&handle, &name, relative)?;
+        let (kind, identity) = list_entry(handle, &name, relative)?;
         if !visit(&name, kind, &identity) {
             return Err(DeletionPlanError::Cancelled);
         }
     }
-    let after = snapshot_from_open_file(&handle, PlannedKind::Directory)
+    let after = snapshot_from_open_file(handle, PlannedKind::Directory)
         .map_err(|error| plan_io(relative, error))?;
     if after != before {
         return Err(DeletionPlanError::Changed);
@@ -4273,6 +4351,102 @@ mod tests {
         assert!(directory.exists());
     }
 
+    /// While an entry is isolated, the name that holds it is a name the executor made in the
+    /// folder that holds the entry. It is registered by its exact path, the one a scan builds for
+    /// the same name, so a scan of the folder records no entry of the executor's and fails to read
+    /// none; and the registration is gone once the entry is.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn the_name_that_holds_an_isolated_entry_is_registered_by_its_exact_path() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let folder = root.path().join("folder");
+        std::fs::create_dir(&folder).expect("folder should be created");
+        let path = folder.join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        std::fs::write(folder.join("other"), b"stay").expect("other should be written");
+        let metadata = std::fs::symlink_metadata(&path).expect("target metadata");
+        let storage = TemporaryStorage::default();
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            lone_target(root.path(), Path::new("folder/target"), &metadata),
+            false,
+            &AtomicBool::new(false),
+            1 << 20,
+            &storage,
+        )
+        .expect("plan should build");
+
+        let mut seen = None;
+        let report = execute_plan_with_hook_after_inspection(root.path(), plan, |name| {
+            let registered = folder.join(name);
+            let (recorded, failed) = crate::runtime::recorded_by_a_scan_of(
+                root.path(),
+                &folder,
+                storage.private_files(),
+            );
+            seen = Some((
+                registered.clone(),
+                storage.private_files().contains(&registered),
+                recorded,
+                failed,
+            ));
+        });
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert!(!path.exists());
+        let (registered, was_registered, recorded, failed) = seen.expect("the hook should run");
+        assert!(
+            was_registered,
+            "the isolated entry's name is registered: {registered:?}"
+        );
+        assert!(
+            recorded.iter().all(|path| !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".excise-delete-"))),
+            "a scan records none of the executor's names: {recorded:?}"
+        );
+        assert!(recorded.contains(&folder.join("other")));
+        assert!(failed.is_empty(), "and fails to read none: {failed:?}");
+        assert!(
+            !storage.private_files().contains(&registered),
+            "the registration ends with the entry's isolation"
+        );
+    }
+
+    /// The registration is released however the entry's isolation ends, not only when it is
+    /// removed: here the entry changed, so it is put back.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn the_registration_of_an_isolated_name_ends_when_the_entry_is_restored() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("target should be written");
+        let storage = TemporaryStorage::default();
+        let plan = build_plan_cancellable_with_temporary_storage(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+            &AtomicBool::new(false),
+            1 << 20,
+            &storage,
+        )
+        .expect("plan should build");
+
+        let mut registered = None;
+        let report = execute_plan_with_hook_after_inspection(root.path(), plan, |name| {
+            registered = Some(root.path().join(name));
+            // The entry changes after the executor looked at it.
+            std::fs::write(root.path().join(name), b"changed afterwards")
+                .expect("the isolated entry should change");
+        });
+
+        assert_eq!(report.deleted_entries(), 0);
+        assert!(path.exists(), "the entry is put back");
+        let registered = registered.expect("the hook should run");
+        assert!(!storage.private_files().contains(&registered));
+        assert!(!registered.exists());
+    }
+
     #[test]
     fn soft_cancel_leaves_every_entry_unattempted() {
         let root = tempfile::tempdir().expect("deletion root should exist");
@@ -4302,8 +4476,10 @@ mod tests {
     fn a_placeholder_is_removed_even_when_its_detached_name_is_taken() {
         let root = tempfile::tempdir().expect("deletion root should exist");
         let parent = std::fs::File::open(root.path()).expect("the root should open");
-        let (detached, placeholder) =
-            create_placeholder(&parent).expect("a placeholder should be reserved");
+        let files = PrivateFiles::default();
+        let names = TransientNames::new(root.path(), Path::new("target"), &files);
+        let (detached, placeholder, _registered) =
+            create_placeholder(&parent, &names).expect("a placeholder should be reserved");
         // After a deletion the placeholder holds the entry's original name and moves back to the
         // detached name, which the target has just vacated. Here another entry holds that name.
         std::fs::rename(root.path().join(&detached), root.path().join("target"))
@@ -4313,6 +4489,7 @@ mod tests {
 
         finalize_placeholder(
             &parent,
+            &names,
             std::ffi::OsStr::new("target"),
             &detached,
             &placeholder,
@@ -6193,20 +6370,28 @@ mod tests {
                 }
             };
 
+            let files = PrivateFiles::default();
+            let names = TransientNames::new(tree.root(), Path::new(FOLDER), &files);
             rustix::fs::mkdirat(&parent, FOLDER, mode).expect("the probe folder should be created");
-            let (detached, placeholder) =
-                create_placeholder(&parent).expect("a placeholder should be reserved");
+            let (detached, placeholder, _registered) =
+                create_placeholder(&parent, &names).expect("a placeholder should be reserved");
             let refusal = isolate_entry(&parent, OsStr::new(FOLDER), &detached)
                 .and_then(|()| cap_fs::remove_dir(&parent, Path::new(&detached)))
                 .and_then(|()| {
-                    finalize_placeholder(&parent, OsStr::new(FOLDER), &detached, &placeholder)
+                    finalize_placeholder(
+                        &parent,
+                        &names,
+                        OsStr::new(FOLDER),
+                        &detached,
+                        &placeholder,
+                    )
                 })
                 .err();
             remove(OsStr::new(FOLDER));
             remove(&detached);
 
-            let (file, _) =
-                create_placeholder(&parent).expect("a reference file should be created");
+            let (file, _, _registered) =
+                create_placeholder(&parent, &names).expect("a reference file should be created");
             rustix::fs::mkdirat(&parent, REFERENCE, mode)
                 .expect("the reference folder should be created");
             let reference = exchange_names(&parent, &file, OsStr::new(REFERENCE)).and_then(|()| {

@@ -888,10 +888,7 @@ fn scan_directory(
             Some(Err(error)) => {
                 let _ = send_event(
                     sender,
-                    WorkerEvent::ScanFailed {
-                        path: Some(frame.task.path.clone()),
-                        message: error.to_string(),
-                    },
+                    directory_task_failure(frame.task.path.clone(), &error),
                     cancelled,
                 );
             }
@@ -931,6 +928,63 @@ fn scan_directory(
         continue_scanning: true,
         completed: true,
     }
+}
+
+/// What one worker scan of `folder` records and fails to read: the paths of the entries of its
+/// batches, and the paths of its failures. `private_files` is the session's registry of the files
+/// Excise keeps in the tree, which the scan skips as a real one does. For the tests of what the
+/// scan makes of what another part of Excise leaves in the tree.
+#[cfg(all(test, unix))]
+pub(crate) fn recorded_by_a_scan_of(
+    root: &Path,
+    folder: &Path,
+    private_files: &PrivateFiles,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (queue, _) = TaskQueue::new(root.to_path_buf(), 1, &TemporaryStorage::default())
+        .expect("scanner task queue should be available");
+    let (sender, events) = crossbeam_channel::bounded(64);
+    let root_directory =
+        cap_fs::open_ambient_dir(root, ambient_authority()).expect("scan root handle should open");
+    let exclusions = Exclusions::new(root, Vec::new(), Vec::new())
+        .expect("scanner exclusions should compile")
+        .with_private_files(private_files.clone());
+    assert!(scan_directory_with_queue(
+        DirectoryTask {
+            path: folder.to_path_buf(),
+            identity: None,
+        },
+        &queue,
+        &sender,
+        &AtomicBool::new(false),
+        &AtomicBool::new(false),
+        &AtomicBool::new(false),
+        &root_directory,
+        root,
+        None,
+        &exclusions,
+        None,
+        true,
+    ));
+    let mut recorded = Vec::new();
+    let mut failed = Vec::new();
+    for event in events.try_iter() {
+        match event {
+            WorkerEvent::ScanBatch { entries, .. } => {
+                recorded.extend(entries.into_iter().map(|entry| entry.path));
+            }
+            WorkerEvent::ScanFailed {
+                path: Some(path), ..
+            }
+            | WorkerEvent::ScanPathGone { path, .. }
+            | WorkerEvent::ScanUnscanned { path, .. } => failed.push(path),
+            WorkerEvent::ScanFailed { path: None, .. }
+            | WorkerEvent::ScanFinished { .. }
+            | WorkerEvent::DeletionPlanned { .. }
+            | WorkerEvent::DeletionExecutionRejected { .. }
+            | WorkerEvent::DeletionFinished { .. } => {}
+        }
+    }
+    (recorded, failed)
 }
 
 #[cfg(test)]
@@ -1136,6 +1190,63 @@ pub(super) fn replace_after_next_batch(path: PathBuf, displaced: PathBuf, target
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, displaced, target));
 }
+
+/// The event for a directory task that failed with `error`. A directory that is gone
+/// ([`path_is_gone`]) is told apart by the kind of the error, never by its text: a deletion that
+/// removes a directory is no failure of the scan, and only the owner knows whether one did.
+fn directory_task_failure(path: PathBuf, error: &io::Error) -> WorkerEvent {
+    path_failure(path, error.to_string(), path_is_gone(error))
+}
+
+/// Whether `error` says the path is gone: it does not exist (`NotFound`), or a component of it is
+/// not a directory (`NotADirectory`), as one is while the executor holds its name with a
+/// placeholder file.
+fn path_is_gone(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+/// Why an entry of a folder could not be read: the text for the reader, and whether the entry was
+/// gone ([`path_is_gone`]), told by the kind of the error and never by the text.
+#[derive(Debug)]
+struct EntryReadError {
+    message: String,
+    not_found: bool,
+}
+
+impl EntryReadError {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            not_found: false,
+        }
+    }
+}
+
+impl From<&io::Error> for EntryReadError {
+    fn from(error: &io::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            not_found: path_is_gone(error),
+        }
+    }
+}
+
+/// The event for a path the scan was reading that failed. A path that is gone is told apart: a
+/// deletion that removes it is no failure of the scan, and only the owner knows whether one did.
+fn path_failure(path: PathBuf, message: String, not_found: bool) -> WorkerEvent {
+    if not_found {
+        WorkerEvent::ScanPathGone { path, message }
+    } else {
+        WorkerEvent::ScanFailed {
+            path: Some(path),
+            message,
+        }
+    }
+}
+
 fn report_directory_task_error(
     path: PathBuf,
     error: DirectoryTaskError,
@@ -1157,14 +1268,7 @@ fn report_directory_task_error(
             );
         }
         DirectoryTaskError::Io(error) => {
-            let _ = send_event(
-                sender,
-                WorkerEvent::ScanFailed {
-                    path: Some(path),
-                    message: error.to_string(),
-                },
-                cancelled,
-            );
+            let _ = send_event(sender, directory_task_failure(path, &error), cancelled);
         }
     }
 }
@@ -1503,10 +1607,10 @@ fn read_entry(
     directory: &File,
     name: &OsStr,
     _path: &Path,
-) -> Result<(EntryMetadata, Option<NativeIdentity>), String> {
+) -> Result<(EntryMetadata, Option<NativeIdentity>), EntryReadError> {
     let stat = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|error| io::Error::from(error).to_string())?;
-    let (metadata, identity) = EntryMetadata::from_stat(&stat)?;
+        .map_err(|error| EntryReadError::from(&io::Error::from(error)))?;
+    let (metadata, identity) = EntryMetadata::from_stat(&stat).map_err(EntryReadError::other)?;
     Ok((metadata, Some(identity)))
 }
 
@@ -1515,15 +1619,15 @@ fn read_entry(
     _directory: &File,
     _name: &OsStr,
     path: &Path,
-) -> Result<(EntryMetadata, Option<NativeIdentity>), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+) -> Result<(EntryMetadata, Option<NativeIdentity>), EntryReadError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| EntryReadError::from(&error))?;
     let identity = identity_for(path, &metadata).map_err(|error| {
-        format!(
+        EntryReadError::other(format!(
             "{}: {error}",
             path.parent()
                 .unwrap_or_else(|| Path::new("."))
                 .to_string_lossy()
-        )
+        ))
     })?;
     Ok((EntryMetadata::from_std(&metadata), identity))
 }
@@ -1564,13 +1668,10 @@ fn process_entry(
             );
             return;
         }
-        Err(message) => {
+        Err(error) => {
             let _ = send_event(
                 sender,
-                WorkerEvent::ScanFailed {
-                    path: Some(path),
-                    message,
-                },
+                path_failure(path, error.message, error.not_found),
                 cancelled,
             );
             return;
@@ -1870,7 +1971,8 @@ mod tests {
         let mut finished = false;
         for event in events.try_iter() {
             match event {
-                WorkerEvent::ScanFailed { message, .. } => {
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
                     saw_capacity_error |= message.contains("scan store capacity exhausted")
                         && message.contains("--scan-store-mib");
                 }
@@ -1955,7 +2057,10 @@ mod tests {
                     panic!("scanner sealed an unleased batch")
                 }
                 WorkerEvent::ScanFinished { cancelled } => finished |= !cancelled,
-                WorkerEvent::ScanFailed { message, .. } => panic!("scanner failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scanner failed: {message}")
+                }
                 WorkerEvent::ScanUnscanned {
                     lease: Some(lease),
                     input_runs,
@@ -2089,7 +2194,10 @@ mod tests {
                     panic!("scanner emitted an unleased batch")
                 }
                 WorkerEvent::ScanFinished { cancelled } => finished |= !cancelled,
-                WorkerEvent::ScanFailed { message, .. } => panic!("scanner failed: {message}"),
+                WorkerEvent::ScanFailed { message, .. }
+                | WorkerEvent::ScanPathGone { message, .. } => {
+                    panic!("scanner failed: {message}")
+                }
                 WorkerEvent::ScanUnscanned { path, reason, .. } => {
                     panic!("fixture path was unexpectedly unscanned: {path:?}: {reason:?}")
                 }
@@ -2326,6 +2434,7 @@ mod tests {
                     );
                 }
                 WorkerEvent::ScanFailed { .. }
+                | WorkerEvent::ScanPathGone { .. }
                 | WorkerEvent::ScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
@@ -2411,6 +2520,7 @@ mod tests {
                     );
                 }
                 WorkerEvent::ScanFailed { .. }
+                | WorkerEvent::ScanPathGone { .. }
                 | WorkerEvent::ScanFinished { .. }
                 | WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
@@ -2519,6 +2629,9 @@ mod tests {
                         unscanned.push((path, reason));
                     }
                     WorkerEvent::ScanFailed { path, message } => failed.push((path, message)),
+                    WorkerEvent::ScanPathGone { path, message } => {
+                        failed.push((Some(path), message));
+                    }
                     WorkerEvent::ScanFinished { cancelled } => {
                         assert!(!cancelled, "scanner should reach its normal terminal event");
                         break;
@@ -2672,6 +2785,9 @@ mod tests {
             }
             WorkerEvent::ScanUnscanned { reason, .. } => format!("unscanned: {reason:?}"),
             WorkerEvent::ScanFailed { message, .. } => format!("failed: {message}"),
+            WorkerEvent::ScanPathGone { message, .. } => {
+                format!("a path that is gone: {message}")
+            }
             WorkerEvent::ScanFinished { .. } => "finished".to_string(),
             WorkerEvent::DeletionPlanned { .. }
             | WorkerEvent::DeletionExecutionRejected { .. }
@@ -2740,17 +2856,167 @@ mod tests {
             },
         );
 
-        let [WorkerEvent::ScanFailed { path, message }] = events.as_slice() else {
+        let [WorkerEvent::ScanPathGone { path, message }] = events.as_slice() else {
             panic!(
                 "a folder that cannot be opened should be reported, got {:?}",
                 events.iter().map(describe).collect::<Vec<_>>()
             );
         };
-        assert_eq!(path.as_deref(), Some(tree.deepest().as_path()));
+        assert_eq!(*path, tree.deepest());
         assert!(
             message.contains("No such file or directory"),
             "the reason should name the failure: {message}"
         );
+    }
+
+    /// A folder that is gone when the scanner comes to it is reported by its kind, so that the
+    /// owner can tell one a deletion removed from one that failed otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn scanner_reports_a_folder_that_vanished_as_not_found() {
+        let root = tempfile::tempdir().expect("fixture root should exist");
+        let vanished = root.path().join("vanished");
+        fs::create_dir(&vanished).expect("folder should be created");
+        let identity = identity_for(&vanished, &fs::symlink_metadata(&vanished).expect("stat"))
+            .expect("folder identity should be readable")
+            .expect("folder should not be a link");
+        fs::remove_dir(&vanished).expect("folder should be removed");
+
+        for identity in [Some(identity), None] {
+            let events = scan_one_directory(
+                root.path(),
+                DirectoryTask {
+                    path: vanished.clone(),
+                    identity,
+                },
+            );
+
+            let [WorkerEvent::ScanPathGone { path, .. }] = events.as_slice() else {
+                panic!(
+                    "a folder that is gone should be reported as such, got {:?}",
+                    events.iter().map(describe).collect::<Vec<_>>()
+                );
+            };
+            assert_eq!(*path, vanished);
+        }
+    }
+
+    /// An entry that is gone when the scanner stats it (a deletion removed it after its folder
+    /// was listed) is reported by its kind too, not by the text of the error.
+    #[cfg(unix)]
+    #[test]
+    fn scanner_reports_an_entry_that_is_gone_when_it_is_stat_as_gone() {
+        let root = tempfile::tempdir().expect("fixture root should exist");
+        let gone = root.path().join("gone");
+        fs::write(&gone, b"x").expect("fixture file should be written");
+        let root_directory = cap_fs::open_ambient_dir(root.path(), ambient_authority())
+            .expect("fixture root handle should open");
+        let Ok(mut frame) = open_frame(
+            &root_directory,
+            root.path(),
+            DirectoryTask {
+                path: root.path().to_path_buf(),
+                identity: None,
+            },
+        ) else {
+            panic!("the fixture root should open");
+        };
+        let entry = frame
+            .entries
+            .next()
+            .expect("the folder lists its file")
+            .expect("the entry should read");
+        // The folder was listed; the entry goes before the scanner stats it.
+        fs::remove_file(&gone).expect("the file should be removed");
+        let (sender, events) = crossbeam_channel::bounded(4);
+        let exclusions = Exclusions::new(root.path(), Vec::new(), Vec::new())
+            .expect("scanner exclusions should compile");
+
+        process_entry(
+            &mut frame,
+            &entry,
+            root.path(),
+            None,
+            None,
+            &sender,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &exclusions,
+            None,
+            true,
+        );
+
+        let events: Vec<WorkerEvent> = events.try_iter().collect();
+        let [WorkerEvent::ScanPathGone { path, .. }] = events.as_slice() else {
+            panic!(
+                "an entry that is gone should be reported as such, got {:?}",
+                events.iter().map(describe).collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(*path, gone);
+    }
+
+    /// A folder opened for a path whose parent is a file (the executor's placeholder holds the
+    /// name for a moment) is told apart as well, as is a path that is gone.
+    #[cfg(unix)]
+    #[test]
+    fn scanner_reports_a_path_below_a_file_as_gone() {
+        let root = tempfile::tempdir().expect("fixture root should exist");
+        fs::write(root.path().join("file"), b"x").expect("fixture file should be written");
+        let below = root.path().join("file").join("below").join("deeper");
+
+        let events = scan_one_directory(
+            root.path(),
+            DirectoryTask {
+                path: below.clone(),
+                identity: None,
+            },
+        );
+
+        let [WorkerEvent::ScanPathGone { path, .. }] = events.as_slice() else {
+            panic!(
+                "a path below a file should be reported as gone, got {:?}",
+                events.iter().map(describe).collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(*path, below);
+    }
+
+    /// Only a folder that is gone is told apart: one the scanner is not allowed to open stays a
+    /// plain failure, and is counted as unreadable whatever a deletion did.
+    #[cfg(unix)]
+    #[test]
+    fn scanner_reports_a_folder_it_may_not_open_as_a_plain_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("fixture root should exist");
+        let sealed = root.path().join("sealed");
+        fs::create_dir(&sealed).expect("folder should be created");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))
+            .expect("folder should be sealed");
+        let may_open = fs::read_dir(&sealed).is_ok();
+
+        let events = scan_one_directory(
+            root.path(),
+            DirectoryTask {
+                path: sealed.clone(),
+                identity: None,
+            },
+        );
+
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755))
+            .expect("folder should be opened again for its removal");
+        if may_open {
+            // A process that may open a sealed folder (the superuser) cannot show this.
+            return;
+        }
+        let [WorkerEvent::ScanFailed { path, .. }] = events.as_slice() else {
+            panic!(
+                "a folder that may not be opened should be a plain failure, got {:?}",
+                events.iter().map(describe).collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(path.as_deref(), Some(sealed.as_path()));
     }
 
     #[cfg(unix)]

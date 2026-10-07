@@ -484,6 +484,11 @@ pub(crate) struct RefreshedFolder {
     /// The entries the folder holds now, read in the same moment as the snapshot. The snapshot
     /// may replace the recorded one only when these are the entries the overlay publishes.
     pub(crate) entries: FolderDigest,
+    /// Removals the map still lists that are already gone from the file system, each with an
+    /// overlay of its own to follow this one. The entries of the folder that lie below one of them
+    /// are not what the folder holds now, so they are left out of what `entries` is compared with:
+    /// the folder holds what the map lists of it, less every removal already made.
+    pub(crate) removed_later: Vec<RelativePath>,
 }
 
 impl RefreshedFolder {
@@ -1118,7 +1123,9 @@ impl ScanStore {
         let storage = self.temporary_storage.clone();
         let mut paths = Vec::with_capacity(MAX_OBSERVATIONS_PER_BATCH);
         let mut identities = Vec::with_capacity(MAX_OBSERVATIONS_PER_BATCH);
-        let mut folder_copied = folder.is_none();
+        // The scan root has no record of its own to refresh: when it is the folder, it is checked
+        // and its recorded snapshot is left as it is.
+        let mut folder_copied = folder.is_none_or(|folder| folder.path.is_root());
         // The entries of the refreshed folder that this overlay publishes: the ones the base has,
         // less the removed one.
         let mut folder_entries = FolderDigest::default();
@@ -1139,6 +1146,10 @@ impl ScanStore {
                         folder.refresh(&mut path)?;
                         folder_copied = true;
                     } else if path.path.is_direct_child_of(&folder.path)
+                        && !folder
+                            .removed_later
+                            .iter()
+                            .any(|later| path.path.starts_with(later))
                         && let Some(name) = path.path.components().last()
                     {
                         folder_entries.add(
@@ -3170,6 +3181,122 @@ mod tests {
         entries
     }
 
+    /// Another removal from the same folder can already be gone from the file system while this
+    /// overlay is built, and the folder is then checked against the map less both: the entry
+    /// of the later removal stays in this overlay's map, for its own overlay to drop.
+    #[test]
+    fn an_overlay_checks_the_folder_against_the_map_less_the_removals_that_follow() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = store_with_a_folder_inside_a_folder(parent.path());
+        let folder = RefreshedFolder {
+            path: path("holder"),
+            snapshot: folder_snapshot(file_id::FileId::new_inode(1, 1), 2, 200),
+            // `stay` is gone from the file system already: its removal follows.
+            entries: FolderDigest::default(),
+            removed_later: vec![path("holder/stay")],
+        };
+
+        let next = ScanGeneration::from_value(1);
+        let base = overlay_base_of(&store);
+        store
+            .begin_overlay_generation(&base, next, &path("holder/inner"), Some(&folder))
+            .expect("the folder holds what the map lists of it, less both removals");
+        assert_eq!(store.publish().expect("overlay should publish"), next);
+        let page = store
+            .published_mut()
+            .expect("overlay should be published")
+            .page(PageRequest::first(path("holder"), 8))
+            .expect("the folder's page should load");
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![path("holder/stay")],
+            "the later removal's entry is left for its own overlay"
+        );
+    }
+
+    /// The scan root has no record of its own, so what is checked of it is its entries: the map's
+    /// entries of the root less the removal must be what the root holds now.
+    #[test]
+    fn an_overlay_can_check_the_scan_root_against_the_map() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = store_with_a_folder_inside_a_folder(parent.path());
+        let snapshot = folder_snapshot(file_id::FileId::new_inode(1, 7), 2, 200);
+        let mut intruder = FolderDigest::default();
+        intruder.add(
+            std::ffi::OsStr::new("intruder"),
+            PathEntryKind::File,
+            Some(&file_id::FileId::new_inode(1, 9)),
+        );
+        let base = overlay_base_of(&store);
+        let refused = store.begin_overlay_generation(
+            &base,
+            ScanGeneration::from_value(1),
+            &path("holder"),
+            Some(&RefreshedFolder {
+                path: RelativePath::root(),
+                snapshot: snapshot.clone(),
+                entries: intruder,
+                removed_later: Vec::new(),
+            }),
+        );
+        assert!(matches!(
+            refused,
+            Err(ScanStoreError::OverlayNeedsRescan(_))
+        ));
+
+        let base = overlay_base_of(&store);
+        store
+            .begin_overlay_generation(
+                &base,
+                ScanGeneration::from_value(2),
+                &path("holder"),
+                Some(&RefreshedFolder {
+                    path: RelativePath::root(),
+                    snapshot,
+                    entries: FolderDigest::default(),
+                    removed_later: Vec::new(),
+                }),
+            )
+            .expect("the root holds what the map lists of it, less the removal");
+        assert_eq!(
+            store.publish().expect("overlay should publish"),
+            ScanGeneration::from_value(2)
+        );
+    }
+
+    /// A change to another entry of the folder is still one the map cannot describe, however many
+    /// removals follow.
+    #[test]
+    fn an_overlay_with_removals_to_follow_still_refuses_a_folder_that_changed() {
+        let parent = tempfile::tempdir().expect("session parent should exist");
+        let mut store = store_with_a_folder_inside_a_folder(parent.path());
+        let mut entries = FolderDigest::default();
+        entries.add(
+            std::ffi::OsStr::new("intruder"),
+            PathEntryKind::File,
+            Some(&file_id::FileId::new_inode(1, 9)),
+        );
+        let folder = RefreshedFolder {
+            path: path("holder"),
+            snapshot: folder_snapshot(file_id::FileId::new_inode(1, 1), 2, 200),
+            entries,
+            removed_later: vec![path("holder/stay")],
+        };
+
+        let base = overlay_base_of(&store);
+        let result = store.begin_overlay_generation(
+            &base,
+            ScanGeneration::from_value(1),
+            &path("holder/inner"),
+            Some(&folder),
+        );
+
+        assert!(matches!(result, Err(ScanStoreError::OverlayNeedsRescan(_))));
+    }
+
     /// Removing an entry changes the folder that held it, and the map a deletion leaves says what
     /// the folder is now: the check that the reader is deleting what they saw compares it.
     #[test]
@@ -3181,6 +3308,7 @@ mod tests {
             path: path("holder"),
             snapshot: now.clone(),
             entries: holder_entries_without_inner(),
+            removed_later: Vec::new(),
         };
 
         let next = ScanGeneration::from_value(1);
@@ -3226,11 +3354,13 @@ mod tests {
             path: path("holder"),
             snapshot: folder_snapshot(file_id::FileId::new_inode(1, 99), 2, 200),
             entries: holder_entries_without_inner(),
+            removed_later: Vec::new(),
         };
         let elsewhere = RefreshedFolder {
             path: path("elsewhere"),
             snapshot: folder_snapshot(file_id::FileId::new_inode(1, 1), 2, 200),
             entries: holder_entries_without_inner(),
+            removed_later: Vec::new(),
         };
         let base = overlay_base_of(&store);
 
@@ -3299,6 +3429,7 @@ mod tests {
                 path: path("holder"),
                 snapshot: folder_snapshot(file_id::FileId::new_inode(1, 1), 2, 200),
                 entries: digest,
+                removed_later: Vec::new(),
             };
 
             let error = store
