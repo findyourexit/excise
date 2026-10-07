@@ -230,7 +230,9 @@ impl WorkerEventKind {
         match event {
             WorkerEvent::ScanBatch { .. } => Self::ScanBatch,
             WorkerEvent::ScanUnscanned { .. } => Self::ScanUnscanned,
-            WorkerEvent::ScanFailed { .. } => Self::ScanFailed,
+            // A path that is gone is a scan failure the owner may find explained; it is timed
+            // with the others.
+            WorkerEvent::ScanFailed { .. } | WorkerEvent::ScanPathGone { .. } => Self::ScanFailed,
             WorkerEvent::ScanFinished { .. } => Self::ScanFinished,
             WorkerEvent::DeletionPlanned { .. } => Self::DeletionPlanned,
             WorkerEvent::DeletionExecutionRejected { .. } => Self::DeletionExecutionRejected,

@@ -2,6 +2,8 @@ mod clock;
 #[cfg(feature = "internal")]
 mod probe;
 mod scanner;
+#[cfg(all(test, unix))]
+pub(crate) use scanner::recorded_by_a_scan_of;
 mod worker;
 
 use std::collections::VecDeque;
@@ -1004,9 +1006,22 @@ where
         path: &Path,
         reason: &crate::model::UnscannedReason,
     ) -> Result<(), AppError> {
-        self.admit_coverage_runs(lease, input_runs)?;
+        // A folder the executor holds under a placeholder while it removes it fails to open as one
+        // that was replaced: below a deletion's target that is the deletion's doing, and nothing of
+        // it is counted. The scanner sends such an event with an empty batch of runs, which
+        // `admit_coverage_runs` records as a path the scan store could not record, so an excused
+        // event is not admitted when it carries none. Runs it does carry are the scan's own and
+        // are admitted as for any other event. While a rebuild is running none of these events is
+        // counted, and none is asked about: asking is what makes an executing deletion owe its
+        // removal to the first map, and a rebuild has no first map to owe it to.
+        let excused = !self.generation_rebuild_active
+            && matches!(reason, crate::model::UnscannedReason::Replacement(_))
+            && self.app.path_removed_by_a_deletion(path);
+        if !excused || !input_runs.is_empty() {
+            self.admit_coverage_runs(lease, input_runs)?;
+        }
         self.scan_view_dirty |= path.starts_with(&self.scan_view_root);
-        if self.generation_rebuild_active {
+        if self.generation_rebuild_active || excused {
             return Ok(());
         }
         self.summary.unscanned_entries = self.summary.unscanned_entries.saturating_add(1);
@@ -1033,6 +1048,25 @@ where
             crate::model::UnscannedReason::IdentityStorageCapacity => {}
         }
         Ok(())
+    }
+
+    /// A scanner task failed, whichever way the worker told the owner: a scan-store capacity
+    /// failure is the store's, once, and any other is an unreadable path.
+    fn handle_failed_scan_work(&mut self, path: Option<&Path>, message: &str) {
+        if is_scan_store_capacity_failure(message) {
+            let message = safe_display_text(message);
+            if self
+                .app
+                .note_scan_store_capacity_failure_from_worker(message.clone())
+            {
+                self.summary.unscanned_entries = self.summary.unscanned_entries.saturating_add(1);
+                self.summary.last_unscanned_path = path.map(safe_display_path_text);
+                self.summary.last_unscanned_reason = Some(message.clone());
+                self.summary.last_worker_error = Some(message);
+            }
+        } else {
+            self.handle_scan_failure(path, message, self.generation_rebuild_active);
+        }
     }
 
     fn handle_scan_failure(&mut self, path: Option<&Path>, message: &str, rebuild_active: bool) {
@@ -1238,25 +1272,15 @@ where
                 self.handle_primary_unscanned(lease.as_ref(), input_runs, &path, &reason)?;
             }
             WorkerEvent::ScanFailed { path, message } => {
-                if is_scan_store_capacity_failure(&message) {
-                    let message = safe_display_text(&message);
-                    if self
-                        .app
-                        .note_scan_store_capacity_failure_from_worker(message.clone())
-                    {
-                        self.summary.unscanned_entries =
-                            self.summary.unscanned_entries.saturating_add(1);
-                        self.summary.last_unscanned_path =
-                            path.as_deref().map(safe_display_path_text);
-                        self.summary.last_unscanned_reason = Some(message.clone());
-                        self.summary.last_worker_error = Some(message);
-                    }
-                } else {
-                    self.handle_scan_failure(
-                        path.as_deref(),
-                        &message,
-                        self.generation_rebuild_active,
-                    );
+                self.handle_failed_scan_work(path.as_deref(), &message);
+            }
+            WorkerEvent::ScanPathGone { path, message } => {
+                // A path a deletion removed is gone because of it, not because the scan could
+                // not read it: nothing of it reaches the summary, the scan store, or the exit
+                // code. The first map is made to agree with the deletion instead (an overlay
+                // behind it, or a rebuild).
+                if !self.app.path_removed_by_a_deletion(&path) {
+                    self.handle_failed_scan_work(Some(&path), &message);
                 }
             }
             WorkerEvent::ScanFinished { cancelled } => {
@@ -1330,6 +1354,8 @@ where
                         self.app.record_deletion_notice(notice);
                     }
                 }
+                // However the execution ended, it removed nothing.
+                self.app.excused_execution_ended(false);
             }
             WorkerEvent::DeletionFinished { work_id, report } => {
                 crate::test_events::deletion_finished(
@@ -1377,6 +1403,10 @@ where
                         );
                     }
                     self.reconcile_deletion_report(report)?;
+                } else {
+                    // The report belongs to no executing item: whatever it removed is not reconciled, so an
+                    // excused failure falls back to the rebuild.
+                    self.app.excused_execution_ended(false);
                 }
             }
         }
@@ -1839,7 +1869,10 @@ impl BenchmarkScan {
                         "scanner benchmark completed with cancelled={cancelled}, expected {expected_cancelled}"
                     )));
                 }
-                Ok(WorkerEvent::ScanFailed { message, .. }) => {
+                Ok(
+                    WorkerEvent::ScanFailed { message, .. }
+                    | WorkerEvent::ScanPathGone { message, .. },
+                ) => {
                     return Err(AppError::Worker(format!(
                         "scanner benchmark failed: {message}"
                     )));
@@ -1965,6 +1998,49 @@ fn scan_headless_with_scan_store_storage(
         ScanStoreStorage::new(scan_store_storage, settings.scan_store_dir.as_deref())
             .map_err(|error| AppError::Config(error.to_string()))?;
     scan_headless_with_scan_store_session(settings, scan_store_session, None)
+}
+
+/// Notes a scanner task that failed in a headless scan: the scan store running out of room ends
+/// its map, once, and any other failure is an unreadable path.
+fn note_headless_scan_failure(
+    scan_store: &mut ScanStore,
+    scan_store_capacity_exhausted: &mut bool,
+    summary: &mut RunSummary,
+    root: &Path,
+    path: Option<&Path>,
+    message: &str,
+) -> Result<(), AppError> {
+    let capacity_exhausted = is_scan_store_capacity_failure(message);
+    let message = safe_display_text(message);
+    if capacity_exhausted {
+        if !*scan_store_capacity_exhausted {
+            *scan_store_capacity_exhausted = true;
+            scan_store
+                .discard_active()
+                .map_err(|error| AppError::Model(error.to_string()))?;
+            summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
+            summary.last_unscanned_path = path.map(safe_display_path_text);
+            summary.last_unscanned_reason = Some(message.clone());
+            summary.last_worker_error = Some(message);
+        }
+    } else {
+        scan_store.record_unrecorded_path();
+        if let Some(path) = path
+            .and_then(|path| path.strip_prefix(root).ok())
+            .and_then(|relative| RelativePath::from_path(relative).ok())
+        {
+            scan_store.record_unreadable_directory(path);
+        }
+        summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
+        summary.unreadable_entries = summary.unreadable_entries.saturating_add(1);
+        summary.last_unscanned_path = path.map(safe_display_path_text);
+        summary
+            .last_unreadable_path
+            .clone_from(&summary.last_unscanned_path);
+        summary.last_unscanned_reason = Some(message.clone());
+        summary.last_worker_error = Some(message);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
@@ -2121,40 +2197,24 @@ fn scan_headless_with_scan_store_session(
                         crate::model::UnscannedReason::IdentityStorageCapacity => {}
                     }
                 }
-                WorkerEvent::ScanFailed { path, message } => {
-                    let capacity_exhausted = is_scan_store_capacity_failure(&message);
-                    let message = safe_display_text(&message);
-                    if capacity_exhausted {
-                        if !scan_store_capacity_exhausted {
-                            scan_store_capacity_exhausted = true;
-                            scan_store
-                                .discard_active()
-                                .map_err(|error| AppError::Model(error.to_string()))?;
-                            summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
-                            summary.last_unscanned_path =
-                                path.as_deref().map(safe_display_path_text);
-                            summary.last_unscanned_reason = Some(message.clone());
-                            summary.last_worker_error = Some(message);
-                        }
-                    } else {
-                        scan_store.record_unrecorded_path();
-                        if let Some(path) = path
-                            .as_deref()
-                            .and_then(|path| path.strip_prefix(&settings.root).ok())
-                            .and_then(|relative| RelativePath::from_path(relative).ok())
-                        {
-                            scan_store.record_unreadable_directory(path);
-                        }
-                        summary.unscanned_entries = summary.unscanned_entries.saturating_add(1);
-                        summary.unreadable_entries = summary.unreadable_entries.saturating_add(1);
-                        summary.last_unscanned_path = path.as_deref().map(safe_display_path_text);
-                        summary
-                            .last_unreadable_path
-                            .clone_from(&summary.last_unscanned_path);
-                        summary.last_unscanned_reason = Some(message.clone());
-                        summary.last_worker_error = Some(message);
-                    }
-                }
+                WorkerEvent::ScanFailed { path, message } => note_headless_scan_failure(
+                    &mut scan_store,
+                    &mut scan_store_capacity_exhausted,
+                    &mut summary,
+                    &settings.root,
+                    path.as_deref(),
+                    &message,
+                )?,
+                // Nothing deletes while a headless scan runs, so a path that is gone is a
+                // failure like any other.
+                WorkerEvent::ScanPathGone { path, message } => note_headless_scan_failure(
+                    &mut scan_store,
+                    &mut scan_store_capacity_exhausted,
+                    &mut summary,
+                    &settings.root,
+                    Some(&path),
+                    &message,
+                )?,
                 WorkerEvent::ScanFinished { cancelled } => return Ok(cancelled),
                 WorkerEvent::DeletionPlanned { .. }
                 | WorkerEvent::DeletionExecutionRejected { .. }
@@ -2913,6 +2973,17 @@ mod tests {
         let target = app
             .request_deletion()
             .expect("rendered target should delete");
+        complete_queued_deletion_of(app, root, target)
+    }
+
+    /// Takes the deletion of `target` through the queue to the end of its execution: the item is
+    /// executing, the target is gone from the disk, and the report is in hand, not yet delivered.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    fn complete_queued_deletion_of(
+        app: &mut App<TestBackend>,
+        root: &std::path::Path,
+        target: crate::state::FileToDelete,
+    ) -> (crate::state::deletion_work::DeletionWorkId, DeletionReport) {
         let plan = crate::deletion::build_plan(root, target.clone(), false)
             .expect("target deletion plan should build");
         assert!(app.queue_deletion_confirmation(target, false, 1024, Duration::ZERO));
@@ -4324,6 +4395,317 @@ mod tests {
             .expect("an unrelated scan failure should be handled");
         assert_eq!(owner.summary.unreadable_entries, 1);
         assert_eq!(owner.summary.unscanned_entries, 1);
+    }
+
+    /// The identity of `path`, as the scan records it.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    fn identity_of(path: &Path) -> NativeIdentity {
+        let metadata = std::fs::symlink_metadata(path).expect("test path metadata should exist");
+        crate::native_path::identity_for(path, &metadata)
+            .expect("test path identity should be readable")
+            .expect("test path should not be a link")
+    }
+
+    /// An app whose first scan is still running over a root that holds a `vanishing` folder (empty
+    /// on the disk, so that removing it leaves no link behind on any system) and a `survivor`,
+    /// with the live view of the root on screen; and the deletion of `vanishing`, taken to the end
+    /// of its execution: the item is executing, the folder is gone, and the report has not been
+    /// delivered.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    fn app_deleting_a_folder_during_its_first_scan(
+        root: &Path,
+        root_identity: &NativeIdentity,
+    ) -> (
+        App<TestBackend>,
+        crate::state::deletion_work::DeletionWorkId,
+        DeletionReport,
+    ) {
+        let vanishing = root.join("vanishing");
+        std::fs::create_dir(&vanishing).expect("test folder should be created");
+        let survivor = root.join("survivor");
+        std::fs::write(&survivor, b"keep").expect("test survivor should be created");
+        let mut app = App::new_with_root_identity(
+            TestBackend::new(80, 24),
+            root.to_path_buf(),
+            root_identity.clone(),
+            false,
+            false,
+            crate::model::MIN_PROCESS_MIB,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        for path in [&vanishing, &survivor] {
+            let metadata = std::fs::symlink_metadata(path).expect("test path metadata");
+            app.append_scan_store_entry_for_test(&metadata, path, &identity_of(path));
+        }
+        assert!(app.refresh_board_from_scan());
+        app.process_scan_store_events();
+        let mut animation = AnimationScheduler::new(true, false, Duration::ZERO);
+        app.render_if_dirty(
+            &mut animation,
+            Duration::ZERO,
+            "test",
+            crate::theme::Theme::for_id(ThemeId::ExciseDark),
+            false,
+            false,
+            true,
+        )
+        .expect("the live view should render");
+        let target = app
+            .live_deletion_target_for_test("vanishing")
+            .expect("the folder on screen should be deletable while the scan runs");
+        let (work_id, report) = complete_queued_deletion_of(&mut app, root, target);
+        (app, work_id, report)
+    }
+
+    /// The run's summary says nothing was found unreadable, and nothing was left unscanned.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    fn assert_no_scan_failure_was_counted(summary: &RunSummary) {
+        assert_eq!(summary.unscanned_entries, 0);
+        assert_eq!(summary.unreadable_entries, 0);
+        assert_eq!(summary.last_unscanned_path, None);
+        assert_eq!(summary.last_unreadable_path, None);
+        assert_eq!(summary.last_unscanned_reason, None);
+        assert_eq!(summary.last_worker_error, None);
+    }
+
+    /// The first scan ends: its map lists no folder the scan could not list, and the overlay that
+    /// takes the folder a deletion removed out of it follows, with no scan again.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    fn finish_the_first_scan_without_a_failure(owner: &mut OwnerLoop<TestBackend>) {
+        owner.app.finalize_scan();
+        assert!(
+            !owner.app.scan_is_uncertain(&owner.summary),
+            "the first map must not show a folder the scan could not read"
+        );
+        owner.app.start_ui();
+        while owner.app.scan_store_busy() {
+            assert!(
+                owner.app.process_scan_store_events(),
+                "the store should answer each overlay"
+            );
+        }
+        assert_eq!(owner.app.listed_names_for_test(), ["survivor"]);
+        assert!(!owner.app.scan_is_uncertain(&owner.summary));
+        assert_eq!(
+            owner.app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+    }
+
+    /// A directory the first scan finds gone because a deletion removed it is not one it could
+    /// not read: nothing of it reaches the run's summary or the scan store, so the first map
+    /// lists no folder it could not list, and the run does not end in the code of an uncertain
+    /// scan.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    #[test]
+    fn a_directory_a_finished_deletion_removed_is_not_an_unreadable_one() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_identity = identity_of(root.path());
+        let (app, work_id, report) =
+            app_deleting_a_folder_during_its_first_scan(root.path(), &root_identity);
+        let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
+        owner
+            .handle_worker_event(WorkerEvent::DeletionFinished { work_id, report })
+            .expect("the deletion's end should be handled");
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanPathGone {
+                path: root.path().join("vanishing"),
+                message: "No such file or directory (os error 2)".to_string(),
+            })
+            .expect("a folder the deletion removed should be handled");
+
+        assert_no_scan_failure_was_counted(&owner.summary);
+        finish_the_first_scan_without_a_failure(&mut owner);
+    }
+
+    /// The scanner can reach a folder the executor has removed before the deletion's report
+    /// arrives, and the deletion is then still executing.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    #[test]
+    fn a_directory_an_executing_deletion_removed_is_not_an_unreadable_one() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_identity = identity_of(root.path());
+        let (app, work_id, report) =
+            app_deleting_a_folder_during_its_first_scan(root.path(), &root_identity);
+        let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanPathGone {
+                path: root.path().join("vanishing"),
+                message: "No such file or directory (os error 2)".to_string(),
+            })
+            .expect("a folder the deletion removed should be handled");
+        assert_no_scan_failure_was_counted(&owner.summary);
+
+        owner
+            .handle_worker_event(WorkerEvent::DeletionFinished { work_id, report })
+            .expect("the deletion's end should be handled");
+        assert_no_scan_failure_was_counted(&owner.summary);
+        finish_the_first_scan_without_a_failure(&mut owner);
+    }
+
+    /// What a deletion removed under a folder the scanner was listing fails to stat, entry by
+    /// entry: those are the deletion's doing as well.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    #[test]
+    fn an_entry_a_finished_deletion_removed_is_not_an_unreadable_one() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_identity = identity_of(root.path());
+        let (app, work_id, report) =
+            app_deleting_a_folder_during_its_first_scan(root.path(), &root_identity);
+        let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
+        owner
+            .handle_worker_event(WorkerEvent::DeletionFinished { work_id, report })
+            .expect("the deletion's end should be handled");
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanPathGone {
+                path: root.path().join("vanishing").join("inside"),
+                message: "No such file or directory (os error 2)".to_string(),
+            })
+            .expect("an entry the deletion removed should be handled");
+
+        assert_no_scan_failure_was_counted(&owner.summary);
+    }
+
+    /// A failure excused below the target of the executing deletion is owed a removal: when the
+    /// deletion's execution is rejected instead, the first map is rebuilt.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    #[test]
+    fn an_excused_failure_below_a_deletion_that_is_then_rejected_sends_the_map_back_to_a_scan() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_identity = identity_of(root.path());
+        let (app, work_id, _report) =
+            app_deleting_a_folder_during_its_first_scan(root.path(), &root_identity);
+        let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
+        owner
+            .handle_worker_event(WorkerEvent::ScanPathGone {
+                path: root.path().join("vanishing"),
+                message: "No such file or directory (os error 2)".to_string(),
+            })
+            .expect("a folder the deletion is removing should be handled");
+        assert_no_scan_failure_was_counted(&owner.summary);
+
+        owner
+            .handle_worker_event(WorkerEvent::DeletionExecutionRejected {
+                work_id,
+                error: crate::deletion::DeletionPlanError::Changed,
+            })
+            .expect("the rejection should be handled");
+        owner.app.finalize_scan();
+
+        assert!(
+            owner.app.scan_is_uncertain(&owner.summary),
+            "nothing was removed, so the map is rebuilt, not shown with the folder empty and complete"
+        );
+    }
+
+    /// While the executor holds a folder under a placeholder file, the scanner fails to open it
+    /// as a folder: it reports a replacement. Below a deletion's target, finished or executing,
+    /// that is the deletion's doing as well, and nothing of it is counted: not in the run's
+    /// summary, and not in the scan store as a path it could not record (the scanner sends these
+    /// events with an empty batch of runs, which the owner would record as that). The first map
+    /// is then the exact one, and the run does not end in the code of an uncertain scan. A batch
+    /// that carries runs is the scan's own and is admitted whatever the reason.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    #[test]
+    fn a_replacement_below_a_removed_target_is_not_an_unreadable_one() {
+        for finished in [true, false] {
+            let root = tempfile::tempdir().expect("test root should be created");
+            let root_identity = identity_of(root.path());
+            let (app, work_id, report) =
+                app_deleting_a_folder_during_its_first_scan(root.path(), &root_identity);
+            let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
+            let replaced = WorkerEvent::ScanUnscanned {
+                lease: None,
+                path: root.path().join("vanishing").join("inside"),
+                reason: crate::model::UnscannedReason::Replacement(
+                    "scanner directory task was replaced by a symbolic link or non-directory"
+                        .to_string(),
+                ),
+                input_runs: SealedBatch::empty(),
+            };
+            let mut report = Some(report);
+            if finished {
+                let report = report.take().expect("the report is delivered once");
+                owner
+                    .handle_worker_event(WorkerEvent::DeletionFinished { work_id, report })
+                    .expect("the deletion's end should be handled");
+            }
+
+            owner
+                .handle_worker_event(replaced)
+                .expect("a replacement the deletion made should be handled");
+            assert_no_scan_failure_was_counted(&owner.summary);
+
+            if let Some(report) = report {
+                // The scanner reached the folder while the deletion was still executing.
+                owner
+                    .handle_worker_event(WorkerEvent::DeletionFinished { work_id, report })
+                    .expect("the deletion's end should be handled");
+                assert_no_scan_failure_was_counted(&owner.summary);
+            }
+            finish_the_first_scan_without_a_failure(&mut owner);
+        }
+    }
+
+    /// The same events below no deletion's target are failures, as they always were.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    #[test]
+    fn a_replacement_elsewhere_still_counts_as_unreadable() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_identity = identity_of(root.path());
+        let (app, work_id, report) =
+            app_deleting_a_folder_during_its_first_scan(root.path(), &root_identity);
+        let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
+        owner
+            .handle_worker_event(WorkerEvent::DeletionFinished { work_id, report })
+            .expect("the deletion's end should be handled");
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanUnscanned {
+                lease: None,
+                path: root.path().join("survivor"),
+                reason: crate::model::UnscannedReason::Replacement("replaced".to_string()),
+                input_runs: SealedBatch::empty(),
+            })
+            .expect("a replacement should be handled");
+
+        assert_eq!(owner.summary.unreadable_entries, 1);
+        assert_eq!(owner.summary.unscanned_entries, 1);
+    }
+
+    /// A folder that is gone and that no deletion removed is a failure, as it always was.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+    #[test]
+    fn a_directory_that_vanished_elsewhere_still_counts_as_unreadable() {
+        let root = tempfile::tempdir().expect("test root should be created");
+        let root_identity = identity_of(root.path());
+        let (app, work_id, report) =
+            app_deleting_a_folder_during_its_first_scan(root.path(), &root_identity);
+        let mut owner = owner_for_completed_deletion(app, root.path(), root_identity);
+        owner
+            .handle_worker_event(WorkerEvent::DeletionFinished { work_id, report })
+            .expect("the deletion's end should be handled");
+
+        owner
+            .handle_worker_event(WorkerEvent::ScanPathGone {
+                path: root.path().join("survivor"),
+                message: "No such file or directory (os error 2)".to_string(),
+            })
+            .expect("a folder that vanished should be handled");
+
+        assert_eq!(owner.summary.unreadable_entries, 1);
+        assert_eq!(owner.summary.unscanned_entries, 1);
+        owner.app.finalize_scan();
+        assert!(
+            owner.app.scan_is_uncertain(&owner.summary),
+            "a folder the scan could not read leaves the scan uncertain"
+        );
     }
 
     #[test]

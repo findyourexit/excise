@@ -58,6 +58,16 @@ use crate::ui::palette::ColorCycle;
 const MIB: usize = 1024 * 1024;
 const MINIMUM_PLAN_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_DELETION_REPORTS: usize = 32;
+
+/// How many deletions that finish before the first map is shown are recorded, to be taken out of
+/// it by an overlay each, one after the other. Every overlay is a pass over the whole map on the
+/// store thread, and more than this many deletions during the one scan they wait for are rare,
+/// so the rest are better answered by the rebuild a removal falls back to than by a chain that
+/// keeps the store thread busy for as long. The list is also what the scan's failures are
+/// checked against, so it is what keeps that check, and the memory it holds, from growing with
+/// the number of deletions.
+const MAX_REMOVALS_BEFORE_FIRST_MAP: usize = 8;
+
 const SNAPSHOT_PAGE_ENTRIES: usize = 512;
 const MAX_SNAPSHOT_PAGE_HISTORY: usize = 32;
 
@@ -85,6 +95,58 @@ enum PendingPublication {
     Rebuild,
     /// A deletion's overlay: the map without `prefix`.
     Overlay { prefix: RelativePath },
+}
+
+/// The deletions that finished before the first map was shown. The scan went on through them, so
+/// the map it ends with mixes what the file system held before each deletion and after it. The
+/// map is made to agree with them once it is shown: by an overlay that takes out each of them,
+/// one after the other, or by a rebuild when one cannot be described.
+#[derive(Debug, Default)]
+struct RemovalsBeforeFirstMap {
+    /// The target of each deletion that removed something, in the order the deletions finished,
+    /// never more than [`MAX_REMOVALS_BEFORE_FIRST_MAP`]. Until the first map is shown the scan's
+    /// failures below one of them are the deletion's doing, not failures
+    /// ([`App::path_removed_by_a_deletion`]). Once it is, each is taken out of the map by
+    /// an overlay, oldest first, and leaves this list as its overlay is asked for.
+    prefixes: VecDeque<RelativePath>,
+    /// A removal that overlays cannot describe, or that did not fit the limit above, was made:
+    /// the map is rebuilt behind itself, which scans the real tree. The targets recorded then only
+    /// tell the scan's failures below them from real ones, until the map is shown.
+    rebuild: bool,
+    /// A failure below the target of the deletion that is executing was excused, on the strength of
+    /// a removal that is not yet known to have been made. Unless the deletion ends as a complete
+    /// removal the overlay can describe, the map shows what the scan found under that target and
+    /// nothing says it was removed, so the map is rebuilt
+    /// ([`App::excused_execution_ended`]).
+    excused_under_execution: bool,
+    /// How many of the first `prefixes` were recorded before the first map was shown. Their
+    /// overlays check the scan root's entries too, which a removal directly below the root would
+    /// otherwise skip, because the root has no record of its own to compare with: the scan was
+    /// still reading when the deletion ran, and a map that lists what the root does not hold is
+    /// scanned for again, not shown as exact. (The executor's own transient names are not such an
+    /// entry: it registers them as private files of the session, which the scan skips.)
+    recorded_before_map: usize,
+}
+
+impl RemovalsBeforeFirstMap {
+    fn is_empty(&self) -> bool {
+        self.prefixes.is_empty() && !self.rebuild
+    }
+
+    fn clear(&mut self) {
+        self.prefixes.clear();
+        self.rebuild = false;
+        self.excused_under_execution = false;
+        self.recorded_before_map = 0;
+    }
+}
+
+/// The target a deletion removed, as the map names it. `None` for the scan root, which no
+/// deletion removes.
+fn removed_prefix(report: &DeletionReport) -> Option<RelativePath> {
+    RelativePath::from_path(&report.root_relative_path)
+        .ok()
+        .filter(|path| !path.is_root())
 }
 
 /// A publication whose generation the owner has swapped in, or given up on, for the owner loop to
@@ -291,12 +353,10 @@ where
     /// A deletion removed entries, and the map on screen still lists them: until the rebuild or
     /// the overlay that replaces it lands, see [`App::take_landed_refresh`].
     refresh_owed: bool,
-    /// A deletion finished before the first map was published. The scan went on through it, so
-    /// the map it ends with mixes what the file system held before the deletion and after it:
-    /// once that map is shown, the map is rebuilt behind it, see
-    /// [`App::settle_removals_before_first_map`]. The refresh the deletion owes does not land
-    /// before then, see [`App::take_landed_refresh`].
-    removed_before_first_map: bool,
+    /// The deletions that finished before the first map was shown, which that map is owed: the
+    /// scan went on through them. The refresh they owe does not land before the map has been made
+    /// to agree with them, see [`App::take_landed_refresh`].
+    removals: RemovalsBeforeFirstMap,
     /// When the primary scan's publication has run long enough to show its progress.
     publication_progress_from: Option<Instant>,
     /// An announcement that waits for the reader to finish what they are deciding. A later one
@@ -484,7 +544,7 @@ where
             publications: VecDeque::new(),
             finished_publications: VecDeque::new(),
             refresh_owed: false,
-            removed_before_first_map: false,
+            removals: RemovalsBeforeFirstMap::default(),
             publication_progress_from: None,
             waiting_announcement: None,
             provisional_page_waiting: None,
@@ -902,12 +962,13 @@ where
             .any(|pending| matches!(pending, PendingPublication::Primary))
     }
 
-    /// Whether a deletion's map is still being built: until it arrives, the map on screen lists
-    /// what the deletion removed.
+    /// Whether a deletion's map is still being built, or is still to be asked for behind the one
+    /// under way: until it arrives, the map on screen lists what the deletion removed.
     fn overlay_publication_pending(&self) -> bool {
         self.publications
             .iter()
             .any(|pending| matches!(pending, PendingPublication::Overlay { .. }))
+            || self.removal_chain_pending()
     }
 
     /// Whether the primary scan's publication ended and the owner loop has not taken it yet.
@@ -1056,12 +1117,43 @@ where
         while self.take_finished_publication().is_some() {}
     }
 
+    /// The target of deleting the entry that the live view of the folder on screen lists under
+    /// `name`, made as the deletion of a selected entry makes it. It is not asked of the
+    /// selection: a folder of no size has no tile to select.
+    #[cfg(test)]
+    pub(crate) fn live_deletion_target_for_test(&self, name: &str) -> Option<FileToDelete> {
+        let node_id = self
+            .files_in_current_view(0)
+            .into_iter()
+            .find(|file| file.name == name)?
+            .node_id;
+        self.snapshot_page_cache
+            .as_ref()?
+            .current()
+            .deletion_target_from_preview(node_id, self.show_apparent_size)
+            .ok()
+    }
+
+    /// The names the folder on screen lists, in a stable order.
+    #[cfg(test)]
+    pub(crate) fn listed_names_for_test(&self) -> Vec<std::ffi::OsString> {
+        let mut names = self
+            .files_in_current_view(0)
+            .into_iter()
+            .map(|file| file.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     fn abandon_scan_store_generation(&mut self) {
         if let Err(error) = self.scan_store.discard_active() {
             self.scan_store_failure
                 .get_or_insert_with(|| error.to_string());
         }
         self.scan_store_available = false;
+        // No map is coming that a removal could be taken out of.
+        self.removals.clear();
     }
 
     fn abandon_scan_store_generation_with_failure(&mut self, failure: impl Into<String>) {
@@ -1157,10 +1249,13 @@ where
     }
 
     /// Whether the store thread still owes a publication, or one ended and the loop has not taken
-    /// it yet: the loop keeps polling while this holds.
+    /// it yet, or the map is owed an overlay still to be asked for after the one under way: the
+    /// loop keeps polling while this holds.
     #[must_use]
     pub(crate) fn scan_store_busy(&self) -> bool {
-        !self.publications.is_empty() || !self.finished_publications.is_empty()
+        !self.publications.is_empty()
+            || !self.finished_publications.is_empty()
+            || self.removal_chain_pending()
     }
 
     /// The next publication that ended, for the owner loop to finish its own part of.
@@ -1177,7 +1272,7 @@ where
             || self.generation_rebuild_required
             || self.generation_rebuild_active
             || self.scan_store_busy()
-            || self.removed_before_first_map
+            || !self.removals.is_empty()
         {
             return None;
         }
@@ -1229,7 +1324,7 @@ where
             self.publication_progress_from = Some(Instant::now() + PUBLICATION_PROGRESS_DELAY);
             return;
         }
-        // No first map is coming, so none needs a deletion rebuilt behind it.
+        // No first map is coming, so the removals recorded before it are dropped.
         self.settle_removals_before_first_map();
         let message = self.scan_results_unavailable_message();
         self.show_scan_results_unavailable(message);
@@ -1386,6 +1481,8 @@ where
             self.invalidate_snapshot_view_for_live_mutation();
         }
         self.render_and_update_board();
+        // Another removal may be owed an overlay: it derives from the map just installed.
+        self.start_next_removal_overlay();
     }
 
     /// Shows the map the store thread published, at the folder the reader was looking at, else at
@@ -1688,6 +1785,8 @@ where
         self.generation_rebuild_invalidated |= self.generation_rebuild_active;
         self.generation_rebuild_restart_suppressed = false;
         self.generation_rebuild_required = true;
+        // The scan the rebuild starts finds every removal already made.
+        self.removals.clear();
         self.cancel_pending_deletion_work_and_dismiss_confirmation();
         if !retains_published_snapshot {
             self.snapshot_filter = None;
@@ -1719,21 +1818,70 @@ where
             && !self.generation_rebuild_active
     }
 
-    /// The first map was published, or will not be. A deletion that finished before it owes the
-    /// map a rebuild, which starts behind the map the reader now has: the scan went on through
-    /// the deletion, so that map mixes what the file system held before it and after it.
+    /// Whether a removal the report tells of can be described to the store thread, which builds
+    /// the map without it from the map it derives from: the target was removed whole, and no file
+    /// of it may have other links (the map has its files by path, and does not say where those
+    /// are).
+    fn removal_can_be_described(&self, report: &DeletionReport) -> bool {
+        self.scan_store_available
+            && report.target_was_removed()
+            && !report.deleted_files_may_have_other_links()
+    }
+
+    /// A deletion finished before the first map was shown. The scan went on through it, so the
+    /// map it ends with mixes what the file system held before the deletion and after it, and
+    /// the reader keeps the live view and the scan keeps its work meanwhile. The deletion's
+    /// target is recorded, to be taken out of that map by an overlay once it is shown
+    /// ([`Self::settle_removals_before_first_map`]) and, until then, to tell the scan's failures
+    /// below it from real ones ([`Self::path_removed_by_a_deletion`]). A removal the overlay
+    /// cannot describe (a partial one, one that may have left other links, one of the scan root)
+    /// owes the map a rebuild instead, and so does one that does not fit the limit of what is
+    /// recorded; the rebuild scans the real tree, whatever else was recorded.
+    fn record_removal_before_first_map(&mut self, report: &DeletionReport) {
+        let described = self.removal_can_be_described(report);
+        match removed_prefix(report) {
+            Some(prefix) if self.removals.prefixes.len() < MAX_REMOVALS_BEFORE_FIRST_MAP => {
+                self.removals.rebuild |= !described;
+                self.removals.prefixes.push_back(prefix);
+                self.removals.recorded_before_map += 1;
+            }
+            _ => self.removals.rebuild = true,
+        }
+    }
+
+    /// The first map was published, or will not be. If it will not (the store was lost, or the
+    /// map could not be published), nothing is owed it. If a removal before it could not be
+    /// described, it is rebuilt behind itself, which scans the real tree. Otherwise the removals
+    /// recorded are taken out of it by overlays, one after the other, which start once the owner
+    /// has finished with the scan ([`Self::start_ui`]); the store thread is owed an overlay from
+    /// now to the last one's arrival ([`Self::removal_chain_pending`]).
     fn settle_removals_before_first_map(&mut self) {
-        if std::mem::take(&mut self.removed_before_first_map) && self.scan_store_available {
+        if self.removals.is_empty() {
+            return;
+        }
+        if !self.scan_store_available || self.scan_store.published().is_none() {
+            self.removals.clear();
+        } else if self.removals.rebuild {
             self.invalidate_snapshot_view_for_live_mutation();
         }
+    }
+
+    /// Whether the installed map is still owed an overlay for a removal that finished before it
+    /// was shown. The overlays are asked for one at a time, each when the one before it has
+    /// arrived, and nothing may start between two of them: no deletion, no rebuild, and no refresh
+    /// is reported as landed.
+    fn removal_chain_pending(&self) -> bool {
+        self.scan_store_available
+            && !self.removals.prefixes.is_empty()
+            && self.scan_store.published().is_some()
     }
 
     /// Applies a completed mutation to the canonical generation boundary.
     ///
     /// A deletion that finishes before the first map is published leaves the scan alone: the
-    /// reader keeps the live view and the work the scan has done, and the map it ends with is
-    /// rebuilt behind itself ([`Self::settle_removals_before_first_map`]). No map exists yet for
-    /// an overlay to derive from, and the scan went on through the deletion.
+    /// reader keeps the live view and the work the scan has done, and the removal is recorded for
+    /// the map the scan ends with ([`Self::record_removal_before_first_map`]). No map exists yet
+    /// for an overlay to derive from, and the scan went on through the deletion.
     ///
     /// After that, a complete removal of its exact target can safely publish an overlay that
     /// drops that prefix: the store thread builds it from the map the reader has installed, with
@@ -1749,31 +1897,50 @@ where
             return;
         }
         if self.first_map_is_owed() {
-            self.removed_before_first_map = true;
+            self.record_removal_before_first_map(report);
             return;
         }
-        if !self.scan_store_available
-            || !report.target_was_removed()
-            || report.deleted_files_may_have_other_links()
-        {
-            self.invalidate_snapshot_view_for_live_mutation();
-            return;
-        }
-        let Some(prefix) = RelativePath::from_path(&report.root_relative_path)
-            .ok()
-            .filter(|path| !path.is_root())
+        let Some(prefix) = removed_prefix(report).filter(|_| self.removal_can_be_described(report))
         else {
             self.invalidate_snapshot_view_for_live_mutation();
             return;
         };
         // An overlay derives from the installed map, and only from it: while no map is installed
-        // (a rebuild stands in for the first one), or another publication is still owed (the
-        // installed map is then about to be replaced, and an overlay of it would replace its
-        // successor with a map older than that one), the deletion invalidates the map.
-        if self.scan_store.published().is_none() || !self.publications.is_empty() {
+        // (a rebuild stands in for the first one), or the store thread owes a publication that is
+        // not an overlay's (the installed map is then about to be replaced, and an overlay of it
+        // would replace its successor with a map older than that one), the deletion invalidates
+        // the map. An overlay owed is no reason: the overlays are asked for one after the other,
+        // each when the one before it has arrived, and this one waits its turn.
+        if self.scan_store.published().is_none()
+            || self
+                .publications
+                .iter()
+                .any(|pending| !matches!(pending, PendingPublication::Overlay { .. }))
+            || self.removals.prefixes.len() >= MAX_REMOVALS_BEFORE_FIRST_MAP
+        {
             self.invalidate_snapshot_view_for_live_mutation();
             return;
         }
+        self.removals.prefixes.push_back(prefix);
+        self.start_next_removal_overlay();
+    }
+
+    /// Asks the store thread for the map without the removal that finished first of those the
+    /// installed map is still owed, unless it owes a publication already: each overlay derives
+    /// from the map the one before it installed, so the next is asked for when that one has
+    /// arrived ([`Self::complete_overlay_publication`]). A removal whose overlay cannot be asked
+    /// for sends the map back to a scan, and with it every removal still owed, which that scan
+    /// finds already made.
+    fn start_next_removal_overlay(&mut self) {
+        if !self.scan_store_available
+            || !self.publications.is_empty()
+            || self.scan_store.published().is_none()
+        {
+            return;
+        }
+        let Some(prefix) = self.removals.prefixes.pop_front() else {
+            return;
+        };
         let Ok(next_generation) = self.scan_store.next_generation() else {
             self.invalidate_snapshot_view_for_live_mutation();
             return;
@@ -1782,9 +1949,14 @@ where
             path: self.scan_root.clone(),
             identity: self.root_identity.clone(),
         };
+        // The removals still owed are already gone from the file system: the overlay checks the
+        // folder that held this one against the map less them (at most one fewer than the limit).
+        let removed_later = self.removals.prefixes.iter().cloned().collect();
+        let verify_root = self.removals.recorded_before_map > 0;
+        self.removals.recorded_before_map = self.removals.recorded_before_map.saturating_sub(1);
         if self
             .scan_store
-            .begin_overlay(next_generation, &prefix, root)
+            .begin_overlay(next_generation, &prefix, removed_later, verify_root, root)
             .is_err()
         {
             self.invalidate_snapshot_view_for_live_mutation();
@@ -1907,6 +2079,10 @@ where
                 _ => {}
             }
         }
+        // Only now may the removals the first map is owed be taken out of it: an overlay moves the
+        // session coordinator to a newer generation, which would invalidate the reduction lease
+        // that the owner holds until the scan is over for the reader.
+        self.start_next_removal_overlay();
     }
 
     /// A scan the reader watched fill in has ended and its map is on screen. While it filled in,
@@ -1950,7 +2126,60 @@ where
         self.scan_store.record_unreadable_directory(relative);
     }
 
+    /// Whether a directory the first scan found gone is gone because a deletion removed it, and
+    /// so is no failure: it lies below the target of a deletion that has finished (which waits
+    /// to be taken out of the first map), or of the one that is executing. The scanner can reach
+    /// what the executor has removed before the deletion's report arrives, so the executing
+    /// deletion counts from the moment its work is handed to the executor. A deletion that
+    /// ended without removing anything leaves nothing behind: a failure below its target is a
+    /// real one. Once the first map is in, the scan is over and no failure is left to tell apart.
+    #[must_use]
+    pub(crate) fn path_removed_by_a_deletion(&mut self, path: &Path) -> bool {
+        if !self.first_map_is_owed() {
+            return false;
+        }
+        let Some(relative) = path
+            .strip_prefix(&self.scan_root)
+            .ok()
+            .and_then(|relative| RelativePath::from_path(relative).ok())
+        else {
+            return false;
+        };
+        if self
+            .removals
+            .prefixes
+            .iter()
+            .any(|prefix| relative.starts_with(prefix))
+        {
+            return true;
+        }
+        if self.deletion_work.executing_target_contains(&relative) {
+            // Only the end of the deletion says whether it removed what the scan failed to find.
+            self.removals.excused_under_execution = true;
+            return true;
+        }
+        false
+    }
+
+    /// The execution of a deletion ended, in whatever way: with a report, rejected, cancelled, or
+    /// its report dropped. `described` says it ended as a complete removal that the overlay can
+    /// describe, which its report records. If it did not, a failure excused below its target
+    /// leaves the map showing that folder as the scan found it (empty and complete) with nothing
+    /// to correct it: the map is rebuilt, which scans the real tree.
+    pub(crate) fn excused_execution_ended(&mut self, described: bool) {
+        if !std::mem::take(&mut self.removals.excused_under_execution) || described {
+            return;
+        }
+        if self.first_map_is_owed() {
+            self.removals.rebuild = true;
+        } else if self.scan_store_available && self.scan_store.published().is_some() {
+            self.invalidate_snapshot_view_for_live_mutation();
+        }
+    }
+
     pub(crate) fn cancel_primary_scan(&mut self) -> Result<(), AppError> {
+        // No first map will exist, so none is owed what the deletions before it removed.
+        self.removals.clear();
         self.scan_store
             .cancel_active()
             .map_err(|error| AppError::Model(error.to_string()))
@@ -2807,7 +3036,10 @@ where
         // The map on screen lists what the deletion removed until the rebuild or the overlay that
         // reconciles it lands (see `Self::take_landed_refresh`).
         self.refresh_owed |= deleted;
+        let described =
+            deleted && removed_prefix(&report).is_some() && self.removal_can_be_described(&report);
         self.reconcile_generation_after_deletion(&report);
+        self.excused_execution_ended(described);
         self.ui_effects.record_deletion_result(&report);
         let report = Arc::new(report);
         // The history keeps room for every deletion allowed to start (see `request_deletion`),
@@ -3877,15 +4109,41 @@ mod tests {
         );
     }
 
-    /// An app whose first scan is still running, with the live view of its folder on screen, and
-    /// the report of deleting `target` from disk completely, the way the executor does.
+    /// An app whose first scan is still running, with the live view of its folder on screen: a
+    /// `survivor`, and a target for each of `names`, as `make_a_target` makes them (a test about
+    /// the map that follows a removal that left no link behind uses [`make_a_removable_target`]).
     #[cfg(any(unix, windows))]
-    fn app_scanning_with_a_target_removal_report()
-    -> (tempfile::TempDir, App<TestBackend>, DeletionReport) {
+    fn app_scanning_listing(
+        names: &[&str],
+        make_a_target: fn(&Path),
+    ) -> (tempfile::TempDir, App<TestBackend>) {
+        app_scanning_listing_in(None, names, make_a_target)
+    }
+
+    /// As [`app_scanning_listing`], with everything in a `holder` folder of the root, which is
+    /// the folder on screen. The overlay of a removal checks the folder that held the removed
+    /// entry against the map, unless that folder is the scan root.
+    #[cfg(any(unix, windows))]
+    fn app_scanning_inside_a_folder(
+        names: &[&str],
+        make_a_target: fn(&Path),
+    ) -> (tempfile::TempDir, App<TestBackend>) {
+        app_scanning_listing_in(Some("holder"), names, make_a_target)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn app_scanning_listing_in(
+        holder: Option<&str>,
+        names: &[&str],
+        make_a_target: fn(&Path),
+    ) -> (tempfile::TempDir, App<TestBackend>) {
         let root = tempfile::tempdir().expect("app root should exist");
-        let target_path = root.path().join("target");
-        let survivor_path = root.path().join("survivor");
-        std::fs::write(&target_path, b"target").expect("target fixture should exist");
+        let folder =
+            holder.map_or_else(|| root.path().to_path_buf(), |name| root.path().join(name));
+        if holder.is_some() {
+            std::fs::create_dir(&folder).expect("holder fixture should exist");
+        }
+        let survivor_path = folder.join("survivor");
         std::fs::write(&survivor_path, b"survivor").expect("survivor fixture should exist");
         let mut app = App::new(
             TestBackend::new(160, 48),
@@ -3900,31 +4158,159 @@ mod tests {
         .expect("app should initialize");
         app.board
             .change_area(ratatui::layout::Rect::new(0, 0, 160, 48));
-        add_fixture_entry(&mut app, &target_path);
+        if holder.is_some() {
+            add_fixture_entry(&mut app, &folder);
+        }
+        for name in names {
+            let path = folder.join(name);
+            make_a_target(&path);
+            add_fixture_entry(&mut app, &path);
+        }
         add_fixture_entry(&mut app, &survivor_path);
         refresh_live_page(&mut app, "the live view should refresh");
-        let target_id = node_id_of(&app, "target");
-        assert!(app.board.select_node(target_id));
+        if let Some(name) = holder {
+            assert!(app.navigate(PendingNavigation {
+                folder: RelativePath::from_path(Path::new(name)).expect("a canonical path"),
+                kind: NavigationKind::Enter { pivot: None },
+            }));
+            app.process_scan_store_events();
+        }
+        (root, app)
+    }
+
+    /// Deletes the entry `name` of the live view from disk, completely, the way the executor
+    /// does, and returns the report that ends the deletion. `after_planning` is what happens to
+    /// the file system between the plan the reader confirmed and the execution of it.
+    #[cfg(any(unix, windows))]
+    fn remove_the_live_entry(
+        app: &mut App<TestBackend>,
+        name: &str,
+        after_planning: impl FnOnce(),
+    ) -> DeletionReport {
+        let root = app.scan_root.clone();
         let target = app
-            .request_deletion()
+            .live_deletion_target_for_test(name)
             .expect("a concrete live entry is deletable while the scan runs");
-        let plan = crate::deletion::build_plan(root.path(), target, false)
-            .expect("target plan should build");
-        let report = crate::deletion::execute_plan(
-            root.path(),
+        let plan =
+            crate::deletion::build_plan(&root, target, false).expect("target plan should build");
+        after_planning();
+        crate::deletion::execute_plan(
+            &root,
             plan,
             &std::sync::atomic::AtomicBool::new(false),
             &std::sync::atomic::AtomicBool::new(false),
-        );
+        )
+    }
+
+    /// The report of a removal of a target that [`make_a_removable_target`] made, which is one
+    /// the owner may answer with a map updated in place (see `app_and_target_removal_report` for
+    /// what the executor can prove of the links of a file it removed, and where).
+    #[cfg(any(unix, windows))]
+    fn removal_that_left_no_link(report: DeletionReport) -> DeletionReport {
         assert!(report.target_was_removed());
+        #[cfg(unix)]
+        assert!(
+            !report.deleted_files_may_have_other_links(),
+            "an entry removed whole that left no link behind"
+        );
+        #[cfg(windows)]
+        let report = report.assuming_no_link_survived();
+        report
+    }
+
+    /// An app whose first scan is still running, with the live view of its folder on screen, and
+    /// the report of deleting `target` from disk completely, the way the executor does.
+    #[cfg(any(unix, windows))]
+    fn app_scanning_with_a_target_removal_report()
+    -> (tempfile::TempDir, App<TestBackend>, DeletionReport) {
+        let (root, mut app) = app_scanning_listing(&["target"], make_a_removable_target);
+        let report = removal_that_left_no_link(remove_the_live_entry(&mut app, "target", || {}));
         (root, app, report)
     }
 
+    /// An app whose first scan is still running over `levels` nested folders, the root the first:
+    /// each holds a removable `target{level}`, and the folder of the next level, `level{next}`.
+    /// The reports of deleting every target from disk, from the root down, in the order they
+    /// were made; the live view is left in the deepest folder. No two targets share a folder.
+    #[cfg(any(unix, windows))]
+    fn app_scanning_levels_with_a_removal_report_each(
+        levels: usize,
+    ) -> (tempfile::TempDir, App<TestBackend>, Vec<DeletionReport>) {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let mut app = App::new(
+            TestBackend::new(160, 48),
+            root.path().to_path_buf(),
+            false,
+            false,
+            128,
+            KeyPreset::Vim,
+            None,
+            false,
+        )
+        .expect("app should initialize");
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 160, 48));
+        let mut folder = root.path().to_path_buf();
+        for level in 0..levels {
+            let target = folder.join(format!("target{level}"));
+            make_a_removable_target(&target);
+            add_fixture_entry(&mut app, &target);
+            if level + 1 < levels {
+                folder = folder.join(format!("level{}", level + 1));
+                std::fs::create_dir(&folder).expect("level folder should exist");
+                add_fixture_entry(&mut app, &folder);
+            }
+        }
+        refresh_live_page(&mut app, "the live view should refresh");
+        let mut reports = Vec::new();
+        let mut relative = PathBuf::new();
+        for level in 0..levels {
+            reports.push(removal_that_left_no_link(remove_the_live_entry(
+                &mut app,
+                &format!("target{level}"),
+                || {},
+            )));
+            if level + 1 < levels {
+                relative.push(format!("level{}", level + 1));
+                assert!(app.navigate(PendingNavigation {
+                    folder: RelativePath::from_path(&relative).expect("a canonical path"),
+                    kind: NavigationKind::Enter { pivot: None },
+                }));
+                app.process_scan_store_events();
+            }
+        }
+        (root, app, reports)
+    }
+
+    /// Applies the store thread's next answer to an overlay, and no other. The owner loop applies
+    /// every answer that is waiting, so a test that is about what stands between two overlays
+    /// takes them one at a time.
+    #[cfg(any(unix, windows))]
+    fn apply_the_next_store_answer(app: &mut App<TestBackend>) {
+        let Some(StoreEvent::Overlaid(result)) = app.scan_store.poll() else {
+            panic!("the store thread should have answered an overlay");
+        };
+        app.apply_publication_result(result.map_err(|error| error.to_string()));
+    }
+
+    /// Whether the map the reader has lists `relative`, however deep.
+    #[cfg(any(unix, windows))]
+    fn map_lists(app: &App<TestBackend>, relative: &str) -> bool {
+        let relative = RelativePath::from_path(Path::new(relative)).expect("a canonical path");
+        app.scan_store
+            .published()
+            .expect("a map should be installed")
+            .page_entry(&relative)
+            .expect("the lookup should succeed")
+            .is_some()
+    }
+
     /// A deletion that finishes while the first scan runs leaves the scan alone: the reader keeps
-    /// the map as it fills in, and the scan keeps what it found and goes on finding. The map the
-    /// scan ends with mixes what the file system held before the deletion and after it, so it is
-    /// rebuilt behind itself once it is shown. The reader is never left with an empty map to
-    /// navigate while the scan runs.
+    /// the map as it fills in, and the scan keeps what it found and goes on finding. The first
+    /// map lists what the scan found, the removed entry included, because the scan went on
+    /// through the deletion; an overlay that takes the entry out is built behind it. The reader
+    /// is never left with an empty map to navigate while the scan runs, and the scan is not run
+    /// again.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_deletion_during_the_first_scan_leaves_the_live_map_and_the_scan_alone() {
@@ -3954,18 +4340,221 @@ mod tests {
             "nothing is rebuilt, and nothing is locked, while the first scan runs"
         );
 
-        // The first map arrives, and the rebuild it owes starts behind it.
+        // The first map arrives, and the overlay that takes the entry out is built behind it.
         app.finalize_scan();
-        let names = listed_names(&app);
-        for kept in ["survivor", "late"] {
-            assert!(
-                names.contains(&std::ffi::OsString::from(kept)),
-                "the first map must list {kept}: {names:?}"
-            );
+        app.start_ui();
+        assert_eq!(listed_names(&app), ["late", "survivor", "target"]);
+        assert!(
+            app.scan_store_busy() && !app.generation_rebuild_required,
+            "the map without the target is being built, not scanned for"
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "the map on screen still lists the target"
+        );
+
+        assert!(app.process_scan_store_events());
+        assert_eq!(listed_names(&app), ["late", "survivor"]);
+        assert!(!app.generation_rebuild_required);
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(1))
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "a landed refresh is reported once"
+        );
+    }
+
+    /// A deletion that finishes while the first map is being published is taken out of it by an
+    /// overlay as well: the scan went on through it, and the map was not published yet.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_deletion_that_finishes_as_the_first_map_is_published_is_taken_out_of_it_by_an_overlay() {
+        let (_root, mut app, removal) = app_scanning_with_a_target_removal_report();
+
+        app.begin_primary_publication();
+        assert!(app.complete_deletion(removal));
+        app.process_scan_store_events();
+        while app.take_finished_publication().is_some() {}
+        app.start_ui();
+
+        assert!(app.scan_store.published().is_some());
+        assert!(
+            !app.generation_rebuild_required,
+            "the map that was being published is made to agree with the deletion, not scanned again"
+        );
+        assert!(app.process_scan_store_events());
+        assert_eq!(listed_names(&app), ["survivor"]);
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+    }
+
+    /// Each overlay derives from the map the one before it installed, so the second is asked for
+    /// only when the first has arrived, and nothing may start between them: the map on screen
+    /// still lists what the second removed, the next deletion waits for the last map, and the
+    /// refresh lands once, behind the last overlay.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn two_deletions_during_the_first_scan_are_taken_out_of_the_first_map_one_overlay_after_the_other()
+     {
+        let (_root, mut app, mut reports) = app_scanning_levels_with_a_removal_report_each(2);
+        let second = reports.pop().expect("the second removal");
+        let first = reports.pop().expect("the first removal");
+        assert!(app.complete_deletion(first));
+        assert!(app.complete_deletion(second));
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "the first map is still to come"
+        );
+
+        app.finalize_scan();
+        assert!(
+            app.scan_store_busy(),
+            "the first map is installed and its overlays are owed: nothing is idle"
+        );
+        app.start_ui();
+        assert!(app.scan_store_busy());
+        assert!(map_lists(&app, "target0") && map_lists(&app, "level1/target1"));
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial()),
+            "the first map lists what the scan found"
+        );
+
+        apply_the_next_store_answer(&mut app);
+        assert!(
+            !map_lists(&app, "target0") && map_lists(&app, "level1/target1"),
+            "the first overlay takes out the first removal and only that"
+        );
+        assert!(
+            app.scan_store_busy() && app.deletion_waits_for_store(),
+            "the second overlay is owed: nothing may start between the two"
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "the last map is still to come"
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(1))
+        );
+
+        apply_the_next_store_answer(&mut app);
+        assert!(
+            !map_lists(&app, "target0") && !map_lists(&app, "level1/target1"),
+            "the second overlay derives from the first's map, so neither entry is back"
+        );
+        assert!(!app.scan_store_busy() && !app.generation_rebuild_required);
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(2))
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(app.take_landed_refresh(), None);
+    }
+
+    /// A deletion that began during the first scan can finish after the first map is shown, with
+    /// the overlay of an earlier one under way: its overlay waits for that one's map, as the
+    /// second of two removals does, and the map is not scanned again.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_deletion_that_finishes_behind_the_first_map_waits_for_the_overlays_before_it() {
+        let (_root, mut app, mut reports) = app_scanning_levels_with_a_removal_report_each(2);
+        let second = reports.pop().expect("the second removal");
+        let first = reports.pop().expect("the first removal");
+        assert!(app.complete_deletion(first));
+        app.finalize_scan();
+        app.start_ui();
+        assert!(app.scan_store_busy() && map_lists(&app, "target0"));
+
+        assert!(app.complete_deletion(second));
+
+        assert!(
+            !app.generation_rebuild_required,
+            "the second removal is described behind the first, not scanned for"
+        );
+        while app.scan_store_busy() {
+            assert!(app.process_scan_store_events());
         }
+        assert!(!map_lists(&app, "target0") && !map_lists(&app, "level1/target1"));
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(2))
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(app.take_landed_refresh(), None);
+    }
+
+    /// When the first map cannot be published there is no map for a removal to be taken out of,
+    /// and nothing is started for it: no overlay, no rebuild. The refresh it owed ends as a
+    /// failed one.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_removal_during_the_first_scan_is_dropped_when_the_first_map_cannot_be_published() {
+        let (_root, mut app, removal) = app_scanning_with_a_target_removal_report();
+        assert!(app.complete_deletion(removal));
+        app.scan_store_stopped("the scan store thread stopped");
+
+        app.begin_primary_publication();
+        while app.take_finished_publication().is_some() {}
+        app.start_ui();
+
+        assert!(
+            !app.generation_rebuild_required && !app.scan_store_busy(),
+            "no map exists to be rebuilt behind or taken the removal out of"
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Failed)
+        );
+    }
+
+    /// A removal the first map cannot be updated for is followed by a rebuild, as one after the
+    /// map is shown is: a file may have other links the map cannot say where they are.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_gained_a_link_before_its_removal_during_the_first_scan_is_scanned_again() {
+        let elsewhere = tempfile::tempdir().expect("a folder outside the scan should exist");
+        let (root, mut app) = app_scanning_listing(&["target"], |path| {
+            std::fs::write(path, b"target").expect("target fixture should exist");
+        });
+        let report = remove_the_live_entry(&mut app, "target", || {
+            std::fs::hard_link(
+                root.path().join("target"),
+                elsewhere.path().join("another-name-for-target"),
+            )
+            .expect("the second link should be created");
+        });
+        assert!(report.target_was_removed());
+
+        assert!(app.complete_deletion(report));
+        app.finalize_scan();
+        app.start_ui();
+
         assert!(
             app.generation_rebuild_required,
-            "the map the scan ended with mixes before and after the deletion"
+            "the file had a second link when it was removed, so the map cannot be updated in place"
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial())
         );
         assert_eq!(app.take_landed_refresh(), None, "the rebuild is owed");
         assert!(
@@ -3979,24 +4568,384 @@ mod tests {
         );
     }
 
-    /// A deletion that finishes while the first map is being published is rebuilt behind it as
-    /// well: the scan went on through it, and the map was not published yet.
+    /// So is a deletion that removed only some of what it set out to.
     #[cfg(any(unix, windows))]
     #[test]
-    fn a_deletion_that_finishes_as_the_first_map_is_published_is_rebuilt_behind_it() {
-        let (_root, mut app, removal) = app_scanning_with_a_target_removal_report();
+    fn a_partial_deletion_during_the_first_scan_is_scanned_again() {
+        let (root, mut app) = app_scanning_listing(&["target"], |path| {
+            std::fs::create_dir(path).expect("target folder should exist");
+            std::fs::write(path.join("deleted"), b"delete").expect("fixture should exist");
+            std::fs::write(path.join("changed"), b"old").expect("fixture should exist");
+        });
+        let changed = root.path().join("target").join("changed");
+        let report = remove_the_live_entry(&mut app, "target", || {
+            std::fs::write(&changed, b"changed-after-confirmation")
+                .expect("the fixture should change after confirmation");
+        });
+        assert!(report.deleted_entries() > 0 && !report.target_was_removed());
 
-        app.begin_primary_publication();
+        assert!(app.complete_deletion(report));
+        app.finalize_scan();
+        app.start_ui();
+
+        assert!(app.generation_rebuild_required);
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial())
+        );
+        assert_eq!(app.take_landed_refresh(), None, "the rebuild is owed");
+    }
+
+    /// The map is checked against the folder that held the removed entry (unless the scan root
+    /// held it), and an overlay that finds the folder holding something else than the map lists
+    /// is not published: the folder changed after the scan listed it, so what the map says of it
+    /// is not what the overlay would.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_folder_that_changed_beside_the_removed_entry_during_the_first_scan_is_scanned_again() {
+        let (root, mut app) = app_scanning_inside_a_folder(&["target"], make_a_removable_target);
+        let removal = removal_that_left_no_link(remove_the_live_entry(&mut app, "target", || {}));
         assert!(app.complete_deletion(removal));
-        app.process_scan_store_events();
-        while app.take_finished_publication().is_some() {}
+        std::fs::write(root.path().join("holder").join("intruder"), b"new")
+            .expect("intruder should be created");
 
-        assert!(app.scan_store.published().is_some());
+        app.finalize_scan();
+        app.start_ui();
+        while app.scan_store_busy() {
+            assert!(app.process_scan_store_events());
+        }
+
         assert!(
             app.generation_rebuild_required,
-            "the map that was being published did not know of the deletion"
+            "the folder holds an entry the map does not list, so the overlay cannot say what it is"
         );
-        assert!(listed_names(&app).contains(&std::ffi::OsString::from("survivor")));
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial()),
+            "the first map stays until the scan that follows"
+        );
+        assert_eq!(app.take_landed_refresh(), None, "the rebuild is owed");
+    }
+
+    /// Each overlay checks the folder that held its entry against the map less that entry and
+    /// less the removals still owed an overlay, which are already gone from the folder: several
+    /// entries removed from one folder are described one after the other, not scanned for.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn two_deletions_from_one_folder_during_the_first_scan_are_taken_out_one_overlay_after_the_other()
+     {
+        let (_root, mut app) =
+            app_scanning_inside_a_folder(&["first", "second"], make_a_removable_target);
+        let first = removal_that_left_no_link(remove_the_live_entry(&mut app, "first", || {}));
+        let second = removal_that_left_no_link(remove_the_live_entry(&mut app, "second", || {}));
+        assert!(app.complete_deletion(first));
+        assert!(app.complete_deletion(second));
+
+        app.finalize_scan();
+        app.start_ui();
+        while app.scan_store_busy() {
+            assert!(app.process_scan_store_events());
+        }
+
+        assert!(
+            !app.generation_rebuild_required,
+            "both entries are described, one overlay each"
+        );
+        assert!(!map_lists(&app, "holder/first") && !map_lists(&app, "holder/second"));
+        assert!(map_lists(&app, "holder/survivor"));
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::from_value(2))
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(app.take_landed_refresh(), None);
+    }
+
+    /// A removal that cannot be described still sends the map back to a scan when it is one of
+    /// several from the folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_another_link_among_removals_from_one_folder_is_scanned_again() {
+        let elsewhere = tempfile::tempdir().expect("a folder outside the scan should exist");
+        let (root, mut app) = app_scanning_inside_a_folder(&["first", "second"], |path| {
+            std::fs::write(path, b"target").expect("target fixture should exist");
+        });
+        let first = remove_the_live_entry(&mut app, "first", || {
+            std::fs::hard_link(
+                root.path().join("holder").join("first"),
+                elsewhere.path().join("another-name"),
+            )
+            .expect("the second link should be created");
+        });
+        let second = remove_the_live_entry(&mut app, "second", || {});
+        assert!(app.complete_deletion(first));
+        assert!(app.complete_deletion(second));
+
+        app.finalize_scan();
+        app.start_ui();
+        while app.scan_store_busy() {
+            assert!(app.process_scan_store_events());
+        }
+
+        assert!(app.generation_rebuild_required);
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial())
+        );
+    }
+
+    /// The deletion that is executing, handed to the executor, and its plan.
+    #[cfg(any(unix, windows))]
+    fn start_executing(
+        app: &mut App<TestBackend>,
+        root: &Path,
+        name: &str,
+    ) -> (DeletionWorkId, Box<DeletionPlan>) {
+        let target = app
+            .live_deletion_target_for_test(name)
+            .expect("a concrete live entry is deletable while the scan runs");
+        assert!(app.queue_deletion_confirmation(target, true, 1 << 20, Duration::ZERO));
+        let Some(DeletionWorkCommand::Plan {
+            work_id, target, ..
+        }) = app.next_deletion_planning_work()
+        else {
+            panic!("the deletion should be planned");
+        };
+        let plan = crate::deletion::build_plan(root, *target, true).expect("plan should build");
+        assert!(app.deletion_plan_ready(work_id, Box::new(plan)));
+        let Some(DeletionWorkCommand::Execute { plan, .. }) = app.next_deletion_execution_work()
+        else {
+            panic!("the deletion should be handed to the executor");
+        };
+        (work_id, plan)
+    }
+
+    /// A failure excused below the target of a deletion that then restores what it was removing
+    /// (the entry changed, so nothing was removed) leaves the map showing the folder the scan
+    /// found, empty and complete, with nothing to correct it: the map is rebuilt.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_excused_failure_below_a_deletion_that_removed_nothing_sends_the_map_back_to_a_scan() {
+        let (root, mut app) = app_scanning_listing(&["target"], make_a_removable_target);
+        let (work_id, _plan) = start_executing(&mut app, root.path(), "target");
+        assert!(app.path_removed_by_a_deletion(&root.path().join("target").join("inner")));
+
+        assert!(app.deletion_execution_finished(work_id, WorkCompletion::Succeeded));
+        assert!(!app.complete_deletion(report(0)));
+        app.finalize_scan();
+        app.start_ui();
+
+        assert!(
+            app.generation_rebuild_required,
+            "the folder was excused as removed, and nothing was"
+        );
+    }
+
+    /// So is one a deletion removed only part of, and one whose execution was rejected.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_excused_failure_below_a_partial_or_rejected_deletion_sends_the_map_back_to_a_scan() {
+        let (root, mut app) = app_scanning_listing(&["target"], |path| {
+            std::fs::create_dir(path).expect("target folder should exist");
+            std::fs::write(path.join("deleted"), b"delete").expect("fixture should exist");
+            std::fs::write(path.join("changed"), b"old").expect("fixture should exist");
+        });
+        let (work_id, plan) = start_executing(&mut app, root.path(), "target");
+        assert!(app.path_removed_by_a_deletion(&root.path().join("target").join("inner")));
+        std::fs::write(
+            root.path().join("target").join("changed"),
+            b"changed afterwards",
+        )
+        .expect("the fixture should change");
+        let report = crate::deletion::execute_plan(
+            root.path(),
+            *plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(report.deleted_entries() > 0 && !report.target_was_removed());
+        assert!(app.deletion_execution_finished(work_id, WorkCompletion::Succeeded));
+        assert!(app.complete_deletion(report));
+        app.finalize_scan();
+        app.start_ui();
+        assert!(app.generation_rebuild_required);
+
+        // An execution that was rejected ends the same way.
+        let (root, mut app) = app_scanning_listing(&["target"], make_a_removable_target);
+        let (work_id, _plan) = start_executing(&mut app, root.path(), "target");
+        assert!(app.path_removed_by_a_deletion(&root.path().join("target")));
+        assert!(app.deletion_execution_stale(work_id));
+        app.excused_execution_ended(false);
+        app.finalize_scan();
+        assert!(app.generation_rebuild_required);
+    }
+
+    /// A map that lists a name the scan root no longer holds. A removal directly below the scan
+    /// root is the one an overlay would not check against a folder (the root has no record of its
+    /// own to compare with), so the overlays of removals recorded before the first map check the
+    /// root's entries too, and a map that lists what the root does not hold is scanned for again.
+    /// (The executor's own transient names are not such an entry: it registers them, and the scan
+    /// skips them. The root can change for other reasons as well.)
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_chain_overlay_whose_root_listing_disagrees_sends_the_map_back_to_a_scan() {
+        let (root, mut app, removal) = app_scanning_with_a_target_removal_report();
+        // The scan listed a name the root no longer holds.
+        let phantom = root.path().join("phantom");
+        std::fs::write(&phantom, b"phantom").expect("phantom fixture should exist");
+        add_fixture_entry(&mut app, &phantom);
+        std::fs::remove_file(&phantom).expect("phantom should be removed again");
+        assert!(app.complete_deletion(removal));
+
+        app.finalize_scan();
+        app.start_ui();
+        while app.scan_store_busy() {
+            assert!(app.process_scan_store_events());
+        }
+
+        assert!(
+            app.generation_rebuild_required,
+            "the map lists a name the root does not hold"
+        );
+        assert_eq!(
+            app.scan_store.published_generation(),
+            Some(ScanGeneration::initial())
+        );
+    }
+
+    /// The overlay of a removal that finishes after the first map is shown stays as cheap as it
+    /// was: the scan root is not listed for it.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_overlay_after_the_first_map_does_not_check_the_scan_root() {
+        let (root, mut app, removal) = app_scanning_with_a_target_removal_report();
+        let phantom = root.path().join("phantom");
+        std::fs::write(&phantom, b"phantom").expect("phantom fixture should exist");
+        add_fixture_entry(&mut app, &phantom);
+        std::fs::remove_file(&phantom).expect("phantom should be removed again");
+        app.finalize_scan();
+        app.start_ui();
+
+        assert!(app.complete_deletion(removal));
+        while app.scan_store_busy() {
+            assert!(app.process_scan_store_events());
+        }
+
+        assert!(!app.generation_rebuild_required);
+        assert!(!map_lists(&app, "target"));
+    }
+
+    /// The chain has a limit: deletions past it fall back to the rebuild, and every one up to it
+    /// is described.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn deletions_during_the_first_scan_are_chained_up_to_a_limit_and_scanned_again_past_it() {
+        for (levels, chained) in [
+            (MAX_REMOVALS_BEFORE_FIRST_MAP, true),
+            (MAX_REMOVALS_BEFORE_FIRST_MAP + 1, false),
+        ] {
+            let (_root, mut app, reports) = app_scanning_levels_with_a_removal_report_each(levels);
+            for report in reports {
+                assert!(app.complete_deletion(report));
+            }
+
+            app.finalize_scan();
+            app.start_ui();
+            while app.scan_store_busy() {
+                assert!(app.process_scan_store_events());
+            }
+
+            assert_eq!(
+                app.generation_rebuild_required, !chained,
+                "{levels} deletions"
+            );
+            if chained {
+                assert_eq!(
+                    app.scan_store.published_generation(),
+                    Some(ScanGeneration::from_value(
+                        u64::try_from(levels).expect("a small count")
+                    )),
+                    "one overlay for each of {levels} deletions"
+                );
+                assert_eq!(
+                    app.take_landed_refresh(),
+                    Some(crate::test_events::RefreshOutcome::Published)
+                );
+            } else {
+                assert_eq!(
+                    app.scan_store.published_generation(),
+                    Some(ScanGeneration::initial()),
+                    "{levels} deletions are more than the chain holds"
+                );
+            }
+        }
+    }
+
+    /// A directory the first scan finds gone is a failure, unless a deletion removed it: one that
+    /// finished (and is waiting to be taken out of the first map), or one that is still
+    /// executing, whose directories the scanner can reach before its report arrives. Nothing is
+    /// excused once the first map is in, and a deletion that ended without removing anything
+    /// excuses nothing.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_vanished_directory_is_a_deletions_doing_only_under_what_a_deletion_removes() {
+        let (root, mut app) = app_scanning_listing(&["target", "other"], make_a_removable_target);
+        let below_target = root.path().join("target").join("inner");
+        assert!(
+            !app.path_removed_by_a_deletion(&below_target),
+            "no deletion has run"
+        );
+
+        // A deletion handed to the executor excuses what is below its target, from then on.
+        let target = app
+            .live_deletion_target_for_test("other")
+            .expect("a concrete live entry is deletable while the scan runs");
+        assert!(app.queue_deletion_confirmation(target, true, 1 << 20, Duration::ZERO));
+        let Some(DeletionWorkCommand::Plan {
+            work_id, target, ..
+        }) = app.next_deletion_planning_work()
+        else {
+            panic!("the deletion should be planned");
+        };
+        let plan = crate::deletion::build_plan(root.path(), *target, true)
+            .expect("target plan should build");
+        assert!(app.deletion_plan_ready(work_id, Box::new(plan)));
+        let below_other = root.path().join("other").join("inner");
+        assert!(
+            !app.path_removed_by_a_deletion(&below_other),
+            "a planned deletion has removed nothing"
+        );
+        assert!(matches!(
+            app.next_deletion_execution_work(),
+            Some(DeletionWorkCommand::Execute { .. })
+        ));
+        assert!(app.path_removed_by_a_deletion(&below_other));
+        assert!(app.path_removed_by_a_deletion(&root.path().join("other")));
+        assert!(
+            !app.path_removed_by_a_deletion(&root.path().join("others")),
+            "a sibling whose name starts with the target's is not below it"
+        );
+        assert!(!app.path_removed_by_a_deletion(&below_target));
+
+        // It ended without removing anything: a failure under its target is a real one.
+        assert!(app.deletion_execution_stale(work_id));
+        assert!(!app.path_removed_by_a_deletion(&below_other));
+
+        // A deletion that finished is excused until the first map is in.
+        let removal = removal_that_left_no_link(remove_the_live_entry(&mut app, "target", || {}));
+        assert!(app.complete_deletion(removal));
+        assert!(app.path_removed_by_a_deletion(&below_target));
+        assert!(app.path_removed_by_a_deletion(&root.path().join("target")));
+        assert!(!app.path_removed_by_a_deletion(&below_other));
+        assert!(!app.path_removed_by_a_deletion(&root.path().join("survivor")));
+        app.finalize_scan();
+        assert!(
+            !app.path_removed_by_a_deletion(&below_target),
+            "the scan is over, and nothing it finds is left to be told apart"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 schema_version = 1
 name = "delete-file-while-scanning"
-description = "A file deleted while the first scan is still running leaves the scan and its map alone: the map as it fills in stays on the screen and navigable, the scan goes on, and the map is rebuilt behind the one the scan ends with, which does not list the file."
+description = "A file deleted while the first scan is still running leaves the scan and its map alone: the map as it fills in stays on the screen and navigable, the scan goes on, and a map that does not list the file replaces the one the scan ends with, by an overlay behind it or, where the removal cannot be described, a rebuild."
 fixture = "delete-file-while-scanning"
 sentinels = ["keep-a.bin", "docs/keep-0.txt"]
 profiles = ["default", "deterministic"]
@@ -38,7 +38,7 @@ timeout_ms = 30000
 
 # The deletion left the scan and its map alone: the header goes on counting the entries the scan
 # finds, and the badge still reads SCANNING while it does. A map taken away shows no entries until
-# the scan has ended, and the rebuild that then starts reads REBUILDING.
+# the scan has ended.
 [[steps]]
 step = "wait_text"
 regex = "[1-9][0-9]{5} items"
@@ -59,8 +59,9 @@ key = "down"
 step = "settle"
 timeout_ms = 10000
 
-# The scan ends, and the map is rebuilt behind the one it ended with. The program says when the
-# rebuilt map is on the screen: the header cannot, because the map it replaces read COMPLETE too.
+# The scan ends, and a map without the file replaces the one it ended with (an overlay behind it;
+# a rebuild instead where the removal cannot be described). Either way the program says when the
+# new map is on the screen: the header cannot, because the map it replaces read COMPLETE too.
 [[steps]]
 step = "wait_refresh"
 timeout_ms = 120000

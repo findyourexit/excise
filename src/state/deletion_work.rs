@@ -857,6 +857,19 @@ impl DeletionWork {
         })
     }
 
+    /// Whether `path` is the target of the deletion that is executing, or below it. The item is
+    /// executing from the moment its work is handed to the executor until the owner takes its end,
+    /// so this holds for whatever the executor has removed, or is about to, however far it has
+    /// got. A target is never the scan root: a deletion of it is refused before it is planned.
+    #[must_use]
+    pub(crate) fn executing_target_contains(&self, path: &RelativePath) -> bool {
+        self.items.iter().any(|item| {
+            matches!(item.stage, DeletionWorkStage::Executing { .. })
+                && !item.relative_path.is_root()
+                && path.starts_with(&item.relative_path)
+        })
+    }
+
     #[must_use]
     pub(crate) fn presentation_snapshot(&self) -> DeletionWorkPhaseSnapshot {
         DeletionWorkPhaseSnapshot {

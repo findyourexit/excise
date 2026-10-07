@@ -14,6 +14,17 @@
 //! a registered path without reading it. The match is by path and never by name pattern: a
 //! user's own file may carry any name, so the shape of a name proves nothing about who made it.
 //!
+//! The deletion executor is a second user, on Linux and macOS (Windows removes an entry through an
+//! open handle and makes no name of its own in the tree). To remove an entry it makes a
+//! placeholder in the folder that holds it and exchanges names with it: while the entry is
+//! isolated, a name that is gone a moment later holds the entry itself, with its full size, and the
+//! entry's own name holds an empty file. A scan or an overlay's listing of that folder must not
+//! record the first. The executor registers each name it makes, by the path the scanner builds
+//! for it and before the name exists, and releases it when the entry's outcome is known. A scanner
+//! that took a name from a listing before then, and reaches it after, finds it gone: that is the
+//! one thing the registration does not cover. There is no file to hand over, and the names carry
+//! a random token, so the moment between a name going and its release cannot hide a user's file.
+//!
 //! The registration and the file go together ([`PrivateFile`]), and the file is closed, which on
 //! Windows removes its name, with the registry locked: the lock is let go only once the path is
 //! released, and every lookup takes it. A lookup therefore finds either the live file with its
@@ -56,13 +67,6 @@ impl PrivateFiles {
     ///
     /// Register before the file exists: a reader that can see the file then also sees that it is
     /// registered.
-    #[cfg_attr(
-        not(any(windows, test)),
-        allow(
-            dead_code,
-            reason = "only Windows keeps a named spill file in the user's tree"
-        )
-    )]
     pub(crate) fn register(&self, path: PathBuf) -> PrivateFile {
         PrivateFile::new(self, path)
     }

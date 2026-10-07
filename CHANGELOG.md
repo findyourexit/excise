@@ -12,7 +12,8 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ### Fixed
 
-* Deleting an entry while the first scan is still running no longer replaces the map with an empty `SCANNING FOLDER` field until a rescan ends. The scan carries on and the map stays navigable; once the scan ends, the map is rebuilt behind it to account for the deletion.
+* Deleting an entry while the first scan is still running no longer replaces the map with an empty `SCANNING FOLDER` field until a rescan ends. The scan carries on and the map stays navigable; once the scan ends, a map without the removed entries replaces it, with no rescan (for up to eight such deletions). The map is rebuilt behind the finished one when a removal cannot be taken out of it exactly: a partial deletion, a file that may have other hard links, a folder that changed beside the removed entry, or more than eight such deletions.
+* A folder or entry that a deletion removes while the first scan is running no longer shows `READ ERROR` or makes Excise exit with code 2 (for up to eight deletions).
 
 ## [1.4.0] - 2026-10-07
 

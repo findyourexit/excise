@@ -417,7 +417,9 @@ Details that a table cannot carry:
 - **`wait_refresh`.** A deletion that removed entries leaves the map listing them until the program
   replaces it, either with a rebuild of the whole map (after a file that may have had another
   link: one whose last link the program did not see go) or with a map that leaves them out. A
-  quit meanwhile cancels the replacement and exits 130, not 0, and nothing on the screen says when
+  quit while a rebuild is running cancels it and exits 130, not 0; one before a rebuild that the
+  map is owed has started exits 2, and one before an overlay lands exits with the map as it
+  stands. Nothing on the screen says when
   it is over: the header reads `COMPLETE` from the map as it was. The step waits until the program
   says so, and then for a frame that shows it (see [PTY runner](#pty-runner) for how, and
   [In-process runner](#in-process-runner) for the barrier that stands in for it there). A deletion
@@ -512,7 +514,7 @@ the run ends) and not whole frames.
 
 A scenario that deletes something waits with `wait_refresh` before it asserts the outcome and
 before it quits: until the program has replaced the map, the map still lists what was removed, and
-a quit meanwhile exits 130.
+a quit while a rebuild is running exits 130, and one before it has started exits 2.
 
 What the interface reports is read from the header's status row (`Last deletion: 1 deleted · 0
 changed · 0 missing · 0 failed · 0 not run`), which shows it after a deletion whatever is
@@ -538,7 +540,7 @@ which depends on the platform.
 | `delete-file-lifecycle` | `delete-file` | A confirmed deletion removes only that file, the header reports one entry deleted and none failed, the map stays navigable, and quitting restores the terminal. |
 | `delete-file-slow-terminal` | `delete-file` | The same on a terminal that drains 20,000 bytes a second, so that the screen trails the program by a good part of a second: the `delete` step reads its dialog from a screen that shows the frame the program drew for the Backspace, and still deletes exactly its target. `full` tier; Linux and macOS. |
 | `delete-folder-lifecycle` | `delete-folder` | The same for a folder of 5,011 entries. |
-| `delete-file-while-scanning` | `delete-file-while-scanning` | A file deleted while the first scan is still running leaves the scan and its map alone: the header goes on counting entries under a `SCANNING` badge, a key is answered, and once the scan ends the map is rebuilt behind the first one, and the rebuilt map lacks the file. `full` tier; Linux and macOS. |
+| `delete-file-while-scanning` | `delete-file-while-scanning` | A file deleted while the first scan is still running leaves the scan and its map alone: the header goes on counting entries under a `SCANNING` badge, a key is answered, and once the scan ends a map without the file replaces the first one (a rebuild behind it instead, where the removal cannot be described). `full` tier; Linux and macOS. |
 | `delete-tree-confirmed-with-enter` | `nested` | Enter confirms, and a folder goes with the folder inside it while the files beside it stay. |
 | `delete-tree-narrow-terminal` | `nested` | The same in a terminal 60 columns wide. Linux and macOS: on Windows the fixture's path (under the runner's temporary directory, every backslash doubled on screen) is longer than a 60-column dialog shows, and the `delete` step refuses a path it cannot read whole. |
 | `delete-file-cancelled` | `delete-file` | The first Backspace of a fresh map opens the confirmation for the largest entry; `n` closes it, and nothing is touched. |
@@ -803,8 +805,10 @@ checks that directly.
   as soon as a frame shows the dialog has closed, without waiting for the deletion itself: the
   deletion keeps running after the step returns, so a step
   that needs its outcome waits for that separately (`wait_fs_absent`, `wait_event`). The map still
-  lists what the deletion removed when the step returns, and the program treats a quit before it
-  has replaced that map as a cancellation (exit code 130): a scenario that goes on to quit waits
+  lists what the deletion removed when the step returns, and the program treats a quit while a
+  rebuild of that map is running as a cancellation (exit code 130; before the rebuild has started
+  the exit code is 2, and before an overlay lands the program exits with the map as it stands): a
+  scenario that goes on to quit waits
   with `wait_refresh` first, after a `"started"` delete as after a `"finished"` one. The header
   cannot stand in for it, because it reads `COMPLETE` from the map as it was.
 - **`wait_refresh`** needs every deletion the scenario has confirmed to have reported
@@ -3312,8 +3316,8 @@ A run resolves to a `Verdict` with strict xfail: an `expect = "fail"` scenario t
    [Spec files](#spec-files)).
 3. Use only the steps above. Put a `quit` and an `expect_exit` at the end, so the run ends the way
    a user would end it; a scenario that stops earlier is stopped by the runner. After a `delete`,
-   put a `wait_refresh` before the `quit`: a quit while the program is still replacing its map
-   exits 130, not 0.
+   put a `wait_refresh` before the `quit`: a quit while the program is still rebuilding its map
+   exits 130, not 0, and one before the rebuild has started exits 2.
 4. Run `cargo test -p excise --lib scenario_runner -- --nocapture`. A scenario that this runner
    cannot perform is skipped, never silently dropped: the suite prints `SKIP <name>: <reason>` for
    each one.

@@ -150,6 +150,12 @@ pub(crate) struct ScanRoot {
 struct OverlayRequest {
     generation: ScanGeneration,
     replaced_prefix: RelativePath,
+    /// The removals the map lists still, whose overlays follow this one: already gone from the
+    /// file system, so the folder that held `replaced_prefix` no longer holds their entries.
+    removed_later: Vec<RelativePath>,
+    /// Whether to check the scan root's entries against the map when the root held the removed
+    /// entry, which an overlay otherwise does not do. The root's snapshot is never replaced.
+    verify_root: bool,
     /// The generation the owner has installed: the one the overlay is the successor of.
     base: OverlayBase,
     root: ScanRoot,
@@ -291,10 +297,24 @@ impl StoreEngine {
         let OverlayRequest {
             generation,
             replaced_prefix,
+            removed_later,
+            verify_root,
             base,
             root,
         } = request;
-        let folder = refreshed_folder(&root, &replaced_prefix, &self.quota, &self.internal_paths)?;
+        let mut folder =
+            refreshed_folder(&root, &replaced_prefix, &self.quota, &self.internal_paths)?;
+        if folder.is_none() && verify_root {
+            folder = Some(listed_folder(
+                &root,
+                RelativePath::root(),
+                &self.quota,
+                &self.internal_paths,
+            )?);
+        }
+        if let Some(folder) = folder.as_mut() {
+            folder.removed_later = removed_later;
+        }
         self.store.begin_overlay_generation(
             &base,
             generation,
@@ -382,6 +402,16 @@ fn refreshed_folder(
     }
     let path = RelativePath::from_components(removed.components()[..removed.depth() - 1].to_vec())
         .map_err(|error| ScanStoreError::OverlayNeedsRescan(format!("{error:?}")))?;
+    listed_folder(root, path, quota, internal_paths).map(Some)
+}
+
+/// The folder `path` as the file system has it now, listed as [`refreshed_folder`] describes.
+fn listed_folder(
+    root: &ScanRoot,
+    path: RelativePath,
+    quota: &TemporaryStorage,
+    internal_paths: &[PathBuf],
+) -> Result<RefreshedFolder, ScanStoreError> {
     let folder = path.to_path_buf();
     let location = root.path.join(&folder);
     let internal: Vec<&OsStr> = internal_paths
@@ -409,11 +439,12 @@ fn refreshed_folder(
             "the folder that held the removed entry cannot be read as it is now: {error}"
         ))
     })?;
-    Ok(Some(RefreshedFolder {
+    Ok(RefreshedFolder {
         path,
         snapshot,
         entries,
-    }))
+        removed_later: Vec::new(),
+    })
 }
 
 /// The kind the map records for an entry the planner reads as `kind`.
@@ -795,6 +826,11 @@ impl StoreHandle {
     /// `replaced_prefix`, and publishing it: a deletion's overlay. The installed generation is
     /// the base because it is the one the reader sees, and the one the files of which stay until
     /// the overlay's arrives; `root` is where to read the folder that held the removed entry.
+    /// `removed_later` are the removals the map still lists whose overlays follow this one: they
+    /// are already gone from the file system, and the folder is checked against the map less them.
+    /// `verify_root` also checks the scan root's entries when the root held the removed entry:
+    /// only for a removal recorded before the first map, whose overlay is the one check the
+    /// root's listing gets.
     ///
     /// # Errors
     ///
@@ -803,6 +839,8 @@ impl StoreHandle {
         &mut self,
         generation: ScanGeneration,
         replaced_prefix: &RelativePath,
+        removed_later: Vec<RelativePath>,
+        verify_root: bool,
         root: ScanRoot,
     ) -> Result<(), StoreUnavailable> {
         let base = self
@@ -815,6 +853,8 @@ impl StoreHandle {
         self.send(StoreCommand::Overlay(Box::new(OverlayRequest {
             generation,
             replaced_prefix: replaced_prefix.clone(),
+            removed_later,
+            verify_root,
             base,
             root,
         })))?;
