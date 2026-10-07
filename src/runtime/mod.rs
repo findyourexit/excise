@@ -2905,7 +2905,7 @@ mod tests {
             "a due scan field frame must be rendered before the busy scan batch returns"
         );
     }
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
     fn complete_queued_deletion(
         app: &mut App<TestBackend>,
         root: &std::path::Path,
@@ -3754,13 +3754,19 @@ mod tests {
     }
 
     /// The map without the removed target is the overlay the store thread builds, and the owner
-    /// loop reflows the map around the survivor as that overlay arrives. That takes a removal
-    /// the executor can show left no link behind, which for a file is Linux and Windows: macOS
-    /// opens nothing it removes, and sends the map back to a scan after a removed file (see
-    /// `a_deletion_of_a_file_sends_the_map_back_to_a_scan_on_macos` in the app's tests).
-    #[cfg(any(target_os = "linux", windows))]
+    /// loop reflows the map around the survivor as that overlay arrives. That takes a removal the
+    /// executor can show left no link behind, which for a file is every system it runs on but a
+    /// macOS file system that does not resolve an object by its identity: the map is scanned
+    /// again after a file removed there, and this test has nothing to show.
+    #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
     #[test]
     fn completed_target_reflows_immediately_while_its_copied_tile_departs() {
+        #[cfg(unix)]
+        {
+            if !crate::deletion::proves_no_link_survived() {
+                return;
+            }
+        }
         let root = tempfile::tempdir().expect("test root should be created");
         let target_path = root.path().join("target");
         std::fs::write(&target_path, vec![b'x'; 8 * 1024]).expect("test target should be created");

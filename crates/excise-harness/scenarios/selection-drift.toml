@@ -76,9 +76,10 @@ step = "wait_fs_absent"
 path = "big-file.bin"
 timeout_ms = 15000
 
-# Deleting the root's file makes the program rebuild its map (macOS cannot show that the file left
-# no other link), and a quit meanwhile cancels the rebuild (exit code 130). The header reads
-# COMPLETE from the map as it was, so this waits for the program to say the rebuild is over.
+# Deleting the root's file leaves the map listing it until the program replaces the map, with a
+# rebuild where it cannot show that the file left no other link, and a quit meanwhile cancels the
+# replacement (exit code 130). The header reads COMPLETE from the map as it was, so this waits for
+# the program to say the replacement is over.
 [[steps]]
 step = "wait_refresh"
 timeout_ms = 30000

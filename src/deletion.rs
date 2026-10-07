@@ -16,6 +16,8 @@ use cap_primitives::ambient_authority;
 use cap_primitives::fs::FollowSymlinks;
 use cap_primitives::fs::{self as cap_fs};
 use file_id::FileId;
+#[cfg(target_vendor = "apple")]
+use rustix::fs::lstat;
 #[cfg(unix)]
 use rustix::fs::{AtFlags, statat};
 #[cfg(target_os = "linux")]
@@ -1975,6 +1977,37 @@ where
     )
 }
 
+/// Whether the executor can show, in the folders tests make, that a file it removed left no link
+/// behind. Linux and Windows always can: Linux reads the object's link count through a reference
+/// held across the removal, and Windows through the handle that removes it. macOS can where the
+/// system resolves an object by its identity, which it does on APFS, where the executor works
+/// (it isolates an entry by exchanging two names, which HFS+ and exFAT refuse); that is asked of
+/// a fresh file in the temporary folder with the system's own `stat`, not with the executor's
+/// code. Where it cannot, every file or link counts as possibly linked, and the map is scanned
+/// again after such a deletion.
+#[cfg(test)]
+pub(crate) fn proves_no_link_survived() -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        static RESOLVES_BY_IDENTITY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let probe = tempfile::NamedTempFile::new().expect("the probe file should exist");
+            let metadata = probe
+                .as_file()
+                .metadata()
+                .expect("the probe file should be readable");
+            std::fs::symlink_metadata(format!("/.vol/{}/{}", metadata.dev(), metadata.ino()))
+                .is_ok()
+        });
+        *RESOLVES_BY_IDENTITY
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        true
+    }
+}
+
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[allow(
     clippy::too_many_arguments,
@@ -2252,18 +2285,16 @@ where
     }
 
     // The link count at this last look before the removal is the one the space it frees is
-    // counted from, so a link made after the first look is in it. Linux counts again through
-    // the reference below once the removal is done; macOS, which cannot, keeps this count.
+    // counted from, so a link made after the first look is in it. Once a file or link is removed
+    // only the reference below can keep that count: an entry it cannot be made for, or whose
+    // count it cannot read, is left with none, and its space is not counted as freed.
     entry.snapshot.identity.link_count = revalidated.identity.link_count;
 
-    // Linux only: a reference to the object, held across its removal, so that the links that
-    // outlive the removal can be counted through it once the removed name is gone. A count read
-    // through a name has to be read while the name is there, and a link made after that read is
-    // not in it. An object that already had other links needs none: it is known to have had
-    // them. macOS opens nothing it removes: a plain open of an entry another process swapped for
-    // a FIFO blocks, and one of a file whose content is elsewhere makes the system fetch it, so
-    // there every file or link that is removed counts as possibly linked.
-    #[cfg(target_os = "linux")]
+    // A reference to the object, held across its removal, so that the links that outlive the
+    // removal can be counted through it once the removed name is gone. A count read through a
+    // name has to be read while the name is there, and a link made after that read is not in it.
+    // An object that already had other links needs none: it is known to have had them. One that
+    // the system cannot make a reference to counts as possibly linked once it is removed.
     let reference = if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link)
         && actual.identity.link_count == Some(1)
     {
@@ -2280,20 +2311,17 @@ where
     };
     match removal {
         Ok(()) => {
-            #[cfg(target_os = "linux")]
-            {
-                if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link) {
-                    // The removed name was the last name the executor held for the object, and
-                    // no other process can name a removed object, so a link the reference still
-                    // counts is one that outlived the removal. Only an object that had one link
-                    // when it was isolated and has none now is proven to have left none;
-                    // anything the executor could not read, or could not reference, is a link
-                    // that may remain, and its space is not counted as freed.
-                    isolation.no_link_survived =
-                        reference.as_ref().and_then(LinkReference::links) == Some(0);
-                    if !isolation.no_link_survived {
-                        entry.snapshot.identity.link_count = None;
-                    }
+            if matches!(entry.snapshot.kind, PlannedKind::File | PlannedKind::Link) {
+                // The removed name was the last name the executor held for the object, and no
+                // other process can name a removed object, so a link the reference still counts
+                // is one that outlived the removal. Only an object that had one link when it was
+                // isolated and has none now is proven to have left none; anything the executor
+                // could not read, or could not reference, is a link that may remain, and its
+                // space is not counted as freed.
+                isolation.no_link_survived =
+                    reference.as_ref().and_then(LinkReference::links) == Some(0);
+                if !isolation.no_link_survived {
+                    entry.snapshot.identity.link_count = None;
                 }
             }
             match finalize_placeholder(&parent, &original_name, &detached_name, &placeholder) {
@@ -2683,10 +2711,10 @@ struct Isolation {
     /// no longer being there.
     refused: bool,
     /// The executor removed a file or link and saw every link to it go with the removal: the
-    /// object had one link when it was isolated, and has none now. Only Linux can see that (a
-    /// reference held across the removal, `LinkReference`); it is always false on macOS, which
-    /// opens nothing it removes. False for anything else too, including an entry that was already
-    /// gone and one the executor could not count.
+    /// object had one link when it was isolated, and has none now, which it read through a
+    /// reference held across the removal (`LinkReference`). False for anything else, including an
+    /// entry that was already gone, one the executor could not make a reference to, and one it
+    /// could not count.
     no_link_survived: bool,
 }
 
@@ -2869,18 +2897,19 @@ fn finalize_placeholder(
 
 /// A reference to the object an entry names, held across the removal of the names the executor
 /// controls, so that the links that outlive the removal can be counted through it afterwards.
-/// Only Linux has one.
 ///
 /// A count read through a name has to be read while the name is there, and a link made after that
 /// read is not in it. A reference outlives every name, and its count is the object's own: zero
 /// once the last link is gone, whatever the number was and whenever the links were made.
 ///
-/// It is opened with `O_PATH` and without following a link, which has no effect on any kind of
-/// object, a FIFO, a device, and a socket included, and cannot block or fetch anything. An
-/// object that is not the one that was inspected gets none, and the executor then counts the
-/// removal as one that may have left a link. macOS has no such flag, and opens nothing it
-/// removes: a plain open of an entry that another process swapped for a FIFO blocks, and one of a
+/// It is made without opening the object. A plain open cannot be trusted to leave an object
+/// alone: the open of an entry that another process swapped for a FIFO blocks, and the open of a
 /// file whose content is somewhere else makes the system fetch it.
+///
+/// Linux holds an `O_PATH` descriptor, opened without following a link, which has no effect on
+/// any kind of object, a FIFO, a device, and a socket included, and cannot block or fetch
+/// anything. An object that is not the one that was inspected gets none, and the executor then
+/// counts the removal as one that may have left a link.
 #[cfg(target_os = "linux")]
 struct LinkReference(OwnedFd);
 
@@ -2903,6 +2932,79 @@ impl LinkReference {
     fn links(&self) -> Option<u64> {
         let (_, identity) = EntryMetadata::from_stat(&fstat(&self.0).ok()?).ok()?;
         identity.link_count
+    }
+}
+
+/// The longest path that names an object by its identity: `/.vol/`, a device number of up to ten
+/// digits, a separator, and an inode number of up to twenty.
+#[cfg(target_vendor = "apple")]
+const BY_IDENTITY_PATH_BYTES: usize = 6 + 10 + 1 + 20;
+
+/// A reference to the object an entry names, held across the removal of the names the executor
+/// controls, so that the links that outlive the removal can be counted through it afterwards. A
+/// count read through a name has to be read while the name is there, and a link made after that
+/// read is not in it; the object's own count is zero once its last link is gone, whenever the
+/// links were made.
+///
+/// macOS opens nothing it removes: a plain open can block on an entry that another process
+/// swapped for a FIFO, can make the system fetch a file whose content is somewhere else, and
+/// cannot open a socket at all. The reference is the object's identity instead. The system
+/// resolves `/.vol/<device>/<inode>` to the object with that identity for as long as the object
+/// has a link, and answers `ENOENT` once it has none. A lookup there is an `lstat`, which opens,
+/// fetches, and waits for nothing, whatever the object is, and it names a symbolic link itself,
+/// never what it points at. Any answer but `ENOENT` counts against the proof, whichever object
+/// gives it.
+///
+/// `ENOENT` is also what the system answers when it cannot resolve the identity at all, for
+/// whatever reason: a file system that does not support the lookup, a volume that has gone, a
+/// lookup that fails at that moment. The answer after the removal therefore proves something
+/// only when the same lookup found the object before it, and the reference is made only then; for
+/// any other object the executor counts the removal as one that may have left a link. What is
+/// left is a lookup that fails in the instant between the removal and the second look, and it
+/// would also need another process to have linked the object in that instant, because a
+/// reference is made only for an object with one link. The count decides only whether the map is
+/// scanned again and what space is counted as freed, never whether a deletion is safe.
+#[cfg(target_vendor = "apple")]
+struct LinkReference {
+    path: [u8; BY_IDENTITY_PATH_BYTES],
+    len: usize,
+}
+
+#[cfg(target_vendor = "apple")]
+impl LinkReference {
+    /// A reference to the object that `expected` identifies, when the system resolves it by that
+    /// identity now. Linux names the object by `parent` and `name`; this does not need them.
+    fn open(_parent: &File, _name: &OsStr, expected: &NativeIdentity) -> Option<Self> {
+        let FileId::Inode {
+            device_id,
+            inode_number,
+        } = &expected.file_id
+        else {
+            return None;
+        };
+        // The path spells the device as the system's signed 32 bits; one that does not fit has no
+        // spelling, and no reference.
+        let device = i32::try_from(*device_id).ok()?;
+        let mut path = [0_u8; BY_IDENTITY_PATH_BYTES];
+        let mut unwritten = &mut path[..];
+        write!(unwritten, "/.vol/{device}/{inode_number}").ok()?;
+        let len = BY_IDENTITY_PATH_BYTES - unwritten.len();
+        let reference = Self { path, len };
+        let (_, found) = EntryMetadata::from_stat(&lstat(reference.bytes()).ok()?).ok()?;
+        same_object(expected, &found).then_some(reference)
+    }
+
+    /// How many links the object has now: none once the system no longer resolves it.
+    fn links(&self) -> Option<u64> {
+        match lstat(self.bytes()) {
+            Ok(stat) => EntryMetadata::from_stat(&stat).ok()?.1.link_count,
+            Err(rustix::io::Errno::NOENT) => Some(0),
+            Err(_) => None,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.path[..self.len]
     }
 }
 
@@ -3554,8 +3656,8 @@ fn note_deleted_link(entry: &mut PlannedEntry) {
 /// entry that failed, changed, or was already gone when the executor reached it can have been
 /// taken out of its folder by another process, so that nothing says where its object is by then,
 /// or under what other names. Only proof that no link survived says otherwise, so an entry the
-/// executor could not count, or could not reference, counts too, and on macOS, where nothing is
-/// referenced, every file and link does. A folder has no other links to speak of.
+/// executor could not count, or could not reference, counts too. A folder has no other links to
+/// speak of.
 const fn removed_with_other_links(
     kind: PlannedKind,
     outcome: &DeletionEntryOutcome,
@@ -4681,13 +4783,6 @@ mod tests {
         }
     }
 
-    /// Whether the executor can prove that a file it removed left no link behind, where it
-    /// removes by name (Unix). Linux reads the object's link count through a reference held
-    /// across the removal. macOS opens nothing it removes, so every file or link it removes counts
-    /// as possibly linked, and the map is scanned again after such a deletion.
-    #[cfg(unix)]
-    const PROVES_NO_LINK_SURVIVED: bool = !cfg!(target_vendor = "apple");
-
     /// A deletion reports whether a file it removed may have had other links: the executor counts
     /// the links the removal left, and the owner scans the map again, instead of updating it in
     /// place, when it cannot show there were none. A link gained after the plan was made counts
@@ -4749,7 +4844,7 @@ mod tests {
         assert_eq!(sole_link.deleted_entries(), 1);
         assert_eq!(
             sole_link.deleted_files_may_have_other_links(),
-            !PROVES_NO_LINK_SURVIVED,
+            !proves_no_link_survived(),
             "a file with one link"
         );
 
@@ -4781,7 +4876,7 @@ mod tests {
         assert!(folder_of_sole_links.entries.is_spilled());
         assert_eq!(
             folder_of_sole_links.deleted_files_may_have_other_links(),
-            !PROVES_NO_LINK_SURVIVED,
+            !proves_no_link_survived(),
             "a folder of files with one link each, in a plan that spilled"
         );
 
@@ -4879,7 +4974,8 @@ mod tests {
     }
 
     /// A symbolic link is referenced itself, never what it points at (`O_PATH` does not follow
-    /// one), so where the executor can prove a file left no link behind it proves it of a link.
+    /// one, and the identity that macOS looks up is the link's own), so where the executor can
+    /// prove a file left no link behind it proves it of a link.
     #[cfg(unix)]
     #[test]
     fn a_symbolic_link_is_removed_and_counted_as_a_file_is() {
@@ -4903,7 +4999,7 @@ mod tests {
         assert_eq!(report.deleted_entries(), 1);
         assert_eq!(
             report.deleted_files_may_have_other_links(),
-            !PROVES_NO_LINK_SURVIVED,
+            !proves_no_link_survived(),
             "a link with no other link"
         );
         assert!(
@@ -4913,9 +5009,9 @@ mod tests {
     }
 
     /// A FIFO is removed without being opened, which a plain open would block on, and a device
-    /// without the side effects an open can have. Where a reference to it can be made without
-    /// opening it (Linux's `O_PATH`), the executor proves it had no other link; macOS opens
-    /// nothing it removes, and counts the removal as one that may have left a link.
+    /// without the side effects an open can have. A reference to it is made without opening it
+    /// (Linux's `O_PATH`, macOS's lookup by identity), so the executor proves it had no other
+    /// link.
     #[cfg(unix)]
     #[test]
     fn a_fifo_is_removed_without_being_opened() {
@@ -4944,8 +5040,8 @@ mod tests {
         assert_eq!(report.deleted_entries(), 1);
         assert_eq!(
             report.deleted_files_may_have_other_links(),
-            !PROVES_NO_LINK_SURVIVED,
-            "only where the FIFO can be referenced without opening it is its removal proven"
+            !proves_no_link_survived(),
+            "the FIFO was referenced without being opened, so its removal is proven"
         );
         assert!(
             std::fs::symlink_metadata(&path).is_err(),
@@ -4953,67 +5049,173 @@ mod tests {
         );
     }
 
-    /// macOS opens nothing it removes, so it cannot show that a file with one link, or a symbolic
-    /// link, left no link behind: the removal counts as one that may have, and the map is scanned
-    /// again, as it is after any removal the map cannot describe exactly. A folder has no other
-    /// links to speak of, so a folder with no file in it is still described in place.
+    /// A socket cannot be opened at all, so only a reference that opens nothing can count the
+    /// links of one: the executor removes it as it removes a file, and proves it had no other
+    /// link.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_is_removed_and_counted_as_a_file_is() {
+        let root = tempfile::tempdir().expect("deletion root should exist");
+        let path = root.path().join("target");
+        // Closing the listener leaves the socket's file where it was bound.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("the socket should be bound"));
+        let plan = build_plan(
+            root.path(),
+            target(root.path(), OsString::from("target"), FileType::File),
+            false,
+        )
+        .expect("the plan should build");
+
+        let report = execute_plan(
+            root.path(),
+            plan,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(report.deleted_entries(), 1);
+        assert_eq!(
+            report.deleted_files_may_have_other_links(),
+            !proves_no_link_survived(),
+            "a socket with no other link"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the socket is gone"
+        );
+    }
+
+    /// The identity of the entry at `path` as the planner reads it.
+    #[cfg(target_vendor = "apple")]
+    fn identity_at(path: &Path) -> NativeIdentity {
+        let metadata =
+            std::fs::symlink_metadata(path).expect("fixture metadata should be readable");
+        crate::native_path::identity_for(path, &metadata)
+            .expect("fixture identity lookup should succeed")
+            .expect("fixture identity should be readable")
+    }
+
+    /// The reference to an object counts the links the object has when it is asked, not the names
+    /// the executor knew: a link made after the reference was made is in the count, one that is
+    /// removed is not, and none is left once the last link is removed.
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn a_file_or_link_removed_on_macos_counts_as_possibly_linked_and_a_folder_does_not() {
-        let removed = |make: fn(&Path), folder: bool| {
-            let root = tempfile::tempdir().expect("deletion root should exist");
-            let path = root.path().join("target");
-            make(&path);
-            let file_type = if folder {
-                FileType::Folder
-            } else {
-                FileType::File
-            };
-            let mut target = target(root.path(), OsString::from("target"), file_type);
-            if folder {
-                target.reviewed_entries.clear();
-            }
-            let plan = build_plan(root.path(), target, false).expect("the plan should build");
-            let report = execute_plan(
-                root.path(),
-                plan,
-                &AtomicBool::new(false),
-                &AtomicBool::new(false),
-            );
-            assert!(report.target_was_removed());
-            assert!(
-                std::fs::symlink_metadata(&path).is_err(),
-                "the entry is gone"
-            );
-            report
+    fn a_reference_counts_the_links_an_object_has_when_it_is_asked() {
+        let root = tempfile::tempdir().expect("root should exist");
+        let first = root.path().join("first");
+        std::fs::write(&first, b"payload").expect("file should exist");
+        let parent = std::fs::File::open(root.path()).expect("folder should open");
+
+        let reference =
+            LinkReference::open(&parent, std::ffi::OsStr::new("first"), &identity_at(&first));
+
+        assert_eq!(
+            reference.is_some(),
+            proves_no_link_survived(),
+            "a reference exists exactly where the system resolves a file by its identity"
+        );
+        let Some(reference) = reference else { return };
+        assert_eq!(reference.links(), Some(1));
+        let second = root.path().join("second");
+        std::fs::hard_link(&first, &second).expect("a second link should be made");
+        assert_eq!(
+            reference.links(),
+            Some(2),
+            "a link made after the reference is in the count"
+        );
+        std::fs::remove_file(&first).expect("the first link should be removed");
+        assert_eq!(
+            reference.links(),
+            Some(1),
+            "the object lives on under its other name"
+        );
+        std::fs::remove_file(&second).expect("the second link should be removed");
+        assert_eq!(
+            reference.links(),
+            Some(0),
+            "nothing names the object any more"
+        );
+    }
+
+    /// A lookup that fails for a reason other than the object being gone proves nothing: a link
+    /// that survives in a folder nobody can search is out of its reach, and is not taken for
+    /// none.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_link_the_lookup_cannot_reach_is_not_taken_for_none() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("root should exist");
+        let first = root.path().join("first");
+        std::fs::write(&first, b"payload").expect("file should exist");
+        let parent = std::fs::File::open(root.path()).expect("folder should open");
+        let Some(reference) =
+            LinkReference::open(&parent, std::ffi::OsStr::new("first"), &identity_at(&first))
+        else {
+            return;
+        };
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).expect("folder should exist");
+        std::fs::hard_link(&first, locked.join("survivor")).expect("a second link should be made");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("folder should lock");
+        std::fs::remove_file(&first).expect("the first link should be removed");
+
+        let links = reference.links();
+
+        // Unlocked before anything is asserted, so that the temporary folder can be removed.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("folder should unlock");
+        assert_ne!(
+            links,
+            Some(0),
+            "the object lives on under a name the lookup cannot reach"
+        );
+    }
+
+    /// A reference is made only to the object that was inspected, found by the identity it was
+    /// inspected with: an identity that names no object, a device number the path cannot spell,
+    /// and a file found where a link was inspected get none, so the executor counts the removal as
+    /// one that may have left a link.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn an_object_that_is_not_the_one_inspected_gets_no_reference() {
+        let root = tempfile::tempdir().expect("root should exist");
+        let path = root.path().join("target");
+        std::fs::write(&path, b"payload").expect("file should exist");
+        let parent = std::fs::File::open(root.path()).expect("folder should open");
+        let identity = identity_at(&path);
+        let FileId::Inode {
+            device_id,
+            inode_number,
+        } = &identity.file_id
+        else {
+            panic!("a Unix identity is an inode")
+        };
+        let gets_none = |changed: NativeIdentity| {
+            LinkReference::open(&parent, std::ffi::OsStr::new("target"), &changed).is_none()
         };
 
-        let file = removed(
-            |path| std::fs::write(path, b"payload").expect("file should exist"),
-            false,
-        );
-        let link = removed(
-            |path| {
-                std::os::unix::fs::symlink("points-nowhere", path).expect("link should exist");
-            },
-            false,
-        );
-        let folder = removed(
-            |path| std::fs::create_dir(path).expect("folder should exist"),
-            true,
-        );
-
         assert!(
-            file.deleted_files_may_have_other_links(),
-            "a file with one link, which the executor cannot show left none"
+            gets_none(NativeIdentity {
+                file_id: FileId::new_inode(*device_id, u64::MAX),
+                ..identity.clone()
+            }),
+            "an inode number that nothing has"
         );
         assert!(
-            link.deleted_files_may_have_other_links(),
-            "a symbolic link, likewise"
+            gets_none(NativeIdentity {
+                file_id: FileId::new_inode(u64::MAX, *inode_number),
+                ..identity.clone()
+            }),
+            "a device number the path cannot spell"
         );
         assert!(
-            !folder.deleted_files_may_have_other_links(),
-            "a folder with no file in it has no other links to speak of"
+            gets_none(NativeIdentity {
+                reparse_point: true,
+                ..identity.clone()
+            }),
+            "a file found where a link was inspected"
         );
     }
 
@@ -5058,7 +5260,7 @@ mod tests {
     /// `Failed`, though the file is gone and the folder that held it can still be removed. The
     /// flag does not follow the outcome but what the executor knows of the file's links: a file
     /// with another link may live on whatever the cleanup did, and so may one whose last link the
-    /// executor did not see go, which is every file on macOS.
+    /// executor did not see go.
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn a_file_removed_and_then_failed_on_its_cleanup_still_counts_as_possibly_linked() {
@@ -5099,7 +5301,7 @@ mod tests {
         );
         assert_eq!(
             removed_then_failed(false).deleted_files_may_have_other_links(),
-            !PROVES_NO_LINK_SURVIVED,
+            !proves_no_link_survived(),
             "a file with one link: counted unless the executor proved that none survived"
         );
     }
@@ -5753,7 +5955,14 @@ mod tests {
             report.deleted_entries(),
             u64::try_from(LINKS + 1).expect("fixture entry count should fit"),
         );
-        assert_eq!(report.deleted_allocated_bytes(), allocation);
+        assert_eq!(
+            report.deleted_allocated_bytes(),
+            if proves_no_link_survived() {
+                allocation
+            } else {
+                0
+            }
+        );
         assert!(!directory.exists());
         drop(report);
         assert_eq!(temporary_storage.used(), 0);
@@ -6274,7 +6483,14 @@ mod tests {
         );
 
         assert_eq!(report.deleted_entries(), 1);
-        assert_eq!(report.deleted_allocated_bytes(), link_allocation);
+        assert_eq!(
+            report.deleted_allocated_bytes(),
+            if proves_no_link_survived() {
+                link_allocation
+            } else {
+                0
+            }
+        );
         assert!(!link.exists());
         assert!(outside_file.exists());
     }
@@ -6833,7 +7049,14 @@ mod tests {
             &AtomicBool::new(false),
             &AtomicBool::new(false),
         );
-        assert_eq!(second_report.deleted_allocated_bytes(), first_allocated);
+        assert_eq!(
+            second_report.deleted_allocated_bytes(),
+            if proves_no_link_survived() {
+                first_allocated
+            } else {
+                0
+            }
+        );
         assert!(!second.exists());
     }
     #[cfg(unix)]
@@ -6905,7 +7128,14 @@ mod tests {
         );
 
         assert_eq!(report.deleted_entries(), 3);
-        assert_eq!(report.deleted_allocated_bytes(), allocated);
+        assert_eq!(
+            report.deleted_allocated_bytes(),
+            if proves_no_link_survived() {
+                allocated
+            } else {
+                0
+            }
+        );
         assert!(!directory.exists());
     }
 }

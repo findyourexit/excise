@@ -1069,11 +1069,12 @@ impl ScanStore {
     ///
     /// Entries are copied as the scan recorded them, which is right for all but what the removal
     /// itself changed on disk. Removing an entry moves the modification time of the folder that
-    /// held it, and that folder's link count when the entry was a folder, and the check that the
-    /// reader is deleting what they saw compares both, so `folder` (that folder as the file
-    /// system has it now) replaces the snapshot the map recorded. That time describes every
-    /// change to the folder's entries, not only the removal: another process that made,
-    /// removed, renamed, or replaced an entry beside it moved it too, and a map that recorded
+    /// held it, and that folder's link count when the entry was a folder (or a file, on APFS,
+    /// which counts a folder's files in it), and the check that the reader is deleting what they
+    /// saw compares both, so `folder` (that folder as the file system has it now) replaces the
+    /// snapshot the map recorded. That time describes every change to the folder's entries, not
+    /// only the removal: another process that made, removed, renamed, or replaced an entry
+    /// beside it moved it too, and a map that recorded
     /// the new time would pass a later deletion of the folder as unchanged while the folder
     /// holds what the map never showed. So `folder` also carries what the folder holds now (a
     /// [`FolderDigest`] of the names, kinds, and identities of its entries), and the snapshot

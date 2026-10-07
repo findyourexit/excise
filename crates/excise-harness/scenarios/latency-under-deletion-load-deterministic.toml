@@ -1,6 +1,6 @@
 schema_version = 1
 name = "latency-under-deletion-load-deterministic"
-description = "Under the deterministic profile (one scan thread), navigation keys sent while the 5,011-entry delete-folder victim is being removed meet the strict latency budgets on macOS and Linux: the post-deletion rebuild admits scan-store runs on the owner thread, so any admission that waits on the disk stalls input."
+description = "Under the deterministic profile (one scan thread), navigation keys sent while the 5,011-entry delete-folder victim is being removed meet the strict latency budgets on macOS and Linux: the deletion, and the refresh of the map that follows it, must not stall input."
 fixture = "delete-folder"
 sentinels = ["keep-a.bin", "keep-b/keep.txt"]
 profiles = ["deterministic"]
