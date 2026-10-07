@@ -1,0 +1,100 @@
+schema_version = 1
+name = "delete-folder-while-scanning"
+description = "A folder deleted while the first scan is still running, with folders below it that the scan has not read yet, is no failure of the scan: the scan goes on, the map as it fills in stays on the screen and navigable, no READ ERROR is shown for what the deletion removed, the map that ends the scan is made to agree with the deletion, and the program exits 0."
+fixture = "delete-folder-while-scanning"
+sentinels = ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
+profiles = ["default", "deterministic"]
+tier = "full"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+# The scan is still running: the badge must read SCANNING, so this never passes by outrunning it.
+[[steps]]
+step = "wait_header"
+state = "scanning"
+timeout_ms = 10000
+
+# The cursor lands on the victim and stays there while the scan runs: once its own listing is in,
+# it is the only entry of the root with a size (a folder counts what is below it, never its own
+# blocks), and its name sorts before the others, which settles a page drawn before that. The
+# filter is not available during a scan, so nothing could select it by name.
+[[steps]]
+step = "wait_text"
+text = "a-victim"
+region = { rows = [31, 31] }
+timeout_ms = 10000
+
+[[steps]]
+step = "delete"
+name = "a-victim"
+kind = "folder"
+timeout_ms = 60000
+
+[[steps]]
+step = "wait_fs_absent"
+path = "a-victim"
+timeout_ms = 30000
+
+# The deletion left the scan and its map alone, and the badge still reads SCANNING while it goes
+# on counting the entries it finds.
+[[steps]]
+step = "wait_text"
+regex = "[1-9][0-9]{5} items"
+region = { rows = [1, 1] }
+timeout_ms = 60000
+
+[[steps]]
+step = "expect_screen"
+region = "header"
+contains = ["SCANNING"]
+not_contains = ["READ ERROR"]
+
+# The map is navigable meanwhile: a key is answered by a frame that reflects it.
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+# The scan reaches the folders below the victim that the deletion removed, and ends. The program
+# says when the map without the victim is on the screen.
+[[steps]]
+step = "wait_refresh"
+timeout_ms = 120000
+
+[[steps]]
+step = "expect_screen"
+region = "header"
+not_contains = ["READ ERROR", "NEEDS REVIEW"]
+
+# The map has the entries the scan found, less the ones the deletion removed: the root and the
+# 249,254 that are left.
+[[steps]]
+step = "expect_screen"
+region = { rows = [1, 1] }
+regex = ["249255 items"]
+
+[[steps]]
+step = "expect_screen"
+region = { rows = [3, 29] }
+not_contains = ["victim"]
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
+absent = ["a-victim"]
+
+# Nothing the scan could not read: a quit is an exact one.
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
