@@ -1,0 +1,33 @@
+schema_version = 1
+id = "delete-file-while-scanning"
+description = "A file to delete while the scan is still running. `victim.bin` is the victim; `keep-a.bin` beside it and `docs/keep-0.txt` one folder down are the sentinels, and `docs/keep-1.txt` is a sibling that must survive too. `bulk/` holds 250,000 empty files in 250 folders, so that the scan of the root is still running when the first frame is drawn and the victim is on the screen."
+seed = 20261007
+
+[[parts]]
+kind = "file"
+root = "victim.bin"
+size = 49152
+
+[[parts]]
+kind = "file"
+root = "keep-a.bin"
+size = 16384
+
+[[parts]]
+kind = "tree"
+root = "docs"
+depth = 0
+files_per_dir = 2
+file_names = { style = "sequential", prefix = "keep-", suffix = ".txt" }
+file_size = 12288
+
+[[parts]]
+kind = "tree"
+root = "bulk"
+depth = 1
+fanout = 250
+files_per_dir = 1000
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "bucket", width = 3 }
+file_names = { style = "sequential", prefix = "t", suffix = ".dat", width = 4 }
+file_size = 0
