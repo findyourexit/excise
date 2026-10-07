@@ -33,6 +33,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             timing_informational: false
             pr_scenarios: >-
+              delete-file-while-scanning
               latency-under-deletion-load-deterministic
               latency-under-export-after-deletion
               latency-under-scan-load
@@ -55,6 +56,7 @@ jobs:
             target: aarch64-apple-darwin
             timing_informational: true
             pr_scenarios: >-
+              delete-file-while-scanning
               latency-under-deletion-load-deterministic
               latency-under-scan-load
               latency-under-slow-terminal

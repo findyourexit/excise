@@ -1,0 +1,90 @@
+schema_version = 1
+name = "delete-file-while-scanning"
+description = "A file deleted while the first scan is still running leaves the scan and its map alone: the map as it fills in stays on the screen and navigable, the scan goes on, and the map is rebuilt behind the one the scan ends with, which does not list the file."
+fixture = "delete-file-while-scanning"
+sentinels = ["keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default", "deterministic"]
+tier = "full"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+# The scan is still running: the badge must read SCANNING, so this never passes by outrunning it.
+[[steps]]
+step = "wait_header"
+state = "scanning"
+timeout_ms = 10000
+
+# The cursor lands on the victim, the largest entry, as the map fills in. The filter is not
+# available during a scan, so nothing could select it by name.
+[[steps]]
+step = "wait_text"
+text = "victim.bin"
+region = { rows = [31, 31] }
+timeout_ms = 10000
+
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+timeout_ms = 60000
+
+[[steps]]
+step = "wait_fs_absent"
+path = "victim.bin"
+timeout_ms = 30000
+
+# The deletion left the scan and its map alone: the header goes on counting the entries the scan
+# finds, and the badge still reads SCANNING while it does. A map taken away shows no entries until
+# the scan has ended, and the rebuild that then starts reads REBUILDING.
+[[steps]]
+step = "wait_text"
+regex = "[1-9][0-9]{5} items"
+region = { rows = [1, 1] }
+timeout_ms = 60000
+
+[[steps]]
+step = "expect_screen"
+region = "header"
+contains = ["SCANNING"]
+
+# The map is navigable meanwhile: a key is answered by a frame that reflects it.
+[[steps]]
+step = "key"
+key = "down"
+
+[[steps]]
+step = "settle"
+timeout_ms = 10000
+
+# The scan ends, and the map is rebuilt behind the one it ended with. The program says when the
+# rebuilt map is on the screen: the header cannot, because the map it replaces read COMPLETE too.
+[[steps]]
+step = "wait_refresh"
+timeout_ms = 120000
+
+[[steps]]
+step = "expect_screen"
+region = { rows = [1, 1] }
+regex = ["250256 items"]
+
+[[steps]]
+step = "expect_screen"
+region = { rows = [3, 29] }
+not_contains = ["victim.bin"]
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "docs/keep-0.txt"]
+absent = ["victim.bin"]
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"
