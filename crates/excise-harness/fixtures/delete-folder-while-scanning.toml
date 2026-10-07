@@ -1,0 +1,38 @@
+schema_version = 1
+id = "delete-folder-while-scanning"
+description = "A folder to delete while the scan is still running. `a-victim/` holds a 48 KiB file and, below it, a chain of three folders (`inner/inner/inner`), each holding one more 48 KiB file. Every other file of the tree is empty, so once its own listing is in the victim is the only entry of the root that has a size (a folder counts what is below it, never its own blocks), and the cursor lands on it. Its name sorts before every other entry of the root, so the cursor lands on it also if the first page of the live map is drawn before that listing is in: entries of equal size are ordered by path. `bulk/` is 249 folders of 1,000 empty files each. The scan reads folders in the order it finds them, so the two deepest folders of the victim's chain, which it finds only after it has read the one above them, come after all 249 of bulk's: when the deletion is made the scan is still running and those two have not been read. `keep-a.bin` beside the victim and `docs/keep-0.txt` one folder down are the sentinels, and `docs/keep-1.txt` is a sibling that must survive too."
+seed = 20261008
+
+[[parts]]
+kind = "file"
+root = "keep-a.bin"
+size = 0
+
+[[parts]]
+kind = "tree"
+root = "docs"
+depth = 0
+files_per_dir = 2
+file_names = { style = "sequential", prefix = "keep-", suffix = ".txt" }
+file_size = 0
+
+[[parts]]
+kind = "tree"
+root = "a-victim"
+depth = 3
+fanout = 1
+files_per_dir = 1
+dir_names = { style = "literal", name = "inner" }
+file_names = { style = "sequential", prefix = "part-", suffix = ".bin" }
+file_size = 49152
+
+[[parts]]
+kind = "tree"
+root = "bulk"
+depth = 1
+fanout = 249
+files_per_dir = 1000
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "bucket", width = 3 }
+file_names = { style = "sequential", prefix = "t", suffix = ".dat", width = 4 }
+file_size = 0
