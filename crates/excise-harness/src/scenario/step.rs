@@ -608,11 +608,14 @@ pub struct Settle {
     pub timeout_ms: u64,
 }
 
-/// Waits until the map on screen has caught up with the deletions the scenario has confirmed.
+/// Waits until the map the program holds has caught up with the deletions the scenario has
+/// confirmed.
 ///
-/// A deletion that removed entries leaves the map listing them until the program replaces it, with
-/// a rebuild of the whole map or with a map without the entries, and the program treats a quit
-/// while it does so as a cancellation, exit code 130. The step returns once the deletions
+/// A deletion that removed entries leaves that map listing them until the program replaces it,
+/// with a rebuild of the whole map or with a map without the entries: the screen leaves out an
+/// entry removed whole from the moment its deletion ends, and the sizes above it and the totals
+/// follow when the replacement lands. The program treats a quit while it does so as a
+/// cancellation, exit code 130. The step returns once the deletions
 /// confirmed so far have finished and the replacement of the last one that removed anything has
 /// landed, and then once a frame shows it. A deletion that removed nothing owes no refresh, so
 /// after one the step returns at once.

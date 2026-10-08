@@ -1,0 +1,75 @@
+schema_version = 1
+name = "delete-file-in-large-map-1m"
+description = "A file deleted from a completed map of a million entries, the size of a home folder, is off the screen when its deletion has finished and the departure has ended, and stays off it until the map without it replaces the one the program holds, which takes seconds here and longer on a slower machine. The map on screen still lists what survives. The nightly-tier size of delete-file-in-large-map-250k."
+fixture = "delete-file-1m"
+sentinels = ["keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default"]
+tier = "nightly"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 1800000
+
+# The cursor lands on the victim, the largest entry, once the scan is over.
+[[steps]]
+step = "wait_text"
+text = "victim.bin"
+region = { rows = [31, 31] }
+timeout_ms = 10000
+
+# Returns when the deletion has finished and its dialog is gone. The map without the file is not
+# there yet.
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+timeout_ms = 120000
+
+# The departure of a deleted entry takes at most 420 ms. The map without the file takes about nine
+# seconds to build on the machine this was measured on; no step here waits for it.
+[[steps]]
+step = "idle"
+after_ms = 1500
+window_ms = 100
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["victim.bin"]
+
+[[steps]]
+step = "expect_screen"
+region = { rows = [3, 29] }
+contains = ["keep-a.bin"]
+
+[[steps]]
+step = "wait_refresh"
+timeout_ms = 900000
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["victim.bin"]
+
+[[steps]]
+step = "expect_screen"
+region = { rows = [3, 29] }
+contains = ["keep-a.bin"]
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "docs/keep-0.txt"]
+absent = ["victim.bin"]
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"

@@ -35,6 +35,7 @@ jobs:
             pr_scenarios: >-
               delete-file-while-scanning
               delete-folder-while-scanning
+              delete-file-in-large-map-250k
               latency-under-deletion-load-deterministic
               latency-under-export-after-deletion
               latency-under-scan-load
