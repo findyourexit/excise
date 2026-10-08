@@ -2,7 +2,7 @@
 
 !!! warning "Release from an exact reviewed commit"
 
-    The current stable package version is `1.4.0`. This runbook defines the v1 release procedure. Candidate generation is read-only; publication is a separate reviewed action. Dated approval records are historical evidence, not instructions for a new publication.
+    The current stable package version is `1.4.1`. This runbook defines the v1 release procedure. Candidate generation is read-only; publication is a separate reviewed action. Dated approval records are historical evidence, not instructions for a new publication.
 
 ```mermaid
 flowchart LR

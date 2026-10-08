@@ -28,7 +28,7 @@ Excise combines an interactive storage map with careful space accounting, clear 
 ```console
 brew tap findyourexit/tap
 brew install findyourexit/tap/excise
-excise --version  # excise 1.4.0
+excise --version  # excise 1.4.1
 ```
 
 </details>
@@ -37,8 +37,8 @@ excise --version  # excise 1.4.0
 <summary><strong>crates.io</strong></summary>
 
 ```console
-cargo install excise --version 1.4.0 --locked
-excise --version  # excise 1.4.0
+cargo install excise --version 1.4.1 --locked
+excise --version  # excise 1.4.1
 ```
 
 </details>
@@ -60,7 +60,7 @@ x eget use findyourexit/excise
 <details>
 <summary><strong>Pre-built Binaries</strong></summary>
 
-Download the [v1.4.0 release](https://github.com/findyourexit/excise/releases/tag/v1.4.0) for macOS, Linux, and Windows, across Apple Silicon, Intel, or ARM systems.
+Download the [v1.4.1 release](https://github.com/findyourexit/excise/releases/tag/v1.4.1) for macOS, Linux, and Windows, across Apple Silicon, Intel, or ARM systems.
 
 Full support is limited to `x86_64` Linux, `AArch64` macOS, and `x86_64` Windows binaries at present. Each of these are built and tested.
 
@@ -75,7 +75,7 @@ Other binaries are also available, but they're build-only, and so support is con
 <summary><strong>Build From Source</strong></summary>
 
 ```console
-git clone --branch v1.4.0 --depth 1 https://github.com/findyourexit/excise.git
+git clone --branch v1.4.1 --depth 1 https://github.com/findyourexit/excise.git
 cd excise
 cargo install --path . --locked
 excise --version
@@ -84,7 +84,7 @@ excise --version
 [Nix](https://github.com/nixos/nix) users can run the tagged release without changing its lock file:
 
 ```console
-nix run github:findyourexit/excise/v1.4.0 -- --format table /path/to/inspect
+nix run github:findyourexit/excise/v1.4.1 -- --format table /path/to/inspect
 ```
 
 </details>
