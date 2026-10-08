@@ -67,6 +67,13 @@ pub struct Board {
     /// the same entry by name across every regeneration, or clears if that
     /// entry is genuinely gone.
     selection_locked: bool,
+    /// The cursor the reader placed was cleared because its entry is gone from what the board
+    /// lists, and they have not placed it again. A refresh that finds no cursor to carry arms
+    /// none meanwhile, whatever else it changes (a view the program changes included, such as
+    /// the filter a rebuilt map drops): a deletion never moves the cursor onto an entry the
+    /// reader did not choose. It ends when the reader places a cursor (`place_cursor`), opens
+    /// another folder or filter (`arm_afresh`), or zooms.
+    selection_cleared: bool,
     /// Zoom level held in each folder on the way down, restored on the way back
     /// up. The cursor is not stacked with it: coming out of a folder selects that
     /// folder by identity, which survives a layout the index would not.
@@ -121,6 +128,7 @@ impl Board {
             files: Vec::new(),
             selected_index: None,
             selection_locked: false,
+            selection_cleared: false,
             previous_zoom_levels: Vec::new(),
             zoom_level: 0,
             area: Rect {
@@ -168,6 +176,14 @@ impl Board {
         if !changed && !data_changed {
             return false;
         }
+        if !changed && self.holds_the_same_entries_as(&files) {
+            // A map built after the one on screen lists these entries again, under ids of its
+            // own (the map that replaces one a deletion left behind). Nothing is laid out again:
+            // ids from different maps are not the same entries, so matching them against the
+            // geometry already drawn would move tiles that have not changed.
+            self.adopt_node_ids(files);
+            return true;
+        }
         if changed && self.pending_pivot.is_none() && self.pending_pivot_geometry.is_none() {
             self.clear_retained_pivot();
         }
@@ -200,6 +216,45 @@ impl Board {
         self.files = files;
         self.fill_from_selected(selected.as_deref());
     }
+
+    /// Whether `files` lists the entries the board holds, in the order it holds them, and
+    /// differs from them in nothing but the ids.
+    fn holds_the_same_entries_as(&self, files: &[FileMetadata]) -> bool {
+        self.files.len() == files.len()
+            && self
+                .files
+                .iter()
+                .zip(files)
+                .all(|(held, listed)| held.is_same_entry_as(listed))
+    }
+
+    /// Gives every entry the board holds the id the map that lists `files` gave it, and leaves
+    /// the layout, the selection, and any movement under way as they are. The ids are replaced
+    /// all at once: one map's id for an entry can be another's for a different one.
+    fn adopt_node_ids(&mut self, files: Vec<FileMetadata>) {
+        let mut renumbered = self
+            .files
+            .iter()
+            .zip(&files)
+            .filter(|(held, listed)| held.node_id != listed.node_id)
+            .map(|(held, listed)| (held.node_id, listed.node_id))
+            .collect::<Vec<_>>();
+        renumbered.sort_unstable_by_key(|(held, _)| *held);
+        let renumber = |id: NodeId| {
+            renumbered
+                .binary_search_by_key(&id, |(held, _)| *held)
+                .map_or(id, |index| renumbered[index].1)
+        };
+        for tile in self.tiles.iter_mut().chain(&mut self.rendered_tiles) {
+            tile.node_id = renumber(tile.node_id);
+        }
+        for (node, _) in &mut self.transition_from {
+            *node = renumber(*node);
+        }
+        self.transition_from.sort_unstable_by_key(|(node, _)| *node);
+        self.files = files;
+    }
+
     /// Drops a resolved drill pivot once no movement remains. A stationary pivot
     /// is retained only for same-view scan arrivals. Resize and zoom are new
     /// layouts and must not make later entries grow from that old rectangle.
@@ -406,32 +461,40 @@ impl Board {
     fn fill_from_selected(&mut self, selected: Option<&OsStr>) {
         self.list_layout = self.area.width < 72;
         let had_candidate = selected.is_some();
-        let selected = selected
-            .and_then(|name| {
+        let carried = selected.and_then(|name| {
+            self.files
+                .iter()
+                .find(|file| file.name.as_os_str() == name && file.is_interactive())
+                .map(|file| file.node_id)
+        });
+        // The entry of a cursor the reader placed is gone: the cursor is cleared, and the
+        // refreshes that follow, which have no entry to carry, arm no other.
+        if had_candidate && carried.is_none() && self.selection_locked {
+            self.selection_cleared = true;
+        }
+        let selected = carried.or_else(|| {
+            if self.selection_cleared {
+                None
+            } else {
                 self.files
                     .iter()
-                    .find(|file| file.name.as_os_str() == name && file.is_interactive())
+                    .find(|file| file.is_interactive())
                     .map(|file| file.node_id)
-            })
-            .or_else(|| {
-                if had_candidate && self.selection_locked {
-                    None
-                } else {
-                    self.files
-                        .iter()
-                        .find(|file| file.is_interactive())
-                        .map(|file| file.node_id)
-                }
-            });
+            }
+        });
         self.tiles = self.lay_out_tiles(selected);
         self.selected_index =
             selected.and_then(|id| self.tiles.iter().position(|tile| tile.node_id == id));
         // The map holds a cursor only while an actionable entry is available, unless the
         // user has already chosen one: once locked, a candidate that no longer resolves
-        // clears the selection instead of auto-arming elsewhere, so a deletion can never
-        // silently retarget after the user has picked something.
+        // clears the selection instead of auto-arming elsewhere, and it stays cleared
+        // (`selection_cleared`) until the reader places the cursor again, so a deletion can
+        // never silently retarget after the user has picked something.
         if self.selected_index.is_none() && !self.selection_locked {
             self.select_largest();
+        }
+        if self.selected_index.is_some() {
+            self.selection_cleared = false;
         }
         let pivot_resolution = self.resolve_pivot();
         let drilling = pivot_resolution == PivotResolution::Resolved;
@@ -720,13 +783,28 @@ impl Board {
             .saturating_sub(self.list_offset.saturating_add(self.tiles.len()))
     }
     pub const fn set_selected_index(&mut self, next_index: usize) {
-        self.selected_index = Some(next_index);
+        self.place_cursor(Some(next_index));
     }
     pub const fn has_selected_index(&self) -> bool {
         self.selected_index.is_some()
     }
     pub const fn reset_selected_index(&mut self) {
         self.selected_index = None;
+    }
+    /// Forgets the cursor, and any clearing the board kept for an entry that vanished, so that
+    /// the next fill arms the largest entry as it does before the reader has placed a cursor.
+    /// It is for a view the reader opens (a folder, a filter), and for nothing a refresh does.
+    pub const fn arm_afresh(&mut self) {
+        self.selected_index = None;
+        self.selection_cleared = false;
+    }
+    /// Puts the cursor on tile `index`, or takes it away. A cursor placed ends the clearing
+    /// the board kept for the entry that vanished (`selection_cleared`).
+    const fn place_cursor(&mut self, index: Option<usize>) {
+        self.selected_index = index;
+        if index.is_some() {
+            self.selection_cleared = false;
+        }
     }
     /// Returns the selected entry's data from the settled layout.
     ///
@@ -791,7 +869,7 @@ impl Board {
             })
             .filter(|index| self.tiles.get(*index).is_some_and(Tile::is_interactive));
         if let Some(index) = selected {
-            self.selected_index = Some(index);
+            self.place_cursor(Some(index));
             true
         } else {
             false
@@ -958,7 +1036,8 @@ impl Board {
         }
         let id = self.files[next].node_id;
         self.fill();
-        self.selected_index = self.tiles.iter().position(|tile| tile.node_id == id);
+        let placed = self.tiles.iter().position(|tile| tile.node_id == id);
+        self.place_cursor(placed);
     }
     /// Selects the biggest actionable entry in the folder.
     ///
@@ -967,7 +1046,8 @@ impl Board {
     /// Callers must not use this to retarget a selection the user already made;
     /// see `fill_from_selected`'s `selection_locked` handling.
     pub fn select_largest(&mut self) {
-        self.selected_index = self.tiles.iter().position(Tile::is_interactive);
+        let largest = self.tiles.iter().position(Tile::is_interactive);
+        self.place_cursor(largest);
     }
 
     /// Moves a selection the user has not chosen onto the largest actionable
@@ -1007,7 +1087,7 @@ impl Board {
             .iter()
             .position(|tile| tile.node_id == node && tile.is_interactive())
         {
-            self.selected_index = Some(index);
+            self.place_cursor(Some(index));
             return true;
         }
         if let Some(name) = self
@@ -1035,6 +1115,7 @@ impl Board {
             self.zoom_level += 1;
             self.list_offset = 0;
             self.files = files;
+            self.selection_cleared = false;
             self.fill_from_selected(None);
         }
     }
@@ -1045,6 +1126,7 @@ impl Board {
             self.zoom_level -= 1;
             self.list_offset = 0;
             self.files = files;
+            self.selection_cleared = false;
             self.fill_from_selected(None);
         }
     }
@@ -1054,6 +1136,7 @@ impl Board {
         self.zoom_level = 0;
         self.list_offset = 0;
         self.files = files;
+        self.selection_cleared = false;
         self.fill_from_selected(None);
     }
 
@@ -1228,6 +1311,125 @@ mod tests {
         );
         assert!(board.select_node(NodeId(1)));
         assert!(!board.select_node(NodeId(2)));
+    }
+
+    /// The entries `ids` name, laid out by `weights`: the dataset a map lists for one folder.
+    fn listing(ids: [u32; 3], weights: [f64; 3]) -> Vec<FileMetadata> {
+        ["docs", "keep", "marker"]
+            .into_iter()
+            .zip(ids)
+            .zip(weights)
+            .map(|((name, id), weight)| file_named(id, name, weight))
+            .collect()
+    }
+
+    /// What a frame draws of `tiles`: each entry's name and rectangle.
+    fn drawn(tiles: &[Tile]) -> Vec<(OsString, u16, u32, u16, u32)> {
+        tiles
+            .iter()
+            .map(|tile| (tile.name.clone(), tile.x, tile.y, tile.width, tile.height))
+            .collect()
+    }
+
+    /// A map built after the one on screen lists the same entries under ids of its own, as the
+    /// map that replaces one a deletion left behind does, and its ids overlap the old ones: the
+    /// old map's entry 2 is not the new map's. Matching them by id would send tiles that have not
+    /// changed flying from each other's places.
+    #[test]
+    fn the_same_entries_under_the_ids_of_a_newer_map_stay_where_they_are() {
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files_for_view(listing([2, 3, 4], [0.55, 0.36, 0.09]), NodeId(0), None);
+        board.advance_geometry(Duration::ZERO, true);
+        assert!(!board.is_transitioning());
+        assert!(board.select_node(NodeId(3)));
+        let laid_out = drawn(&board.tiles);
+
+        assert!(board.change_files_for_view(
+            listing([1, 2, 3], [0.55, 0.36, 0.09]),
+            NodeId(0),
+            None
+        ));
+
+        assert!(
+            !board.is_transitioning(),
+            "no tile has a place to move from"
+        );
+        assert_eq!(drawn(&board.tiles), laid_out);
+        assert_eq!(drawn(board.rendered_tiles()), laid_out);
+        let ids = |tiles: &[Tile]| tiles.iter().map(|tile| tile.node_id).collect::<Vec<_>>();
+        assert_eq!(ids(&board.tiles), [NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(
+            ids(board.rendered_tiles()),
+            [NodeId(1), NodeId(2), NodeId(3)]
+        );
+        assert_eq!(
+            board
+                .currently_selected()
+                .map(|tile| (tile.name.clone(), tile.node_id)),
+            Some((OsString::from("keep"), NodeId(2))),
+            "the cursor stays on the entry it was on, under its new id"
+        );
+    }
+
+    /// A movement under way goes on when the ids change under it, from where the tiles are drawn
+    /// and at the pace they were moving, to the layout it was heading for. A board whose ids never
+    /// changed is the measure. Ids of another order are the hard case: the origins of the
+    /// movement are looked up by id, and a lookup that misses sends a tile from another's place.
+    #[test]
+    fn a_movement_under_way_goes_on_under_the_ids_of_a_newer_map() {
+        let under_way = |ids: [u32; 3]| {
+            let mut board = Board::new();
+            board.change_area(Rect::new(0, 0, 80, 24));
+            board.change_files_for_view(listing(ids, [0.55, 0.36, 0.09]), NodeId(0), None);
+            board.advance_geometry(Duration::ZERO, true);
+            board.change_files_for_view(listing(ids, [0.20, 0.30, 0.50]), NodeId(0), None);
+            board.advance_geometry(Duration::from_millis(50), false);
+            board
+        };
+        let mut twin = under_way([2, 3, 4]);
+        let mut board = under_way([2, 3, 4]);
+        assert!(board.is_transitioning());
+        let on_screen = drawn(board.rendered_tiles());
+        assert_ne!(on_screen, drawn(&board.tiles));
+
+        assert!(board.change_files_for_view(
+            listing([3, 1, 2], [0.20, 0.30, 0.50]),
+            NodeId(0),
+            None
+        ));
+
+        assert!(board.is_transitioning());
+        assert_eq!(drawn(board.rendered_tiles()), on_screen, "no tile jumps");
+        for now in [100, 130, 160, 220] {
+            board.advance_geometry(Duration::from_millis(now), false);
+            twin.advance_geometry(Duration::from_millis(now), false);
+            assert_eq!(
+                drawn(board.rendered_tiles()),
+                drawn(twin.rendered_tiles()),
+                "{now} ms into the movement"
+            );
+        }
+        board.advance_geometry(Duration::from_secs(5), false);
+        assert!(!board.is_transitioning());
+        assert_eq!(drawn(board.rendered_tiles()), drawn(&board.tiles));
+    }
+
+    /// Entries that differ from the ones on screen in anything but their ids are laid out again.
+    #[test]
+    fn entries_that_changed_under_the_ids_of_a_newer_map_are_laid_out_again() {
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files_for_view(listing([2, 3, 4], [0.55, 0.36, 0.09]), NodeId(0), None);
+        board.advance_geometry(Duration::ZERO, true);
+
+        assert!(board.change_files_for_view(
+            listing([1, 2, 3], [0.20, 0.30, 0.50]),
+            NodeId(0),
+            None
+        ));
+
+        assert!(board.is_transitioning());
     }
 
     fn reordered_board_mid_tween() -> Board {
@@ -2044,6 +2246,147 @@ mod tests {
 
     fn selected_name(board: &Board) -> Option<OsString> {
         board.currently_selected().map(|tile| tile.name.clone())
+    }
+
+    /// The reader clicks the tile of `name`, which places the cursor on it and locks the cursor.
+    fn click_on(board: &mut Board, name: &str) {
+        board.advance_geometry(Duration::ZERO, true);
+        let tile = board
+            .tiles
+            .iter()
+            .find(|tile| tile.name == name)
+            .cloned()
+            .expect("the entry should have a tile");
+        let row = u16::try_from(tile.top_row()).expect("the test pane fits in a terminal row");
+        assert!(board.select_at(tile.x.saturating_add(1), row));
+        assert_eq!(selected_name(board), Some(OsString::from(name)));
+    }
+
+    /// The entry of the cursor the reader placed is gone, and the cursor is cleared. It stays
+    /// cleared through every refresh that follows, whatever the refresh changes and wherever it
+    /// comes from (a page of a scan, a map that replaces the one on screen, a resize), until the
+    /// reader places it again: a deletion never moves the cursor onto an entry they did not
+    /// choose.
+    #[test]
+    fn a_cursor_cleared_for_a_vanished_entry_stays_cleared_until_the_reader_places_it_again() {
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files(vec![
+            file_named(0, "large", 0.7),
+            file_named(1, "small", 0.3),
+        ]);
+        click_on(&mut board, "small");
+
+        board.change_files(vec![file_named(0, "large", 1.0)]);
+        assert_eq!(
+            selected_name(&board),
+            None,
+            "the entry the reader chose is gone"
+        );
+
+        board.change_files(vec![
+            file_named(0, "large", 0.8),
+            file_named(1, "late", 0.2),
+        ]);
+        assert_eq!(
+            selected_name(&board),
+            None,
+            "a page that lists more arms no cursor"
+        );
+        board.change_files(vec![
+            file_named(0, "late", 0.6),
+            file_named(1, "large", 0.4),
+        ]);
+        assert_eq!(
+            selected_name(&board),
+            None,
+            "nor does one that lists the entries in another order"
+        );
+        board.change_area(Rect::new(0, 0, 100, 30));
+        assert_eq!(selected_name(&board), None, "nor does a resize");
+
+        board.move_selected_right();
+        let chosen = selected_name(&board);
+        assert!(chosen.is_some(), "the reader places the cursor again");
+        board.change_files(vec![
+            file_named(0, "large", 0.5),
+            file_named(1, "late", 0.5),
+        ]);
+        assert_eq!(
+            selected_name(&board),
+            chosen,
+            "and it follows its entry through the next refresh, as any cursor the reader placed"
+        );
+    }
+
+    /// A board whose reader clicked the cursor onto `small`, and whose entry has since gone: the
+    /// cursor is cleared.
+    fn board_with_a_cleared_cursor() -> Board {
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 24));
+        board.change_files_for_view(
+            vec![file_named(0, "large", 0.7), file_named(1, "small", 0.3)],
+            NodeId(1),
+            None,
+        );
+        click_on(&mut board, "small");
+        board.change_files_for_view(vec![file_named(0, "large", 1.0)], NodeId(1), None);
+        assert_eq!(selected_name(&board), None);
+        board
+    }
+
+    /// A cursor cleared for a vanished entry stays cleared when the program changes the view
+    /// under it: the map that replaces the one on screen can drop the filter the reader
+    /// applied, and a refresh is not a choice. The board arms no cursor for it.
+    #[test]
+    fn a_cleared_cursor_stays_cleared_when_the_program_changes_the_view() {
+        let mut board = board_with_a_cleared_cursor();
+
+        board.change_files_for_view(vec![file_named(0, "large", 1.0)], NodeId(1), Some("lar"));
+        assert_eq!(selected_name(&board), None, "a filter the program applies");
+        board.change_files_for_view(vec![file_named(0, "large", 1.0)], NodeId(1), None);
+        assert_eq!(selected_name(&board), None, "a filter the program drops");
+        board.change_files_for_view(
+            vec![file_named(5, "inner-a", 0.6), file_named(6, "inner-b", 0.4)],
+            NodeId(2),
+            None,
+        );
+        assert_eq!(selected_name(&board), None, "a folder the program shows");
+    }
+
+    /// A folder, a filter, or a zoom level the reader opens lays the board out afresh, and arms
+    /// the largest entry as it does before the reader has placed a cursor.
+    #[test]
+    fn a_cleared_cursor_is_armed_again_when_the_reader_opens_another_view() {
+        let mut board = board_with_a_cleared_cursor();
+        board.arm_afresh();
+        board.change_files_for_view(
+            vec![file_named(5, "inner-a", 0.6), file_named(6, "inner-b", 0.4)],
+            NodeId(2),
+            None,
+        );
+        assert_eq!(
+            selected_name(&board),
+            Some(OsString::from("inner-a")),
+            "another folder"
+        );
+
+        let mut board = board_with_a_cleared_cursor();
+        board.arm_afresh();
+        board.change_files_for_view(vec![file_named(0, "large", 1.0)], NodeId(1), Some("lar"));
+        assert_eq!(
+            selected_name(&board),
+            Some(OsString::from("large")),
+            "another filter"
+        );
+
+        let mut board = board_with_a_cleared_cursor();
+        board.zoom_in(vec![file_named(0, "large", 1.0)]);
+        assert_eq!(
+            selected_name(&board),
+            Some(OsString::from("large")),
+            "another zoom level"
+        );
     }
 
     #[test]

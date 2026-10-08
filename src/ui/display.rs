@@ -3489,7 +3489,7 @@ mod tests {
 
         let mut board = Board::new();
         board.change_area(Rect::new(0, 0, 78, 10));
-        board.change_files(tree.files_in_current_folder(0, true));
+        board.change_files(tree.files_in_current_folder(0, true, &[]));
         board.set_selected_index(0);
         let area = Rect::new(0, 0, 80, INSPECTOR_HEIGHT);
         let mut buffer = Buffer::empty(area);
@@ -3585,7 +3585,7 @@ mod tests {
         let (tree, entry) = concrete_file_tree(root.path(), &path, &metadata, &identity);
         let mut board = Board::new();
         board.change_area(Rect::new(0, 0, 80, 10));
-        board.change_files(tree.files_in_current_folder(0, true));
+        board.change_files(tree.files_in_current_folder(0, true, &[]));
         board.set_selected_index(0);
         let relative = entry.path.clone();
         let target = SnapshotTree::deletion_target_from_entry(
@@ -3715,7 +3715,7 @@ mod tests {
         .expect("provisional snapshot should fit");
         let mut board = Board::new();
         board.change_area(Rect::new(0, 0, 78, 10));
-        board.change_files(tree.files_in_current_folder(0, true));
+        board.change_files(tree.files_in_current_folder(0, true, &[]));
         board.set_selected_index(0);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 80, INSPECTOR_HEIGHT));
         render_inspector(

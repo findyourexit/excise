@@ -29,6 +29,32 @@ impl FileMetadata {
     pub const fn is_interactive(&self) -> bool {
         !matches!(self.synthetic_kind, Some(SyntheticKind::Shared))
     }
+
+    /// Whether `other` is this entry as another map lists it: the name, kind, and weights are
+    /// the same, and only the id that map gave it can differ. A field added to the entry has to
+    /// be taken into account here: the destructuring names every one.
+    #[must_use]
+    pub fn is_same_entry_as(&self, other: &Self) -> bool {
+        let Self {
+            node_id: _,
+            name,
+            size,
+            apparent_size,
+            descendants,
+            percentage,
+            file_type,
+            synthetic_kind,
+            uncertain,
+        } = self;
+        *name == other.name
+            && *size == other.size
+            && *apparent_size == other.apparent_size
+            && *descendants == other.descendants
+            && percentage.to_bits() == other.percentage.to_bits()
+            && *file_type == other.file_type
+            && *synthetic_kind == other.synthetic_kind
+            && *uncertain == other.uncertain
+    }
 }
 
 fn calculate_percentage(size: u128, total_size: u128, total_files_in_parent: usize) -> f64 {
