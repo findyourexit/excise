@@ -44,10 +44,10 @@ File-system limitations are documented in [Support](https://github.com/findyoure
     cargo install --path . --locked
     ```
 
-=== "crates.io 1.4.0"
+=== "crates.io 1.4.1"
 
     ```console
-    cargo install excise --version 1.4.0 --locked
+    cargo install excise --version 1.4.1 --locked
     excise --version
     ```
 
