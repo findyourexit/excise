@@ -414,9 +414,11 @@ Details that a table cannot carry:
   label, or `! ELEVATED` on an elevated Windows session such as the hosted runner), so `select`
   cannot read the prompt there; a scenario at that width leaves selected the entry that the fresh
   map selects (the largest) instead of choosing one.
-- **`wait_refresh`.** A deletion that removed entries leaves the map listing them until the program
-  replaces it, either with a rebuild of the whole map (after a file that may have had another
-  link: one whose last link the program did not see go) or with a map that leaves them out. A
+- **`wait_refresh`.** A deletion that removed a target whole takes it off the screen when it ends,
+  but the map the program holds lists it, and the sizes above it and the header's totals count it,
+  until the program replaces that map, either with a rebuild of the whole map (after a file that
+  may have had another link: one whose last link the program did not see go) or with a map that
+  leaves them out. A
   quit while a rebuild is running cancels it and exits 130, not 0; one before a rebuild that the
   map is owed has started exits 2, and one before an overlay lands exits with the map as it
   stands. Nothing on the screen says when
@@ -513,8 +515,15 @@ asserts the facts by name (what is on disk, what the dialog names, what the inte
 the run ends) and not whole frames.
 
 A scenario that deletes something waits with `wait_refresh` before it asserts the outcome and
-before it quits: until the program has replaced the map, the map still lists what was removed, and
-a quit while a rebuild is running exits 130, and one before it has started exits 2.
+before it quits: until the program has replaced the map, the map it holds still lists what was
+removed, and counts it in the sizes above it and the header's totals, and a quit while a rebuild
+is running exits 130, and one before it has started exits 2. The screen does not list what a
+deletion removed whole, from the moment it has ended (a partial removal keeps its target listed,
+because part of it is still there), so a scenario may assert that before the wait,
+and two do (`delete-file-in-large-map-250k` and `delete-file-in-large-map-1m`): a wait that
+follows every `delete` hides the window in which the map is behind the screen, which a map of a
+few thousand entries closes in a few milliseconds and a map of a million entries keeps open for
+seconds.
 
 What the interface reports is read from the header's status row (`Last deletion: 1 deleted · 0
 changed · 0 missing · 0 failed · 0 not run`), which shows it after a deletion whatever is
@@ -542,6 +551,8 @@ which depends on the platform.
 | `delete-folder-lifecycle` | `delete-folder` | The same for a folder of 5,011 entries. |
 | `delete-file-while-scanning` | `delete-file-while-scanning` | A file deleted while the first scan is still running leaves the scan and its map alone: the header goes on counting entries under a `SCANNING` badge, a key is answered, and once the scan ends a map without the file replaces the first one (a rebuild behind it instead, where the removal cannot be described). `full` tier; Linux and macOS. |
 | `delete-folder-while-scanning` | `delete-folder-while-scanning` | A folder deleted while the first scan is still running, with folders below it that the scan has not read yet, is no failure of the scan: the header goes on counting entries under a `SCANNING` badge with no `READ ERROR`, a key is answered, and once the scan ends a map without the folder replaces the first one (a rebuild behind it instead, where the removal cannot be described) and holds every other entry the scan found, and the program exits 0, not 2. `full` tier; Linux and macOS. |
+| `delete-file-in-large-map-250k` | `delete-file-while-scanning` | A file deleted from a completed map of 249,255 entries is off the screen, in the map and in the selected-item panel, when its deletion has ended and the departure is over, and the map still lists what survives; and the same once the map without it has landed. That map is a pass over every entry, about 2 s at this size on the machine this was written on, and the first look is made 0.8 s after the confirmation: it falls inside the pass on a machine that takes longer than that, and holds trivially on one that is quicker (the million-entry scenario keeps its margin). `full` tier; Linux and macOS. |
+| `delete-file-in-large-map-1m` | `delete-file-1m` | The same for a map of a million entries, the size of a home folder, where the map without the file takes about nine seconds to build on the machine it was measured on. `nightly` tier; Linux and macOS. |
 | `delete-tree-confirmed-with-enter` | `nested` | Enter confirms, and a folder goes with the folder inside it while the files beside it stay. |
 | `delete-tree-narrow-terminal` | `nested` | The same in a terminal 60 columns wide. Linux and macOS: on Windows the fixture's path (under the runner's temporary directory, every backslash doubled on screen) is longer than a 60-column dialog shows, and the `delete` step refuses a path it cannot read whole. |
 | `delete-file-cancelled` | `delete-file` | The first Backspace of a fresh map opens the confirmation for the largest entry; `n` closes it, and nothing is touched. |
@@ -805,8 +816,9 @@ checks that directly.
   result. `wait_for = "started"` ends it
   as soon as a frame shows the dialog has closed, without waiting for the deletion itself: the
   deletion keeps running after the step returns, so a step
-  that needs its outcome waits for that separately (`wait_fs_absent`, `wait_event`). The map still
-  lists what the deletion removed when the step returns, and the program treats a quit while a
+  that needs its outcome waits for that separately (`wait_fs_absent`, `wait_event`). The map the
+  program holds still lists what the deletion removed when the step returns (the screen does not
+  list what it removed whole), and the program treats a quit while a
   rebuild of that map is running as a cancellation (exit code 130; before the rebuild has started
   the exit code is 2, and before an overlay lands the program exits with the map as it stands): a
   scenario that goes on to quit waits
@@ -2858,8 +2870,9 @@ marker.
 | `all-classes-small` | 253 | Every class once, in one fixture. |
 | `delete-folder` | 5,014 | A 5,000-entry victim for deletion scenarios. |
 | `delete-file` | 5 | A 48 KiB victim file, a sentinel beside it, and a folder below it with two more files that must survive. The in-process lifecycle scenario deletes the victim. |
-| `delete-file-while-scanning` | 249,255 | `victim.bin`, a 48 KiB file that is the largest entry as soon as the root is listed, so the cursor lands on it while the scan runs; `keep-a.bin` and `docs/keep-0.txt` as sentinels, with `docs/keep-1.txt` beside the second; and `bulk/`, 249,000 empty files in 249 folders, so that the scan is still running when the scenario deletes the victim. |
+| `delete-file-while-scanning` | 249,255 | `victim.bin`, a 48 KiB file that is the largest entry as soon as the root is listed, so the cursor lands on it while the scan runs; `keep-a.bin` and `docs/keep-0.txt` as sentinels, with `docs/keep-1.txt` beside the second; and `bulk/`, 249,000 empty files in 249 folders, so that the scan is still running when the scenario deletes the victim. `delete-file-in-large-map-250k` deletes the same victim from the completed map instead. |
 | `delete-folder-while-scanning` | 249,262 | `a-victim/`, a 48 KiB file and a chain of three folders below it (`inner/inner/inner`) that hold one such file each, the only entry of the root that has a size once its own listing is in, and named to sort before every other entry of the root, so the cursor lands on it while the scan runs; `keep-a.bin` and `docs/keep-0.txt` as sentinels, with `docs/keep-1.txt` beside the second (all three empty); and `bulk/`, 249,000 empty files in 249 folders, which the scan reads before the two deepest folders of the chain, so that the scan is still running when the scenario deletes the victim and those two have not been read. |
+| `delete-file-1m` | 1,001,006 | `victim.bin`, a 48 KiB file that is the largest entry, so the cursor lands on it once the scan is over; `keep-a.bin` and `docs/keep-0.txt` as sentinels, with `docs/keep-1.txt` beside the second; and `bulk/`, 1,000,000 empty files in 1,000 folders: a file to delete from a map the size of a home folder, where the map without it takes seconds to build. For nightly and manual tiers only: tests never generate it. |
 | `nested` | 8 | A folder with a folder inside it, and files beside it: `victim/` holds two files and `inner/`, which holds two more (32 KiB in all, the largest entry, so a fresh map selects it), and `keep-a.bin` and `keep-b.bin` (16 KiB each) are the sentinels. The id is short on purpose: a terminal 60 columns wide cuts a longer path in the deletion dialog. |
 | `refused` | 4 | A file that cannot be deleted: `hostile/unwritable/stuck.txt`, in a mode 555 directory, and `keep-a.bin` beside it as a sentinel. It needs permission modes and a user that is not root (Linux and macOS), and it is never cached: take a run copy. The id is short on purpose: the deletion dialog cuts a long path, and the `delete` step refuses to confirm a path it cannot read whole. |
 | `twins` | 4 | Two files called `twin.bin`, one at the root (the largest entry, so a fresh map selects it) and one in `docs/`, and `keep-a.bin` beside them as a sentinel. The selected-item panel shows a name and a kind and nothing else, so it cannot tell the twins apart: the controls for a `delete` step with no `path`, or with no dialog, use it. |

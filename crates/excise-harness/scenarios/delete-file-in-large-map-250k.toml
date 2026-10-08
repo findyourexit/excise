@@ -1,0 +1,81 @@
+schema_version = 1
+name = "delete-file-in-large-map-250k"
+description = "A file deleted from a completed map of 249,255 entries is off the screen when its deletion has finished and the departure has ended, though the map without it may still be being built: that is a pass over every entry, and takes seconds at this size and longer for more entries, so for that long the map the program holds still lists the file. The screen must not: no entry the reader confirmed removed comes back onto it, on the map or in the selected-item panel, and the map still lists what survives."
+fixture = "delete-file-while-scanning"
+sentinels = ["keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default", "deterministic"]
+tier = "full"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 1200000
+
+# The cursor lands on the victim, the largest entry, once the scan is over.
+[[steps]]
+step = "wait_text"
+text = "victim.bin"
+region = { rows = [31, 31] }
+timeout_ms = 10000
+
+# Returns when the deletion has finished and its dialog is gone. The map without the file is not
+# there yet.
+[[steps]]
+step = "delete"
+name = "victim.bin"
+kind = "file"
+timeout_ms = 60000
+
+# The departure of a deleted entry takes at most 420 ms, and where motion is reduced there is none.
+# Whatever comes after is the map as it stands while the program builds the one without the file,
+# and the file must not be on it. No step here waits for that map: the check below is made while
+# it is still owed. It takes about 2 s at this size on the machine this was written on, so the
+# checks bite only where it takes longer than the 0.8 s above; on a machine that builds it faster
+# they hold trivially, and delete-file-in-large-map-1m keeps its margin.
+[[steps]]
+step = "idle"
+after_ms = 700
+window_ms = 100
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["victim.bin"]
+
+[[steps]]
+step = "expect_screen"
+region = { rows = [3, 29] }
+contains = ["keep-a.bin"]
+
+# The program says when the map without the file is the one on screen: the header cannot, because
+# the map it replaces read COMPLETE too.
+[[steps]]
+step = "wait_refresh"
+timeout_ms = 300000
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["victim.bin"]
+
+[[steps]]
+step = "expect_screen"
+region = { rows = [3, 29] }
+contains = ["keep-a.bin"]
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "docs/keep-0.txt"]
+absent = ["victim.bin"]
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"

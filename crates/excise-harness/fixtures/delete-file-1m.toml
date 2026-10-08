@@ -1,0 +1,33 @@
+schema_version = 1
+id = "delete-file-1m"
+description = "A file to delete from a map of a million entries, the size of a home folder, where the map without a deleted file takes seconds to build. `victim.bin` is the victim, and the largest entry, so the cursor lands on it; `keep-a.bin` beside it and `docs/keep-0.txt` one folder down are the sentinels, and `docs/keep-1.txt` is a sibling that must survive too. `bulk/` holds 1,000,000 empty files in 1,000 folders. For the nightly and manual tiers only: tests never generate it."
+seed = 20261008
+
+[[parts]]
+kind = "file"
+root = "victim.bin"
+size = 49152
+
+[[parts]]
+kind = "file"
+root = "keep-a.bin"
+size = 16384
+
+[[parts]]
+kind = "tree"
+root = "docs"
+depth = 0
+files_per_dir = 2
+file_names = { style = "sequential", prefix = "keep-", suffix = ".txt" }
+file_size = 12288
+
+[[parts]]
+kind = "tree"
+root = "bulk"
+depth = 1
+fanout = 1000
+files_per_dir = 1000
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "bucket", width = 3 }
+file_names = { style = "sequential", prefix = "t", suffix = ".dat", width = 4 }
+file_size = 0

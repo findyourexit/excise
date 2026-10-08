@@ -453,11 +453,12 @@ impl Executor<'_> {
         }
     }
 
-    /// `wait_refresh`: waits until the map on screen has caught up with the deletions confirmed so
-    /// far, and for the frame that shows it.
+    /// `wait_refresh`: waits until the map the program holds has caught up with the deletions
+    /// confirmed so far, and for the frame that shows it.
     ///
-    /// A deletion that removed entries leaves the map listing them until the program replaces it,
-    /// and a quit meanwhile cancels the replacement (exit code 130). The step needs every
+    /// A deletion that removed entries leaves that map listing them until the program replaces it
+    /// (the screen leaves out what was removed whole at once), and a quit meanwhile cancels the
+    /// replacement (exit code 130). The step needs every
     /// confirmed deletion to have reported (`deletion_finished`), and then the program's
     /// `refresh_finished` after the last report that removed something: a refresh that ended
     /// before that deletion is no answer, which is why no `wait_event` can name the event. A
