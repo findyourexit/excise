@@ -2489,10 +2489,13 @@ xtask` command, and the prompt says so. Agents never run it (`AGENTS.md`).
 It runs on macOS and Linux and refuses everywhere else: it has to end everything it starts, with an
 interrupt handler and by killing a program's whole process group, and Windows has neither. The
 library builds and its tests run on Windows too (where the screen is not exact, `ConPTY` paints on
-its own timer, so latency comes from frame events and no decision rests on the screen). The
-library entry, `excise_harness::soak::run_soak`, takes the root directly, and the tests use it, on
-fixtures and scratch trees only. The code is [`src/soak`](src/soak); `xtask/src/soak.rs` asks and
-prints, and `xtask/src/soak_build.rs` builds the binary.
+its own timer, so latency comes from frame events and no key that could delete is chosen from the
+screen; a read takes the screen model, after the paint that follows a frame's mark has come or the
+window for it has passed, and reads on for a later paint, because `ConPTY` passes the mark on
+before the paint of its frame and the last frame of a scan has no later mark to wait for).
+The library entry, `excise_harness::soak::run_soak`, takes the root directly, and the tests use it,
+on fixtures and scratch trees only. The code is [`src/soak`](src/soak); `xtask/src/soak.rs` asks
+and prints, and `xtask/src/soak_build.rs` builds the binary.
 
 ### Why it cannot delete
 
