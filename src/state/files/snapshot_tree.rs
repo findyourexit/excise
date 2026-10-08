@@ -377,16 +377,25 @@ impl SnapshotTree {
         })
     }
 
+    /// The entries the board lists for the folder on screen.
+    ///
+    /// `removed` are targets that deletions took off the file system after the map this page
+    /// comes from was built. The page still lists them, and the map that leaves them out is yet
+    /// to arrive, so neither they nor anything below them is listed: what the reader confirmed
+    /// removed does not come back onto the screen. Everything else on the page, sizes included,
+    /// is as the map says.
     #[must_use]
     pub(crate) fn files_in_current_folder(
         &self,
         offset: usize,
         show_apparent_size: bool,
+        removed: &[RelativePath],
     ) -> Vec<FileMetadata> {
         let files = self
             .current_node()
             .children
             .iter()
+            .filter(|id| !self.is_removed(**id, removed))
             .filter_map(|id| self.node(*id))
             .map(|node| {
                 let size = if show_apparent_size {
@@ -421,6 +430,13 @@ impl SnapshotTree {
             })
             .collect::<Vec<_>>();
         normalize_file_metadata(files, offset)
+    }
+
+    /// Whether `id` is one of the `removed` targets, or lies below one. The shared-allocation
+    /// summary names no path and is never removed.
+    fn is_removed(&self, id: NodeId, removed: &[RelativePath]) -> bool {
+        self.relative_for_id(id)
+            .is_some_and(|relative| removed.iter().any(|target| relative.starts_with(target)))
     }
 
     /// Builds an identity-bound deletion target from one immutable canonical entry.
@@ -842,7 +858,7 @@ mod tests {
             (0, 4 * 1024 * 1024),
         )
         .expect("snapshot should materialize");
-        let files = tree.files_in_current_folder(0, false);
+        let files = tree.files_in_current_folder(0, false, &[]);
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|file| file.name == "entry"));
         assert!(
@@ -855,6 +871,72 @@ mod tests {
                 .iter()
                 .find(|file| file.synthetic_kind == Some(SyntheticKind::Shared))
                 .is_some_and(|file| !file.is_interactive())
+        );
+    }
+
+    /// A page lists what its map listed when it was built. The targets deletions have removed
+    /// since, and what lies below them, are left out of the listing, and nothing else is: a name
+    /// that only starts like a target's is another entry, and a folder above a removed target is
+    /// still there.
+    #[test]
+    fn the_listing_leaves_out_removed_targets_and_what_lies_below_them() {
+        let root = tempfile::tempdir().expect("snapshot root should exist");
+        let listing = |folder: &str, entries: &[&str], removed: &[&str]| {
+            let mut page = page(if folder.is_empty() {
+                RelativePath::root()
+            } else {
+                path(folder)
+            });
+            page.shared_allocation = None;
+            page.entries = entries
+                .iter()
+                .map(|entry| ScanPageEntry {
+                    path: path(entry),
+                    kind: PageEntryKind::File,
+                    metrics: SummaryMetrics::leaf(4, ByteBounds::exact(4), ByteBounds::exact(4)),
+                    coverage: Coverage::Complete,
+                    snapshot: None,
+                })
+                .collect();
+            let tree = SnapshotTree::from_page(
+                root.path().to_path_buf(),
+                page,
+                64 * 1024,
+                (0, 4 * 1024 * 1024),
+            )
+            .expect("snapshot should materialize");
+            let removed = removed
+                .iter()
+                .map(|target| path(target))
+                .collect::<Vec<_>>();
+            let mut names = tree
+                .files_in_current_folder(0, false, &removed)
+                .into_iter()
+                .map(|file| file.name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+
+        let top = ["target", "target-two", "survivor"];
+        assert_eq!(listing("", &top, &[]), ["survivor", "target", "target-two"]);
+        assert_eq!(listing("", &top, &["target"]), ["survivor", "target-two"]);
+        assert_eq!(
+            listing("", &top, &["target", "survivor"]),
+            ["target-two"],
+            "every removed target is left out"
+        );
+
+        let inner = ["outer/a", "outer/b"];
+        assert_eq!(listing("outer", &inner, &["outer/a"]), ["b"]);
+        assert!(
+            listing("outer", &inner, &["outer"]).is_empty(),
+            "the page of a folder that was removed lists nothing: all of it is gone with it"
+        );
+        assert_eq!(
+            listing("outer", &inner, &["outer/a/deeper"]),
+            ["a", "b"],
+            "an entry above a removed target is still there"
         );
     }
 

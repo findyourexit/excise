@@ -68,6 +68,13 @@ const MAX_RETAINED_DELETION_REPORTS: usize = 32;
 /// the number of deletions.
 const MAX_REMOVALS_BEFORE_FIRST_MAP: usize = 8;
 
+/// How many removals the reader's view may leave out of a map that still lists them
+/// ([`App::removed_but_listed`]). After the first map, no deletion starts while a replacement map
+/// is owed, so one is outstanding at a time; deletions during the first scan go on, and this is
+/// far past what one scan is waited out with. Past it the oldest is forgotten, and the map lists
+/// it again until the one that replaces it arrives.
+const MAX_REMOVED_BUT_LISTED: usize = 32;
+
 const SNAPSHOT_PAGE_ENTRIES: usize = 512;
 const MAX_SNAPSHOT_PAGE_HISTORY: usize = 32;
 
@@ -350,9 +357,17 @@ where
     /// Publications that ended, for the owner loop to finish its own part of: the loop drains them
     /// with [`App::take_finished_publication`].
     finished_publications: VecDeque<FinishedPublication>,
-    /// A deletion removed entries, and the map on screen still lists them: until the rebuild or
-    /// the overlay that replaces it lands, see [`App::take_landed_refresh`].
+    /// A deletion removed entries, and the map the program holds still lists them: until the
+    /// rebuild or the overlay that replaces it lands, see [`App::take_landed_refresh`].
     refresh_owed: bool,
+    /// The targets that deletions removed whole after the map the program holds was built, which
+    /// that map still lists. The reader's view leaves them, and what lies below them, out
+    /// ([`SnapshotTree::files_in_current_folder`]): the replacement map is only as fast as a pass
+    /// over every entry, and a removal the reader confirmed does not come back onto the screen
+    /// meanwhile. Emptied when that replacement lands, and kept when the store is lost instead,
+    /// because no map follows and the one the board holds still lists them: see
+    /// [`App::take_landed_refresh`].
+    removed_but_listed: Vec<RelativePath>,
     /// The deletions that finished before the first map was shown, which that map is owed: the
     /// scan went on through them. The refresh they owe does not land before the map has been made
     /// to agree with them, see [`App::take_landed_refresh`].
@@ -544,6 +559,7 @@ where
             publications: VecDeque::new(),
             finished_publications: VecDeque::new(),
             refresh_owed: false,
+            removed_but_listed: Vec::new(),
             removals: RemovalsBeforeFirstMap::default(),
             publication_progress_from: None,
             waiting_announcement: None,
@@ -913,7 +929,11 @@ where
             .expect("every navigable app state retains a snapshot page")
             .current();
         self.board.change_files_for_view(
-            snapshot.files_in_current_folder(self.board.zoom_level, self.show_apparent_size),
+            snapshot.files_in_current_folder(
+                self.board.zoom_level,
+                self.show_apparent_size,
+                &self.removed_but_listed,
+            ),
             snapshot.current_id(),
             snapshot.filter_raw(),
         )
@@ -963,7 +983,7 @@ where
     }
 
     /// Whether a deletion's map is still being built, or is still to be asked for behind the one
-    /// under way: until it arrives, the map on screen lists what the deletion removed.
+    /// under way: until it arrives, the map the program holds lists what the deletion removed.
     fn overlay_publication_pending(&self) -> bool {
         self.publications
             .iter()
@@ -1026,7 +1046,7 @@ where
             .as_ref()
             .expect("every navigable app state retains a snapshot page")
             .current()
-            .files_in_current_folder(offset, self.show_apparent_size)
+            .files_in_current_folder(offset, self.show_apparent_size, &self.removed_but_listed)
     }
     #[cfg(test)]
     pub(crate) fn append_scan_store_entry_for_test(
@@ -1266,7 +1286,12 @@ where
     /// How the refresh that deletions owed ended, once it has: the rebuild or the overlay that
     /// replaces the map listing what they removed has landed, and no other rebuild or publication
     /// is owed. `None` while one is, and when no deletion removed anything since the last answer,
-    /// so a refresh is reported once, however many deletions it covers.
+    /// so a refresh is reported once, however many deletions it covers. When a map landed, the
+    /// reader's view stops leaving out what they removed, and the board is built again from the
+    /// page on screen: a rebuild that landed lists an entry created again at a removed path, and
+    /// the page it came with was drawn while the view still left that path out. When the store
+    /// was lost instead (the outcome is `Failed`), no map follows and the one the board holds
+    /// still lists what they removed, so the view goes on leaving it out.
     pub(crate) fn take_landed_refresh(&mut self) -> Option<crate::test_events::RefreshOutcome> {
         if !self.refresh_owed
             || self.generation_rebuild_required
@@ -1277,6 +1302,10 @@ where
             return None;
         }
         self.refresh_owed = false;
+        if self.scan_store_available && !self.removed_but_listed.is_empty() {
+            self.removed_but_listed.clear();
+            self.render_and_update_board();
+        }
         Some(if self.scan_store_available {
             crate::test_events::RefreshOutcome::Published
         } else {
@@ -1645,7 +1674,7 @@ where
                     self.board.pivot_transition_on_geometry(pivot);
                 }
                 self.board.reset_zoom_index();
-                self.board.reset_selected_index();
+                self.board.arm_afresh();
                 self.render_and_update_board();
             }
             NavigationKind::Up { leaving_relative } => {
@@ -1655,6 +1684,7 @@ where
                 if let Some(leaving) = leaving {
                     self.board.pivot_transition_on(Pivot::Entry(leaving));
                 }
+                self.board.arm_afresh();
                 self.render_and_update_board();
                 if let Some(node_id) = self
                     .snapshot_page_cache
@@ -1826,6 +1856,22 @@ where
         self.scan_store_available
             && report.target_was_removed()
             && !report.deleted_files_may_have_other_links()
+    }
+
+    /// The reader's view leaves out the target of a deletion that removed it whole, and what lay
+    /// below it, from now until the map that does not list it replaces the one on screen. The
+    /// replacement can be as slow as a pass over every entry of the map (an overlay) or a scan of
+    /// the tree (a rebuild): until it lands, nothing on screen may say that what the reader
+    /// confirmed removed is still there. What the map says of everything else, the sizes of the
+    /// folders above the target included, is left as it is until then.
+    fn hide_removed_target(&mut self, report: &DeletionReport) {
+        let Some(target) = removed_prefix(report) else {
+            return;
+        };
+        if self.removed_but_listed.len() == MAX_REMOVED_BUT_LISTED {
+            self.removed_but_listed.remove(0);
+        }
+        self.removed_but_listed.push(target);
     }
 
     /// A deletion finished before the first map was shown. The scan went on through it, so the
@@ -3033,9 +3079,14 @@ where
 
     pub fn complete_deletion(&mut self, report: DeletionReport) -> bool {
         let deleted = report.deleted_entries() > 0;
-        // The map on screen lists what the deletion removed until the rebuild or the overlay that
-        // reconciles it lands (see `Self::take_landed_refresh`).
+        // The map the program holds lists what the deletion removed until the rebuild or the
+        // overlay that reconciles it lands (see `Self::take_landed_refresh`), which takes a pass
+        // over every entry of the map: the screen leaves the removal out at once, not when that
+        // ends.
         self.refresh_owed |= deleted;
+        if deleted && report.target_was_removed() {
+            self.hide_removed_target(&report);
+        }
         let described =
             deleted && removed_prefix(&report).is_some() && self.removal_can_be_described(&report);
         self.reconcile_generation_after_deletion(&report);
@@ -3055,9 +3106,28 @@ where
         }
         // The streamed report may remove the current node. Board replacement keeps a
         // surviving selection; a vanished one re-arms to the largest entry only before
-        // the reader's first move and otherwise clears, as an empty view does.
+        // the reader's first move and otherwise clears, as an empty view does, and stays
+        // clear until the reader places the cursor again (`Board::arm_afresh` has the rest).
+        self.leave_the_pages_removals_emptied();
         self.render_and_update_board();
         deleted
+    }
+
+    /// A later page of a folder that the removals left without an entry is not an empty folder,
+    /// and the board would say it is until the map without them arrives. The reader is taken back
+    /// to the last page before it that still lists something. A cursor they placed was on an
+    /// entry of the page that is gone: the board is laid out for what the page lists now before
+    /// it goes back, so the lock rule clears the cursor and the page before it arms no other.
+    fn leave_the_pages_removals_emptied(&mut self) {
+        if self.snapshot_page_history.is_empty() || !self.files_in_current_view(0).is_empty() {
+            return;
+        }
+        self.update_board();
+        while !self.snapshot_page_history.is_empty() && self.files_in_current_view(0).is_empty() {
+            if !self.previous_snapshot_page() {
+                break;
+            }
+        }
     }
 
     #[must_use]
@@ -3104,8 +3174,8 @@ where
             ));
         }
         if self.overlay_publication_pending() {
-            // The map on screen still lists what the last deletion removed, and a report of it
-            // would too.
+            // The map the program holds still lists what the last deletion removed (the screen
+            // leaves it out), and a report of it would list it.
             return Err(ReportError::Invariant(
                 "scan export is unavailable until the map reflects the last deletion".to_string(),
             ));
@@ -3555,7 +3625,21 @@ where
             self.show_error(format!("Could not filter this scan page: {error}"));
             return;
         }
-        self.board.reset_selected_index();
+        // Only another filter is another view: applying the one in force again lays out nothing,
+        // and leaves the clearing of a cursor as it was.
+        let another_filter = previous
+            .0
+            .as_ref()
+            .map(|(filter, root)| (filter.raw(), root))
+            != self
+                .snapshot_filter
+                .as_ref()
+                .map(|(filter, root)| (filter.raw(), root));
+        if another_filter {
+            self.board.arm_afresh();
+        } else {
+            self.board.reset_selected_index();
+        }
         self.render_and_update_board();
     }
 
@@ -3742,6 +3826,40 @@ mod tests {
         app.board
             .currently_selected()
             .map(|tile| tile.name.to_string_lossy().into_owned())
+    }
+
+    /// The reader moves the cursor until it is on `name`. The first move is the one that locks
+    /// the cursor, wherever it was before.
+    fn the_reader_puts_the_cursor_on(app: &mut App<TestBackend>, name: &str) {
+        app.move_selected_right();
+        for step in [
+            App::move_selected_left,
+            App::move_selected_down,
+            App::move_selected_up,
+            App::move_selected_right,
+        ] {
+            if cursor_on(app).as_deref() == Some(name) {
+                return;
+            }
+            step(app);
+        }
+        assert_eq!(
+            cursor_on(app).as_deref(),
+            Some(name),
+            "the reader can put the cursor on {name}"
+        );
+    }
+
+    /// The names of the tiles the board has laid out, in a stable order.
+    fn tile_names(app: &App<TestBackend>) -> Vec<String> {
+        let mut names = app
+            .board
+            .tiles
+            .iter()
+            .map(|tile| tile.name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     /// A lease to enumerate the root in `generation` of the app's own session.
@@ -4308,13 +4426,15 @@ mod tests {
     /// A deletion that finishes while the first scan runs leaves the scan alone: the reader keeps
     /// the map as it fills in, and the scan keeps what it found and goes on finding. The first
     /// map lists what the scan found, the removed entry included, because the scan went on
-    /// through the deletion; an overlay that takes the entry out is built behind it. The reader
-    /// is never left with an empty map to navigate while the scan runs, and the scan is not run
-    /// again.
+    /// through the deletion, and an overlay that takes the entry out is built behind it; the
+    /// reader sees the entry gone from the deletion on, in the live map and in the first map
+    /// alike. The reader is never left with an empty map to navigate while the scan runs, and the
+    /// scan is not run again.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_deletion_during_the_first_scan_leaves_the_live_map_and_the_scan_alone() {
         let (root, mut app, removal) = app_scanning_with_a_target_removal_report();
+        assert_eq!(listed_names(&app), ["survivor", "target"]);
 
         assert!(app.complete_deletion(removal));
         assert_eq!(
@@ -4322,19 +4442,24 @@ mod tests {
             None,
             "the first map is still to come, and the refresh waits for it"
         );
+        assert_eq!(
+            listed_names(&app),
+            ["survivor"],
+            "the scan listed the target before the deletion removed it"
+        );
 
-        // What the scan finds next reaches the live map, beside what it found before.
+        // What the scan finds next reaches the live map, beside what it found before. The map was
+        // moving into the room the entry left, and takes the page once it has settled.
+        app.board.settle_geometry();
         let late_path = root.path().join("late");
         std::fs::write(&late_path, b"late").expect("late fixture should exist");
         add_fixture_entry(&mut app, &late_path);
         refresh_live_page(&mut app, "the live view should refresh after the deletion");
-        let names = listed_names(&app);
-        for kept in ["survivor", "late"] {
-            assert!(
-                names.contains(&std::ffi::OsString::from(kept)),
-                "the live map must still list {kept}: {names:?}"
-            );
-        }
+        assert_eq!(
+            listed_names(&app),
+            ["late", "survivor"],
+            "the live map lists what the scan found since, and not what was removed"
+        );
         assert!(
             !app.generation_rebuild_required && !app.deletion_is_unavailable(),
             "nothing is rebuilt, and nothing is locked, while the first scan runs"
@@ -4343,7 +4468,11 @@ mod tests {
         // The first map arrives, and the overlay that takes the entry out is built behind it.
         app.finalize_scan();
         app.start_ui();
-        assert_eq!(listed_names(&app), ["late", "survivor", "target"]);
+        assert!(
+            map_lists(&app, "target"),
+            "the scan went on through the deletion, so the first map lists the target"
+        );
+        assert_eq!(listed_names(&app), ["late", "survivor"]);
         assert!(
             app.scan_store_busy() && !app.generation_rebuild_required,
             "the map without the target is being built, not scanned for"
@@ -4351,10 +4480,11 @@ mod tests {
         assert_eq!(
             app.take_landed_refresh(),
             None,
-            "the map on screen still lists the target"
+            "the map the store holds still lists the target"
         );
 
         assert!(app.process_scan_store_events());
+        assert!(!map_lists(&app, "target"));
         assert_eq!(listed_names(&app), ["late", "survivor"]);
         assert!(!app.generation_rebuild_required);
         assert_eq!(
@@ -7117,16 +7247,23 @@ mod tests {
         );
     }
 
+    /// The map a deletion leaves is built on the store thread, and for a map of millions of
+    /// entries that takes seconds: the map the reader had stays installed until its result
+    /// arrives. What they confirmed removed is off the screen from the moment the deletion ends,
+    /// not from the moment that map arrives, and stays off it when it does.
     #[cfg(any(unix, windows))]
     #[test]
-    fn removed_entry_stays_listed_until_the_overlay_result_arrives() {
+    fn a_removed_entry_leaves_the_screen_before_the_overlay_result_arrives() {
         let (_root, mut app, report) = app_and_target_removal_report();
+        assert_eq!(listed_names(&app), ["survivor", "target"]);
 
         assert!(app.complete_deletion(report));
 
-        // The store thread builds the overlay: until its result arrives, the reader keeps the
-        // map they had.
-        assert_eq!(listed_names(&app), ["survivor", "target"]);
+        assert_eq!(listed_names(&app), ["survivor"]);
+        assert!(
+            map_lists(&app, "target"),
+            "the store still holds the map from before the deletion"
+        );
         assert_eq!(
             app.scan_store.published_generation(),
             Some(ScanGeneration::initial())
@@ -7136,11 +7273,418 @@ mod tests {
         assert!(app.process_scan_store_events());
 
         assert_eq!(listed_names(&app), ["survivor"]);
+        assert!(!map_lists(&app, "target"));
         assert_eq!(
             app.scan_store.published_generation(),
             Some(ScanGeneration::from_value(1))
         );
         assert!(!app.scan_store_busy());
+    }
+
+    /// The map the reader looks at lays out without the entry a deletion removed as soon as the
+    /// deletion ends, and the cursor is not left on it, whichever way the store goes on to
+    /// replace the map (an overlay, or a scan where the removal cannot be described).
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_removed_entry_leaves_the_map_and_the_cursor_before_its_replacement_arrives() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let (mut app, mut targets) = app_with_three_files_and_targets(root.path(), &["c"]);
+        let target = targets.pop().expect("the largest file is the target");
+        let plan = crate::deletion::build_plan(root.path(), target, false)
+            .expect("target plan should build");
+        let report = crate::deletion::execute_plan(
+            root.path(),
+            plan,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert!(report.target_was_removed());
+        assert!(
+            tile_names(&app).iter().any(|name| name == "c"),
+            "the largest file is drawn"
+        );
+        assert_eq!(cursor_on(&app).as_deref(), Some("c"));
+
+        assert!(app.complete_deletion(report));
+
+        assert_eq!(tile_names(&app), ["a", "b"]);
+        assert_ne!(
+            cursor_on(&app).as_deref(),
+            Some("c"),
+            "the cursor is not left on an entry that is gone"
+        );
+        assert!(
+            map_lists(&app, "c"),
+            "the store still holds the map from before the deletion"
+        );
+    }
+
+    /// The reader can leave the folder and come back before the replacement map arrives: the page
+    /// they open is the installed map's, or one of its pages kept in the cache, and neither may
+    /// list the target again.
+    #[cfg(unix)]
+    #[test]
+    fn a_removed_entry_stays_off_the_screen_when_the_reader_leaves_its_folder_and_returns() {
+        let (root, mut app) = app_listing_a_folder(|_| {});
+        app.start_ui();
+        enter_the_holder(&mut app);
+        assert_eq!(listed_names(&app), ["survivor", "target"]);
+        let report = delete_the_target_in_the_folder(root.path(), &app, || {});
+        assert!(app.complete_deletion(report));
+        assert_eq!(listed_names(&app), ["survivor"]);
+
+        assert!(app.go_up());
+        enter_the_holder(&mut app);
+
+        assert_eq!(listed_names(&app), ["survivor"]);
+        assert!(
+            map_lists(&app, "holder/target"),
+            "the page that was opened is the stale map's"
+        );
+
+        assert!(app.process_scan_store_events());
+        assert_eq!(listed_names(&app), ["survivor"]);
+        assert!(!map_lists(&app, "holder/target"));
+    }
+
+    /// What the screen leaves out lasts as long as the map that lists it does. An entry created
+    /// again where one was removed is a new entry: a map built after that lists it, whatever the
+    /// map before did.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_entry_created_again_where_one_was_removed_is_listed_by_the_map_built_after_it() {
+        let (root, mut app, report) = app_and_target_removal_report();
+        assert!(app.complete_deletion(report));
+        assert!(app.process_scan_store_events());
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(listed_names(&app), ["survivor"]);
+
+        let again = root.path().join("target");
+        make_a_removable_target(&again);
+        app.require_generation_rebuild_for_test();
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("the rebuild should start with the retained map")
+        );
+        add_fixture_entry(&mut app, &again);
+        add_fixture_entry(&mut app, &root.path().join("survivor"));
+        finish_rebuild(&mut app).expect("the rebuild should settle");
+
+        assert_eq!(listed_names(&app), ["survivor", "target"]);
+    }
+
+    /// A rescan that follows a removal can list an entry created again at the removed path, and
+    /// the board it came with was drawn while the view still left that path out: the entry is on
+    /// the screen when the refresh lands, not when the reader next moves.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_created_again_at_a_removed_path_is_drawn_when_the_scan_that_lists_it_lands() {
+        let (root, mut app) = app_listing_a_folder(|_| {});
+        app.start_ui();
+        enter_the_holder(&mut app);
+        let mut animation = AnimationScheduler::new(false, false, Duration::ZERO);
+        draw(&mut app, &mut animation, 0);
+        assert_eq!(tile_names(&app), ["survivor", "target"]);
+        let report = delete_the_target_in_the_folder(root.path(), &app, || {});
+        let holder = root.path().join("holder");
+        // Another program makes the entry again before the map without it is built, which the
+        // overlay cannot describe: the map is scanned again.
+        std::fs::write(holder.join("target"), b"again").expect("entry should return");
+
+        finish_the_deletion(&mut app, report);
+
+        assert!(app.generation_rebuild_required);
+        assert_eq!(tile_names(&app), ["survivor"]);
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("the rebuild should start with the retained map")
+        );
+        add_fixture_entry(&mut app, &holder);
+        add_fixture_entry(&mut app, &holder.join("target"));
+        add_fixture_entry(&mut app, &holder.join("survivor"));
+        finish_rebuild(&mut app).expect("the rebuild should settle");
+        assert_eq!(
+            tile_names(&app),
+            ["survivor"],
+            "the refresh has not landed, and the screen still leaves the removed path out"
+        );
+
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+
+        assert_eq!(tile_names(&app), ["survivor", "target"]);
+    }
+
+    /// A later page of a long folder that a removal leaves without an entry is not an empty
+    /// folder, and does not say so: the reader is back on the page before it, which lists what
+    /// is left, until the map without the entry arrives. A cursor the reader placed was on the
+    /// entry that is gone, and the page before it arms none; a cursor nobody placed goes on
+    /// arming the largest entry.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn the_last_page_a_removal_empties_gives_way_to_the_page_before_it() {
+        for placed in [false, true] {
+            let root = tempfile::tempdir().expect("app root should exist");
+            let mut app = App::new(
+                TestBackend::new(160, 48),
+                root.path().to_path_buf(),
+                true,
+                false,
+                128,
+                KeyPreset::Vim,
+                None,
+                false,
+            )
+            .expect("app should initialize");
+            app.board
+                .change_area(ratatui::layout::Rect::new(0, 0, 160, 48));
+            for index in 0..=SNAPSHOT_PAGE_ENTRIES {
+                let path = root.path().join(format!("entry-{index:03}"));
+                std::fs::write(&path, b"x").expect("fixture entry should exist");
+                add_fixture_entry(&mut app, &path);
+            }
+            app.finalize_scan();
+            assert!(app.next_snapshot_page());
+            assert_eq!(listed_names(&app), ["entry-512"]);
+            if placed {
+                // The page lists one entry, and the reader's first move places the cursor on it.
+                app.move_selected_right();
+            }
+            assert_eq!(cursor_on(&app).as_deref(), Some("entry-512"));
+            let target = deletion_target_in_the_map(root.path(), &app, "entry-512");
+            let plan = crate::deletion::build_plan(root.path(), target, false)
+                .expect("target plan should build");
+            let report = crate::deletion::execute_plan(
+                root.path(),
+                plan,
+                &std::sync::atomic::AtomicBool::new(false),
+                &std::sync::atomic::AtomicBool::new(false),
+            );
+            assert!(report.target_was_removed());
+
+            assert!(app.complete_deletion(report));
+
+            let listed = app.files_in_current_view(0);
+            assert_eq!(
+                listed.len(),
+                SNAPSHOT_PAGE_ENTRIES,
+                "the reader is on the first page, not on an empty one"
+            );
+            assert!(listed.iter().all(|file| file.name != "entry-512"));
+            assert!(
+                app.snapshot_page_history.is_empty(),
+                "the first page is where the way back ends"
+            );
+            assert_eq!(
+                cursor_on(&app).is_none(),
+                placed,
+                "a cursor the reader placed is cleared with the entry it was on, and the page \
+                 before it arms none; one nobody placed is armed on the largest entry of that page"
+            );
+        }
+    }
+
+    /// The reader chose an entry, and a deletion that finishes while the first scan runs removes
+    /// it. The cursor clears, and the pages of the scan that follow, and the first map that ends
+    /// it, arm no other: a deletion never moves the cursor onto an entry the reader did not
+    /// choose.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_cursor_the_reader_placed_stays_cleared_through_the_first_scan_after_its_entry_goes() {
+        let (root, mut app, removal) = app_scanning_with_a_target_removal_report();
+        the_reader_puts_the_cursor_on(&mut app, "target");
+
+        assert!(app.complete_deletion(removal));
+        assert_eq!(cursor_on(&app), None, "the entry the reader chose is gone");
+
+        // What the scan finds next reaches the live map, which carries no cursor to keep.
+        app.board.settle_geometry();
+        let late_path = root.path().join("late");
+        std::fs::write(&late_path, b"late").expect("late fixture should exist");
+        add_fixture_entry(&mut app, &late_path);
+        refresh_live_page(&mut app, "the live view should refresh after the deletion");
+        assert_eq!(listed_names(&app), ["late", "survivor"]);
+        assert_eq!(cursor_on(&app), None, "a page of the scan arms no cursor");
+
+        // The first map ends the scan, and the overlay that takes the entry out lands behind it.
+        app.finalize_scan();
+        app.start_ui();
+        assert_eq!(cursor_on(&app), None, "the first map arms none");
+        assert!(app.process_scan_store_events());
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(cursor_on(&app), None, "nor does the map without the entry");
+
+        app.move_selected_right();
+        assert!(
+            cursor_on(&app).is_some(),
+            "the reader places the cursor again"
+        );
+    }
+
+    /// A rebuilt map replaces the filtered view the reader had with an unfiltered one. That is a
+    /// refresh and not a choice: the cursor the reader placed on the entry they deleted stays
+    /// cleared through it, and the map arms no other.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_cursor_the_reader_placed_stays_cleared_when_a_rebuilt_map_drops_the_filter() {
+        let (root, mut app) = app_listing_a_folder(|_| {});
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 160, 48));
+        app.start_ui();
+        enter_the_holder(&mut app);
+        apply_filter_text(&mut app, "*r*");
+        assert!(app.visible_tree().has_filter());
+        assert_eq!(listed_names(&app), ["survivor", "target"]);
+        the_reader_puts_the_cursor_on(&mut app, "target");
+        let report = delete_the_target_in_the_folder(root.path(), &app, || {});
+        let holder = root.path().join("holder");
+        // Another program makes a file beside the removed entry before the map without it is
+        // built, which the overlay cannot describe: the map is scanned again.
+        std::fs::write(holder.join("intruder"), b"new").expect("sibling should be created");
+
+        finish_the_deletion(&mut app, report);
+
+        assert!(app.generation_rebuild_required);
+        assert_eq!(cursor_on(&app), None, "the entry the reader chose is gone");
+        assert!(
+            app.begin_generation_rebuild()
+                .expect("the rebuild should start with the retained map")
+        );
+        add_fixture_entry(&mut app, &holder);
+        add_fixture_entry(&mut app, &holder.join("survivor"));
+        add_fixture_entry(&mut app, &holder.join("intruder"));
+        finish_rebuild(&mut app).expect("the rebuild should settle");
+
+        assert!(
+            !app.visible_tree().has_filter(),
+            "the rebuilt map is not filtered"
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(listed_names(&app), ["intruder", "survivor"]);
+        assert_eq!(cursor_on(&app), None, "the rebuilt map arms no cursor");
+    }
+
+    /// What a refresh leaves cleared, the reader's own view arms afresh: a filter they apply
+    /// puts the cursor on the largest entry it leaves, as it did before the deletion.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_filter_the_reader_applies_arms_a_cursor_where_the_one_they_placed_was_removed() {
+        let (root, mut app) = app_listing_a_folder(|_| {});
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 160, 48));
+        app.start_ui();
+        enter_the_holder(&mut app);
+        the_reader_puts_the_cursor_on(&mut app, "target");
+        let report =
+            removal_that_left_no_link(delete_the_target_in_the_folder(root.path(), &app, || {}));
+
+        finish_the_deletion(&mut app, report);
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(cursor_on(&app), None, "the map without the entry arms none");
+
+        apply_filter_text(&mut app, "*r*");
+
+        assert_eq!(listed_names(&app), ["survivor"]);
+        assert_eq!(cursor_on(&app).as_deref(), Some("survivor"));
+    }
+
+    /// Applying the filter in force again is no other view: nothing is laid out, and a cursor
+    /// cleared for a vanished entry stays clear through the refresh that follows.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn applying_the_same_filter_again_leaves_a_cleared_cursor_clear() {
+        let (root, mut app) = app_listing_a_folder(|_| {});
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 160, 48));
+        app.start_ui();
+        enter_the_holder(&mut app);
+        the_reader_puts_the_cursor_on(&mut app, "target");
+        let report =
+            removal_that_left_no_link(delete_the_target_in_the_folder(root.path(), &app, || {}));
+        finish_the_deletion(&mut app, report);
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Published)
+        );
+        assert_eq!(cursor_on(&app), None, "the map without the entry arms none");
+
+        // `/` and Enter with nothing typed, and no filter in force.
+        apply_filter_text(&mut app, "");
+        app.board
+            .change_area(ratatui::layout::Rect::new(0, 0, 150, 40));
+
+        assert_eq!(cursor_on(&app), None, "a resize arms no cursor");
+    }
+
+    /// The reader goes up a level with their cursor cleared, and the zoom level they come back
+    /// to does not show the folder they come out of. They have opened another folder, so the
+    /// board arms the largest entry the level shows, as it does for any folder the reader opens.
+    #[cfg(unix)]
+    #[test]
+    fn going_up_arms_a_cursor_when_the_folder_left_is_not_among_the_entries_shown() {
+        let root = tempfile::tempdir().expect("app root should exist");
+        let (mut app, _targets) = app_with_three_files_and_targets(root.path(), &[]);
+        // The reader places the cursor, and the entry under it goes.
+        app.move_selected_right();
+        let chosen = cursor_on(&app).expect("the reader's move leaves a cursor");
+        let remaining = app
+            .files_in_current_view(0)
+            .into_iter()
+            .filter(|file| file.name != chosen.as_str())
+            .collect();
+        app.board.change_files(remaining);
+        assert_eq!(cursor_on(&app), None, "the entry the reader chose is gone");
+        // The zoom level they come back to skips the largest entry: the folder they leave.
+        let left = app.files_in_current_view(0)[0].name.clone();
+        app.board.set_zoom_index(1);
+
+        app.finish_navigation(
+            NavigationKind::Up {
+                leaving_relative: RelativePath::from_path(Path::new(&left))
+                    .expect("a canonical path"),
+            },
+            None,
+        );
+
+        assert!(cursor_on(&app).is_some());
+    }
+
+    /// The store is lost while a removal that finished during the first scan is still owed its
+    /// map. None follows, and the live page the board holds still lists the entry: the screen
+    /// goes on leaving it out, as it did while the map was owed.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_removed_entry_stays_off_the_screen_when_the_store_is_lost_before_its_map_arrives() {
+        let (_root, mut app, removal) = app_scanning_with_a_target_removal_report();
+        assert_eq!(tile_names(&app), ["survivor", "target"]);
+        assert!(app.complete_deletion(removal));
+        assert_eq!(tile_names(&app), ["survivor"]);
+
+        app.fail_scan_store("the scan store could not take another batch".to_string());
+
+        assert_eq!(
+            app.take_landed_refresh(),
+            Some(crate::test_events::RefreshOutcome::Failed)
+        );
+        assert_eq!(
+            tile_names(&app),
+            ["survivor"],
+            "no map without the entry follows, and the page the board holds still lists it"
+        );
     }
 
     /// The next overlay derives from the last one's map, so a deletion queued behind one whose
@@ -7231,7 +7775,15 @@ mod tests {
         let (_root, mut app, report) = app_and_target_removal_report();
         assert!(app.complete_deletion(report));
         assert!(app.scan_store_busy());
-        assert_eq!(listed_names(&app), ["survivor", "target"]);
+        assert_eq!(
+            listed_names(&app),
+            ["survivor"],
+            "the screen already leaves out what the deletion removed"
+        );
+        assert!(
+            map_lists(&app, "target"),
+            "the map the store holds still lists it, and its folder sizes count it"
+        );
 
         app.scan_store_stopped("the scan store thread stopped");
 
@@ -7351,6 +7903,16 @@ mod tests {
         app.process_scan_store_events();
     }
 
+    /// Opens the folder `holder` of an app whose published map lists it
+    /// ([`app_listing_a_folder`]).
+    #[cfg(any(unix, windows))]
+    fn enter_the_holder(app: &mut App<TestBackend>) {
+        assert!(app.navigate(PendingNavigation {
+            folder: RelativePath::from_path(Path::new("holder")).expect("a canonical path"),
+            kind: NavigationKind::Enter { pivot: None },
+        }));
+    }
+
     /// The map a deletion leaves says what the folder that held the entry is now, so that the
     /// folder can be deleted next. That is only true of a folder whose entries are the ones the
     /// map lists but the removed one: the folder's modification time is what ties a later
@@ -7468,6 +8030,39 @@ mod tests {
         assert_eq!(
             app.scan_store.published_generation(),
             Some(ScanGeneration::initial())
+        );
+    }
+
+    /// A removal that sends the map back to a scan is as gone from the screen as one an overlay
+    /// takes out: the map the reader had stays up while the scan is owed, which can take as long
+    /// as the first scan did, and it leaves out the entry they removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_that_sends_the_map_back_to_a_scan_is_off_the_screen_while_the_scan_is_owed() {
+        let (root, mut app) = app_listing_a_folder_holding_a_file(|_| {});
+        app.start_ui();
+        enter_the_holder(&mut app);
+        assert_eq!(listed_names(&app), ["survivor", "target"]);
+        let report = delete_the_target_in_the_folder(root.path(), &app, || {
+            std::fs::hard_link(
+                root.path().join("holder/target"),
+                root.path().join("another-name-for-target"),
+            )
+            .expect("the second link should be created");
+        });
+
+        finish_the_deletion(&mut app, report);
+
+        assert!(app.generation_rebuild_required);
+        assert_eq!(listed_names(&app), ["survivor"]);
+        assert!(
+            map_lists(&app, "holder/target"),
+            "the stale map stays up until the scan replaces it"
+        );
+        assert_eq!(
+            app.take_landed_refresh(),
+            None,
+            "the scan is still owed, so the entry stays off the screen"
         );
     }
 
