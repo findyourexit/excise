@@ -23,16 +23,16 @@
 //!    frame the key draws.
 //! 3. **Complete.** The wait for the scan to be over and shown: the `scan_complete` event, and
 //!    then a frame, drawn after the event, that the screen shows and whose header badge says that
-//!    the scan of what is shown has ended. Every read of a frame (the badge, the inspector, a
-//!    dialog) is made of the screen as the frame's mark left it ([`Driver::shown`]), never of the
-//!    screen model itself: the read of the terminal that brings a mark can bring the first output
-//!    of the next redraw as well, and then the model holds half a frame, a badge half drawn. The
-//!    wait ends with the bound on the scan. The badge is `COMPLETE`, or the label of an uncertain
-//!    result (`NEEDS REVIEW`, `READ ERROR`, `OTHER DEVICE`, ...), whatever it is: a real home
-//!    directory nearly always holds folders the program cannot read, and a wait for the literal
-//!    `COMPLETE` would wait for something that never comes. A label other than `COMPLETE` is a
-//!    quirk ([`QuirkKind::UncertainScan`]): counted by kind in `summary.json`, its text only in
-//!    `quirks.txt`.
+//!    the scan of what is shown has ended. Where the screen is exact, every read of a frame (the
+//!    badge, the inspector, a dialog) is made of the screen as the frame's mark left it
+//!    ([`Driver::shown`]), never of the screen model itself: the read of the terminal that brings
+//!    a mark can bring the first output of the next redraw as well, and then the model holds half
+//!    a frame, a badge half drawn. The wait ends with the bound on the scan. The badge is
+//!    `COMPLETE`, or the label of an uncertain result (`NEEDS REVIEW`, `READ ERROR`,
+//!    `OTHER DEVICE`, ...), whatever it is: a real home directory nearly always holds folders the
+//!    program cannot read, and a wait for the literal `COMPLETE` would wait for something that
+//!    never comes. A label other than `COMPLETE` is a quirk ([`QuirkKind::UncertainScan`]):
+//!    counted by kind in `summary.json`, its text only in `quirks.txt`.
 //! 4. **A folder.** At the end of the scan the program puts the cursor on the largest entry. If
 //!    the inspector says it is a folder, `Enter` opens it, and `Esc` goes back up. Both are
 //!    timed, from the key to a screen that shows a frame with the folder (or the root) and a badge
@@ -69,9 +69,15 @@
 //! the answer.
 //!
 //! On a terminal whose screen is not exact (Windows: `ConPTY` paints on its own timer) latency is
-//! taken from frame events, which the program writes itself, screen reads are lenient, and no
-//! decision rests on the screen: `Enter` is sent whatever the inspector says, and whether a folder
-//! opened is a measurement, not a condition.
+//! taken from frame events, which the program writes itself, screen reads are lenient, and no key
+//! that could delete is chosen from the screen: `Enter` is sent whatever the inspector says, the
+//! `Esc` that goes back up follows a lenient read that says a folder opened, and whether one
+//! opened is a measurement, not a condition. A read is made of the screen model, which can hold a
+//! paint in progress, and not of the screen as the mark of a frame left it: `ConPTY` passes the
+//! mark on before it paints the frame, so that screen is the one before the paint, and the last
+//! frame of a scan would never be seen ([`Driver::shown`], [`Driver::wait_for_the_paint`]). The
+//! refusal of the two keys that confirm a deletion looks at both screens all the same
+//! ([`Driver::vet`]).
 //!
 //! The person's interrupt is looked at where the session reads the program ([`Driver::pump`],
 //! which every wait calls before it asks its question). It kills the program's process group and
@@ -412,8 +418,9 @@ struct Driver<'a> {
 
 impl<'a> Driver<'a> {
     fn new(mut live: Live, store_dir: PathBuf, context: &Context<'a>, scope: String) -> Self {
-        // Every read of a frame is made of the screen as the frame's mark left it, never of the
-        // screen model that holds the first output of the next redraw as well.
+        // Where the screen is exact, every read of a frame is made of the screen as the frame's
+        // mark left it, never of the screen model that holds the first output of the next redraw
+        // as well (`Driver::shown` says what a terminal that is not exact reads).
         live.session.keep_the_screen_of_each_mark();
         let started = live.session.started();
         Self {
@@ -439,12 +446,25 @@ impl<'a> Driver<'a> {
         }
     }
 
-    /// The screen as the latest frame's mark left it ([`PtySession::marked_screen`]): what every
-    /// read of a frame is made of, the header, the inspector, and the dialogs. The read of a
-    /// terminal can end in the middle of the redraw of the next frame, and the screen model
-    /// then holds half of it.
+    /// The screen that every read of a frame is made of: the header, the inspector, and the
+    /// dialogs.
+    ///
+    /// Where the screen is exact it is the screen as the latest frame's mark left it
+    /// ([`PtySession::marked_screen`]). The read of a terminal can end in the middle of the redraw
+    /// of the next frame, and the screen model then holds half of it. A terminal that paints on
+    /// its own timer (`ConPTY`) passes the mark of a frame on before it paints the frame, so the
+    /// screen as the mark left it is the one before that paint, and a read of it would miss the
+    /// frame. There it is the screen model, which holds the frame once its paint has come
+    /// ([`Drive::catch_up`] waits for the first output after the mark, or for the window of the
+    /// terminal to pass without any, and [`Driver::wait_for_the_paint`] for a paint that comes
+    /// later or in pieces) and can hold a paint in progress. Such a read is lenient, and no key
+    /// that could delete is chosen by it ([`Driver::vet`] looks at both screens).
     fn shown(&self) -> &Screen {
-        self.live.session.marked_screen()
+        if self.live.screen_is_exact() {
+            self.live.session.marked_screen()
+        } else {
+            self.live.session.screen()
+        }
     }
 
     /// The write that every key passes, and the only one in the soak: the allowlist
@@ -457,11 +477,13 @@ impl<'a> Driver<'a> {
         if self.live.reading_of(key.bytes()).request {
             return Err(Refusal::Composes);
         }
-        // A dialog that the screen model holds as well as one that a frame left stops the two keys
-        // that confirm one: the model may hold a dialog that is being drawn.
+        // A dialog that the screen model holds as well as one that a frame's mark left stops the
+        // two keys that confirm one: the model may hold a dialog that is being drawn, and, where
+        // the screen is not exact, the screen as the mark left it can still show one that a split
+        // repaint has half overwritten in the model.
         if (key == Key::ENTER || key == Key::Y)
             && (deletion_dialog_visible(self.live.session.screen())
-                || deletion_dialog_visible(self.shown()))
+                || deletion_dialog_visible(self.live.session.marked_screen()))
         {
             return Err(Refusal::DeletionDialog);
         }
@@ -720,7 +742,8 @@ impl<'a> Driver<'a> {
     /// The header is read only from a screen that shows a frame (the mark of the frame has been
     /// read: [`Driver::wait_for_a_shown_frame`]) and never in the middle of one. A read of the
     /// terminal can end half way through the redraw of the badge, and half of the label of a scan
-    /// that ends `COMPLETE` is not the label of an uncertain one.
+    /// that ends `COMPLETE` is not the label of an uncertain one. (Where the screen is not exact,
+    /// the read is lenient: see [`Driver::shown`].)
     fn await_complete(&mut self, scan_deadline: Instant) -> Result<(), Stop> {
         let event = self.wait_before(SoakPhase::Complete, scan_deadline, |driver| {
             driver.scan_complete.map(|end| end.event)
@@ -758,12 +781,14 @@ impl<'a> Driver<'a> {
     /// Waits until the screen shows a frame that satisfies `accept`, before `deadline`. Each frame
     /// the program draws after the event at index `after` (any, when that is `None`) and later
     /// than `since` is waited for in turn: the screen is caught up to it ([`Drive::catch_up`]: the
-    /// mark of the frame has been read), and only then is `accept` asked about the screen as the
-    /// latest mark left it ([`Driver::shown`]), which is the screen of a frame and not of a
-    /// redraw in progress: the read that brought the mark can have brought the first output of
-    /// the next frame as well, and the screen model holds that. A frame that does not satisfy it
-    /// is followed by the next one. The frame waited for is always the latest at the time, so a
-    /// program that keeps drawing cannot keep the wait from ending.
+    /// mark of the frame has been read), and only then is `accept` asked about the screen
+    /// ([`Driver::shown`]). Where the screen is exact that is the screen of a frame and not of a
+    /// redraw in progress: the read that brought the mark can have brought the first output of the
+    /// next frame as well, and the screen model holds that. Where it is not, it is the screen
+    /// model, which can hold a paint in progress. A frame that does not satisfy it is followed by
+    /// the next one and, where the screen is not exact, first by what the paint of the frame
+    /// brings ([`Driver::wait_for_the_paint`]). The frame waited for is always the latest at the
+    /// time, so a program that keeps drawing cannot keep the wait from ending.
     fn wait_for_a_shown_frame<T>(
         &mut self,
         phase: SoakPhase,
@@ -781,7 +806,54 @@ impl<'a> Driver<'a> {
             if let Some(found) = accept(self.shown()) {
                 return Ok(found);
             }
+            if !self.live.screen_is_exact()
+                && let Some(found) =
+                    self.wait_for_the_paint(phase, deadline, after, seq, &mut accept)?
+            {
+                return Ok(found);
+            }
             since = Some(seq);
+        }
+    }
+
+    /// Where the screen is not exact, waits for what the paint of frame `seq` brings, which is
+    /// all that a program that draws no frame after it can show. `ConPTY` passes the mark of a
+    /// frame on before it paints the frame (`runner::live`, "Frame marks"), so the screen that
+    /// [`Drive::catch_up`] waited for is the one before the paint when the paint comes later than
+    /// the window that wait allows for it, or in pieces, and the last frame of a scan is followed
+    /// by no frame whose mark would bring it into view. Each time more output has been read, this
+    /// reads on until the output has been quiet (`catch_up` gives up on its quiet after at most
+    /// 20 ms) and asks `accept` about the screen. It returns what `accept` takes (`Some`); `None`
+    /// when a frame later than `seq` has been drawn and no output has come since the last read, so
+    /// that the caller waits for that frame in turn; and the stop of the wait when the deadline or
+    /// the end of the run passes, or the program ends.
+    fn wait_for_the_paint<T>(
+        &mut self,
+        phase: SoakPhase,
+        deadline: Instant,
+        after: Option<usize>,
+        seq: u64,
+        accept: &mut impl FnMut(&Screen) -> Option<T>,
+    ) -> Result<Option<T>, Stop> {
+        let mut read = self.live.session.output_bytes();
+        loop {
+            let paint = self.wait_before(phase, deadline, |driver| {
+                if driver.live.session.output_bytes() == read {
+                    driver.latest_frame_since(after, Some(seq)).map(|_| false)
+                } else {
+                    Some(true)
+                }
+            })?;
+            if !paint {
+                return Ok(None);
+            }
+            // A paint can come in pieces: read on until the output has been quiet.
+            let shown = self.catch_up(seq, deadline)?;
+            self.end_of_wait(shown, phase)?;
+            read = self.live.session.output_bytes();
+            if let Some(found) = accept(self.shown()) {
+                return Ok(Some(found));
+            }
         }
     }
 
@@ -2533,6 +2605,80 @@ mod tests {
                     .wait_quietly(Duration::from_millis(150))
                     .expect("the program is driven");
                 assert!(fs::read(received).unwrap_or_default().is_empty());
+            },
+        );
+    }
+
+    /// The program of a scan that has ended, whose last frame `ConPTY` passes on in its order: the
+    /// event and the mark of the frame come first, and the paint of it, with `header`, `delay`
+    /// seconds after. No frame follows it.
+    fn a_last_frame_painted_after_its_mark(header: &str, delay: &str) -> String {
+        format!(
+            "{prelude}stty raw -echo\n{scanning}frame 0\n{SCAN_COMPLETE}report 1\nmark\n\
+             /bin/sleep {delay}\n{painted}exec /bin/cat > /dev/null\n",
+            prelude = prelude(true),
+            scanning = map(SCANNING, None, None),
+            painted = map(header, None, None),
+        )
+    }
+
+    #[test]
+    fn the_end_of_a_scan_is_read_from_the_paint_that_follows_its_mark_where_the_screen_is_not_exact()
+     {
+        // `ConPTY` passes the mark of a frame on before it paints the frame. The last frame of the
+        // scan is marked first and painted after, and no frame follows it: the screen as the mark
+        // left it says `SCANNING`, and only the paint says `COMPLETE`. The paint comes inside the
+        // window that the terminal allows for it, and after it.
+        for (delay, window) in [
+            ("0.05", Duration::from_secs(5)),
+            ("0.6", Duration::from_millis(100)),
+        ] {
+            with_program(
+                |_| a_last_frame_painted_after_its_mark(COMPLETE, delay),
+                |driver, _| {
+                    driver.live.frame_window = window;
+
+                    let ended = driver.await_complete(Instant::now() + Duration::from_secs(10));
+
+                    assert!(ended.is_ok(), "the paint came after {delay} s: {ended:?}");
+                    assert_eq!(
+                        driver.ended_as,
+                        Some(HeaderState::Complete),
+                        "the paint came after {delay} s"
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn the_wait_for_a_paint_ends_at_its_deadline_when_the_paint_never_says_the_scan_is_over() {
+        // The scan is over by the program's word, the paint that follows the mark of the last
+        // frame says `SCANNING` for good, and no frame follows: reading on cannot find the end,
+        // and gives up when the time is up, having read the event, the mark, and the paint.
+        with_program(
+            |_| a_last_frame_painted_after_its_mark(SCANNING, "0.05"),
+            |driver, _| {
+                driver.live.frame_window = Duration::from_millis(100);
+
+                let ended = driver.await_complete(Instant::now() + Duration::from_secs(2));
+
+                assert!(
+                    matches!(ended, Err(Stop::Timeout(SoakPhase::Complete))),
+                    "{ended:?}"
+                );
+                assert_eq!(driver.ended_as, None);
+                assert!(driver.scan_complete.is_some(), "the event was not read");
+                assert_eq!(
+                    driver.live.session.frame_shown(),
+                    2,
+                    "the mark was not read"
+                );
+                assert_eq!(
+                    header_state(driver.live.session.screen()),
+                    Some(HeaderState::Scanning),
+                    "the paint was not read"
+                );
             },
         );
     }
