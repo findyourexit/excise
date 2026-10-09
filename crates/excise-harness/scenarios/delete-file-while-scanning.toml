@@ -1,6 +1,6 @@
 schema_version = 1
 name = "delete-file-while-scanning"
-description = "A file deleted while the first scan is still running leaves the scan and its map alone: the map as it fills in stays on the screen and navigable, the scan goes on, and a map that does not list the file replaces the one the scan ends with, by an overlay behind it or, where the removal cannot be described, a rebuild."
+description = "A file deleted while the first scan is still running leaves the scan and its map alone: the map as it fills in stays on the screen and navigable and does not list the file, the scan goes on, and a map that does not list the file replaces the one the scan ends with, by an overlay behind it or, where the removal cannot be described, a rebuild."
 fixture = "delete-file-while-scanning"
 sentinels = ["keep-a.bin", "docs/keep-0.txt"]
 profiles = ["default", "deterministic"]
@@ -49,6 +49,13 @@ timeout_ms = 60000
 step = "expect_screen"
 region = "header"
 contains = ["SCANNING"]
+
+# The map the screen shows meanwhile is the live view of the scan, which still lists the file until
+# the scan's own map without it arrives, and the file must not be on it, or in the selected-item
+# panel: the departure ended long ago, and what the reader confirmed removed does not come back.
+[[steps]]
+step = "expect_screen"
+not_contains = ["victim.bin"]
 
 # The map is navigable meanwhile: a key is answered by a frame that reflects it.
 [[steps]]

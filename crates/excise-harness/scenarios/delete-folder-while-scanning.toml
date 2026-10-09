@@ -1,6 +1,6 @@
 schema_version = 1
 name = "delete-folder-while-scanning"
-description = "A folder deleted while the first scan is still running, with folders below it that the scan has not read yet, is no failure of the scan: the scan goes on, the map as it fills in stays on the screen and navigable, no READ ERROR is shown for what the deletion removed, the map that ends the scan is made to agree with the deletion, and the program exits 0."
+description = "A folder deleted while the first scan is still running, with folders below it that the scan has not read yet, is no failure of the scan: the scan goes on, the map as it fills in stays on the screen and navigable and does not list the folder, no READ ERROR is shown for what the deletion removed, the map that ends the scan is made to agree with the deletion, and the program exits 0."
 fixture = "delete-folder-while-scanning"
 sentinels = ["keep-a.bin", "docs/keep-0.txt", "docs/keep-1.txt"]
 profiles = ["default", "deterministic"]
@@ -51,6 +51,14 @@ step = "expect_screen"
 region = "header"
 contains = ["SCANNING"]
 not_contains = ["READ ERROR"]
+
+# The map the screen shows meanwhile is the live view of the scan, which still lists the folder
+# until the scan's own map without it arrives, and the folder must not be on it, or in the
+# selected-item panel: the departure ended long ago, and what the reader confirmed removed does not
+# come back.
+[[steps]]
+step = "expect_screen"
+not_contains = ["a-victim"]
 
 # The map is navigable meanwhile: a key is answered by a frame that reflects it.
 [[steps]]
