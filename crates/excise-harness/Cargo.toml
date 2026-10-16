@@ -21,7 +21,7 @@ shell-words = "1.1.1"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
-toml = "1.1.6"
+toml = "1.1.8"
 vt100 = "0.16.2"
 
 [target.'cfg(unix)'.dependencies]
