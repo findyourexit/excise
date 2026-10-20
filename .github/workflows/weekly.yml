@@ -62,7 +62,7 @@ jobs:
   largest-fixture:
     name: ubuntu-24.04
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.job == '' || inputs.job == 'largest-fixture'))
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 330
     env:
       FIXTURE: ${{ inputs.fixture || 'tiny-files-10m' }}
