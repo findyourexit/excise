@@ -844,7 +844,7 @@ dependencies = [
  "base64",
  "jsonschema",
  "libproc",
- "nix 0.28.0",
+ "nix 0.31.3",
  "portable-pty",
  "regex",
  "rustix",
