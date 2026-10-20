@@ -615,7 +615,7 @@ dependencies = [
  "mio",
  "parking_lot",
  "rustix",
- "signal-hook",
+ "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
 ]
@@ -826,7 +826,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "signal-hook",
+ "signal-hook 0.4.5",
  "sysinfo",
  "tachyonfx",
  "tempfile",
@@ -2100,6 +2100,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b29ffa27d3d59a049bb328258de100f8012848d1b08d444e08bbc02ac468435e"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-mio"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2107,7 +2117,7 @@ checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
 dependencies = [
  "libc",
  "mio",
- "signal-hook",
+ "signal-hook 0.3.18",
 ]
 
 [[package]]
@@ -2866,7 +2876,7 @@ dependencies = [
  "jsonschema",
  "serde_json",
  "sha2",
- "signal-hook",
+ "signal-hook 0.4.5",
  "tar",
  "tempfile",
 ]
