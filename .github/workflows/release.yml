@@ -367,7 +367,7 @@ jobs:
           Compress-Archive -Path "stage/$root" -DestinationPath "upload/$root.zip"
       - name: Upload immutable candidate target archive
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: excise-${{ matrix.target }}
           path: upload/*
@@ -416,7 +416,7 @@ jobs:
           cp source/xtask/Cargo.toml sbom-source/xtask/
           cp source/crates/excise-harness/Cargo.toml sbom-source/crates/excise-harness/
       - name: Download target archives
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: excise-*
           path: release
@@ -464,7 +464,7 @@ jobs:
         with:
           subject-path: release/*
       - name: Upload release candidate bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: excise-release-candidate
           path: release
@@ -483,7 +483,7 @@ jobs:
       contents: read
     steps:
       - name: Download reviewed candidate bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: excise-release-candidate
           path: release
@@ -548,7 +548,7 @@ jobs:
               --source-ref refs/heads/main
           done
       - name: Upload approved release bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: excise-release-bundle
           path: release
@@ -568,7 +568,7 @@ jobs:
       contents: write
     steps:
       - name: Download approved release bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: excise-release-bundle
           path: release
@@ -960,7 +960,7 @@ jobs:
           manifest_version="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' source/Cargo.toml | sed -n '1p')"
           test "$manifest_version" = "${EXPECTED_TAG#v}"
       - name: Download approved release bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: excise-release-bundle
           path: release
