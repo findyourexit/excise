@@ -70,7 +70,7 @@ base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 crossbeam-channel = "0.5.17"
 directories = "6.0.0"
 file-id = { version = "0.2.3", features = ["serde"] }
-globset = "0.4.20"
+globset = "0.4.21"
 getrandom = "0.4.3"
 ignore = "0.4.33"
 redb = "4.3.0"
