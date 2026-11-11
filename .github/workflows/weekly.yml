@@ -122,7 +122,7 @@ jobs:
           du -sh /mnt/excise-big/target/excise-fixtures.noindex || true
       - name: Keep the failure evidence
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: weekly-linux
           path: |
@@ -223,7 +223,7 @@ jobs:
           fi
       - name: Keep the table, the document, and the evidence
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: version-sweep-${{ matrix.os }}
           # `latest` is a link to the run's directory: left in, it would upload every file twice.
