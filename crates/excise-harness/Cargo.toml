@@ -29,7 +29,7 @@ nix = { version = "0.28.0", default-features = false, features = ["fs", "resourc
 rustix = { version = "1.1.6", features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-libproc = "0.14.11"
+libproc = "0.15.0"
 
 [lints]
 workspace = true
