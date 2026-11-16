@@ -788,15 +788,18 @@ impl PtySession {
 
     #[cfg(unix)]
     fn line_discipline(&self) -> (Option<bool>, Option<bool>) {
-        use nix::sys::termios::LocalFlags;
+        // `get_termios` hands back the `Termios` of the `nix` that `portable-pty` is built on,
+        // which is not the `nix` this crate depends on, so the flag types cannot be named here:
+        // the raw bits are compared with the system constants instead.
+        use nix::libc::{ECHO, ICANON};
 
         self.master
             .as_deref()
             .and_then(MasterPty::get_termios)
             .map_or((None, None), |termios| {
                 (
-                    Some(termios.local_flags.contains(LocalFlags::ECHO)),
-                    Some(termios.local_flags.contains(LocalFlags::ICANON)),
+                    Some(termios.local_flags.bits() & ECHO != 0),
+                    Some(termios.local_flags.bits() & ICANON != 0),
                 )
             })
     }
