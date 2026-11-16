@@ -43,7 +43,7 @@ use crate::scan_store::store_thread::{
 };
 use crate::signals::ShutdownWait;
 use crate::state::deletion_work::{
-    DeletionExecutionProgress, DeletionWork, DeletionWorkCommand, DeletionWorkId,
+    DeletionExecutionProgress, DeletionWork, DeletionWorkCommand, DeletionWorkId, MapWait,
 };
 use crate::state::files::snapshot_page_cache::SnapshotPageCache;
 use crate::state::files::snapshot_tree::SnapshotTree;
@@ -78,8 +78,9 @@ const MAX_REMOVED_BUT_LISTED: usize = 32;
 const SNAPSHOT_PAGE_ENTRIES: usize = 512;
 const MAX_SNAPSHOT_PAGE_HISTORY: usize = 32;
 
-/// How long a finished scan's map may take to publish before the header shows how far it has got.
-/// Most publications end well within it, and for those a progress line would only flash by.
+/// How long a map the store thread builds may take before the screen shows how far it has got: the
+/// finished scan's, and the one that deletion work waits for. Most maps arrive well within it, and
+/// for those a progress line would only flash by.
 const PUBLICATION_PROGRESS_DELAY: Duration = Duration::from_millis(100);
 
 #[cfg(test)]
@@ -374,6 +375,9 @@ where
     removals: RemovalsBeforeFirstMap,
     /// When the primary scan's publication has run long enough to show its progress.
     publication_progress_from: Option<Instant>,
+    /// When deletion work that has not started began to wait for the map the store thread is
+    /// still building, on the clock the frames are drawn by: [`App::sync_deletion_map_wait`].
+    deletion_map_wait_since: Option<Duration>,
     /// An announcement that waits for the reader to finish what they are deciding. A later one
     /// replaces it: the reader sees the latest result.
     waiting_announcement: Option<Announcement>,
@@ -562,6 +566,7 @@ where
             removed_but_listed: Vec::new(),
             removals: RemovalsBeforeFirstMap::default(),
             publication_progress_from: None,
+            deletion_map_wait_since: None,
             waiting_announcement: None,
             provisional_page_waiting: None,
             pending_navigation: None,
@@ -604,6 +609,7 @@ where
         reduced_motion: bool,
     ) -> Result<bool, AppError> {
         self.sync_deletion_work_summary();
+        self.sync_deletion_map_wait(now);
         if !self.dirty {
             return Ok(false);
         }
@@ -2988,6 +2994,40 @@ where
         {
             self.ui_effects.deletion_work = summary;
             self.ui_effects.deletion_in_progress = summary.mutating;
+            self.mark_dirty();
+        }
+    }
+
+    /// Tells the deletion work what it waits for. Work that has not started waits for the map
+    /// while the store thread still owes one ([`Self::deletion_waits_for_store`]), and the rail
+    /// then says so: a map of a million entries takes seconds, and a queue that gave no sign of it
+    /// would look stuck. Once the wait has run [`PUBLICATION_PROGRESS_DELAY`] it also counts how
+    /// far the store thread has got and how long the work has waited, so the screen keeps moving
+    /// through the pass. With no work waiting nothing is said, and a deletion that nothing is
+    /// queued behind draws no frame of its own for the map that follows it.
+    fn sync_deletion_map_wait(&mut self, now: Duration) {
+        let wait = if self.deletion_work.has_work_waiting_to_start()
+            && self.deletion_waits_for_store()
+        {
+            let since = *self.deletion_map_wait_since.get_or_insert(now);
+            let waited = now.saturating_sub(since);
+            let progress = if waited >= PUBLICATION_PROGRESS_DELAY {
+                self.scan_store
+                    .publication_progress()
+                    .map(|(done, total)| PublicationProgress {
+                        done,
+                        total,
+                        elapsed_tenths: u32::try_from(waited.as_millis() / 100).unwrap_or(u32::MAX),
+                    })
+            } else {
+                None
+            };
+            Some(MapWait { progress })
+        } else {
+            self.deletion_map_wait_since = None;
+            None
+        };
+        if self.deletion_work.set_map_wait(wait) {
             self.mark_dirty();
         }
     }
@@ -7739,6 +7779,128 @@ mod tests {
             app.next_deletion_planning_work(),
             Some(DeletionWorkCommand::Plan { work_id: id, .. }) if id == work_id
         ));
+    }
+
+    /// What the rail says the foreground work is doing.
+    #[cfg(any(unix, windows))]
+    fn foreground_status(
+        app: &App<TestBackend>,
+    ) -> Option<crate::state::deletion_work::WorkRailStatus> {
+        app.deletion_work
+            .foreground_rail_item()
+            .map(|item| item.status)
+    }
+
+    /// The target the reader would confirm for `survivor`, the entry beside the one removed.
+    #[cfg(any(unix, windows))]
+    fn deletion_target_of_the_survivor(app: &App<TestBackend>, root: &Path) -> FileToDelete {
+        let survivor =
+            RelativePath::from_path(Path::new("survivor")).expect("survivor path is canonical");
+        let entry = app
+            .scan_store
+            .published()
+            .expect("published generation should exist")
+            .page_entry(&survivor)
+            .expect("canonical survivor query should succeed")
+            .expect("survivor should be in the published generation");
+        SnapshotTree::deletion_target_from_entry(
+            root.to_path_buf(),
+            node_id_of(app, "survivor"),
+            &survivor,
+            entry,
+            false,
+        )
+        .expect("survivor should retain its canonical snapshot")
+    }
+
+    /// The queue must not look stuck while it waits for a map that takes seconds: the deletion
+    /// behind the one whose map is being built says that it waits for it, counts how far the store
+    /// thread has got and for how long it has waited once that is worth showing, and stops saying
+    /// so the moment the map arrives.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_queued_deletion_says_it_waits_for_the_map_of_the_one_before_it() {
+        use crate::state::deletion_work::WorkRailStatus;
+
+        let (root, mut app, report) = app_and_target_removal_report();
+        let survivor_target = deletion_target_of_the_survivor(&app, root.path());
+        app.start_ui();
+        assert!(app.complete_deletion(report));
+        assert!(app.queue_deletion_confirmation(survivor_target, false, 1 << 20, Duration::ZERO));
+        assert!(app.show_next_deletion_confirmation());
+        let (work_id, confirmed) = app
+            .arm_and_confirm_deletion_target()
+            .expect("the reader confirms the second deletion");
+        assert!(app.queue_confirmed_deletion(work_id, confirmed, Duration::ZERO));
+        assert_eq!(
+            foreground_status(&app),
+            Some(WorkRailStatus::Planning),
+            "until the application says what the work waits for, it only waits its turn"
+        );
+
+        let began = Duration::from_secs(40);
+        app.dirty = false;
+        app.sync_deletion_map_wait(began);
+        assert_eq!(
+            foreground_status(&app),
+            Some(WorkRailStatus::WaitingForMap(MapWait { progress: None })),
+            "a wait that has only begun has nothing worth counting"
+        );
+        assert!(
+            app.is_dirty(),
+            "the screen must change when the work starts to wait"
+        );
+
+        app.dirty = false;
+        app.sync_deletion_map_wait(began + Duration::from_millis(50));
+        assert!(
+            !app.is_dirty(),
+            "nothing has changed before the wait has run long enough to be counted"
+        );
+
+        app.sync_deletion_map_wait(began + Duration::from_millis(2350));
+        let Some(WorkRailStatus::WaitingForMap(MapWait {
+            progress: Some(progress),
+        })) = foreground_status(&app)
+        else {
+            panic!("a wait of 2.35 s counts: {:?}", foreground_status(&app));
+        };
+        assert_eq!(
+            progress.elapsed_tenths, 23,
+            "the wait is counted from its start, not from the clock's"
+        );
+        assert_eq!(progress.total, ScanStore::PUBLISH_STAGES);
+        assert!(app.is_dirty(), "the count moving is a change to draw");
+
+        assert!(app.process_scan_store_events());
+        app.dirty = false;
+        app.sync_deletion_map_wait(began + Duration::from_millis(2400));
+        assert_eq!(
+            foreground_status(&app),
+            Some(WorkRailStatus::Planning),
+            "the map has arrived, and the work is no longer held back"
+        );
+        assert!(app.is_dirty(), "the screen must change when the wait ends");
+        assert_eq!(app.deletion_map_wait_since, None);
+    }
+
+    /// A deletion that nothing is queued behind has no work to hold back, so the map that follows
+    /// it draws no frames of its own: the idle screen stays idle.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn the_map_that_follows_a_deletion_with_nothing_queued_behind_it_draws_nothing() {
+        let (_root, mut app, report) = app_and_target_removal_report();
+        app.start_ui();
+        assert!(app.complete_deletion(report));
+        assert!(app.scan_store_busy(), "the map without the target is owed");
+
+        app.dirty = false;
+        for tenths in 0..50 {
+            app.sync_deletion_map_wait(Duration::from_millis(tenths * 100));
+        }
+
+        assert!(!app.is_dirty());
+        assert_eq!(foreground_status(&app), None);
     }
 
     /// The map on screen lists what the last deletion removed until the overlay arrives, and a

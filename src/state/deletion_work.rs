@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::FileToDelete;
+use super::ui_effects::PublicationProgress;
 use crate::deletion::DeletionPlan;
 use crate::native_path::safe_display_path_text;
 use crate::scan_coordinator::{
@@ -233,11 +234,27 @@ impl DeletionWorkCommand {
     }
 }
 
+/// What work that has not started waits for: the map the store thread is still building. The next
+/// deletion's overlay derives from the map the last one's overlay builds, so nothing that is queued
+/// starts until that map has arrived. The work waits, and is not cancelled, and the rail says so:
+/// for a map of a million entries the wait is seconds long, and a queue that says nothing in that
+/// time looks stuck.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MapWait {
+    /// How far the store thread has got with that map, and for how long the work has waited for
+    /// it. `None` until the wait has run long enough for numbers to be worth showing (most waits
+    /// end well within it), and while the store thread builds no map, between two overlays.
+    pub progress: Option<PublicationProgress>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkRailStatus {
     Planning,
     AwaitingConfirmation,
     Queued,
+    /// Ready for the planner or the executor, but held back until the store thread has built the
+    /// map that the last deletion made stale.
+    WaitingForMap(MapWait),
     Executing,
 }
 
@@ -256,7 +273,9 @@ impl WorkRailItem<'_> {
     #[must_use]
     pub(crate) fn is_preparing(self) -> bool {
         match self.status {
-            WorkRailStatus::Planning | WorkRailStatus::Queued => true,
+            WorkRailStatus::Planning
+            | WorkRailStatus::Queued
+            | WorkRailStatus::WaitingForMap(_) => true,
             WorkRailStatus::Executing => self.mutation_started.is_none_or(|started| !started),
             WorkRailStatus::AwaitingConfirmation => false,
         }
@@ -311,6 +330,9 @@ pub(crate) struct DeletionWork {
     coordinator: SessionCoordinator,
     leases: Vec<(DeletionWorkId, WorkLease)>,
     next_id: u64,
+    /// What work that has not started waits for, as the owner loop last saw it. The store thread
+    /// belongs to the application, not to this rail, so the application says.
+    map_wait: Option<MapWait>,
 }
 
 impl Default for DeletionWork {
@@ -337,6 +359,7 @@ impl DeletionWork {
             coordinator,
             leases: Vec::with_capacity(MAX_DELETION_WORK_ITEMS),
             next_id: 0,
+            map_wait: None,
         }
     }
 
@@ -806,6 +829,28 @@ impl DeletionWork {
         })
     }
 
+    /// Whether any work has yet to be handed to the planner or the executor: what a map that has
+    /// not arrived holds back.
+    #[must_use]
+    pub(crate) fn has_work_waiting_to_start(&self) -> bool {
+        self.items.iter().any(|item| {
+            matches!(
+                item.stage,
+                DeletionWorkStage::QueuedPlanning { .. } | DeletionWorkStage::QueuedExecution
+            )
+        })
+    }
+
+    /// Records what the work that has not started waits for. `None` says it waits for nothing
+    /// the store thread owes. Returns whether that changed what the rail shows.
+    pub(crate) fn set_map_wait(&mut self, wait: Option<MapWait>) -> bool {
+        if self.map_wait == wait {
+            return false;
+        }
+        self.map_wait = wait;
+        true
+    }
+
     #[must_use]
     pub(crate) fn has_active_mutation(&self) -> bool {
         self.coordinator
@@ -821,7 +866,7 @@ impl DeletionWork {
     #[must_use]
     pub(crate) fn has_checker_animation(&self, now: Duration) -> bool {
         self.items.iter().any(|item| {
-            work_rail_item(item).is_preparing()
+            work_rail_item(item, self.map_wait).is_preparing()
                 && item.confirmed_at.is_some_and(|confirmed_at| {
                     now.saturating_sub(confirmed_at) < DELETION_CHECKER_COVER_DURATION
                 })
@@ -904,7 +949,7 @@ impl DeletionWork {
                     .is_some_and(|target| target.path_in_filesystem.as_path() == scan_root)
                     && item.relative_path == *relative_path
             })
-            .map(|item| work_rail_item_with_phase_snapshot(item, phase_snapshot))
+            .map(|item| work_rail_item_with_phase_snapshot(item, phase_snapshot, self.map_wait))
     }
 
     #[must_use]
@@ -914,7 +959,9 @@ impl DeletionWork {
 
     #[must_use]
     pub(crate) fn rail_item(&self, index: usize) -> Option<WorkRailItem<'_>> {
-        self.items.get(index).map(work_rail_item)
+        self.items
+            .get(index)
+            .map(|item| work_rail_item(item, self.map_wait))
     }
 
     #[must_use]
@@ -933,7 +980,7 @@ impl DeletionWork {
             .position(|item| matches!(item.stage, DeletionWorkStage::Executing { .. }));
         self.items
             .get(active.unwrap_or(0))
-            .map(|item| work_rail_item_with_phase_snapshot(item, phase_snapshot))
+            .map(|item| work_rail_item_with_phase_snapshot(item, phase_snapshot, self.map_wait))
     }
 
     #[must_use]
@@ -1073,13 +1120,14 @@ impl DeletionWork {
     }
 }
 
-fn work_rail_item(item: &DeletionWorkItem) -> WorkRailItem<'_> {
-    work_rail_item_with_phase_snapshot(item, None)
+fn work_rail_item(item: &DeletionWorkItem, map_wait: Option<MapWait>) -> WorkRailItem<'_> {
+    work_rail_item_with_phase_snapshot(item, None, map_wait)
 }
 
 fn work_rail_item_with_phase_snapshot(
     item: &DeletionWorkItem,
     phase_snapshot: Option<DeletionWorkPhaseSnapshot>,
+    map_wait: Option<MapWait>,
 ) -> WorkRailItem<'_> {
     let (status, planned_entries, completed, mutation_started) = match &item.stage {
         DeletionWorkStage::Executing {
@@ -1094,7 +1142,7 @@ fn work_rail_item_with_phase_snapshot(
                 |snapshot| snapshot.execution_mutation_started,
             ),
         ),
-        stage => (work_rail_status(stage), None, None, None),
+        stage => (work_rail_status(stage, map_wait), None, None, None),
     };
     WorkRailItem {
         path: &item.label,
@@ -1109,16 +1157,28 @@ fn work_rail_item_with_phase_snapshot(
 fn targets_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
-fn work_rail_status(stage: &DeletionWorkStage) -> WorkRailStatus {
-    match stage {
-        DeletionWorkStage::QueuedPlanning { .. }
-        | DeletionWorkStage::Planning
-        | DeletionWorkStage::CancellingPlanning => WorkRailStatus::Planning,
-        DeletionWorkStage::AwaitingConfirmation { .. } | DeletionWorkStage::Confirming { .. } => {
-            WorkRailStatus::AwaitingConfirmation
-        }
-        DeletionWorkStage::QueuedExecution => WorkRailStatus::Queued,
-        DeletionWorkStage::Executing { .. } => WorkRailStatus::Executing,
+
+/// What the reader sees of a stage. Work that has not been handed to the planner or the executor
+/// is waiting for the map while one is owed (`map_wait`); work that has been handed on is not held
+/// back by it.
+fn work_rail_status(stage: &DeletionWorkStage, map_wait: Option<MapWait>) -> WorkRailStatus {
+    match (stage, map_wait) {
+        (
+            DeletionWorkStage::QueuedPlanning { .. } | DeletionWorkStage::QueuedExecution,
+            Some(wait),
+        ) => WorkRailStatus::WaitingForMap(wait),
+        (
+            DeletionWorkStage::QueuedPlanning { .. }
+            | DeletionWorkStage::Planning
+            | DeletionWorkStage::CancellingPlanning,
+            _,
+        ) => WorkRailStatus::Planning,
+        (
+            DeletionWorkStage::AwaitingConfirmation { .. } | DeletionWorkStage::Confirming { .. },
+            _,
+        ) => WorkRailStatus::AwaitingConfirmation,
+        (DeletionWorkStage::QueuedExecution, None) => WorkRailStatus::Queued,
+        (DeletionWorkStage::Executing { .. }, _) => WorkRailStatus::Executing,
     }
 }
 
@@ -1377,5 +1437,118 @@ mod tests {
                 .map(|completed| completed.load(std::sync::atomic::Ordering::Acquire)),
             Some(3)
         );
+    }
+
+    fn status_of(work: &DeletionWork, name: &str) -> WorkRailStatus {
+        work.rail_item_for_relative_path(Path::new("/scan-root"), &relative(&[name]))
+            .expect("the work should be on the rail")
+            .status
+    }
+
+    /// A map that has not arrived holds back what the planner and the executor have not taken, and
+    /// only that: a confirmation is the reader's to answer, and work already handed on goes on.
+    #[test]
+    fn a_map_that_has_not_arrived_holds_back_only_work_that_has_not_started() {
+        let mut work = DeletionWork::new();
+        work.enqueue_confirmation(target(&["asking"]), false, 1024, Duration::ZERO)
+            .expect("a confirmation should queue");
+        work.enqueue_confirmation(target(&["planning"]), true, 1024, Duration::ZERO)
+            .expect("work should queue");
+        work.enqueue_confirmation(target(&["to-plan"]), true, 1024, Duration::ZERO)
+            .expect("work should queue");
+        let planned = work
+            .enqueue_confirmation(target(&["planned"]), true, 1024, Duration::ZERO)
+            .expect("work should queue");
+        let _ = work
+            .next_planning_command()
+            .expect("the first work that is ready should go to the planner");
+        work.items
+            .iter_mut()
+            .find(|item| item.id == planned)
+            .expect("the work should be retained")
+            .stage = DeletionWorkStage::QueuedExecution;
+        assert_eq!(status_of(&work, "to-plan"), WorkRailStatus::Planning);
+        assert_eq!(status_of(&work, "planned"), WorkRailStatus::Queued);
+
+        let wait = MapWait { progress: None };
+        assert!(work.set_map_wait(Some(wait)));
+
+        assert_eq!(
+            status_of(&work, "asking"),
+            WorkRailStatus::AwaitingConfirmation
+        );
+        assert_eq!(status_of(&work, "planning"), WorkRailStatus::Planning);
+        assert_eq!(
+            status_of(&work, "to-plan"),
+            WorkRailStatus::WaitingForMap(wait)
+        );
+        assert_eq!(
+            status_of(&work, "planned"),
+            WorkRailStatus::WaitingForMap(wait)
+        );
+        let waiting = work
+            .rail_item_for_relative_path(Path::new("/scan-root"), &relative(&["planned"]))
+            .expect("the work should be on the rail");
+        assert!(
+            waiting.is_preparing(),
+            "waiting for the map is still before the executor's final check"
+        );
+
+        assert!(work.set_map_wait(None));
+        assert_eq!(status_of(&work, "to-plan"), WorkRailStatus::Planning);
+        assert_eq!(status_of(&work, "planned"), WorkRailStatus::Queued);
+    }
+
+    #[test]
+    fn what_the_map_wait_changes_is_what_set_map_wait_reports() {
+        let mut work = DeletionWork::new();
+        assert!(!work.set_map_wait(None), "nothing waited, and nothing does");
+        let started = MapWait { progress: None };
+        assert!(work.set_map_wait(Some(started)));
+        assert!(
+            !work.set_map_wait(Some(started)),
+            "the same wait shows the same"
+        );
+        let counting = MapWait {
+            progress: Some(PublicationProgress {
+                done: 3,
+                total: 12,
+                elapsed_tenths: 24,
+            }),
+        };
+        assert!(
+            work.set_map_wait(Some(counting)),
+            "the count moving is a change"
+        );
+        assert!(work.set_map_wait(None));
+    }
+
+    #[test]
+    fn only_queued_work_is_waiting_to_start() {
+        let mut work = DeletionWork::new();
+        assert!(!work.has_work_waiting_to_start());
+        work.enqueue_confirmation(target(&["asking"]), false, 1024, Duration::ZERO)
+            .expect("a confirmation should queue");
+        assert!(
+            !work.has_work_waiting_to_start(),
+            "a confirmation waits for the reader, not for a map"
+        );
+        let queued = work
+            .enqueue_confirmation(target(&["queued"]), true, 1024, Duration::ZERO)
+            .expect("work should queue");
+        assert!(work.has_work_waiting_to_start());
+        let _ = work
+            .next_planning_command()
+            .expect("the work should go to the planner");
+        assert!(
+            !work.has_work_waiting_to_start(),
+            "work the planner has taken is not held back by a map"
+        );
+        work.items
+            .iter_mut()
+            .find(|item| item.id == queued)
+            .expect("the work should be retained")
+            .stage = DeletionWorkStage::QueuedExecution;
+        assert!(work.has_work_waiting_to_start());
     }
 }

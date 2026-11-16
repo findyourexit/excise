@@ -747,8 +747,8 @@ fn work_marker(work: WorkRailItem<'_>, ascii: bool) -> &'static str {
         (WorkRailStatus::AwaitingConfirmation, _) => "!",
         (WorkRailStatus::Planning, true) => "~",
         (WorkRailStatus::Planning, false) => "◌",
-        (WorkRailStatus::Queued, true) => "+",
-        (WorkRailStatus::Queued, false) => "◍",
+        (WorkRailStatus::Queued | WorkRailStatus::WaitingForMap(_), true) => "+",
+        (WorkRailStatus::Queued | WorkRailStatus::WaitingForMap(_), false) => "◍",
         (WorkRailStatus::Executing, true) => "*",
         (WorkRailStatus::Executing, false) => "◉",
     }
@@ -768,6 +768,8 @@ fn work_label(work: WorkRailItem<'_>, ascii: bool) -> Cow<'static, str> {
         (WorkRailStatus::Planning, false) => Cow::Borrowed("◌ Checking deletion"),
         (WorkRailStatus::Queued, true) => Cow::Borrowed("+ Queued for deletion"),
         (WorkRailStatus::Queued, false) => Cow::Borrowed("◍ Queued for deletion"),
+        (WorkRailStatus::WaitingForMap(_), true) => Cow::Borrowed("+ Waiting for map"),
+        (WorkRailStatus::WaitingForMap(_), false) => Cow::Borrowed("◍ Waiting for map"),
         (WorkRailStatus::Executing, true) => {
             let completed = work
                 .completed
@@ -961,7 +963,7 @@ fn work_color(theme: Theme, work: WorkRailItem<'_>) -> Color {
     match work.status {
         WorkRailStatus::AwaitingConfirmation => theme.focus,
         WorkRailStatus::Planning => theme.state_scanning,
-        WorkRailStatus::Queued => theme.state_rebuilding,
+        WorkRailStatus::Queued | WorkRailStatus::WaitingForMap(_) => theme.state_rebuilding,
         WorkRailStatus::Executing => theme.text_danger,
     }
 }
@@ -2566,7 +2568,8 @@ mod tests {
 
     use crate::model::{EntrySnapshot, NodeId, NodeKind};
     use crate::scan_coordinator::RelativePath;
-    use crate::state::FileToDelete;
+    use crate::state::deletion_work::MapWait;
+    use crate::state::{FileToDelete, PublicationProgress};
     use crate::theme::ThemeId;
     use crate::ui::palette::Oklch;
 
@@ -4177,6 +4180,61 @@ mod tests {
         assert_eq!(active[(29, 4)].symbol(), "◌");
         assert!(text_of(&active).contains("Checking deletion"));
         assert_ne!(active[(1, 3)].bg, resting[(1, 3)].bg);
+    }
+
+    /// Work held back by a map that has not arrived is not being checked, and is not queued behind
+    /// anything: its tile says what it waits for, in the words the header and the inspector use.
+    #[test]
+    fn deletion_waiting_for_the_map_names_that_wait_on_its_tile() {
+        let area = Rect::new(0, 0, 30, 5);
+        let mut entry = tile(0, 0, 30, 10, 1);
+        entry.file_type = FileType::Folder;
+        let mut work = DeletionWork::new();
+        work.enqueue_confirmation(deletion_target(entry.node_id), true, 1024, Duration::ZERO)
+            .expect("background work should retain the target");
+        let page = TestPage::new(entry.node_id, "", "entry");
+        let draw = |work: &DeletionWork, ascii: bool| {
+            let mut buffer = Buffer::empty(area);
+            DenseRectangleGrid::new(
+                MapLayout {
+                    rectangles: std::slice::from_ref(&entry),
+                    departing: &[],
+                    overflow: None,
+                    selected_rect_index: None,
+                    transitioning: false,
+                    show_empty_label: false,
+                    scan: None,
+                    file_tree: Some(&page),
+                    deletion_work: Some(work),
+                    deletion_departure: None,
+                    now: Duration::ZERO,
+                    animate_deletion_checker: false,
+                    sheen_settled: false,
+                },
+                Theme::for_id(ThemeId::CatppuccinMocha),
+                ascii,
+                false,
+            )
+            .render(area, &mut buffer);
+            buffer
+        };
+        assert!(text_of(&draw(&work, false)).contains("Checking deletion"));
+
+        work.set_map_wait(Some(MapWait {
+            progress: Some(PublicationProgress {
+                done: 5,
+                total: 12,
+                elapsed_tenths: 27,
+            }),
+        }));
+
+        let waiting = draw(&work, false);
+        assert_eq!(waiting[(29, 4)].symbol(), "◍");
+        assert!(text_of(&waiting).contains("Waiting for map"));
+        assert!(!text_of(&waiting).contains("Checking deletion"));
+        let ascii = draw(&work, true);
+        assert_eq!(ascii[(29, 4)].symbol(), "+");
+        assert!(text_of(&ascii).contains("+ Waiting for map"));
     }
 
     #[test]
