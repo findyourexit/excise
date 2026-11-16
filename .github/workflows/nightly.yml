@@ -138,7 +138,7 @@ jobs:
           retention-days: 14
 
   macos:
-    name: macos-14
+    name: macos-26
     runs-on: macos-26
     timeout-minutes: 120
     steps:
