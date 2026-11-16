@@ -9,6 +9,7 @@
 //! [`Screen::boxes`].
 
 use std::fmt;
+use std::num::NonZeroU16;
 
 use crate::scenario::Region;
 
@@ -46,7 +47,7 @@ impl vt100::Callbacks for Responder {
             let (_, columns) = screen.size();
             // The emulator keeps a pending wrap as a column one past the edge; a terminal
             // reports the last column.
-            let column = column.min(columns.saturating_sub(1));
+            let column = column.min(columns.get() - 1);
             self.replies
                 .extend_from_slice(format!("\u{1b}[{};{}R", row + 1, column + 1).as_bytes());
             self.answered += 1;
@@ -115,6 +116,11 @@ const ASCII_BORDER: Border = Border {
     right: "|",
 };
 
+/// A row or column count as the emulator takes it, which has no empty terminal: zero is one.
+fn dimension(cells: u16) -> NonZeroU16 {
+    NonZeroU16::new(cells).unwrap_or(NonZeroU16::MIN)
+}
+
 /// A terminal emulator and the queries the harness makes of it.
 pub struct Screen {
     parser: vt100::Parser<Responder>,
@@ -135,7 +141,12 @@ impl Screen {
     #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: vt100::Parser::new_with_callbacks(rows, cols, 0, Responder::default()),
+            parser: vt100::Parser::new_with_callbacks(
+                dimension(rows),
+                dimension(cols),
+                0,
+                Responder::default(),
+            ),
         }
     }
 
@@ -146,7 +157,12 @@ impl Screen {
     #[must_use]
     pub fn snapshot(&self) -> Self {
         let (rows, cols) = self.size();
-        let mut parser = vt100::Parser::new_with_callbacks(rows, cols, 0, Responder::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            dimension(rows),
+            dimension(cols),
+            0,
+            Responder::default(),
+        );
         *parser.screen_mut() = self.parser.screen().clone();
         Self { parser }
     }
@@ -171,13 +187,16 @@ impl Screen {
 
     /// Resizes the emulator.
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows, cols);
+        self.parser
+            .screen_mut()
+            .set_size(dimension(rows), dimension(cols));
     }
 
     /// The size as `(rows, cols)`.
     #[must_use]
     pub fn size(&self) -> (u16, u16) {
-        self.parser.screen().size()
+        let (rows, cols) = self.parser.screen().size();
+        (rows.get(), cols.get())
     }
 
     /// The cursor position as `(row, column)`, both zero-based.
