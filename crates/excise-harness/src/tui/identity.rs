@@ -83,11 +83,12 @@ impl ProcessIdentity {
     /// What the system says about process `pid` once it shows the mark `nonce` in its
     /// environment, which is when it is the program of the session and not a process that is
     /// still being started (see the module's note on those). `None` if the process is not there,
-    /// or has not shown the mark within `bound`.
+    /// has not shown the mark within `bound`, or cannot be looked at because the system will not
+    /// show its processes.
     pub(super) fn once_marked(pid: u32, nonce: &str, bound: Duration) -> Option<Self> {
         let deadline = Instant::now() + bound;
         loop {
-            let seen = look(pid, true)?;
+            let seen = look(pid, true).ok()??;
             if seen
                 .environment
                 .as_deref()
@@ -108,9 +109,10 @@ impl ProcessIdentity {
 }
 
 /// Whether a process with this id is there and is not a zombie, which nobody can signal to any
-/// purpose: the question a kill asks once it has been delivered.
+/// purpose: the question a kill asks once it has been delivered. A system that will not show its
+/// processes cannot say that it is gone, so it counts as there.
 pub(super) fn exists(pid: u32) -> bool {
-    look(pid, false).is_some()
+    look(pid, false).map_or(true, |seen| seen.is_some())
 }
 
 /// What the system shows about a process.
@@ -124,28 +126,34 @@ struct Seen {
 }
 
 /// Looks at process `pid`. A zombie, which nobody can signal to any purpose, is not there.
-fn look(pid: u32, with_environment: bool) -> Option<Seen> {
+///
+/// # Errors
+///
+/// Returns the error of a system that cannot show its processes.
+fn look(pid: u32, with_environment: bool) -> Result<Option<Seen>, sysinfo::Error> {
     let target = Pid::from_u32(pid);
     let mut kind = ProcessRefreshKind::nothing().with_exe(UpdateKind::Always);
     if with_environment {
         kind = kind.with_environ(UpdateKind::Always);
     }
-    let mut system = System::new();
+    let mut system = System::new()?;
     if system.refresh_processes_specifics(ProcessesToUpdate::Some(&[target]), false, kind) == 0 {
-        return None;
+        return Ok(None);
     }
-    let process = system.process(target)?;
+    let Some(process) = system.process(target) else {
+        return Ok(None);
+    };
     if process.status() == ProcessStatus::Zombie {
-        return None;
+        return Ok(None);
     }
-    Some(Seen {
+    Ok(Some(Seen {
         started: process.start_time(),
         exe: process
             .exe()
             .map(|path| path.to_string_lossy().into_owned()),
         environment: (with_environment && !process.environ().is_empty())
             .then(|| process.environ().to_vec()),
-    })
+    }))
 }
 
 /// Whether `environment` holds the nonce `nonce`.
@@ -181,7 +189,11 @@ pub(super) enum Standing {
 /// neither does a recorded identity that matches: the process is [`Standing::Unknown`], and the
 /// identity, which another process can have in common with the session's, is not a proof.
 pub(super) fn standing(pid: u32, recorded: Option<&ProcessIdentity>, nonce: &str) -> Standing {
-    look(pid, true).map_or(Standing::Gone, |seen| weigh(pid, &seen, recorded, nonce))
+    match look(pid, true) {
+        Ok(Some(seen)) => weigh(pid, &seen, recorded, nonce),
+        Ok(None) => Standing::Gone,
+        Err(error) => Standing::Unknown(format!("the system will not show its processes: {error}")),
+    }
 }
 
 /// What the system showed of process `pid`, held against what the session recorded.
@@ -224,9 +236,12 @@ fn weigh(pid: u32, seen: &Seen, recorded: Option<&ProcessIdentity>, nonce: &str)
 ///
 /// On Linux the system lists every thread of a process as an entry of its own, with the
 /// process's command line and environment; those entries are left out, so each process is found
-/// once, by its process id.
+/// once, by its process id. A system that will not show its processes has none to find, and none
+/// is signaled.
 pub(super) fn carrying(root: &Path, nonce: &str) -> Vec<u32> {
-    let mut system = System::new();
+    let Ok(mut system) = System::new() else {
+        return Vec::new();
+    };
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,

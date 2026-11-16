@@ -119,6 +119,9 @@ pub enum BenchError {
     /// The document could not be rendered.
     #[error("cannot render the comparison: {0}")]
     Json(#[from] serde_json::Error),
+    /// The system cannot report its processes, so concurrent `excise` sessions cannot be counted.
+    #[error("cannot read the system's processes: {0}")]
+    System(#[from] sysinfo::Error),
 }
 
 fn io_error(context: impl Into<String>) -> impl FnOnce(io::Error) -> BenchError {
@@ -196,7 +199,7 @@ pub fn run_bench_e2e(options: &BenchOptions) -> Result<BenchReport, BenchError> 
         options.out_root.display()
     )))?;
 
-    let snapshot = Snapshot::take();
+    let snapshot = Snapshot::take()?;
     let concurrent = snapshot.concurrent_excise_processes();
     if concurrent > 0 {
         if options.strict {

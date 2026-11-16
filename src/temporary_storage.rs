@@ -164,9 +164,8 @@ fn available_bytes(f_bavail: u64, f_frsize: u64, f_bsize: u64) -> io::Result<u64
 #[cfg(not(unix))]
 fn scratch_volume_available_bytes(scratch: &Path) -> io::Result<u64> {
     let scratch = std::fs::canonicalize(scratch)?;
-    let disks = Disks::new_with_refreshed_list();
+    let disks = Disks::new_with_refreshed_list().map_err(io::Error::other)?;
     disks
-        .list()
         .iter()
         .filter_map(|disk| {
             std::fs::canonicalize(disk.mount_point())

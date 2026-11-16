@@ -13,9 +13,12 @@ pub struct Snapshot(System);
 
 impl Snapshot {
     /// Takes a snapshot of CPUs and processes.
-    #[must_use]
-    pub fn take() -> Self {
-        Self(System::new_all())
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a system that cannot report CPUs and processes.
+    pub fn take() -> Result<Self, sysinfo::Error> {
+        System::new_all().map(Self)
     }
 
     /// The CPU model (brand string), or `unknown` where the platform reports none.
@@ -60,7 +63,7 @@ const fn excise_process_name() -> &'static str {
 /// The operating system and version, for example `macOS 14.8.9` or `Ubuntu 24.04.1 LTS`.
 #[must_use]
 pub fn os_description() -> String {
-    match (System::name(), System::os_version()) {
+    match (System::name().ok(), System::os_version().ok()) {
         (Some(name), Some(version)) if !version.is_empty() => format!("{name} {version}"),
         (Some(name), _) => name,
         (None, _) => std::env::consts::OS.to_owned(),
@@ -82,10 +85,10 @@ pub fn toolchain() -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// The 1-minute load average.
+/// The 1-minute load average, or `0.0` where the platform reports none (Windows).
 #[must_use]
 pub fn load_average_one_minute() -> f64 {
-    System::load_average().one
+    System::load_average().map_or(0.0, |load| load.one)
 }
 
 /// The power state: `ac`, `battery`, or `unknown` where the platform cannot say. macOS reads
@@ -171,7 +174,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_reports_at_least_one_logical_cpu_and_a_nonempty_model() {
-        let snapshot = Snapshot::take();
+        let snapshot = Snapshot::take().expect("a snapshot");
 
         assert!(snapshot.logical_cpus() >= 1);
         assert!(!snapshot.cpu_model().is_empty());

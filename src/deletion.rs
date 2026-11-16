@@ -3416,8 +3416,9 @@ fn is_mount_root(path: &Path) -> io::Result<bool> {
         if canonical.parent().is_none_or(|parent| parent == canonical) {
             return Ok(true);
         }
-        let disks = Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing());
-        Ok(disks.list().iter().any(|disk| {
+        let disks = Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing())
+            .map_err(io::Error::other)?;
+        Ok(disks.iter().any(|disk| {
             std::fs::canonicalize(disk.mount_point()).is_ok_and(|mount| mount == canonical)
         }))
     }
