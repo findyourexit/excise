@@ -206,6 +206,9 @@ pub enum SweepError {
     /// The document could not be rendered.
     #[error("cannot render the sweep: {0}")]
     Json(#[from] serde_json::Error),
+    /// The system cannot report its processes, so concurrent `excise` sessions cannot be counted.
+    #[error("cannot read the system's processes: {0}")]
+    System(#[from] sysinfo::Error),
     /// The document breaks a rule of its own: a defect in the sweep.
     #[error("the sweep built a document that breaks its own rules: {0}")]
     Invalid(#[from] SweepInvalid),
@@ -453,7 +456,7 @@ pub fn run_sweep(
     let run_id = options.run.id.clone();
     let run_dir = options.run.path.clone();
     let mut output = Output::new(&run_dir, &options.versions)?;
-    let snapshot = Snapshot::take();
+    let snapshot = Snapshot::take()?;
     let concurrent = snapshot.concurrent_excise_processes();
     if concurrent > 0 {
         progress(&format!(

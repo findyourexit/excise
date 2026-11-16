@@ -168,7 +168,7 @@ pub fn live_cpu_ms(pid: u32) -> Option<f64> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
     let target = Pid::from_u32(pid);
-    let mut system = System::new();
+    let mut system = System::new().ok()?;
     if system.refresh_processes_specifics(
         ProcessesToUpdate::Some(std::slice::from_ref(&target)),
         false,

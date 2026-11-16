@@ -80,7 +80,10 @@ impl MemoryBudget {
 
 #[must_use]
 pub fn detected_memory_limit_mib() -> usize {
-    let mut system = System::new();
+    // A system that cannot report its memory has no detected limit: callers clamp to the minimum.
+    let Ok(mut system) = System::new() else {
+        return 0;
+    };
     system.refresh_memory();
     let total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
     total.saturating_mul(3) / 4 / MIB
