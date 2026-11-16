@@ -1,0 +1,124 @@
+schema_version = 1
+name = "delete-queue-in-large-map-250k"
+description = "Four folders confirmed one after the other, in a completed map of about 244,000 entries, are removed one after the other, and the queue says why it waits. The deletion after the first starts only when the map without the one before it has landed (the next overlay derives from that map), and that map is a pass over every entry: about 2 s at this size on the machine this was written on, and longer for more entries. A queue that went on saying `Queued for deletion` through that time looked stuck, while the program was building the map. It must say what the deletions wait for, on the tile, in the selected-item panel, and in the header, and count the stages the map has got through and the seconds the wait has taken, so that the screen moves while the pass runs."
+fixture = "delete-queue-250k"
+sentinels = ["keep-a.bin", "docs/keep-0.txt"]
+profiles = ["default", "deterministic"]
+tier = "full"
+platforms = ["linux", "macos"]
+
+[terminal]
+cols = 120
+rows = 40
+
+[[steps]]
+step = "wait_header"
+state = "complete"
+timeout_ms = 1200000
+
+# Each confirmation returns as soon as its dialog has closed. The first deletion (5,011 entries)
+# is still running while the other three are confirmed behind it.
+[[steps]]
+step = "select"
+name = "queue-a"
+timeout_ms = 20000
+
+[[steps]]
+step = "delete"
+name = "queue-a"
+kind = "folder"
+wait_for = "started"
+timeout_ms = 60000
+
+[[steps]]
+step = "select"
+name = "queue-b"
+timeout_ms = 20000
+
+[[steps]]
+step = "delete"
+name = "queue-b"
+kind = "folder"
+wait_for = "started"
+timeout_ms = 60000
+
+[[steps]]
+step = "select"
+name = "queue-c"
+timeout_ms = 20000
+
+[[steps]]
+step = "delete"
+name = "queue-c"
+kind = "folder"
+wait_for = "started"
+timeout_ms = 60000
+
+# The filter this leaves keeps queue-d, the last in line, on the map and in the selected-item panel.
+[[steps]]
+step = "select"
+name = "queue-d"
+timeout_ms = 20000
+
+[[steps]]
+step = "delete"
+name = "queue-d"
+kind = "folder"
+wait_for = "started"
+timeout_ms = 60000
+
+# The first deletion ends, and the map without it is built before the next one starts. The header
+# says what the queue waits for and, once the wait has run a tenth of a second, counts: the stages
+# the store thread has got through, and the seconds.
+[[steps]]
+step = "wait_text"
+text = "updating the map"
+region = "header"
+timeout_ms = 60000
+
+[[steps]]
+step = "wait_text"
+regex = 'updating the map \d+/\d+ . \d+\.\d s'
+region = "header"
+timeout_ms = 10000
+
+# Nothing is running: the three deletions that have not started wait for the map, and the tile, the
+# selected-item panel, and the header all say so, and none of them says it is queued or checking.
+[[steps]]
+step = "expect_screen"
+region = "header"
+contains = ["Deletion queued: "]
+
+[[steps]]
+step = "expect_screen"
+contains = ["Waiting for map", "Deletion: waiting for the map to update"]
+not_contains = ["Queued for deletion", "queued behind active work", "Checking deletion"]
+
+[[steps]]
+step = "wait_fs_absent"
+path = "queue-d"
+timeout_ms = 300000
+
+# The program says when the map without the last of the four is the one on screen: by then no
+# deletion waits for a map any more.
+[[steps]]
+step = "wait_refresh"
+timeout_ms = 300000
+
+[[steps]]
+step = "expect_screen"
+not_contains = ["Waiting for map", "updating the map", "Deletion queued"]
+
+[[steps]]
+step = "expect_fs"
+present = ["keep-a.bin", "docs/keep-0.txt"]
+absent = ["queue-a", "queue-b", "queue-c", "queue-d"]
+
+[[steps]]
+step = "quit"
+
+[[steps]]
+step = "expect_exit"
+code = 0
+terminal_restored = true
+residue = "none"

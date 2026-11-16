@@ -1,0 +1,66 @@
+schema_version = 1
+id = "delete-queue-250k"
+description = "Four folders to delete one after the other, from a map large enough that the map without each of them takes seconds to build. `queue-a/` holds 5,011 entries (111 directories, 4,900 files), so that its deletion is still running while the other three are confirmed behind it; `queue-b/`, `queue-c/`, and `queue-d/` hold 246 entries each (6 directories, 240 files). `keep-a.bin` and `docs/keep-0.txt` are the sentinels, and `bulk/` holds 238,000 empty files in 238 folders, so that the map without a deleted folder is a pass over about 244,000 entries."
+seed = 20261012
+
+[[parts]]
+kind = "file"
+root = "keep-a.bin"
+size = 16384
+
+[[parts]]
+kind = "tree"
+root = "docs"
+depth = 0
+files_per_dir = 2
+file_names = { style = "sequential", prefix = "keep-", suffix = ".txt" }
+file_size = 12288
+
+[[parts]]
+kind = "tree"
+root = "queue-a"
+depth = 2
+fanout = 10
+files_per_dir = 49
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "part", width = 2 }
+file_names = { style = "hex", prefix = "blob-", suffix = ".bin", length = 6 }
+file_size = { min = 100, max = 8192 }
+
+[[parts]]
+kind = "tree"
+root = "queue-b"
+depth = 1
+fanout = 5
+files_per_dir = 40
+file_names = { style = "sequential", prefix = "b", suffix = ".dat", width = 4 }
+file_size = { min = 2048, max = 4096 }
+
+[[parts]]
+kind = "tree"
+root = "queue-c"
+depth = 1
+fanout = 5
+files_per_dir = 40
+file_names = { style = "sequential", prefix = "c", suffix = ".dat", width = 4 }
+file_size = { min = 2048, max = 4096 }
+
+[[parts]]
+kind = "tree"
+root = "queue-d"
+depth = 1
+fanout = 5
+files_per_dir = 40
+file_names = { style = "sequential", prefix = "d", suffix = ".dat", width = 4 }
+file_size = { min = 2048, max = 4096 }
+
+[[parts]]
+kind = "tree"
+root = "bulk"
+depth = 1
+fanout = 238
+files_per_dir = 1000
+file_placement = "leaves"
+dir_names = { style = "sequential", prefix = "bucket", width = 3 }
+file_names = { style = "sequential", prefix = "t", suffix = ".dat", width = 4 }
+file_size = 0
