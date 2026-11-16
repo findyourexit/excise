@@ -76,15 +76,18 @@ impl DeletionDeparture {
     }
 }
 
-/// How far finishing the primary scan's map has got, once the scanner is done and the map is not.
+/// How far the store thread has got with a map it is building, and for how long the reader has
+/// waited for it: the finished scan's map, once the scanner is done and the map is not, or the map
+/// without the last deletion's target, for the deletion work that waits for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PublicationProgress {
     /// Stages the store thread has completed.
     pub done: u8,
     /// Stages in all.
     pub total: u8,
-    /// Whole tenths of a second since the scanner finished. A stage can run for longer than the
-    /// screen may stand still, so the clock is what moves it between stages.
+    /// Whole tenths of a second since the scanner finished, or since the deletion work began to
+    /// wait. A stage can run for longer than the screen may stand still, so the clock is what
+    /// moves it between stages.
     pub elapsed_tenths: u32,
 }
 

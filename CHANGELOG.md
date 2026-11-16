@@ -6,6 +6,10 @@ Excise preserves the historical Diskonaut changelog below. Diskonaut versions an
 
 ## [Unreleased]
 
+### Fixed
+
+* Deletions queued behind another no longer look stuck while they wait. The next deletion starts when the map without the one before it has landed, which is a pass over every entry (seconds for a million entries), and for all of that time the tiles said only `Queued for deletion`. They now read `Waiting for map`, the selected-item panel and the header say the deletion is waiting for the map to update, and the header counts the stages the map has got through and the seconds the wait has taken, so the screen keeps moving until the map lands and the deletion starts.
+
 ## [1.4.1] - 2026-10-09
 
 ### Changed

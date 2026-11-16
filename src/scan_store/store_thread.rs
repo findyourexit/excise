@@ -850,6 +850,10 @@ impl StoreHandle {
             .ok_or(StoreUnavailable(
                 "no installed map to build the overlay from",
             ))?;
+        // The stage count belongs to the publication under way, which is this overlay's. Left as
+        // the last map ended on, it would read as this one's until the thread begins publishing,
+        // after it has listed the folder and copied the map.
+        self.progress.store(0, Ordering::Relaxed);
         self.send(StoreCommand::Overlay(Box::new(OverlayRequest {
             generation,
             replaced_prefix: replaced_prefix.clone(),
@@ -1063,6 +1067,20 @@ mod tests {
         StoreHandle::new(store).expect("handle should take the store")
     }
 
+    /// A handle whose store keeps its runs in the files of a private session directory below
+    /// `parent`. An overlay reads the installed map through the paths of its files, so only a
+    /// store that keeps them in files can be asked for one.
+    fn file_backed_handle(parent: &Path) -> StoreHandle {
+        let storage = ScanStoreStorage::new(
+            TemporaryStorage::scan_store_with_limit_bytes(STORAGE_BYTES),
+            Some(parent),
+        )
+        .expect("the private scan session should initialize");
+        let store = ScanStore::new_with_storage(ScanGeneration::initial(), storage)
+            .expect("store should initialize");
+        StoreHandle::new(store).expect("handle should take the store")
+    }
+
     /// A batch of one file, sealed the way the scanner seals one.
     fn batch(handle: &StoreHandle, name: &str) -> SealedBatch {
         handle
@@ -1186,6 +1204,66 @@ mod tests {
             "each batch returned its credit once the thread was done with it"
         );
         assert!(!handle.publication_in_flight());
+        handle.shutdown().expect("the thread should stop");
+    }
+
+    /// The stage count belongs to the publication under way. The one an overlay is asked for reads
+    /// no stage done, not the last stage of the map before it, however long the thread takes to
+    /// list the folder and copy the map before it begins to publish: a queue that waits for that
+    /// map counts it, and must not read as nearly done at the start of every wait.
+    #[test]
+    fn an_overlay_is_asked_for_with_no_stage_done_not_where_the_map_before_it_ended() {
+        let root = tempfile::tempdir().expect("the scan root should exist");
+        let metadata =
+            std::fs::symlink_metadata(root.path()).expect("the root should have metadata");
+        let identity = crate::native_path::identity_for(root.path(), &metadata)
+            .expect("the root's identity should read")
+            .expect("the root is no link");
+        let session_parent = tempfile::tempdir().expect("the session's parent should exist");
+        let mut handle = file_backed_handle(session_parent.path());
+        handle.start_thread().expect("the thread should start");
+        let lease = active_lease(&handle);
+        let sealed = batch(&handle, "a");
+        handle.admit(&lease, sealed).expect("the queue has room");
+        handle.begin_publication().expect("the queue has room");
+        let publication = wait_for_event(&mut handle, |event| match event {
+            StoreEvent::Published(result) => Some(result),
+            other => panic!("unexpected event {:?}", std::mem::discriminant(&other)),
+        })
+        .expect("the scan should publish");
+        handle.install(publication);
+        assert_eq!(
+            handle.progress.load(Ordering::Relaxed),
+            ScanStore::PUBLISH_STAGES,
+            "the first map ended on its last stage"
+        );
+
+        // The thread is held before it has taken the overlay, so nothing it does can move the
+        // count: what the owner reads is what the owner left.
+        let held = handle.hold_for_test();
+        let next = handle.next_generation().expect("a generation follows");
+        handle
+            .begin_overlay(
+                next,
+                &path("a"),
+                Vec::new(),
+                false,
+                ScanRoot {
+                    path: root.path().to_path_buf(),
+                    identity,
+                },
+            )
+            .expect("the queue has room");
+
+        assert_eq!(
+            handle.publication_progress(),
+            Some((0, ScanStore::PUBLISH_STAGES))
+        );
+        drop(held);
+        wait_for_event(&mut handle, |event| match event {
+            StoreEvent::Overlaid(_) => Some(()),
+            _ => None,
+        });
         handle.shutdown().expect("the thread should stop");
     }
 

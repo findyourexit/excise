@@ -1065,8 +1065,8 @@ fn work_status_marker(work: WorkRailItem<'_>, ascii: bool) -> &'static str {
         (WorkRailStatus::AwaitingConfirmation, _) => "!",
         (WorkRailStatus::Planning, true) => "~",
         (WorkRailStatus::Planning, false) => "◌",
-        (WorkRailStatus::Queued, true) => "+",
-        (WorkRailStatus::Queued, false) => "◍",
+        (WorkRailStatus::Queued | WorkRailStatus::WaitingForMap(_), true) => "+",
+        (WorkRailStatus::Queued | WorkRailStatus::WaitingForMap(_), false) => "◍",
         (WorkRailStatus::Executing, true) => "*",
         (WorkRailStatus::Executing, false) => "◉",
     }
@@ -1234,6 +1234,7 @@ fn deletion_activity_label(work: WorkRailItem<'_>) -> &'static str {
         WorkRailStatus::Planning => "Deletion: checking current files in background",
         WorkRailStatus::AwaitingConfirmation => "Deletion: waiting for confirmation",
         WorkRailStatus::Queued => "Deletion: queued behind active work",
+        WorkRailStatus::WaitingForMap(_) => "Deletion: waiting for the map to update",
         WorkRailStatus::Executing => "Deletion: running in background",
     }
 }
@@ -1636,14 +1637,9 @@ fn header_status_line(
         } => Some(match ui_effects.publication_progress {
             // The scanner is done; the map is being finished. What moves on screen is how far, and
             // how long it has taken.
-            Some(PublicationProgress {
-                done,
-                total,
-                elapsed_tenths,
-            }) => format!(
-                "~ SCANNING {separator} finishing the map {done}/{total} {separator} {}.{} s",
-                elapsed_tenths / 10,
-                elapsed_tenths % 10
+            Some(progress) => format!(
+                "~ SCANNING {separator} finishing the map {}",
+                publication_progress_text(progress, separator)
             ),
             None => ui_effects.last_read_path.as_ref().map_or_else(
                 || "~ SCANNING".to_string(),
@@ -1784,6 +1780,20 @@ fn filter_control_hint_line(theme: Theme) -> Line<'static> {
     styled_control_hints(&[&apply, &cancel], true, theme)
 }
 
+/// How far a map being built has got and how long it has taken: `5/12 · 2.7 s`.
+fn publication_progress_text(progress: PublicationProgress, separator: &str) -> String {
+    let PublicationProgress {
+        done,
+        total,
+        elapsed_tenths,
+    } = progress;
+    format!(
+        "{done}/{total} {separator} {}.{} s",
+        elapsed_tenths / 10,
+        elapsed_tenths % 10
+    )
+}
+
 fn deletion_work_status(item: WorkRailItem<'_>, total: usize, ascii: bool) -> String {
     let separator = if ascii { "." } else { "·" };
     let waiting = total.saturating_sub(1);
@@ -1807,6 +1817,23 @@ fn deletion_work_status(item: WorkRailItem<'_>, total: usize, ascii: bool) -> St
         WorkRailStatus::Queued => {
             format!(
                 "Deletion queued: {} {separator} {waiting} waiting",
+                item.path
+            )
+        }
+        // The map comes last, after the count: a status too long for the header is cut in the
+        // middle, and the tail is what goes on saying why the queue does not move.
+        WorkRailStatus::WaitingForMap(wait) => {
+            let map = wait.progress.map_or_else(
+                || "updating the map".to_owned(),
+                |progress| {
+                    format!(
+                        "updating the map {}",
+                        publication_progress_text(progress, separator)
+                    )
+                },
+            );
+            format!(
+                "Deletion queued: {} {separator} {waiting} waiting {separator} {map}",
                 item.path
             )
         }
@@ -2226,6 +2253,7 @@ mod tests {
     use crate::scan_session::ScanSessionId;
     use crate::scan_store::page::{PageEntryKind, ScanPage, ScanPageEntry};
     use crate::scan_store::path_reducer::{Coverage, SummaryMetrics};
+    use crate::state::deletion_work::MapWait;
     use crate::state::files::snapshot_tree::SnapshotTree;
     use crate::theme::ThemeId;
 
@@ -3669,6 +3697,152 @@ mod tests {
             theme,
         );
         assert!(line_text(&header).contains("Verifying deletion"));
+    }
+
+    /// A tree of one file with the cursor on it, and background work that has that file queued
+    /// for deletion.
+    fn tree_board_and_queued_deletion(root: &Path) -> (SnapshotTree, Board, DeletionWork) {
+        let path = root.join("selected-entry");
+        fs::write(&path, b"selected contents").expect("fixture should be written");
+        let metadata = fs::symlink_metadata(&path).expect("fixture metadata should exist");
+        let identity = identity_for(&path, &metadata)
+            .expect("fixture identity should be readable")
+            .expect("fixture should not be a link");
+        let (tree, entry) = concrete_file_tree(root, &path, &metadata, &identity);
+        let mut board = Board::new();
+        board.change_area(Rect::new(0, 0, 80, 10));
+        board.change_files(tree.files_in_current_folder(0, true, &[]));
+        board.set_selected_index(0);
+        let relative = entry.path.clone();
+        let target = SnapshotTree::deletion_target_from_entry(
+            root.to_path_buf(),
+            NodeId(1),
+            &relative,
+            entry,
+            true,
+        )
+        .expect("selected file should retain a deletion target");
+        let mut work = DeletionWork::new();
+        work.enqueue_confirmation(target, true, 1024, Duration::ZERO)
+            .expect("background deletion should retain the selected target");
+        (tree, board, work)
+    }
+
+    /// The map the last deletion made stale holds the next deletion back for as long as the store
+    /// thread takes to build the one without it. The header no longer says that work nothing has
+    /// started on is being checked or is queued behind other work: it says what the work waits
+    /// for, counts how far that has got once there is something to count, and does so in ASCII
+    /// too.
+    #[test]
+    fn the_header_says_what_a_deletion_that_waits_for_the_map_waits_for() {
+        let root = tempfile::tempdir().expect("display root should exist");
+        let (tree, board, mut work) = tree_board_and_queued_deletion(root.path());
+        let header = |work: &DeletionWork, ascii: bool| {
+            line_text(&header_status_line(
+                &tree,
+                &board,
+                &UiMode::Normal,
+                &UiEffects::new(),
+                work,
+                work.presentation_snapshot(),
+                None,
+                "Excise Dark",
+                false,
+                false,
+                false,
+                false,
+                ascii,
+                200,
+                Theme::for_id(ThemeId::ExciseDark),
+            ))
+        };
+        assert!(header(&work, false).contains("Checking deletion"));
+
+        // The wait has only just begun, so there is nothing to count yet.
+        work.set_map_wait(Some(MapWait { progress: None }));
+        let bare = header(&work, false);
+        assert!(bare.contains("Deletion queued: "), "{bare}");
+        assert!(bare.contains("0 waiting · updating the map"), "{bare}");
+        assert!(!bare.contains("Checking deletion"), "{bare}");
+        assert!(!bare.contains("/12"), "{bare}");
+
+        work.set_map_wait(Some(MapWait {
+            progress: Some(PublicationProgress {
+                done: 5,
+                total: 12,
+                elapsed_tenths: 27,
+            }),
+        }));
+        assert!(
+            header(&work, false).ends_with("0 waiting · updating the map 5/12 · 2.7 s"),
+            "{}",
+            header(&work, false)
+        );
+        assert!(
+            header(&work, true).ends_with("0 waiting . updating the map 5/12 . 2.7 s"),
+            "{}",
+            header(&work, true)
+        );
+    }
+
+    /// The list's marker and the selected-item panel say it too, in place of "queued behind
+    /// active work", which nothing is.
+    #[test]
+    fn the_list_and_the_inspector_say_a_deletion_waits_for_the_map() {
+        let root = tempfile::tempdir().expect("display root should exist");
+        let (tree, board, mut work) = tree_board_and_queued_deletion(root.path());
+        work.set_map_wait(Some(MapWait { progress: None }));
+        let theme = Theme::for_id(ThemeId::ExciseDark);
+
+        let list_area = Rect::new(0, 0, 80, 1);
+        let mut list_buffer = Buffer::empty(list_area);
+        render_list_with_work(
+            &mut list_buffer,
+            list_area,
+            &board,
+            Some(&tree),
+            Some(&work),
+            work.presentation_snapshot(),
+            theme,
+            false,
+            Duration::ZERO,
+            false,
+            false,
+            false,
+        );
+        let list_text = list_buffer
+            .content
+            .iter()
+            .map(Cell::symbol)
+            .collect::<String>();
+        assert!(list_text.contains("◍"), "{list_text}");
+
+        let inspector_area = Rect::new(0, 0, 80, INSPECTOR_HEIGHT);
+        let mut inspector_buffer = Buffer::empty(inspector_area);
+        render_inspector_with_work(
+            &mut inspector_buffer,
+            inspector_area,
+            &tree,
+            &board,
+            Some(&work),
+            work.presentation_snapshot(),
+            Some(&UiEffects::new()),
+            &UiMode::Normal,
+            theme,
+            false,
+            false,
+            Duration::ZERO,
+        );
+        let inspector_text = inspector_buffer
+            .content
+            .iter()
+            .map(Cell::symbol)
+            .collect::<String>();
+        assert!(
+            inspector_text.contains("Deletion: waiting for the map to update"),
+            "{inspector_text}"
+        );
+        assert!(!inspector_text.contains("queued behind active work"));
     }
 
     #[test]
