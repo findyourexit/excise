@@ -54,7 +54,7 @@ jobs:
               signal-second-forces-exit
               signal-term-mid-deletion
               signal-term-mid-scan
-          - os: macos-14
+          - os: macos-26
             target: aarch64-apple-darwin
             timing_informational: true
             pr_scenarios: >-
